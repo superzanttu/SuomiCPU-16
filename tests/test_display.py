@@ -4,12 +4,12 @@ from unittest.mock import Mock, patch
 import pygame
 
 from assembler import assemble
-from SuomiCPU import MEM_SIZE, VRAM_START, SuomiCompute8
+from SuomiCPU import MEM_SIZE, VRAM_START, SuomiCompute16
 
 
 class DisplayTests(unittest.TestCase):
     def test_cpu_vram_writes_are_visible_in_palette_surface(self):
-        emulator = SuomiCompute8.__new__(SuomiCompute8)
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.memory = bytearray(MEM_SIZE)
         emulator.registers = [0] * 8
         emulator.flags = {"Z": 0, "C": 0}
@@ -51,7 +51,7 @@ class DisplayTests(unittest.TestCase):
         )
 
     def test_halt_keeps_display_open_until_keypress(self):
-        emulator = SuomiCompute8.__new__(SuomiCompute8)
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.clock = Mock()
         emulator.reset = lambda: setattr(emulator, "running", True)
         emulator.execute_frame = lambda: setattr(emulator, "running", False)

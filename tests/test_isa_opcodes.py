@@ -11,7 +11,7 @@ import unittest
 
 import isa
 from assembler import AssemblyError, assemble
-from SuomiCPU import ICR_ADDR, MEM_SIZE, SuomiCompute8
+from SuomiCPU import ICR_ADDR, MEM_SIZE, SuomiCompute16
 
 REGS = range(8)
 CODE = 0x100
@@ -36,7 +36,7 @@ def encode(text):
 
 
 def make_cpu(program=b"", registers=None, pc=CODE, sp=0x2FFFF, flags=None):
-    cpu = SuomiCompute8.__new__(SuomiCompute8)
+    cpu = SuomiCompute16.__new__(SuomiCompute16)
     cpu.memory = bytearray(MEM_SIZE)
     cpu.memory[pc:pc + len(program)] = program
     cpu.registers = list(registers) if registers else [0] * 8

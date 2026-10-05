@@ -3,12 +3,12 @@ import unittest
 from pathlib import Path
 
 from assembler import assemble_file
-from SuomiCPU import KBD_ADDR, MEM_SIZE, SCREEN_WIDTH, VRAM_START, SuomiCompute8, load_program_file
+from SuomiCPU import KBD_ADDR, MEM_SIZE, SCREEN_WIDTH, VRAM_START, SuomiCompute16, load_program_file
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source, main as compiler_main
 
 
 def run_image(image, maximum_steps=100_000):
-    cpu = SuomiCompute8.__new__(SuomiCompute8)
+    cpu = SuomiCompute16.__new__(SuomiCompute16)
     cpu.memory = bytearray(MEM_SIZE)
     cpu.registers = [0] * 8
     cpu.flags = {"Z": 0, "C": 0}
@@ -312,7 +312,7 @@ class CCompilerTests(unittest.TestCase):
             "  return 0;\n"
             "}\n"
         )
-        cpu = SuomiCompute8.__new__(SuomiCompute8)
+        cpu = SuomiCompute16.__new__(SuomiCompute16)
         cpu.memory = bytearray(MEM_SIZE)
         cpu.registers = [0] * 8
         cpu.flags = {"Z": 0, "C": 0}

@@ -1,14 +1,14 @@
 """Headless helpers for running compiled SC-8 programs frame by frame."""
 from pathlib import Path
 
-from SuomiCPU import BACK_START, KEYS_ADDR, MEM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START, SuomiCompute8
+from SuomiCPU import BACK_START, KEYS_ADDR, MEM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START, SuomiCompute16
 from c_compiler import compile_source
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def make_cpu(image):
-    cpu = SuomiCompute8.__new__(SuomiCompute8)
+    cpu = SuomiCompute16.__new__(SuomiCompute16)
     cpu.memory = bytearray(MEM_SIZE)
     cpu.registers = [0] * 8
     cpu.flags = {"Z": 0, "C": 0}

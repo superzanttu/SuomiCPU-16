@@ -4,7 +4,7 @@ from pathlib import Path
 
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
-from SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, MEM_SIZE, SCREEN_WIDTH, SuomiCompute8
+from SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, MEM_SIZE, SCREEN_WIDTH, SuomiCompute16
 
 HEADER = '#include "suomi_gfx.h"\n'
 
@@ -17,7 +17,7 @@ def run_c(body, frames=1):
 
 
 def bare_cpu():
-    cpu = SuomiCompute8.__new__(SuomiCompute8)
+    cpu = SuomiCompute16.__new__(SuomiCompute16)
     cpu.memory = bytearray(MEM_SIZE)
     cpu.frame_yield = False
     return cpu

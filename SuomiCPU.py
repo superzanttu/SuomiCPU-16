@@ -93,7 +93,7 @@ def load_program_file(path: str | Path) -> AssemblyImage:
     return assemble_file(program_path)
 
 
-class SuomiCompute8:
+class SuomiCompute16:
     def __init__(self):
         self.memory = bytearray(MEM_SIZE)
         self.registers = [0] * 8
@@ -487,7 +487,7 @@ if __name__ == "__main__":
     except (AssemblyError, CCompilerError, OSError, ValueError) as exc:
         parser.error(str(exc))
 
-    sc8 = SuomiCompute8()
+    sc16 = SuomiCompute16()
     if program is not None:
         sc8.load_program(program)
     try:
