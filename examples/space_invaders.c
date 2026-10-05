@@ -1,7 +1,11 @@
-// Space Invaders for the SC-16.  Left/Right (or A/D) move, Space fires,
-// Enter restarts after GAME OVER or after clearing all waves.
+// Space Invaders for the SC-16.
+// Controls:
+// - Left/Right (or A/D): Move ship
+// - Space: Fire bullet
+// - Enter: Restart after GAME OVER or clearing all waves.
 #include "suomi_gfx.h"
 
+/* Constants */
 #define COLS 8
 #define ROWS 4
 #define COUNT 32
@@ -10,7 +14,7 @@
 #define CELL_H 18
 #define PLAYER_Y 214
 
-// Two 8x8 frames for each of the three invader kinds, then the player ship.
+/* Sprite data (8x8 bitmaps) */
 unsigned char inv_a0[8] = {0x18, 0x3C, 0x7E, 0xDB, 0xFF, 0x24, 0x5A, 0xA5};
 unsigned char inv_a1[8] = {0x18, 0x3C, 0x7E, 0xDB, 0xFF, 0x5A, 0x81, 0x42};
 unsigned char inv_b0[8] = {0x42, 0x24, 0x7E, 0xDB, 0xFF, 0xFF, 0xA5, 0x24};
@@ -20,30 +24,32 @@ unsigned char inv_c1[8] = {0x3C, 0x7E, 0xFF, 0x99, 0xFF, 0x66, 0x42, 0xC3};
 unsigned char ship_bmp[8] = {0x10, 0x38, 0x38, 0x7C, 0xFE, 0xFE, 0xFE, 0x00};
 unsigned char boom_bmp[8] = {0x91, 0x4A, 0x24, 0x81, 0x81, 0x24, 0x4A, 0x91};
 
+/* Game State */
 unsigned char alive[COUNT];
-int ox;
-int oy;
-int dir;
-int px;
-int bullet_x;
-int bullet_y;
-int shot_x[MAXS];
-int shot_y[MAXS];
-int left_count;
-int move_timer;
-int move_delay;
-int anim;
-int cooldown;
-int lives;
-int wave;
-int over;
-int wait;
-int boom_x;
-int boom_y;
-int boom_timer;
-int invuln;
-unsigned int score;
+int ox;            // Invaders formation X offset
+int oy;            // Invaders formation Y offset
+int dir;           // Movement direction (positive: right, negative: left)
+int px;            // Player X position
+int bullet_x;      // Player's bullet X
+int bullet_y;      // Player's bullet Y
+int shot_x[MAXS];  // Enemy bullets X
+int shot_y[MAXS];  // Enemy bullets Y
+int left_count;    // Number of remaining invaders
+int move_timer;    // Timer for formation movement
+int move_delay;    // Delay between formation movements
+int anim;          // Animation frame toggle
+int cooldown;      // Player fire cooldown
+int lives;         // Player remaining lives
+int wave;          // Current wave number
+int over;          // Game over flag
+int wait;          // Delay before restart is allowed
+int boom_x;        // Explosion X position
+int boom_y;        // Explosion Y position
+int boom_timer;    // Explosion duration timer
+int invuln;        // Player invulnerability timer
+unsigned int score; // Current score
 
+/* Initializes a new wave of invaders */
 void set_wave(void)
 {
     int i;
@@ -64,6 +70,7 @@ void set_wave(void)
     bullet_y = -1;
 }
 
+/* Resets the game to starting state */
 void new_game(void)
 {
     score = 0;
@@ -77,6 +84,7 @@ void new_game(void)
     set_wave();
 }
 
+/* Converts an unsigned integer to a string */
 void number_text(unsigned int value, char *out)
 {
     char tmp[6];
@@ -101,6 +109,7 @@ void number_text(unsigned int value, char *out)
     out[n] = 0;
 }
 
+/* Finds the lowest active invader in a given column */
 int lowest_in_column(int c)
 {
     int r;
@@ -114,6 +123,7 @@ int lowest_in_column(int c)
     return -1;
 }
 
+/* Randomly selects an invader to fire a shot */
 void invader_fire(void)
 {
     int s;
@@ -136,6 +146,7 @@ void invader_fire(void)
     }
 }
 
+/* Moves the invader formation and checks for game over */
 void step_formation(void)
 {
     int r;
@@ -183,6 +194,7 @@ void step_formation(void)
     }
 }
 
+/* Handles killing an invader and updating score */
 void hit_invader(int index)
 {
     int r;
@@ -196,6 +208,7 @@ void hit_invader(int index)
     }
 }
 
+/* Handles player movement and firing */
 void update_player(unsigned int keys)
 {
     if ((keys & KEY_LEFT) && px > 8)
@@ -222,6 +235,7 @@ void update_player(unsigned int keys)
     }
 }
 
+/* Updates player bullet position and checks for hits */
 void update_bullet(void)
 {
     int r;
@@ -257,6 +271,7 @@ void update_bullet(void)
     }
 }
 
+/* Updates enemy bullet positions and checks for player hits */
 void update_shots(void)
 {
     int s;
@@ -284,6 +299,7 @@ void update_shots(void)
     }
 }
 
+/* Main game logic update loop */
 void update(unsigned int keys)
 {
     update_player(keys);
@@ -311,6 +327,7 @@ void update(unsigned int keys)
     }
 }
 
+/* Draws the current wave of invaders */
 void draw_invaders(void)
 {
     int r;
@@ -362,6 +379,7 @@ void draw_invaders(void)
     }
 }
 
+/* Renders the game frame */
 void draw(void)
 {
     char buffer[8];
