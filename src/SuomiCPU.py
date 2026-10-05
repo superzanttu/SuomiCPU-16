@@ -1072,14 +1072,19 @@ def main():
     except (AssemblyError, CCompilerError, OSError, ValueError) as exc:
         parser.error(str(exc))
 
-    sc16 = SuomiCompute16()
-    sc16.net_port = args.net_port
-    if program is not None:
-        sc16.load_program(program)
     try:
-        sc16.run()
+        sc16 = None
+        if program is None:
+            from src.sc_launcher import run_launcher
+
+            run_launcher(net_port=args.net_port)
+        else:
+            sc16 = SuomiCompute16()
+            sc16.net_port = args.net_port
+            sc16.load_program(program)
+            sc16.run()
     finally:
-        if getattr(sc16, 'net', None) is not None:
+        if sc16 is not None and getattr(sc16, 'net', None) is not None:
             sc16.net.close()
         pygame.quit()
 

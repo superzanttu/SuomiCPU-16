@@ -9,7 +9,14 @@ SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
 - Basic graphics and text-mode support.
 
 ## Getting Started
-Run an example from the repository root:
+Start SC-16 without arguments to open SC-launcher. It lists the `.c` modules in
+the `modules/` folder. Click a module, then click **LOAD MODULE** to run it;
+the first source line is shown as its description:
+```console
+python main.py
+```
+
+Run an example directly from the repository root:
 ```console
 python main.py examples/factorial.c
 ```

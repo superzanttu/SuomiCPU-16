@@ -1,3 +1,4 @@
+// SC-16 text-mode demonstration.
 void SCREEN_CLEAR(void);
 void SCREEN_SET_CURSOR(unsigned char column, unsigned char row);
 int SCREEN_GET_CURSOR(void);

@@ -27,8 +27,12 @@ On Windows, run the PowerShell launcher with a source or binary path:
 ```
 
 `run.ps1` changes to the repository directory and starts the emulator through
-`main.py`. It requires Python to be available as `python` on `PATH`. The program
-argument is optional; without it, the emulator starts with no program loaded.
+`main.py`. It requires Python to be available as `python` on `PATH`. Without a
+program path, SC-16 opens SC-launcher. The launcher lists `.c` files in
+`modules/`, using each filename as its module name and the first source line as
+its description. Click a module to select it, then click **LOAD MODULE**; the
+16x16 outlined square is reserved for a module icon. Use the mouse wheel to
+scroll through the list. Press Escape to close the launcher.
 
 Additional examples are in [`examples/commands.asm`](examples/commands.asm)
 and [`examples/directives.asm`](examples/directives.asm):
@@ -51,9 +55,9 @@ The compiler defaults to an output file with the input name and a `.bin`
 extension. `-S` emits readable SC-16 assembly instead. The emulator accepts
 `.asm`, `.c`, and flat `.bin` inputs.
 
-The input file argument is optional. Without a file, the emulator starts at
-address `0`; the zero-filled memory there decodes as `HALT`. The emulator uses
-Pygame for its window, display, and keyboard input.
+The input file argument is optional. With no file, the launcher starts instead
+of opening an empty emulator. The emulator and launcher use Pygame for their
+window, display, and input.
 
 ## 3. Assembly source syntax
 

@@ -13,11 +13,9 @@ if (!(Get-Command python -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# With no program path, main.py opens SC-launcher.
 if ([string]::IsNullOrWhiteSpace($ProgramFile)) {
-    Write-Host "Usage: .\run.ps1 <program_file>" -ForegroundColor Yellow
-    Write-Host "Example: .\run.ps1 .\examples\asteroids.c" -ForegroundColor Yellow
-    exit 0
+    python main.py
+} else {
+    python main.py $ProgramFile
 }
-
-# Run the emulator via main.py
-python main.py $ProgramFile
