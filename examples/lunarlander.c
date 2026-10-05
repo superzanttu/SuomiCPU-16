@@ -4,9 +4,9 @@
 //
 // Controls:
 // - Left/Right (or A/D): Rotation thrusters
-// - Up (or W) / Space:   Main engine (the throttle ramps up and down smoothly)
+// - Space:               Main engine (the throttle ramps up and down smoothly)
 // - Menu: Up/Down changes the game mode, Left/Right the difficulty, Enter starts
-// - Enter/Space: Continue after a landing or a crash
+// - Enter: Continue after a landing or a crash
 //
 // Game modes:
 // - Classic:   3 landers, limited fuel
@@ -518,7 +518,7 @@ void update_play(unsigned int keys) {
     int rot = 0, want = 0, idx, s, c, acc, t, i;
     if (keys & KEY_LEFT) rot = rot - 1;
     if (keys & KEY_RIGHT) rot = rot + 1;
-    if (keys & (KEY_UP | KEY_FIRE)) want = 1;
+    if (keys & KEY_FIRE) want = 1;
     if (fuel <= 0 && mode != M_PRACTICE) { want = 0; rot = 0; }
 
     /* Rotation thrusters: angular acceleration with damping when idle */
@@ -850,14 +850,14 @@ void update_menu(unsigned int pressed) {
     if (pressed & KEY_DOWN) { mode++; if (mode > 2) mode = 0; }
     if (pressed & KEY_RIGHT) { diff++; if (diff > 2) diff = 0; }
     if (pressed & KEY_LEFT) { diff = diff + 2; if (diff > 2) diff = diff - 3; }
-    if (pressed & (KEY_START | KEY_FIRE)) new_game();
+    if (pressed & KEY_START) new_game();
 }
 
 /* Result screens: wait a moment, then continue or return to the menu */
 void update_result(unsigned int pressed) {
     timer++;
     update_particles();
-    if (timer > 40 && (pressed & (KEY_START | KEY_FIRE))) {
+    if (timer > 40 && (pressed & KEY_START)) {
         if (state == ST_LANDED) { level++; start_round(); }
         else if (state == ST_CRASHED) {
             if (mode != M_PRACTICE && lives <= 0) { state = ST_OVER; timer = 0; }

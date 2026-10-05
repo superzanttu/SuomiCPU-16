@@ -634,7 +634,7 @@ instructions per frame.
   exhaust, dust and explosion particles, a starfield with the Earth, a HUD with
   altitude, velocity and fuel, and synthesized sound (engine, RCS, ambient drone,
   landing jingle, crash). Modes: Classic, Practice (unlimited fuel) and Challenge
-  (rough terrain, stronger gravity), each with three difficulty levels. Up/W fires
+  (rough terrain, stronger gravity), each with three difficulty levels. Space fires
   the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
   Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
   accuracy bonus) x pad multiplier. Run it with `python main.py examples/lunarlander.c`.

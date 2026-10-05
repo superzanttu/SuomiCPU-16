@@ -307,7 +307,7 @@ class GameTests(unittest.TestCase):
         cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else 0, 8)
         self.assertIn(3, vram(cpu))
         cpu.sound_log.clear()
-        cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else (4 if 8 <= f < 30 else 0), 30)
+        cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else (16 if 8 <= f < 30 else 0), 30)
         self.assertTrue(any(call[0] == 0 and call[1] > 0 for call in cpu.sound_log))
         for frame in range(400):
             cpu.memory[KEYS_ADDR] = 0
