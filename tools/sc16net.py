@@ -74,7 +74,7 @@ class NetNode:
         self.full = False
         self.joined_at = 0.0
         self.last_hello = 0.0
-        self.peers = {}          # instance id -> [slot, last seen]
+        self.peers = {}          # instance id -> [slot, last seen, settled]
         self.inbox = []
         self.last_sender = 0
 
@@ -162,9 +162,13 @@ class NetNode:
         slot = self.slot if self.slot is not None else 0
         self.transport.send(HEADER.pack(MAGIC, kind, slot, self.title, self.instance_id) + payload)
 
+    @property
+    def settled(self):
+        return self.slot is not None and self.clock() - self.joined_at >= JOIN_TIME
+
     def _hello(self):
         self.last_hello = self.clock()
-        self._send(HELLO)
+        self._send(HELLO, b"\x01" if self.settled else b"\x00")
 
     def _leave_full(self):
         self.full = True
@@ -189,13 +193,18 @@ class NetNode:
                 if self.slot is not None and self.clock() - self.joined_at < JOIN_TIME:
                     self._leave_full()
                 return
-            self.peers[sender] = [slot, now]
+            self.peers[sender] = [slot, now, True]
             self._hello()           # introduce ourselves to the newcomer
         entry = self.peers[sender]
         entry[0], entry[1] = slot, now
+        if kind == HELLO:
+            entry[2] = payload[:1] == b"\x01"
         if self.slot is not None and slot == self.slot:
-            # Slot clash: the lower instance id keeps the slot.
-            if sender < self.instance_id:
+            # Slot clash: a settled player keeps its slot against a newcomer;
+            # otherwise the lower instance id wins.
+            mine = self.settled
+            theirs = entry[2]
+            if (theirs and not mine) or (theirs == mine and sender < self.instance_id):
                 new_slot = self._free_slot()
                 if new_slot is None:
                     self._leave_full()

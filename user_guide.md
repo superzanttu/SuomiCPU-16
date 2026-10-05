@@ -562,6 +562,8 @@ no flicker.
 | `unsigned int gfx_mouse_buttons(void)`                                                  | Held buttons: `MOUSE_LEFT` 1, `MOUSE_RIGHT` 2 (use with position for dragging). |
 | `unsigned int gfx_mouse_events(void)`                                                   | One-frame events: press `MOUSE_LEFT_DOWN`/`RIGHT_DOWN` 1/2, double-click `MOUSE_LEFT_DOUBLE`/`RIGHT_DOUBLE` 4/8, release `MOUSE_LEFT_UP`/`RIGHT_UP` 16/32. |
 | `void gfx_sound(int channel, int freq, int frames, int wave, int volume)`                | Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. `WAVE_SQUARE/NOISE/TRIANGLE`. |
+| `void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y)` | Fill the screen from a tile map (1 byte per tile = palette colour, 0 = black; 16x16 px tiles; camera in pixels; outside the map is black). |
+| `int gfx_getchar(void)` | Next typed ASCII character (8 backspace, 13 enter), 0 if none; consumes it. |
 | `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store the back buffer as a static layer / redraw it in one call.              |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
@@ -579,7 +581,7 @@ Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 2 pixel, 3 rect, 4 line (W,H are the end point), 5 sprite, 6 bitmap, 7 text
 (NUL-terminated string at SRC), 8 present, 9 random (to RESULT), 10 polygon
 (W is the point count), 13 sound (COLOR channel, X Hz, Y frames, W wave, H volume %),
-14 save back buffer, 15 restore it, 16-20 networking (below). Assembly programs can use it directly.
+14 save back buffer, 15 restore it, 16-20 networking (below), 21 tile map (X,Y camera, W,H map size, SRC map). Assembly programs can use it directly.
 
 ### LAN games (`net_*`)
 
@@ -587,8 +589,8 @@ Games can talk to other emulator instances on the local network without any serv
 every instance is a peer and finds the others with small UDP broadcast packets (port 47016,
 change with `--net-port`; all players must use the same port). Instances only see peers that
 called `net_open` with the **same title** (up to 16 characters), so "pacman" ignores "elite".
-At most 8 instances share a title; each gets a stable slot 0-7 (settled about 0.6 s after joining,
-`net_ready()`). Peers that vanish time out after about 3.5 s; `net_close()` leaves immediately.
+At most 8 instances share a title; each gets a slot 0-7 (settled about 0.6 s after joining, `net_ready()`;
+an already settled player keeps its slot against a newcomer). Peers that vanish time out after about 3.5 s; `net_close()` leaves immediately.
 Broadcasts are not delivered back to the sender. Delivery is UDP: messages can be lost or reordered,
 so send state continuously rather than relying on single events.
 
@@ -680,6 +682,14 @@ instructions per frame.
 - [`examples/net_game_demo.c`](examples/net_game_demo.c) is a LAN demo: start it in up to 8
   emulator instances on one network; each player moves a coloured square (arrows) and Space
   broadcasts a ping ring to all others. Run it with `python main.py examples/net_game_demo.c`.
+- [`examples/spacecave.c`](examples/spacecave.c) (SpaceCave) is an Asteroids-style LAN dogfight
+  for up to 8 pilots inside a procedurally generated cave with auto-repairing defence turrets.
+  Start it in one emulator per player (`python main.py examples/spacecave.c`), type a nickname and
+  press Enter. Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard. The
+  lowest network slot acts as the authoritative host: clients only send their keys, the host simulates
+  and broadcasts ships, bullets, turrets and scores, and the cave is rebuilt from a broadcast seed.
+  A disconnected pilot's score stays on the board (slot reserved) for 10 s; a destroyed ship
+  respawns after 10 s at a safe random spot. If the host leaves, the next slot takes over.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
 - [`examples/asteroids.c`](examples/asteroids.c) and

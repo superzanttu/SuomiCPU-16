@@ -1,4 +1,4 @@
-"""A small, self-contained C89 subset compiler for the SC-16."""
+﻿"""A small, self-contained C89 subset compiler for the SC-16."""
 
 import argparse
 import ast
@@ -48,6 +48,8 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_mouse_y": ("int", ()),
     "gfx_mouse_buttons": ("unsigned int", ()),
     "gfx_mouse_events": ("unsigned int", ()),
+    "gfx_tilemap": ("void", ("unsigned char*", "int", "int", "int", "int")),
+    "gfx_getchar": ("int", ()),
     "net_open": ("int", ("char*",)),
     "net_close": ("void", ()),
     "net_send": ("int", ("unsigned char*", "int")),
@@ -73,6 +75,9 @@ LIBRARY_FILES = {
 ALU_NAMES = {"+": "ADD", "-": "SUB", "&": "AND", "|": "OR", "^": "XOR"}
 SIGNED_BRANCHES = {"<": "BLTX", "<=": "BLEX", ">": "BGTX", ">=": "BGEX"}
 UNSIGNED_BRANCHES = {"<": "BCX", "<=": "BLSX", ">": "BHIX", ">=": "BNCX"}
+# Inverted conditions, used to branch when a comparison is false
+SIGNED_INVERSE = {"<": "BGEX", "<=": "BGTX", ">": "BLEX", ">=": "BLTX"}
+UNSIGNED_INVERSE = {"<": "BNCX", "<=": "BHIX", ">": "BLSX", ">=": "BCX"}
 
 class CCompilerError(ValueError):
     """Raised for unsupported or invalid input in the supported C subset."""
@@ -778,6 +783,7 @@ class _CodeGenerator:
         self.frame_size = 0
         self.scopes: list[dict[str, _Variable]] = []
         self.break_labels: list[str] = []
+        self._jump_false: str | None = None
         self.continue_labels: list[str] = []
         self.used_helpers: set[str] = set()
         self.function_names = {function.name for function in functions}
@@ -1259,14 +1265,7 @@ class _CodeGenerator:
             condition, then_branch, else_branch = statement.children
             else_label = self.label("else")
             end_label = self.label("endif")
-            self._expression(condition)
-            if self._expression_type(condition) == "float":
-                self.emit("    LDI R1, 0")
-                self.emit("    FCMP R0, R1")
-            else:
-                self.emit("    LDI R1, 0")
-                self.emit("    CMP R0, R1")
-            self.emit(f"    BZX {else_label}")
+            self._branch_if_false(condition, else_label)
             self._statement(then_branch)
             if else_branch is not None:
                 self.emit(f"    JMPX {end_label}")
@@ -1290,6 +1289,39 @@ class _CodeGenerator:
             return
         raise self.error(statement.line, f"unsupported statement {kind}")
 
+    def _branch_if_false(self, condition: Expr, target: str) -> None:
+        """Jump to target when the condition is zero; comparisons and && / || branch directly."""
+        if condition.kind == "binary":
+            operator = str(condition.value)
+            left, right = condition.children
+            if operator in ("&&", "||"):
+                self._expression_type(condition)
+                if operator == "&&":
+                    self._branch_if_false(left, target)
+                    self._branch_if_false(right, target)
+                else:
+                    second = self.label("or_second")
+                    done = self.label("or_done")
+                    self._branch_if_false(left, second)
+                    self.emit(f"    JMPX {done}")
+                    self.emit(f"{second}:")
+                    self._branch_if_false(right, target)
+                    self.emit(f"{done}:")
+                return
+            if (operator in ("==", "!=", "<", "<=", ">", ">=")
+                    and "float" not in (self._expression_type(left), self._expression_type(right))):
+                self._jump_false = target
+                self._expression(condition)
+                return
+        self._expression(condition)
+        if self._expression_type(condition) == "float":
+            self.emit("    LDI R1, 0")
+            self.emit("    FCMP R0, R1")
+        else:
+            self.emit("    LDI R1, 0")
+            self.emit("    CMP R0, R1")
+        self.emit(f"    BZX {target}")
+
     def _loop_statement(self, statement: Stmt) -> None:
         kind = statement.kind
         start = self.label("loop")
@@ -1300,10 +1332,7 @@ class _CodeGenerator:
         if kind == "while":
             condition, body = statement.children
             self.emit(f"{start}:")
-            self._expression(condition)
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R0, R1")
-            self.emit(f"    BZX {end}")
+            self._branch_if_false(condition, end)
             self._statement(body)
             self.emit(f"{continue_label}:")
             self.emit(f"    JMPX {start}")
@@ -1312,10 +1341,7 @@ class _CodeGenerator:
             self.emit(f"{start}:")
             self._statement(body)
             self.emit(f"{continue_label}:")
-            self._expression(condition)
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R0, R1")
-            self.emit(f"    BZX {end}")
+            self._branch_if_false(condition, end)
             self.emit(f"    JMPX {start}")
         else:
             initializer, condition, increment, body = statement.children
@@ -1323,10 +1349,7 @@ class _CodeGenerator:
                 self._expression(initializer)
             self.emit(f"{start}:")
             if condition is not None:
-                self._expression(condition)
-                self.emit("    LDI R1, 0")
-                self.emit("    CMP R0, R1")
-                self.emit(f"    BZX {end}")
+                self._branch_if_false(condition, end)
             self._statement(body)
             self.emit(f"{continue_label}:")
             if increment is not None:
@@ -1738,6 +1761,7 @@ class _CodeGenerator:
     def _binary_expression(self, expression: Expr) -> None:
         operator = str(expression.value)
         left, right = expression.children
+        jump_false, self._jump_false = self._jump_false, None
         if operator in ("&&", "||"):
             second_label = self.label("logic_second")
             true_label = self.label("logic_true")
@@ -1766,7 +1790,7 @@ class _CodeGenerator:
             return
         left_type = self._expression_type(left)
         right_type = self._expression_type(right)
-        if right.kind == "constant" and self._constant_binary(expression, operator, left, left_type):
+        if right.kind == "constant" and self._constant_binary(expression, operator, left, left_type, jump_false):
             return
         self._expression(left)
         left_size = _object_size(left_type)
@@ -1835,9 +1859,10 @@ class _CodeGenerator:
                     self.emit("    ITOF R0")
                 if right_type != "float":
                     self.emit("    ITOF R1")
-            self._comparison(operator, expression.line, compare_type)
+            self._comparison(operator, expression.line, compare_type, jump_false=jump_false)
 
-    def _constant_binary(self, expression: Expr, operator: str, left: Expr, left_type: str) -> bool:
+    def _constant_binary(self, expression: Expr, operator: str, left: Expr, left_type: str,
+                         jump_false: str | None = None) -> bool:
         """Emit `left <op> constant` without the operand stack; False if not applicable."""
         value = int(expression.children[1].value) & WORD_MASK
         if left_type == "float" or left_type.endswith("*"):
@@ -1863,7 +1888,8 @@ class _CodeGenerator:
             else:
                 self.emit(f"    CMP R0, {value}")
             compare_type = "unsigned int" if unsigned_left else "int"
-            self._comparison(operator, expression.line, compare_type, compared=True)
+            self._comparison(operator, expression.line, compare_type, compared=True,
+                             jump_false=jump_false)
             return True
         result_type = self._expression_type(expression)
         if operator in ("*", "/", "%"):
@@ -1912,7 +1938,18 @@ class _CodeGenerator:
         self.emit("    AND R0, R7")
 
     def _comparison(self, operator: str, line: int, compare_type: str = "int",
-                    compared: bool = False) -> None:
+                    compared: bool = False, jump_false: str | None = None) -> None:
+        if jump_false is not None and compare_type != "float":
+            if not compared:
+                self.emit("    CMP R0, R1")
+            if operator == "==":
+                branch = "BNZX"
+            elif operator == "!=":
+                branch = "BZX"
+            else:
+                branch = (SIGNED_INVERSE if compare_type == "int" else UNSIGNED_INVERSE)[operator]
+            self.emit(f"    {branch} {jump_false}")
+            return
         true_label = self.label("cmp_true")
         false_label = self.label("cmp_false")
         end_label = self.label("cmp_end")

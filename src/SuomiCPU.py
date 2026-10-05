@@ -87,6 +87,10 @@ GPU_SOUND = 13  # Sound: COLOR=channel 0-3, X=frequency Hz (0=silence), Y=durati
 GPU_SAVE, GPU_LOAD = 14, 15  # Save/restore the back buffer (static background layer)
 # LAN networking: SOURCE=buffer, X=length; results in bytes +14/+15 (word)
 GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 18, 19, 20
+# Tile map: SRC=map (1 byte per tile = palette color, 0 black), W/H=map size in tiles,
+# X/Y=camera pixel position. Draws 16x16 tiles over the whole back buffer.
+GPU_TILEMAP = 21
+TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
@@ -100,6 +104,7 @@ PALETTE_COLORS = [
     (0, 0, 0), (255, 255, 255), (255, 48, 48), (48, 220, 64),
     (64, 96, 255), (255, 224, 0), (0, 224, 224), (224, 64, 224),
     (255, 144, 0), (150, 150, 150), (80, 80, 80), (128, 0, 0),
+    (255, 128, 192), (150, 100, 50), (46, 30, 22),
 ]
 
 # Näppäimistön yhdistykset
@@ -260,6 +265,28 @@ class SuomiCompute16:
             self.memory[GPU_BASE + 14] = random.randrange(256)
         elif GPU_NET_OPEN <= command <= GPU_NET_INFO:
             self._gpu_net(command, color, x)
+        elif command == GPU_TILEMAP:
+            self._gpu_tilemap(x, y, w, h, self._gpu_source())
+
+    _TILE_ROWS = [bytes([c]) * TILE_SIZE for c in range(256)]
+
+    def _gpu_tilemap(self, camx, camy, map_w, map_h, source):
+        out = bytearray(SCREEN_WIDTH * SCREEN_HEIGHT)
+        if map_w > 0 and map_h > 0:
+            first_col = camx // TILE_SIZE
+            last_col = (camx + SCREEN_WIDTH - 1) // TILE_SIZE
+            crop = camx - first_col * TILE_SIZE
+            for tile_y in range(camy // TILE_SIZE, (camy + SCREEN_HEIGHT - 1) // TILE_SIZE + 1):
+                if not 0 <= tile_y < map_h:
+                    continue
+                base = source + tile_y * map_w
+                cells = [self.memory[base + c] if 0 <= c < map_w else 0
+                         for c in range(first_col, last_col + 1)]
+                line = b"".join([self._TILE_ROWS[c] for c in cells])[crop:crop + SCREEN_WIDTH]
+                top = tile_y * TILE_SIZE - camy
+                for row in range(max(top, 0), min(top + TILE_SIZE, SCREEN_HEIGHT)):
+                    out[row * SCREEN_WIDTH:(row + 1) * SCREEN_WIDTH] = line
+        self.memory[BACK_START:BACK_START + len(out)] = out
 
     def _net_node(self):
         node = getattr(self, 'net', None)
