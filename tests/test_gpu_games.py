@@ -247,17 +247,33 @@ class GameTests(unittest.TestCase):
         self.assertTrue(cpu.running)
         self.assertEqual(len(set(faces)), 7)
 
-    def test_elitedemo_runs_with_throttle_turn_and_fire_inputs(self):
-        cpu = self.play(
-            "elitedemo.c",
-            lambda f: (4 if f < 24 else 8 if f < 40 else 0)
-            | (1 if 28 <= f < 36 else 0)
-            | (16 if f % 10 == 0 else 0),
-            60,
+    def play_elite(self, keys, frames):
+        cpu = make_cpu(compile_file(ROOT / "examples" / "elitedemo.c"))
+        for frame in range(frames):
+            low, ext = keys(frame)
+            cpu.memory[KEYS_ADDR] = low
+            cpu.memory[KEYS_ADDR + 1] = ext
+            self.assertGreater(run_frame(cpu, 5_000_000), 0)
+        return cpu
+
+    def test_elitedemo_flies_with_thrust_turn_roll_and_fire(self):
+        cpu = self.play_elite(
+            lambda f: (
+                (1 if 20 <= f < 40 else 4 if 40 <= f < 60 else 0) | (16 if f % 6 == 0 else 0),
+                (4 if f < 40 else 1 if f < 60 else 0),
+            ),
+            90,
         )
         self.assertTrue(cpu.running)
         self.assertGreater(sum(1 for byte in vram(cpu) if byte), 100)
 
+    def test_elitedemo_moons_orbit_and_scene_changes(self):
+        cpu = make_cpu(compile_file(ROOT / "examples" / "elitedemo.c"))
+        run_frame(cpu, 5_000_000)
+        first = bytes(vram(cpu))
+        for _ in range(40):
+            run_frame(cpu, 5_000_000)
+        self.assertNotEqual(first, bytes(vram(cpu)))
     def test_showcase_pages_and_interrupt_counters(self):
         cpu = make_cpu(compile_file(ROOT / "examples" / "sc16_showcase.c"))
         run_frame(cpu, 400_000)

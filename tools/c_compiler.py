@@ -43,6 +43,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_irq_init": ("void", ()),
     "gfx_irq_ticks": ("unsigned int", ()),
     "gfx_irq_keys": ("unsigned int", ()),
+    "gfx_keys_ext": ("unsigned int", ()),
 }
 LIBRARY_FUNCTIONS = {**SCREEN_LIBRARY_FUNCTIONS, **GRAPHICS_LIBRARY_FUNCTIONS}
 LIBRARY_FILES = {
@@ -1469,6 +1470,16 @@ class _CodeGenerator:
         if expression.kind == "index":
             base, index = expression.children
             element_type = self._expression_type(expression)
+            if base.kind == "name" and _type_size(element_type) in (1, 2):
+                array = self._lookup(str(base.value), line)
+                if array.array_size:
+                    # Direct array element: base + index * size, no pointer spill.
+                    self._expression(index)
+                    if _type_size(element_type) == 2:
+                        self.emit("    ADD R0, R0")
+                    self._array_address(array, "R1", line)
+                    self.emit("    ADD R0, R1")
+                    return element_type
             self._expression(base)
             self.emit("    ADJSP -3")
             self.emit("    MOVSP R7")
@@ -1825,13 +1836,12 @@ class _CodeGenerator:
             self.emit(f"    {mnemonic} R0, R1")
         elif operator in ("*", "/", "%"):
             unsigned = result_type.startswith("unsigned")
-            helper = {
-                "*": "__runtime_mul",
-                "/": "__runtime_udiv" if unsigned else "__runtime_div",
-                "%": "__runtime_umod" if unsigned else "__runtime_mod",
+            mnemonic = {
+                "*": "MUL",
+                "/": "DIV" if unsigned else "DIVS",
+                "%": "MOD" if unsigned else "MODS",
             }[operator]
-            self.used_helpers.add(helper)
-            self.emit(f"    CALLX {helper}")
+            self.emit(f"    {mnemonic} R0, R1")
         else:
             raise self.error(line, f"unsupported binary operator {operator!r}")
 
@@ -1922,182 +1932,6 @@ class _CodeGenerator:
     def _generate_helper(self, helper: str) -> None:
         if helper in ("__runtime_shl", "__runtime_shr", "__runtime_sar"):
             self._generate_shift(helper)
-        elif helper == "__runtime_mul":
-            self._generate_multiply()
-        elif helper in ("__runtime_div", "__runtime_mod", "__runtime_udiv", "__runtime_umod"):
-            self._generate_divide(
-                modulo=helper.endswith("mod"),
-                signed=not helper.startswith("__runtime_u"),
-            )
-
-    def _generate_multiply(self) -> None:
-        self.emit("__runtime_mul:")
-        self.emit("    MOV R2, R0")
-        self.emit("    LDI R4, 0")
-        self.emit("    LDI R7, 0x8000")
-        self.emit("    AND R2, R7")
-        self.emit("    LDI R6, 0")
-        self.emit("    CMP R2, R6")
-        self.emit("    BZX __mul_left_positive")
-        self.emit("    LDI R5, 0")
-        self.emit("    SUB R5, R0")
-        self.emit("    LDI R7, 0xFFFF")
-        self.emit("    AND R5, R7")
-        self.emit("    MOV R0, R5")
-        self.emit("    LDI R5, 1")
-        self.emit("    XOR R4, R5")
-        self.emit("__mul_left_positive:")
-        self.emit("    MOV R2, R1")
-        self.emit("    LDI R7, 0x8000")
-        self.emit("    AND R2, R7")
-        self.emit("    LDI R6, 0")
-        self.emit("    CMP R2, R6")
-        self.emit("    BZX __mul_right_positive")
-        self.emit("    LDI R5, 0")
-        self.emit("    SUB R5, R1")
-        self.emit("    LDI R7, 0xFFFF")
-        self.emit("    AND R5, R7")
-        self.emit("    MOV R1, R5")
-        self.emit("    LDI R5, 1")
-        self.emit("    XOR R4, R5")
-        self.emit("__mul_right_positive:")
-        self.emit("    LDI R2, 0")
-        self.emit("    LDI R7, 0xFFFF")
-        self.emit("    LDI R6, 0")
-        self.emit("__mul_loop:")
-        self.emit("    MOV R3, R1")
-        self.emit("    LDI R5, 1")
-        self.emit("    AND R3, R5")
-        self.emit("    CMP R3, R6")
-        self.emit("    BZX __mul_skip_add")
-        self.emit("    ADD R2, R0")
-        self.emit("    AND R2, R7")
-        self.emit("__mul_skip_add:")
-        self.emit("    ADD R0, R0")
-        self.emit("    AND R0, R7")
-        self.emit("    SHR R1")
-        self.emit("    CMP R1, R6")
-        self.emit("    BZX __mul_done")
-        self.emit("    JMPX __mul_loop")
-        self.emit("__mul_done:")
-        self.emit("    LDI R5, 1")
-        self.emit("    AND R4, R5")
-        self.emit("    CMP R4, R6")
-        self.emit("    BZX __mul_positive")
-        self.emit("    LDI R5, 0")
-        self.emit("    SUB R5, R2")
-        self.emit("    AND R5, R7")
-        self.emit("    MOV R2, R5")
-        self.emit("__mul_positive:")
-        self.emit("    MOV R0, R2")
-        self.emit("    RET")
-
-    def _generate_divide(self, modulo: bool, signed: bool = True) -> None:
-        name = (
-            "__runtime_mod" if modulo else "__runtime_div"
-        ) if signed else (
-            "__runtime_umod" if modulo else "__runtime_udiv"
-        )
-        prefix = name
-        self.emit(f"{name}:")
-        self.emit("    MOV R3, R0")
-        self.emit("    MOV R4, R1")
-        self.emit("    LDI R5, 0")  # dividend sign for modulo, quotient sign for division
-        self.emit("    LDI R6, 0")  # divisor sign
-        if signed:
-            self.emit("    LDI R7, 0x8000")
-            self.emit("    MOV R2, R3")
-            self.emit("    AND R2, R7")
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R2, R1")
-            self.emit(f"    BZX {prefix}_dividend_positive")
-            self.emit("    LDI R1, 0")
-            self.emit("    SUB R1, R3")
-            self.emit("    LDI R7, 0xFFFF")
-            self.emit("    AND R1, R7")
-            self.emit("    MOV R3, R1")
-            self.emit("    LDI R5, 1")
-            self.emit(f"{prefix}_dividend_positive:")
-            self.emit("    LDI R7, 0x8000")
-            self.emit("    MOV R2, R4")
-            self.emit("    AND R2, R7")
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R2, R1")
-            self.emit(f"    BZX {prefix}_divisor_positive")
-            self.emit("    LDI R1, 0")
-            self.emit("    SUB R1, R4")
-            self.emit("    LDI R7, 0xFFFF")
-            self.emit("    AND R1, R7")
-            self.emit("    MOV R4, R1")
-            self.emit("    LDI R6, 1")
-            self.emit(f"{prefix}_divisor_positive:")
-            self.emit("    PUSH R5")
-            self.emit("    PUSH R6")
-        self.emit("    LDI R2, 0")
-        self.emit("    LDI R7, 0")
-        self.emit("    LDI R1, 16")
-        self.emit("    LDI R5, 0")
-        self.emit("    CMP R4, R5")
-        self.emit(f"    BZX {prefix}_divide_by_zero")
-        self.emit(f"{prefix}_loop:")
-        self.emit("    MOV R0, R3")
-        self.emit("    LDI R6, 0")
-        self.emit("    LDI_H R6, 0x80")
-        self.emit("    AND R0, R6")
-        self.emit("    CMP R0, R5")
-        self.emit(f"    BZX {prefix}_zero_bit")
-        self.emit("    ADD R3, R3")
-        self.emit("    LDI R6, 0xFF")
-        self.emit("    LDI_H R6, 0xFF")
-        self.emit("    AND R3, R6")
-        self.emit("    ADD R7, R7")
-        self.emit("    INC R7")
-        self.emit(f"    JMPX {prefix}_compare_remainder")
-        self.emit(f"{prefix}_zero_bit:")
-        self.emit("    ADD R3, R3")
-        self.emit("    LDI R6, 0xFF")
-        self.emit("    LDI_H R6, 0xFF")
-        self.emit("    AND R3, R6")
-        self.emit("    ADD R7, R7")
-        self.emit(f"{prefix}_compare_remainder:")
-        self.emit("    ADD R2, R2")
-        self.emit("    CMP R7, R4")
-        self.emit(f"    BCX {prefix}_next_bit")
-        self.emit("    SUB R7, R4")
-        self.emit("    INC R2")
-        self.emit(f"{prefix}_next_bit:")
-        self.emit("    DEC R1")
-        self.emit("    CMP R1, R5")
-        self.emit(f"    BZX {prefix}_finish")
-        self.emit(f"    JMPX {prefix}_loop")
-        self.emit(f"{prefix}_divide_by_zero:")
-        self.emit("    MOV R7, R3")
-        self.emit(f"    JMPX {prefix}_finish")
-        self.emit(f"{prefix}_finish:")
-        if modulo:
-            self.emit("    MOV R0, R7")
-            if signed:
-                self.emit("    POP R6")
-                self.emit("    POP R5")
-                self.emit("    LDI R1, 0")
-                self.emit("    CMP R5, R1")
-                self.emit(f"    BZX {prefix}_return")
-                self.emit("    LDI R1, 0")
-                self.emit("    SUB R1, R0")
-                self.emit("    MOV R0, R1")
-        else:
-            self.emit("    MOV R0, R2")
-            if signed:
-                self.emit("    POP R6")
-                self.emit("    POP R5")
-                self.emit("    LDI R1, 0")
-                self.emit("    CMP R5, R6")
-                self.emit(f"    BZX {prefix}_return")
-                self.emit("    LDI R1, 0")
-                self.emit("    SUB R1, R0")
-                self.emit("    MOV R0, R1")
-        self.emit(f"{prefix}_return:")
-        self.emit("    RET")
 
 
 def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:

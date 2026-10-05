@@ -60,6 +60,13 @@ jump_target:
     FCMP R2, R3
     ITOF R2
     FTOI R2
+    MUL R2, R3             ; Integer multiply/divide group (register or immediate source)
+    MULHU R2, R3
+    MULHS R2, R3
+    DIV R2, R3
+    DIVS R2, R3
+    MOD R2, 10
+    MODS R2, -10
     JMPX sample_routine    ; Far control-flow encodings; unreachable
     CALLX sample_routine
     BZX sample_routine

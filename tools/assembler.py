@@ -3,7 +3,13 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.isa import OPCODES, OP_LDI_H
+from src.isa import (
+    MULDIV_IMMEDIATE_FLAG,
+    MULDIV_OPERATIONS,
+    MULDIV_PREFIX,
+    OPCODES,
+    OP_LDI_H,
+)
 
 MEMORY_SIZE = 1 << 19
 
@@ -220,6 +226,10 @@ def _instruction_size(text: str, line_number: int) -> int:
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")
         return 6
+    if mnemonic in MULDIV_OPERATIONS:
+        if len(operands) != 2:
+            raise _error(line_number, f"{mnemonic} expects a register and a register or immediate")
+        return 6 if not re.fullmatch(r"R[0-7]", operands[1].strip(), re.IGNORECASE) else 4
     if mnemonic == "LDA":
         if len(operands) != 2:
             raise _error(line_number, "LDA expects a register and an address or label")
@@ -265,6 +275,18 @@ def _assemble_instruction(
         if not 0 <= target < MEMORY_SIZE:
             raise _error(line_number, f"{mnemonic} target is outside available memory")
         return [far_control[mnemonic], target & 0xFFFF, target >> 16]
+
+    if mnemonic in MULDIV_OPERATIONS:
+        require_count(2)
+        destination = _parse_register(operands[0], line_number)
+        first = (opcode << 11) | (destination << 8) | MULDIV_PREFIX
+        control = MULDIV_OPERATIONS[mnemonic] << 12
+        if re.fullmatch(r"R[0-7]", operands[1].strip(), re.IGNORECASE):
+            return [first, control | _parse_register(operands[1], line_number)]
+        value = _parse_number(operands[1], line_number)
+        if not -0x8000 <= value <= 0xFFFF:
+            raise _error(line_number, f"{mnemonic} immediate must fit in 16 bits")
+        return [first, control | MULDIV_IMMEDIATE_FLAG, value & 0xFFFF]
 
     extended = {
         "MOVSP": 0,

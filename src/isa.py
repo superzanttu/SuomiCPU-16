@@ -39,6 +39,22 @@ OP_FCMP = OP_SHR
 OP_ITOF = OP_SHR
 OP_FTOI = OP_SHR
 
+# Integer multiply/divide group: a 32-bit (or 48-bit with an immediate) instruction.
+#   word 1: 0xF800 | (Rd << 8) | 0x1E   (OP_SHR extension space, prefix 0x1E)
+#   word 2: (operation << 12) | (immediate flag << 11) | Rs
+#   word 3: 16-bit immediate, present only when the immediate flag is set
+MULDIV_PREFIX = 0x1E
+MULDIV_IMMEDIATE_FLAG = 0x0800
+MULDIV_OPERATIONS = {
+    "MUL": 0,    # Rd = low 16 bits of Rd * Rs; C = product did not fit in 16 bits
+    "MULHU": 1,  # Rd = high 16 bits of the unsigned product
+    "MULHS": 2,  # Rd = high 16 bits of the signed product
+    "DIV": 3,    # Rd = Rd / Rs, unsigned
+    "DIVS": 4,   # Rd = Rd / Rs, signed (truncates toward zero)
+    "MOD": 5,    # Rd = Rd % Rs, unsigned
+    "MODS": 6,   # Rd = Rd % Rs, signed (sign follows the dividend)
+}
+
 OPCODES = {
     "HALT": OP_HALT,
     "LDI": OP_LDI,
@@ -86,3 +102,4 @@ OPCODES = {
     "BZX": OP_SHR,
     "BCX": OP_SHR,
 }
+OPCODES.update({name: OP_SHR for name in MULDIV_OPERATIONS})

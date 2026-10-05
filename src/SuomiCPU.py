@@ -98,6 +98,10 @@ KEY_BITS = {
     pygame.K_LEFT: 1, pygame.K_a: 1, pygame.K_RIGHT: 2, pygame.K_d: 2,
     pygame.K_UP: 4, pygame.K_w: 4, pygame.K_DOWN: 8, pygame.K_s: 8,
     pygame.K_SPACE: 16, pygame.K_RETURN: 32, pygame.K_TAB: 64,
+    # Extended keys are reported in the byte after KEYS_ADDR (see gfx_keys_ext).
+    pygame.K_q: 0x100, pygame.K_e: 0x200,
+    pygame.K_LSHIFT: 0x400, pygame.K_RSHIFT: 0x400, pygame.K_x: 0x400,
+    pygame.K_LCTRL: 0x800, pygame.K_RCTRL: 0x800, pygame.K_z: 0x800,
 }
 
 def load_program_file(path: str | Path) -> AssemblyImage:
@@ -149,7 +153,7 @@ class SuomiCompute16:
         
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE))
-        pygame.display.set_caption("SC-16 Flash-Execution Emulator")
+        pygame.display.set_caption("SuomiCPU-16 Emulator")
         self.clock = pygame.time.Clock()
         self.palette = [pygame.Color(i, i, i) for i in range(256)]
         for index, color in enumerate(PALETTE_COLORS):
@@ -326,6 +330,50 @@ class SuomiCompute16:
         self.sp += 2
         return val
 
+    def _execute_muldiv(self, instr):
+        """Run the MUL/DIV/MOD group; `instr` is the 0xF81E prefix word."""
+        rd = (instr >> 8) & 0x7
+        control = self.read_16(self.pc)
+        self.pc += 2
+        if control & 0x0800:
+            right = self.read_16(self.pc)
+            self.pc += 2
+        else:
+            right = self.registers[control & 0x7]
+        left = self.registers[rd] & 0xFFFF
+        right &= 0xFFFF
+        signed_left = left - 0x10000 if left & 0x8000 else left
+        signed_right = right - 0x10000 if right & 0x8000 else right
+        operation = control >> 12
+        carry = 0
+        if operation == 0:
+            product = left * right
+            result = product & 0xFFFF
+            carry = int(product > 0xFFFF)
+        elif operation == 1:
+            result = (left * right) >> 16
+        elif operation == 2:
+            result = ((signed_left * signed_right) >> 16) & 0xFFFF
+        elif right == 0:
+            # Division by zero: quotient 0, remainder = dividend, C flag set.
+            result = left if operation in (5, 6) else 0
+            carry = 1
+        elif operation == 3:
+            result = left // right
+        elif operation == 5:
+            result = left % right
+        else:
+            quotient = abs(signed_left) // abs(signed_right)
+            if (signed_left < 0) != (signed_right < 0):
+                quotient = -quotient
+            if operation == 4:
+                result = quotient & 0xFFFF
+            else:
+                result = (signed_left - quotient * signed_right) & 0xFFFF
+        self.registers[rd] = result
+        self.flags['Z'] = int(result == 0)
+        self.flags['C'] = carry
+
     def step(self):
         if not self.running: return
         memory = self.memory
@@ -341,7 +389,9 @@ class SuomiCompute16:
         rs2 = (instr >> 2) & 0x7
         imm = instr & 0xFF
 
-        if instr >= 0xF800 and instr in (0xF81D, 0xF91D, 0xFA1D, 0xFB1D):
+        if (instr & 0xF8FF) == 0xF81E:
+            self._execute_muldiv(instr)
+        elif instr >= 0xF800 and instr in (0xF81D, 0xF91D, 0xFA1D, 0xFB1D):
             target = self.read_16(self.pc) | (self.read_16(self.pc + 2) << 16)
             self.pc += 4
             if instr == 0xF91D:
@@ -477,6 +527,14 @@ class SuomiCompute16:
                 break
             self.step()
 
+    def press_keys(self, mask):
+        self.write(KEYS_ADDR, self.read(KEYS_ADDR) | (mask & 0xFF))
+        self.write(KEYS_ADDR + 1, self.read(KEYS_ADDR + 1) | (mask >> 8))
+
+    def release_keys(self, mask):
+        self.write(KEYS_ADDR, self.read(KEYS_ADDR) & ~(mask & 0xFF))
+        self.write(KEYS_ADDR + 1, self.read(KEYS_ADDR + 1) & ~(mask >> 8))
+
     def reset(self):
         print("SC-16 starting...")
         self.registers = [0]*8
@@ -487,18 +545,26 @@ class SuomiCompute16:
     def run(self):
         self.reset()
         self.window_open = True
+        deferred_release = 0
         while self.window_open:
+            fresh_keys = 0
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.window_open = False
                 if event.type == pygame.KEYUP and event.key in KEY_BITS:
-                    self.write(KEYS_ADDR, self.read(KEYS_ADDR) & ~KEY_BITS[event.key])
+                    # A tap shorter than one frame stays visible for that frame.
+                    if KEY_BITS[event.key] & fresh_keys:
+                        deferred_release |= KEY_BITS[event.key]
+                    else:
+                        self.release_keys(KEY_BITS[event.key])
                 if event.type == pygame.KEYDOWN:
                     if not self.running:
                         self.window_open = False
                         continue
                     if event.key in KEY_BITS:
-                        self.write(KEYS_ADDR, self.read(KEYS_ADDR) | KEY_BITS[event.key])
+                        fresh_keys |= KEY_BITS[event.key]
+                        deferred_release &= ~KEY_BITS[event.key]
+                        self.press_keys(KEY_BITS[event.key])
                     if event.key == pygame.K_RETURN:
                         key = 13
                     elif event.key == pygame.K_BACKSPACE:
@@ -512,6 +578,9 @@ class SuomiCompute16:
                 break
             self.update_rtc()
             self.execute_frame()
+            if deferred_release:
+                self.release_keys(deferred_release)
+                deferred_release = 0
             self.update_display()
             self.clock.tick(DISPLAY_FPS)
 

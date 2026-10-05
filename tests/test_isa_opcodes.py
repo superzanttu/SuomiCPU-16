@@ -86,7 +86,8 @@ class OpcodeTableTests(unittest.TestCase):
         for mnemonic, opcode in expected.items():
             with self.subTest(mnemonic=mnemonic):
                 self.assertEqual(isa.OPCODES[mnemonic], opcode)
-        for mnemonic in ("MOVSP", "FADD", "FSUB", "FMUL", "FDIV", "FCMP", "ITOF", "FTOI"):
+        for mnemonic in ("MOVSP", "FADD", "FSUB", "FMUL", "FDIV", "FCMP", "ITOF", "FTOI",
+                         "MUL", "MULHU", "MULHS", "DIV", "DIVS", "MOD", "MODS"):
             self.assertEqual(isa.OPCODES[mnemonic], isa.OP_SHR)
 
 
@@ -678,6 +679,77 @@ class AssembledProgramTests(unittest.TestCase):
             """
         )
         self.assertEqual(cpu.registers[2], 9)
+
+class MulDivTests(unittest.TestCase):
+    def run_op(self, name, left, right, immediate=False):
+        source = f"LDI R1, {left}\n"
+        if immediate:
+            source += f"{name} R1, {right}\nHALT\n"
+        else:
+            source += f"LDI R2, {right}\n{name} R1, R2\nHALT\n"
+        cpu = make_cpu(b"")
+        image = assemble(source)
+        cpu.load_program(image)
+        cpu.pc = image.entry_point
+        for _ in range(10):
+            if not cpu.running:
+                break
+            cpu.step()
+        return cpu
+
+    def test_encoding(self):
+        self.assertEqual(encode("MUL R3, R5"), be(0xF800 | (3 << 8) | 0x1E, 0x0005))
+        self.assertEqual(encode("MODS R1, R0"), be(0xF800 | (1 << 8) | 0x1E, 0x6000))
+        self.assertEqual(encode("DIV R0, 1000"), be(0xF81E, 0x3800, 1000))
+        self.assertEqual(encode("MUL R0, -1"), be(0xF81E, 0x0800, 0xFFFF))
+
+    def test_operations(self):
+        def signed(v):
+            return v - 0x10000 if v & 0x8000 else v
+
+        cases = [(7, 6), (300, 500), (0xFFFF, 0xFFFF), (0x8000, 3), (65530, 7), (12345, 0), (1, 0xFFFF)]
+        for left, right in cases:
+            for immediate in (False, True):
+                with self.subTest(left=left, right=right, immediate=immediate):
+                    mul = self.run_op("MUL", left, right, immediate)
+                    self.assertEqual(mul.registers[1], (left * right) & 0xFFFF)
+                    self.assertEqual(mul.flags["C"], int(left * right > 0xFFFF))
+                    self.assertEqual(self.run_op("MULHU", left, right, immediate).registers[1], (left * right) >> 16)
+                    self.assertEqual(
+                        self.run_op("MULHS", left, right, immediate).registers[1],
+                        ((signed(left) * signed(right)) >> 16) & 0xFFFF,
+                    )
+                    div = self.run_op("DIV", left, right, immediate)
+                    mod = self.run_op("MOD", left, right, immediate)
+                    if right == 0:
+                        self.assertEqual((div.registers[1], div.flags["C"]), (0, 1))
+                        self.assertEqual(mod.registers[1], left)
+                    else:
+                        self.assertEqual(div.registers[1], left // right)
+                        self.assertEqual(mod.registers[1], left % right)
+                        self.assertEqual(div.flags["C"], 0)
+                    sl, sr = signed(left), signed(right)
+                    divs = self.run_op("DIVS", left, right, immediate)
+                    mods = self.run_op("MODS", left, right, immediate)
+                    if sr:
+                        quotient = abs(sl) // abs(sr) * (-1 if (sl < 0) != (sr < 0) else 1)
+                        self.assertEqual(divs.registers[1], quotient & 0xFFFF)
+                        self.assertEqual(mods.registers[1], (sl - quotient * sr) & 0xFFFF)
+
+    def test_zero_flag_and_register_pairs(self):
+        self.assertEqual(self.run_op("MUL", 0, 5).flags["Z"], 1)
+        self.assertEqual(self.run_op("MUL", 3, 5).flags["Z"], 0)
+        for rd in REGS:
+            for rs in REGS:
+                if rd == rs:
+                    continue
+                with self.subTest(rd=rd, rs=rs):
+                    cpu = make_cpu(be(0xF81E | (rd << 8), 0x3000 | rs))
+                    cpu.registers[rd] = 100
+                    cpu.registers[rs] = 7
+                    cpu.step()
+                    self.assertEqual(cpu.registers[rd], 14)
+                    self.assertEqual(cpu.pc, CODE + 4)
 
 
 if __name__ == "__main__":

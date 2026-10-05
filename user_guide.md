@@ -256,6 +256,32 @@ where needed to implement its 16-bit integer semantics.
 operand is less than the second. `AND`, `OR`, `XOR`, `NOT`, `INC`, and `DEC` do
 not update the flags in the current emulator.
 
+### Integer multiply and divide
+
+| Instruction | Syntax                         | Operation                                                                       |
+| ----------- | ------------------------------ | ------------------------------------------------------------------------------- |
+| `MUL`       | `MUL Rd, Rs` / `MUL Rd, imm`   | `Rd` = low 16 bits of `Rd * source`; `C` is set if the product exceeds 16 bits. |
+| `MULHU`     | `MULHU Rd, Rs` / `imm`         | `Rd` = high 16 bits of the unsigned 32-bit product.                             |
+| `MULHS`     | `MULHS Rd, Rs` / `imm`         | `Rd` = high 16 bits of the signed 32-bit product.                               |
+| `DIV`       | `DIV Rd, Rs` / `imm`           | `Rd = Rd / source`, unsigned.                                                   |
+| `DIVS`      | `DIVS Rd, Rs` / `imm`          | `Rd = Rd / source`, signed, truncating toward zero.                             |
+| `MOD`       | `MOD Rd, Rs` / `imm`           | `Rd = Rd % source`, unsigned.                                                   |
+| `MODS`      | `MODS Rd, Rs` / `imm`          | `Rd = Rd % source`, signed; the sign follows the dividend.                      |
+
+The source is a register (`R0`-`R7`) or a 16-bit immediate (decimal, `0x` hex,
+or negative). Operands are taken as 16-bit values and the result is always a
+clean 16-bit value. `Z` is set when the result is zero. Dividing by zero gives a
+quotient of `0` or a remainder equal to the dividend, and sets `C`; otherwise
+the division instructions clear `C`.
+
+Encoding: these share the `0x1F` opcode with the extension group. The first
+word is `0xF800 | (Rd << 8) | 0x1E`; the second word is
+`(operation << 12) | (immediate flag 0x0800) | Rs` with operations
+`MUL`=0, `MULHU`=1, `MULHS`=2, `DIV`=3, `DIVS`=4, `MOD`=5, `MODS`=6. With an
+immediate, a third word holds the 16-bit value. The register form is four
+bytes and the immediate form six bytes. The C compiler emits `MUL`, `DIV`/`DIVS`
+and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
+
 ### Branches
 
 | Instruction | Syntax                    | Operation                                               |
@@ -502,10 +528,12 @@ no flicker.
 | `void gfx_text(int x, int y, char *text, unsigned char color)`                          | 6x8-cell text from the 5x7 font; UTF-8 `??????` and `\n` supported.           |
 | `void gfx_present(void)`                                                                | Show the back buffer and wait for the next frame.                             |
 | `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                             |
+| `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.   |
 | `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                          |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
-left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab.
+left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
+(`0x43005`, `gfx_keys_ext()`, constants `KEYX_*`) holds bit 0 Q, 1 E, 2 X/Shift, 3 Z/Ctrl.
 
 Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 `+0` CMD (writing it runs the command), `+1` COLOR, `+2` X, `+4` Y, `+6` W,
@@ -554,12 +582,17 @@ instructions per frame.
   recursive calls, local variables, arithmetic, and a `for` loop.
 - [`examples/anaclock.c`](examples/anaclock.c) displays the emulator RTC as a
   live clock with five classic analog faces, a Nixie-tube simulation, and a
-  split-flap flip clock. Press Tab to cycle through the seven faces. Run it with
+  split-flap flip clock. Each analog face has its own hand design, Nixie digits
+  dim and re-ignite when they change, and flip cards animate each change.
+  Press Tab to cycle through the seven faces. Run it with
   `python main.py examples/anaclock.c`.
 - [`examples/elitedemo.c`](examples/elitedemo.c) is a first-person Elite-style
-  space combat demo with perspective hazards, enemy fighters, regenerating
-  shields, and a heat-limited laser. Use Left/Right to turn, Up/Down to adjust
-  throttle, and Space to fire. The ship accelerates and drifts with inertia.
+  space-combat prototype around a planet with two orbiting moons, drifting
+  asteroids and patrolling enemy fighters that dogfight and shoot back. Flight is
+  Newtonian-inspired: the ship keeps its velocity when it turns. Arrows pitch/yaw
+  (Up = nose up), Q/E roll, X or Shift thrust, Z or Ctrl reverse, Space fires a
+  heat-limited laser. It has regenerating shields, a hull, collisions with every
+  body, a 3D radar and a HUD. It needs roughly 100,000 instructions per frame.
   Run it with `python main.py examples/elitedemo.c`.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.

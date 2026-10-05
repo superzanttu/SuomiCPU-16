@@ -53,6 +53,12 @@ class DisplayTests(unittest.TestCase):
             (255, 255, 255),
         )
 
+    def test_extended_keys_use_second_key_byte(self):
+        self.assertEqual(KEY_BITS[pygame.K_q], 0x100)
+        self.assertEqual(KEY_BITS[pygame.K_e], 0x200)
+        self.assertEqual(KEY_BITS[pygame.K_x], 0x400)
+        self.assertEqual(KEY_BITS[pygame.K_z], 0x800)
+
     def test_halt_keeps_display_open_until_keypress(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.clock = Mock()
