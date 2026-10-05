@@ -6,6 +6,7 @@ import argparse
 import array
 import struct
 import random
+import os
 from pathlib import Path
 
 # Tuomme tarvittavat asiat työkaluista
@@ -131,6 +132,23 @@ def load_program_file(path: str | Path) -> AssemblyImage:
             raise ValueError("Ohjelma on liian suuri muistiin")
         return AssemblyImage((MemorySegment(0, binary),), 0)
     return assemble_file(program_path)
+
+_JIT = False  # False = not tried yet, None = unavailable
+
+def _load_jit():
+    """Import the optional Numba CPU core once; returns None if numba is missing or disabled
+    (set SC16_NOJIT=1 to force the pure-Python core)."""
+    global _JIT
+    if _JIT is False:
+        _JIT = None
+        if not os.environ.get("SC16_NOJIT"):
+            try:
+                import sc16_jit
+                if sc16_jit.CONSTANTS == (MEM_MASK, GPU_BASE, ICR_ADDR):
+                    _JIT = sc16_jit
+            except Exception:
+                _JIT = None
+    return _JIT
 
 class SuomiCompute16:
     """Tämä on itse tietokoneen sydän (emulaattori)."""
@@ -883,14 +901,55 @@ class SuomiCompute16:
         self.screen.blit(pygame.transform.scale(self.vram_surface.convert(self.screen), self.screen.get_size()), (0, 0))
         pygame.display.flip()
 
+    def _max_speed(self):
+        memory = getattr(self, 'memory', None)
+        return bool(memory and memory[SPEED_ADDR])
+
     def execute_frame(self):
         self.frame_yield = False
         self.frames = (getattr(self, 'frames', 0) + 1) & 0xFFFF
         budget = MAX_SPEED_INSTRUCTIONS if self.memory[SPEED_ADDR] else INSTRUCTIONS_PER_FRAME
+        if getattr(self, 'use_jit', True) and _load_jit() is not None:
+            self._execute_jit(budget)
+            return
         for _ in range(budget):
             if not self.running or self.frame_yield:
                 break
             self.step()
+
+    def _execute_jit(self, budget):
+        """Run `budget` instructions with the compiled core (sc16_jit). Instructions the core
+        cannot handle (graphics register writes, HALT, float ops) are run by step(), and
+        pending interrupts are dispatched here, so the result is identical to step()-ing."""
+        import numpy as np
+        run_block = _load_jit().run_block
+        regs = np.array(self.registers, dtype=np.int64)
+        st = np.zeros(6, dtype=np.int64)
+        flags = self.flags
+        remaining = budget
+        while remaining > 0 and self.running and not self.frame_yield:
+            st[0] = self.pc
+            st[1] = self.sp
+            st[2] = flags['Z']
+            st[3] = flags['C']
+            st[4] = flags.get('N', 0)
+            st[5] = flags.get('V', 0)
+            regs[:] = self.registers
+            memory = np.frombuffer(self.memory, dtype=np.uint8)
+            count, status = run_block(memory, regs, st, remaining)
+            del memory
+            self.registers[:] = regs.tolist()
+            self.pc = int(st[0])
+            self.sp = int(st[1])
+            flags['Z'], flags['C'], flags['N'], flags['V'] = (int(x) for x in st[2:6])
+            remaining -= count
+            if status == 0:
+                break
+            if status == 2:
+                self.check_interrupts()
+            else:
+                self.step()
+                remaining -= 1
 
     # Mouse button bits: held (MOUSE_ADDR+4) bit0 left, bit1 right.
     # Events (MOUSE_ADDR+5), valid for one frame: bit0/1 left/right press, bit2/3 left/right double click,
@@ -983,16 +1042,16 @@ class SuomiCompute16:
                 break
             self.begin_mouse_frame()
             self.update_rtc()
-            was_turbo = self.memory[SPEED_ADDR]
+            was_turbo = self._max_speed()
             self.execute_frame()
             self.end_mouse_frame()
             if deferred_release:
                 self.release_keys(deferred_release)
                 deferred_release = 0
             turbo_frames += 1
-            if not (self.memory[SPEED_ADDR] and was_turbo) or turbo_frames % 32 == 0:
+            if not (was_turbo and self._max_speed()) or turbo_frames % 32 == 0:
                 self.update_display()
-            if not self.memory[SPEED_ADDR]:
+            if not self._max_speed():
                 self.clock.tick(DISPLAY_FPS)
 
 def main():

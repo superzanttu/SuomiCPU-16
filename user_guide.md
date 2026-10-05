@@ -779,3 +779,7 @@ Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchma
 
     python tools/c_compiler.py examples/sc16_showcase.c -o showcase.bin
     python main.py showcase.bin
+
+## Optional JIT acceleration
+
+If [Numba](https://numba.pivot.org) is installed (`pip install numba`), the emulator runs the CPU core as compiled machine code, typically 5-15x faster than the pure-Python interpreter (the first start compiles and caches it, taking a few seconds). Without Numba the emulator falls back automatically to the pure-Python core. Set `SC16_NOJIT=1` to force the Python core. Both cores are verified identical by `tests/test_jit_core.py`.

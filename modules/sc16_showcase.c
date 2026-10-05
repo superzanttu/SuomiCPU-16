@@ -791,10 +791,14 @@ void bench_max(void)
     int j;
     int ops;
     int secs;
+    int last;
+    unsigned int ksum;
     ops = bench_ops(0);
     blocks = 0;
     acc = 0;
     k = 0;
+    ksum = 0;
+    last = 0;
     gfx_speed(1);
     s0 = gfx_rtc(0);
     while (gfx_rtc(0) == s0)
@@ -821,9 +825,16 @@ void bench_max(void)
             s = s + 60;
         }
         secs = s - s0;
+        if (secs != last)
+        {
+            /* fold each finished second in separately so 16-bit counters cannot overflow */
+            ksum = ksum + k / CMP_SECS;
+            k = 0;
+            last = secs;
+        }
     }
     gfx_speed(0);
-    bench_kops[0] = k / secs;
+    bench_kops[0] = ksum;
 }
 char *bench_name(int test)
 {
@@ -1021,7 +1032,7 @@ void page_compare(void)
     sc = mach_tenths[SC16_ROW];
     if (cmp_state == 2 || bench_state == 2)
     {
-        sc = (bench_kops[0] * INSTR_PER_ITER) / 100;
+        sc = (bench_kops[0] / 25) * 4 + ((bench_kops[0] % 25) * 4) / 25;
     }
     gfx_text(8, 20, "SPEED IN MIPS (MILLION INSTRUCTIONS/S)", YELLOW);
     for (i = 0; i < NMACH; i++)
