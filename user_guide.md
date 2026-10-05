@@ -1,0 +1,620 @@
+# SC-8 Assembler and Emulator User Guide
+
+## 1. Overview
+
+SuomiCPU is a Python emulator for the SC-8, a small, byte-addressed machine with
+eight general-purpose registers and a 16-bit instruction format. Assembly source
+files use the `.asm` extension. The assembler converts instructions to machine
+code and places instructions or data at the addresses specified in the source.
+
+The emulator has no BIOS. On reset, it starts executing at the assembly image's
+entry point. The first instruction in the source determines that entry point,
+regardless of the numeric order of the image's memory segments.
+
+## 2. Running the emulator
+
+Run an assembly file from the project directory:
+
+```console
+python SuomiCPU.py example.asm
+```
+
+Additional examples are in [`examples/commands.asm`](examples/commands.asm)
+and [`examples/directives.asm`](examples/directives.asm):
+
+```console
+python SuomiCPU.py examples/commands.asm
+python SuomiCPU.py examples/directives.asm
+```
+
+Compile and immediately run a C source file, or create a flat binary image:
+
+```console
+python SuomiCPU.py examples/factorial.c
+python c_compiler.py examples/factorial.c
+python c_compiler.py examples/factorial.c -S -o examples/factorial.asm
+python SuomiCPU.py examples/factorial.bin
+```
+
+The compiler defaults to an output file with the input name and a `.bin`
+extension. `-S` emits readable SC-8 assembly instead. The emulator accepts
+`.asm`, `.c`, and flat `.bin` inputs.
+
+The input file argument is optional. Without a file, the emulator starts at
+address `0`; the zero-filled memory there decodes as `HALT`. The emulator uses
+Pygame for its window, display, and keyboard input.
+
+## 3. Assembly source syntax
+
+- Mnemonics and directives are case-insensitive. Register names are `R0` through
+  `R7`.
+- Labels start with a letter or underscore and may then contain letters, digits,
+  and underscores. Labels are case-sensitive and end in a colon:
+
+  ```asm
+  loop:
+      INC R0
+      JMP loop
+  ```
+
+- A label can share a line with an instruction or directive:
+
+  ```asm
+  message: .data string "Hello"
+  ```
+
+- `;` and `#` start comments outside quoted strings.
+- Numeric instruction operands use Python-style integer prefixes: decimal
+  (`25`), hexadecimal (`0x19`), octal (`0o31`), or binary (`0b11001`).
+- There is no implicit `CALL`, `RET`, `NOP`, expression evaluation, or data
+  alignment directive. Every instruction has a two-byte encoding, except a
+  wide `LDI`, which expands to two instructions.
+
+## 4. Directives
+
+### `.address`
+
+Set the current **byte address** for subsequent instructions, data, and labels:
+
+```asm
+.address 0x0100
+entry:
+    LDI R0, 25
+    HALT
+
+.address 0x0200
+scratch:
+    .data hex 00, 00, 00
+```
+
+Use as many `.address` directives as needed. Each takes one numeric address;
+labels are not accepted as `.address` arguments. Moving the address does not
+emit bytes. Sections need not be written in address order. The assembler returns
+separate memory segments for disjoint ranges and rejects overlapping output.
+
+Valid addresses are `0` through `0x7FFFF`, the emulator's 512 KiB memory range.
+The entry point is the address of the first instruction encountered in source
+order. If there are no instructions, it is the first emitted data address; if
+the source emits nothing, it is the initial address `0`.
+
+### `.data`
+
+Emit one or more bytes at the current address. Each numeric value must fit in a
+byte (`0x00` through `0xFF`). Values can be separated by spaces or commas.
+
+#### Hexadecimal
+
+The `hex` format treats unprefixed tokens as hexadecimal. An optional `0x`
+prefix is allowed:
+
+```asm
+.data hex 53, 0x43, FF
+```
+
+This emits bytes `0x53`, `0x43`, and `0xFF`.
+
+#### Octal
+
+The `oct` format treats unprefixed tokens as octal. An optional `0o` prefix is
+allowed:
+
+```asm
+.data oct 123, 0o377
+```
+
+This emits bytes `0x53` and `0xFF`.
+
+#### Binary
+
+The `bin` format treats unprefixed tokens as binary. An optional `0b` prefix is
+allowed:
+
+```asm
+.data bin 01010011, 0b01000011
+```
+
+This emits bytes `0x53` and `0x43`.
+
+#### Strings
+
+The `string` format accepts one or more quoted strings. Strings are encoded as
+UTF-8 and emitted exactly as given; no null terminator is added. Python-style
+quoted escapes such as `\n` and `\t` are interpreted:
+
+```asm
+.data string "Hello", " world!\n"
+```
+
+This emits the UTF-8 bytes of `Hello world!` followed by a newline byte.
+
+### `.include`
+
+Insert another assembler source file at the current point:
+
+```asm
+.include "fonts/font5x7.asm"
+```
+
+The path is relative to the file containing the `.include`, so the same include
+works when the top-level source is assembled from another working directory.
+Included sources are assembled inline: their `.address` directives change the
+current address, and their labels share the global label namespace with the
+including source. Nested includes are supported. Circular includes, missing
+files, and invalid paths are reported as assembly errors. Use unique labels in
+shared include files; including a file twice that defines the same label
+produces a duplicate-label error.
+
+## 5. Instruction reference
+
+All instructions occupy one 16-bit word (two bytes), stored most-significant
+byte first. Registers are selected from `R0` through `R7`. Unless stated
+otherwise, instructions do not change the condition flags.
+
+### Program and immediate instructions
+
+| Instruction | Syntax | Operation |
+|---|---|---|
+| `HALT` | `HALT` | Stop execution. |
+| `LDI` | `LDI Rd, value` | Load an immediate value into `Rd`. Values from `0` to `255` use one word. Values from `256` to `65535` expand to `LDI` (low byte) followed by `LDI_H` (high byte). |
+| `LDI_H` | `LDI_H Rd, high_byte` | Replace the high byte of `Rd`, preserving its low byte. `high_byte` must be `0` to `255`. |
+
+For example:
+
+```asm
+LDI R0, 0x34
+LDI_H R0, 0x12       ; R0 becomes 0x1234
+; Equivalent one-line pseudo-instruction:
+LDI R1, 0x1234
+```
+
+The assembler accepts `LDI R1, 0x1234` as a pseudo-instruction and emits the
+same pair of machine instructions.
+
+### Memory and register instructions
+
+| Instruction | Syntax | Operation |
+|---|---|---|
+| `LD` | `LD Rd, Ra` | Load one byte from the address in `Ra` into `Rd`. |
+| `ST` | `ST Ra, Rs` | Store the low byte of `Rs` at the address in `Ra`. |
+| `LDW` | `LDW Rd, Ra` | Load a big-endian 16-bit word from the address in `Ra`. |
+| `STW` | `STW Ra, Rs` | Store a big-endian 16-bit word from `Rs` at the address in `Ra`. |
+| `LDWS` | `LDWS Rd, offset` | Load a word from `SP + offset`; offset is 0-255. |
+| `STWS` | `STWS Rs, offset` | Store a word at `SP + offset`; offset is 0-255. |
+| `MOV` | `MOV Rd, Rs` | Copy the register value from `Rs` to `Rd`. |
+
+Example:
+
+```asm
+LDI R0, 0x2000
+LDI R1, 0x2A
+ST R0, R1
+LD R2, R0
+MOV R3, R2
+```
+
+`LD` and `ST` access byte-sized memory. `ST`'s first operand is the address
+register; its second operand is the value register.
+
+### Arithmetic and logic
+
+| Instruction | Syntax | Operation |
+|---|---|---|
+| `ADD` | `ADD Rd, Rs` | `Rd = Rd + Rs`; sets `Z` and `C`. |
+| `SUB` | `SUB Rd, Rs` | `Rd = Rd - Rs`; sets `Z` and `C`. |
+| `AND` | `AND Rd, Rs` | `Rd = Rd & Rs`. |
+| `OR` | `OR Rd, Rs` | `Rd = Rd \| Rs`. |
+| `XOR` | `XOR Rd, Rs` | `Rd = Rd ^ Rs`. |
+| `NOT` | `NOT Rd` or `NOT Rd, Rs` | `Rd = ~Rd` or `Rd = ~Rs`, limited to the low eight bits. |
+| `INC` | `INC Rd` | Increment `Rd` by one. |
+| `DEC` | `DEC Rd` | Decrement `Rd` by one. |
+| `CMP` | `CMP Ra, Rb` | Set `Z` and `C` as if subtracting `Rb` from `Ra`, without storing the result. |
+| `SHR` | `SHR Rd` | Logical right shift of the low 16 bits of `Rd` by one. |
+
+For two-register arithmetic/logical operations the first operand is also the
+destination. `CMP` uses its two operands only as inputs.
+
+The original byte-oriented instructions retain their existing behavior:
+register values are Python integers, `LDI` may load up to 16 bits, arithmetic
+does not automatically mask its result, and byte stores and `POP` retain only a
+byte. `SHR` explicitly operates on a 16-bit word. The C compiler emits masks
+where needed to implement its 16-bit integer semantics.
+
+`ADD` sets `Z` when its result is zero and `C` when the result exceeds `255`.
+`SUB` sets `Z` when its result is zero and `C` when the result is negative
+(borrow). `CMP` sets `Z` when the operands are equal and `C` when the first
+operand is less than the second. `AND`, `OR`, `XOR`, `NOT`, `INC`, and `DEC` do
+not update the flags in the current emulator.
+
+### Branches
+
+| Instruction | Syntax | Operation |
+|---|---|---|
+| `JMP` | `JMP address_or_label` | Unconditionally set the PC to an absolute byte address. |
+| `JZ` | `JZ Rn, address_or_label` | Jump to an absolute byte address if `Rn` is zero. |
+| `BZ` | `BZ address_or_label` | Jump if the `Z` condition flag is set. |
+| `BC` | `BC address_or_label` | Jump if the `C` condition flag is set. |
+| `CALL` | `CALL address_or_label` | Push the return PC and call an absolute byte address. |
+| `JMPX` | `JMPX address_or_label` | Unconditionally jump to a full 19-bit byte address. |
+| `BZX` | `BZX address_or_label` | Jump to a full 19-bit address if `Z` is set. |
+| `BCX` | `BCX address_or_label` | Jump to a full 19-bit address if `C` is set. |
+| `CALLX` | `CALLX address_or_label` | Call a full 19-bit byte address. |
+| `RET` | `RET` | Pop the return PC from the stack. |
+
+Example:
+
+```asm
+    LDI R0, 0
+    JZ R0, is_zero
+    JMP finished
+is_zero:
+    LDI R1, 1
+finished:
+    HALT
+```
+
+`JMP`, `BZ`, `BC`, and `CALL` encode an 11-bit address (`0` to `0x7FF`); `JZ`
+encodes an 8-bit target (`0` to `0xFF`). These are absolute **byte** addresses,
+not instruction indexes or offsets. `JZ` tests the named register directly; it
+does not test the `Z` flag. `BZ` and `BC` test the `Z` and `C` flags,
+respectively, commonly after `SUB` or `CMP`.
+`JMPX`, `BZX`, `BCX`, and `CALLX` use six bytes and encode a full 19-bit address;
+use them when code or routines are outside the short-address range.
+
+### Stack and interrupt instructions
+
+| Instruction | Syntax | Operation |
+|---|---|---|
+| `PUSH` | `PUSH Rd` | Push a 16-bit register value to the stack. |
+| `POP` | `POP Rd` | Pop a value from the stack into `Rd`; the register is masked to one byte. |
+| `EI` | `EI` | Set the interrupt-enable bit in the interrupt control register. |
+| `DI` | `DI` | Clear the interrupt-enable bit. |
+| `RTI` | `RTI` | Restore `Z` and the PC from the interrupt stack frame. |
+| `ADJSP` | `ADJSP signed_byte` | Add a signed -128 to 127 byte adjustment to the stack pointer. |
+
+The stack pointer starts at `0x2FFFF`. `PUSH` decrements the pointer by two and
+stores a big-endian word; `POP` reads that word and advances the pointer by two.
+`CALL`/`RET` use the same stack. The `POP` instruction loads only the low byte
+into a general-purpose register, whereas `RET` and `RTI` use the full popped
+word. `LDW`/`STW` use big-endian byte order. `LDWS`/`STWS` address words from
+the current stack pointer; `ADJSP` reserves or releases a small stack region.
+Interrupt handling attempts to save the PC and `Z` flag, but not `C`.
+The interrupt vectors are two-byte absolute addresses stored at `0x0002`
+(keyboard) and `0x0004` (RTC).
+
+Example vector setup:
+
+```asm
+.address 0x0002
+.data hex 00, 70
+.address 0x0004
+.data hex 00, 70
+.address 0x0070
+interrupt_handler:
+    RTI
+```
+
+Interrupt input and timing are emulator-specific. The emulated RTC sets its
+interrupt-pending bit on each display-loop update, and the emulator checks
+interrupts after each instruction. Set up vectors and an `RTI` handler before
+enabling interrupts.
+
+## 6. Instruction encoding and execution
+
+- Memory is byte-addressed. The PC points to a byte address and advances by two
+  for each 16-bit instruction.
+- The instruction word has a five-bit opcode in bits 15-11. Other bits hold a
+  destination register, source registers, or an immediate/address field,
+  depending on the instruction.
+- Instruction words are stored big-endian: the high byte is at the instruction
+  address and the low byte is at the next address.
+- The assembler's `.data` directives emit literal bytes and do not apply
+  instruction endianness or alignment.
+- There is no ROM protection: assembled segments are copied into the same
+  writable memory used by the CPU.
+
+## 7. Emulator memory and devices
+
+The backing memory is `2**19` bytes (`0x80000`, or 512 KiB). CPU read/write
+addresses are masked with `0x7FFFF`, so out-of-range accesses wrap into that
+memory. Program-image loading is stricter and rejects segments that extend past
+the end of the backing memory.
+
+The emulator declares these addresses, which now map to distinct backing
+memory ranges:
+
+| Name | Address range | Size |
+|---|---:|---:|
+| Flash | `0x00000`-`0x1FFFF` | 128 KiB |
+| RAM and stack | `0x20000`-`0x2FFFF` | 64 KiB |
+| VRAM | `0x30000`-`0x42BFF` | 76,800 bytes |
+| Keyboard | `0x43000` | 1 byte |
+| Held-key bitmask | `0x43004` | 1 byte |
+| Interrupt control (`ICR`) | `0x43002` | 1 byte |
+| RTC seconds/minutes/hours | `0x43010`-`0x43012` | 3 bytes |
+| Graphics coprocessor registers | `0x43020`-`0x4302E` | 15 bytes |
+| Back buffer (coprocessor drawing target) | `0x44000`-`0x56BFF` | 76,800 bytes |
+
+The display is 320 by 240 pixels. Each VRAM byte indexes a 256-entry palette:
+entries 0-11 are named colors (0 black, 1 white, 2 red, 3 green, 4 blue,
+5 yellow, 6 cyan, 7 magenta, 8 orange, 9 gray, 10 dark gray, 11 dark red), 25 is
+pure blue, and the rest are grayscale. VRAM is a live view of CPU memory, so byte writes starting at
+`0x30000 + y * 320 + x` change the pixel at `(x, y)` and are shown at the next
+display refresh. The emulator renders the indexed framebuffer directly rather
+than converting every pixel in Python. It executes up to 30,000 instructions per
+display frame (capped at 60 frames per second), so long drawing routines can
+finish without requiring a separate screen update for every CPU instruction.
+When the CPU halts, the window remains open with the final frame displayed;
+press any key to close it, or close the window using its title-bar control.
+Keyboard key presses write the character byte to the keyboard address and mark
+a keyboard interrupt pending. The RTC writes seconds, minutes, and hours to its
+three declared byte addresses.
+
+## 8. Bitmap font
+
+[`fonts/font5x7.asm`](fonts/font5x7.asm) contains an original 5x7 bitmap font
+for every printable ASCII character (`0x20`-`0x7E`) plus `ÃƒÆ’Ã‚Â¶ÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¥ÃƒÆ’Ã¢â‚¬â€œÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Â¦`. Include it
+with:
+
+```asm
+.include "fonts/font5x7.asm"
+```
+
+It places `font5x7` at `0x4400`, clear of the graphics mask table and scratch
+memory. The 95 ASCII glyphs are ordered by character
+code, starting with space. The six Finnish letters follow in the order
+`ÃƒÆ’Ã‚Â¶`, `ÃƒÆ’Ã‚Â¤`, `ÃƒÆ’Ã‚Â¥`, `ÃƒÆ’Ã¢â‚¬â€œ`, `ÃƒÆ’Ã¢â‚¬Å¾`, `ÃƒÆ’Ã¢â‚¬Â¦`. Each glyph occupies eight bytes, so ASCII glyph
+index `character_code - 0x20` starts at `0x4400 + index * 8`; the Finnish
+glyphs have indexes 95-100. Each byte describes one horizontal row:
+bits 7 through 3 are the five visible pixels (left to right), bit 2 is the
+blank sixth column, and bits 1 and 0 are unused. The eighth row is blank. Thus,
+the glyph bitmap is 5x7 inside a 6x8 cell. For `GFX_TEXT`, glyph ID is the ASCII
+code minus 31 (`1` for space, `95` for `~`), and IDs 96-101 select the Finnish
+letters in the order above; `0` terminates the text. `SCREEN_PRINT` accepts
+ordinary ASCII and UTF-8 strings containing those Finnish letters. The reusable
+graphics include provides a renderer that uses this table and a small mask
+table to unpack the pixels.
+
+## 9. Minimal C89 compiler
+
+[`c_compiler.py`](c_compiler.py) implements a small, dependency-free C89 subset
+compiler; it is not a complete C89 implementation. Supported types are signed
+`int`, `unsigned int`, `char`, `unsigned char`, `float`, `void`, pointers to
+supported object types, and fixed-size arrays. It accepts global and local
+variables, function prototypes and definitions, recursion, calls, and C89-style
+declarations at the start of each block.
+
+Supported statements are blocks, expression statements, `if`/`else`, `while`,
+`do`/`while`, `for`, `switch`, `break`, `continue`, and `return`. `switch`
+accepts constant `case` labels and one optional `default`; cases fall through
+until a `break`. Expressions include numeric and character constants, string
+literals, scalar and pointer assignment, compound assignment,
+prefix/postfix increment and decrement, unary `+`, `-`, `!`, `~`, arithmetic
+`+`, `-`, `*`, `/`, `%`, bitwise `&`, `|`, `^`, comparisons, and short-circuit
+`&&` and `||`.
+
+Integer and pointer details:
+
+- `int` and `unsigned int` are 16-bit values. Arithmetic wraps modulo 65536;
+  signed comparisons and division apply to `int`, unsigned comparisons and
+  division apply to `unsigned int`. Signed division truncates toward zero and
+  signed remainder has the dividend's sign.
+- `char` array elements and string data occupy one byte. Integer and floating
+  objects occupy two bytes. Floating-point values use IEEE-754 binary16.
+- Pointers occupy three bytes, matching the CPU's 19-bit address space.
+  Pointer arithmetic and array indexing scale by the element size.
+- Global storage begins at `0xE800` (`GLOBAL_BASE` in `c_compiler.py`); uninitialized globals are zeroed. Local
+  variables, arguments, return addresses, and temporaries use the machine stack.
+
+The subset excludes storage-class and type qualifiers, structures, unions,
+enums, `typedef`, function-like macros, `goto`, casts, and most of the C standard
+library. Global initializers must be constant expressions supported by the
+compiler.
+
+There is no `printf` or separate console device. When a screen routine is
+referenced, the compiler links [`lib_text.asm`](lib_text.asm), which uses
+[`fonts/font5x7.asm`](fonts/font5x7.asm) to provide a 53-column by 30-row text
+grid of 6x8 cells:
+
+| Routine | C signature | Behavior |
+|---|---|---|
+| `SCREEN_CLEAR` | `void SCREEN_CLEAR(void)` | Clear the display and reset the cursor to `(0, 0)`. |
+| `SCREEN_SET_CURSOR` | `void SCREEN_SET_CURSOR(unsigned char column, unsigned char row)` | Set the zero-based text cursor. |
+| `SCREEN_GET_CURSOR` | `int SCREEN_GET_CURSOR(void)` | Return `(row << 8) \| column`. |
+| `SCREEN_PUTCHAR` | `void SCREEN_PUTCHAR(char ch, unsigned char color)` | Draw one character; newline/carriage return advance to the next row. |
+| `SCREEN_PRINT` | `void SCREEN_PRINT(char *text, unsigned char color)` | Print a zero-terminated string. |
+| `SCREEN_INPUT` | `unsigned int SCREEN_INPUT(char *buffer, unsigned int capacity, unsigned char color)` | Read and echo a line, NUL-terminate it, and return its character count. `capacity` is the maximum character count, so reserve at least `capacity + 1` bytes for the buffer. Enter finishes and Backspace edits. |
+
+Screen text input accepts printable ASCII and Latin-1 keys, echoes the entered
+glyphs, and uses Enter as the line terminator. The library reserves scratch bytes near `0x4300`;
+do not use that region for application data while a screen routine is running.
+See [`examples/text_demo.c`](examples/text_demo.c) for a C example.
+
+Generated C code uses the far control instructions (`JMPX`, `CALLX`, `BZX`,
+`BCX`). Address 0 holds a small entry stub (`JMP` to a boot routine at `0x0006` that runs `CALLX main; HALT`; `0x0002`-`0x0005` hold the interrupt vectors); compiled code
+starts at `0x4800` (above the font and library scratch memory) and must stay\nbelow `0xE800`, where globals begin (and below `0x10000`), because `CALLX` pushes a 16-bit return address. Libraries
+live below that: `lib_gfx` at `0x400`, `lib_text` at `0x700`, and `lib_cgfx`
+at `0x1000`. The compiler reports assembler errors when generated code or
+stack frames exceed supported limits. The command-line compiler writes a flat `.bin` image
+with address gaps zero-filled; the emulator loads it at address zero. In
+[`examples/factorial.c`](examples/factorial.c), the global `result` should
+contain 123 at `0xE800` after execution.
+
+### Preprocessor, shifts and arrays
+
+A minimal preprocessor handles object-like `#define NAME tokens` (replaced as
+tokens, may nest) and `#include "file"` or `#include <file>` (searched next to
+the source file, then next to the compiler). Function-like macros and other
+directives are errors. Binary `<<` and `>>` are supported: `>>` is arithmetic
+for `int` and logical for unsigned types. `x[i]++` and casts are not supported;
+write `x[i] = x[i] + 1`.
+
+### C graphics library (`gfx_*`)
+
+[`suomi_gfx.h`](suomi_gfx.h) declares the graphics builtins and defines color
+(`RED`, `GREEN`, ...), key (`KEY_LEFT`, `KEY_FIRE`, ...) and screen-size
+constants. Using any `gfx_*` function makes the compiler link
+[`lib_cgfx.asm`](lib_cgfx.asm), which drives the graphics coprocessor, plus the
+font. All drawing goes to an off-screen back buffer; `gfx_present()` copies it
+to VRAM in one step and ends the current emulator frame (vsync), so there is
+no flicker.
+
+| Function | Behavior |
+|---|---|
+| `void gfx_clear(unsigned char color)` | Fill the back buffer. |
+| `void gfx_pixel(int x, int y, unsigned char color)` | Plot one pixel. |
+| `void gfx_rect(int x, int y, int w, int h, unsigned char color)` | Filled rectangle. |
+| `void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)` | Line (clipped). |
+| `void gfx_poly(int x, int y, int n, char *pts, unsigned char color)` | Closed outline through `n` signed-byte `(dx, dy)` pairs relative to `(x, y)`. |
+| `void gfx_sprite(int x, int y, int w, int h, unsigned char *data)` | Draw `w*h` palette bytes; 0 is transparent. |
+| `void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char color)` | 1 bit per pixel, MSB first, `(w+7)/8` bytes per row. |
+| `void gfx_text(int x, int y, char *text, unsigned char color)` | 6x8-cell text from the 5x7 font; UTF-8 `??????` and `\n` supported. |
+| `void gfx_present(void)` | Show the back buffer and wait for the next frame. |
+| `unsigned int gfx_keys(void)` | Held-key bitmask. |
+| `unsigned int gfx_random(void)` | Random byte (0-255). |
+
+Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
+left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter.
+
+Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
+`+0` CMD (writing it runs the command), `+1` COLOR, `+2` X, `+4` Y, `+6` W,
+`+8` H, `+10` SRC word, `+12` SRC high byte, `+14` RESULT. Commands: 1 clear,
+2 pixel, 3 rect, 4 line (W,H are the end point), 5 sprite, 6 bitmap, 7 text
+(NUL-terminated string at SRC), 8 present, 9 random (to RESULT), 10 polygon
+(W is the point count). Assembly programs can use it directly.
+
+### Games
+
+[`examples/asteroids.c`](examples/asteroids.c) and
+[`examples/space_invaders.c`](examples/space_invaders.c) are complete playable
+games with score, lives and restart. Build and run:
+
+```
+python c_compiler.py examples/asteroids.c -o asteroids.bin
+python SuomiCPU.py asteroids.bin
+```
+
+Pac-Man (examples/pacman.c) is a 19x21-tile maze with four chasing ghosts, power pellets, a wrap-around tunnel, lives and levels; steer with the arrow keys or WASD.
+
+Controls: Left/Right (A/D) steer or move, Up (W) thrusts in Asteroids, Space
+fires, Enter or Space restarts after GAME OVER. Run time is roughly 15,000-25,000
+emulated instructions per game frame.
+
+## 10. Examples
+
+- [`example.asm`](example.asm) draws a letter `H` into the emulated display
+  memory.
+- [`examples/commands.asm`](examples/commands.asm) contains at least one
+  example of every supported instruction mnemonic. `EI`, `DI`, and `RTI` are
+  placed after `HALT` so they are assembled but not executed by this tour.
+- [`examples/directives.asm`](examples/directives.asm) demonstrates `.address`
+  and all `.data` formats across multiple memory locations.
+- [`examples/asteroids.asm`](examples/asteroids.asm) is a minimal Asteroids-like
+  demo with a horizontally controlled ship, a moving asteroid pixel, and a
+  fire marker.
+- [`examples/space_invaders.asm`](examples/space_invaders.asm) is a minimal
+  Space-Invaders-like demo with a horizontal ship, a fixed alien block, and a
+  fire marker.
+- [`examples/gfx_demo.asm`](examples/gfx_demo.asm) demonstrates plot, line,
+  rectangle, sprite, and text routines.
+- [`examples/factorial.c`](examples/factorial.c) demonstrates the C compiler,
+  recursive calls, local variables, arithmetic, and a `for` loop.
+- [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
+  cursor positioning, buffered keyboard input, and printing.
+
+Both game examples include the font table and graphics library. They are
+intentionally tiny assembly demos rather than full arcade implementations:
+the current instruction set has no multiplication, shifts, indirect branches,
+random number generator, or built-in graphics instructions. Their controls
+use `a`, `d`, and Space. The keyboard device retains the last key until the
+game clears it, so each key-down is treated as one action.
+
+These examples document the current assembler and emulator behavior. Register
+arithmetic is not strictly limited to eight bits, and the CPU's `LDI` pair loads
+16-bit values; these are implementation details rather than guarantees of a
+conventional 8-bit processor.
+
+## 11. Reusable graphics library
+
+[`lib_gfx.asm`](lib_gfx.asm) provides assembly-callable routines. Include it
+after the main code (its routines occupy addresses starting at `0x0400`):
+
+```asm
+.address 0x0100
+start:
+    LDI R0, 20
+    LDI R1, 20
+    LDI R2, 25
+    CALL GFX_PLOT
+    HALT
+.include "lib_gfx.asm"
+```
+
+`CALL`/`RET` and the full-width conditional branches support reusable routines.
+The graphics library calling conventions are:
+
+| Routine | Inputs | Effect |
+|---|---|---|
+| `GFX_PLOT` | `R0=x`, `R1=y`, `R2=color` | Write one palette index at a pixel. Preserves `R0`-`R3`; clobbers `R4`-`R7`. |
+| `GFX_CLEAR` | none | Clear all 320x240 pixels to color 0. Clobbers all registers. |
+| `GFX_HLINE` | `R0=x`, `R1=y`, `R2=length`, `R3=color` | Draw a horizontal line. Length must be 1-255. Clobbers `R0`, `R2`, and `R4`-`R7`. |
+| `GFX_RECT` | `R0=x`, `R1=y`, `R2=width`, `R3=height`, `R4=color` | Draw a filled rectangle. Width and height must be 1-255. Clobbers all registers. |
+| `GFX_SPRITE` | `R0=x`, `R1=y`, `R2=width`, `R3=height`, `R4=data address` | Draw row-major palette bytes; zero is transparent. Clobbers all registers. |
+| `GFX_TEXT` | `R0=x`, `R1=y`, `R2=text-data address`, `R3=color` | Draw 6x8 cells using the font include. Clobbers all registers. |
+
+Coordinates are pixels from the top-left. Drawing beyond the screen is not
+clipped. Pixel and sprite colors are palette indexes. A sprite is a sequence of
+`width * height` bytes; `.data hex` is suitable for small sprites. Text data
+consists of glyph IDs: printable ASCII uses its character code minus 31, IDs
+96-101 select `ÃƒÆ’Ã‚Â¶ÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¥ÃƒÆ’Ã¢â‚¬â€œÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Â¦`, and `0` terminates the text. `GFX_TEXT` accepts a full
+19-bit text pointer. Its x/y inputs are stored as bytes and therefore should be in the
+range 0-255. Its scratch bytes at `0x4300`-`0x4306` are reserved while it runs.
+Include the glyph data so it is loaded at `0x4400`; the mask table is supplied
+by `lib_gfx.asm` at `0x4200`.
+
+These routines are simple reference implementations rather than optimized
+renderers. In particular, `GFX_CLEAR`, `GFX_RECT`, `GFX_SPRITE`, and `GFX_TEXT`
+execute many instructions per pixel. Use them sparingly in timing-sensitive
+loops. Code, graphics scratch data, and the stack must not overlap.
+
+## SC-8 showcase and timing/interrupt additions
+
+GPU commands 11 and 12 (in addition to 1-10):
+
+| Cmd | Name  | Effect |
+|-----|-------|--------|
+| 11  | TICKS | Frame counter written big-endian to RESULT (+14/+15) |
+| 12  | RTC   | RTC register selected by COLOR (0 sec, 1 min, 2 hour) to RESULT (+14) |
+
+C builtins: `gfx_ticks()`, `gfx_rtc(field)`, `gfx_irq_init()` (executes EI),
+`gfx_irq_ticks()` (timer interrupt count, word at 0x4340) and
+`gfx_irq_keys()` (key interrupt count, word at 0x4342).
+
+Interrupt handlers live in `lib_cgfx.asm` at fixed addresses: `irq_timer` at
+0x0010 (vector 0x0004) and `irq_key` at 0x0030 (vector 0x0002). The C entry stub
+is `JMP __c_boot` at 0 with the boot code at 6. `RTI` restores both Z and C flags.
+C globals start at 0xE800.
+
+Run the showcase (8 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8):
+
+    python c_compiler.py examples/sc8_showcase.c -o showcase.bin
+    python SuomiCPU.py showcase.bin
