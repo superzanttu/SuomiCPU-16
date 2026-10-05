@@ -1,15 +1,21 @@
-// Asteroids for the SC-8.  Left/Right (or A/D) rotate, Up (or W) thrusts,
-// Space fires, Enter restarts after GAME OVER.
-// Positions are kept in 1/16 pixel units, so the 320x240 screen is 5120x3840.
+// Asteroids for the SC-8.
+// Controls:
+// - Left/Right (or A/D): Rotate ship
+// - Up (or W): Thrust forward
+// - Space: Fire bullet
+// - Enter: Restart after GAME OVER
+//
+// Positions are kept in 1/16 pixel units (fixed-point), 
+// so the 320x240 screen is mapped to 5120x3840.
 #include "suomi_gfx.h"
 
-// --- Constants ---
-#define MAXA 12
-#define MAXB 4
-#define WORLD_W 5120
-#define WORLD_H 3840
+/* --- Constants --- */
+#define MAXA 12         // Maximum number of asteroids
+#define MAXB 4          // Maximum number of bullets
+#define WORLD_W 5120    // Virtual world width (320 * 16)
+#define WORLD_H 3840    // Virtual world height (240 * 16)
 
-// Direction tables for 32-degree increments
+/* Direction tables for 32-degree increments (pre-calculated sine/cosine) */
 int dxT[32] = {
     0, 2, 3, 4, 6, 7, 7, 8, 8, 8, 7, 7, 6, 4, 3, 2,
     0, -2, -3, -4, -6, -7, -7, -8, -8, -8, -7, -7, -6, -4, -3, -2
@@ -19,48 +25,57 @@ int dyT[32] = {
     8, 8, 7, 7, 6, 4, 3, 2, 0, -2, -3, -4, -6, -7, -7, -8
 };
 
-// Asteroid shapes (8 points per size)
+/* Asteroid shapes (8 relative points per size) */
 char ast_shape[48] = {
     0, -6, 3, -3, 6, 0, 4, 4, 0, 6, -3, 3, -6, 0, -4, -4,
     0, -11, 6, -6, 11, 0, 7, 7, 0, 11, -6, 6, -11, 0, -7, -7,
     0, -18, 10, -10, 18, 0, 11, 11, 0, 18, -10, 10, -18, 0, -11, -11
 };
 
+/* Collision radius and score per asteroid size */
 int hitbox[4] = {0, 112, 192, 304};
 int points[4] = {0, 100, 50, 20};
 
-// --- Game State ---
-int ax[MAXA], ay[MAXA], avx[MAXA], avy[MAXA], asz[MAXA]; // Asteroids
-int bx[MAXB], by[MAXB], bvx[MAXB], bvy[MAXB], blife[MAXB]; // Bullets
+/* --- Game State --- */
+// Asteroids: position (x,y), velocity (vx,vy), and size
+int ax[MAXA], ay[MAXA], avx[MAXA], avy[MAXA], asz[MAXA]; 
+// Bullets: position (x,y), velocity (vx,vy), and lifetime
+int bx[MAXB], by[MAXB], bvx[MAXB], bvy[MAXB], blife[MAXB]; 
 
+// Player Ship: position, velocity, and angle
 int shipx, shipy, shipvx, shipvy, ang;
+// Game status and timers
 int invuln, cooldown, lives, level, frame, over, thrusting, wait;
 unsigned int score;
 
-// --- Utilities ---
+/* --- Utilities --- */
 int iabs(int v)
 {
     if (v < 0) return -v;
     return v;
 }
+/* Wraps X coordinate to fit within world boundaries */
 int wrapx(int v)
 {
     if (v < 0) return v + WORLD_W;
     if (v >= WORLD_W) return v - WORLD_W;
     return v;
 }
+/* Wraps Y coordinate to fit within world boundaries */
 int wrapy(int v)
 {
     if (v < 0) return v + WORLD_H;
     if (v >= WORLD_H) return v - WORLD_H;
     return v;
 }
+/* Clamps a value between -limit and limit */
 int clamp(int v, int limit)
 {
     if (v > limit) return limit;
     if (v < -limit) return -limit;
     return v;
 }
+/* Returns a random velocity for asteroids/debris */
 int random_speed(void)
 {
     int v = (gfx_random() & 15) - 8;
@@ -68,7 +83,8 @@ int random_speed(void)
     return v - 3;
 }
 
-// --- Game Logic ---
+/* --- Game Logic --- */
+/* Spawns an asteroid of a given size at (x,y) */
 void spawn(int size, int x, int y) {
     int i;
     for (i = 0; i < MAXA; i++) {
@@ -80,6 +96,7 @@ void spawn(int size, int x, int y) {
     }
 }
 
+/* Starts a new level by spawning asteroids */
 void start_level(void) {
     int count;
     int i;
@@ -91,10 +108,12 @@ void start_level(void) {
     }
 }
 
+/* Resets ship to center with temporary invulnerability */
 void respawn_ship(void) {
     shipx = 2560; shipy = 1920; shipvx = 0; shipvy = 0; ang = 0; invuln = 120;
 }
 
+/* Initializes game state for a new game */
 void new_game(void) {
     int i;
     for (i = 0; i < MAXA; i++) asz[i] = 0;
@@ -104,6 +123,7 @@ void new_game(void) {
     start_level();
 }
 
+/* Fires a bullet from the ship's current position and angle */
 void fire(void) {
     int i;
     for (i = 0; i < MAXB; i++) {
@@ -119,6 +139,7 @@ void fire(void) {
     }
 }
 
+/* Handles asteroid destruction and splitting into smaller ones */
 void hit_asteroid(int i) {
     int size = asz[i];
     score += points[size];
@@ -130,6 +151,7 @@ void hit_asteroid(int i) {
     } else asz[i] = 0;
 }
 
+/* Updates ship rotation, thrust, friction, and position */
 void update_ship(unsigned int keys) {
     int f = frame;
     if ((f & 1) == 0) {
@@ -152,6 +174,7 @@ void update_ship(unsigned int keys) {
     if (invuln > 0) invuln--;
 }
 
+/* Updates asteroid and bullet positions and checks for collisions */
 void update_world(void) {
     int i;
     int j;
@@ -194,7 +217,8 @@ void update_world(void) {
     if (alive == 0 && over == 0) { level++; start_level(); }
 }
 
-// --- Rendering ---
+/* --- Rendering --- */
+/* Converts a number to a text string for HUD display */
 void number_text(unsigned int value, char *out) {
     char tmp[6]; 
     int n = 0;
@@ -205,10 +229,12 @@ void number_text(unsigned int value, char *out) {
     out[n] = 0;
 }
 
+/* Draws an asteroid based on its size and current position */
 void draw_asteroid(int i) {
     gfx_poly(ax[i] >> 4, ay[i] >> 4, 8, ast_shape + ((asz[i] - 1) << 4), WHITE);
 }
 
+/* Draws the player ship and its thrust flame */
 void draw_ship(void) {
     int cx = shipx >> 4, cy = shipy >> 4;
     int nose = ang, left = (ang + 13) & 31, right = (ang + 19) & 31;
@@ -221,6 +247,7 @@ void draw_ship(void) {
     }
 }
 
+/* Draws score and lives in the HUD */
 void draw_hud(void) {
     char buffer[8];
     int i;
@@ -233,6 +260,7 @@ void draw_hud(void) {
     }
 }
 
+/* Renders the entire game frame */
 void draw(void) {
     int i;
     gfx_clear(BLACK);
