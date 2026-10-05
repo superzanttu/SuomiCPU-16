@@ -291,7 +291,7 @@ class CpuExecutionTests(unittest.TestCase):
                     regs[rs] = value
                     cpu = self.run_one(word(isa.OP_NOT, rd, rs), regs)
                     expected = list(regs)
-                    expected[rd] = (~value) & 0xFF
+                    expected[rd] = (~value) & 0xFFFF
                     self.assertEqual(cpu.registers, expected)
 
     def test_inc_dec_every_register(self):
@@ -429,11 +429,11 @@ class CpuExecutionTests(unittest.TestCase):
                 self.assertEqual(cpu.sp, 0x2FFFF)
                 self.assertEqual(cpu.registers[other], regs[rd])
 
-    def test_pop_masks_to_a_byte(self):
+    def test_pop_loads_a_word(self):
         cpu = make_cpu(be(word(isa.OP_POP, 2)), sp=0x1000)
         cpu.memory[0x1000:0x1002] = b"\x12\x34"
         cpu.step()
-        self.assertEqual(cpu.registers[2], 0x34)
+        self.assertEqual(cpu.registers[2], 0x1234)
 
     def test_jmp_every_target_boundary(self):
         for target in (0, 2, 0xFF, 0x100, 0x7FE, 0x7FF):

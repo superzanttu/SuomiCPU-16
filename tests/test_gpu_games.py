@@ -156,6 +156,18 @@ class CGraphicsTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 0xFFF0)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 0x8000)
 
+    def test_constant_operand_fast_paths(self):
+        cpu = run_c(
+            "int r[16]; unsigned int u;\n"
+            "int main(void) { int n; n = -5; u = 0xFFF0;\n"
+            "  r[0] = n < 3; r[1] = n > -9; r[2] = u > 5; r[3] = u < 300;\n"
+            "  r[4] = n >= -5; r[5] = n <= -6; r[6] = (n + 1000) - 7; r[7] = 77 % 10 + (n * 3);\n"
+            "  r[8] = (n & 0xFF00) | 0x12; r[9] = u >> 4; r[10] = n << 2; r[11] = n == -5;\n"
+            "  r[12] = n != -5; r[13] = u >= 0xFFF0; r[14] = 30000 / 3; return 0; }\n"
+        )
+        got = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(15)]
+        self.assertEqual(got, [1, 1, 1, 0, 1, 0, 988, 0xFFF8, 0xFF12, 0x0FFF, 0xFFEC, 1, 0, 1, 10000])
+
     def test_library_names_are_reserved(self):
         with self.assertRaises(CCompilerError):
             compile_source("void gfx_clear(unsigned char c) {}\nint main(void) { return 0; }\n")

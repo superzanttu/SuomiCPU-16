@@ -71,5 +71,50 @@ jump_target:
     CALLX sample_routine
     BZX sample_routine
     BCX sample_routine
+    SHL R2, 3              ; Extended group: shifts/rotates (register or 0-15 immediate count)
+    LSR R2, R3
+    ASR R2, 1
+    ROL R2, 1
+    ROR R2, R3
+    ADC R2, R3
+    SBC R2, 1
+    NEG R2
+    TEST R2, 255
+    SWAP R2
+    SEXT R2
+    CLZ R2
+    PUSHF
+    POPF
+    SETC
+    CLC
+    SETSP R2
+    NOP
+    JMPR R2
+    CALLR R2
+    BNZX sample_routine    ; Far conditional branches (flag/signed/unsigned)
+    BNCX sample_routine
+    BNX sample_routine
+    BNNX sample_routine
+    BVX sample_routine
+    BNVX sample_routine
+    BLTX sample_routine
+    BGEX sample_routine
+    BGTX sample_routine
+    BLEX sample_routine
+    BHIX sample_routine
+    BLSX sample_routine
+    BNZ sample_routine
+    BNC sample_routine
+    BN sample_routine
+    BNN sample_routine
+    BV sample_routine
+    BNV sample_routine
+    BLT sample_routine
+    BGE sample_routine
+    BGT sample_routine
+    BLE sample_routine
+    BHI sample_routine
+    BLS sample_routine
 sample_routine:
     RET
+

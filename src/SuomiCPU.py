@@ -128,7 +128,7 @@ class SuomiCompute16:
         self.entry_point = 0
         # Pino (Stack) on paikka, jonne tallennetaan tietoa funktioiden ajaksi
         self.sp = 0x2FFFF
-        self.flags = {'Z': 0, 'C': 0} # Z = nolla, C = kanto (käytetään vertailuissa)
+        self.flags = {'Z': 0, 'C': 0, 'N': 0, 'V': 0} # Z = nolla, C = kanto (käytetään vertailuissa)
         self.running = True
         
         # Käynnistetään näyttö ja ikkuna
@@ -148,7 +148,7 @@ class SuomiCompute16:
 
         self.entry_point = 0
         self.sp = 0x2FFFF
-        self.flags = {'Z': 0, 'C': 0}
+        self.flags = {'Z': 0, 'C': 0, 'N': 0, 'V': 0}
         self.running = True
         
         pygame.init()
@@ -374,6 +374,154 @@ class SuomiCompute16:
         self.flags['Z'] = int(result == 0)
         self.flags['C'] = carry
 
+    def _set_flags(self, result, carry, overflow=0):
+        """Set Z, N, C and V from a 16-bit result."""
+        result &= 0xFFFF
+        self.flags['Z'] = int(result == 0)
+        self.flags['N'] = result >> 15
+        self.flags['C'] = int(carry)
+        self.flags['V'] = int(overflow)
+
+    def _set_nv(self, left, right, result, subtract):
+        """Set N and V after the classic ADD/SUB/CMP (Z and C keep their old meaning)."""
+        left &= 0xFFFF
+        right &= 0xFFFF
+        result &= 0xFFFF
+        if subtract:
+            overflow = ((left ^ right) & (left ^ result) & 0x8000) != 0
+        else:
+            overflow = ((left ^ result) & (right ^ result) & 0x8000) != 0
+        self.flags['N'] = result >> 15
+        self.flags['V'] = int(overflow)
+
+    def _flag_condition(self, condition):
+        """Evaluate a far-branch condition code (see isa.BRANCH_CONDITIONS)."""
+        flags = self.flags
+        zero, carry = flags['Z'], flags['C']
+        negative, overflow = flags.get('N', 0), flags.get('V', 0)
+        if condition == 0: return not zero
+        if condition == 1: return not carry
+        if condition == 2: return bool(negative)
+        if condition == 3: return not negative
+        if condition == 4: return bool(overflow)
+        if condition == 5: return not overflow
+        if condition == 6: return negative != overflow
+        if condition == 7: return negative == overflow
+        if condition == 8: return not zero and negative == overflow
+        if condition == 9: return bool(zero) or negative != overflow
+        if condition == 10: return not carry and not zero
+        if condition == 11: return bool(carry) or bool(zero)
+        return False
+
+    def _execute_alu(self, instr):
+        """Run the extended ALU group; `instr` is the 0xF81F prefix word."""
+        rd = (instr >> 8) & 0x7
+        control = self.read_16(self.pc)
+        self.pc += 2
+        operation = control >> 12
+        left = self.registers[rd] & 0xFFFF
+        if operation == 15:
+            self._execute_misc(rd, left, control & 0xF)
+            return
+        immediate = bool(control & 0x0800)
+        if operation <= 4:
+            count = (control & 0xF) if immediate else self.registers[control & 0x7] & 0xF
+            self._execute_shift(rd, left, operation, count)
+            return
+        if operation == 7:
+            result = -left & 0xFFFF
+            self._set_flags(result, left != 0, left == 0x8000)
+            self.registers[rd] = result
+            return
+        if immediate:
+            right = self.read_16(self.pc) & 0xFFFF
+            self.pc += 2
+        else:
+            right = self.registers[control & 0x7] & 0xFFFF
+        carry_in = self.flags['C']
+        if operation in (5, 9):
+            total = left + right + (carry_in if operation == 5 else 0)
+            result = total & 0xFFFF
+            overflow = ((left ^ result) & (right ^ result) & 0x8000) != 0
+            self._set_flags(result, total > 0xFFFF, overflow)
+        elif operation in (6, 10, 14):
+            total = left - right - (carry_in if operation == 6 else 0)
+            result = total & 0xFFFF
+            overflow = ((left ^ right) & (left ^ result) & 0x8000) != 0
+            self._set_flags(result, total < 0, overflow)
+        else:
+            if operation in (8, 11):
+                result = left & right
+            elif operation == 12:
+                result = left | right
+            else:
+                result = left ^ right
+            self._set_flags(result, 0, 0)
+        if operation not in (8, 14):
+            self.registers[rd] = result
+
+    def _execute_shift(self, rd, value, operation, count):
+        """Shift or rotate `value` by `count` bits (0-15); C gets the last bit out."""
+        if count == 0:
+            self._set_flags(value, self.flags['C'], 0)
+            self.registers[rd] = value
+            return
+        if operation == 0:
+            result = (value << count) & 0xFFFF
+            carry = (value >> (16 - count)) & 1
+        elif operation == 1:
+            result = value >> count
+            carry = (value >> (count - 1)) & 1
+        elif operation == 2:
+            signed = value - 0x10000 if value & 0x8000 else value
+            result = (signed >> count) & 0xFFFF
+            carry = (signed >> (count - 1)) & 1
+        elif operation == 3:
+            result = ((value << count) | (value >> (16 - count))) & 0xFFFF
+            carry = result & 1
+        else:
+            result = ((value >> count) | (value << (16 - count))) & 0xFFFF
+            carry = result >> 15
+        self._set_flags(result, carry, 0)
+        self.registers[rd] = result
+
+    def _execute_misc(self, rd, value, selector):
+        """Run the miscellaneous register instructions (ALU operation 15)."""
+        if selector == 0:
+            self.registers[rd] = ((value << 8) | (value >> 8)) & 0xFFFF
+        elif selector == 1:
+            result = (value & 0xFF) | (0xFF00 if value & 0x80 else 0)
+            self.registers[rd] = result
+            self._set_flags(result, self.flags['C'], 0)
+        elif selector == 2:
+            self.pc = value
+        elif selector == 3:
+            self.push(self.pc)
+            self.pc = value
+        elif selector == 4:
+            self.push(self._pack_flags())
+        elif selector == 5:
+            self._restore_flags(self.pop())
+        elif selector == 6:
+            self.flags['C'] = 1
+        elif selector == 7:
+            self.flags['C'] = 0
+        elif selector == 8:
+            self.sp = value
+        elif selector == 9:
+            self.registers[rd] = 16 - value.bit_length()
+            self.flags['Z'] = int(value == 0)
+
+    def _pack_flags(self):
+        flags = self.flags
+        return flags['Z'] | (flags['C'] << 1) | (flags.get('N', 0) << 2) | (flags.get('V', 0) << 3)
+
+    def _restore_flags(self, saved):
+        self.flags['Z'] = saved & 1
+        self.flags['C'] = (saved >> 1) & 1
+        self.flags['N'] = (saved >> 2) & 1
+        self.flags['V'] = (saved >> 3) & 1
+
     def step(self):
         if not self.running: return
         memory = self.memory
@@ -391,6 +539,14 @@ class SuomiCompute16:
 
         if (instr & 0xF8FF) == 0xF81E:
             self._execute_muldiv(instr)
+        elif (instr & 0xF8FF) == 0xF81F:
+            self._execute_alu(instr)
+        elif (instr & 0xF81F) == 0xF81B:
+            condition = ((instr >> 8) & 0x7) | (((instr >> 5) & 0x7) << 3)
+            target = self.read_16(self.pc) | (self.read_16(self.pc + 2) << 16)
+            self.pc += 4
+            if self._flag_condition(condition):
+                self.pc = target
         elif instr >= 0xF800 and instr in (0xF81D, 0xF91D, 0xFA1D, 0xFB1D):
             target = self.read_16(self.pc) | (self.read_16(self.pc + 2) << 16)
             self.pc += 4
@@ -412,15 +568,17 @@ class SuomiCompute16:
             registers[rd] = res
             self.flags['Z'] = 1 if (registers[rd] == 0) else 0
             self.flags['C'] = 1 if res > 0xFF else 0
+            self._set_nv(registers[rs1], registers[rs2], res, False)
         elif opcode == OP_SUB:
             res = registers[rs1] - registers[rs2]
             registers[rd] = res
             self.flags['Z'] = 1 if (registers[rd] == 0) else 0
             self.flags['C'] = 1 if res < 0 else 0
+            self._set_nv(registers[rs1], registers[rs2], res, True)
         elif opcode == OP_AND: registers[rd] = registers[rs1] & registers[rs2]
         elif opcode == OP_OR:  registers[rd] = registers[rs1] | registers[rs2]
         elif opcode == OP_XOR: registers[rd] = registers[rs1] ^ registers[rs2]
-        elif opcode == OP_NOT: registers[rd] = (~registers[rs1]) & 0xFF
+        elif opcode == OP_NOT: registers[rd] = (~registers[rs1]) & 0xFFFF
         elif opcode == OP_INC: registers[rd] = registers[rd] + 1
         elif opcode == OP_DEC: registers[rd] = registers[rd] - 1
         elif opcode == OP_SHR:
@@ -463,6 +621,7 @@ class SuomiCompute16:
             res = registers[rs1] - registers[rs2]
             self.flags['Z'] = 1 if res == 0 else 0
             self.flags['C'] = 1 if res < 0 else 0
+            self._set_nv(registers[rs1], registers[rs2], res, True)
         elif opcode == OP_LD: registers[rd] = self.read(registers[rs1])
         elif opcode == OP_ST: self.write(registers[rs1], registers[rd])
         elif opcode == OP_LDW: registers[rd] = self.read_16(registers[rs1])
@@ -484,11 +643,9 @@ class SuomiCompute16:
             self.pc = instr & 0x7FF
         elif opcode == OP_RET: self.pc = self.pop()
         elif opcode == OP_PUSH: self.push(registers[rd])
-        elif opcode == OP_POP: registers[rd] = self.pop() & 0xFF
+        elif opcode == OP_POP: registers[rd] = self.pop() & 0xFFFF
         elif opcode == OP_RTI:
-            saved = self.pop()
-            self.flags['Z'] = saved & 1
-            self.flags['C'] = (saved >> 1) & 1
+            self._restore_flags(self.pop())
             self.pc = self.pop()
         elif opcode == OP_EI: self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x01)
         elif opcode == OP_DI: self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x01)
@@ -503,7 +660,7 @@ class SuomiCompute16:
 
     def handle_interrupt(self, vector_addr):
         self.push(self.pc)
-        self.push(self.flags['Z'] | (self.flags['C'] << 1))
+        self.push(self._pack_flags())
         self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x01)
         self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x02 & ~0x08)
         self.pc = self.read_16(vector_addr)

@@ -4,6 +4,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.isa import (
+    ALU_IMMEDIATE_FLAG,
+    ALU_IMMEDIATE_OPERATIONS,
+    ALU_MISC_OPERATION,
+    ALU_OPERATIONS,
+    ALU_PREFIX,
+    ALU_SHIFTS,
+    BRANCH_ALIASES,
+    BRANCH_CONDITIONS,
+    BRANCH_PREFIX,
+    MISC_OPERATIONS,
     MULDIV_IMMEDIATE_FLAG,
     MULDIV_OPERATIONS,
     MULDIV_PREFIX,
@@ -220,8 +230,101 @@ def _parse_instruction(text: str, line_number: int) -> tuple[str, list[str]]:
     return _parse_operands(text, line_number)
 
 
+_REGISTER_PATTERN = re.compile(r"R[0-7]", re.IGNORECASE)
+_MISC_ZERO_OPERAND = ("PUSHF", "POPF", "SETC", "CLC")
+
+
+def _is_register(text: str) -> bool:
+    return _REGISTER_PATTERN.fullmatch(text.strip()) is not None
+
+
+def _alu_name(mnemonic: str, operands: list[str]) -> str | None:
+    """Return the extended-ALU mnemonic that `mnemonic` selects, or None."""
+    if mnemonic == "SHR" and len(operands) == 2:
+        return "LSR"
+    if mnemonic in ("SHL", "LSR", "ASR", "ROL", "ROR", "ADC", "SBC", "NEG", "TEST"):
+        return mnemonic
+    if mnemonic in ("ADD", "SUB", "AND", "OR", "XOR", "CMP"):
+        if len(operands) == 2 and not _is_register(operands[1]):
+            return mnemonic
+    return None
+
+
+def _extended_size(mnemonic: str, operands: list[str], line_number: int) -> int | None:
+    """Size in bytes of the extended instructions, or None for other mnemonics."""
+    if mnemonic in BRANCH_CONDITIONS or mnemonic in BRANCH_ALIASES:
+        if len(operands) != 1:
+            raise _error(line_number, f"{mnemonic} expects one address or label")
+        return 6
+    if mnemonic == "NOP":
+        return 2
+    if mnemonic in MISC_OPERATIONS:
+        return 4
+    name = _alu_name(mnemonic, operands)
+    if name is None:
+        return None
+    if name in ALU_IMMEDIATE_OPERATIONS and len(operands) == 2 and not _is_register(operands[1]):
+        return 6
+    return 4
+
+
+def _assemble_extended(
+    mnemonic: str, operands: list[str], line_number: int, labels: dict[str, int]
+) -> list[int] | None:
+    """Encode the extended instructions, or return None for other mnemonics."""
+    if mnemonic == "NOP":
+        if operands:
+            raise _error(line_number, "NOP expects no operands")
+        return [OPCODES["MOV"] << 11]
+    shared = OPCODES["SHR"] << 11
+    if mnemonic in BRANCH_CONDITIONS or mnemonic in BRANCH_ALIASES:
+        if len(operands) != 1:
+            raise _error(line_number, f"{mnemonic} expects one address or label")
+        condition = BRANCH_CONDITIONS[BRANCH_ALIASES.get(mnemonic, mnemonic)]
+        if operands[0] in labels:
+            target = labels[operands[0]]
+        else:
+            target = _parse_number(operands[0], line_number)
+        if not 0 <= target < MEMORY_SIZE:
+            raise _error(line_number, f"{mnemonic} target is outside available memory")
+        first = shared | ((condition & 7) << 8) | ((condition >> 3) << 5) | BRANCH_PREFIX
+        return [first, target & 0xFFFF, target >> 16]
+    if mnemonic in MISC_OPERATIONS:
+        wanted = 0 if mnemonic in _MISC_ZERO_OPERAND else 1
+        if len(operands) != wanted:
+            raise _error(line_number, f"{mnemonic} expects {wanted} operand(s)")
+        register = _parse_register(operands[0], line_number) if wanted else 0
+        control = (ALU_MISC_OPERATION << 12) | MISC_OPERATIONS[mnemonic]
+        return [shared | (register << 8) | ALU_PREFIX, control]
+    name = _alu_name(mnemonic, operands)
+    if name is None:
+        return None
+    if name == "NEG":
+        if len(operands) != 1:
+            raise _error(line_number, "NEG expects one register")
+        register = _parse_register(operands[0], line_number)
+        return [shared | (register << 8) | ALU_PREFIX, ALU_OPERATIONS["NEG"] << 12]
+    if len(operands) != 2:
+        raise _error(line_number, f"{mnemonic} expects 2 operand(s)")
+    register = _parse_register(operands[0], line_number)
+    control = ALU_OPERATIONS[name] << 12
+    first = shared | (register << 8) | ALU_PREFIX
+    if _is_register(operands[1]):
+        return [first, control | _parse_register(operands[1], line_number)]
+    value = _parse_number(operands[1], line_number)
+    if name in ALU_SHIFTS:
+        if not 0 <= value <= 15:
+            raise _error(line_number, f"{mnemonic} shift count must be between 0 and 15")
+        return [first, control | ALU_IMMEDIATE_FLAG | value]
+    if not -0x8000 <= value <= 0xFFFF:
+        raise _error(line_number, f"{mnemonic} immediate must fit in 16 bits")
+    return [first, control | ALU_IMMEDIATE_FLAG, value & 0xFFFF]
+
 def _instruction_size(text: str, line_number: int) -> int:
     mnemonic, operands = _parse_instruction(text, line_number)
+    extended_size = _extended_size(mnemonic, operands, line_number)
+    if extended_size is not None:
+        return extended_size
     if mnemonic in ("JMPX", "CALLX", "BZX", "BCX"):
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")
@@ -249,6 +352,9 @@ def _assemble_instruction(
 ) -> list[int]:
     mnemonic, operands = _parse_instruction(text, line_number)
     opcode = OPCODES[mnemonic]
+    extended_words = _assemble_extended(mnemonic, operands, line_number, labels)
+    if extended_words is not None:
+        return extended_words
 
     def require_count(count: int) -> None:
         if len(operands) != count:

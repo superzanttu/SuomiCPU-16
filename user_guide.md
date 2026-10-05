@@ -282,6 +282,34 @@ immediate, a third word holds the 16-bit value. The register form is four
 bytes and the immediate form six bytes. The C compiler emits `MUL`, `DIV`/`DIVS`
 and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
 
+### Extended ALU, miscellaneous and conditional-branch instructions
+
+| Instruction | Syntax | Operation |
+| ----------- | ------ | --------- |
+| `SHL` `LSR` `ASR` | `SHL Rd, n` / `SHL Rd, Rs` | Shift left, logical right, arithmetic right. Count is 0-15 (a register uses its low 4 bits). `C` = last bit shifted out. |
+| `ROL` `ROR` | `ROL Rd, n` / `ROL Rd, Rs` | Rotate left/right by 0-15. |
+| `ADC` `SBC` | `ADC Rd, Rs` / `imm` | Add/subtract including the carry flag, for multi-word arithmetic. |
+| `NEG` | `NEG Rd` | Two's complement negate. |
+| `TEST` | `TEST Rd, Rs` / `imm` | `Rd AND source`; sets flags only. |
+| `ADD SUB AND OR XOR CMP` | `ADD Rd, imm` | Immediate forms (a non-register second operand selects them). |
+| `SWAP` `SEXT` `CLZ` | `SWAP Rd` | Swap bytes; sign-extend the low byte; count leading zeros (all in place). |
+| `JMPR` `CALLR` | `JMPR Rd` | Jump/call to the 19-bit address held in `Rd`. |
+| `PUSHF` `POPF` | `PUSHF` | Push/pop the flags (Z=1, C=2, N=4, V=8). |
+| `SETC` `CLC` | `SETC` | Set/clear the carry flag. |
+| `SETSP` | `SETSP Rd` | Load the stack pointer from `Rd`. |
+| `NOP` | `NOP` | Do nothing (`MOV R0, R0`). |
+| `BNZX BNCX BNX BNNX BVX BNVX` | `BNZX label` | Far branch if `Z`, `C`, `N`, `V` is clear (`BNZ`, `BNC`, `BNV`) or set (`BN`, `BV`); `BNNX` = `N` clear. |
+| `BLT BGE BGT BLE` | `BLT label` | Signed compare branches after `CMP` (use `N` and `V`). |
+| `BHI BLS` | `BHI label` | Unsigned higher / lower-or-same after `CMP`. |
+
+Every branch also has an `X` spelling (`BLTX`, ...); all conditional branches
+here are 6-byte, full-address forms. `ADD`, `SUB` and `CMP` now also set the
+`N` (negative) and `V` (signed overflow) flags. `NOT` and `POP` now produce
+full 16-bit values. Encoding: opcode `0x1F` with low-byte prefix `0x1F`
+(ALU/misc group: `(op<<12) | 0x0800 immediate flag | operand`, ops `SHL`=0,
+`LSR`=1, `ASR`=2, `ROL`=3, `ROR`=4, `ADC`=5, `SBC`=6, `NEG`=7, `TEST`=8,
+`ADD`=9, `SUB`=10, `AND`=11, `OR`=12, `XOR`=13, `CMP`=14, misc=15) or `0x1B`
+(conditional far branch; condition in the prefix word, then a 24-bit target).
 ### Branches
 
 | Instruction | Syntax                    | Operation                                               |

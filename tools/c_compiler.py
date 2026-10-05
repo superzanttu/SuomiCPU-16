@@ -52,6 +52,10 @@ LIBRARY_FILES = {
 }
 
 
+ALU_NAMES = {"+": "ADD", "-": "SUB", "&": "AND", "|": "OR", "^": "XOR"}
+SIGNED_BRANCHES = {"<": "BLTX", "<=": "BLEX", ">": "BGTX", ">=": "BGEX"}
+UNSIGNED_BRANCHES = {"<": "BCX", "<=": "BLSX", ">": "BHIX", ">=": "BNCX"}
+
 class CCompilerError(ValueError):
     """Raised for unsupported or invalid input in the supported C subset."""
 
@@ -1665,10 +1669,7 @@ class _CodeGenerator:
                     self.emit("    LDI R7, 0x8000")
                     self.emit("    XOR R0, R7")
                 else:
-                    self.emit("    LDI R1, 0")
-                    self.emit("    SUB R1, R0")
-                    self.emit("    MOV R0, R1")
-                    self._mask_result()
+                    self.emit("    NEG R0")
             elif operator == "!":
                 self._boolean_not(self._expression_type(child))
             elif operator == "~":
@@ -1747,6 +1748,8 @@ class _CodeGenerator:
             return
         left_type = self._expression_type(left)
         right_type = self._expression_type(right)
+        if right.kind == "constant" and self._constant_binary(expression, operator, left, left_type):
+            return
         self._expression(left)
         left_size = _object_size(left_type)
         if left_type.endswith("*"):
@@ -1816,6 +1819,47 @@ class _CodeGenerator:
                     self.emit("    ITOF R1")
             self._comparison(operator, expression.line, compare_type)
 
+    def _constant_binary(self, expression: Expr, operator: str, left: Expr, left_type: str) -> bool:
+        """Emit `left <op> constant` without the operand stack; False if not applicable."""
+        value = int(expression.children[1].value) & WORD_MASK
+        if left_type == "float" or left_type.endswith("*"):
+            return False
+        shifts = ("<<", ">>")
+        compares = ("==", "!=", "<", "<=", ">", ">=")
+        if operator in shifts:
+            if value > 15:
+                return False
+        elif operator not in ("+", "-", "&", "|", "^", "*", "/", "%") + compares:
+            return False
+        unsigned_left = left_type.startswith("unsigned") or left_type in ("char", "unsigned char")
+        self._expression(left)
+        if operator in shifts:
+            if value:
+                mnemonic = "SHL" if operator == "<<" else ("LSR" if unsigned_left else "ASR")
+                self.emit(f"    {mnemonic} R0, {value}")
+            return True
+        if operator in compares:
+            if value < 256:
+                self.emit(f"    LDI R1, {value}")
+                self.emit("    CMP R0, R1")
+            else:
+                self.emit(f"    CMP R0, {value}")
+            compare_type = "unsigned int" if unsigned_left else "int"
+            self._comparison(operator, expression.line, compare_type, compared=True)
+            return True
+        result_type = self._expression_type(expression)
+        if operator in ("*", "/", "%"):
+            unsigned = result_type.startswith("unsigned")
+            mnemonic = {"*": "MUL", "/": "DIV" if unsigned else "DIVS",
+                        "%": "MOD" if unsigned else "MODS"}[operator]
+            self.emit(f"    {mnemonic} R0, {value}")
+        elif operator in ("&", "|", "^") and value < 256:
+            self.emit(f"    LDI R1, {value}")
+            self.emit(f"    {ALU_NAMES[operator]} R0, R1")
+        else:
+            self.emit(f"    {ALU_NAMES[operator]} R0, {value}")
+        return True
+
     def _binary_operation(self, operator: str, line: int, result_type: str = "int") -> None:
         if result_type == "float":
             if operator not in ("+", "-", "*", "/"):
@@ -1849,11 +1893,17 @@ class _CodeGenerator:
         self.emit("    LDI R7, 0xFFFF")
         self.emit("    AND R0, R7")
 
-    def _comparison(self, operator: str, line: int, compare_type: str = "int") -> None:
+    def _comparison(self, operator: str, line: int, compare_type: str = "int",
+                    compared: bool = False) -> None:
         true_label = self.label("cmp_true")
         false_label = self.label("cmp_false")
         end_label = self.label("cmp_end")
-        if operator in ("<", "<=", ">", ">="):
+        if compare_type != "float" and operator in ("<", "<=", ">", ">="):
+            if not compared:
+                self.emit("    CMP R0, R1")
+            table = SIGNED_BRANCHES if compare_type == "int" else UNSIGNED_BRANCHES
+            self.emit(f"    {table[operator]} {true_label}")
+        elif operator in ("<", "<=", ">", ">="):
             if operator in (">", ">="):
                 self.emit("    MOV R2, R0")
                 self.emit("    MOV R0, R1")
@@ -1872,7 +1922,8 @@ class _CodeGenerator:
                 self.emit(f"    BCX {true_label}")
                 self.emit(f"    BZX {true_label}")
         else:
-            self.emit("    FCMP R0, R1" if compare_type == "float" else "    CMP R0, R1")
+            if not compared:
+                self.emit("    FCMP R0, R1" if compare_type == "float" else "    CMP R0, R1")
             if operator == "==":
                 self.emit(f"    BZX {true_label}")
             elif operator == "!=":
