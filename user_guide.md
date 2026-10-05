@@ -555,6 +555,11 @@ instructions per frame.
 - [`examples/anaclock.c`](examples/anaclock.c) displays the emulator RTC as a
   live analog clock with a digital hours, minutes, and seconds readout. Run it
   with `python main.py examples/anaclock.c`.
+- [`examples/elitedemo.c`](examples/elitedemo.c) is a first-person Elite-style
+  space combat demo with perspective hazards, enemy fighters, regenerating
+  shields, and a heat-limited laser. Use Left/Right to turn, Up/Down to adjust
+  throttle, and Space to fire. The ship accelerates and drifts with inertia.
+  Run it with `python main.py examples/elitedemo.c`.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
 - [`examples/asteroids.c`](examples/asteroids.c) and

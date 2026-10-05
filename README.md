@@ -19,6 +19,14 @@ For a live analog clock with a digital hours, minutes, and seconds readout, run:
 python main.py examples/anaclock.c
 ```
 
+For a first-person Elite-style space combat demo, run:
+```console
+python main.py examples/elitedemo.c
+```
+Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
+Space. The ship accelerates and drifts with inertia; shields regenerate and the
+laser needs time to cool.
+
 On Windows, the PowerShell launcher can run the same programs:
 ```powershell
 .\run.ps1 .\examples\factorial.c

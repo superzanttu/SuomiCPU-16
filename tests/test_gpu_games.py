@@ -230,6 +230,17 @@ class GameTests(unittest.TestCase):
         self.assertTrue(moving.running)
         self.assertNotEqual(vram(idle), vram(moving))
 
+    def test_elitedemo_runs_with_throttle_turn_and_fire_inputs(self):
+        cpu = self.play(
+            "elitedemo.c",
+            lambda f: (4 if f < 24 else 8 if f < 40 else 0)
+            | (1 if 28 <= f < 36 else 0)
+            | (16 if f % 10 == 0 else 0),
+            60,
+        )
+        self.assertTrue(cpu.running)
+        self.assertGreater(sum(1 for byte in vram(cpu) if byte), 100)
+
     def test_showcase_pages_and_interrupt_counters(self):
         cpu = make_cpu(compile_file(ROOT / "examples" / "sc16_showcase.c"))
         run_frame(cpu, 400_000)
