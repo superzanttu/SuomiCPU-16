@@ -3,6 +3,7 @@ import datetime
 import math
 import sys
 import argparse
+import array
 import struct
 import random
 from pathlib import Path
@@ -80,6 +81,8 @@ GPU_CLEAR, GPU_PIXEL, GPU_RECT, GPU_LINE = 1, 2, 3, 4
 GPU_SPRITE, GPU_BITMAP, GPU_TEXT, GPU_PRESENT, GPU_RANDOM, GPU_POLY = 5, 6, 7, 8, 9, 10
 GPU_TICKS = 11  # Laskee kuinka monta ruutua on kulunut
 GPU_RTC = 12    # Kello-tieto
+GPU_SOUND = 13  # Sound: COLOR=channel 0-3, X=frequency Hz (0=silence), Y=duration frames (0=loop), W=waveform, H=volume %
+GPU_SAVE, GPU_LOAD = 14, 15  # Save/restore the back buffer (static background layer)
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
@@ -236,8 +239,85 @@ class SuomiCompute16:
         elif command == GPU_RTC:
             index = self.memory[GPU_BASE + 1]
             self.memory[GPU_BASE + 14] = self.memory[RTC_START + index] if index < 3 else 0
+        elif command == GPU_SOUND:
+            self._gpu_sound(color, self._gpu_word(2, False), self._gpu_word(4, False),
+                            self._gpu_word(6, False), self._gpu_word(8, False))
+        elif command == GPU_SAVE:
+            size = SCREEN_WIDTH * SCREEN_HEIGHT
+            self._saved_layer = bytes(self.memory[BACK_START:BACK_START + size])
+        elif command == GPU_LOAD:
+            size = SCREEN_WIDTH * SCREEN_HEIGHT
+            saved = getattr(self, '_saved_layer', None)
+            if saved is not None:
+                self.memory[BACK_START:BACK_START + size] = saved
         elif command == GPU_RANDOM:
             self.memory[GPU_BASE + 14] = random.randrange(256)
+
+    SOUND_RATE = 22050
+    SOUND_FPS = 60
+
+    def _gpu_sound(self, channel, freq, frames, wave, volume):
+        """Play a synthesized tone on a channel. wave: 0 square, 1 noise, 2 triangle.
+
+        frames == 0 loops until the channel is changed or silenced (freq == 0).
+        """
+        channel &= 3
+        log = getattr(self, 'sound_log', None)
+        if log is not None:
+            log.append((channel, freq, frames, wave, volume))
+        if not getattr(self, 'audio_enabled', True):
+            return
+        key = (freq, frames, wave, volume)
+        playing = getattr(self, '_sound_playing', None)
+        if playing is None:
+            playing = self._sound_playing = {}
+            self._sound_cache = {}
+            try:
+                pygame.mixer.quit()
+                pygame.mixer.init(self.SOUND_RATE, -16, 1, 512)
+                pygame.mixer.set_num_channels(4)
+            except pygame.error:
+                self.audio_enabled = False
+                return
+        mixer_channel = pygame.mixer.Channel(channel)
+        if freq == 0:
+            mixer_channel.stop()
+            playing.pop(channel, None)
+            return
+        if frames == 0 and playing.get(channel) == key and mixer_channel.get_busy():
+            return
+        sound = self._sound_cache.get(key)
+        if sound is None:
+            sound = self._sound_cache[key] = pygame.mixer.Sound(
+                buffer=self._synthesize(freq, frames, wave, volume))
+        mixer_channel.play(sound, loops=-1 if frames == 0 else 0)
+        playing[channel] = key
+
+    def _synthesize(self, freq, frames, wave, volume):
+        rate = self.SOUND_RATE
+        freq = max(20, min(freq, rate // 2))
+        period = max(2, round(rate / freq))
+        if frames:
+            count = frames * rate // self.SOUND_FPS
+        else:
+            count = period * max(1, (rate // 4) // period) if wave != 1 else rate // 2
+        amplitude = 32767 * max(1, min(volume or 100, 100)) // 100 // 2
+        samples = array.array('h')
+        held = 0
+        for index in range(count):
+            if wave == 1:
+                if index % period == 0:
+                    held = random.randrange(-amplitude, amplitude + 1)
+                value = held
+            elif wave == 2:
+                phase = (index % period) / period
+                value = int(amplitude * (4 * abs(phase - 0.5) - 1))
+            else:
+                value = amplitude if (index % period) < period // 2 else -amplitude
+            if frames:
+                value = value * (count - index) // count
+            samples.append(value)
+        return samples.tobytes()
 
     def _gpu_line(self, x, y, end_x, end_y, color):
         dx, dy = abs(end_x - x), -abs(end_y - y)

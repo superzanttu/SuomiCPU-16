@@ -558,6 +558,8 @@ no flicker.
 | `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                             |
 | `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.   |
 | `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                          |
+| `void gfx_sound(int channel, int freq, int frames, int wave, int volume)`                | Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. `WAVE_SQUARE/NOISE/TRIANGLE`. |
+| `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store the back buffer as a static layer / redraw it in one call.              |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
@@ -568,7 +570,8 @@ Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 `+8` H, `+10` SRC word, `+12` SRC high byte, `+14` RESULT. Commands: 1 clear,
 2 pixel, 3 rect, 4 line (W,H are the end point), 5 sprite, 6 bitmap, 7 text
 (NUL-terminated string at SRC), 8 present, 9 random (to RESULT), 10 polygon
-(W is the point count). Assembly programs can use it directly.
+(W is the point count), 13 sound (COLOR channel, X Hz, Y frames, W wave, H volume %),
+14 save back buffer, 15 restore it. Assembly programs can use it directly.
 
 ### Games
 
@@ -622,6 +625,15 @@ instructions per frame.
   heat-limited laser. It has regenerating shields, a hull, collisions with every
   body, a 3D radar and a HUD. It needs roughly 100,000 instructions per frame.
   Run it with `python main.py examples/elitedemo.c`.
+- [`examples/lunarlander.c`](examples/lunarlander.c) is a Lunar Lander game with
+  gravity, inertia, limited fuel, procedural terrain with x2/x3/x5 landing pads,
+  exhaust, dust and explosion particles, a starfield with the Earth, a HUD with
+  altitude, velocity and fuel, and synthesized sound (engine, RCS, ambient drone,
+  landing jingle, crash). Modes: Classic, Practice (unlimited fuel) and Challenge
+  (rough terrain, stronger gravity), each with three difficulty levels. Up/W fires
+  the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
+  Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
+  accuracy bonus) x pad multiplier. Run it with `python main.py examples/lunarlander.c`.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
 - [`examples/asteroids.c`](examples/asteroids.c) and

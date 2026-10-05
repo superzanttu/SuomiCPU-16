@@ -15,6 +15,8 @@ def make_cpu(image):
     cpu.running = True
     cpu.sp = 0x2FFFF
     cpu.frame_yield = False
+    cpu.audio_enabled = False
+    cpu.sound_log = []
     cpu.load_program(image)
     cpu.reset()
     return cpu

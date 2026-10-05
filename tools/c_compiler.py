@@ -44,6 +44,9 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_irq_ticks": ("unsigned int", ()),
     "gfx_irq_keys": ("unsigned int", ()),
     "gfx_keys_ext": ("unsigned int", ()),
+    "gfx_save": ("void", ()),
+    "gfx_restore": ("void", ()),
+    "gfx_sound": ("void", ("int", "int", "int", "int", "int")),
 }
 LIBRARY_FUNCTIONS = {**SCREEN_LIBRARY_FUNCTIONS, **GRAPHICS_LIBRARY_FUNCTIONS}
 LIBRARY_FILES = {

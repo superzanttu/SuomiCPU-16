@@ -303,6 +303,24 @@ class GameTests(unittest.TestCase):
         self.assertGreater(cpu.read_16(0x4340), 10)
         self.assertGreaterEqual(cpu.read_16(0x4342), 1)
 
+    def test_lunar_lander_menu_flight_sound_and_crash(self):
+        cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else 0, 8)
+        self.assertIn(3, vram(cpu))
+        cpu.sound_log.clear()
+        cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else (4 if 8 <= f < 30 else 0), 30)
+        self.assertTrue(any(call[0] == 0 and call[1] > 0 for call in cpu.sound_log))
+        for frame in range(400):
+            cpu.memory[KEYS_ADDR] = 0
+            run_frame(cpu)
+        self.assertTrue(any(call[0] == 2 and call[3] == 1 for call in cpu.sound_log))
+        self.assertIn(2, vram(cpu))
+
+    def test_gfx_sound_and_static_layer_commands(self):
+        cpu = run_c("int main(void) { gfx_sound(1, 440, 10, WAVE_TRIANGLE, 50); gfx_rect(0,0,4,4,3); gfx_save();"
+                    " gfx_clear(0); gfx_restore(); gfx_present(); return 0; }")
+        self.assertIn((1, 440, 10, 2, 50), cpu.sound_log)
+        self.assertEqual(back(cpu, 1, 1), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
