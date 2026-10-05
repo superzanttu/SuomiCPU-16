@@ -505,7 +505,7 @@ no flicker.
 | `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                          |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
-left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter.
+left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab.
 
 Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 `+0` CMD (writing it runs the command), `+1` COLOR, `+2` X, `+4` Y, `+6` W,
@@ -553,8 +553,9 @@ instructions per frame.
 - [`examples/factorial.c`](examples/factorial.c) demonstrates the C compiler,
   recursive calls, local variables, arithmetic, and a `for` loop.
 - [`examples/anaclock.c`](examples/anaclock.c) displays the emulator RTC as a
-  live analog clock with a digital hours, minutes, and seconds readout. Run it
-  with `python main.py examples/anaclock.c`.
+  live clock with five classic analog faces, a Nixie-tube simulation, and a
+  split-flap flip clock. Press Tab to cycle through the seven faces. Run it with
+  `python main.py examples/anaclock.c`.
 - [`examples/elitedemo.c`](examples/elitedemo.c) is a first-person Elite-style
   space combat demo with perspective hazards, enemy fighters, regenerating
   shields, and a heat-limited laser. Use Left/Right to turn, Up/Down to adjust

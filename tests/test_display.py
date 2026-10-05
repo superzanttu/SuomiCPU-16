@@ -4,10 +4,13 @@ from unittest.mock import Mock, patch
 import pygame
 
 from assembler import assemble
-from src.SuomiCPU import MEM_SIZE, VRAM_START, SuomiCompute16
+from src.SuomiCPU import KEY_BITS, MEM_SIZE, VRAM_START, SuomiCompute16
 
 
 class DisplayTests(unittest.TestCase):
+    def test_tab_key_has_a_dedicated_held_key_bit(self):
+        self.assertEqual(KEY_BITS[pygame.K_TAB], 64)
+
     def test_cpu_vram_writes_are_visible_in_palette_surface(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.memory = bytearray(MEM_SIZE)

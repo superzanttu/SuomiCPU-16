@@ -230,6 +230,23 @@ class GameTests(unittest.TestCase):
         self.assertTrue(moving.running)
         self.assertNotEqual(vram(idle), vram(moving))
 
+    def test_anaclock_cycles_through_seven_distinct_faces(self):
+        cpu = make_cpu(compile_file(ROOT / "examples" / "anaclock.c"))
+        faces = []
+
+        cpu.memory[KEYS_ADDR] = 0
+        self.assertGreater(run_frame(cpu, 3_000_000), 0)
+        faces.append(vram(cpu))
+        for _ in range(6):
+            cpu.memory[KEYS_ADDR] = 64
+            self.assertGreater(run_frame(cpu, 3_000_000), 0)
+            faces.append(vram(cpu))
+            cpu.memory[KEYS_ADDR] = 0
+            self.assertGreater(run_frame(cpu, 3_000_000), 0)
+
+        self.assertTrue(cpu.running)
+        self.assertEqual(len(set(faces)), 7)
+
     def test_elitedemo_runs_with_throttle_turn_and_fire_inputs(self):
         cpu = self.play(
             "elitedemo.c",

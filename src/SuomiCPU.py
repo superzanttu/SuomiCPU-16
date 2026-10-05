@@ -97,7 +97,7 @@ PALETTE_COLORS = [
 KEY_BITS = {
     pygame.K_LEFT: 1, pygame.K_a: 1, pygame.K_RIGHT: 2, pygame.K_d: 2,
     pygame.K_UP: 4, pygame.K_w: 4, pygame.K_DOWN: 8, pygame.K_s: 8,
-    pygame.K_SPACE: 16, pygame.K_RETURN: 32,
+    pygame.K_SPACE: 16, pygame.K_RETURN: 32, pygame.K_TAB: 64,
 }
 
 def load_program_file(path: str | Path) -> AssemblyImage:
@@ -541,4 +541,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

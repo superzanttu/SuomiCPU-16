@@ -14,10 +14,11 @@ Run an example from the repository root:
 python main.py examples/factorial.c
 ```
 
-For a live analog clock with a digital hours, minutes, and seconds readout, run:
+For five analog clock styles, a Nixie-tube display, and a flip clock, run:
 ```console
 python main.py examples/anaclock.c
 ```
+Press Tab to cycle through the seven clock faces.
 
 For a first-person Elite-style space combat demo, run:
 ```console

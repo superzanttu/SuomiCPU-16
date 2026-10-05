@@ -8,7 +8,7 @@ from isa import OPCODES
 
 class AssemblerTests(unittest.TestCase):
     def test_bitmap_font_contains_ascii_and_finnish_glyphs(self):
-        font_path = Path(__file__).parent / "fonts" / "font5x7.asm"
+        font_path = Path(__file__).resolve().parent.parent / "fonts" / "font5x7.asm"
         image = assemble_file(font_path)
         font = next(segment for segment in image.segments if segment.address == 0x4400)
 
@@ -27,7 +27,7 @@ class AssemblerTests(unittest.TestCase):
         self.assertEqual(image.segments[0].data[-2:], b"\x00\x00")
 
     def test_command_tour_covers_every_opcode(self):
-        source = Path(__file__).parent / "examples" / "commands.asm"
+        source = Path(__file__).resolve().parent.parent / "examples" / "commands.asm"
         mnemonics = {
             line.split(";", 1)[0].strip().split()[0].upper()
             for line in source.read_text(encoding="utf-8").splitlines()
