@@ -1,4 +1,4 @@
-// SC-8 showcase: a tour of the machine, written in C for the SC-8 itself.
+// SC-16 showcase: a tour of the machine, written in C for the SC-16 itself.
 // Left/Right (or A/D) change page.  On the benchmark page press Enter to run it.
 // Pages: 1 title, 2 CPU, 3 memory map, 4 graphics, 5 animation, 6 text/font,
 //        7 devices (RTC, keyboard, random numbers), 8 benchmark.
@@ -41,7 +41,7 @@ int ceb[12] = {1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7};
 int cpx[8];
 int cpy[8];
 
-char logo_text[7] = "SC-8 !";
+char logo_text[7] = "SC-16 !";
 int starx[40];
 int stary[40];
 int ballx[3] = {20, 140, 250};
@@ -83,16 +83,19 @@ int cosv(int a)
     return sintab[(a + 8) & 31];
 }
 
-
-int pick(int cond, int a, int b) {
-    if (cond) {
+int pick(int cond, int a, int b)
+{
+    if (cond)
+    {
         return a;
     }
     return b;
 }
 
-char *bit_text(int cond) {
-    if (cond) {
+char *bit_text(int cond)
+{
+    if (cond)
+    {
         return "1";
     }
     return "0";
@@ -104,16 +107,19 @@ void num_text(unsigned int value, char *out)
     int n;
     int i;
     n = 0;
-    if (value == 0) {
+    if (value == 0)
+    {
         tmp[0] = '0';
         n = 1;
     }
-    while (value > 0) {
+    while (value > 0)
+    {
         tmp[n] = '0' + (value % 10);
         value = value / 10;
         n++;
     }
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < n; i++)
+    {
         out[i] = tmp[n - 1 - i];
     }
     out[n] = 0;
@@ -137,11 +143,15 @@ void hex_text(int x, int y, unsigned int v, int digits, unsigned char c)
 {
     int i;
     int d;
-    for (i = 0; i < digits; i++) {
+    for (i = 0; i < digits; i++)
+    {
         d = (v >> ((digits - 1 - i) << 2)) & 15;
-        if (d < 10) {
+        if (d < 10)
+        {
             nb[i] = '0' + d;
-        } else {
+        }
+        else
+        {
             nb[i] = 'A' + d - 10;
         }
     }
@@ -153,7 +163,8 @@ int text_len(char *s)
 {
     int n;
     n = 0;
-    while (s[n]) {
+    while (s[n])
+    {
         n++;
     }
     return n;
@@ -177,17 +188,21 @@ void chrome(char *title)
     int i;
     gfx_rect(0, 0, 320, 14, BLUE);
     gfx_text(6, 3, title, WHITE);
-    gfx_text(278, 3, "SC-8", YELLOW);
+    gfx_text(278, 3, "SC-16", YELLOW);
     gfx_line(0, 14, 319, 14, CYAN);
     gfx_line(0, 226, 319, 226, DARK_GRAY);
     gfx_text(6, 231, "< > PAGE", GRAY);
     gfx_text(96, 231, "UP", DARK_GRAY);
     pnum(114, 231, gfx_ticks() / 60, GRAY);
     gfx_text(150, 231, "S", DARK_GRAY);
-    for (i = 0; i < PAGES; i++) {
-        if (i == page) {
+    for (i = 0; i < PAGES; i++)
+    {
+        if (i == page)
+        {
             gfx_rect(236 + i * 10, 232, 8, 6, YELLOW);
-        } else {
+        }
+        else
+        {
             gfx_rect(236 + i * 10, 232, 8, 6, DARK_GRAY);
         }
     }
@@ -203,18 +218,23 @@ void page_title(void)
     int y;
     int i;
     unsigned char b;
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 7; i++)
+    {
         y = 22 + i * 3 + ((sinv(frame / 2 + i * 2) * 3) / 100) * 2;
         gfx_rect(0, y, 320, 2, rainbow[(i + frame / 6) % 7]);
         y = 200 + i * 3 + ((sinv(frame / 2 + i * 2 + 16) * 3) / 100) * 2;
         gfx_rect(0, y, 320, 2, rainbow[(i + 7 - (frame / 6) % 7) % 7]);
     }
     gfx_rect(0, 40, 320, 100, BLACK);
-    for (g = 0; g < 4; g++) {
-        for (r = 0; r < 7; r++) {
+    for (g = 0; g < 4; g++)
+    {
+        for (r = 0; r < 7; r++)
+        {
             b = logo[g * 7 + r];
-            for (c = 0; c < 5; c++) {
-                if (b & bit5[c]) {
+            for (c = 0; c < 5; c++)
+            {
+                if (b & bit5[c])
+                {
                     x = 91 + g * 36 + c * 6;
                     y = 48 + r * 6 + ((sinv(frame / 2 + g * 3 + c) * 2) / 100);
                     gfx_rect(x, y, 5, 5, rainbow[(r + g + frame / 5) % 7]);
@@ -224,14 +244,15 @@ void page_title(void)
     }
     ctext(100, "A COMPLETE 8-REGISTER COMPUTER", WHITE);
     ctext(112, "CPU - ASSEMBLER - C COMPILER - GRAPHICS", CYAN);
-    ctext(124, "EVERYTHING YOU SEE RUNS ON THE SC-8", YELLOW);
+    ctext(124, "EVERYTHING YOU SEE RUNS ON THE SC-16", YELLOW);
     gfx_text(112, 150, "CLOCK", GRAY);
     pad2(154, 150, gfx_rtc(2), WHITE);
     gfx_text(166, 150, ":", pick((frame >> 4) & 1, WHITE, DARK_GRAY));
     pad2(172, 150, gfx_rtc(1), WHITE);
     gfx_text(184, 150, ":", pick((frame >> 4) & 1, WHITE, DARK_GRAY));
     pad2(190, 150, gfx_rtc(0), WHITE);
-    if ((frame >> 5) & 1) {
+    if ((frame >> 5) & 1)
+    {
         ctext(172, "PRESS RIGHT ARROW TO BEGIN THE TOUR", GREEN);
     }
 }
@@ -264,7 +285,8 @@ void page_cpu(void)
     gfx_text(56, 82, "KEYBOARD AND RTC, VECTORS 2 AND 4", WHITE);
 
     gfx_text(8, 98, "REGISTERS", YELLOW);
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < 8; i++)
+    {
         x = 8 + i * 38;
         panel(x, 110, 34, 16, GREEN);
         gfx_text(x + 3, 114, "R", GREEN);
@@ -347,10 +369,12 @@ void page_graphics(void)
     int y;
     int a;
     gfx_text(8, 20, "320X240 - 256 COLOR PALETTE - DOUBLE BUFFERED", YELLOW);
-    for (i = 0; i < 12; i++) {
+    for (i = 0; i < 12; i++)
+    {
         gfx_rect(8 + i * 14, 32, 12, 12, i);
     }
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < 16; i++)
+    {
         gfx_rect(8 + i * 8, 48, 8, 6, 128 + i * 8);
     }
     gfx_text(190, 34, "12 NAMED COLORS", GRAY);
@@ -359,12 +383,14 @@ void page_graphics(void)
     panel(8, 62, 96, 70, DARK_GRAY);
     gfx_text(12, 65, "LINES", CYAN);
     a = frame / 2;
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < 16; i++)
+    {
         gfx_line(56, 100, 56 + (cosv(i * 2 + a) * 22) / 100 * 2, 100 + (sinv(i * 2 + a) * 22) / 100, rainbow[i % 7]);
     }
     panel(112, 62, 96, 70, DARK_GRAY);
     gfx_text(116, 65, "RECTANGLES", CYAN);
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 6; i++)
+    {
         gfx_rect(122 + i * 12, 82 + ((sinv(frame / 2 + i * 3) * 16) / 100), 10, 22, rainbow[i]);
     }
     panel(216, 62, 96, 70, DARK_GRAY);
@@ -374,14 +400,16 @@ void page_graphics(void)
 
     panel(8, 140, 96, 78, DARK_GRAY);
     gfx_text(12, 143, "SPRITES", CYAN);
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 4; i++)
+    {
         gfx_sprite(16 + i * 20, 160 + ((i & 1) << 3) + ((sinv(frame / 2 + i * 4) * 4) / 100), 8, 8, smiley);
     }
     gfx_text(12, 190, "PALETTE BYTES,", GRAY);
     gfx_text(12, 200, "0 = TRANSPARENT", GRAY);
     panel(112, 140, 96, 78, DARK_GRAY);
     gfx_text(116, 143, "1-BIT BITMAPS", CYAN);
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 7; i++)
+    {
         gfx_bitmap(120 + i * 12, 164, 8, 8, ball, rainbow[(i + frame / 8) % 7]);
     }
     gfx_text(116, 190, "ANY COLOR, MSB", GRAY);
@@ -409,9 +437,11 @@ void page_animation(void)
     int y1;
     int z2;
     int s;
-    for (i = 0; i < 40; i++) {
+    for (i = 0; i < 40; i++)
+    {
         starx[i] = starx[i] - (1 + (i % 3));
-        if (starx[i] < 0) {
+        if (starx[i] < 0)
+        {
             starx[i] = 319;
             stary[i] = 18 + gfx_random() % 205;
         }
@@ -419,7 +449,8 @@ void page_animation(void)
     }
     a = frame / 2;
     b = frame / 3;
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < 8; i++)
+    {
         x = cvx[i];
         y = cvy[i];
         z = cvz[i];
@@ -431,16 +462,20 @@ void page_animation(void)
         cpx[i] = 160 + (x1 * 150) / s;
         cpy[i] = 118 + (y1 * 150) / s;
     }
-    for (i = 0; i < 12; i++) {
+    for (i = 0; i < 12; i++)
+    {
         gfx_line(cpx[cea[i]], cpy[cea[i]], cpx[ceb[i]], cpy[ceb[i]], rainbow[i % 7]);
     }
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 3; i++)
+    {
         ballx[i] = ballx[i] + balldx[i];
         bally[i] = bally[i] + balldy[i];
-        if (ballx[i] < 2 || ballx[i] > 310) {
+        if (ballx[i] < 2 || ballx[i] > 310)
+        {
             balldx[i] = -balldx[i];
         }
-        if (bally[i] < 20 || bally[i] > 214) {
+        if (bally[i] < 20 || bally[i] > 214)
+        {
             balldy[i] = -balldy[i];
         }
         gfx_bitmap(ballx[i], bally[i], 8, 8, ball, rainbow[(i * 2 + 1)]);
@@ -460,12 +495,17 @@ void page_text(void)
     unsigned char bits;
     char line[50];
     gfx_text(8, 20, "BITMAP FONT - ALL PRINTABLE ASCII + OEAA", YELLOW);
-    for (row = 0; row < 3; row++) {
-        for (i = 0; i < 32; i++) {
+    for (row = 0; row < 3; row++)
+    {
+        for (i = 0; i < 32; i++)
+        {
             idx = 32 + row * 32 + i;
-            if (idx > 126) {
+            if (idx > 126)
+            {
                 line[i] = ' ';
-            } else {
+            }
+            else
+            {
                 line[i] = idx;
             }
         }
@@ -477,22 +517,32 @@ void page_text(void)
     gfx_text(8, 94, "BITS 7-3 = PIXELS, BIT 2 = BLANK COLUMN", GRAY);
     idx = (frame / 30) % 6;
     glyph = FONT_ROM + (logo_text[idx] - 32) * 8;
-    for (row = 0; row < 7; row++) {
+    for (row = 0; row < 7; row++)
+    {
         bits = glyph[row];
-        for (col = 0; col < 6; col++) {
-            if (bits & bit8[col]) {
+        for (col = 0; col < 6; col++)
+        {
+            if (bits & bit8[col])
+            {
                 gfx_rect(16 + col * 10, 112 + row * 10, 9, 9, rainbow[(row + frame / 6) % 7]);
-            } else {
+            }
+            else
+            {
                 gfx_rect(16 + col * 10, 112 + row * 10, 9, 9, 10);
             }
         }
     }
-    for (row = 0; row < 8; row++) {
+    for (row = 0; row < 8; row++)
+    {
         hex_text(120, 112 + row * 9, glyph[row], 2, pick(row < 7, GREEN, DARK_GRAY));
-        for (col = 0; col < 8; col++) {
-            if (glyph[row] & bit8[col]) {
+        for (col = 0; col < 8; col++)
+        {
+            if (glyph[row] & bit8[col])
+            {
                 gfx_rect(150 + col * 4, 113 + row * 9, 3, 6, GREEN);
-            } else {
+            }
+            else
+            {
                 gfx_rect(150 + col * 4, 113 + row * 9, 3, 6, DARK_GRAY);
             }
         }
@@ -547,7 +597,8 @@ void page_devices(void)
     gfx_rect(120, 98, 30, 10, pick(keys & KEY_FIRE, GREEN, DARK_GRAY));
     gfx_text(18, 112, "L    R    U    D    FIRE", GRAY);
     gfx_text(16, 121, "MASK", GRAY);
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 6; i++)
+    {
         gfx_text(52 + i * 8, 121, bit_text(keys & (32 >> i)), WHITE);
     }
     gfx_text(106, 121, "IRQ2", GRAY);
@@ -555,29 +606,35 @@ void page_devices(void)
 
     gfx_text(170, 80, "RANDOM - GPU CMD 9", YELLOW);
     panel(170, 92, 142, 38, DARK_GRAY);
-    for (i = 0; i < 40; i++) {
+    for (i = 0; i < 40; i++)
+    {
         x = 172 + (gfx_random() % 136);
         y = 94 + (gfx_random() % 34);
         gfx_rect(x, y, 2, 2, 2 + gfx_random() % 7);
     }
 
     gfx_text(8, 138, "DISTRIBUTION OF 16 BUCKETS (UNIFORM = FLAT)", YELLOW);
-    for (i = 0; i < 40; i++) {
+    for (i = 0; i < 40; i++)
+    {
         r = gfx_random() >> 4;
         hist[r] = hist[r] + 1;
         hist_total = hist_total + 1;
     }
-    if (hist_total >= 16000) {
-        for (i = 0; i < 16; i++) {
+    if (hist_total >= 16000)
+    {
+        for (i = 0; i < 16; i++)
+        {
             hist[i] = hist[i] / 2;
         }
         hist_total = hist_total / 2;
     }
     m = hist_total / 16 + 1;
     panel(8, 150, 304, 62, DARK_GRAY);
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < 16; i++)
+    {
         y = (hist[i] * 30) / m;
-        if (y > 58) {
+        if (y > 58)
+        {
             y = 58;
         }
         gfx_rect(16 + i * 18, 210 - y, 14, y, rainbow[i % 7]);
@@ -589,7 +646,8 @@ void page_devices(void)
 // ---------------------------------------------------------------- page 8
 unsigned int fibo(int n)
 {
-    if (n < 2) {
+    if (n < 2)
+    {
         return n;
     }
     return fibo(n - 1) + fibo(n - 2);
@@ -600,30 +658,48 @@ void bench_block(int test, unsigned int blk)
     int i;
     unsigned int x;
     x = bench_sink;
-    if (test == 0) {
-        for (i = 0; i < 32; i++) {
+    if (test == 0)
+    {
+        for (i = 0; i < 32; i++)
+        {
             x = x + i;
         }
-    } else if (test == 1) {
-        for (i = 0; i < 8; i++) {
+    }
+    else if (test == 1)
+    {
+        for (i = 0; i < 8; i++)
+        {
             x = x * i + 3;
         }
-    } else if (test == 2) {
-        for (i = 0; i < 4; i++) {
+    }
+    else if (test == 2)
+    {
+        for (i = 0; i < 4; i++)
+        {
             x = (x + 9999) / (i + 3);
         }
-    } else if (test == 3) {
-        for (i = 0; i < 32; i++) {
+    }
+    else if (test == 3)
+    {
+        for (i = 0; i < 32; i++)
+        {
             bench_mem[i] = i + blk;
         }
-        for (i = 0; i < 32; i++) {
+        for (i = 0; i < 32; i++)
+        {
             x = x + bench_mem[i];
         }
-    } else if (test == 4) {
+    }
+    else if (test == 4)
+    {
         x = x + fibo(6);
-    } else if (test == 5) {
+    }
+    else if (test == 5)
+    {
         gfx_rect(blk & 127, 100, 10, 10, GREEN);
-    } else {
+    }
+    else
+    {
         gfx_sprite(blk & 127, 120, 8, 8, smiley);
     }
     bench_sink = x;
@@ -631,22 +707,28 @@ void bench_block(int test, unsigned int blk)
 
 int bench_ops(int test)
 {
-    if (test == 0) {
+    if (test == 0)
+    {
         return 32;
     }
-    if (test == 1) {
+    if (test == 1)
+    {
         return 8;
     }
-    if (test == 2) {
+    if (test == 2)
+    {
         return 4;
     }
-    if (test == 3) {
+    if (test == 3)
+    {
         return 64;
     }
-    if (test == 4) {
+    if (test == 4)
+    {
         return 25;
     }
-    if (test == 5) {
+    if (test == 5)
+    {
         return 100;
     }
     return 64;
@@ -664,14 +746,17 @@ void bench_run(int test)
     acc = 0;
     k = 0;
     t = gfx_ticks();
-    while (gfx_ticks() == t) {
+    while (gfx_ticks() == t)
+    {
     }
     t = gfx_ticks();
-    while (gfx_ticks() - t < DUR) {
+    while (gfx_ticks() - t < DUR)
+    {
         bench_block(test, blocks);
         blocks++;
         acc = acc + ops;
-        if (acc >= 1000) {
+        if (acc >= 1000)
+        {
             acc = acc - 1000;
             k++;
         }
@@ -687,22 +772,28 @@ unsigned int host_seconds(void)
 
 char *bench_name(int test)
 {
-    if (test == 0) {
+    if (test == 0)
+    {
         return "INTEGER ADD LOOP";
     }
-    if (test == 1) {
+    if (test == 1)
+    {
         return "16-BIT MULTIPLY";
     }
-    if (test == 2) {
+    if (test == 2)
+    {
         return "16-BIT DIVIDE";
     }
-    if (test == 3) {
+    if (test == 3)
+    {
         return "MEMORY READ+WRITE";
     }
-    if (test == 4) {
+    if (test == 4)
+    {
         return "RECURSIVE CALLS";
     }
-    if (test == 5) {
+    if (test == 5)
+    {
         return "GPU RECT FILL";
     }
     return "GPU SPRITE BLIT";
@@ -710,22 +801,28 @@ char *bench_name(int test)
 
 char *bench_unit(int test)
 {
-    if (test == 0) {
+    if (test == 0)
+    {
         return "K ITER/S";
     }
-    if (test == 1) {
+    if (test == 1)
+    {
         return "K MUL/S";
     }
-    if (test == 2) {
+    if (test == 2)
+    {
         return "K DIV/S";
     }
-    if (test == 3) {
+    if (test == 3)
+    {
         return "K BYTES/S";
     }
-    if (test == 4) {
+    if (test == 4)
+    {
         return "K CALLS/S";
     }
-    if (test == 5) {
+    if (test == 5)
+    {
         return "K PIXELS/S";
     }
     return "K PIXELS/S";
@@ -736,21 +833,30 @@ void page_bench(void)
     int i;
     int w;
     unsigned int t;
-    gfx_text(8, 20, "BENCHMARK - TIMED WITH THE SC-8'S OWN FRAME CLOCK", YELLOW);
-    for (i = 0; i < NTEST; i++) {
+    gfx_text(8, 20, "BENCHMARK - TIMED WITH THE SC-16'S OWN FRAME CLOCK", YELLOW);
+    for (i = 0; i < NTEST; i++)
+    {
         gfx_text(8, 36 + i * 20, bench_name(i), WHITE);
-        if (bench_state == 0 || i >= bench_index) {
-            if (bench_state == 1 && i == bench_index) {
+        if (bench_state == 0 || i >= bench_index)
+        {
+            if (bench_state == 1 && i == bench_index)
+            {
                 gfx_text(150, 36 + i * 20, "RUNNING...", pick((frame >> 3) & 1, YELLOW, ORANGE));
-            } else {
+            }
+            else
+            {
                 gfx_text(150, 36 + i * 20, "-", DARK_GRAY);
             }
-        } else {
+        }
+        else
+        {
             w = bench_kops[i] / bench_scale[i];
-            if (w > 100) {
+            if (w > 100)
+            {
                 w = 100;
             }
-            if (w < 1) {
+            if (w < 1)
+            {
                 w = 1;
             }
             gfx_rect(150, 36 + i * 20, w, 6, rainbow[i]);
@@ -759,28 +865,37 @@ void page_bench(void)
         }
     }
     gfx_line(8, 180, 311, 180, DARK_GRAY);
-    if (bench_state == 2) {
-        gfx_text(8, 186, "SC-8 MARK", CYAN);
+    if (bench_state == 2)
+    {
+        gfx_text(8, 186, "SC-16 MARK", CYAN);
         pnum(80, 186, bench_mark, YELLOW);
         gfx_text(8, 196, "FRAMES", GRAY);
         pnum(80, 196, bench_ticks, WHITE);
         gfx_text(8, 206, "HOST SEC", GRAY);
         pnum(80, 206, bench_host_secs, WHITE);
         gfx_text(150, 186, "EMULATION SPEED", GRAY);
-        if (bench_host_secs > 0) {
+        if (bench_host_secs > 0)
+        {
             t = bench_ticks / bench_host_secs;
             pnum(150, 196, t, GREEN);
             gfx_text(150 + 6 * 3, 196, "FRAMES/S", GRAY);
             pnum(150, 206, (t * 100) / 60, GREEN);
             gfx_text(150 + 6 * 3, 206, "% OF REAL TIME", GRAY);
-        } else {
+        }
+        else
+        {
             gfx_text(150, 196, "UNDER 1 SECOND (RTC TICK)", GRAY);
         }
-    } else if (bench_state == 0) {
-        if ((frame >> 4) & 1) {
+    }
+    else if (bench_state == 0)
+    {
+        if ((frame >> 4) & 1)
+        {
             ctext(196, "PRESS ENTER TO RUN THE BENCHMARK", GREEN);
         }
-    } else {
+    }
+    else
+    {
         ctext(196, "BENCHMARK RUNNING - PLEASE WAIT", ORANGE);
     }
 }
@@ -788,18 +903,22 @@ void page_bench(void)
 void bench_step(void)
 {
     int i;
-    if (bench_state == 1) {
-        if (bench_index == 0) {
+    if (bench_state == 1)
+    {
+        if (bench_index == 0)
+        {
             bench_t0 = gfx_ticks();
             bench_host_start = host_seconds();
         }
         bench_run(bench_index);
         bench_index = bench_index + 1;
-        if (bench_index >= NTEST) {
+        if (bench_index >= NTEST)
+        {
             bench_ticks = gfx_ticks() - bench_t0;
             bench_host_secs = (host_seconds() + 3600 - bench_host_start) % 3600;
             bench_mark = 0;
-            for (i = 0; i < NTEST; i++) {
+            for (i = 0; i < NTEST; i++)
+            {
                 bench_mark = bench_mark + bench_blocks[i] * (60 / DUR);
             }
             bench_state = 2;
@@ -811,51 +930,72 @@ int main(void)
 {
     int i;
     gfx_irq_init();
-    for (i = 0; i < 40; i++) {
+    for (i = 0; i < 40; i++)
+    {
         starx[i] = gfx_random() + (gfx_random() & 63);
         stary[i] = 18 + gfx_random() % 205;
     }
     page = 0;
-    while (1) {
+    while (1)
+    {
         keys = gfx_keys();
         pressed = keys & ~prev_keys;
         prev_keys = keys;
-        if (bench_state != 1) {
-            if (pressed & KEY_RIGHT) {
+        if (bench_state != 1)
+        {
+            if (pressed & KEY_RIGHT)
+            {
                 page = (page + 1) % PAGES;
             }
-            if (pressed & KEY_LEFT) {
+            if (pressed & KEY_LEFT)
+            {
                 page = (page + PAGES - 1) % PAGES;
             }
-            if (page == 7 && (pressed & KEY_START)) {
+            if (page == 7 && (pressed & KEY_START))
+            {
                 bench_state = 1;
                 bench_index = 0;
             }
         }
         frame++;
         gfx_clear(BLACK);
-        if (page == 0) {
+        if (page == 0)
+        {
             page_title();
             chrome("WELCOME");
-        } else if (page == 1) {
+        }
+        else if (page == 1)
+        {
             page_cpu();
             chrome("CPU ARCHITECTURE");
-        } else if (page == 2) {
+        }
+        else if (page == 2)
+        {
             page_memory();
             chrome("MEMORY MAP");
-        } else if (page == 3) {
+        }
+        else if (page == 3)
+        {
             page_graphics();
             chrome("GRAPHICS");
-        } else if (page == 4) {
+        }
+        else if (page == 4)
+        {
             page_animation();
             chrome("REAL-TIME ANIMATION");
-        } else if (page == 5) {
+        }
+        else if (page == 5)
+        {
             page_text();
             chrome("TEXT AND FONT");
-        } else if (page == 6) {
+        }
+        else if (page == 6)
+        {
             page_devices();
             chrome("DEVICES: RTC, KEYBOARD, RANDOM");
-        } else {
+        }
+        else
+        {
             page_bench();
             chrome("BENCHMARK");
         }

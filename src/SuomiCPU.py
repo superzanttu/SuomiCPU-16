@@ -7,97 +7,141 @@ import struct
 import random
 from pathlib import Path
 
+# Tuomme tarvittavat asiat työkaluista
 from tools.assembler import AssemblyError, AssemblyImage, MemorySegment, assemble_file
 from tools.c_compiler import CCompilerError, compile_file
-from .isa import (
-    OP_ADD,
-    OP_ADJSP,
-    OP_AND,
-    OP_BC,
-    OP_BZ,
-    OP_CALL,
-    OP_CMP,
-    OP_DEC,
-    OP_DI,
-    OP_EI,
-    OP_HALT,
-    OP_INC,
-    OP_JMP,
-    OP_JZ,
-    OP_LD,
-    OP_LDW,
-    OP_LDWS,
-    OP_LDI,
-    OP_LDI_H,
-    OP_MOV,
-    OP_NOT,
-    OP_OR,
-    OP_POP,
-    OP_PUSH,
-    OP_RET,
-    OP_RTI,
-    OP_ST,
-    OP_STW,
-    OP_STWS,
-    OP_SHR,
-    OP_SUB,
-    OP_XOR,
-)
-# ==========================================
-# CONFIGURATION & MEMORY MAP
-# ==========================================
-MEM_SIZE = 2**19
-FLASH_START = 0x00000
-RAM_START   = 0x20000
-VRAM_START  = 0x30000
-KBD_ADDR    = 0x43000
-ICR_ADDR    = 0x43002
-RTC_START   = 0x43010
-KEYS_ADDR   = 0x43004   # held-key bitmask: 1 left, 2 right, 4 up, 8 down, 16 fire, 32 start
-GPU_BASE    = 0x43020   # graphics coprocessor registers (see user_guide.md)
-BACK_START  = 0x44000   # off-screen back buffer drawn by the coprocessor
-FONT_ADDR   = 0x4400    # 5x7 font table used by the coprocessor TEXT command
 
+# =============================================================================
+# ISA (Instruction Set Architecture) - Prosessorin "kieli"
+# Tässä määritellään, mitä numeroita prosessori käyttää eri käskyille.
+# =============================================================================
+OP_HALT = 0x00 # Pysäytä kone
+OP_LDI = 0x01  # Laita numero rekisteriin
+OP_LD = 0x02   # Lue muistista rekisteriin
+OP_ST = 0x03   # Tallenna rekisteristä muistiin
+OP_MOV = 0x04  # Kopioi rekisteristä toiseen
+OP_ADD = 0x05  # Laske yhteen
+OP_SUB = 0x06  # Vähennä
+OP_AND = 0x07  # JA-operaatio (bittitason)
+OP_OR = 0x08   # TAI-operaatio (bittitason)
+OP_XOR = 0x09  # XOR-operaatio (bittitason)
+OP_NOT = 0x0A  # Käännä bitit
+OP_JMP = 0x0B  # Hyppää tiettyyn kohtaan
+OP_JZ = 0x0C   # Hyppää jos nolla
+OP_INC = 0x0D  # Kasvata yhdellä
+OP_DEC = 0x0E  # Vähennä yhdellä
+OP_CMP = 0x0F  # Vertaa kahta lukua
+OP_LDI_H = 0x10 # Laita numero rekisterin yläosaan
+OP_EI = 0x11   # Salli keskeytykset
+OP_DI = 0x12   # Estä keskeytykset
+OP_RTI = 0x13  # Palaa keskeytyksestä
+OP_PUSH = 0x14 # Työnnä pinoon
+OP_POP = 0x15  # Poista pinosta
+OP_CALL = 0x16 # Kutsu funktiota
+OP_RET = 0x17  # Palaa funktiosta
+OP_BZ = 0x18   # Hyppää jos nolla (toinen versio)
+OP_LDW = 0x19  # Lue 16-bittinen sana muistista
+OP_STW = 0x1A  # Tallenna 16-bittinen sana muistiin
+OP_LDWS = 0x1B # Lue sana pinon suhteen
+OP_STWS = 0x1C # Tallenna sana pinon suhteen
+OP_ADJSP = 0x1D # Muuta pinon kokoa
+OP_BC = 0x1E   # Hyppää jos kantolippu on päällä
+OP_SHR = 0x1F  # Siirrä bittejä oikealle
+
+# Erikoiskäskyt, jotka käyttävät samaa koodia mutta toimivat eri tavalla
+OP_MOVSP = OP_SHR
+OP_FADD = OP_SHR
+OP_FSUB = OP_SHR
+OP_FMUL = OP_SHR
+OP_FDIV = OP_SHR
+OP_FCMP = OP_SHR
+OP_ITOF = OP_SHR
+OP_FTOI = OP_SHR
+
+# =============================================================================
+# KONFIGURAATIO JA MUISTIKARTTA
+# Tässä päätetään, mihin muistiin mitäkin laitetaan.
+# =============================================================================
+MEM_SIZE = 2**19       # Muistin kokonaiskoko (512 KB)
+FLASH_START = 0x00000 # Ohjelman alkuosa
+RAM_START   = 0x20000 # Työmuistin alku
+VRAM_START  = 0x30000 # Videomuistin alku (tänne piirretään ruutu)
+KBD_ADDR    = 0x43000 # Näppäimistön osoite
+ICR_ADDR    = 0x43002 # Keskeytysten ohjaus
+RTC_START   = 0x43010 # Reaaliaikakello
+KEYS_ADDR   = 0x43004 # Mitkä näppäimet on painettuna
+GPU_BASE    = 0x43020 # Grafiikkapiirin ohjausrekisterit
+BACK_START  = 0x44000 # "Takapuskuri" - piirretään tänne, sitten siirretään ruudulle
+FONT_ADDR   = 0x4400  # Fonttien paikka
+
+# Grafiikkapiirin komennot
 GPU_CLEAR, GPU_PIXEL, GPU_RECT, GPU_LINE = 1, 2, 3, 4
 GPU_SPRITE, GPU_BITMAP, GPU_TEXT, GPU_PRESENT, GPU_RANDOM, GPU_POLY = 5, 6, 7, 8, 9, 10
-GPU_TICKS = 11  # RESULT word (+14/+15) = emulated frame counter
-GPU_RTC = 12  # RESULT byte (+14) = RTC register COLOR (0 sec, 1 min, 2 hour)
+GPU_TICKS = 11  # Laskee kuinka monta ruutua on kulunut
+GPU_RTC = 12    # Kello-tieto
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
-WINDOW_SCALE = 3
+WINDOW_SCALE = 3   # Tehdään ikkunasta isompi, jotta näkyy paremmin
 DISPLAY_FPS = 60
-INSTRUCTIONS_PER_FRAME = 30000
+INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
+
+# Värit, joita kone osaa käyttää
 PALETTE_COLORS = [
     (0, 0, 0), (255, 255, 255), (255, 48, 48), (48, 220, 64),
     (64, 96, 255), (255, 224, 0), (0, 224, 224), (224, 64, 224),
     (255, 144, 0), (150, 150, 150), (80, 80, 80), (128, 0, 0),
 ]
+
+# Näppäimistön yhdistykset
 KEY_BITS = {
     pygame.K_LEFT: 1, pygame.K_a: 1, pygame.K_RIGHT: 2, pygame.K_d: 2,
     pygame.K_UP: 4, pygame.K_w: 4, pygame.K_DOWN: 8, pygame.K_s: 8,
     pygame.K_SPACE: 16, pygame.K_RETURN: 32,
 }
 
-
 def load_program_file(path: str | Path) -> AssemblyImage:
-    """Load an assembly, C source, or flat binary program image."""
+    """Lataa ohjelman tiedostosta (.asm, .c tai .bin)."""
     program_path = Path(path)
     if program_path.suffix.lower() == ".c":
         return compile_file(program_path)
     if program_path.suffix.lower() == ".bin":
         binary = program_path.read_bytes()
         if len(binary) > MEM_SIZE:
-            raise ValueError("binary program exceeds available memory")
+            raise ValueError("Ohjelma on liian suuri muistiin")
         return AssemblyImage((MemorySegment(0, binary),), 0)
     return assemble_file(program_path)
 
-
 class SuomiCompute16:
+    """Tämä on itse tietokoneen sydän (emulaattori)."""
     def __init__(self):
+        # Muisti on kuin pitkä jono numeroita
         self.memory = bytearray(MEM_SIZE)
+        # Rekisterit ovat koneen "lyhytkestoisia muistipaikkoja"
         self.registers = [0] * 8
+        # PC (Program Counter) kertoo, missä kohtaa ohjelmaa ollaan
         self.pc = 0
+        self.entry_point = 0
+        # Pino (Stack) on paikka, jonne tallennetaan tietoa funktioiden ajaksi
+        self.sp = 0x2FFFF
+        self.flags = {'Z': 0, 'C': 0} # Z = nolla, C = kanto (käytetään vertailuissa)
+        self.running = True
+        
+        # Käynnistetään näyttö ja ikkuna
+        pygame.init()
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE))
+        pygame.display.set_caption("SuomiCPU-16 Emulaattori")
+        self.clock = pygame.time.Clock()
+        
+        # Luodaan väripaletti
+        self.palette = [pygame.Color(i, i, i) for i in range(256)]
+        for index, color in enumerate(PALETTE_COLORS):
+            self.palette[index] = color
+        self.palette[25] = (0, 0, 255) # Lisätään yksi sininen väri
+        
+        self.frame_yield = False
+        self.vram_surface = self._create_vram_surface()
+
         self.entry_point = 0
         self.sp = 0x2FFFF
         self.flags = {'Z': 0, 'C': 0}
@@ -105,7 +149,7 @@ class SuomiCompute16:
         
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE))
-        pygame.display.set_caption("SC-8 Flash-Execution Emulator")
+        pygame.display.set_caption("SC-16 Flash-Execution Emulator")
         self.clock = pygame.time.Clock()
         self.palette = [pygame.Color(i, i, i) for i in range(256)]
         for index, color in enumerate(PALETTE_COLORS):
@@ -434,7 +478,7 @@ class SuomiCompute16:
             self.step()
 
     def reset(self):
-        print("SC-8 starting...")
+        print("SC-16 starting...")
         self.registers = [0]*8
         self.sp = 0x2FFFF
         self.pc = self.entry_point

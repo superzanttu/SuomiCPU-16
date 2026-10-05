@@ -1,8 +1,8 @@
-# SC-8 Assembler and Emulator User Guide
+# SC-16 Assembler and Emulator User Guide
 
 ## 1. Overview
 
-SuomiCPU is a Python emulator for the SC-8, a small, byte-addressed machine with
+SuomiCPU is a Python emulator for the SC-16, a small, byte-addressed machine with
 eight general-purpose registers and a 16-bit instruction format. Assembly source
 files use the `.asm` extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
@@ -37,7 +37,7 @@ python SuomiCPU.py examples/factorial.bin
 ```
 
 The compiler defaults to an output file with the input name and a `.bin`
-extension. `-S` emits readable SC-8 assembly instead. The emulator accepts
+extension. `-S` emits readable SC-16 assembly instead. The emulator accepts
 `.asm`, `.c`, and flat `.bin` inputs.
 
 The input file argument is optional. Without a file, the emulator starts at
@@ -172,11 +172,11 @@ otherwise, instructions do not change the condition flags.
 
 ### Program and immediate instructions
 
-| Instruction | Syntax | Operation |
-|---|---|---|
-| `HALT` | `HALT` | Stop execution. |
-| `LDI` | `LDI Rd, value` | Load an immediate value into `Rd`. Values from `0` to `255` use one word. Values from `256` to `65535` expand to `LDI` (low byte) followed by `LDI_H` (high byte). |
-| `LDI_H` | `LDI_H Rd, high_byte` | Replace the high byte of `Rd`, preserving its low byte. `high_byte` must be `0` to `255`. |
+| Instruction | Syntax                | Operation                                                                                                                                                          |
+| ----------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `HALT`      | `HALT`                | Stop execution.                                                                                                                                                    |
+| `LDI`       | `LDI Rd, value`       | Load an immediate value into `Rd`. Values from `0` to `255` use one word. Values from `256` to `65535` expand to `LDI` (low byte) followed by `LDI_H` (high byte). |
+| `LDI_H`     | `LDI_H Rd, high_byte` | Replace the high byte of `Rd`, preserving its low byte. `high_byte` must be `0` to `255`.                                                                          |
 
 For example:
 
@@ -192,15 +192,15 @@ same pair of machine instructions.
 
 ### Memory and register instructions
 
-| Instruction | Syntax | Operation |
-|---|---|---|
-| `LD` | `LD Rd, Ra` | Load one byte from the address in `Ra` into `Rd`. |
-| `ST` | `ST Ra, Rs` | Store the low byte of `Rs` at the address in `Ra`. |
-| `LDW` | `LDW Rd, Ra` | Load a big-endian 16-bit word from the address in `Ra`. |
-| `STW` | `STW Ra, Rs` | Store a big-endian 16-bit word from `Rs` at the address in `Ra`. |
-| `LDWS` | `LDWS Rd, offset` | Load a word from `SP + offset`; offset is 0-255. |
-| `STWS` | `STWS Rs, offset` | Store a word at `SP + offset`; offset is 0-255. |
-| `MOV` | `MOV Rd, Rs` | Copy the register value from `Rs` to `Rd`. |
+| Instruction | Syntax            | Operation                                                        |
+| ----------- | ----------------- | ---------------------------------------------------------------- |
+| `LD`        | `LD Rd, Ra`       | Load one byte from the address in `Ra` into `Rd`.                |
+| `ST`        | `ST Ra, Rs`       | Store the low byte of `Rs` at the address in `Ra`.               |
+| `LDW`       | `LDW Rd, Ra`      | Load a big-endian 16-bit word from the address in `Ra`.          |
+| `STW`       | `STW Ra, Rs`      | Store a big-endian 16-bit word from `Rs` at the address in `Ra`. |
+| `LDWS`      | `LDWS Rd, offset` | Load a word from `SP + offset`; offset is 0-255.                 |
+| `STWS`      | `STWS Rs, offset` | Store a word at `SP + offset`; offset is 0-255.                  |
+| `MOV`       | `MOV Rd, Rs`      | Copy the register value from `Rs` to `Rd`.                       |
 
 Example:
 
@@ -217,18 +217,18 @@ register; its second operand is the value register.
 
 ### Arithmetic and logic
 
-| Instruction | Syntax | Operation |
-|---|---|---|
-| `ADD` | `ADD Rd, Rs` | `Rd = Rd + Rs`; sets `Z` and `C`. |
-| `SUB` | `SUB Rd, Rs` | `Rd = Rd - Rs`; sets `Z` and `C`. |
-| `AND` | `AND Rd, Rs` | `Rd = Rd & Rs`. |
-| `OR` | `OR Rd, Rs` | `Rd = Rd \| Rs`. |
-| `XOR` | `XOR Rd, Rs` | `Rd = Rd ^ Rs`. |
-| `NOT` | `NOT Rd` or `NOT Rd, Rs` | `Rd = ~Rd` or `Rd = ~Rs`, limited to the low eight bits. |
-| `INC` | `INC Rd` | Increment `Rd` by one. |
-| `DEC` | `DEC Rd` | Decrement `Rd` by one. |
-| `CMP` | `CMP Ra, Rb` | Set `Z` and `C` as if subtracting `Rb` from `Ra`, without storing the result. |
-| `SHR` | `SHR Rd` | Logical right shift of the low 16 bits of `Rd` by one. |
+| Instruction | Syntax                   | Operation                                                                     |
+| ----------- | ------------------------ | ----------------------------------------------------------------------------- |
+| `ADD`       | `ADD Rd, Rs`             | `Rd = Rd + Rs`; sets `Z` and `C`.                                             |
+| `SUB`       | `SUB Rd, Rs`             | `Rd = Rd - Rs`; sets `Z` and `C`.                                             |
+| `AND`       | `AND Rd, Rs`             | `Rd = Rd & Rs`.                                                               |
+| `OR`        | `OR Rd, Rs`              | `Rd = Rd \| Rs`.                                                              |
+| `XOR`       | `XOR Rd, Rs`             | `Rd = Rd ^ Rs`.                                                               |
+| `NOT`       | `NOT Rd` or `NOT Rd, Rs` | `Rd = ~Rd` or `Rd = ~Rs`, limited to the low eight bits.                      |
+| `INC`       | `INC Rd`                 | Increment `Rd` by one.                                                        |
+| `DEC`       | `DEC Rd`                 | Decrement `Rd` by one.                                                        |
+| `CMP`       | `CMP Ra, Rb`             | Set `Z` and `C` as if subtracting `Rb` from `Ra`, without storing the result. |
+| `SHR`       | `SHR Rd`                 | Logical right shift of the low 16 bits of `Rd` by one.                        |
 
 For two-register arithmetic/logical operations the first operand is also the
 destination. `CMP` uses its two operands only as inputs.
@@ -247,18 +247,18 @@ not update the flags in the current emulator.
 
 ### Branches
 
-| Instruction | Syntax | Operation |
-|---|---|---|
-| `JMP` | `JMP address_or_label` | Unconditionally set the PC to an absolute byte address. |
-| `JZ` | `JZ Rn, address_or_label` | Jump to an absolute byte address if `Rn` is zero. |
-| `BZ` | `BZ address_or_label` | Jump if the `Z` condition flag is set. |
-| `BC` | `BC address_or_label` | Jump if the `C` condition flag is set. |
-| `CALL` | `CALL address_or_label` | Push the return PC and call an absolute byte address. |
-| `JMPX` | `JMPX address_or_label` | Unconditionally jump to a full 19-bit byte address. |
-| `BZX` | `BZX address_or_label` | Jump to a full 19-bit address if `Z` is set. |
-| `BCX` | `BCX address_or_label` | Jump to a full 19-bit address if `C` is set. |
-| `CALLX` | `CALLX address_or_label` | Call a full 19-bit byte address. |
-| `RET` | `RET` | Pop the return PC from the stack. |
+| Instruction | Syntax                    | Operation                                               |
+| ----------- | ------------------------- | ------------------------------------------------------- |
+| `JMP`       | `JMP address_or_label`    | Unconditionally set the PC to an absolute byte address. |
+| `JZ`        | `JZ Rn, address_or_label` | Jump to an absolute byte address if `Rn` is zero.       |
+| `BZ`        | `BZ address_or_label`     | Jump if the `Z` condition flag is set.                  |
+| `BC`        | `BC address_or_label`     | Jump if the `C` condition flag is set.                  |
+| `CALL`      | `CALL address_or_label`   | Push the return PC and call an absolute byte address.   |
+| `JMPX`      | `JMPX address_or_label`   | Unconditionally jump to a full 19-bit byte address.     |
+| `BZX`       | `BZX address_or_label`    | Jump to a full 19-bit address if `Z` is set.            |
+| `BCX`       | `BCX address_or_label`    | Jump to a full 19-bit address if `C` is set.            |
+| `CALLX`     | `CALLX address_or_label`  | Call a full 19-bit byte address.                        |
+| `RET`       | `RET`                     | Pop the return PC from the stack.                       |
 
 Example:
 
@@ -282,14 +282,14 @@ use them when code or routines are outside the short-address range.
 
 ### Stack and interrupt instructions
 
-| Instruction | Syntax | Operation |
-|---|---|---|
-| `PUSH` | `PUSH Rd` | Push a 16-bit register value to the stack. |
-| `POP` | `POP Rd` | Pop a value from the stack into `Rd`; the register is masked to one byte. |
-| `EI` | `EI` | Set the interrupt-enable bit in the interrupt control register. |
-| `DI` | `DI` | Clear the interrupt-enable bit. |
-| `RTI` | `RTI` | Restore `Z` and the PC from the interrupt stack frame. |
-| `ADJSP` | `ADJSP signed_byte` | Add a signed -128 to 127 byte adjustment to the stack pointer. |
+| Instruction | Syntax              | Operation                                                                 |
+| ----------- | ------------------- | ------------------------------------------------------------------------- |
+| `PUSH`      | `PUSH Rd`           | Push a 16-bit register value to the stack.                                |
+| `POP`       | `POP Rd`            | Pop a value from the stack into `Rd`; the register is masked to one byte. |
+| `EI`        | `EI`                | Set the interrupt-enable bit in the interrupt control register.           |
+| `DI`        | `DI`                | Clear the interrupt-enable bit.                                           |
+| `RTI`       | `RTI`               | Restore `Z` and the PC from the interrupt stack frame.                    |
+| `ADJSP`     | `ADJSP signed_byte` | Add a signed -128 to 127 byte adjustment to the stack pointer.            |
 
 The stack pointer starts at `0x2FFFF`. `PUSH` decrements the pointer by two and
 stores a big-endian word; `POP` reads that word and advances the pointer by two.
@@ -342,16 +342,16 @@ the end of the backing memory.
 The emulator declares these addresses, which now map to distinct backing
 memory ranges:
 
-| Name | Address range | Size |
-|---|---:|---:|
-| Flash | `0x00000`-`0x1FFFF` | 128 KiB |
-| RAM and stack | `0x20000`-`0x2FFFF` | 64 KiB |
-| VRAM | `0x30000`-`0x42BFF` | 76,800 bytes |
-| Keyboard | `0x43000` | 1 byte |
-| Held-key bitmask | `0x43004` | 1 byte |
-| Interrupt control (`ICR`) | `0x43002` | 1 byte |
-| RTC seconds/minutes/hours | `0x43010`-`0x43012` | 3 bytes |
-| Graphics coprocessor registers | `0x43020`-`0x4302E` | 15 bytes |
+| Name                                     |       Address range |         Size |
+| ---------------------------------------- | ------------------: | -----------: |
+| Flash                                    | `0x00000`-`0x1FFFF` |      128 KiB |
+| RAM and stack                            | `0x20000`-`0x2FFFF` |       64 KiB |
+| VRAM                                     | `0x30000`-`0x42BFF` | 76,800 bytes |
+| Keyboard                                 |           `0x43000` |       1 byte |
+| Held-key bitmask                         |           `0x43004` |       1 byte |
+| Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
+| RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
+| Graphics coprocessor registers           | `0x43020`-`0x4302E` |     15 bytes |
 | Back buffer (coprocessor drawing target) | `0x44000`-`0x56BFF` | 76,800 bytes |
 
 The display is 320 by 240 pixels. Each VRAM byte indexes a 256-entry palette:
@@ -435,14 +435,14 @@ referenced, the compiler links [`lib_text.asm`](lib_text.asm), which uses
 [`fonts/font5x7.asm`](fonts/font5x7.asm) to provide a 53-column by 30-row text
 grid of 6x8 cells:
 
-| Routine | C signature | Behavior |
-|---|---|---|
-| `SCREEN_CLEAR` | `void SCREEN_CLEAR(void)` | Clear the display and reset the cursor to `(0, 0)`. |
-| `SCREEN_SET_CURSOR` | `void SCREEN_SET_CURSOR(unsigned char column, unsigned char row)` | Set the zero-based text cursor. |
-| `SCREEN_GET_CURSOR` | `int SCREEN_GET_CURSOR(void)` | Return `(row << 8) \| column`. |
-| `SCREEN_PUTCHAR` | `void SCREEN_PUTCHAR(char ch, unsigned char color)` | Draw one character; newline/carriage return advance to the next row. |
-| `SCREEN_PRINT` | `void SCREEN_PRINT(char *text, unsigned char color)` | Print a zero-terminated string. |
-| `SCREEN_INPUT` | `unsigned int SCREEN_INPUT(char *buffer, unsigned int capacity, unsigned char color)` | Read and echo a line, NUL-terminate it, and return its character count. `capacity` is the maximum character count, so reserve at least `capacity + 1` bytes for the buffer. Enter finishes and Backspace edits. |
+| Routine             | C signature                                                                           | Behavior                                                                                                                                                                                                        |
+| ------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SCREEN_CLEAR`      | `void SCREEN_CLEAR(void)`                                                             | Clear the display and reset the cursor to `(0, 0)`.                                                                                                                                                             |
+| `SCREEN_SET_CURSOR` | `void SCREEN_SET_CURSOR(unsigned char column, unsigned char row)`                     | Set the zero-based text cursor.                                                                                                                                                                                 |
+| `SCREEN_GET_CURSOR` | `int SCREEN_GET_CURSOR(void)`                                                         | Return `(row << 8) \| column`.                                                                                                                                                                                  |
+| `SCREEN_PUTCHAR`    | `void SCREEN_PUTCHAR(char ch, unsigned char color)`                                   | Draw one character; newline/carriage return advance to the next row.                                                                                                                                            |
+| `SCREEN_PRINT`      | `void SCREEN_PRINT(char *text, unsigned char color)`                                  | Print a zero-terminated string.                                                                                                                                                                                 |
+| `SCREEN_INPUT`      | `unsigned int SCREEN_INPUT(char *buffer, unsigned int capacity, unsigned char color)` | Read and echo a line, NUL-terminate it, and return its character count. `capacity` is the maximum character count, so reserve at least `capacity + 1` bytes for the buffer. Enter finishes and Backspace edits. |
 
 Screen text input accepts printable ASCII and Latin-1 keys, echoes the entered
 glyphs, and uses Enter as the line terminator. The library reserves scratch bytes near `0x4300`;
@@ -478,19 +478,19 @@ font. All drawing goes to an off-screen back buffer; `gfx_present()` copies it
 to VRAM in one step and ends the current emulator frame (vsync), so there is
 no flicker.
 
-| Function | Behavior |
-|---|---|
-| `void gfx_clear(unsigned char color)` | Fill the back buffer. |
-| `void gfx_pixel(int x, int y, unsigned char color)` | Plot one pixel. |
-| `void gfx_rect(int x, int y, int w, int h, unsigned char color)` | Filled rectangle. |
-| `void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)` | Line (clipped). |
-| `void gfx_poly(int x, int y, int n, char *pts, unsigned char color)` | Closed outline through `n` signed-byte `(dx, dy)` pairs relative to `(x, y)`. |
-| `void gfx_sprite(int x, int y, int w, int h, unsigned char *data)` | Draw `w*h` palette bytes; 0 is transparent. |
-| `void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char color)` | 1 bit per pixel, MSB first, `(w+7)/8` bytes per row. |
-| `void gfx_text(int x, int y, char *text, unsigned char color)` | 6x8-cell text from the 5x7 font; UTF-8 `??????` and `\n` supported. |
-| `void gfx_present(void)` | Show the back buffer and wait for the next frame. |
-| `unsigned int gfx_keys(void)` | Held-key bitmask. |
-| `unsigned int gfx_random(void)` | Random byte (0-255). |
+| Function                                                                                | Behavior                                                                      |
+| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `void gfx_clear(unsigned char color)`                                                   | Fill the back buffer.                                                         |
+| `void gfx_pixel(int x, int y, unsigned char color)`                                     | Plot one pixel.                                                               |
+| `void gfx_rect(int x, int y, int w, int h, unsigned char color)`                        | Filled rectangle.                                                             |
+| `void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)`                    | Line (clipped).                                                               |
+| `void gfx_poly(int x, int y, int n, char *pts, unsigned char color)`                    | Closed outline through `n` signed-byte `(dx, dy)` pairs relative to `(x, y)`. |
+| `void gfx_sprite(int x, int y, int w, int h, unsigned char *data)`                      | Draw `w*h` palette bytes; 0 is transparent.                                   |
+| `void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char color)` | 1 bit per pixel, MSB first, `(w+7)/8` bytes per row.                          |
+| `void gfx_text(int x, int y, char *text, unsigned char color)`                          | 6x8-cell text from the 5x7 font; UTF-8 `??????` and `\n` supported.           |
+| `void gfx_present(void)`                                                                | Show the back buffer and wait for the next frame.                             |
+| `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                             |
+| `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                          |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter.
@@ -572,14 +572,14 @@ start:
 `CALL`/`RET` and the full-width conditional branches support reusable routines.
 The graphics library calling conventions are:
 
-| Routine | Inputs | Effect |
-|---|---|---|
-| `GFX_PLOT` | `R0=x`, `R1=y`, `R2=color` | Write one palette index at a pixel. Preserves `R0`-`R3`; clobbers `R4`-`R7`. |
-| `GFX_CLEAR` | none | Clear all 320x240 pixels to color 0. Clobbers all registers. |
-| `GFX_HLINE` | `R0=x`, `R1=y`, `R2=length`, `R3=color` | Draw a horizontal line. Length must be 1-255. Clobbers `R0`, `R2`, and `R4`-`R7`. |
-| `GFX_RECT` | `R0=x`, `R1=y`, `R2=width`, `R3=height`, `R4=color` | Draw a filled rectangle. Width and height must be 1-255. Clobbers all registers. |
-| `GFX_SPRITE` | `R0=x`, `R1=y`, `R2=width`, `R3=height`, `R4=data address` | Draw row-major palette bytes; zero is transparent. Clobbers all registers. |
-| `GFX_TEXT` | `R0=x`, `R1=y`, `R2=text-data address`, `R3=color` | Draw 6x8 cells using the font include. Clobbers all registers. |
+| Routine      | Inputs                                                     | Effect                                                                            |
+| ------------ | ---------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `GFX_PLOT`   | `R0=x`, `R1=y`, `R2=color`                                 | Write one palette index at a pixel. Preserves `R0`-`R3`; clobbers `R4`-`R7`.      |
+| `GFX_CLEAR`  | none                                                       | Clear all 320x240 pixels to color 0. Clobbers all registers.                      |
+| `GFX_HLINE`  | `R0=x`, `R1=y`, `R2=length`, `R3=color`                    | Draw a horizontal line. Length must be 1-255. Clobbers `R0`, `R2`, and `R4`-`R7`. |
+| `GFX_RECT`   | `R0=x`, `R1=y`, `R2=width`, `R3=height`, `R4=color`        | Draw a filled rectangle. Width and height must be 1-255. Clobbers all registers.  |
+| `GFX_SPRITE` | `R0=x`, `R1=y`, `R2=width`, `R3=height`, `R4=data address` | Draw row-major palette bytes; zero is transparent. Clobbers all registers.        |
+| `GFX_TEXT`   | `R0=x`, `R1=y`, `R2=text-data address`, `R3=color`         | Draw 6x8 cells using the font include. Clobbers all registers.                    |
 
 Coordinates are pixels from the top-left. Drawing beyond the screen is not
 clipped. Pixel and sprite colors are palette indexes. A sprite is a sequence of
@@ -596,13 +596,13 @@ renderers. In particular, `GFX_CLEAR`, `GFX_RECT`, `GFX_SPRITE`, and `GFX_TEXT`
 execute many instructions per pixel. Use them sparingly in timing-sensitive
 loops. Code, graphics scratch data, and the stack must not overlap.
 
-## SC-8 showcase and timing/interrupt additions
+## SC-16 showcase and timing/interrupt additions
 
 GPU commands 11 and 12 (in addition to 1-10):
 
-| Cmd | Name  | Effect |
-|-----|-------|--------|
-| 11  | TICKS | Frame counter written big-endian to RESULT (+14/+15) |
+| Cmd | Name  | Effect                                                                |
+| --- | ----- | --------------------------------------------------------------------- |
+| 11  | TICKS | Frame counter written big-endian to RESULT (+14/+15)                  |
 | 12  | RTC   | RTC register selected by COLOR (0 sec, 1 min, 2 hour) to RESULT (+14) |
 
 C builtins: `gfx_ticks()`, `gfx_rtc(field)`, `gfx_irq_init()` (executes EI),

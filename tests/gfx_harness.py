@@ -1,4 +1,4 @@
-"""Headless helpers for running compiled SC-8 programs frame by frame."""
+"""Headless helpers for running compiled SC-16 programs frame by frame."""
 from pathlib import Path
 
 from src.SuomiCPU import BACK_START, KEYS_ADDR, MEM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START, SuomiCompute16

@@ -23,4 +23,4 @@ binary_bytes:
 
 .address 0x0230
 message:
-    .data string "SC-8", " ready!\n"
+    .data string "SC-16", " ready!\n"

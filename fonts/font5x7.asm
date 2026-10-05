@@ -1,4 +1,4 @@
-; SC-8 5x7 bitmap font in 6x8 cells.
+; SC-16 5x7 bitmap font in 6x8 cells.
 ; ASCII glyphs are ordered from space (index 0) through tilde (index 94).
 ; The next six glyphs are ö, ä, å, Ö, Ä, Å in that order.
 ; Each row uses bits 7..3 for five pixels; bits 1..0 are unused.

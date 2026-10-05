@@ -9,7 +9,7 @@ MEMORY_SIZE = 1 << 19
 
 
 class AssemblyError(ValueError):
-    """Raised when assembly source cannot be encoded for the SC-8."""
+    """Raised when assembly source cannot be encoded for the SC-16."""
 
 
 @dataclass(frozen=True)
@@ -494,7 +494,7 @@ def assemble(
 
 
 def assemble_file(path: str | Path, origin: int = 0) -> AssemblyImage:
-    """Read and assemble an UTF-8 SC-8 assembly file."""
+    """Read and assemble an UTF-8 SC-16 assembly file."""
     source_path = Path(path).resolve()
     try:
         source = source_path.read_text(encoding="utf-8-sig")

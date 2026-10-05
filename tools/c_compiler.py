@@ -1,4 +1,4 @@
-"""A small, self-contained C89 subset compiler for the SC-8."""
+"""A small, self-contained C89 subset compiler for the SC-16."""
 
 import argparse
 import ast
@@ -2110,18 +2110,18 @@ def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
         source_directory = Path(filename).resolve().parent
         image = assemble(assembly, base_directory=source_directory)
     except AssemblyError as exc:
-        raise CCompilerError(f"{filename}: generated SC-8 assembly is invalid: {exc}") from exc
+        raise CCompilerError(f"{filename}: generated SC-16 assembly is invalid: {exc}") from exc
     return assembly, image
 
 
 def compile_to_assembly(source: str, filename: str = "<input>") -> str:
-    """Compile the supported C89 subset to SC-8 assembly source."""
+    """Compile the supported C89 subset to SC-16 assembly source."""
     assembly, _ = _compile(source, filename)
     return assembly
 
 
 def compile_source(source: str, filename: str = "<input>") -> AssemblyImage:
-    """Compile C source to an assembled SC-8 program image."""
+    """Compile C source to an assembled SC-16 program image."""
     return _compile(source, filename)[1]
 
 
@@ -2146,7 +2146,7 @@ def _flat_binary(image: AssemblyImage) -> bytes:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Compile the SC-8 C89 subset.")
+    parser = argparse.ArgumentParser(description="Compile the SC-16 C89 subset.")
     parser.add_argument("source", help="input C source file")
     parser.add_argument("-o", "--output", help="output path; defaults to input .bin")
     parser.add_argument(
