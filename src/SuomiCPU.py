@@ -90,6 +90,7 @@ GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 
 # Tile map: SRC=map (1 byte per tile = palette color, 0 black), W/H=map size in tiles,
 # X/Y=camera pixel position. Draws 16x16 tiles over the whole back buffer.
 GPU_TILEMAP = 21
+SPEED_ADDR  = 0x43003 # Speed register: 0 = fixed (60 fps, 30000 instr/frame), 1 = maximum (unthrottled)
 TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
@@ -97,6 +98,7 @@ SCREEN_HEIGHT = 240
 DOUBLE_CLICK_MS = 400  # Max gap between two clicks counted as a double click
 WINDOW_SCALE = 3   # Tehdään ikkunasta isompi, jotta näkyy paremmin
 DISPLAY_FPS = 60
+MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed register selects maximum speed
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
 
 # Värit, joita kone osaa käyttää
@@ -884,7 +886,8 @@ class SuomiCompute16:
     def execute_frame(self):
         self.frame_yield = False
         self.frames = (getattr(self, 'frames', 0) + 1) & 0xFFFF
-        for _ in range(INSTRUCTIONS_PER_FRAME):
+        budget = MAX_SPEED_INSTRUCTIONS if self.memory[SPEED_ADDR] else INSTRUCTIONS_PER_FRAME
+        for _ in range(budget):
             if not self.running or self.frame_yield:
                 break
             self.step()
@@ -942,6 +945,7 @@ class SuomiCompute16:
         self.reset()
         self.window_open = True
         deferred_release = 0
+        turbo_frames = 0
         while self.window_open:
             fresh_keys = 0
             for event in pygame.event.get():
@@ -979,13 +983,17 @@ class SuomiCompute16:
                 break
             self.begin_mouse_frame()
             self.update_rtc()
+            was_turbo = self.memory[SPEED_ADDR]
             self.execute_frame()
             self.end_mouse_frame()
             if deferred_release:
                 self.release_keys(deferred_release)
                 deferred_release = 0
-            self.update_display()
-            self.clock.tick(DISPLAY_FPS)
+            turbo_frames += 1
+            if not (self.memory[SPEED_ADDR] and was_turbo) or turbo_frames % 32 == 0:
+                self.update_display()
+            if not self.memory[SPEED_ADDR]:
+                self.clock.tick(DISPLAY_FPS)
 
 def main():
     parser = argparse.ArgumentParser(description="Run the SC-16 emulator.")

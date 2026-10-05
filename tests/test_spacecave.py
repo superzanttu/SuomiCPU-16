@@ -74,13 +74,173 @@ class Game:
         return [bytes(memory[base + t * 9:base + t * 9 + 8]).decode().strip() for t in range(8)]
 
 
-def start(count, name_prefix="P", settle=120):
+def start(count, name_prefix="P", settle=120, mission=False):
     game = Game(count)
     for i in range(count):
+        if mission:
+            game.cpus[i].memory[KEYS] = 1  # LEFT toggles the mode in the menu
+            run_frame(game.cpus[i])
+            game.cpus[i].memory[KEYS] = 0
+            run_frame(game.cpus[i])
         game.join(i, f"{name_prefix}{i}")
         game.frames(3)
     game.frames(settle)
     return game
+
+
+def host_of(game):
+    return min(range(len(game.cpus)), key=lambda i: game.cpus[i].net.slot)
+
+
+def put(game, index, name, value, entry=0, size=2):
+    address = GLOBAL_BASE + OFFSETS[name] + entry * size
+    if size == 1:
+        game.cpus[index].memory[address] = value
+    else:
+        game.cpus[index].write_16(address, value & 0xFFFF)
+
+
+def force_objective(game, index, otype, items):
+    put(game, index, "otype", otype)
+    put(game, index, "ob_left", len(items))
+    put(game, index, "ob_hp", 100)
+    for k in range(6):
+        x, y = items[k] if k < len(items) else (-1, 0)
+        put(game, index, "obx", x, k)
+        put(game, index, "oby", y, k)
+
+
+def park(game, index, entry, x, y):
+    for name, value in (("px", x), ("py", y), ("pvx", 0), ("pvy", 0)):
+        put(game, index, name, value, entry)
+    put(game, index, "pinv", 0, entry, 1)
+    cave = GLOBAL_BASE + OFFSETS["cave"]
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            game.cpus[index].memory[cave + ((y >> 4) + dy) * 64 + (x >> 4) + dx] = 0
+
+
+class MissionTests(unittest.TestCase):
+    def test_classic_mode_has_no_drones_or_target(self):
+        game = start(1)
+        self.assertEqual(game.var(0, "gmode"), 0)
+        self.assertEqual([game.var(0, "dhp", k, 1) for k in range(4)], [0] * 4)
+        self.assertEqual(game.var(0, "obx", 0), -1)
+
+    def test_mission_mode_spawns_target_and_drones_and_syncs_clients(self):
+        game = start(2, mission=True)
+        for i in range(2):
+            self.assertEqual(game.var(i, "gmode"), 1)
+            self.assertGreaterEqual(game.var(i, "obx", 0), 0)
+            self.assertEqual([game.var(i, "dhp", k, 1) for k in range(4)], [20] * 4)
+        self.assertEqual(game.var(0, "otype"), game.var(1, "otype"))
+        self.assertEqual(game.var(0, "otype"), game.var(0, "cave_seed", size=2, signed=False) % 3)
+        self.assertEqual(game.var(0, "obx", 0), game.var(1, "obx", 0))
+
+    def test_client_adopts_hosts_mode(self):
+        game = Game(2)
+        game.cpus[0].memory[KEYS] = 1  # LEFT toggles Mission mode in the menu
+        run_frame(game.cpus[0])
+        game.cpus[0].memory[KEYS] = 0
+        run_frame(game.cpus[0])
+        for i in (0, 1):
+            game.join(i, f"P{i}")
+            game.frames(3)
+        game.frames(120)
+        self.assertEqual(game.var(0, "gmode"), 1)
+        self.assertEqual(game.var(1, "gmode"), 1)
+
+    def test_drones_roam(self):
+        game = start(1, mission=True)
+        before = [(game.var(0, "dfx", k), game.var(0, "dfy", k)) for k in range(4)]
+        game.frames(120)
+        after = [(game.var(0, "dfx", k), game.var(0, "dfy", k)) for k in range(4)]
+        self.assertNotEqual(before, after)
+
+    def test_beacon_gives_bonus_and_moves(self):
+        game = start(2, mission=True)
+        host = host_of(game)
+        me = game.var(host, "me")
+        x, y = game.var(host, "obx", 0), game.var(host, "oby", 0)
+        force_objective(game, host, 0, [(x, y)])
+        put(game, host, "pscore", 0, me)
+        park(game, host, me, x, y)
+        game.frames(2)
+        self.assertGreaterEqual(game.var(host, "pscore", me), 150)
+        moved = (game.var(host, "obx", 0), game.var(host, "oby", 0))
+        self.assertNotEqual(moved, (x, y))
+        game.frames(10)
+        self.assertEqual(game.var(1 - host, "pscore", me), game.var(host, "pscore", me))
+
+    def test_reactor_destroyed_by_shots(self):
+        game = start(1, mission=True)
+        me = game.var(0, "me")
+        x, y = game.var(0, "obx", 0), game.var(0, "oby", 0)
+        force_objective(game, 0, 1, [(x, y)])
+        put(game, 0, "ob_hp", 20)
+        put(game, 0, "pscore", 0, me)
+        park(game, 0, me, x - 60, y)
+        put(game, 0, "blife", 5, 0, 1)
+        put(game, 0, "bx", x - 2, 0)
+        put(game, 0, "by", y, 0)
+        put(game, 0, "bvx", 0, 0)
+        put(game, 0, "bvy", 0, 0)
+        put(game, 0, "bown", me, 0, 1)
+        game.frames(2)
+        self.assertEqual(game.var(0, "pscore", me), 300)
+        self.assertEqual(game.var(0, "obx", 0), -1)
+        game.frames(620)
+        self.assertGreaterEqual(game.var(0, "obx", 0), 0)
+        self.assertEqual(game.var(0, "ob_hp"), 100)
+
+    def test_crystals_score_each_and_set_bonus(self):
+        game = start(1, mission=True)
+        me = game.var(0, "me")
+        a = (game.var(0, "chx", 0, 1) * 16 + 8, game.var(0, "chy", 0, 1) * 16 + 8)
+        b = (game.var(0, "chx", 1, 1) * 16 + 8, game.var(0, "chy", 1, 1) * 16 + 8)
+        force_objective(game, 0, 2, [a, b])
+        put(game, 0, "pscore", 0, me)
+        park(game, 0, me, *a)
+        game.frames(2)
+        self.assertEqual(game.var(0, "pscore", me), 40)
+        self.assertEqual(game.var(0, "ob_left"), 1)
+        park(game, 0, me, *b)
+        game.frames(2)
+        self.assertEqual(game.var(0, "pscore", me), 180)
+        self.assertEqual(game.var(0, "ob_left"), 6)  # a fresh set of six
+
+    def test_shooting_a_drone_scores(self):
+        game = start(1, mission=True)
+        me = game.var(0, "me")
+        park(game, 0, me, 100, 100)
+        x, y = game.var(0, "chx", 5, 1) * 16 + 8, game.var(0, "chy", 5, 1) * 16 + 8
+        put(game, 0, "dfx", x << 3, 0)
+        put(game, 0, "dfy", y << 3, 0)
+        put(game, 0, "dhp", 20, 0, 1)
+        put(game, 0, "pscore", 0, me)
+        put(game, 0, "blife", 5, 0, 1)
+        put(game, 0, "bx", x, 0)
+        put(game, 0, "by", y, 0)
+        put(game, 0, "bvx", 0, 0)
+        put(game, 0, "bvy", 0, 0)
+        put(game, 0, "bown", me, 0, 1)
+        game.frames(1)
+        self.assertEqual(game.var(0, "dhp", 0, 1), 0)
+        self.assertEqual(game.var(0, "pscore", me), 25)
+
+    def test_drone_rams_pilot(self):
+        game = start(1, mission=True)
+        me = game.var(0, "me")
+        x, y = game.var(0, "chx", 5, 1) * 16 + 8, game.var(0, "chy", 5, 1) * 16 + 8
+        park(game, 0, me, x, y)
+        put(game, 0, "pinv", 0, me, 1)
+        put(game, 0, "dfx", x << 3, 1)
+        put(game, 0, "dfy", y << 3, 1)
+        put(game, 0, "dhp", 20, 1, 1)
+        game.frames(1)
+        self.assertEqual(game.var(0, "dhp", 1, 1), 0)
+        self.assertLess(game.var(0, "php", me, 1), 100)
+        self.assertGreater(game.var(0, "php", me, 1), 0)
 
 
 class SpaceCaveTests(unittest.TestCase):

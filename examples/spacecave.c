@@ -4,7 +4,14 @@
 //     python main.py examples/spacecave.c
 //
 // Controls: Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard.
-// Menu: type a nickname (A-Z, 0-9, space), Enter joins, Tab shows the controls.
+// Menu: type a nickname (A-Z, 0-9, space), Left/Right picks the mode, Enter joins, Tab shows the controls.
+//
+// Modes (the host's choice decides for the whole match):
+//   * Classic: pure dogfight against pilots and turrets.
+//   * Mission: every map has one target (chosen by the map seed) - a BEACON to fly into
+//     (+150, then it moves), a REACTOR to shoot down (+300, rebuilt after 10 s) or six
+//     CRYSTALS to collect (+40 each, +100 for the full set). Drones roam the caves, home in
+//     on pilots in view and ram them; shooting one scores +25.
 //
 // Architecture (server-authoritative, no dedicated server program):
 //   * The player with the lowest network slot is the host. The host alone simulates
@@ -47,7 +54,18 @@
 #define M_WORLD 6
 #define M_EVENT 7
 #define M_PLAYER 8
+#define M_DRONE 9
+#define M_OBJ 10
 
+#define MAXD 4
+#define MAXO 6
+#define DRONE_HP 20
+#define REACTOR_HP 100
+#define FROM_TARGET 10                       // Kill-feed codes: 10 target, 11 drone
+#define FROM_DRONE 11
+
+#define EV_PICK 7
+#define EV_DRONE 8
 #define EV_KILL 1
 #define EV_TURRET 2
 #define EV_IMPACT 3
@@ -84,6 +102,13 @@ unsigned char blife[20], bown[20];           // bown: 0-7 player, 8 turret
 int tx[12], ty[12], ttimer[12];
 unsigned char thp[12], taim[12], tcool[12], tboost[12];
 int nt;
+
+// Mission mode (gmode 1): one target per map (otype 0 beacon, 1 reactor, 2 crystals)
+// plus roaming drones. Classic mode (gmode 0) uses none of this.
+int gmode, otype, ob_hp, ob_timer, ob_left;
+int obx[6], oby[6];                          // Target items; obx = -1 means not present
+int dfx[4], dfy[4], dtimer[4];               // Drone position in 1/8 pixel units
+unsigned char dhp[4], ddir[4];
 
 int qx[40], qy[40], qvx[40], qvy[40];        // Particles in 1/4 pixel units
 unsigned char qlife[40], qcol[40];
@@ -287,6 +312,62 @@ void reset_mirror(void) {
     for (i = 0; i < MAXP; i++) { pused[i] = 0; php[i] = 0; pstale[i] = 0; }
     for (i = 0; i < MAXB; i++) blife[i] = 0;
     for (i = 0; i < MAXPART; i++) qlife[i] = 0;
+    for (i = 0; i < MAXD; i++) dhp[i] = 0;
+    for (i = 0; i < MAXO; i++) obx[i] = -1;
+}
+
+/* --- 3b. Mission mode setup: target placement and drone spawning (host) --- */
+int lastc;
+
+/* Puts the map's target in random chambers: 1 item (beacon, reactor) or 6 crystals */
+void place_objective(void) {
+    int n, c, k;
+    unsigned char cused[12];
+    for (k = 0; k < 12; k++) cused[k] = 0;
+    for (k = 0; k < MAXO; k++) obx[k] = -1;
+    n = 1;
+    if (otype == 2) n = 6;
+    else cused[lastc] = 1;                    // The next beacon/reactor moves to another chamber
+    for (k = 0; k < n; k++) {
+        c = rnd(12);
+        while (cused[c]) c = (c + 1) % 12;
+        cused[c] = 1;
+        obx[k] = chx[c] * 16 + 8;
+        oby[k] = chy[c] * 16 + 8;
+        if (otype == 2) {
+            obx[k] = obx[k] + (rnd(3) - 1) * 16;
+            oby[k] = oby[k] + (rnd(3) - 1) * 16;
+        }
+        lastc = c;
+    }
+    ob_left = n;
+    ob_hp = REACTOR_HP;
+}
+
+/* Drone appears in a chamber away from every pilot */
+void spawn_drone(int k) {
+    int tries, c, t, ok;
+    for (tries = 0; tries < 20; tries++) {
+        c = rnd(12);
+        ok = 1;
+        for (t = 0; t < MAXP; t++) {
+            if (php[t] > 0 && iabs(px[t] - chx[c] * 16) + iabs(py[t] - chy[c] * 16) < 200) ok = 0;
+        }
+        if (ok) break;
+    }
+    dfx[k] = (chx[c] * 16 + 8) << 3;
+    dfy[k] = (chy[c] * 16 + 8) << 3;
+    dhp[k] = DRONE_HP;
+    ddir[k] = rnd(32);
+    dtimer[k] = 0;
+}
+
+void init_mission(void) {
+    int k;
+    otype = cave_seed % 3;
+    lastc = 0;
+    place_objective();
+    for (k = 0; k < MAXD; k++) spawn_drone(k);
 }
 
 void make_world(unsigned int seed) {
@@ -298,6 +379,7 @@ void make_world(unsigned int seed) {
     reset_mirror();
     cave_ok = 1;
     rs = seed ^ gfx_ticks() ^ 0x5A5A;
+    if (gmode) init_mission();
 }
 
 /* --- 4. Particles, kill feed, audio and events --- */
@@ -365,6 +447,17 @@ void handle_event(int kind, int a, int b, int x, int y) {
     } else if (kind == EV_CRASH) {
         burst(x, y, 7, 3, YELLOW, GRAY);
         if (near) gfx_sound(2, 220, 8, WAVE_NOISE, 45);
+    } else if (kind == EV_PICK) {
+        burst(x, y, 22, 4, YELLOW, pcol[a & 7]);
+        if (near) {
+            gfx_sound(2, 600, 8, WAVE_SQUARE, 50);
+            if (b) gfx_sound(3, 900, 14, WAVE_SQUARE, 50);
+        }
+        feed_add(a, FROM_TARGET);
+    } else if (kind == EV_DRONE) {
+        burst(x, y, 14, 3, ORANGE, YELLOW);
+        if (near) gfx_sound(2, 260, 10, WAVE_NOISE, 50);
+        if (a < 8) feed_add(a, FROM_DRONE);
     } else if (kind == EV_TFIRE) {
         if (near) gfx_sound(3, 330, 7, WAVE_TRIANGLE, 30);
     } else if (kind == EV_FIRE) {
@@ -421,7 +514,7 @@ void hurt(int t, int amount, int killer) {
     if (killer < 8 && killer != t) {
         pkills[killer] = pkills[killer] + 1;
         add_score(killer, 100);
-    } else if (killer != 8) {
+    } else if (killer != 8 && killer != FROM_DRONE) {
         add_score(t, -10);
         killer = 9;
     }
@@ -445,6 +538,28 @@ void destroy_turret(int k, int owner) {
     ttimer[k] = 600 + rnd(1200);              // Auto-repair in 10-30 seconds
     if (owner < 8) add_score(owner, 50);
     event(EV_TURRET, k, owner, tx[k], ty[k]);
+}
+
+void kill_drone(int k, int owner) {
+    dhp[k] = 0;
+    dtimer[k] = 300 + rnd(300);
+    if (owner < 8) add_score(owner, 25);
+    event(EV_DRONE, owner, k, dfx[k] >> 3, dfy[k] >> 3);
+}
+
+void hit_reactor(int owner) {
+    int x, y;
+    if (ob_hp > 20) {
+        ob_hp = ob_hp - 20;
+        return;
+    }
+    x = obx[0]; y = oby[0];
+    ob_hp = 0;
+    obx[0] = -1;
+    ob_left = 0;
+    ob_timer = 600;                           // A new reactor comes online in 10 seconds
+    add_score(owner, 300);
+    event(EV_PICK, owner, 1, x, y);
 }
 
 void sim_bullets(void) {
@@ -474,6 +589,19 @@ void sim_bullets(void) {
                 else destroy_turret(k, bown[i]);
                 done = 1;
             }
+        }
+        for (k = 0; k < MAXD && !done && gmode && bown[i] < 8; k++) {
+            if (dhp[k] > 0 && iabs(bx[i] - (dfx[k] >> 3)) < 7 && iabs(by[i] - (dfy[k] >> 3)) < 7) {
+                event(EV_IMPACT, 0, 0, bx[i], by[i]);
+                kill_drone(k, bown[i]);
+                done = 1;
+            }
+        }
+        if (!done && gmode && otype == 1 && bown[i] < 8 && obx[0] >= 0
+            && iabs(bx[i] - obx[0]) < 10 && iabs(by[i] - oby[0]) < 10) {
+            event(EV_IMPACT, 0, 0, bx[i], by[i]);
+            hit_reactor(bown[i]);
+            done = 1;
         }
         if (done) blife[i] = 0;
     }
@@ -655,6 +783,100 @@ void sim_turrets(void) {
     }
 }
 
+/* --- 7b. Mission mode: drones and target (host) --- */
+int drone_blocked(int x, int y) {
+    return wall(x - 3, y - 3) || wall(x + 3, y - 3) || wall(x - 3, y + 3) || wall(x + 3, y + 3);
+}
+
+/* Drones wander through the caves; a pilot in view makes them home in and ram */
+void sim_drones(void) {
+    int k, t, best, bd, d, ax, ay, dx, dy, cr, sp, nx, ny;
+    for (k = 0; k < MAXD; k++) {
+        if (dhp[k] == 0) {
+            if (dtimer[k] > 0) {
+                dtimer[k] = dtimer[k] - 1;
+                if (dtimer[k] == 0) spawn_drone(k);
+            }
+            continue;
+        }
+        ax = dfx[k] >> 3;
+        ay = dfy[k] >> 3;
+        best = -1;
+        bd = 170;
+        for (t = 0; t < MAXP; t++) {
+            if (php[t] > 0) {
+                d = iabs(px[t] - ax) + iabs(py[t] - ay);
+                if (d < bd && los(ax, ay, px[t], py[t])) { bd = d; best = t; }
+            }
+        }
+        sp = 1;
+        if (best >= 0) {
+            sp = 3;
+            if ((frame & 3) == 0) {
+                dx = px[best] - ax;
+                dy = py[best] - ay;
+                cr = dxT[ddir[k]] * dy - dyT[ddir[k]] * dx;
+                if (cr >= 0) ddir[k] = (ddir[k] + 1) & 31;
+                else ddir[k] = (ddir[k] + 31) & 31;
+            }
+        } else if ((frame & 63) == 0 && rnd(3) == 0) {
+            ddir[k] = (ddir[k] + 30 + rnd(5)) & 31;
+        }
+        nx = dfx[k] + ((dxT[ddir[k]] * sp) >> 1);
+        ny = dfy[k] + ((dyT[ddir[k]] * sp) >> 1);
+        if (drone_blocked(nx >> 3, ny >> 3)) {
+            ddir[k] = (ddir[k] + 14 + rnd(5)) & 31;
+        } else {
+            dfx[k] = nx;
+            dfy[k] = ny;
+        }
+        ax = dfx[k] >> 3;
+        ay = dfy[k] >> 3;
+        for (t = 0; t < MAXP && dhp[k] > 0; t++) {
+            if (php[t] > 0 && pinv[t] == 0 && iabs(px[t] - ax) < 8 && iabs(py[t] - ay) < 8) {
+                kill_drone(k, 8);
+                hurt(t, 25, FROM_DRONE);
+            }
+        }
+    }
+}
+
+/* Beacon and crystals are collected by flying into them; the reactor is shot (see sim_bullets) */
+void sim_objective(void) {
+    int t, k, x, y;
+    if (otype == 1) {
+        if (obx[0] < 0 && ob_timer > 0) {
+            ob_timer = ob_timer - 1;
+            if (ob_timer == 0) place_objective();
+        }
+        return;
+    }
+    for (t = 0; t < MAXP; t++) {
+        if (php[t] == 0) continue;
+        for (k = 0; k < MAXO; k++) {
+            if (obx[k] >= 0 && iabs(px[t] - obx[k]) < 12 && iabs(py[t] - oby[k]) < 12) {
+                x = obx[k];
+                y = oby[k];
+                obx[k] = -1;
+                ob_left = ob_left - 1;
+                if (otype == 0) {
+                    add_score(t, 150);
+                    event(EV_PICK, t, 1, x, y);
+                    place_objective();
+                } else if (ob_left == 0) {
+                    add_score(t, 140);        // 40 for the crystal + 100 set bonus
+                    event(EV_PICK, t, 1, x, y);
+                    place_objective();
+                } else {
+                    add_score(t, 40);
+                    event(EV_PICK, t, 0, x, y);
+                }
+                break;
+            }
+        }
+    }
+}
+
 /* --- 8. Player management (host) --- */
 int find_net(int ns) {
     int t;
@@ -718,6 +940,7 @@ void become_host(void) {
         tcool[k] = 40;
         if (thp[k] == 0) ttimer[k] = 600;
     }
+    if (gmode && otype == 1 && obx[0] < 0) ob_timer = 300;
 }
 
 /* --- 9. Networking --- */
@@ -763,6 +986,28 @@ void send_turrets(void) {
     net_send(obuf, 2 + nt * 2);
 }
 
+void send_drones(void) {
+    int k;
+    obuf[0] = M_DRONE;
+    for (k = 0; k < MAXD; k++) {
+        obuf[1 + k * 5] = dhp[k];
+        obuf[2 + k * 5] = ddir[k];
+        put16(3 + k * 5, dfx[k] >> 3);
+        put16(5 + k * 5, dfy[k] >> 3);
+    }
+    net_send(obuf, 1 + MAXD * 5);
+}
+
+void send_objective(void) {
+    int k;
+    obuf[0] = M_OBJ; obuf[1] = otype; obuf[2] = ob_hp; obuf[3] = ob_left;
+    for (k = 0; k < MAXO; k++) {
+        put16(4 + k * 4, obx[k]);
+        put16(6 + k * 4, oby[k]);
+    }
+    net_send(obuf, 4 + MAXO * 4);
+}
+
 void host_broadcast(void) {
     int t;
     if ((frame & 1) == 0) {
@@ -773,11 +1018,14 @@ void host_broadcast(void) {
         send_bullets(0);
         send_bullets(1);
         send_turrets();
+        if (gmode) send_drones();
     }
+    if (gmode && (frame & 7) == 6) send_objective();
     if ((frame & 31) == 5) {
         obuf[0] = M_WORLD;
         put16(1, cave_seed);
-        net_send(obuf, 3);
+        obuf[3] = gmode;
+        net_send(obuf, 4);
     }
     if ((frame & 15) == 3) {
         for (t = 0; t < MAXP; t++) {
@@ -813,7 +1061,23 @@ void handle_message(int n) {
     }
     if (s != hnet) return;                    // Only the host is trusted
     if (type == M_WORLD) {
-        if (!cave_ok || get16(1) != cave_seed) make_world(get16(1));
+        if (!cave_ok || get16(1) != cave_seed || ibuf[3] != gmode) {
+            gmode = ibuf[3];
+            make_world(get16(1));
+        }
+    } else if (type == M_DRONE && n >= 21) {
+        for (k = 0; k < MAXD; k++) {
+            dhp[k] = ibuf[1 + k * 5];
+            ddir[k] = ibuf[2 + k * 5] & 31;
+            dfx[k] = get16(3 + k * 5) << 3;
+            dfy[k] = get16(5 + k * 5) << 3;
+        }
+    } else if (type == M_OBJ && n >= 28) {
+        otype = ibuf[1]; ob_hp = ibuf[2]; ob_left = ibuf[3];
+        for (k = 0; k < MAXO; k++) {
+            obx[k] = get16(4 + k * 4);
+            oby[k] = get16(6 + k * 4);
+        }
     } else if (type == M_SHIP && n >= 22) {
         t = ibuf[1] & 7;
         pused[t] = ibuf[2]; php[t] = ibuf[3]; pang[t] = ibuf[4];
@@ -929,12 +1193,50 @@ void draw_turret(int k, int sx, int sy) {
     if (thp[k] < TURRET_HP) gfx_rect(sx - 5, sy - 10, thp[k] / 6, 2, GREEN);
 }
 
+void diamond(int sx, int sy, int r, int col) {
+    gfx_line(sx, sy - r, sx + r, sy, col);
+    gfx_line(sx + r, sy, sx, sy + r, col);
+    gfx_line(sx, sy + r, sx - r, sy, col);
+    gfx_line(sx - r, sy, sx, sy - r, col);
+}
+
+void draw_target(int k, int sx, int sy) {
+    if (otype == 0) {
+        diamond(sx, sy, 6 + ((frame >> 3) & 3), YELLOW);
+        gfx_rect(sx - 1, sy - 1, 3, 3, WHITE);
+    } else if (otype == 1) {
+        gfx_rect(sx - 7, sy - 7, 14, 14, BLUE);
+        gfx_rect(sx - 5, sy - 5, 10, 10, CYAN);
+        if (frame & 4) gfx_rect(sx - 2, sy - 2, 4, 4, WHITE);
+        gfx_rect(sx - 7, sy - 12, ob_hp / 7, 2, GREEN);
+    } else {
+        diamond(sx, sy, 5, CYAN);
+        if ((frame + k * 5) & 8) gfx_rect(sx - 1, sy - 1, 2, 2, WHITE);
+    }
+}
+
+void draw_drone(int sx, int sy) {
+    diamond(sx, sy, 5, ORANGE);
+    if (frame & 4) gfx_rect(sx - 1, sy - 1, 3, 3, RED);
+    else gfx_rect(sx - 1, sy - 1, 3, 3, YELLOW);
+}
+
 void draw_world(void) {
     int i, k, t, sx, sy;
     gfx_tilemap(cave, MW, MH, camx, camy);
     for (k = 0; k < nt; k++) {
         sx = tx[k] - camx; sy = ty[k] - camy;
         if (sx > -12 && sx < 332 && sy > -12 && sy < 252) draw_turret(k, sx, sy);
+    }
+    if (gmode) {
+        for (k = 0; k < MAXO; k++) {
+            sx = obx[k] - camx; sy = oby[k] - camy;
+            if (obx[k] >= 0 && sx > -14 && sx < 334 && sy > -14 && sy < 254) draw_target(k, sx, sy);
+        }
+        for (k = 0; k < MAXD; k++) {
+            sx = (dfx[k] >> 3) - camx; sy = (dfy[k] >> 3) - camy;
+            if (dhp[k] > 0 && sx > -8 && sx < 328 && sy > -8 && sy < 248) draw_drone(sx, sy);
+        }
     }
     for (i = 0; i < MAXB; i++) {
         if (blife[i] > 0) {
@@ -967,6 +1269,14 @@ void draw_radar(void) {
     gfx_sprite(254, 190, 64, 48, cave);
     for (k = 0; k < nt; k++) {
         if (thp[k] > 0) gfx_rect(254 + (tx[k] >> 4), 190 + (ty[k] >> 4), 2, 2, RED);
+    }
+    if (gmode) {
+        for (k = 0; k < MAXO; k++) {
+            if (obx[k] >= 0) gfx_rect(253 + (obx[k] >> 4), 189 + (oby[k] >> 4), 3, 3, YELLOW);
+        }
+        for (k = 0; k < MAXD; k++) {
+            if (dhp[k] > 0) gfx_rect(254 + (dfx[k] >> 7), 190 + (dfy[k] >> 7), 2, 2, ORANGE);
+        }
     }
     for (t = 0; t < MAXP; t++) {
         if (pused[t] == 1 && php[t] > 0 && (t != me || (frame & 8))) {
@@ -1039,12 +1349,14 @@ void draw_full_scores(void) {
 void draw_feed_name(int code, int x, int y) {
     if (code < 8) gfx_text(x, y, names + code * 9, pcol[code]);
     else if (code == 8) gfx_text(x, y, "TURRET", RED);
+    else if (code == FROM_TARGET) gfx_text(x, y, "TARGET", YELLOW);
+    else if (code == FROM_DRONE) gfx_text(x, y, "DRONE", ORANGE);
     else gfx_text(x, y, "CRASH", GRAY);
 }
 
 int feed_name_width(int code) {
     if (code < 8) return slen(names + code * 9) * 6;
-    if (code == 8) return 36;
+    if (code == 8 || code == FROM_TARGET) return 36;
     return 30;
 }
 
@@ -1059,6 +1371,39 @@ void draw_feed(void) {
             draw_feed_name(fv[i], x + 14, y);
         }
     }
+}
+
+/* Mission line plus a marker at the screen edge pointing to the nearest target */
+void draw_mission_hud(void) {
+    char buf[8];
+    int k, best, bd, d, sx, sy;
+    gfx_text(76, 4, "TARGET", GRAY);
+    if (otype == 0) gfx_text(118, 4, "BEACON", YELLOW);
+    else if (otype == 1) gfx_text(118, 4, "REACTOR", YELLOW);
+    else {
+        gfx_text(118, 4, "CRYSTALS", YELLOW);
+        number_text(ob_left, buf);
+        gfx_text(172, 4, buf, WHITE);
+    }
+    if (me < 0 || php[me] == 0) return;
+    best = -1;
+    bd = 30000;
+    for (k = 0; k < MAXO; k++) {
+        if (obx[k] >= 0) {
+            d = iabs(obx[k] - px[me]) + iabs(oby[k] - py[me]);
+            if (d < bd) { bd = d; best = k; }
+        }
+    }
+    if (best < 0) return;
+    sx = obx[best] - camx;
+    sy = oby[best] - camy;
+    if (sx >= 6 && sx < 314 && sy >= 6 && sy < 234) return;
+    if (sx < 6) sx = 6;
+    if (sx > 313) sx = 313;
+    if (sy < 6) sy = 6;
+    if (sy > 233) sy = 233;
+    if (frame & 8) gfx_rect(sx - 2, sy - 2, 5, 5, YELLOW);
+    else gfx_rect(sx - 1, sy - 1, 3, 3, WHITE);
 }
 
 void draw_hud(void) {
@@ -1129,10 +1474,11 @@ void draw_menu(void) {
         gfx_text(70, 82, "UP          THRUST", WHITE);
         gfx_text(70, 94, "SPACE       FIRE", WHITE);
         gfx_text(70, 106, "TAB         SCOREBOARD", WHITE);
-        gfx_text(70, 126, "DESTROY PILOTS AND TURRETS,", GRAY);
-        gfx_text(70, 136, "AVOID THE CAVE WALLS.", GRAY);
-        gfx_text(70, 146, "RESPAWN TAKES 10 SECONDS.", GRAY);
-        gfx_text(70, 190, "TAB: BACK", GREEN);
+        gfx_text(70, 126, "SHOOT PILOTS AND TURRETS.", GRAY);
+        gfx_text(70, 136, "AVOID THE WALLS.", GRAY);
+        gfx_text(70, 162, "MISSION: REACH THE TARGET,", YELLOW);
+        gfx_text(70, 172, "SHOOT THE ROAMING DRONES.", YELLOW);
+        gfx_text(70, 200, "TAB: BACK", GREEN);
         return;
     }
     gfx_text(70, 80, "NICKNAME:", WHITE);
@@ -1140,9 +1486,13 @@ void draw_menu(void) {
     tname[name_len] = 0;
     gfx_text(140, 80, tname, GREEN);
     if (frame & 16) gfx_rect(140 + name_len * 8, 88, 6, 2, YELLOW);
-    gfx_text(70, 130, "ENTER: JOIN GAME", WHITE);
-    gfx_text(70, 144, "TAB:   CONTROLS", WHITE);
-    if (name_len == 0) gfx_text(70, 170, "TYPE A NAME FIRST", GRAY);
+    gfx_text(70, 106, "MODE:", WHITE);
+    if (gmode) gfx_text(112, 106, "< MISSION >", YELLOW);
+    else gfx_text(112, 106, "< CLASSIC >", GREEN);
+    gfx_text(70, 140, "ENTER: JOIN GAME", WHITE);
+    gfx_text(70, 154, "TAB:   CONTROLS", WHITE);
+    gfx_text(70, 168, "LEFT/RIGHT: CHANGE MODE", WHITE);
+    if (name_len == 0) gfx_text(70, 190, "TYPE A NAME FIRST", GRAY);
 }
 
 void join_game(void) {
@@ -1200,6 +1550,10 @@ void play_frame(unsigned int keys) {
         ship_collisions();
         sim_bullets();
         sim_turrets();
+        if (gmode) {
+            sim_objective();
+            sim_drones();
+        }
         host_broadcast();
     } else {
         obuf[0] = M_INPUT; obuf[1] = keys & 31;
@@ -1219,6 +1573,7 @@ void play_frame(unsigned int keys) {
     draw_world();
     sort_players();
     draw_hud();
+    if (gmode) draw_mission_hud();
     draw_mini_scores();
     draw_radar();
     draw_feed();
@@ -1246,6 +1601,7 @@ int main(void) {
         } else {
             draw_menu();
             if ((keys & KEY_TAB) && !(prev_keys & KEY_TAB)) show_help = 1 - show_help;
+            if ((keys & 3) && !(prev_keys & 3) && !show_help) gmode = 1 - gmode;
             if ((keys & KEY_START) && !(prev_keys & KEY_START) && name_len > 0 && !show_help) join_game();
         }
         prev_keys = keys;

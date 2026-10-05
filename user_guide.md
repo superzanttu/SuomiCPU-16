@@ -413,6 +413,7 @@ memory ranges:
 | RAM and stack                            | `0x20000`-`0x2FFFF` |       64 KiB |
 | VRAM                                     | `0x30000`-`0x42BFF` | 76,800 bytes |
 | Keyboard                                 |           `0x43000` |       1 byte |
+| Speed register (0 = fixed, 1 = maximum)  |           `0x43003` |       1 byte |
 | Held-key bitmask                         |           `0x43004` |       1 byte |
 | Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
@@ -570,6 +571,8 @@ Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
 (`0x43005`, `gfx_keys_ext()`, constants `KEYX_*`) holds bit 0 Q, 1 E, 2 X/Shift, 3 Z/Ctrl.
 
+Speed register (`0x43003`): 0 = fixed speed (60 frames/s, 30000 instructions per frame), nonzero = maximum speed: the emulator drops the frame cap, skips most display refreshes and runs up to 300000 instructions per pass. Use it from C with `gfx_speed(1)` / `gfx_speed(0)`; time maximum-speed runs with the real-time clock (`gfx_rtc`), since frame ticks no longer match wall time. Page 9 of the showcase uses it to measure the SC-16 for 3 seconds.
+
 Mouse registers (base `0x43008`): `+0` X word, `+2` Y word, `+4` held buttons, `+5` events.
 A double click is a second press of the same button within 400 ms and 4 pixels; it raises
 the press bit and the double-click bit together. Drag and drop = button held while the
@@ -690,6 +693,11 @@ instructions per frame.
   and broadcasts ships, bullets, turrets and scores, and the cave is rebuilt from a broadcast seed.
   A disconnected pilot's score stays on the board (slot reserved) for 10 s; a destroyed ship
   respawns after 10 s at a safe random spot. If the host leaves, the next slot takes over.
+  In the menu, Left/Right switches between **Classic** (pure dogfight) and **Mission** mode; clients
+  follow the host's mode. Mission mode adds one target per map (type chosen by the map seed):
+  a *beacon* (fly into it, +150), a *reactor* (shoot it down, +300, rebuilt elsewhere) or six
+  *crystals* (+40 each, +140 for the last), plus four roaming drones (+25 when shot; they chase
+  pilots in line of sight and damage them on contact). An edge marker points to the nearest target.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
 - [`examples/asteroids.c`](examples/asteroids.c) and
@@ -767,7 +775,7 @@ Interrupt handlers live in `lib_cgfx.asm` at fixed addresses: `irq_timer` at
 is `JMP __c_boot` at 0 with the boot code at 6. `RTI` restores both Z and C flags.
 C globals start at 0xE800.
 
-Run the showcase (8 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8):
+Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 
     python tools/c_compiler.py examples/sc16_showcase.c -o showcase.bin
     python main.py showcase.bin

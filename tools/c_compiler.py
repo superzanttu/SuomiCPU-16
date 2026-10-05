@@ -1,4 +1,4 @@
-﻿"""A small, self-contained C89 subset compiler for the SC-16."""
+"""A small, self-contained C89 subset compiler for the SC-16."""
 
 import argparse
 import ast
@@ -40,6 +40,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_random": ("unsigned int", ()),
     "gfx_ticks": ("unsigned int", ()),
     "gfx_rtc": ("unsigned int", ("unsigned char",)),
+    "gfx_speed": ("void", ("int",)),
     "gfx_irq_init": ("void", ()),
     "gfx_irq_ticks": ("unsigned int", ()),
     "gfx_irq_keys": ("unsigned int", ()),
@@ -784,6 +785,8 @@ class _CodeGenerator:
         self.scopes: list[dict[str, _Variable]] = []
         self.break_labels: list[str] = []
         self._jump_false: str | None = None
+        self._discard: Expr | None = None
+        self._nomask: Expr | None = None
         self.continue_labels: list[str] = []
         self.used_helpers: set[str] = set()
         self.function_names = {function.name for function in functions}
@@ -1195,8 +1198,8 @@ class _CodeGenerator:
             self.emit(f"    LDI R7, {offset}")
             self.emit(f"    ADD {register}, R7")
 
-    def _convert_loaded(self, register: str, c_type: str) -> None:
-        if c_type in ("char", "unsigned char"):
+    def _convert_loaded(self, register: str, c_type: str, byte_loaded: bool = False) -> None:
+        if c_type in ("char", "unsigned char") and not byte_loaded:
             self.emit(f"    LDI R7, 0x00FF")
             self.emit(f"    AND {register}, R7")
         if c_type == "char":
@@ -1246,7 +1249,7 @@ class _CodeGenerator:
                 )
             return
         if kind == "expression":
-            self._expression(statement.children[0])
+            self._discarded_expression(statement.children[0])
             return
         if kind == "return":
             expression = statement.children[0]
@@ -1289,6 +1292,15 @@ class _CodeGenerator:
             return
         raise self.error(statement.line, f"unsupported statement {kind}")
 
+    def _discarded_expression(self, expression: Expr) -> None:
+        """Generate an expression whose value is unused, so the store can skip 16-bit masking."""
+        if expression.kind == "postfix":
+            expression = Expr("unary", expression.value, expression.children, expression.line)
+        if expression.kind in ("assign", "unary"):
+            self._discard = expression
+        self._expression(expression)
+        self._discard = None
+
     def _branch_if_false(self, condition: Expr, target: str) -> None:
         """Jump to target when the condition is zero; comparisons and && / || branch directly."""
         if condition.kind == "binary":
@@ -1318,8 +1330,7 @@ class _CodeGenerator:
             self.emit("    LDI R1, 0")
             self.emit("    FCMP R0, R1")
         else:
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R0, R1")
+            self.emit("    CMP R0, 0")
         self.emit(f"    BZX {target}")
 
     def _loop_statement(self, statement: Stmt) -> None:
@@ -1346,14 +1357,14 @@ class _CodeGenerator:
         else:
             initializer, condition, increment, body = statement.children
             if initializer is not None:
-                self._expression(initializer)
+                self._discarded_expression(initializer)
             self.emit(f"{start}:")
             if condition is not None:
                 self._branch_if_false(condition, end)
             self._statement(body)
             self.emit(f"{continue_label}:")
             if increment is not None:
-                self._expression(increment)
+                self._discarded_expression(increment)
             self.emit(f"    JMPX {start}")
         self.emit(f"{end}:")
         self.break_labels.pop()
@@ -1519,6 +1530,10 @@ class _CodeGenerator:
                 array = self._lookup(str(base.value), line)
                 if array.array_size:
                     # Direct array element: base + index * size, no pointer spill.
+                    if index.kind == "constant" and array.global_address is not None:
+                        element = array.global_address + int(index.value) * _type_size(element_type)
+                        self.emit(f"    LDI R0, {element & WORD_MASK}")
+                        return element_type
                     self._expression(index)
                     if _type_size(element_type) == 2:
                         self.emit("    ADD R0, R0")
@@ -1554,12 +1569,12 @@ class _CodeGenerator:
             self._load_variable(variable, "R0", line)
             return
         c_type = self._lvalue_address(expression, line)
-        self.emit("    MOV R7, R0")
         if c_type.endswith("*"):
+            self.emit("    MOV R7, R0")
             self._emit_load_pointer("R0")
         else:
-            self.emit(f"    {'LD' if _type_size(c_type) == 1 else 'LDW'} R0, R7")
-        self._convert_loaded("R0", c_type)
+            self.emit(f"    {'LD' if _type_size(c_type) == 1 else 'LDW'} R0, R0")
+        self._convert_loaded("R0", c_type, _type_size(c_type) == 1 and not c_type.endswith("*"))
 
     def _store_lvalue(
         self, expression: Expr, register: str, source_type: str, line: int
@@ -1596,9 +1611,8 @@ class _CodeGenerator:
         self.emit(f"    PUSH {register}")
         self.stack_depth += 2
         self._lvalue_address(expression, line)
-        self.emit("    MOV R7, R0")
         self.emit("    LDWS R1, 0")
-        self.emit(f"    {'ST' if _type_size(c_type) == 1 else 'STW'} R7, R1")
+        self.emit(f"    {'ST' if _type_size(c_type) == 1 else 'STW'} R0, R1")
         self.emit("    ADJSP 2")
         self.stack_depth -= 2
 
@@ -1664,7 +1678,11 @@ class _CodeGenerator:
         if kind == "assign":
             operator, target = expression.value
             target_type = self._expression_type(target)
+            discarded = self._discard is expression
+            self._discard = None
             if operator == "=":
+                if discarded and expression.children[0].kind == "binary":
+                    self._nomask = expression.children[0]
                 self._expression(expression.children[0])
             else:
                 self._load_lvalue(target, expression.line)
@@ -1673,7 +1691,7 @@ class _CodeGenerator:
                 self._expression(expression.children[0])
                 self.emit("    MOV R1, R0")
                 self.emit("    LDWS R0, 0")
-                self._binary_operation(str(operator[:-1]), expression.line, target_type)
+                self._binary_operation(str(operator[:-1]), expression.line, target_type, not discarded)
                 self.emit("    ADJSP 2")
                 self.stack_depth -= 2
             source_type = (
@@ -1694,14 +1712,16 @@ class _CodeGenerator:
                 return
             if operator in ("++", "--"):
                 c_type = self._expression_type(child)
+                discarded = self._discard is expression
+                self._discard = None
                 self._load_lvalue(child, expression.line)
                 if c_type.endswith("*"):
                     self.emit(f"    LDI R7, {_type_size(c_type[:-1])}")
                     self.emit(f"    {'ADD' if operator == '++' else 'SUB'} R0, R7")
                 else:
                     self.emit(f"    {'INC' if operator == '++' else 'DEC'} R0")
-                    self.emit("    LDI R7, 0xFFFF")
-                    self.emit("    AND R0, R7")
+                    if not discarded:
+                        self._mask_result()
                 self._store_lvalue(child, "R0", c_type, expression.line)
                 return
             self._expression(child)
@@ -1763,24 +1783,17 @@ class _CodeGenerator:
         left, right = expression.children
         jump_false, self._jump_false = self._jump_false, None
         if operator in ("&&", "||"):
-            second_label = self.label("logic_second")
             true_label = self.label("logic_true")
             false_label = self.label("logic_false")
             end_label = self.label("logic_end")
-            self._expression(left)
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R0, R1")
             if operator == "&&":
-                self.emit(f"    BZX {false_label}")
+                self._branch_if_false(left, false_label)
             else:
-                self.emit(f"    BZX {second_label}")
+                second_label = self.label("logic_second")
+                self._branch_if_false(left, second_label)
                 self.emit(f"    JMPX {true_label}")
                 self.emit(f"{second_label}:")
-            self._expression(right)
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R0, R1")
-            self.emit(f"    BZX {false_label}")
-            self.emit(f"    JMPX {true_label}")
+            self._branch_if_false(right, false_label)
             self.emit(f"{true_label}:")
             self.emit("    LDI R0, 1")
             self.emit(f"    JMPX {end_label}")
@@ -1846,7 +1859,7 @@ class _CodeGenerator:
             self.used_helpers.add(helper)
             self.emit(f"    CALLX {helper}")
         elif operator in ("+", "-", "&", "|", "^", "*", "/", "%"):
-            self._binary_operation(operator, expression.line, result_type)
+            self._binary_operation(operator, expression.line, result_type, self._nomask is not expression)
         else:
             compare_type = "float" if left_type == "float" or right_type == "float" else (
                 "unsigned int" if left_type.startswith("unsigned") or right_type.startswith("unsigned")
@@ -1904,7 +1917,9 @@ class _CodeGenerator:
             self.emit(f"    {ALU_NAMES[operator]} R0, {value}")
         return True
 
-    def _binary_operation(self, operator: str, line: int, result_type: str = "int") -> None:
+    def _binary_operation(
+        self, operator: str, line: int, result_type: str = "int", mask: bool = True
+    ) -> None:
         if result_type == "float":
             if operator not in ("+", "-", "*", "/"):
                 raise self.error(line, f"operator {operator} is invalid for float")
@@ -1913,11 +1928,11 @@ class _CodeGenerator:
             return
         if operator == "+":
             self.emit("    ADD R0, R1")
-            if not result_type.endswith("*"):
+            if mask and not result_type.endswith("*"):
                 self._mask_result()
         elif operator == "-":
             self.emit("    SUB R0, R1")
-            if not result_type.endswith("*"):
+            if mask and not result_type.endswith("*"):
                 self._mask_result()
         elif operator in ("&", "|", "^"):
             mnemonic = {"&": "AND", "|": "OR", "^": "XOR"}[operator]
@@ -2001,8 +2016,7 @@ class _CodeGenerator:
             self.emit("    LDI R1, 0")
             self.emit("    FCMP R0, R1")
         else:
-            self.emit("    LDI R1, 0")
-            self.emit("    CMP R0, R1")
+            self.emit("    CMP R0, 0")
         self.emit(f"    BZX {end_label}")
         self.emit(f"{false_label}:")
         self.emit("    LDI R0, 0")

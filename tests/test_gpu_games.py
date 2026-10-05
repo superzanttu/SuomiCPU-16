@@ -286,10 +286,9 @@ class GameTests(unittest.TestCase):
         for _ in range(40):
             run_frame(cpu, 5_000_000)
         self.assertNotEqual(first, bytes(vram(cpu)))
-    def test_showcase_pages_and_interrupt_counters(self):
+    def test_showcase_speed_benchmark_uses_speed_register(self):
         cpu = make_cpu(compile_file(ROOT / "examples" / "sc16_showcase.c"))
         run_frame(cpu, 400_000)
-        seen = set()
         for _ in range(8):
             cpu.memory[KEYS_ADDR] = 2
             run_frame(cpu, 400_000)
@@ -297,8 +296,29 @@ class GameTests(unittest.TestCase):
             cpu.memory[0x43002] |= 2
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
+        cpu.memory[KEYS_ADDR] = 32
+        run_frame(cpu, 400_000)
+        cpu.memory[KEYS_ADDR] = 0
+        run_frame(cpu, 400_000)
+        run_frame(cpu, 400_000)
+        self.assertEqual(cpu.memory[0x43003], 1)
+        for _ in range(8):
+            cpu.memory[0x43010] = (cpu.memory[0x43010] + 1) % 60
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.memory[0x43003], 0)
+    def test_showcase_pages_and_interrupt_counters(self):
+        cpu = make_cpu(compile_file(ROOT / "examples" / "sc16_showcase.c"))
+        run_frame(cpu, 400_000)
+        seen = set()
+        for _ in range(9):
+            cpu.memory[KEYS_ADDR] = 2
+            run_frame(cpu, 400_000)
+            cpu.memory[KEYS_ADDR] = 0
+            cpu.memory[0x43002] |= 2
+            run_frame(cpu, 400_000)
+            run_frame(cpu, 400_000)
             seen.add(bytes(vram(cpu)))
-        self.assertEqual(len(seen), 8)
+        self.assertEqual(len(seen), 9)
         self.assertTrue(cpu.running)
         self.assertGreater(cpu.read_16(0x4340), 10)
         self.assertGreaterEqual(cpu.read_16(0x4342), 1)

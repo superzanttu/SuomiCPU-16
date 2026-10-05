@@ -1,12 +1,17 @@
 // SC-16 showcase: a tour of the machine, written in C for the SC-16 itself.
 // Left/Right (or A/D) change page.  On the benchmark page press Enter to run it.
 // Pages: 1 title, 2 CPU, 3 memory map, 4 graphics, 5 animation, 6 text/font,
-//        7 devices (RTC, keyboard, random numbers), 8 benchmark.
+//        7 devices (RTC, keyboard, random numbers), 8 benchmark,
+//        9 speed comparison with other computers (press Enter to measure).
 // All timing uses the machine's own clocks: gfx_ticks() (frames, 60 per second
 // of emulated time) and gfx_rtc() (the real-time clock registers).
 #include "suomi_gfx.h"
 
-#define PAGES 8
+#define PAGES 9
+#define NMACH 8
+#define SC16_ROW 4
+#define INSTR_PER_ITER 16
+#define CMP_SECS 3
 #define NTEST 7
 #define DUR 30
 #define FONT_ROM 0x4400
@@ -57,6 +62,8 @@ unsigned int bench_blocks[NTEST];
 unsigned int bench_kops[NTEST];
 unsigned int bench_scale[NTEST] = {1, 1, 1, 1, 1, 1, 1};
 int bench_state;
+int cmp_state;
+unsigned int mach_tenths[NMACH] = {1, 3, 4, 7, 18, 540, 1600, 8750};
 int bench_index;
 unsigned int bench_t0;
 unsigned int bench_ticks;
@@ -199,11 +206,11 @@ void chrome(char *title)
     {
         if (i == page)
         {
-            gfx_rect(236 + i * 10, 232, 8, 6, YELLOW);
+            gfx_rect(236 + i * 9, 232, 7, 6, YELLOW);
         }
         else
         {
-            gfx_rect(236 + i * 10, 232, 8, 6, DARK_GRAY);
+            gfx_rect(236 + i * 9, 232, 7, 6, DARK_GRAY);
         }
     }
 }
@@ -772,6 +779,52 @@ unsigned int host_seconds(void)
     return gfx_rtc(1) * 60 + gfx_rtc(0);
 }
 
+/* Unthrottled benchmark: the speed register is set to maximum, and the
+   run is timed against the real-time clock (3 whole seconds). */
+void bench_max(void)
+{
+    unsigned int blocks;
+    unsigned int acc;
+    unsigned int k;
+    int s0;
+    int s;
+    int j;
+    int ops;
+    int secs;
+    ops = bench_ops(0);
+    blocks = 0;
+    acc = 0;
+    k = 0;
+    gfx_speed(1);
+    s0 = gfx_rtc(0);
+    while (gfx_rtc(0) == s0)
+    {
+    }
+    s0 = gfx_rtc(0);
+    secs = 0;
+    while (secs < CMP_SECS)
+    {
+        for (j = 0; j < 8; j++)
+        {
+            bench_block(0, blocks);
+            blocks++;
+            acc = acc + ops;
+            if (acc >= 1000)
+            {
+                acc = acc - 1000;
+                k++;
+            }
+        }
+        s = gfx_rtc(0);
+        if (s < s0)
+        {
+            s = s + 60;
+        }
+        secs = s - s0;
+    }
+    gfx_speed(0);
+    bench_kops[0] = k / secs;
+}
 char *bench_name(int test)
 {
     if (test == 0)
@@ -902,10 +955,130 @@ void page_bench(void)
     }
 }
 
+char *mach_name(int i)
+{
+    if (i == 0)
+    {
+        return "INTEL 4004 1971";
+    }
+    if (i == 1)
+    {
+        return "IBM PC 8088 1981";
+    }
+    if (i == 2)
+    {
+        return "C64 6502 1982";
+    }
+    if (i == 3)
+    {
+        return "AMIGA 68000 1985";
+    }
+    if (i == SC16_ROW)
+    {
+        return "SC-16 (THIS)";
+    }
+    if (i == 5)
+    {
+        return "486DX2-66 1992";
+    }
+    if (i == 6)
+    {
+        return "CRAY-1 1976";
+    }
+    return "RASPBERRY PI A";
+}
+
+// Bar length on a log2 scale (11 px per doubling, 3 fractional steps)
+int log_bar(unsigned int v)
+{
+    int b;
+    b = 0;
+    while ((v >> (b + 1)) > 0)
+    {
+        b++;
+    }
+    if (b < 2)
+    {
+        return 4 + v * 4;
+    }
+    return 12 + b * 11 + ((v >> (b - 2)) & 3) * 3;
+}
+
+void tenths_text(int x, int y, unsigned int v, unsigned char c)
+{
+    pnum(x, y, v / 10, c);
+    x = x + text_len(nb) * 6;
+    gfx_text(x, y, ".", c);
+    pnum(x + 6, y, v % 10, c);
+}
+
+void page_compare(void)
+{
+    int i;
+    int y;
+    unsigned int sc;
+    unsigned char c;
+    sc = mach_tenths[SC16_ROW];
+    if (cmp_state == 2 || bench_state == 2)
+    {
+        sc = (bench_kops[0] * INSTR_PER_ITER) / 100;
+    }
+    gfx_text(8, 20, "SPEED IN MIPS (MILLION INSTRUCTIONS/S)", YELLOW);
+    for (i = 0; i < NMACH; i++)
+    {
+        y = 34 + i * 14;
+        c = WHITE;
+        if (i == SC16_ROW)
+        {
+            c = CYAN;
+        }
+        gfx_text(8, y, mach_name(i), c);
+        if (i == SC16_ROW)
+        {
+            tenths_text(116, y, sc, c);
+            gfx_rect(160, y, log_bar(sc), 8, c);
+        }
+        else
+        {
+            tenths_text(116, y, mach_tenths[i], GRAY);
+            gfx_rect(160, y, log_bar(mach_tenths[i]), 8, rainbow[i % 7]);
+        }
+    }
+    gfx_line(8, 150, 311, 150, DARK_GRAY);
+    gfx_text(8, 156, "CRAY-1 IS", GRAY);
+    pnum(116, 156, mach_tenths[6] / sc, GREEN);
+    gfx_text(116 + text_len(nb) * 6 + 6, 156, "X FASTER", GRAY);
+    gfx_text(8, 166, "RASPBERRY PI A IS", GRAY);
+    pnum(116, 166, mach_tenths[7] / sc, GREEN);
+    gfx_text(116 + text_len(nb) * 6 + 6, 166, "X FASTER", GRAY);
+    gfx_text(8, 176, "486DX2-66 IS", GRAY);
+    pnum(116, 176, mach_tenths[5] / sc, GREEN);
+    gfx_text(116 + text_len(nb) * 6 + 6, 176, "X FASTER", GRAY);
+    gfx_text(8, 188, "LOG-SCALE BARS. OTHERS: APPROX. PUBLISHED", DARK_GRAY);
+    gfx_text(8, 197, "SC-16: MEASURED AT MAX SPEED (SPEED REG)", DARK_GRAY);
+    if (cmp_state == 1)
+    {
+        ctext(210, "MEASURING AT MAX SPEED - 3 S", ORANGE);
+    }
+    else if (cmp_state == 2 || bench_state == 2)
+    {
+        ctext(210, "MEASURED - ENTER TO REPEAT", GREEN);
+    }
+    else if ((frame >> 4) & 1)
+    {
+        ctext(210, "ESTIMATE - PRESS ENTER TO MEASURE", GREEN);
+    }
+}
+
 void bench_step(void)
 {
     int i;
-    if (bench_state == 1)
+    if (cmp_state == 1)
+    {
+        bench_max();
+        cmp_state = 2;
+        gfx_sound(2, 1320, 30, WAVE_TRIANGLE, 50);
+    }    if (bench_state == 1)
     {
         if (bench_index == 0)
         {
@@ -944,7 +1117,7 @@ int main(void)
         keys = gfx_keys();
         pressed = keys & ~prev_keys;
         prev_keys = keys;
-        if (bench_state != 1)
+        if (bench_state != 1 && cmp_state != 1)
         {
             if (pressed & KEY_RIGHT)
             {
@@ -966,6 +1139,11 @@ int main(void)
             {
                 bench_state = 1;
                 bench_index = 0;
+                gfx_sound(2, 880, 10, WAVE_SQUARE, 40);
+            }
+            if (page == 8 && (pressed & KEY_START))
+            {
+                cmp_state = 1;
                 gfx_sound(2, 880, 10, WAVE_SQUARE, 40);
             }
         }
@@ -1006,10 +1184,15 @@ int main(void)
             page_devices();
             chrome("DEVICES: RTC, KEYBOARD, RANDOM");
         }
-        else
+        else if (page == 7)
         {
             page_bench();
             chrome("BENCHMARK");
+        }
+        else
+        {
+            page_compare();
+            chrome("SPEED COMPARISON");
         }
         gfx_present();
         bench_step();
