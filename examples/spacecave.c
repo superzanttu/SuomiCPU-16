@@ -172,7 +172,7 @@ void carve_disc(int cx, int cy, int r) {
     }
 }
 
-/* Meandering tunnel between two tiles; wide tunnels are 2 tiles, narrow ones 1 tile */
+/* Meandering tunnel between two tiles; narrow tunnels are 2 tiles wide, wide ones 3 tiles */
 void tunnel(int x0, int y0, int x1, int y1, int wide) {
     int dx, dy, guard, along_x;
     guard = 200;
@@ -186,10 +186,15 @@ void tunnel(int x0, int y0, int x1, int y1, int wide) {
         if (along_x) x0 = x0 + sgn(dx);
         else y0 = y0 + sgn(dy);
         carve(x0, y0);
+        carve(x0 + 1, y0);
+        carve(x0, y0 + 1);
+        carve(x0 + 1, y0 + 1);
         if (wide) {
-            carve(x0 + 1, y0);
-            carve(x0, y0 + 1);
-            carve(x0 + 1, y0 + 1);
+            carve(x0 + 2, y0);
+            carve(x0 + 2, y0 + 1);
+            carve(x0, y0 + 2);
+            carve(x0 + 1, y0 + 2);
+            carve(x0 + 2, y0 + 2);
         }
         guard--;
     }
