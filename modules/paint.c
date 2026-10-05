@@ -1,4 +1,21 @@
 // Simple MS Paint style drawing program for the SC-16 (images cannot be saved).
+// ICON
+// ################
+// #..............#
+// #..##....##....#
+// #..##....##....#
+// #..............#
+// #....######....#
+// #....######....#
+// #..............#
+// #..##......##..#
+// #..##......##..#
+// #..............#
+// #......##......#
+// #.....####.....#
+// #....######....#
+// #...########...#
+// ################
 //
 // Mouse controls:
 // - Left button draws with the foreground color, right button with the background color

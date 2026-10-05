@@ -1,4 +1,21 @@
 // LAN networking demo for the SC-16 (UDP broadcast, no server program needed).
+// ICON
+// .......##.......
+// .....######.....
+// ...##......##...
+// ..#..........#..
+// .#....####....#.
+// #...##....##...#
+// #..#........#..#
+// #.#...####...#.#
+// #.#..#....#..#.#
+// #.#.#......#.#.#
+// #.##...##...##.#
+// #..#...##...#..#
+// .#....####....#.
+// ..#..........#..
+// ...##......##...
+// .....######.....
 //
 // Start the emulator several times on the same network (up to 8 instances):
 //     python src/SuomiCPU.py examples/net_game_demo.c

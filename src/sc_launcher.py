@@ -35,6 +35,7 @@ class Module:
     path: Path
     name: str
     description: str
+    icon: tuple[str, ...] | None
 
 
 def _description_text(first_line: str) -> str:
@@ -49,6 +50,23 @@ def _description_text(first_line: str) -> str:
     return text.strip().lstrip("*").strip()
 
 
+def _parse_icon(lines: list[str]) -> tuple[str, ...] | None:
+    for index, line in enumerate(lines):
+        if line.strip() != "// ICON":
+            continue
+        pixels = []
+        for icon_line in lines[index + 1:index + 17]:
+            row = icon_line.strip()
+            if not row.startswith("//"):
+                return None
+            row = row[2:].strip()
+            if len(row) != 16 or any(pixel not in ".#" for pixel in row):
+                return None
+            pixels.append(row)
+        return tuple(pixels) if len(pixels) == 16 else None
+    return None
+
+
 def discover_modules(modules_dir: str | Path) -> list[Module]:
     """Return C source modules, ordered by their filename."""
     directory = Path(modules_dir)
@@ -56,13 +74,14 @@ def discover_modules(modules_dir: str | Path) -> list[Module]:
         raise FileNotFoundError(f"Modules folder does not exist: {directory}")
     modules = []
     for path in sorted(directory.glob("*.c"), key=lambda item: item.name.casefold()):
-        with path.open("r", encoding="utf-8-sig") as source:
-            first_line = source.readline().strip()
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        first_line = lines[0].strip() if lines else ""
         modules.append(
             Module(
                 path=path,
                 name=path.stem,
                 description=_description_text(first_line) or "No description",
+                icon=_parse_icon(lines),
             )
         )
     return modules
@@ -150,9 +169,23 @@ class SCLauncher:
                 if selected:
                     pygame.draw.rect(self.canvas, ACCENT, (9, y, 2, ROW_HEIGHT - 3))
 
-                # This 16x16 frame is reserved for a future per-module icon.
-                pygame.draw.rect(self.canvas, (6, 13, 24), (17, y + 10, 16, 16))
-                pygame.draw.rect(self.canvas, (65, 98, 111), (17, y + 10, 16, 16), 1)
+                icon_x, icon_y = 17, y + 10
+                pygame.draw.rect(self.canvas, (6, 13, 24), (icon_x, icon_y, 16, 16))
+                if module.icon is None:
+                    question = self.name_font.render("?", True, TEXT)
+                    self.canvas.blit(
+                        question,
+                        (
+                            icon_x + (16 - question.get_width()) // 2,
+                            icon_y + (16 - question.get_height()) // 2,
+                        ),
+                    )
+                else:
+                    for pixel_y, icon_row in enumerate(module.icon):
+                        for pixel_x, pixel in enumerate(icon_row):
+                            if pixel == "#":
+                                self.canvas.set_at((icon_x + pixel_x, icon_y + pixel_y), (255, 255, 255))
+                pygame.draw.rect(self.canvas, (65, 98, 111), (icon_x, icon_y, 16, 16), 1)
                 name = module.name
                 while name and self.name_font.size(name)[0] > 263:
                     name = name[:-1]

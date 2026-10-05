@@ -1,4 +1,21 @@
 // SpaceCave - LAN multiplayer Asteroids dogfight inside a procedurally generated cave.
+// ICON
+// ################
+// ##............##
+// #..##########..#
+// #..#........#..#
+// #..#.######.#..#
+// #..#.#....#.#..#
+// #..#.#.##.#.#..#
+// #..#.#....#.#..#
+// #..#.######.#..#
+// #..#........#..#
+// #..##########..#
+// ##............##
+// ################
+// ................
+// ##............##
+// ################
 //
 // Up to 8 players on the local network (start the emulator once per player):
 //     python main.py examples/spacecave.c

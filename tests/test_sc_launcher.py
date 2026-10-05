@@ -40,6 +40,13 @@ class ModuleDiscoveryTests(unittest.TestCase):
 
         self.assertTrue(modules)
         self.assertTrue(all(module.description != "No description" for module in modules))
+        self.assertTrue(all(module.icon is not None for module in modules))
+        self.assertTrue(
+            all(
+                len(module.icon) == 16 and all(len(row) == 16 for row in module.icon)
+                for module in modules
+            )
+        )
 
 
 class LauncherInteractionTests(unittest.TestCase):
@@ -81,6 +88,34 @@ class LauncherInteractionTests(unittest.TestCase):
 
         self.assertEqual(launcher.scroll, 1)
         self.assertEqual(launcher.selected, 1)
+
+    def test_icon_pixels_are_rendered_in_black_and_white(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pixel.c"
+            path.write_text(
+                "// Pixel test\n// ICON\n"
+                "// ................\n"
+                "// .#..............\n"
+                + "".join("// ................\n" for _ in range(14))
+            )
+            launcher = SCLauncher(directory)
+            launcher._draw()
+
+        self.assertEqual(launcher.canvas.get_at((18, 59))[:3], (255, 255, 255))
+        self.assertEqual(launcher.canvas.get_at((19, 59))[:3], (6, 13, 24))
+
+    def test_missing_icon_renders_question_mark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "missing.c").write_text("// No icon\n")
+            launcher = SCLauncher(directory)
+            launcher._draw()
+
+        white_pixels = sum(
+            launcher.canvas.get_at((x, y))[:3] == (226, 239, 241)
+            for x in range(18, 32)
+            for y in range(59, 73)
+        )
+        self.assertGreater(white_pixels, 0)
 
     def test_start_without_program_opens_launcher(self):
         with patch("sys.argv", ["main.py"]):

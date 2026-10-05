@@ -1,4 +1,21 @@
 // SC-16 showcase: a tour of the machine, written in C for the SC-16 itself.
+// ICON
+// ################
+// #..............#
+// #..##########..#
+// #..#........#..#
+// #..#..####..#..#
+// #..#..####..#..#
+// #..#........#..#
+// #..##########..#
+// #..............#
+// #....##..##....#
+// #....##..##....#
+// #....##..##....#
+// #....##..##....#
+// #....######....#
+// #..............#
+// ################
 // Left/Right (or A/D) change page.  On the benchmark page press Enter to run it.
 // Pages: 1 title, 2 CPU, 3 memory map, 4 graphics, 5 animation, 6 text/font,
 //        7 devices (RTC, keyboard, random numbers), 8 benchmark,
