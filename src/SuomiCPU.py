@@ -63,6 +63,7 @@ OP_FTOI = OP_SHR
 # Tässä päätetään, mihin muistiin mitäkin laitetaan.
 # =============================================================================
 MEM_SIZE = 2**19       # Muistin kokonaiskoko (512 KB)
+MEM_MASK = MEM_SIZE - 1
 FLASH_START = 0x00000 # Ohjelman alkuosa
 RAM_START   = 0x20000 # Työmuistin alku
 VRAM_START  = 0x30000 # Videomuistin alku (tänne piirretään ruutu)
@@ -527,7 +528,7 @@ class SuomiCompute16:
         memory = self.memory
         registers = self.registers
         pc = self.pc
-        instr = (memory[pc & (MEM_SIZE - 1)] << 8) | memory[(pc + 1) & (MEM_SIZE - 1)]
+        instr = (memory[pc & MEM_MASK] << 8) | memory[(pc + 1) & MEM_MASK]
         self.pc = pc + 2
 
         # 5-Bit Opcode Decoding
@@ -537,17 +538,18 @@ class SuomiCompute16:
         rs2 = (instr >> 2) & 0x7
         imm = instr & 0xFF
 
-        if (instr & 0xF8FF) == 0xF81E:
+        if opcode == OP_LDI: registers[rd] = imm
+        elif opcode == OP_SHR and (instr & 0xF8FF) == 0xF81E:
             self._execute_muldiv(instr)
-        elif (instr & 0xF8FF) == 0xF81F:
+        elif opcode == OP_SHR and (instr & 0xF8FF) == 0xF81F:
             self._execute_alu(instr)
-        elif (instr & 0xF81F) == 0xF81B:
+        elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81B:
             condition = ((instr >> 8) & 0x7) | (((instr >> 5) & 0x7) << 3)
             target = self.read_16(self.pc) | (self.read_16(self.pc + 2) << 16)
             self.pc += 4
             if self._flag_condition(condition):
                 self.pc = target
-        elif instr >= 0xF800 and instr in (0xF81D, 0xF91D, 0xFA1D, 0xFB1D):
+        elif opcode == OP_SHR and instr in (0xF81D, 0xF91D, 0xFA1D, 0xFB1D):
             target = self.read_16(self.pc) | (self.read_16(self.pc + 2) << 16)
             self.pc += 4
             if instr == 0xF91D:
@@ -559,28 +561,88 @@ class SuomiCompute16:
                 self.pc = target
             elif instr == 0xFB1D and self.flags["C"]:
                 self.pc = target
-        elif opcode == OP_HALT: self.running = False
-        elif opcode == OP_LDI: registers[rd] = imm
-        elif opcode == OP_LDI_H: registers[rd] = (imm << 8) | registers[rd]
-        elif opcode == OP_MOV: registers[rd] = registers[rs1]
+        elif opcode == OP_LDWS:
+            addr = self.sp + imm
+            registers[rd] = (memory[addr & MEM_MASK] << 8) | memory[(addr + 1) & MEM_MASK]
         elif opcode == OP_ADD:
-            res = registers[rs1] + registers[rs2]
+            a = registers[rs1]
+            b = registers[rs2]
+            res = a + b
             registers[rd] = res
-            self.flags['Z'] = 1 if (registers[rd] == 0) else 0
-            self.flags['C'] = 1 if res > 0xFF else 0
-            self._set_nv(registers[rs1], registers[rs2], res, False)
-        elif opcode == OP_SUB:
-            res = registers[rs1] - registers[rs2]
-            registers[rd] = res
-            self.flags['Z'] = 1 if (registers[rd] == 0) else 0
-            self.flags['C'] = 1 if res < 0 else 0
-            self._set_nv(registers[rs1], registers[rs2], res, True)
+            flags = self.flags
+            flags['Z'] = 1 if res == 0 else 0
+            flags['C'] = 1 if res > 0xFF else 0
+            r16 = res & 0xFFFF
+            flags['N'] = r16 >> 15
+            flags['V'] = 1 if ((a ^ r16) & (b ^ r16) & 0x8000) else 0
+        elif opcode == OP_LDI_H: registers[rd] = (imm << 8) | registers[rd]
+        elif opcode == OP_PUSH:
+            sp = self.sp - 2
+            self.sp = sp
+            addr = sp & MEM_MASK
+            if GPU_BASE - 1 <= addr <= GPU_BASE:
+                self.write_16(sp, registers[rd])
+            else:
+                value = registers[rd]
+                memory[addr] = (value >> 8) & 0xFF
+                memory[(addr + 1) & MEM_MASK] = value & 0xFF
+        elif opcode == OP_ADJSP:
+            offset = imm if imm < 0x80 else imm - 0x100
+            self.sp = (self.sp + offset) & (MEM_SIZE - 1)
+        elif opcode == OP_MOV: registers[rd] = registers[rs1]
+        elif opcode == OP_CMP:
+            a = registers[rs1]
+            b = registers[rs2]
+            res = a - b
+            flags = self.flags
+            flags['Z'] = 1 if res == 0 else 0
+            flags['C'] = 1 if res < 0 else 0
+            r16 = res & 0xFFFF
+            flags['N'] = r16 >> 15
+            flags['V'] = 1 if ((a ^ b) & (a ^ r16) & 0x8000) else 0
+        elif opcode == OP_RET: self.pc = self.pop()
         elif opcode == OP_AND: registers[rd] = registers[rs1] & registers[rs2]
+        elif opcode == OP_LDW:
+            addr = registers[rs1]
+            registers[rd] = (memory[addr & MEM_MASK] << 8) | memory[(addr + 1) & MEM_MASK]
+        elif opcode == OP_STWS:
+            addr = (self.sp + imm) & MEM_MASK
+            if GPU_BASE - 1 <= addr <= GPU_BASE:
+                self.write_16(addr, registers[rd])
+            else:
+                value = registers[rd]
+                memory[addr] = (value >> 8) & 0xFF
+                memory[(addr + 1) & MEM_MASK] = value & 0xFF
+        elif opcode == OP_BZ:
+            if self.flags['Z']: self.pc = instr & 0x7FF
+        elif opcode == OP_BC:
+            if self.flags['C']: self.pc = instr & 0x7FF
+        elif opcode == OP_JMP: self.pc = instr & 0x7FF
+        elif opcode == OP_LD: registers[rd] = self.read(registers[rs1])
+        elif opcode == OP_ST: self.write(registers[rs1], registers[rd])
+        elif opcode == OP_STW: self.write_16(registers[rs1], registers[rd])
         elif opcode == OP_OR:  registers[rd] = registers[rs1] | registers[rs2]
+        elif opcode == OP_SUB:
+            a = registers[rs1]
+            b = registers[rs2]
+            res = a - b
+            registers[rd] = res
+            flags = self.flags
+            flags['Z'] = 1 if res == 0 else 0
+            flags['C'] = 1 if res < 0 else 0
+            r16 = res & 0xFFFF
+            flags['N'] = r16 >> 15
+            flags['V'] = 1 if ((a ^ b) & (a ^ r16) & 0x8000) else 0
         elif opcode == OP_XOR: registers[rd] = registers[rs1] ^ registers[rs2]
-        elif opcode == OP_NOT: registers[rd] = (~registers[rs1]) & 0xFFFF
         elif opcode == OP_INC: registers[rd] = registers[rd] + 1
         elif opcode == OP_DEC: registers[rd] = registers[rd] - 1
+        elif opcode == OP_JZ:
+            if registers[rd] == 0: self.pc = imm
+        elif opcode == OP_CALL:
+            self.push(self.pc)
+            self.pc = instr & 0x7FF
+        elif opcode == OP_POP: registers[rd] = self.pop() & 0xFFFF
+        elif opcode == OP_NOT: registers[rd] = (~registers[rs1]) & 0xFFFF
         elif opcode == OP_SHR:
             extension = (instr >> 5) & 0x7
             if extension == 0:
@@ -617,33 +679,7 @@ class SuomiCompute16:
                 elif extension == 7:
                     value = self._binary16(registers[rd])
                     registers[rd] = int(value) & 0xFFFF
-        elif opcode == OP_CMP:
-            res = registers[rs1] - registers[rs2]
-            self.flags['Z'] = 1 if res == 0 else 0
-            self.flags['C'] = 1 if res < 0 else 0
-            self._set_nv(registers[rs1], registers[rs2], res, True)
-        elif opcode == OP_LD: registers[rd] = self.read(registers[rs1])
-        elif opcode == OP_ST: self.write(registers[rs1], registers[rd])
-        elif opcode == OP_LDW: registers[rd] = self.read_16(registers[rs1])
-        elif opcode == OP_STW: self.write_16(registers[rs1], registers[rd])
-        elif opcode == OP_LDWS: registers[rd] = self.read_16(self.sp + imm)
-        elif opcode == OP_STWS: self.write_16(self.sp + imm, registers[rd])
-        elif opcode == OP_ADJSP:
-            offset = imm if imm < 0x80 else imm - 0x100
-            self.sp = (self.sp + offset) & (MEM_SIZE - 1)
-        elif opcode == OP_JMP: self.pc = instr & 0x7FF
-        elif opcode == OP_JZ:
-            if registers[rd] == 0: self.pc = imm
-        elif opcode == OP_BZ:
-            if self.flags['Z']: self.pc = instr & 0x7FF
-        elif opcode == OP_BC:
-            if self.flags['C']: self.pc = instr & 0x7FF
-        elif opcode == OP_CALL:
-            self.push(self.pc)
-            self.pc = instr & 0x7FF
-        elif opcode == OP_RET: self.pc = self.pop()
-        elif opcode == OP_PUSH: self.push(registers[rd])
-        elif opcode == OP_POP: registers[rd] = self.pop() & 0xFFFF
+        elif opcode == OP_HALT: self.running = False
         elif opcode == OP_RTI:
             self._restore_flags(self.pop())
             self.pc = self.pop()
