@@ -11,6 +11,7 @@ from pathlib import Path
 # Tuomme tarvittavat asiat työkaluista
 from tools.assembler import AssemblyError, AssemblyImage, MemorySegment, assemble_file
 from tools.c_compiler import CCompilerError, compile_file
+from tools.sc16net import DEFAULT_PORT, MAX_PAYLOAD, NetNode, UdpTransport
 
 # =============================================================================
 # ISA (Instruction Set Architecture) - Prosessorin "kieli"
@@ -84,6 +85,8 @@ GPU_TICKS = 11  # Laskee kuinka monta ruutua on kulunut
 GPU_RTC = 12    # Kello-tieto
 GPU_SOUND = 13  # Sound: COLOR=channel 0-3, X=frequency Hz (0=silence), Y=duration frames (0=loop), W=waveform, H=volume %
 GPU_SAVE, GPU_LOAD = 14, 15  # Save/restore the back buffer (static background layer)
+# LAN networking: SOURCE=buffer, X=length; results in bytes +14/+15 (word)
+GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 18, 19, 20
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
@@ -255,6 +258,62 @@ class SuomiCompute16:
                 self.memory[BACK_START:BACK_START + size] = saved
         elif command == GPU_RANDOM:
             self.memory[GPU_BASE + 14] = random.randrange(256)
+        elif GPU_NET_OPEN <= command <= GPU_NET_INFO:
+            self._gpu_net(command, color, x)
+
+    def _net_node(self):
+        node = getattr(self, 'net', None)
+        if node is None:
+            factory = getattr(self, 'net_transport_factory', None)
+            try:
+                transport = factory() if factory else UdpTransport(getattr(self, 'net_port', DEFAULT_PORT))
+            except OSError:
+                return None
+            node = self.net = NetNode(transport)
+        return node
+
+    def _gpu_result(self, value):
+        value &= 0xFFFF
+        self.memory[GPU_BASE + 14] = value >> 8
+        self.memory[GPU_BASE + 15] = value & 0xFF
+
+    def _gpu_net(self, command, query, arg):
+        """Networking commands; see tools/sc16net.py for the protocol."""
+        node = self._net_node()
+        if node is None:
+            self._gpu_result(0)
+            return
+        node.poll()
+        source = self._gpu_source()
+        if command == GPU_NET_OPEN:
+            title = bytearray()
+            while len(title) < 16 and self.memory[(source + len(title)) & (MEM_SIZE - 1)]:
+                title.append(self.memory[(source + len(title)) & (MEM_SIZE - 1)])
+            self._gpu_result(1 if node.open(bytes(title)) else 0)
+        elif command == GPU_NET_CLOSE:
+            node.close()
+        elif command == GPU_NET_SEND:
+            length = max(0, min(arg, MAX_PAYLOAD))
+            data = bytes(self.memory[(source + i) & (MEM_SIZE - 1)] for i in range(length))
+            self._gpu_result(1 if length and node.send(data) else 0)
+        elif command == GPU_NET_RECV:
+            message = node.recv()
+            if message is None:
+                self._gpu_result(0)
+            else:
+                for i, byte in enumerate(message[1]):
+                    self.memory[(source + i) & (MEM_SIZE - 1)] = byte
+                self._gpu_result(len(message[1]))
+        else:
+            self._gpu_result({
+                0: lambda: node.players(),
+                1: lambda: -1 if node.slot is None else node.slot,
+                2: lambda: int(node.active(arg)),
+                3: lambda: int(node.full),
+                4: lambda: node.last_sender,
+                5: lambda: int(node.ready),
+                6: lambda: int(node.is_open),
+            }.get(query, lambda: 0)())
 
     SOUND_RATE = 22050
     SOUND_FPS = 60
@@ -830,6 +889,9 @@ class SuomiCompute16:
     def begin_mouse_frame(self):
         px, py = pygame.mouse.get_pos()
         self.set_mouse_position(px // WINDOW_SCALE, py // WINDOW_SCALE)
+        node = getattr(self, 'net', None)
+        if node is not None:
+            node.poll()
 
     def end_mouse_frame(self):
         self.memory[MOUSE_ADDR + 5] = 0
@@ -905,6 +967,8 @@ def main():
         nargs="?",
         help="optional .asm, .c, or flat .bin program to load",
     )
+    parser.add_argument("--net-port", type=int, default=DEFAULT_PORT,
+                        help="UDP port for LAN games (all players must use the same port)")
     args = parser.parse_args()
 
     try:
@@ -915,11 +979,14 @@ def main():
         parser.error(str(exc))
 
     sc16 = SuomiCompute16()
+    sc16.net_port = args.net_port
     if program is not None:
         sc16.load_program(program)
     try:
         sc16.run()
     finally:
+        if getattr(sc16, 'net', None) is not None:
+            sc16.net.close()
         pygame.quit()
 
 if __name__ == "__main__":

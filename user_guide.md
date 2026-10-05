@@ -579,7 +579,33 @@ Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 2 pixel, 3 rect, 4 line (W,H are the end point), 5 sprite, 6 bitmap, 7 text
 (NUL-terminated string at SRC), 8 present, 9 random (to RESULT), 10 polygon
 (W is the point count), 13 sound (COLOR channel, X Hz, Y frames, W wave, H volume %),
-14 save back buffer, 15 restore it. Assembly programs can use it directly.
+14 save back buffer, 15 restore it, 16-20 networking (below). Assembly programs can use it directly.
+
+### LAN games (`net_*`)
+
+Games can talk to other emulator instances on the local network without any server program:
+every instance is a peer and finds the others with small UDP broadcast packets (port 47016,
+change with `--net-port`; all players must use the same port). Instances only see peers that
+called `net_open` with the **same title** (up to 16 characters), so "pacman" ignores "elite".
+At most 8 instances share a title; each gets a stable slot 0-7 (settled about 0.6 s after joining,
+`net_ready()`). Peers that vanish time out after about 3.5 s; `net_close()` leaves immediately.
+Broadcasts are not delivered back to the sender. Delivery is UDP: messages can be lost or reordered,
+so send state continuously rather than relying on single events.
+
+| Function | Description |
+|---|---|
+| `int net_open(char *title)` | Join the group for `title`; 1 = ok. |
+| `void net_close(void)` | Leave the group. |
+| `int net_send(unsigned char *data, int len)` | Broadcast 1..`NET_MAX_MSG` (48) bytes to all other instances; 1 = sent. |
+| `int net_recv(unsigned char *buf)` | Pop the next message into `buf`; returns its length, 0 if none. |
+| `int net_sender(void)` | Slot of the sender of the last received message. |
+| `int net_players(void)` | Live instances including this one. |
+| `int net_slot(void)` | Own slot 0-7, -1 when not joined. |
+| `int net_active(int slot)` | 1 if a player occupies `slot`. |
+| `int net_ready(void)` / `int net_full(void)` / `int net_is_open(void)` | Slot settled / group had no free slot / joined. |
+
+Windows may need to allow Python through the firewall for private networks.
+[`examples/net_game_demo.c`](examples/net_game_demo.c) shows the pattern.
 
 ### Games
 
@@ -651,6 +677,9 @@ instructions per frame.
   four brush sizes and a 16-color palette. Left button draws with the foreground color, right
   button with the background color; double-click a palette color to fill the canvas and
   double-click CLR to clear it. Images cannot be saved. Run it with `python main.py examples/paint.c`.
+- [`examples/net_game_demo.c`](examples/net_game_demo.c) is a LAN demo: start it in up to 8
+  emulator instances on one network; each player moves a coloured square (arrows) and Space
+  broadcasts a ping ring to all others. Run it with `python main.py examples/net_game_demo.c`.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
 - [`examples/asteroids.c`](examples/asteroids.c) and
