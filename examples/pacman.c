@@ -1,55 +1,77 @@
-// Pac-Man for the SC-16.  Arrow keys / WASD steer, Enter or Space restarts after GAME OVER.
-// The maze is 19x21 tiles of 8x8 pixels.  Entities move 2 pixels per frame.
+// Pac-Man for the SC-16.
+// Controls:
+// - Arrow keys / WASD: Steer Pac-Man
+// - Enter or Space: Restart after GAME OVER
+//
+// The maze is 19x21 tiles of 8x8 pixels. Entities move 2 pixels per frame.
 #include "suomi_gfx.h"
 
-#define MW 19
-#define MH 21
-#define OX 84
-#define OY 28
-#define TUNNEL_ROW 8
-#define NG 4
+/* --- Constants --- */
+#define MW 19           // Maze Width (tiles)
+#define MH 21           // Maze Height (tiles)
+#define OX 84           // Maze Offset X (pixels)
+#define OY 28           // Maze Offset Y (pixels)
+#define TUNNEL_ROW 8     // Row where the screen wrap tunnel is located
+#define NG 4            // Number of Ghosts
 
+/* Maze layout:
+ * # = wall, . = pellet, o = power pellet, - = ghost door, ' ' = empty
+ * The layout is a flat string representing the 2D grid.
+ */
 char layout[400] = "####################........#........##o##.###.#.###.##o##.................##.##.#.#####.#.##.##....#...#...#....#####.#       #.########.# ##-## #.####    .  #   #  .    ####.# ##### #.########.#       #.########.# ##### #.#####........#........##.##.###.#.###.##.##o.#...........#.o###.#.#.#####.#.#.###....#...#...#....##.######.#.######.##.................##........#........####################";
 
-char maze[672];
-char dxs[4] = {-1, 1, 0, 0};
-char dys[4] = {0, 0, -1, 1};
-char opp[4] = {1, 0, 3, 2};
+/* Movement and Directional data */
+char maze[672];         // Expanded maze representation for faster access
+char dxs[4] = {-1, 1, 0, 0}; // Delta X: 0:Left, 1:Right, 2:Up, 3:Down
+char dys[4] = {0, 0, -1, 1}; // Delta Y: 0:Left, 1:Right, 2:Up, 3:Down
+char opp[4] = {1, 0, 3, 2};  // Opposite directions: L <-> R, U <-> D (used for 180-degree turns)
 
+/* Sprite data (8x8 bitmaps) */
+// Pac-Man frames for different mouth states and directions
 unsigned char pac_closed[8] = {0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C};
 unsigned char pac_l[8] = {0x3C, 0x7E, 0x1F, 0x07, 0x07, 0x1F, 0x7E, 0x3C};
 unsigned char pac_r[8] = {0x3C, 0x7E, 0xF8, 0xE0, 0xE0, 0xF8, 0x7E, 0x3C};
 unsigned char pac_u[8] = {0x81, 0xC3, 0xE7, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C};
 unsigned char pac_d[8] = {0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0xE7, 0xC3, 0x81};
+
+// Ghost components: body and the eyes drawn separately for a better look
 unsigned char ghost_body[8] = {0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xA5};
 unsigned char ghost_eyes[8] = {0x00, 0x00, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00};
 unsigned char ghost_color[4] = {RED, MAGENTA, CYAN, ORANGE};
 
-int px;
-int py;
-int pdir;
-int pwant;
-int pmoving;
-int pdx;
-int pdy;
-int gx[NG];
-int gy[NG];
-int gd[NG];
-int gs[NG];
-int gt[NG];
-int gdx[NG];
-int gdy[NG];
-int pellets;
-int fright;
-int chain;
-int tick;
-int lives;
-int level;
-int mode;
-int wait;
-int hud_dirty;
+/* --- Game State --- */
+// Pac-Man state
+int px;           // Current Pixel X position
+int py;           // Current Pixel Y position
+int pdir;         // Current moving direction (0-3)
+int pwant;        // Direction Pac-Man wants to turn into (buffered input)
+int pmoving;      // 1 if Pac-Man is currently moving, 0 if blocked by a wall
+int pdx;          // Previous frame X position (used to redraw maze tiles)
+int pdy;          // Previous frame Y position (used to redraw maze tiles)
+
+// Ghost state
+int gx[NG];       // Current Pixel X position for each ghost
+int gy[NG];       // Current Pixel Y position for each ghost
+int gd[NG];       // Current moving direction (0-3)
+int gs[NG];       // State: 0=spawning, 1=chase, 2=frightened, 3=returning
+int gt[NG];       // Timer for ghost states (e.g., countdown until spawn)
+int gdx[NG];      // Previous frame X position for each ghost
+int gdy[NG];      // Previous frame Y position for each ghost
+
+// Global game state
+int pellets;      // Total count of remaining pellets (dots + power pellets)
+int fright;       // Timer for how long ghosts stay in 'frightened' state
+int chain;        // Counter for consecutive ghost eats (increases score multiplier)
+int tick;         // Frame counter used for animations and timing
+int lives;        // Number of lives remaining
+int level;        // Current level index
+int mode;         // Game mode: 0=Ready, 1=Playing, 2=Losing Life, 3=Game Over
+int wait;         // Multi-purpose timer for delays and state transitions
+int hud_dirty;    // Flag: 1 if HUD needs to be redrawn on the next frame
 unsigned int score;
 
+/* --- Utilities --- */
+/* Returns absolute value of an integer */
 int abs_i(int v)
 {
     if (v < 0)
@@ -59,6 +81,7 @@ int abs_i(int v)
     return v;
 }
 
+/* Checks if a tile is passable. door=1 allows passing through ghost doors ('-') */
 int passable(int tx, int ty, int door)
 {
     char c;
@@ -82,6 +105,7 @@ int passable(int tx, int ty, int door)
     return 1;
 }
 
+/* Renders a single maze tile */
 void draw_tile(int tx, int ty)
 {
     int x;
@@ -118,6 +142,7 @@ void draw_tile(int tx, int ty)
     }
 }
 
+/* Renders the entire maze */
 void draw_maze(void)
 {
     int tx;
@@ -133,6 +158,7 @@ void draw_maze(void)
     hud_dirty = 1;
 }
 
+/* Redraws tiles covering a specific area to erase moving entities */
 void erase_at(int x, int y)
 {
     int tx;
@@ -153,6 +179,7 @@ void erase_at(int x, int y)
     }
 }
 
+/* Converts an unsigned integer to a string for display */
 void number_text(unsigned int value, char *out)
 {
     char tmp[6];
@@ -177,6 +204,7 @@ void number_text(unsigned int value, char *out)
     out[n] = 0;
 }
 
+/* Renders the game HUD (Score, Level, Lives) */
 void draw_hud(void)
 {
     char buffer[8];
@@ -196,6 +224,8 @@ void draw_hud(void)
     hud_dirty = 0;
 }
 
+/* --- Game Initialization --- */
+/* Loads the maze layout from a string into the game maze array */
 void load_maze(void)
 {
     int tx;
@@ -219,6 +249,7 @@ void load_maze(void)
     }
 }
 
+/* Resets positions of Pac-Man and Ghosts for a new level */
 void reset_positions(void)
 {
     int i;
@@ -255,6 +286,7 @@ void reset_positions(void)
     chain = 0;
 }
 
+/* Sets game to 'Ready' state before level starts */
 void start_ready(void)
 {
     draw_maze();
@@ -263,6 +295,7 @@ void start_ready(void)
     wait = 70;
 }
 
+/* Initializes game state for a brand new game */
 void new_game(void)
 {
     score = 0;
@@ -272,6 +305,9 @@ void new_game(void)
     start_ready();
 }
 
+/* Wraps X coordinate for tunnel traversal.
+ * When moving left out of the screen, warp to the right edge, and vice versa.
+ */
 int wrap_x(int x, int d)
 {
     if (d == 0 && x <= -8)
@@ -285,11 +321,16 @@ int wrap_x(int x, int d)
     return x;
 }
 
+/* Handles Pac-Man movement and pellet consumption.
+ * Implements buffered input (pwant) to allow turning before reaching an intersection.
+ */
 void move_pac(unsigned int keys)
 {
     int tx;
     int ty;
     int tile;
+
+    /* Buffer the desired direction based on keyboard input */
     if (keys & KEY_LEFT)
     {
         pwant = 0;
@@ -306,35 +347,47 @@ void move_pac(unsigned int keys)
     {
         pwant = 3;
     }
+
+    /* Allow immediate 180-degree turns */
     if (pwant == opp[pdir])
     {
         pdir = pwant;
         pmoving = 1;
     }
+
+    /* Only check for turns when Pac-Man is aligned with the 8x8 tile grid */
     if ((px & 7) == 0 && (py & 7) == 0)
     {
         tx = px >> 3;
         ty = py >> 3;
+
         if (passable(tx + dxs[pwant], ty + dys[pwant], 0))
         {
+            /* Turn into the buffered direction if possible */
             pdir = pwant;
             pmoving = 1;
         }
         else if (passable(tx + dxs[pdir], ty + dys[pdir], 0))
         {
+            /* Keep moving in current direction if possible */
             pmoving = 1;
         }
         else
         {
+            /* Blocked by a wall */
             pmoving = 0;
         }
     }
+
+    /* Move Pac-Man if not blocked */
     if (pmoving)
     {
         px = px + dxs[pdir] * 2;
         py = py + dys[pdir] * 2;
         px = wrap_x(px, pdir);
     }
+
+    /* Check for pellet consumption at the center of Pac-Man's 8x8 area */
     tx = (px + 4) >> 3;
     ty = (py + 4) >> 3;
     if (tx >= 0 && tx < MW)
@@ -342,6 +395,7 @@ void move_pac(unsigned int keys)
         tile = (ty << 5) + tx;
         if (maze[tile] == '.')
         {
+            /* Consume normal pellet */
             maze[tile] = ' ';
             score = score + 10;
             pellets--;
@@ -350,6 +404,7 @@ void move_pac(unsigned int keys)
         }
         else if (maze[tile] == 'o')
         {
+            /* Consume power pellet: frightens ghosts and resets chain */
             maze[tile] = ' ';
             score = score + 50;
             pellets--;
@@ -360,6 +415,7 @@ void move_pac(unsigned int keys)
                 fright = 50;
             }
             chain = 0;
+            /* Make all active ghosts turn around */
             for (tile = 0; tile < NG; tile++)
             {
                 if (gs[tile] == 1)
@@ -372,6 +428,9 @@ void move_pac(unsigned int keys)
     }
 }
 
+/* AI for ghost direction selection.
+ * Each ghost has a unique targeting strategy.
+ */
 void choose_dir(int i)
 {
     int tx;
@@ -387,40 +446,49 @@ void choose_dir(int i)
     int nx;
     int ny;
     int door;
+
     tx = gx[i] >> 3;
     ty = gy[i] >> 3;
     ptx = (px + 4) >> 3;
     pty = (py + 4) >> 3;
     door = 0;
+
+    /* Determine the target tile based on ghost state and index */
     if (gs[i] == 2)
     {
+        /* Frightened state: target the ghost house exit */
         targx = 9;
         targy = 8;
         door = 1;
     }
     else if (gs[i] == 3)
     {
+        /* Returning to house state */
         targx = 9;
         targy = 6;
         door = 1;
     }
     else if (fright > 0)
     {
+        /* Random targeting while ghosts are frightened */
         targx = 0;
         targy = 0;
     }
     else if (i == 0)
     {
+        /* Ghost 0 (Blinky): Directly chases Pac-Man */
         targx = ptx;
         targy = pty;
     }
     else if (i == 1)
     {
+        /* Ghost 1 (Pinky): Targets 4 tiles ahead of Pac-Man */
         targx = ptx + dxs[pdir] * 4;
         targy = pty + dys[pdir] * 4;
     }
     else if (i == 2)
     {
+        /* Ghost 2 (Inky): Complex mirroring targeting logic */
         targx = ptx + dxs[pdir] * 2;
         targy = pty + dys[pdir] * 2;
         targx = targx + targx - (gx[0] >> 3);
@@ -428,6 +496,7 @@ void choose_dir(int i)
     }
     else
     {
+        /* Ghost 3 (Clyde): Chases if far, retreats to corner if close */
         targx = ptx;
         targy = pty;
         if (abs_i(tx - ptx) + abs_i(ty - pty) < 8)
@@ -436,10 +505,14 @@ void choose_dir(int i)
             targy = 19;
         }
     }
+
     best = -1;
     bestd = 30000;
+
+    /* Evaluate all 4 directions to find the one closest to target */
     for (d = 0; d < 4; d++)
     {
+        /* Ghosts cannot do a 180-degree turn unless forced */
         if (d == opp[gd[i]])
         {
             continue;
@@ -450,20 +523,26 @@ void choose_dir(int i)
         {
             continue;
         }
+
         if (fright > 0 && gs[i] == 1)
         {
+            /* Random movement when frightened */
             dist = gfx_random();
         }
         else
         {
+            /* Manhattan distance to target */
             dist = abs_i(nx - targx) + abs_i(ny - targy);
         }
+
         if (dist < bestd)
         {
             bestd = dist;
             best = d;
         }
     }
+
+    /* Fallback: if no directions are possible, force a 180 turn */
     if (best < 0)
     {
         best = opp[gd[i]];
@@ -471,6 +550,7 @@ void choose_dir(int i)
     gd[i] = best;
 }
 
+/* Advances one ghost, handling its spawn delay, house transitions, and movement. */
 void move_ghost(int i)
 {
     int tx;
@@ -508,12 +588,14 @@ void move_ghost(int i)
     gx[i] = wrap_x(gx[i], gd[i]);
 }
 
+/* Starts the life-loss pause after Pac-Man collides with a dangerous ghost. */
 void lose_life(void)
 {
     mode = 2;
     wait = 50;
 }
 
+/* Handles Pac-Man/ghost collisions, eating frightened ghosts or losing a life. */
 void check_hits(void)
 {
     int i;
@@ -539,6 +621,7 @@ void check_hits(void)
     }
 }
 
+/* Restores the maze tiles underneath all moving entities before the next draw. */
 void erase_all(void)
 {
     int i;
@@ -549,6 +632,7 @@ void erase_all(void)
     erase_at(pdx, pdy);
 }
 
+/* Draws ghosts and Pac-Man, including frightened colors and mouth animation. */
 void draw_entities(void)
 {
     int i;
@@ -609,6 +693,7 @@ void draw_entities(void)
     gfx_bitmap(px + OX, py + OY, 8, 8, bmp, YELLOW);
 }
 
+/* Advances gameplay by one frame and processes the active game mode. */
 void update(unsigned int keys)
 {
     int i;
@@ -678,6 +763,7 @@ void update(unsigned int keys)
     }
 }
 
+/* Initializes the game, then runs input, update, rendering, and presentation each frame. */
 int main(void)
 {
     unsigned int keys;

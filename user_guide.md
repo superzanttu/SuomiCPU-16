@@ -13,27 +13,38 @@ regardless of the numeric order of the image's memory segments.
 
 ## 2. Running the emulator
 
-Run an assembly file from the project directory:
+Run a program from the repository root:
 
 ```console
-python SuomiCPU.py example.asm
+python main.py examples/example.asm
 ```
+
+On Windows, run the PowerShell launcher with a source or binary path:
+
+```powershell
+.\run.ps1 .\examples\factorial.c
+.\run.ps1 .\examples\asteroids.c
+```
+
+`run.ps1` changes to the repository directory and starts the emulator through
+`main.py`. It requires Python to be available as `python` on `PATH`. The program
+argument is optional; without it, the emulator starts with no program loaded.
 
 Additional examples are in [`examples/commands.asm`](examples/commands.asm)
 and [`examples/directives.asm`](examples/directives.asm):
 
 ```console
-python SuomiCPU.py examples/commands.asm
-python SuomiCPU.py examples/directives.asm
+python main.py examples/commands.asm
+python main.py examples/directives.asm
 ```
 
 Compile and immediately run a C source file, or create a flat binary image:
 
 ```console
-python SuomiCPU.py examples/factorial.c
-python c_compiler.py examples/factorial.c
-python c_compiler.py examples/factorial.c -S -o examples/factorial.asm
-python SuomiCPU.py examples/factorial.bin
+python main.py examples/factorial.c
+python tools/c_compiler.py examples/factorial.c
+python tools/c_compiler.py examples/factorial.c -S -o examples/factorial.asm
+python main.py examples/factorial.bin
 ```
 
 The compiler defaults to an output file with the input name and a `.bin`
@@ -396,7 +407,7 @@ table to unpack the pixels.
 
 ## 9. Minimal C89 compiler
 
-[`c_compiler.py`](c_compiler.py) implements a small, dependency-free C89 subset
+[`tools/c_compiler.py`](tools/c_compiler.py) implements a small, dependency-free C89 subset
 compiler; it is not a complete C89 implementation. Supported types are signed
 `int`, `unsigned int`, `char`, `unsigned char`, `float`, `void`, pointers to
 supported object types, and fixed-size arrays. It accepts global and local
@@ -422,7 +433,8 @@ Integer and pointer details:
   objects occupy two bytes. Floating-point values use IEEE-754 binary16.
 - Pointers occupy three bytes, matching the CPU's 19-bit address space.
   Pointer arithmetic and array indexing scale by the element size.
-- Global storage begins at `0xE800` (`GLOBAL_BASE` in `c_compiler.py`); uninitialized globals are zeroed. Local
+- Global storage begins at `0xE800` (`GLOBAL_BASE` in
+  [`tools/c_compiler.py`](tools/c_compiler.py)); uninitialized globals are zeroed. Local
   variables, arguments, return addresses, and temporaries use the machine stack.
 
 The subset excludes storage-class and type qualifiers, structures, unions,
@@ -431,7 +443,7 @@ library. Global initializers must be constant expressions supported by the
 compiler.
 
 There is no `printf` or separate console device. When a screen routine is
-referenced, the compiler links [`lib_text.asm`](lib_text.asm), which uses
+referenced, the compiler links [`lib/lib_text.asm`](lib/lib_text.asm), which uses
 [`fonts/font5x7.asm`](fonts/font5x7.asm) to provide a 53-column by 30-row text
 grid of 6x8 cells:
 
@@ -470,10 +482,10 @@ write `x[i] = x[i] + 1`.
 
 ### C graphics library (`gfx_*`)
 
-[`suomi_gfx.h`](suomi_gfx.h) declares the graphics builtins and defines color
+[`lib/suomi_gfx.h`](lib/suomi_gfx.h) declares the graphics builtins and defines color
 (`RED`, `GREEN`, ...), key (`KEY_LEFT`, `KEY_FIRE`, ...) and screen-size
 constants. Using any `gfx_*` function makes the compiler link
-[`lib_cgfx.asm`](lib_cgfx.asm), which drives the graphics coprocessor, plus the
+[`lib/lib_cgfx.asm`](lib/lib_cgfx.asm), which drives the graphics coprocessor, plus the
 font. All drawing goes to an off-screen back buffer; `gfx_present()` copies it
 to VRAM in one step and ends the current emulator frame (vsync), so there is
 no flicker.
@@ -506,47 +518,52 @@ Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 
 [`examples/asteroids.c`](examples/asteroids.c) and
 [`examples/space_invaders.c`](examples/space_invaders.c) are complete playable
-games with score, lives and restart. Build and run:
+games with score, lives, and restart. [`examples/pacman.c`](examples/pacman.c)
+is a 19x21-tile maze game with four ghosts, power pellets, a wrap-around tunnel,
+lives, and levels. Build and run any of them from the repository root:
 
 ```
-python c_compiler.py examples/asteroids.c -o asteroids.bin
-python SuomiCPU.py asteroids.bin
+python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
+python main.py asteroids.bin
 ```
 
-Pac-Man (examples/pacman.c) is a 19x21-tile maze with four chasing ghosts, power pellets, a wrap-around tunnel, lives and levels; steer with the arrow keys or WASD.
+[`examples/factorial.c`](examples/factorial.c) and
+[`examples/text_demo.c`](examples/text_demo.c) demonstrate C recursion and text
+input/output. [`examples/sc16_showcase.c`](examples/sc16_showcase.c) is an
+eight-page tour of the SC-16's CPU, memory, graphics, text, devices, and
+benchmark features.
 
-Controls: Left/Right (A/D) steer or move, Up (W) thrusts in Asteroids, Space
-fires, Enter or Space restarts after GAME OVER. Run time is roughly 15,000-25,000
-emulated instructions per game frame.
+Controls: Left/Right (A/D) steer or move; Up (W) thrusts in Asteroids; Space
+fires; Enter or Space restarts after GAME OVER. In Pac-Man, all four directions
+steer. The showcase uses Left/Right (A/D) to change pages and Enter to run the
+benchmark on page 8. Game run time is roughly 15,000-25,000 emulated
+instructions per frame.
 
 ## 10. Examples
 
-- [`example.asm`](example.asm) draws a letter `H` into the emulated display
+- [`examples/example.asm`](examples/example.asm) draws a letter `H` into the emulated display
   memory.
 - [`examples/commands.asm`](examples/commands.asm) contains at least one
   example of every supported instruction mnemonic. `EI`, `DI`, and `RTI` are
   placed after `HALT` so they are assembled but not executed by this tour.
 - [`examples/directives.asm`](examples/directives.asm) demonstrates `.address`
   and all `.data` formats across multiple memory locations.
-- [`examples/asteroids.asm`](examples/asteroids.asm) is a minimal Asteroids-like
-  demo with a horizontally controlled ship, a moving asteroid pixel, and a
-  fire marker.
-- [`examples/space_invaders.asm`](examples/space_invaders.asm) is a minimal
-  Space-Invaders-like demo with a horizontal ship, a fixed alien block, and a
-  fire marker.
 - [`examples/gfx_demo.asm`](examples/gfx_demo.asm) demonstrates plot, line,
   rectangle, sprite, and text routines.
 - [`examples/factorial.c`](examples/factorial.c) demonstrates the C compiler,
   recursive calls, local variables, arithmetic, and a `for` loop.
+- [`examples/anaclock.c`](examples/anaclock.c) displays the emulator RTC as a
+  live analog clock with a digital hours, minutes, and seconds readout. Run it
+  with `python main.py examples/anaclock.c`.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
-
-Both game examples include the font table and graphics library. They are
-intentionally tiny assembly demos rather than full arcade implementations:
-the current instruction set has no multiplication, shifts, indirect branches,
-random number generator, or built-in graphics instructions. Their controls
-use `a`, `d`, and Space. The keyboard device retains the last key until the
-game clears it, so each key-down is treated as one action.
+- [`examples/asteroids.c`](examples/asteroids.c) and
+  [`examples/space_invaders.c`](examples/space_invaders.c) are playable C games.
+- [`examples/pacman.c`](examples/pacman.c) is a tile-based maze game with ghost
+  AI, power pellets, and tunnel wrapping.
+- [`examples/sc16_showcase.c`](examples/sc16_showcase.c) presents an interactive
+  eight-page SC-16 feature tour and benchmark. The playable games are written in C
+  and use the graphics API; their controls are described in the Games section.
 
 These examples document the current assembler and emulator behavior. Register
 arithmetic is not strictly limited to eight bits, and the CPU's `LDI` pair loads
@@ -555,8 +572,9 @@ conventional 8-bit processor.
 
 ## 11. Reusable graphics library
 
-[`lib_gfx.asm`](lib_gfx.asm) provides assembly-callable routines. Include it
-after the main code (its routines occupy addresses starting at `0x0400`):
+[`lib/lib_gfx.asm`](lib/lib_gfx.asm) provides assembly-callable routines.
+Include it after the main code (its routines occupy addresses starting at
+`0x0400`):
 
 ```asm
 .address 0x0100
@@ -616,5 +634,5 @@ C globals start at 0xE800.
 
 Run the showcase (8 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8):
 
-    python c_compiler.py examples/sc8_showcase.c -o showcase.bin
-    python SuomiCPU.py showcase.bin
+    python tools/c_compiler.py examples/sc16_showcase.c -o showcase.bin
+    python main.py showcase.bin

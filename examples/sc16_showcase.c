@@ -41,7 +41,7 @@ int ceb[12] = {1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7};
 int cpx[8];
 int cpy[8];
 
-char logo_text[7] = "SC-16 !";
+char logo_text[8] = "SC-16 !";
 int starx[40];
 int stary[40];
 int ballx[3] = {20, 140, 250};

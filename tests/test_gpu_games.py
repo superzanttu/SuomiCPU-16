@@ -231,7 +231,7 @@ class GameTests(unittest.TestCase):
         self.assertNotEqual(vram(idle), vram(moving))
 
     def test_showcase_pages_and_interrupt_counters(self):
-        cpu = make_cpu(compile_file(ROOT / "examples" / "sc8_showcase.c"))
+        cpu = make_cpu(compile_file(ROOT / "examples" / "sc16_showcase.c"))
         run_frame(cpu, 400_000)
         seen = set()
         for _ in range(8):
