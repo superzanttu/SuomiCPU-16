@@ -1,7 +1,7 @@
 """Headless helpers for running compiled SC-8 programs frame by frame."""
 from pathlib import Path
 
-from SuomiCPU import BACK_START, KEYS_ADDR, MEM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START, SuomiCompute16
+from src.SuomiCPU import BACK_START, KEYS_ADDR, MEM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START, SuomiCompute16
 from c_compiler import compile_source
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,7 +47,7 @@ def pixel(cpu, x, y):
 
 def save_png(cpu, path):
     import pygame
-    from SuomiCPU import PALETTE_COLORS
+    from src.SuomiCPU import PALETTE_COLORS
     palette = [(i, i, i) for i in range(256)]
     palette[:len(PALETTE_COLORS)] = PALETTE_COLORS
     surface = pygame.image.frombuffer(vram(cpu), (SCREEN_WIDTH, SCREEN_HEIGHT), "P")

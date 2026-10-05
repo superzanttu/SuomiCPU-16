@@ -7,9 +7,9 @@ import struct
 import random
 from pathlib import Path
 
-from assembler import AssemblyError, AssemblyImage, MemorySegment, assemble_file
-from c_compiler import CCompilerError, compile_file
-from isa import (
+from tools.assembler import AssemblyError, AssemblyImage, MemorySegment, assemble_file
+from tools.c_compiler import CCompilerError, compile_file
+from .isa import (
     OP_ADD,
     OP_ADJSP,
     OP_AND,
@@ -471,8 +471,8 @@ class SuomiCompute16:
             self.update_display()
             self.clock.tick(DISPLAY_FPS)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the SC-8 emulator.")
+def main():
+    parser = argparse.ArgumentParser(description="Run the SC-16 emulator.")
     parser.add_argument(
         "program_file",
         nargs="?",
@@ -489,8 +489,12 @@ if __name__ == "__main__":
 
     sc16 = SuomiCompute16()
     if program is not None:
-        sc8.load_program(program)
+        sc16.load_program(program)
     try:
-        sc8.run()
+        sc16.run()
     finally:
         pygame.quit()
+
+if __name__ == "__main__":
+    main()
+

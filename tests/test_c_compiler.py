@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from assembler import assemble_file
-from SuomiCPU import KBD_ADDR, MEM_SIZE, SCREEN_WIDTH, VRAM_START, SuomiCompute16, load_program_file
+from src.SuomiCPU import KBD_ADDR, MEM_SIZE, SCREEN_WIDTH, VRAM_START, SuomiCompute16, load_program_file
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source, main as compiler_main
 
 

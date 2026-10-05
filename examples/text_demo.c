@@ -12,11 +12,11 @@ int main(void)
     char name[24];
 
     SCREEN_CLEAR();
-    SCREEN_PRINT("NAME? ", 1);
+    SCREEN_PRINT("Kuka olet? ", 1);
     name_length = SCREEN_INPUT(name, 23, 1);
 
     SCREEN_SET_CURSOR(0, 2);
-    SCREEN_PRINT("HELLO WORLD!", 1);
+    SCREEN_PRINT("Huomenta! Kohta kouluun, ", 1);
     SCREEN_PRINT(name, 1);
     cursor_position = SCREEN_GET_CURSOR();
     return 0;

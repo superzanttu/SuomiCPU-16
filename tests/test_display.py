@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 import pygame
 
 from assembler import assemble
-from SuomiCPU import MEM_SIZE, VRAM_START, SuomiCompute16
+from src.SuomiCPU import MEM_SIZE, VRAM_START, SuomiCompute16
 
 
 class DisplayTests(unittest.TestCase):

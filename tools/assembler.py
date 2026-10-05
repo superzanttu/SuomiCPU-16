@@ -3,7 +3,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from isa import OPCODES, OP_LDI_H
+from src.isa import OPCODES, OP_LDI_H
 
 MEMORY_SIZE = 1 << 19
 
@@ -84,6 +84,23 @@ def _expand_includes(
             raise _error(line_number, '.include expects one non-empty quoted file path')
 
         include_path = (base_directory / include_name).resolve()
+        if not include_path.is_file():
+            # Try searching in the 'lib' and 'fonts' directories relative to the root of the project
+            # We assume the root is where the execution starts or a known directory.
+            # A simpler way is to check a few levels up for these folders.
+            found = False
+            current = base_directory
+            for _ in range(5): # search up to 5 levels
+                for folder in ("lib", "fonts"):
+                    lib_path = current / folder / Path(include_name).name
+                    if lib_path.is_file():
+                        include_path = lib_path.resolve()
+                        found = True
+                        break
+                if found: break
+                current = current.parent
+                if current == current.parent: break
+        
         if include_path in include_stack:
             cycle = " -> ".join(str(path) for path in (*include_stack, include_path))
             raise _error(line_number, f"circular .include detected: {cycle}")

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
-from SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, MEM_SIZE, SCREEN_WIDTH, SuomiCompute16
+from src.SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, MEM_SIZE, SCREEN_WIDTH, SuomiCompute16
 
 HEADER = '#include "suomi_gfx.h"\n'
 
@@ -88,7 +88,7 @@ class GpuTests(unittest.TestCase):
 
 
 def vram_pixel(cpu, x, y):
-    from SuomiCPU import VRAM_START
+    from src.SuomiCPU import VRAM_START
     return cpu.memory[VRAM_START + y * SCREEN_WIDTH + x]
 
 

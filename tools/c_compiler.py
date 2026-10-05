@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from assembler import AssemblyError, AssemblyImage, assemble
+from tools.assembler import AssemblyError, AssemblyImage, assemble
 
 WORD_MASK = 0xFFFF
 CODE_BASE = 0x4800
@@ -815,7 +815,10 @@ class _CodeGenerator:
         if "lib_cgfx.asm" in libraries and "lib_text.asm" not in libraries:
             libraries.append("fonts/font5x7.asm")
         for library in libraries:
-            library_path = Path(__file__).resolve().parent / library
+            if "font5x7.asm" in library:
+                library_path = Path(__file__).resolve().parent.parent / "fonts" / Path(library).name
+            else:
+                library_path = Path(__file__).resolve().parent.parent / "lib" / Path(library).name
             include_path = os.path.relpath(library_path, source_directory).replace("\\", "/")
             self.emit(f'.include "{include_path}"')
         return "\n".join(self.lines) + "\n"
@@ -2209,7 +2212,7 @@ def _preprocess(source: str, filename: str, defines: dict[str, str], depth: int 
                 raise CCompilerError(f"{where}: invalid #include")
             target = quoted.group(1) or quoted.group(2)
             candidates = [Path(filename).resolve().parent / target,
-                          Path(__file__).resolve().parent / target]
+                          Path(__file__).resolve().parent.parent / "lib" / target]
             found = next((path for path in candidates if path.is_file()), None)
             if found is None:
                 raise CCompilerError(f"{where}: cannot find include file {target!r}")

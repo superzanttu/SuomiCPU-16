@@ -11,7 +11,7 @@ import unittest
 
 import isa
 from assembler import AssemblyError, assemble
-from SuomiCPU import ICR_ADDR, MEM_SIZE, SuomiCompute16
+from src.SuomiCPU import ICR_ADDR, MEM_SIZE, SuomiCompute16
 
 REGS = range(8)
 CODE = 0x100
