@@ -86,6 +86,7 @@ int yaw_rate;
 int pitch_rate;
 int roll_rate;
 int thrust_mode;
+int engine_snd;
 int shields;
 int hull;
 int heat;
@@ -479,6 +480,7 @@ void add_explosion(int x, int y, int z, int big)
     }
     exp_t[pick] = 16;
     exp_big[pick] = big;
+    gfx_sound(1, 260 - big * 120, 14 + big * 14, WAVE_NOISE, 60 + big * 25);
     ox[S_EXP + pick] = x;
     oy[S_EXP + pick] = y;
     oz[S_EXP + pick] = z;
@@ -491,6 +493,9 @@ void player_dies(void)
     dead = 1;
     dead_t = 0;
     add_explosion(0, 0, 80, 1);
+    gfx_sound(1, 70, 70, WAVE_NOISE, 100);
+    gfx_sound(0, 0, 0, 0, 0);
+    engine_snd = 0;
 }
 
 /* Apply damage to the player: shields absorb first, then the hull. */
@@ -498,6 +503,7 @@ void damage_player(int n)
 {
     shield_cd = 16;
     dmg_flash = 6;
+    gfx_sound(3, 180, 8, WAVE_NOISE, 70);
     if (shields >= n)
     {
         shields = shields - n;
@@ -653,6 +659,23 @@ void update_controls(unsigned int keys, unsigned int kx)
         thrust_mode = 2;
     }
     /* Light drag along the nose, stronger sideways (flight assist). */
+    /* Engine rumble loops while thrusting; restart it only when the mode changes */
+    if (thrust_mode != engine_snd)
+    {
+        engine_snd = thrust_mode;
+        if (thrust_mode == 1)
+        {
+            gfx_sound(0, 80, 0, WAVE_NOISE, 30);
+        }
+        else if (thrust_mode == 2)
+        {
+            gfx_sound(0, 50, 0, WAVE_NOISE, 18);
+        }
+        else
+        {
+            gfx_sound(0, 0, 0, 0, 0);
+        }
+    }
     ox[S_SHIP] = drag(ox[S_SHIP], 6);
     oy[S_SHIP] = drag(oy[S_SHIP], 6);
     oz[S_SHIP] = drag(oz[S_SHIP], 8);
@@ -964,6 +987,7 @@ void update_enemies(void)
                 {
                     en_cd[i] = 18 + rnd(20);
                     en_beam[i] = 2;
+                    gfx_sound(3, 420, 4, WAVE_SQUARE, 25);
                     if (rnd(100) < 55 && !dead)
                     {
                         damage_player(5);
@@ -1069,6 +1093,10 @@ void update_combat(unsigned int keys)
 {
     if (heat >= 100)
     {
+        if (!overheated)
+        {
+            gfx_sound(2, 220, 20, WAVE_SQUARE, 40);
+        }
         overheated = 1;
     }
     if ((keys & KEY_FIRE) && !overheated && laser_cd == 0)
@@ -1076,6 +1104,7 @@ void update_combat(unsigned int keys)
         heat = heat + 9;
         laser_cd = 3;
         beam = 2;
+        gfx_sound(2, 1500, 3, WAVE_SQUARE, 35);
         laser_hit();
     }
 }

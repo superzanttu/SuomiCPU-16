@@ -473,10 +473,12 @@ void page_animation(void)
         if (ballx[i] < 2 || ballx[i] > 310)
         {
             balldx[i] = -balldx[i];
+            gfx_sound(1, 300 + i * 200, 3, WAVE_TRIANGLE, 30);
         }
         if (bally[i] < 20 || bally[i] > 214)
         {
             balldy[i] = -balldy[i];
+            gfx_sound(1, 300 + i * 200, 3, WAVE_TRIANGLE, 30);
         }
         gfx_bitmap(ballx[i], bally[i], 8, 8, ball, rainbow[(i * 2 + 1)]);
     }
@@ -922,6 +924,7 @@ void bench_step(void)
                 bench_mark = bench_mark + bench_blocks[i] * (60 / DUR);
             }
             bench_state = 2;
+            gfx_sound(2, 1320, 30, WAVE_TRIANGLE, 50);
         }
     }
 }
@@ -951,10 +954,19 @@ int main(void)
             {
                 page = (page + PAGES - 1) % PAGES;
             }
+            if (pressed & (KEY_LEFT | KEY_RIGHT))
+            {
+                gfx_sound(2, 400 + page * 70, 5, WAVE_SQUARE, 30);
+            }
+            if (page == 6 && (pressed & (KEY_UP | KEY_DOWN | KEY_FIRE)))
+            {
+                gfx_sound(3, 1000, 4, WAVE_TRIANGLE, 40);
+            }
             if (page == 7 && (pressed & KEY_START))
             {
                 bench_state = 1;
                 bench_index = 0;
+                gfx_sound(2, 880, 10, WAVE_SQUARE, 40);
             }
         }
         frame++;

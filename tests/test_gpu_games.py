@@ -315,6 +315,29 @@ class GameTests(unittest.TestCase):
         self.assertTrue(any(call[0] == 2 and call[3] == 1 for call in cpu.sound_log))
         self.assertIn(2, vram(cpu))
 
+    def test_games_emit_sound_effects(self):
+        cases = [
+            ("asteroids.c", lambda f: 4 | 16, 40, (0, 2)),
+            ("space_invaders.c", lambda f: 16, 60, (0, 2)),
+            ("pacman.c", lambda f: 0, 90, (0, 2)),
+            ("sc16_showcase.c", lambda f: 2 if f == 3 else 0, 8, (2,)),
+        ]
+        for name, keys, frames, channels in cases:
+            cpu = self.play(name, keys, frames)
+            used = {call[0] for call in cpu.sound_log if call[1]}
+            for channel in channels:
+                self.assertIn(channel, used, name)
+
+    def test_elitedemo_engine_and_laser_sounds(self):
+        cpu = make_cpu(compile_file(ROOT / "examples" / "elitedemo.c"))
+        for frame in range(12):
+            cpu.memory[KEYS_ADDR] = 16
+            cpu.memory[KEYS_ADDR + 1] = 4
+            run_frame(cpu)
+        used = {call[0] for call in cpu.sound_log if call[1]}
+        self.assertIn(0, used)
+        self.assertIn(2, used)
+
     def test_gfx_sound_and_static_layer_commands(self):
         cpu = run_c("int main(void) { gfx_sound(1, 440, 10, WAVE_TRIANGLE, 50); gfx_rect(0,0,4,4,3); gfx_save();"
                     " gfx_clear(0); gfx_restore(); gfx_present(); return 0; }")

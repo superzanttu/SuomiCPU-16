@@ -45,7 +45,7 @@ int bx[MAXB], by[MAXB], bvx[MAXB], bvy[MAXB], blife[MAXB];
 // Player Ship: position, velocity, and angle
 int shipx, shipy, shipvx, shipvy, ang;
 // Game status and timers
-int invuln, cooldown, lives, level, frame, over, thrusting, wait;
+int invuln, cooldown, lives, level, frame, over, thrusting, wait, engine_on;
 unsigned int score;
 
 /* --- Utilities --- */
@@ -134,6 +134,7 @@ void fire(void) {
             bvx[i] = dxT[ang] << 3;
             bvy[i] = dyT[ang] << 3;
             cooldown = 8;
+            gfx_sound(2, 900, 4, WAVE_SQUARE, 35);
             return;
         }
     }
@@ -143,6 +144,8 @@ void fire(void) {
 void hit_asteroid(int i) {
     int size = asz[i];
     score += points[size];
+    /* Bigger rocks rumble lower */
+    gfx_sound(1, 500 - size * 120, 8 + size * 4, WAVE_NOISE, 60);
     if (score > 60000) score = 60000;
     if (size > 1) {
         asz[i] = size - 1;
@@ -159,6 +162,9 @@ void update_ship(unsigned int keys) {
         if (keys & KEY_RIGHT) ang = (ang + 1) & 31;
     }
     thrusting = (keys & KEY_UP);
+    /* Engine rumble loops only while the thrust key is held */
+    if (thrusting && !engine_on) { gfx_sound(0, 90, 0, WAVE_NOISE, 25); engine_on = 1; }
+    if (!thrusting && engine_on) { gfx_sound(0, 0, 0, 0, 0); engine_on = 0; }
     if (thrusting && (f & 3) == 0) {
         shipvx = clamp(shipvx + dxT[ang], 40);
         shipvy = clamp(shipvy + dyT[ang], 40);
@@ -207,14 +213,18 @@ void update_world(void) {
                 int reach = hitbox[asz[j]] + 64;
                 if (iabs(shipx - ax[j]) < reach && iabs(shipy - ay[j]) < reach) {
                     lives--;
-                    if (lives == 0) { over = 1; wait = 60; }
+                    gfx_sound(1, 140, 40, WAVE_NOISE, 90);
+                    if (lives == 0) { over = 1; wait = 60; gfx_sound(3, 60, 70, WAVE_TRIANGLE, 70); }
                     else respawn_ship();
                     break;
                 }
             }
         }
     }
-    if (alive == 0 && over == 0) { level++; start_level(); }
+    if (alive == 0 && over == 0) {
+        level++; start_level();
+        gfx_sound(3, 660, 12, WAVE_TRIANGLE, 50);
+    }
 }
 
 /* --- Rendering --- */
@@ -280,6 +290,7 @@ int main(void) {
     while (1) {
         keys = gfx_keys();
         if (over) {
+            if (engine_on) { gfx_sound(0, 0, 0, 0, 0); engine_on = 0; }
             if (wait > 0) wait--;
             else if (keys & (KEY_START | KEY_FIRE)) new_game();
         } else update_ship(keys);

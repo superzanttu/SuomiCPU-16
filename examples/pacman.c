@@ -67,6 +67,7 @@ int lives;        // Number of lives remaining
 int level;        // Current level index
 int mode;         // Game mode: 0=Ready, 1=Playing, 2=Losing Life, 3=Game Over
 int wait;         // Multi-purpose timer for delays and state transitions
+int waka;         // Alternates the pellet sound pitch
 int hud_dirty;    // Flag: 1 if HUD needs to be redrawn on the next frame
 unsigned int score;
 
@@ -398,6 +399,8 @@ void move_pac(unsigned int keys)
             /* Consume normal pellet */
             maze[tile] = ' ';
             score = score + 10;
+            waka = 1 - waka;
+            gfx_sound(0, 330 + waka * 150, 4, WAVE_TRIANGLE, 45);
             pellets--;
             hud_dirty = 1;
             draw_tile(tx, ty);
@@ -407,6 +410,7 @@ void move_pac(unsigned int keys)
             /* Consume power pellet: frightens ghosts and resets chain */
             maze[tile] = ' ';
             score = score + 50;
+            gfx_sound(1, 200, 20, WAVE_SQUARE, 50);
             pellets--;
             hud_dirty = 1;
             fright = 190 - level * 25;
@@ -593,6 +597,7 @@ void lose_life(void)
 {
     mode = 2;
     wait = 50;
+    gfx_sound(0, 0, 0, 0, 0);
 }
 
 /* Handles Pac-Man/ghost collisions, eating frightened ghosts or losing a life. */
@@ -609,6 +614,7 @@ void check_hits(void)
                 {
                     gs[i] = 2;
                     chain++;
+                    gfx_sound(1, 500 + chain * 150, 16, WAVE_SQUARE, 55);
                     score = score + (100 << chain);
                     hud_dirty = 1;
                 }
@@ -700,6 +706,10 @@ void update(unsigned int keys)
     int t;
     if (mode == 0)
     {
+        if (wait == 68 || wait == 52 || wait == 36)
+        {
+            gfx_sound(2, 440 + (68 - wait) * 12, 10, WAVE_SQUARE, 40);
+        }
         if (wait > 0)
         {
             wait--;
@@ -717,6 +727,8 @@ void update(unsigned int keys)
     if (mode == 2)
     {
         wait--;
+        /* Falling death wail */
+        gfx_sound(1, 150 + wait * 9, 2, WAVE_TRIANGLE, 60);
         if (wait <= 0)
         {
             lives--;
@@ -748,6 +760,10 @@ void update(unsigned int keys)
     if (fright > 0)
     {
         fright--;
+        if ((tick & 7) == 0)
+        {
+            gfx_sound(3, 260 + (tick & 8) * 12, 8, WAVE_TRIANGLE, 25);
+        }
     }
     move_pac(keys);
     for (i = 0; i < NG; i++)
@@ -758,6 +774,7 @@ void update(unsigned int keys)
     if (pellets <= 0)
     {
         level++;
+        gfx_sound(2, 880, 24, WAVE_SQUARE, 45);
         load_maze();
         start_ready();
     }

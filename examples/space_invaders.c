@@ -41,6 +41,7 @@ int anim;          // Animation frame toggle
 int cooldown;      // Player fire cooldown
 int lives;         // Player remaining lives
 int wave;          // Current wave number
+int march;         // Step counter for the four-note march sound
 int over;          // Game over flag
 int wait;          // Delay before restart is allowed
 int boom_x;        // Explosion X position
@@ -200,6 +201,7 @@ void hit_invader(int index)
     int r;
     alive[index] = 0;
     left_count--;
+    gfx_sound(1, 450, 8, WAVE_NOISE, 60);
     r = index >> 3;
     score += (ROWS - r) * 10;
     if (left_count == 8)
@@ -228,6 +230,7 @@ void update_player(unsigned int keys)
         bullet_x = px + 4;
         bullet_y = PLAYER_Y - 4;
         cooldown = 10;
+        gfx_sound(2, 1200, 4, WAVE_SQUARE, 35);
     }
     if (invuln > 0)
     {
@@ -289,10 +292,12 @@ void update_shots(void)
                 shot_y[s] = -1;
                 lives--;
                 invuln = 60;
+                gfx_sound(1, 120, 40, WAVE_NOISE, 90);
                 if (lives == 0)
                 {
                     over = 1;
                     wait = 60;
+                    gfx_sound(3, 70, 70, WAVE_TRIANGLE, 70);
                 }
             }
         }
@@ -310,6 +315,9 @@ void update(unsigned int keys)
     {
         move_timer = 0;
         step_formation();
+        /* Classic descending four-note heartbeat */
+        march = (march + 1) & 3;
+        gfx_sound(0, 110 - march * 10, 5, WAVE_SQUARE, 40);
     }
     if ((gfx_random() & 63) == 0)
     {
@@ -323,6 +331,7 @@ void update(unsigned int keys)
     {
         wave++;
         score += 100;
+        gfx_sound(3, 880, 14, WAVE_TRIANGLE, 50);
         set_wave();
     }
 }
