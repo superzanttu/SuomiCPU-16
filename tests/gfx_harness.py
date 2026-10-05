@@ -17,6 +17,7 @@ def make_cpu(image):
     cpu.frame_yield = False
     cpu.audio_enabled = False
     cpu.sound_log = []
+    cpu._last_click = [(-10**9, 0, 0), (-10**9, 0, 0)]
     cpu.load_program(image)
     cpu.reset()
     return cpu

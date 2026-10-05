@@ -558,12 +558,20 @@ no flicker.
 | `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                             |
 | `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.   |
 | `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                          |
+| `int gfx_mouse_x(void)` / `int gfx_mouse_y(void)`                                       | Mouse position in screen pixels (0-319, 0-239).                               |
+| `unsigned int gfx_mouse_buttons(void)`                                                  | Held buttons: `MOUSE_LEFT` 1, `MOUSE_RIGHT` 2 (use with position for dragging). |
+| `unsigned int gfx_mouse_events(void)`                                                   | One-frame events: press `MOUSE_LEFT_DOWN`/`RIGHT_DOWN` 1/2, double-click `MOUSE_LEFT_DOUBLE`/`RIGHT_DOUBLE` 4/8, release `MOUSE_LEFT_UP`/`RIGHT_UP` 16/32. |
 | `void gfx_sound(int channel, int freq, int frames, int wave, int volume)`                | Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. `WAVE_SQUARE/NOISE/TRIANGLE`. |
 | `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store the back buffer as a static layer / redraw it in one call.              |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
 (`0x43005`, `gfx_keys_ext()`, constants `KEYX_*`) holds bit 0 Q, 1 E, 2 X/Shift, 3 Z/Ctrl.
+
+Mouse registers (base `0x43008`): `+0` X word, `+2` Y word, `+4` held buttons, `+5` events.
+A double click is a second press of the same button within 400 ms and 4 pixels; it raises
+the press bit and the double-click bit together. Drag and drop = button held while the
+position changes; the release event marks the drop.
 
 Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 `+0` CMD (writing it runs the command), `+1` COLOR, `+2` X, `+4` Y, `+6` W,
@@ -638,6 +646,11 @@ instructions per frame.
   the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
   Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
   accuracy bonus) x pad multiplier. Run it with `python main.py examples/lunarlander.c`.
+- [`examples/paint.c`](examples/paint.c) is an MS Paint style drawing program driven by the
+  mouse: pen, eraser, spray, line, rectangle and filled rectangle with live shape previews,
+  four brush sizes and a 16-color palette. Left button draws with the foreground color, right
+  button with the background color; double-click a palette color to fill the canvas and
+  double-click CLR to clear it. Images cannot be saved. Run it with `python main.py examples/paint.c`.
 - [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
 - [`examples/asteroids.c`](examples/asteroids.c) and

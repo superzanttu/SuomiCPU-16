@@ -65,6 +65,8 @@ class DisplayTests(unittest.TestCase):
         emulator.reset = lambda: setattr(emulator, "running", True)
         emulator.execute_frame = lambda: setattr(emulator, "running", False)
         emulator.update_rtc = Mock()
+        emulator.begin_mouse_frame = Mock()
+        emulator.end_mouse_frame = Mock()
         emulator.update_display = Mock()
         keypress = pygame.event.Event(
             pygame.KEYDOWN,

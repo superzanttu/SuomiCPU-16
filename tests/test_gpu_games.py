@@ -4,7 +4,7 @@ from pathlib import Path
 
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
-from src.SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, MEM_SIZE, SCREEN_WIDTH, SuomiCompute16
+from src.SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, MEM_SIZE, MOUSE_ADDR, SCREEN_WIDTH, SuomiCompute16
 
 HEADER = '#include "suomi_gfx.h"\n'
 
@@ -337,6 +337,65 @@ class GameTests(unittest.TestCase):
         used = {call[0] for call in cpu.sound_log if call[1]}
         self.assertIn(0, used)
         self.assertIn(2, used)
+
+    def test_mouse_registers_clicks_double_click_and_drag(self):
+        cpu = run_c("int main(void) { gfx_rect(gfx_mouse_x(), gfx_mouse_y(), 2, 2, gfx_mouse_buttons() + 3);"
+                    " gfx_present(); return 0; }", frames=0)
+        cpu.set_mouse_position(40, 30)
+        cpu.mouse_button(0, True, 40, 30, 1000)
+        self.assertEqual(cpu.memory[MOUSE_ADDR + 4], 1)
+        self.assertEqual(cpu.memory[MOUSE_ADDR + 5], 1)
+        cpu.memory[MOUSE_ADDR + 5] = 0
+        cpu.mouse_button(0, False, 40, 30, 1100)
+        self.assertEqual(cpu.memory[MOUSE_ADDR + 5], 16)
+        cpu.memory[MOUSE_ADDR + 5] = 0
+        cpu.mouse_button(0, True, 41, 30, 1200)
+        self.assertEqual(cpu.memory[MOUSE_ADDR + 5], 1 | 4)
+        cpu.memory[MOUSE_ADDR + 5] = 0
+        cpu.mouse_button(1, True, 41, 30, 1250)
+        self.assertEqual(cpu.memory[MOUSE_ADDR + 5], 2)
+        cpu.set_mouse_position(500, -5)
+        self.assertEqual(bytes(cpu.memory[MOUSE_ADDR:MOUSE_ADDR + 4]), bytes((1, 63, 0, 0)))
+        cpu.set_mouse_position(40, 30)
+        run_frame(cpu)
+        self.assertEqual(back(cpu, 40, 30), 6)
+
+    def test_paint_draws_with_mouse_drag_and_shapes(self):
+        cpu = make_cpu(compile_file(ROOT / "examples" / "paint.c"))
+        clock = [0]
+
+        def step(x, y, down=None, up=None):
+            cpu.set_mouse_position(x, y)
+            if down is not None:
+                clock[0] += 1000
+                cpu.mouse_button(down, True, x, y, clock[0])
+            if up is not None:
+                cpu.mouse_button(up, False, x, y, clock[0])
+            run_frame(cpu)
+            cpu.memory[MOUSE_ADDR + 5] = 0
+
+        step(100, 100)
+        self.assertEqual(pixel(cpu, 100, 100), 1)
+        step(100, 100, down=0)
+        for i in range(1, 20):
+            step(100 + i * 3, 100 + i)
+        step(160, 120, up=0)
+        self.assertEqual(pixel(cpu, 130, 110), 0)
+        step(30, 36, down=0)
+        step(30, 36, up=0)
+        step(60, 150, down=0)
+        for i in range(1, 5):
+            step(60 + i * 20, 150 + i * 10)
+        step(140, 190, up=0)
+        self.assertEqual(pixel(cpu, 100, 170), 0)
+        step(150, 150)
+        self.assertEqual(pixel(cpu, 150, 150), 1)
+        step(10, 200, down=0)
+        step(10, 200, up=0)
+        cpu.set_mouse_position(10, 200)
+        cpu.mouse_button(0, True, 10, 200, clock[0] + 100)
+        run_frame(cpu)
+        self.assertEqual(pixel(cpu, 250, 20), 10)
 
     def test_gfx_sound_and_static_layer_commands(self):
         cpu = run_c("int main(void) { gfx_sound(1, 440, 10, WAVE_TRIANGLE, 50); gfx_rect(0,0,4,4,3); gfx_save();"

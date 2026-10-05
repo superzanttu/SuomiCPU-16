@@ -72,6 +72,7 @@ KBD_ADDR    = 0x43000 # Näppäimistön osoite
 ICR_ADDR    = 0x43002 # Keskeytysten ohjaus
 RTC_START   = 0x43010 # Reaaliaikakello
 KEYS_ADDR   = 0x43004 # Mitkä näppäimet on painettuna
+MOUSE_ADDR  = 0x43008 # Mouse: +0 X word, +2 Y word, +4 held buttons, +5 click events (one frame)
 GPU_BASE    = 0x43020 # Grafiikkapiirin ohjausrekisterit
 BACK_START  = 0x44000 # "Takapuskuri" - piirretään tänne, sitten siirretään ruudulle
 FONT_ADDR   = 0x4400  # Fonttien paikka
@@ -86,6 +87,7 @@ GPU_SAVE, GPU_LOAD = 14, 15  # Save/restore the back buffer (static background l
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
+DOUBLE_CLICK_MS = 400  # Max gap between two clicks counted as a double click
 WINDOW_SCALE = 3   # Tehdään ikkunasta isompi, jotta näkyy paremmin
 DISPLAY_FPS = 60
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
@@ -125,6 +127,7 @@ class SuomiCompute16:
     def __init__(self):
         # Muisti on kuin pitkä jono numeroita
         self.memory = bytearray(MEM_SIZE)
+        self._last_click = [(-10**9, 0, 0), (-10**9, 0, 0)]
         # Rekisterit ovat koneen "lyhytkestoisia muistipaikkoja"
         self.registers = [0] * 8
         # PC (Program Counter) kertoo, missä kohtaa ohjelmaa ollaan
@@ -800,6 +803,37 @@ class SuomiCompute16:
                 break
             self.step()
 
+    # Mouse button bits: held (MOUSE_ADDR+4) bit0 left, bit1 right.
+    # Events (MOUSE_ADDR+5), valid for one frame: bit0/1 left/right press, bit2/3 left/right double click,
+    # bit4/5 left/right release (drop). Drag = button held while the position changes.
+    def set_mouse_position(self, x, y):
+        x = max(0, min(SCREEN_WIDTH - 1, x))
+        y = max(0, min(SCREEN_HEIGHT - 1, y))
+        self.memory[MOUSE_ADDR:MOUSE_ADDR + 4] = bytes((x >> 8, x & 0xFF, y >> 8, y & 0xFF))
+
+    def mouse_button(self, button, down, x=0, y=0, now_ms=0):
+        """Record a press or release of button 0 (left) or 1 (right); presses raise click events."""
+        bit = 1 << button
+        if not down:
+            self.memory[MOUSE_ADDR + 4] &= ~bit
+            self.memory[MOUSE_ADDR + 5] |= bit << 4
+            return
+        self.memory[MOUSE_ADDR + 4] |= bit
+        self.memory[MOUSE_ADDR + 5] |= bit
+        last_time, last_x, last_y = self._last_click[button]
+        if now_ms - last_time <= DOUBLE_CLICK_MS and abs(x - last_x) <= 4 and abs(y - last_y) <= 4:
+            self.memory[MOUSE_ADDR + 5] |= bit << 2
+            self._last_click[button] = (-10**9, 0, 0)
+        else:
+            self._last_click[button] = (now_ms, x, y)
+
+    def begin_mouse_frame(self):
+        px, py = pygame.mouse.get_pos()
+        self.set_mouse_position(px // WINDOW_SCALE, py // WINDOW_SCALE)
+
+    def end_mouse_frame(self):
+        self.memory[MOUSE_ADDR + 5] = 0
+
     def press_keys(self, mask):
         self.write(KEYS_ADDR, self.read(KEYS_ADDR) | (mask & 0xFF))
         self.write(KEYS_ADDR + 1, self.read(KEYS_ADDR + 1) | (mask >> 8))
@@ -824,6 +858,11 @@ class SuomiCompute16:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.window_open = False
+                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (1, 3):
+                    mx, my = event.pos[0] // WINDOW_SCALE, event.pos[1] // WINDOW_SCALE
+                    self.set_mouse_position(mx, my)
+                    self.mouse_button(0 if event.button == 1 else 1, event.type == pygame.MOUSEBUTTONDOWN,
+                                      mx, my, pygame.time.get_ticks())
                 if event.type == pygame.KEYUP and event.key in KEY_BITS:
                     # A tap shorter than one frame stays visible for that frame.
                     if KEY_BITS[event.key] & fresh_keys:
@@ -849,8 +888,10 @@ class SuomiCompute16:
 
             if not self.window_open:
                 break
+            self.begin_mouse_frame()
             self.update_rtc()
             self.execute_frame()
+            self.end_mouse_frame()
             if deferred_release:
                 self.release_keys(deferred_release)
                 deferred_release = 0
