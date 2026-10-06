@@ -4,7 +4,14 @@ from unittest.mock import Mock, patch
 import pygame
 
 from assembler import assemble
-from src.SuomiCPU import KEY_BITS, MEM_SIZE, VRAM_START, SuomiCompute16
+from src.SuomiCPU import (
+    KEY_BITS,
+    MEM_SIZE,
+    VRAM_START,
+    SuomiCompute16,
+    _screen_to_logical,
+    _set_display_mode,
+)
 
 
 class DisplayTests(unittest.TestCase):
@@ -59,6 +66,20 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(KEY_BITS[pygame.K_x], 0x400)
         self.assertEqual(KEY_BITS[pygame.K_z], 0x800)
 
+    def test_fullscreen_viewport_preserves_aspect_ratio_for_mouse(self):
+        self.assertEqual(_screen_to_logical((240, 0), (1920, 1080)), (0, 0))
+        self.assertEqual(_screen_to_logical((960, 540), (1920, 1080)), (160, 120))
+        self.assertEqual(_screen_to_logical((1680, 1080), (1920, 1080)), (319, 239))
+
+    def test_display_mode_can_be_selected(self):
+        with patch("pygame.display.set_mode") as set_mode:
+            _set_display_mode(True)
+            set_mode.assert_called_once_with((0, 0), pygame.FULLSCREEN)
+
+        with patch("pygame.display.set_mode") as set_mode:
+            _set_display_mode(False)
+            set_mode.assert_called_once_with((960, 720))
+
     def test_halt_keeps_display_open_until_keypress(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.clock = Mock()
@@ -80,6 +101,28 @@ class DisplayTests(unittest.TestCase):
         self.assertFalse(emulator.running)
         self.assertFalse(emulator.window_open)
         emulator.update_display.assert_called_once_with()
+        emulator.clock.tick.assert_called_once_with(30)
+
+    def test_f11_toggles_fullscreen_during_emulation(self):
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
+        emulator.fullscreen = False
+        emulator.clock = Mock()
+        emulator.reset = lambda: setattr(emulator, "running", True)
+        emulator.execute_frame = lambda: setattr(emulator, "running", False)
+        emulator.update_rtc = Mock()
+        emulator.begin_mouse_frame = Mock()
+        emulator.end_mouse_frame = Mock()
+        emulator.update_display = Mock()
+        fullscreen_key = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F11, unicode="")
+        close_key = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE, unicode=" ")
+
+        with patch.object(pygame.event, "get", side_effect=[[fullscreen_key], [close_key]]):
+            with patch("src.SuomiCPU._set_display_mode", return_value=object()) as set_mode:
+                with patch("pygame.display.set_caption"):
+                    emulator.run()
+
+        self.assertTrue(emulator.fullscreen)
+        set_mode.assert_called_once_with(True)
         emulator.clock.tick.assert_called_once_with(30)
 
 

@@ -15,6 +15,9 @@ the first source line is shown as its description:
 ```console
 python main.py
 ```
+Press **F11** in the launcher or a running program to toggle windowed/fullscreen
+display. Start directly in fullscreen with `python main.py --fullscreen` or
+`.\run.ps1 -Fullscreen`.
 
 Run an example directly from the repository root:
 ```console

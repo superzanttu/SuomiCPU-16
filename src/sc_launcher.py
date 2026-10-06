@@ -9,8 +9,10 @@ from src.SuomiCPU import (
     CCompilerError,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
-    WINDOW_SCALE,
     SuomiCompute16,
+    _present_scaled,
+    _screen_to_logical,
+    _set_display_mode,
     load_program_file,
 )
 from tools.assembler import AssemblyError
@@ -88,11 +90,15 @@ def discover_modules(modules_dir: str | Path) -> list[Module]:
 
 
 class SCLauncher:
-    def __init__(self, modules_dir: str | Path, net_port: int = DEFAULT_PORT):
+    def __init__(
+        self,
+        modules_dir: str | Path,
+        net_port: int = DEFAULT_PORT,
+        fullscreen: bool = False,
+    ):
         pygame.init()
-        self.screen = pygame.display.set_mode(
-            (SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE)
-        )
+        self.fullscreen = fullscreen
+        self.screen = _set_display_mode(self.fullscreen)
         pygame.display.set_caption("SC-16 Launcher")
         self.clock = pygame.time.Clock()
         self.canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -222,11 +228,7 @@ class SCLauncher:
             (button.centerx - label.get_width() // 2, button.centery - label.get_height() // 2),
         )
 
-        scaled = pygame.transform.scale(
-            self.canvas, (SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE)
-        )
-        self.screen.blit(scaled, (0, 0))
-        pygame.display.flip()
+        _present_scaled(self.canvas, self.screen)
 
     def _launch_selected(self) -> None:
         if not self.modules:
@@ -238,7 +240,7 @@ class SCLauncher:
             self.error_message = f"{module.name}: {exc}"
             return
 
-        emulator = SuomiCompute16()
+        emulator = SuomiCompute16(fullscreen=self.fullscreen)
         emulator.net_port = self.net_port
         try:
             emulator.load_program(image)
@@ -247,16 +249,15 @@ class SCLauncher:
             network = getattr(emulator, "net", None)
             if network is not None:
                 network.close()
+        self.fullscreen = emulator.fullscreen
         if pygame.display.get_init():
-            self.screen = pygame.display.set_mode(
-                (SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE)
-            )
+            self.screen = _set_display_mode(self.fullscreen)
             pygame.display.set_caption("SC-16 Launcher")
             self.clock = pygame.time.Clock()
         self.error_message = ""
 
     def _handle_click(self, position: tuple[int, int]) -> None:
-        x, y = position[0] // WINDOW_SCALE, position[1] // WINDOW_SCALE
+        x, y = _screen_to_logical(position, self.screen.get_size())
         if 217 <= x < 310 and 215 <= y < 235:
             self._launch_selected()
             return
@@ -283,7 +284,11 @@ class SCLauncher:
                 elif event.type == pygame.MOUSEWHEEL:
                     self._scroll_by(-event.y)
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
+                    if event.key == pygame.K_F11:
+                        self.fullscreen = not self.fullscreen
+                        self.screen = _set_display_mode(self.fullscreen)
+                        pygame.display.set_caption("SC-16 Launcher")
+                    elif event.key == pygame.K_ESCAPE:
                         self.running = False
                     elif event.key == pygame.K_UP:
                         self.selected -= 1
@@ -302,7 +307,8 @@ class SCLauncher:
 def run_launcher(
     modules_dir: str | Path | None = None,
     net_port: int = DEFAULT_PORT,
+    fullscreen: bool = False,
 ) -> None:
     root = Path(__file__).resolve().parent.parent
-    launcher = SCLauncher(modules_dir or root / "modules", net_port)
+    launcher = SCLauncher(modules_dir or root / "modules", net_port, fullscreen)
     launcher.run()

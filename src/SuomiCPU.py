@@ -102,6 +102,35 @@ DISPLAY_FPS = 30
 MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed register selects maximum speed
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
 
+
+def _display_viewport(screen_size):
+    scale = min(screen_size[0] / SCREEN_WIDTH, screen_size[1] / SCREEN_HEIGHT)
+    width = int(SCREEN_WIDTH * scale)
+    height = int(SCREEN_HEIGHT * scale)
+    return (screen_size[0] - width) // 2, (screen_size[1] - height) // 2, width, height
+
+
+def _screen_to_logical(position, screen_size):
+    left, top, width, height = _display_viewport(screen_size)
+    x = max(0, min(SCREEN_WIDTH - 1, int((position[0] - left) * SCREEN_WIDTH / width)))
+    y = max(0, min(SCREEN_HEIGHT - 1, int((position[1] - top) * SCREEN_HEIGHT / height)))
+    return x, y
+
+
+def _set_display_mode(fullscreen):
+    if fullscreen:
+        return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    return pygame.display.set_mode((SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE))
+
+
+def _present_scaled(canvas, screen):
+    screen.fill((0, 0, 0))
+    viewport = _display_viewport(screen.get_size())
+    scaled = pygame.transform.scale(canvas, viewport[2:])
+    screen.blit(scaled, viewport[:2])
+    pygame.display.flip()
+
+
 # Värit, joita kone osaa käyttää
 PALETTE_COLORS = [
     (0, 0, 0), (255, 255, 255), (255, 48, 48), (48, 220, 64),
@@ -155,7 +184,7 @@ def _load_jit():
 
 class SuomiCompute16:
     """Tämä on itse tietokoneen sydän (emulaattori)."""
-    def __init__(self):
+    def __init__(self, fullscreen: bool = False):
         # Muisti on kuin pitkä jono numeroita
         self.memory = bytearray(MEM_SIZE)
         self._last_click = [(-10**9, 0, 0), (-10**9, 0, 0)]
@@ -169,28 +198,9 @@ class SuomiCompute16:
         self.flags = {'Z': 0, 'C': 0, 'N': 0, 'V': 0} # Z = nolla, C = kanto (käytetään vertailuissa)
         self.running = True
         
-        # Käynnistetään näyttö ja ikkuna
+        self.fullscreen = fullscreen
         pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE))
-        pygame.display.set_caption("SuomiCPU-16 Emulaattori")
-        self.clock = pygame.time.Clock()
-        
-        # Luodaan väripaletti
-        self.palette = [pygame.Color(i, i, i) for i in range(256)]
-        for index, color in enumerate(PALETTE_COLORS):
-            self.palette[index] = color
-        self.palette[25] = (0, 0, 255) # Lisätään yksi sininen väri
-        
-        self.frame_yield = False
-        self.vram_surface = self._create_vram_surface()
-
-        self.entry_point = 0
-        self.sp = 0x2FFFF
-        self.flags = {'Z': 0, 'C': 0, 'N': 0, 'V': 0}
-        self.running = True
-        
-        pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE))
+        self.screen = _set_display_mode(self.fullscreen)
         pygame.display.set_caption("SuomiCPU-16 Emulator")
         self.clock = pygame.time.Clock()
         self.palette = [pygame.Color(i, i, i) for i in range(256)]
@@ -199,6 +209,11 @@ class SuomiCompute16:
         self.palette[25] = (0, 0, 255)
         self.frame_yield = False
         self.vram_surface = self._create_vram_surface()
+
+    def set_fullscreen(self, fullscreen):
+        self.fullscreen = bool(fullscreen)
+        self.screen = _set_display_mode(self.fullscreen)
+        pygame.display.set_caption("SuomiCPU-16 Emulator")
 
     def _create_vram_surface(self):
         vram_size = SCREEN_WIDTH * SCREEN_HEIGHT
@@ -901,8 +916,7 @@ class SuomiCompute16:
         if now.second % 1 == 0: self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x08)
 
     def update_display(self):
-        self.screen.blit(pygame.transform.scale(self.vram_surface.convert(self.screen), self.screen.get_size()), (0, 0))
-        pygame.display.flip()
+        _present_scaled(self.vram_surface, self.screen)
 
     def _max_speed(self):
         memory = getattr(self, 'memory', None)
@@ -980,7 +994,7 @@ class SuomiCompute16:
 
     def begin_mouse_frame(self):
         px, py = pygame.mouse.get_pos()
-        self.set_mouse_position(px // WINDOW_SCALE, py // WINDOW_SCALE)
+        self.set_mouse_position(*_screen_to_logical((px, py), self.screen.get_size()))
         node = getattr(self, 'net', None)
         if node is not None:
             node.poll()
@@ -1014,10 +1028,13 @@ class SuomiCompute16:
                 if event.type == pygame.QUIT:
                     self.window_open = False
                 if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (1, 3):
-                    mx, my = event.pos[0] // WINDOW_SCALE, event.pos[1] // WINDOW_SCALE
+                    mx, my = _screen_to_logical(event.pos, self.screen.get_size())
                     self.set_mouse_position(mx, my)
                     self.mouse_button(0 if event.button == 1 else 1, event.type == pygame.MOUSEBUTTONDOWN,
                                       mx, my, pygame.time.get_ticks())
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+                    self.set_fullscreen(not self.fullscreen)
+                    continue
                 if event.type == pygame.KEYUP and event.key in KEY_BITS:
                     # A tap shorter than one frame stays visible for that frame.
                     if KEY_BITS[event.key] & fresh_keys:
@@ -1066,6 +1083,8 @@ def main():
     )
     parser.add_argument("--net-port", type=int, default=DEFAULT_PORT,
                         help="UDP port for LAN games (all players must use the same port)")
+    parser.add_argument("--fullscreen", action="store_true",
+                        help="start in fullscreen mode (toggle at runtime with F11)")
     args = parser.parse_args()
 
     try:
@@ -1080,9 +1099,9 @@ def main():
         if program is None:
             from src.sc_launcher import run_launcher
 
-            run_launcher(net_port=args.net_port)
+            run_launcher(net_port=args.net_port, fullscreen=args.fullscreen)
         else:
-            sc16 = SuomiCompute16()
+            sc16 = SuomiCompute16(fullscreen=args.fullscreen)
             sc16.net_port = args.net_port
             sc16.load_program(program)
             sc16.run()

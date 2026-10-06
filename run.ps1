@@ -1,6 +1,7 @@
 param (
     [Parameter(Position=0)]
-    [string]$ProgramFile
+    [string]$ProgramFile,
+    [switch]$Fullscreen
 )
 
 # Get the directory where the script is located
@@ -13,9 +14,11 @@ if (!(Get-Command python -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# With no program path, main.py opens SC-launcher.
-if ([string]::IsNullOrWhiteSpace($ProgramFile)) {
-    python main.py
-} else {
-    python main.py $ProgramFile
+$PythonArgs = @()
+if ($Fullscreen) {
+    $PythonArgs += "--fullscreen"
 }
+if (![string]::IsNullOrWhiteSpace($ProgramFile)) {
+    $PythonArgs += $ProgramFile
+}
+python main.py @PythonArgs

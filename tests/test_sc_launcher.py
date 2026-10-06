@@ -89,6 +89,21 @@ class LauncherInteractionTests(unittest.TestCase):
         self.assertEqual(launcher.scroll, 1)
         self.assertEqual(launcher.selected, 1)
 
+    def test_f11_toggles_fullscreen_in_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = SCLauncher(directory)
+            fullscreen_key = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F11)
+            quit_event = pygame.event.Event(pygame.QUIT)
+            with patch("pygame.event.get", side_effect=[[fullscreen_key], [quit_event]]):
+                with patch.object(launcher, "_draw"):
+                    with patch.object(
+                        sc_launcher, "_set_display_mode", return_value=launcher.screen
+                    ) as set_mode:
+                        launcher.run()
+
+        self.assertTrue(launcher.fullscreen)
+        set_mode.assert_called_once_with(True)
+
     def test_icon_pixels_are_rendered_in_black_and_white(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pixel.c"

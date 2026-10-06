@@ -33,6 +33,9 @@ program path, SC-16 opens SC-launcher. The launcher lists `.c` files in
 its description. Click a module to select it, then click **LOAD MODULE**; the
 16x16 outlined square is reserved for a module icon. Use the mouse wheel to
 scroll through the list. Press Escape to close the launcher.
+Press F11 in the launcher or a running program to toggle fullscreen and windowed
+display. Start in fullscreen with `python main.py --fullscreen` or
+`.\run.ps1 -Fullscreen`.
 
 Additional examples are in [`examples/commands.asm`](examples/commands.asm)
 and [`examples/directives.asm`](examples/directives.asm):
