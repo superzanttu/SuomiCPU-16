@@ -158,7 +158,7 @@ class UdpTests(unittest.TestCase):
 class NetGameDemoTests(unittest.TestCase):
     def test_demo_instances_see_each_other_and_ping(self):
         hub, clock = Hub(), Clock()
-        image = compile_file(ROOT / "examples" / "net_game_demo.c")
+        image = compile_file(ROOT / "modules" / "net_game_demo.c")
         cpus = []
         for i in range(2):
             cpu = make_cpu(image)
