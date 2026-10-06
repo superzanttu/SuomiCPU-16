@@ -20,8 +20,8 @@
 // Pages: 1 title, 2 CPU, 3 memory map, 4 graphics, 5 animation, 6 text/font,
 //        7 devices (RTC, keyboard, random numbers), 8 benchmark,
 //        9 speed comparison with other computers (press Enter to measure).
-// All timing uses the machine's own clocks: gfx_ticks() (frames, 60 per second
-// of emulated time) and gfx_rtc() (the real-time clock registers).
+// All timing uses the machine's own clocks: gfx_ticks() (emulated frames; 30/s
+// at fixed speed) and gfx_rtc() (the real-time clock registers).
 #include "suomi_gfx.h"
 
 #define PAGES 9

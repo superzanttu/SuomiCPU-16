@@ -575,7 +575,7 @@ Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
 (`0x43005`, `gfx_keys_ext()`, constants `KEYX_*`) holds bit 0 Q, 1 E, 2 X/Shift, 3 Z/Ctrl.
 
-Speed register (`0x43003`): 0 = fixed speed (60 frames/s, 30000 instructions per frame), nonzero = maximum speed: the emulator drops the frame cap, skips most display refreshes and runs up to 300000 instructions per pass. Use it from C with `gfx_speed(1)` / `gfx_speed(0)`; time maximum-speed runs with the real-time clock (`gfx_rtc`), since frame ticks no longer match wall time. Page 9 of the showcase uses it to measure the SC-16 for 3 seconds.
+Speed register (`0x43003`): 0 = fixed speed (30 frames/s, 30000 instructions per frame), nonzero = maximum speed: the emulator drops the frame cap, skips most display refreshes and runs up to 300000 instructions per pass. Use it from C with `gfx_speed(1)` / `gfx_speed(0)`; time maximum-speed runs with the real-time clock (`gfx_rtc`), since frame ticks no longer match wall time. Page 9 of the showcase uses it to measure the SC-16 for 3 seconds.
 
 Mouse registers (base `0x43008`): `+0` X word, `+2` Y word, `+4` held buttons, `+5` events.
 A double click is a second press of the same button within 400 ms and 4 pixels; it raises

@@ -91,14 +91,14 @@ GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 
 # Tile map: SRC=map (1 byte per tile = palette color, 0 black), W/H=map size in tiles,
 # X/Y=camera pixel position. Draws 16x16 tiles over the whole back buffer.
 GPU_TILEMAP = 21
-SPEED_ADDR  = 0x43003 # Speed register: 0 = fixed (60 fps, 30000 instr/frame), 1 = maximum (unthrottled)
+SPEED_ADDR  = 0x43003 # Speed register: 0 = fixed (30 fps, 30000 instr/frame), 1 = maximum (unthrottled)
 TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
 DOUBLE_CLICK_MS = 400  # Max gap between two clicks counted as a double click
 WINDOW_SCALE = 3   # Tehdään ikkunasta isompi, jotta näkyy paremmin
-DISPLAY_FPS = 60
+DISPLAY_FPS = 30
 MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed register selects maximum speed
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
 

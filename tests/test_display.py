@@ -80,7 +80,7 @@ class DisplayTests(unittest.TestCase):
         self.assertFalse(emulator.running)
         self.assertFalse(emulator.window_open)
         emulator.update_display.assert_called_once_with()
-        emulator.clock.tick.assert_called_once()
+        emulator.clock.tick.assert_called_once_with(30)
 
 
 if __name__ == "__main__":

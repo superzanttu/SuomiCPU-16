@@ -41,17 +41,17 @@
 
 /* Slot layout of the shared object arrays. */
 #define NSLOT 41
-#define S_SHIP 0     /* ship velocity vector, 1/16 units per frame */
+#define S_SHIP 0 /* ship velocity vector, 1/16 units per frame */
 #define S_PLANET 1
-#define S_MOON 2     /* two moons: slots 2 and 3 */
-#define S_BASE_A 4   /* orbit plane basis vectors (rotate with the world) */
+#define S_MOON 2   /* two moons: slots 2 and 3 */
+#define S_BASE_A 4 /* orbit plane basis vectors (rotate with the world) */
 #define S_BASE_B 5
-#define S_AST 6      /* six asteroid positions */
-#define S_ASTV 12    /* six asteroid drift velocities */
-#define S_EN 18      /* three enemy positions */
-#define S_ENV 21     /* three enemy velocities */
-#define S_EXP 24     /* three explosion positions */
-#define S_DUST 27    /* fourteen dust particles */
+#define S_AST 6   /* six asteroid positions */
+#define S_ASTV 12 /* six asteroid drift velocities */
+#define S_EN 18   /* three enemy positions */
+#define S_ENV 21  /* three enemy velocities */
+#define S_EXP 24  /* three explosion positions */
+#define S_DUST 27 /* fourteen dust particles */
 #define NAST 6
 #define NEN 3
 #define NEXP 3
@@ -89,14 +89,12 @@ int sine[32] = {
     0, 12, 24, 36, 45, 53, 59, 63,
     64, 63, 59, 53, 45, 36, 24, 12,
     0, -12, -24, -36, -45, -53, -59, -63,
-    -64, -63, -59, -53, -45, -36, -24, -12
-};
+    -64, -63, -59, -53, -45, -36, -24, -12};
 
 /* Irregular asteroid outline: eight (dx, dy) pairs, about 11 units wide. */
 char rock_shape[16] = {
     0, -9, 7, -7, 11, -1, 7, 7,
-    1, 10, -6, 8, -10, 3, -8, -5
-};
+    1, 10, -6, 8, -10, 3, -8, -5};
 
 /* Ship state. */
 int yaw_rate;
@@ -717,15 +715,33 @@ void update_controls(unsigned int keys, unsigned int kx)
         }
         if (s > 3300)
         {
-            if (i == 0) { ox[S_SHIP] = ox[S_SHIP] + 8; }
-            if (i == 1) { oy[S_SHIP] = oy[S_SHIP] + 8; }
-            if (i == 2) { oz[S_SHIP] = oz[S_SHIP] + 8; }
+            if (i == 0)
+            {
+                ox[S_SHIP] = ox[S_SHIP] + 8;
+            }
+            if (i == 1)
+            {
+                oy[S_SHIP] = oy[S_SHIP] + 8;
+            }
+            if (i == 2)
+            {
+                oz[S_SHIP] = oz[S_SHIP] + 8;
+            }
         }
         if (s < -3300)
         {
-            if (i == 0) { ox[S_SHIP] = ox[S_SHIP] - 8; }
-            if (i == 1) { oy[S_SHIP] = oy[S_SHIP] - 8; }
-            if (i == 2) { oz[S_SHIP] = oz[S_SHIP] - 8; }
+            if (i == 0)
+            {
+                ox[S_SHIP] = ox[S_SHIP] - 8;
+            }
+            if (i == 1)
+            {
+                oy[S_SHIP] = oy[S_SHIP] - 8;
+            }
+            if (i == 2)
+            {
+                oz[S_SHIP] = oz[S_SHIP] - 8;
+            }
         }
     }
 }
@@ -820,12 +836,30 @@ void move_world(void)
         ox[a] = ox[a] - ((sx + 8) >> 4);
         oy[a] = oy[a] - ((sy + 8) >> 4);
         oz[a] = oz[a] - ((sz + 8) >> 4);
-        if (ox[a] > 250) { ox[a] = ox[a] - 500; }
-        if (ox[a] < -250) { ox[a] = ox[a] + 500; }
-        if (oy[a] > 250) { oy[a] = oy[a] - 500; }
-        if (oy[a] < -250) { oy[a] = oy[a] + 500; }
-        if (oz[a] > 250) { oz[a] = oz[a] - 500; }
-        if (oz[a] < -250) { oz[a] = oz[a] + 500; }
+        if (ox[a] > 250)
+        {
+            ox[a] = ox[a] - 500;
+        }
+        if (ox[a] < -250)
+        {
+            ox[a] = ox[a] + 500;
+        }
+        if (oy[a] > 250)
+        {
+            oy[a] = oy[a] - 500;
+        }
+        if (oy[a] < -250)
+        {
+            oy[a] = oy[a] + 500;
+        }
+        if (oz[a] > 250)
+        {
+            oz[a] = oz[a] - 500;
+        }
+        if (oz[a] < -250)
+        {
+            oz[a] = oz[a] + 500;
+        }
     }
 }
 
@@ -1266,8 +1300,7 @@ void update_collisions(void)
     {
         for (j = i + 1; j < NEN; j++)
         {
-            if (en_state[i] != EN_DEAD && en_state[j] != EN_DEAD
-                && near_pair(S_EN + i, S_EN + j, ENEMY_R * 2))
+            if (en_state[i] != EN_DEAD && en_state[j] != EN_DEAD && near_pair(S_EN + i, S_EN + j, ENEMY_R * 2))
             {
                 hurt_enemy(i, 20, 0);
                 hurt_enemy(j, 20, 0);
