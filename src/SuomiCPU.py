@@ -143,10 +143,10 @@ def _load_jit():
         _JIT = None
         if not os.environ.get("SC16_NOJIT"):
             try:
-                try:
-                    from src import sc16_jit
-                except ImportError:
-                    import sc16_jit
+                src_dir = os.path.dirname(os.path.abspath(__file__))
+                if src_dir not in sys.path:
+                    sys.path.insert(0, src_dir)
+                import sc16_jit
                 if sc16_jit.CONSTANTS == (MEM_MASK, GPU_BASE, ICR_ADDR):
                     _JIT = sc16_jit
             except Exception:
