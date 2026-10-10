@@ -494,7 +494,24 @@ class _Parser:
         short = False
         long = False
         base = None
+        storage_class = None
+        qualifiers: set[str] = set()
         while self.token.value in _STORAGE_WORDS | _TYPE_WORDS:
+            current = self.token.value
+            if current in ("const", "volatile"):
+                if current in qualifiers:
+                    raise self.fail(f"duplicate type qualifier {current!r}")
+                qualifiers.add(current)
+                self.take()
+                continue
+            if current in ("static", "extern", "register", "auto"):
+                if storage_class is not None:
+                    raise self.fail(
+                        "multiple storage-class specifiers in declaration"
+                    )
+                storage_class = current
+                self.take()
+                continue
             if self.token.value == "unsigned":
                 if unsigned:
                     raise self.fail("duplicate type specifier 'unsigned'")
@@ -1218,6 +1235,10 @@ class _Parser:
                 except CCompilerError:
                     self.position = saved_position
                 else:
+                    if c_type == "void" or (
+                        c_type in self.records and not self.records[c_type].complete
+                    ):
+                        raise self.fail("sizeof requires a complete object type")
                     return Expr("sizeof_type", c_type, line=token.line)
             return Expr("sizeof_expr", children=(self.parse_unary(),), line=token.line)
         if self.token.value == "(":
@@ -1555,6 +1576,12 @@ class _CodeGenerator:
             return bytes(data)
         if initializer is None:
             return bytes(_type_size(c_type, self.records))
+        while initializer.kind == "init_list":
+            if len(initializer.children) != 1:
+                raise self.error(
+                    line, "scalar initializer braces must contain exactly one value"
+                )
+            initializer = initializer.children[0]
         if initializer.kind == "string":
             raise self.error(line, "a string literal cannot initialize a scalar")
         if c_type.endswith("*"):
@@ -1579,6 +1606,13 @@ class _CodeGenerator:
     def _constant(self, expression: Expr | None) -> int:
         if expression is None:
             return 0
+        if expression.kind == "init_list":
+            if len(expression.children) != 1:
+                raise self.error(
+                    expression.line,
+                    "scalar initializer braces must contain exactly one value",
+                )
+            return self._constant(expression.children[0])
         if expression.kind == "constant":
             return int(expression.value) & WORD_MASK
         if expression.kind == "name" and str(expression.value) in self.enum_constants:
@@ -1665,6 +1699,11 @@ class _CodeGenerator:
         raise self.error(expression.line, "global initializers must be integer constant expressions")
 
     def _is_integer_constant_expression(self, expression: Expr) -> bool:
+        if expression.kind == "init_list":
+            return (
+                len(expression.children) == 1
+                and self._is_integer_constant_expression(expression.children[0])
+            )
         if expression.kind in {"constant", "sizeof_type", "sizeof_expr"}:
             return True
         if expression.kind == "name":
@@ -2130,6 +2169,11 @@ class _CodeGenerator:
 
     def _branch_if_false(self, condition: Expr, target: str) -> None:
         """Jump to target when the condition is zero; comparisons and && / || branch directly."""
+        condition_type = self._expression_type(condition)
+        if condition_type not in {
+            "char", "unsigned char", "int", "unsigned int", "float"
+        } and not condition_type.endswith("*"):
+            raise self.error(condition.line, "control-flow condition must be scalar")
         if condition.kind == "binary":
             operator = str(condition.value)
             left, right = condition.children
@@ -2153,7 +2197,7 @@ class _CodeGenerator:
                 self._expression(condition)
                 return
         self._expression(condition)
-        if self._expression_type(condition) == "float":
+        if condition_type == "float":
             self.emit("    LDI R1, 0")
             self.emit("    FCMP R0, R1")
         else:
@@ -2281,6 +2325,13 @@ class _CodeGenerator:
             if variable.array_size:
                 return variable.c_type + "*"
             return variable.c_type
+        if expression.kind == "init_list":
+            if len(expression.children) != 1:
+                raise self.error(
+                    expression.line,
+                    "scalar initializer braces must contain exactly one value",
+                )
+            return self._expression_type(expression.children[0])
         if expression.kind == "call":
             function = self.functions_by_name.get(str(expression.value))
             if function is None:
@@ -2304,8 +2355,25 @@ class _CodeGenerator:
             field_ = self._record_field(base_type, field_name, expression.line)
             return field_.c_type + "*" if field_.array_size else field_.c_type
         if expression.kind == "assign":
-            target = expression.value[1]
-            return self._expression_type(target)
+            operator, target = expression.value
+            self._require_modifiable_lvalue(target, expression.line)
+            target_type = self._expression_type(target)
+            if target_type in self.records:
+                raise self.error(expression.line, "aggregate assignment is not supported")
+            if operator != "=":
+                operation_type = self._expression_type(
+                    Expr(
+                        "binary",
+                        operator[:-1],
+                        (target, expression.children[0]),
+                        expression.line,
+                    )
+                )
+                if operation_type == "void":
+                    raise self.error(
+                        expression.line, "compound assignment requires a value operand"
+                    )
+            return target_type
         if expression.kind == "cast":
             return str(expression.value)
         if expression.kind == "conditional":
@@ -2439,7 +2507,14 @@ class _CodeGenerator:
                     f"operator {operator} requires arithmetic operands or "
                     "compatible pointers",
                 )
-            if operator in ("<<", ">>", "%", "&", "|", "^"):
+            if operator in ("<<", ">>"):
+                if not left_integer or not right_integer:
+                    raise self.error(
+                        expression.line,
+                        f"operator {operator} requires integer operands",
+                    )
+                return self._integer_promoted_type(left_type)
+            if operator in ("%", "&", "|", "^"):
                 if not left_integer or not right_integer:
                     raise self.error(
                         expression.line,
@@ -2508,6 +2583,33 @@ class _CodeGenerator:
                 "pointer arithmetic requires a pointer to a complete object type",
             )
 
+    def _require_modifiable_lvalue(self, expression: Expr, line: int) -> str:
+        if expression.kind == "name":
+            variable = self._lookup(str(expression.value), line)
+            if variable.constant_value is not None:
+                raise self.error(line, "enumerators are not modifiable lvalues")
+            if variable.array_size:
+                raise self.error(line, "arrays are not modifiable lvalues")
+            c_type = variable.c_type
+        elif expression.kind == "index":
+            c_type = self._expression_type(expression)
+        elif expression.kind == "member":
+            operator, field_name = expression.value
+            base_type = self._expression_type(expression.children[0])
+            if operator == "->":
+                if not base_type.endswith("*"):
+                    raise self.error(line, "-> requires a pointer to a record")
+                base_type = base_type[:-1]
+            field_ = self._record_field(base_type, field_name, line)
+            if field_.array_size:
+                raise self.error(line, "arrays are not modifiable lvalues")
+            c_type = field_.c_type
+        elif expression.kind == "unary" and expression.value == "*":
+            c_type = self._expression_type(expression)
+        else:
+            raise self.error(line, "expression is not a modifiable lvalue")
+        return c_type
+
     @staticmethod
     def _integer_promoted_type(c_type: str) -> str:
         if c_type in ("char", "unsigned char"):
@@ -2531,11 +2633,33 @@ class _CodeGenerator:
         return "int"
 
     def _sizeof_expression(self, expression: Expr) -> int:
+        if expression.kind == "string":
+            return len(expression.value)
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), expression.line)
             if variable.array_size:
                 return variable.array_size * _type_size(variable.c_type, self.records)
-        return _type_size(self._expression_type(expression), self.records)
+        if expression.kind == "member":
+            operator, field_name = expression.value
+            record_type = self._expression_type(expression.children[0])
+            if operator == "->":
+                if not record_type.endswith("*"):
+                    raise self.error(
+                        expression.line, "-> requires a pointer to a record"
+                    )
+                record_type = record_type[:-1]
+            field_ = self._record_field(record_type, field_name, expression.line)
+            if field_.array_size:
+                return field_.array_size * _type_size(field_.c_type, self.records)
+        c_type = self._expression_type(expression)
+        self._validate_sizeof_type(c_type, expression.line)
+        return _type_size(c_type, self.records)
+
+    def _validate_sizeof_type(self, c_type: str, line: int) -> None:
+        if c_type == "void" or (
+            c_type in self.records and not self.records[c_type].complete
+        ):
+            raise self.error(line, "sizeof requires a complete object type")
 
     def _record_field(self, c_type: str, name: str, line: int) -> _Field:
         record = self.records.get(c_type)
@@ -2728,10 +2852,19 @@ class _CodeGenerator:
 
     def _expression(self, expression: Expr) -> None:
         kind = expression.kind
+        if kind == "init_list":
+            if len(expression.children) != 1:
+                raise self.error(
+                    expression.line,
+                    "scalar initializer braces must contain exactly one value",
+                )
+            self._expression(expression.children[0])
+            return
         if kind == "constant":
             self.emit(f"    LDI R0, {int(expression.value) & WORD_MASK}")
             return
         if kind == "sizeof_type":
+            self._validate_sizeof_type(str(expression.value), expression.line)
             self.emit(f"    LDI R0, {_type_size(str(expression.value), self.records)}")
             return
         if kind == "sizeof_expr":
@@ -2883,7 +3016,10 @@ class _CodeGenerator:
             return
         if kind == "assign":
             operator, target = expression.value
+            self._require_modifiable_lvalue(target, expression.line)
             target_type = self._expression_type(target)
+            if target_type in self.records:
+                raise self.error(expression.line, "aggregate assignment is not supported")
             discarded = self._discard is expression
             self._discard = None
             if operator == "=":
@@ -2891,6 +3027,14 @@ class _CodeGenerator:
                     self._nomask = expression.children[0]
                 self._expression(expression.children[0])
             else:
+                right_type = self._expression_type(expression.children[0])
+                operation = Expr(
+                    "binary",
+                    operator[:-1],
+                    (target, expression.children[0]),
+                    expression.line,
+                )
+                result_type = self._expression_type(operation)
                 self._load_lvalue(target, expression.line)
                 self.emit("    PUSH R0")
                 self.stack_depth += 2
@@ -2912,13 +3056,23 @@ class _CodeGenerator:
                     self.used_helpers.add(helper)
                     self.emit(f"    CALLX {helper}")
                 else:
+                    target_type = self._expression_type(target)
+                    if target_type.endswith("*"):
+                        self._scale_index(
+                            "R1", _type_size(target_type[:-1], self.records)
+                        )
+                    elif result_type == "float":
+                        if target_type != "float":
+                            self.emit("    ITOF R0")
+                        if right_type != "float":
+                            self.emit("    ITOF R1")
                     self._binary_operation(
-                        binary_operator, expression.line, target_type, not discarded
+                        binary_operator, expression.line, result_type, not discarded
                     )
                 self.emit("    ADJSP 2")
                 self.stack_depth -= 2
             source_type = (
-                target_type
+                result_type
                 if operator != "="
                 else self._expression_type(expression.children[0])
             )
@@ -2958,13 +3112,26 @@ class _CodeGenerator:
                 self._load_lvalue(expression, expression.line)
                 return
             if operator in ("++", "--"):
+                self._require_modifiable_lvalue(child, expression.line)
                 c_type = self._expression_type(child)
+                if c_type not in {
+                    "char", "unsigned char", "int", "unsigned int", "float"
+                } and not c_type.endswith("*"):
+                    raise self.error(
+                        expression.line,
+                        "increment and decrement require an arithmetic or pointer operand",
+                    )
+                if c_type.endswith("*"):
+                    self._require_pointer_arithmetic_type(c_type, expression.line)
                 discarded = self._discard is expression
                 self._discard = None
                 self._load_lvalue(child, expression.line)
                 if c_type.endswith("*"):
                     self.emit(f"    LDI R7, {_type_size(c_type[:-1], self.records)}")
                     self.emit(f"    {'ADD' if operator == '++' else 'SUB'} R0, R7")
+                elif c_type == "float":
+                    self.emit("    LDI R7, 0x3C00")
+                    self.emit(f"    {'FADD' if operator == '++' else 'FSUB'} R0, R7")
                 else:
                     self.emit(f"    {'INC' if operator == '++' else 'DEC'} R0")
                     if not discarded:
@@ -2986,7 +3153,17 @@ class _CodeGenerator:
             return
         if kind == "postfix":
             child = expression.children[0]
+            self._require_modifiable_lvalue(child, expression.line)
             c_type = self._expression_type(child)
+            if c_type not in {
+                "char", "unsigned char", "int", "unsigned int", "float"
+            } and not c_type.endswith("*"):
+                raise self.error(
+                    expression.line,
+                    "increment and decrement require an arithmetic or pointer operand",
+                )
+            if c_type.endswith("*"):
+                self._require_pointer_arithmetic_type(c_type, expression.line)
             self._load_lvalue(child, expression.line)
             if c_type.endswith("*"):
                 self.emit("    ADJSP -3")
@@ -3002,9 +3179,15 @@ class _CodeGenerator:
             else:
                 self.emit("    PUSH R0")
                 self.stack_depth += 2
-                self.emit(f"    {'INC' if expression.value == '++' else 'DEC'} R0")
-                self.emit("    LDI R7, 0xFFFF")
-                self.emit("    AND R0, R7")
+                if c_type == "float":
+                    self.emit("    LDI R7, 0x3C00")
+                    self.emit(
+                        f"    {'FADD' if expression.value == '++' else 'FSUB'} R0, R7"
+                    )
+                else:
+                    self.emit(f"    {'INC' if expression.value == '++' else 'DEC'} R0")
+                    self.emit("    LDI R7, 0xFFFF")
+                    self.emit("    AND R0, R7")
                 saved_size = 2
             self._store_lvalue(child, "R0", c_type, expression.line)
             if saved_size == 3:
@@ -3106,6 +3289,13 @@ class _CodeGenerator:
             self.emit(f"    CALLX {helper}")
         elif operator in ("+", "-", "&", "|", "^", "*", "/", "%"):
             self._binary_operation(operator, expression.line, result_type, self._nomask is not expression)
+            if operator == "-" and left_type.endswith("*") and right_type.endswith("*"):
+                stride = _type_size(left_type[:-1], self.records)
+                if stride == 2:
+                    self.emit("    ASR R0, 1")
+                elif stride > 2:
+                    self.emit(f"    LDI R7, {stride}")
+                    self.emit("    DIVS R0, R7")
         else:
             compare_type = "float" if left_type == "float" or right_type == "float" else (
                 "unsigned int" if promoted_left_type.startswith("unsigned")

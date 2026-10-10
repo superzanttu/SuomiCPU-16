@@ -4,16 +4,18 @@
 #define COLS 34
 #define TX 104
 #define TY 44
+#define ANIM 30
 
 unsigned char *dk = 0x43100;      /* control byte, id at +1..+8 */
 unsigned int *dw = 0x43100;       /* dw[5] pointer, dw[6] RAM offset, dw[7] disk count */
 char *ram = 0x20000;              /* edit buffer at 0, directory scratch at 0x200 */
 
 char dirs[144];                   /* up to 16 disk ids, 9 bytes each */
+char dprot[16];                   /* write-protect flag per listed disk */
 char label[9] = "        ";
 char num[6];
 char line[COLS + 1];
-int ndirs, top, sel, loaded, block, cur, dirty, led, press;
+int ndirs, top, sel, loaded, block, cur, dirty, led, press, anim_t, act, prot;
 char *status;
 
 void put_num(int v) {
@@ -50,6 +52,7 @@ void refresh_dir(void) {
         for (j = 0; j < 9; j++) {
             dirs[i * 9 + j] = ram[0x200 + j];
         }
+        dprot[i] = ram[0x209];
     }
     if (sel >= ndirs) sel = ndirs - 1;
     if (sel < 0) sel = 0;
@@ -67,6 +70,8 @@ void do_eject(void) {
     if (loaded) {
         disk_cmd(2);
         loaded = 0;
+        prot = 0;
+        refresh_dir();
         status = "DISK EJECTED";
     }
 }
@@ -74,6 +79,7 @@ void do_eject(void) {
 void load_named(void) {
     do_eject();
     disk_cmd(1);
+    prot = dw[7];
     loaded = 1;
     block = 0;
     cur = 0;
@@ -130,6 +136,10 @@ void do_save(void) {
         status = "NO DISK LOADED";
         return;
     }
+    if (prot) {
+        status = "DISK WRITE PROTECTED";
+        return;
+    }
     if (!dirty) {
         status = "NOTHING TO SAVE";
         return;
@@ -168,7 +178,7 @@ void goto_block(int b) {
 
 void do_clear(void) {
     int i;
-    if (!loaded) return;
+    if (!loaded || prot) return;
     for (i = 0; i < 256; i++) {
         ram[i] = ' ';
     }
@@ -179,6 +189,10 @@ void do_clear(void) {
 
 void type_char(int c) {
     if (!loaded) return;
+    if (prot) {
+        if (c >= 32 || c == 8) status = "DISK WRITE PROTECTED";
+        return;
+    }
     if (c == 8) {
         if (cur > 0) cur--;
         ram[cur] = ' ';
@@ -250,6 +264,57 @@ void draw_text_area(void) {
     }
 }
 
+void draw_drive(void) {
+    int vis, prog, pm;
+    char *nm;
+    vis = 0;
+    if (!loaded) vis = 30;
+    if (anim_t > 0) {
+        if (act == 0 || act == 2) vis = 30 * anim_t / ANIM;
+        if (act == 1) vis = 30 - 30 * anim_t / ANIM;
+    }
+    nm = label;
+    if (!loaded || (anim_t > 0 && (act == 0 || act == 2))) {
+        nm = dirs + sel * 9;
+        if (act == 2 && anim_t > 0) nm = "NEW DISK";
+    }
+    gfx_rect(8, 168, 304, 66, DARK_GRAY);
+    gfx_rect(8, 168, 304, 2, WHITE);
+    gfx_text(16, 176, "DF0:", WHITE);
+    if (vis > 0) {
+        gfx_rect(76, 210 - vis, 128, vis, BLUE);
+        if (vis >= 14) {
+            gfx_rect(96, 212 - vis, 88, 11, WHITE);
+            gfx_text(110, 214 - vis, nm, BLACK);
+        }
+    }
+    if (vis < 30) {
+        pm = prot;
+        if (act == 0 && anim_t > 0) pm = dprot[sel];
+        if (act == 2 && anim_t > 0) pm = 0;
+        if (pm) gfx_rect(196, 210 - vis + 2, 6, 6, RED);
+    }
+    gfx_rect(70, 210, 140, 8, BLACK);
+    gfx_rect(290, 212, 10, 5, GRAY);
+    if (anim_t > 0 || led) {
+        if (act == 6) gfx_rect(290, 212, 10, 5, RED);
+        else gfx_rect(290, 212, 10, 5, GREEN);
+    }
+    if (anim_t > 0) {
+        prog = 60 * (ANIM - anim_t) / ANIM;
+        if (act == 0 || act == 2) gfx_text(226, 176, "LOADING", YELLOW);
+        if (act == 1) gfx_text(226, 176, "EJECTING", YELLOW);
+        if (act == 6) gfx_text(226, 176, "WRITING", YELLOW);
+        if (act >= 3 && act <= 5) gfx_text(226, 176, "READING", YELLOW);
+        gfx_rect(226, 190, 66, 8, BLACK);
+        if (prog > 0) gfx_rect(226, 190, prog, 8, GREEN);
+        if (act >= 3 && act <= 6) {
+            gfx_rect(226, 203, 66, 2, GRAY);
+            gfx_rect(226 + prog, 200, 6, 8, YELLOW);
+        }
+    }
+}
+
 void draw_screen(void) {
     gfx_clear(BLUE);
     gfx_rect(0, 0, 320, 16, WHITE);
@@ -258,18 +323,21 @@ void draw_screen(void) {
     draw_list();
     button(72, 34, 16, 10, "^", DARK_GRAY);
     button(72, 78, 16, 11, "v", DARK_GRAY);
-    if (dirty) {
+    if (loaded) {
         off_button(8, 100, 38, "LOAD");
-        off_button(50, 100, 42, "EJECT");
         off_button(8, 120, 38, "NEW");
     } else {
-        button(8, 100, 38, 0, "LOAD", BLUE);
-        if (loaded) {
-            button(50, 100, 42, 1, "EJECT", ORANGE);
-        } else {
-            off_button(50, 100, 42, "EJECT");
-        }
+        if (ndirs > 0) button(8, 100, 38, 0, "LOAD", BLUE);
+        else off_button(8, 100, 38, "LOAD");
         button(8, 120, 38, 2, "NEW", GREEN);
+    }
+    if (loaded && !dirty) {
+        button(50, 100, 42, 1, "EJECT", ORANGE);
+        if (prot) button(50, 120, 42, 8, "PROT", DARK_RED);
+        else button(50, 120, 42, 8, "PROT", BLUE);
+    } else {
+        off_button(50, 100, 42, "EJECT");
+        off_button(50, 120, 42, "PROT");
     }
 
     gfx_text(104, 24, "DISK:", BLACK);
@@ -293,26 +361,20 @@ void draw_screen(void) {
     } else {
         off_button(188, 134, 38, "READ");
     }
-    if (loaded) {
+    if (loaded && !prot) {
         button(272, 134, 38, 7, "CLR", ORANGE);
     } else {
         off_button(272, 134, 38, "CLR");
     }
-    if (dirty && loaded) {
+    if (dirty && loaded && !prot) {
         button(230, 134, 38, 6, "SAVE", DARK_RED);
     } else {
         off_button(230, 134, 38, "SAVE");
     }
 
-    gfx_rect(104, 158, 12, 6, DARK_GRAY);
-    if (led) gfx_rect(104, 158, 12, 6, GREEN);
-    gfx_text(8, 160, "STATUS:", BLACK);
-    gfx_text(56, 160, status, DARK_RED);
-    gfx_text(8, 176, "CLICK DISK + LOAD, OR NEW.", BLACK);
-    gfx_text(8, 188, "CLICK TEXT TO MOVE CURSOR.", BLACK);
-    gfx_text(8, 200, "TYPE TO EDIT. BKSP/ENTER OK.", BLACK);
-    gfx_text(8, 212, "LOAD/EJECT/NEW/PREV/NEXT LOCKED", BLACK);
-    gfx_text(8, 224, "WHILE UNSAVED: SAVE OR READ.", BLACK);
+    gfx_text(8, 152, "STATUS:", BLACK);
+    gfx_text(56, 152, status, DARK_RED);
+    draw_drive();
     gfx_line(gfx_mouse_x(), gfx_mouse_y(), gfx_mouse_x() + 6, gfx_mouse_y() + 8, YELLOW);
     gfx_line(gfx_mouse_x(), gfx_mouse_y(), gfx_mouse_x(), gfx_mouse_y() + 10, YELLOW);
 }
@@ -326,28 +388,54 @@ int which_button(int mx, int my) {
     if (inside(mx, my, 188, 134, 38, 16)) return 5;
     if (inside(mx, my, 230, 134, 38, 16)) return 6;
     if (inside(mx, my, 272, 134, 38, 16)) return 7;
+    if (inside(mx, my, 50, 120, 42, 16)) return 8;
     if (inside(mx, my, 72, 34, 16, 16)) return 10;
     if (inside(mx, my, 72, 78, 16, 16)) return 11;
     return -1;
 }
 
+void start_act(int a) {
+    act = a;
+    anim_t = ANIM;
+    if (a >= 3 && a <= 6) gfx_sound(0, 110, ANIM, WAVE_NOISE, 12);
+}
+
+void finish_act(void) {
+    if (act == 0) do_load();
+    if (act == 1) do_eject();
+    if (act == 2) do_new();
+    if (act == 3) goto_block(block - 1);
+    if (act == 4) goto_block(block + 1);
+    if (act == 5) do_read();
+    if (act == 6) do_save();
+    gfx_sound(1, 400, 3, WAVE_SQUARE, 20);
+}
+
 void click(int mx, int my) {
     int i;
+    if (anim_t > 0) return;
     if (press == 1 && !loaded) return;
     if (press >= 3 && press <= 7 && !loaded) return;
     if (press == 6 && !dirty) return;
     if (press == 5 && !dirty) return;
-    if (dirty && press >= 0 && press <= 2) {
+    if (press == 7 && prot) return;
+    if (press == 6 && prot) return;
+    if ((press == 0 || press == 2) && loaded) return;
+    if (press == 0 && ndirs == 0) return;
+    if ((press == 1 || press == 8) && dirty) {
         status = "SAVE OR READ FIRST";
         return;
     }
-    if (press == 0) do_load();
-    if (press == 1) do_eject();
-    if (press == 2) do_new();
-    if (press == 3) goto_block(block - 1);
-    if (press == 4) goto_block(block + 1);
-    if (press == 5) do_read();
-    if (press == 6) do_save();
+    if (press == 8) {
+        if (!loaded) return;
+        dw[5] = !prot;
+        disk_cmd(0x20);
+        prot = dw[7];
+        if (prot) status = "WRITE PROTECT ON";
+        else status = "WRITE PROTECT OFF";
+        return;
+    }
+    if (press >= 0 && press <= 6) start_act(press);
     if (press == 7) do_clear();
     if (press == 10 && top > 0) top--;
     if (press == 11 && top + 5 < ndirs) top++;
@@ -374,13 +462,17 @@ int main(void) {
         down = gfx_mouse_buttons() & MOUSE_LEFT;
         ev = gfx_mouse_events() & MOUSE_LEFT_DOWN;
         press = -1;
-        if (down || ev) press = which_button(mx, my);
+        if ((down || ev) && anim_t == 0) press = which_button(mx, my);
         if (ev || (down && !was_down)) click(mx, my);
         was_down = down;
         c = gfx_getchar();
         while (c) {
-            type_char(c);
+            if (anim_t == 0) type_char(c);
             c = gfx_getchar();
+        }
+        if (anim_t > 0) {
+            anim_t--;
+            if (anim_t == 0) finish_act();
         }
         if (led > 0) led--;
         draw_screen();

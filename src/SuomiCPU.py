@@ -362,6 +362,10 @@ class SuomiCompute16:
         if command & 0x01: # Load disk
             disk_id = "".join(chr(self.memory[DISK_BASE + 1 + i]) for i in range(8))
             self.disk.load_disk(disk_id)
+            self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
+        if command & 0x20: # Set write protect from [ptr] (0/1)
+            self.disk.set_protected(self.read_16(DISK_BASE + 10) != 0)
+            self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
         if command & 0x02: # Unload disk
             self.disk.unload_disk()
         if command & 0x04: # Read block
@@ -378,6 +382,7 @@ class SuomiCompute16:
             text = names[index] if index < len(names) else ""
             for i, char in enumerate(text + "\0"):
                 self.write(RAM_START + offset + i, ord(char))
+            self.write(RAM_START + offset + 9, 1 if text and self.disk.is_protected(text) else 0)
         if command & 0x08: # Write block
             ptr = self.read_16(DISK_BASE + 10)
             offset = self.read_16(DISK_BASE + 12)

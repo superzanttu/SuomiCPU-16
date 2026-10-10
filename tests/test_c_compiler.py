@@ -62,15 +62,30 @@ class CCompilerTests(unittest.TestCase):
 
     def test_c90_pointer_arithmetic_and_comparisons_accept_valid_operands(self):
         image = compile_source(
+            "int difference;\n"
+            "int reverse_difference;\n"
+            "int byte_difference;\n"
+            "int record_difference;\n"
+            "struct Pair { int first; int second; };\n"
             "int main(void) {\n"
             "  int values[2];\n"
             "  int *first = values;\n"
             "  int *second = values + 1;\n"
-            "  return (second - first != 1) || (first == 0);\n"
+            "  unsigned char bytes[2];\n"
+            "  struct Pair pairs[2];\n"
+            "  difference = second - first;\n"
+            "  reverse_difference = first - second;\n"
+            "  byte_difference = &bytes[1] - &bytes[0];\n"
+            "  record_difference = &pairs[1] - &pairs[0];\n"
+            "  return first == 0;\n"
             "}\n"
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 0xFFFF)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 1)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 1)
 
     def test_c90_conditional_operator_checks_operand_types(self):
         invalid_sources = (
@@ -95,6 +110,164 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
+
+    def test_c90_control_flow_conditions_must_be_scalar(self):
+        invalid_sources = (
+            "struct S { int value; }; int main(void) { struct S value; "
+            "if (value) return 1; return 0; }\n",
+            "void nothing(void) {} int main(void) { if (nothing()) return 1; "
+            "return 0; }\n",
+            "struct S { int value; }; int main(void) { struct S value; "
+            "while (value) break; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(CCompilerError, "condition must be scalar"):
+                    compile_source(source)
+
+    def test_c90_sizeof_requires_complete_object_types(self):
+        invalid_sources = (
+            "int main(void) { return sizeof(void); }\n",
+            "struct Incomplete; int main(void) { "
+            "return sizeof(struct Incomplete); }\n",
+            "struct Incomplete; int main(void) { struct Incomplete *pointer; "
+            "return sizeof(*pointer); }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError, "sizeof requires a complete object type"
+                ):
+                    compile_source(source)
+
+    def test_c90_sizeof_accepts_pointers_to_incomplete_types(self):
+        image = compile_source(
+            "struct Incomplete;\n"
+            "int main(void) { struct Incomplete *pointer; "
+            "return sizeof(pointer) != 3; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_sizeof_preserves_array_extents(self):
+        image = compile_source(
+            "struct S { char text[4]; };\n"
+            "int main(void) {\n"
+            "  struct S value;\n"
+            "  return sizeof(\"abc\") != 4 || sizeof(value.text) != 4;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_float_increment_and_decrement_use_arithmetic(self):
+        image = compile_source(
+            "float value;\n"
+            "float previous;\n"
+            "int main(void) {\n"
+            "  value = 1.0;\n"
+            "  ++value;\n"
+            "  previous = value--;\n"
+            "  --value;\n"
+            "  value++;\n"
+            "  return previous != 2.0 || value != 1.0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_compound_assignments_enforce_operator_constraints(self):
+        invalid_sources = (
+            "int main(void) { int *pointer; pointer *= 2; return 0; }\n",
+            "int main(void) { float value; value &= 1; return 0; }\n",
+            "int main(void) { float value; value <<= 1; return 0; }\n",
+            "int main(void) { int *pointer; pointer += 1.0; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(CCompilerError):
+                    compile_source(source)
+
+    def test_c90_compound_assignment_scales_pointer_and_converts_float(self):
+        image = compile_source(
+            "int values[2];\n"
+            "int *cursor;\n"
+            "int result;\n"
+            "float floating;\n"
+            "int main(void) {\n"
+            "  values[1] = 7;\n"
+            "  cursor = values;\n"
+            "  cursor += 1;\n"
+            "  result = *cursor;\n"
+            "  floating = 1.0;\n"
+            "  floating += 1;\n"
+            "  result += floating;\n"
+            "  return result != 9;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_increment_rejects_non_scalar_records(self):
+        with self.assertRaisesRegex(CCompilerError, "require an arithmetic or pointer"):
+            compile_source(
+                "struct S { int value; }; int main(void) { "
+                "struct S item; item++; return 0; }\n"
+            )
+
+    def test_c90_arrays_and_enumerators_are_not_modifiable_lvalues(self):
+        invalid_sources = (
+            "int main(void) { int values[2]; values = 0; return 0; }\n",
+            "int main(void) { int values[2]; values++; return 0; }\n",
+            "struct S { char values[2]; }; int main(void) { "
+            "struct S item; item.values = 0; return 0; }\n",
+            "enum State { READY }; int main(void) { READY = 2; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(CCompilerError):
+                    compile_source(source)
+
+    def test_c90_rejects_duplicate_storage_classes_and_qualifiers(self):
+        invalid_sources = (
+            "static extern int value; int main(void) { return 0; }\n",
+            "int main(void) { static auto int value; return 0; }\n",
+            "const const int value; int main(void) { return 0; }\n",
+            "volatile volatile int value; int main(void) { return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(CCompilerError):
+                    compile_source(source)
+
+    def test_c90_scalar_brace_initializers(self):
+        image = compile_source(
+            "int global_value = {{{7}}};\n"
+            "int *global_pointer = {{0}};\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  int local_value = {{5}};\n"
+            "  int *local_pointer = {0};\n"
+            "  result = global_value + local_value + (global_pointer == 0) "
+            "+ (local_pointer == 0);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 5), 14)
+
+    def test_c90_scalar_brace_initializer_requires_one_element(self):
+        invalid_sources = (
+            "int value = {}; int main(void) { return 0; }\n",
+            "int value = {1, 2}; int main(void) { return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError, "scalar initializer braces must contain exactly one value"
+                ):
+                    compile_source(source)
 
     def test_global_pointer_initializer_uses_runtime_pointer_layout(self):
         image = compile_source(

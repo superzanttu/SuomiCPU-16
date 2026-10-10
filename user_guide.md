@@ -457,7 +457,12 @@ to store data blocks of 256 characters.
 - Write `0x10` to `0x43100` to read the disk directory: the disk number (0-based)
   is taken from `0x4310A`, and the ID of that disk (zero terminated, empty when
   out of range) is copied to `0x20000 + offset` (offset at `0x4310C`). The number
-  of disks in the `disks/` folder is returned in the word at `0x4310E`.
+  of disks in the `disks/` folder is returned in the word at `0x4310E`. The byte
+  after the terminating zero (offset 9) is `1` if that disk is write protected.
+- Write `0x20` to `0x43100` to set write protection of the loaded disk: `0` (off)
+  or `1` (on) in `0x4310A`. The flag is saved immediately to the disk's JSON file
+  as `"protected": true`, and writes to a protected disk are ignored. After a
+  load (`0x01`) or `0x20`, the word at `0x4310E` holds the protection state.
 
 `modules/disk_editor.c` is a disk editor built on this interface: it lists the
 disks, creates new ones, and lets you edit and save blocks with the keyboard.
@@ -516,7 +521,7 @@ Supported language features include:
   their C90 type constraints.
 - One-dimensional bounded arrays and initialized arrays with an omitted bound,
   integer constant expression bounds (including arithmetic, enum constants,
-  casts, `sizeof(type)`, and conditional expressions), array parameters
+  casts, `sizeof` on complete object types, and conditional expressions), array parameters
   adjusted to pointers, pointers, casts, `sizeof`, and the comma and conditional
   operators.
 - Blocks, expression statements, `if`/`else`, loops, `switch` with integer
@@ -529,7 +534,14 @@ Supported language features include:
   increment/decrement, arithmetic, bitwise and shift operations, comparisons,
   and logical operators with short-circuit evaluation. Binary operators check
   arithmetic, integer, and scalar operand requirements and reject invalid
-  pointer arithmetic and comparisons.
+  pointer arithmetic and comparisons. Conditional and control-flow conditions
+  must also be scalar expressions. Compound assignments use the corresponding
+  arithmetic and pointer rules, including pointer scaling and floating
+  conversions. Pointer subtraction returns an element difference rather than
+  a byte difference. Arrays and enumerators are rejected as modifiable
+  lvalues; aggregate assignment remains unsupported. Duplicate storage-class
+  specifiers and duplicate `const`/`volatile` qualifiers are diagnosed.
+  Scalar initializers may use nested braces around exactly one value.
 - Object-like and function-like macros, `#`, `##`, `defined`, conditional
   inclusion, `#include`, `#undef`, `#error`, `#pragma`, trigraph replacement,
   and backslash-newline splicing. Quoted includes are searched relative to the
