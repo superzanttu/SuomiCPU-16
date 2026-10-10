@@ -256,7 +256,7 @@ class CCompilerTests(unittest.TestCase):
             "#include <string.h>\n"
             "char text[16];\n"
             "char copy[16];\n"
-            "int results[10];\n"
+            "int results[16];\n"
             "int main(void) {\n"
             "  strcpy(text, \"abc\");\n"
             "  results[0] = strcspn(text, \"x\");\n"
@@ -281,6 +281,33 @@ class CCompilerTests(unittest.TestCase):
             [3, 2, 0, 1, 1, 1, 1, 1, 3, 1],
         )
         self.assertEqual(cpu.memory[GLOBAL_BASE + 16:GLOBAL_BASE + 20], b"xy\0\0")
+
+    def test_c90_string_tokenization_and_error_strings(self):
+        image = compile_source(
+            "#include <string.h>\n"
+            "char text[12];\n"
+            "int results[7];\n"
+            "int main(void) {\n"
+            "  char *token;\n"
+            "  strcpy(text, \"a,,b,c\");\n"
+            "  token = strtok(text, \",\");\n"
+            "  results[0] = token == text && token[0] == 'a';\n"
+            "  token = strtok(NULL, \",\");\n"
+            "  results[1] = token[0] == 'b';\n"
+            "  token = strtok(NULL, \",\");\n"
+            "  results[2] = token[0] == 'c';\n"
+            "  results[3] = strtok(NULL, \",\") == NULL;\n"
+            "  results[4] = memchr(text, 'b', 6) == text + 3;\n"
+            "  results[5] = strerror(33)[0] == 'd';\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 12 + index * 2) for index in range(6)],
+            [1, 1, 1, 1, 1, 1],
+        )
 
     def test_c90_ctype_library(self):
         image = compile_source(
@@ -353,8 +380,14 @@ class CCompilerTests(unittest.TestCase):
             "#if DBL_MANT_DIG != 11 || DBL_DIG != 3\n"
             "#error incorrect double characteristics\n"
             "#endif\n"
+            "#if LDBL_MANT_DIG != 11 || LDBL_DIG != 3\n"
+            "#error incorrect long double characteristics\n"
+            "#endif\n"
             "#if FLT_MIN_EXP != -13 || FLT_MAX_EXP != 16\n"
             "#error incorrect float exponent range\n"
+            "#endif\n"
+            "#if LDBL_MIN_EXP != -13 || LDBL_MAX_EXP != 16\n"
+            "#error incorrect long double exponent range\n"
             "#endif\n"
             "int results[6];\n"
             "int main(void) {\n"
@@ -364,14 +397,15 @@ class CCompilerTests(unittest.TestCase):
             "  results[3] = DBL_MAX == FLT_MAX;\n"
             "  results[4] = DBL_EPSILON == FLT_EPSILON;\n"
             "  results[5] = DBL_MIN == FLT_MIN;\n"
+            "  results[6] = LDBL_MAX == FLT_MAX;\n"
             "  return 0;\n"
             "}\n"
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(
-            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(6)],
-            [1, 1, 1, 1, 1, 1],
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(7)],
+            [1, 1, 1, 1, 1, 1, 1],
         )
 
     def test_c90_basic_stdlib_functions(self):
@@ -398,6 +432,51 @@ class CCompilerTests(unittest.TestCase):
             [12, 13, -123 & 0xFFFF, 321, 26220, 26220, 1],
         )
 
+    def test_c90_strto_integer_conversions(self):
+        image = compile_source(
+            "#include <stdlib.h>\n"
+            "#include <errno.h>\n"
+            "#include <string.h>\n"
+            "int results[10];\n"
+            "int main(void) {\n"
+            "  char *end;\n"
+            "  char text[12];\n"
+            "  strcpy(text, \"  -0x2fZ\");\n"
+            "  results[0] = strtol(text, &end, 0);\n"
+            "  results[1] = end - text;\n"
+            "  results[2] = errno;\n"
+            "  strcpy(text, \"077tail\");\n"
+            "  results[3] = strtoul(text, &end, 0);\n"
+            "  results[4] = end - text;\n"
+            "  strcpy(text, \"32768!\");\n"
+            "  results[5] = strtol(text, &end, 10);\n"
+            "  results[6] = end - text;\n"
+            "  results[7] = errno;\n"
+            "  strcpy(text, \"word\");\n"
+            "  results[8] = strtol(text, &end, 10);\n"
+            "  results[9] = end == text;\n"
+            "  strcpy(text, \"-1\");\n"
+            "  results[10] = strtoul(text, &end, 10);\n"
+            "  results[11] = end - text;\n"
+            "  strcpy(text, \"65536!\");\n"
+            "  results[12] = strtoul(text, &end, 10);\n"
+            "  results[13] = errno;\n"
+            "  strcpy(text, \"-65536!\");\n"
+            "  results[14] = strtoul(text, &end, 10);\n"
+            "  results[15] = errno;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(16)],
+            [
+                -47 & 0xFFFF, 7, 0, 63, 3, 32767, 5, 34, 0, 1,
+                65535, 2, 65535, 34, 65535, 34,
+            ],
+        )
+
     def test_c90_errno_header(self):
         image = compile_source(
             "#include <errno.h>\n"
@@ -410,6 +489,62 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
+
+    def test_c90_assert_macro_passes_and_aborts(self):
+        success_image = compile_source(
+            "#include <assert.h>\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  assert(2 + 2 == 4);\n"
+            "  result = 1;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(success_image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+
+        failure_image = compile_source(
+            "#include <assert.h>\n"
+            "int main(void) {\n"
+            "  assert(0);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(failure_image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_assert_is_disabled_by_ndebug(self):
+        image = compile_source(
+            "#define NDEBUG\n"
+            "#include <assert.h>\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  assert(++result);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 0)
+
+    def test_c90_stdlib_environment_and_system_facilities(self):
+        image = compile_source(
+            "#include <stdlib.h>\n"
+            "int results[3];\n"
+            "int main(void) {\n"
+            "  results[0] = getenv(\"PATH\") == NULL;\n"
+            "  results[1] = system(NULL);\n"
+            "  results[2] = system(\"not-run\") == -1;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(3)],
+            [1, 0, 1],
+        )
 
     def test_executes_recursive_factorial_example(self):
         image = compile_source(

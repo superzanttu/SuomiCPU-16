@@ -536,23 +536,30 @@ does not implement every translation-phase and directive semantic required for
 strict C90 conformance; for example, `#line` is accepted but does not remap
 subsequent diagnostic locations.
 
-The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`, `<float.h>`, `<ctype.h>`,
-`<errno.h>`, `<stdlib.h>`, and `<string.h>`. `<stddef.h>` includes `offsetof`,
-which supports direct struct/union member offsets in constant initializers.
-The string/memory routines,
-C-locale character routines, and a subset of the basic `<stdlib.h>` routines
-(`abs`, `labs`, `atoi`, `atol`, `rand`, and `srand`) are compiled into a
-program when referenced. `RAND_MAX` is 32767; the sequence from `rand` is
-implementation-defined. The limit and floating-point macros describe the
-target's actual types; they also make C90 minimum-range incompatibilities
+The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`,
+`<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`, and
+`<string.h>`. `<stddef.h>` includes `offsetof`, which supports direct
+struct/union member offsets in constant initializers. The string/memory
+routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,
+`labs`, `atoi`, `atol`, `strtol`, `strtoul`, `rand`, `srand`, `getenv`, and
+`system`) are compiled into a program when referenced. `strtol` and `strtoul`
+support base selection, end pointers, and range reporting through `errno`, but
+their `long` range is necessarily limited by the target's 16-bit integer ABI.
+There is no target environment-variable store, so `getenv` returns `NULL`;
+there is no command processor, so `system(NULL)` returns zero and commands
+return -1. `<assert.h>` evaluates assertions unless `NDEBUG` is defined and
+stops the target on a failed assertion. `RAND_MAX` is 32767; the sequence from
+`rand` is implementation-defined. The limit and floating-point macros describe the
+`rand` is implementation-defined. The limit and floating-point macros describe
+the target's actual types; they also make C90 minimum-range incompatibilities
 visible: `long` has only the same 16-bit range as `int`, and `double` has the
-same binary16 precision and range as `float`. `size_t` is 16-bit and cannot
-represent every object size available in the machine's address space. These
-headers are partial: many required `<stdlib.h>` facilities and other C90
-headers—including `stdio.h`—are not implemented. The project's screen and
-graphics routines are SC-16-specific extensions, not replacements for those
-standard facilities. Global initializers must be constant expressions
-supported by the compiler.
+same binary16 precision and range as `float`; `long double` maps to that same
+format as well. `size_t` is 16-bit and cannot represent every object size
+available in the machine's address space. These headers are partial: many
+required `<stdlib.h>` facilities and other C90 headers—including `stdio.h`—are
+not implemented. The project's screen and graphics routines are SC-16-specific
+extensions, not replacements for those standard facilities. Global
+initializers must be constant expressions supported by the compiler.
 
 There is no `printf` or separate console device. When a screen routine is
 referenced, the compiler links [`lib/lib_text.asm`](lib/lib_text.asm), which uses

@@ -68,6 +68,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_sound": ("void", ("int", "int", "int", "int", "int")),
 }
 LIBRARY_FUNCTIONS = {**SCREEN_LIBRARY_FUNCTIONS, **GRAPHICS_LIBRARY_FUNCTIONS}
+LIBRARY_FUNCTIONS["abort"] = ("void", ())
 LIBRARY_FILES = {
     **{name: "lib_text.asm" for name in SCREEN_LIBRARY_FUNCTIONS},
     **{name: "lib_cgfx.asm" for name in GRAPHICS_LIBRARY_FUNCTIONS},
@@ -92,7 +93,10 @@ STANDARD_C_SOURCE = {
     },
     **{
         name: "stdlib.c"
-        for name in ("abs", "labs", "atoi", "atol", "rand", "srand")
+        for name in (
+            "abs", "labs", "atoi", "atol", "strtol", "strtoul", "rand", "srand",
+            "getenv", "system",
+        )
     },
 }
 
@@ -379,6 +383,7 @@ class _Parser:
         self.enum_constants: dict[str, int] = {}
         self.enum_tags: set[str] = set()
         self.records: dict[str, _Record] = {}
+        self.global_declarations: dict[str, Global] = {}
         self._anonymous_record_index = 0
 
     @property
@@ -777,9 +782,28 @@ class _Parser:
             array_size = self._infer_array_size(
                 array_size, current_type, initializer, name_token.line, file_scope=True
             )
-            self.globals.append(
-                Global(name, current_type, initializer, name_token.line, array_size)
-            )
+            declaration = self.global_declarations.get(name)
+            if declaration is None:
+                declaration = Global(
+                    name, current_type, initializer, name_token.line, array_size
+                )
+                self.global_declarations[name] = declaration
+                self.globals.append(declaration)
+            elif (
+                declaration.c_type != current_type
+                or declaration.array_size != array_size
+            ):
+                raise CCompilerError(
+                    f"{self.filename}:{name_token.line}: conflicting declaration "
+                    f"of global variable {name!r}"
+                )
+            elif initializer is not None:
+                if declaration.initializer is not None:
+                    raise CCompilerError(
+                        f"{self.filename}:{name_token.line}: multiple definitions "
+                        f"of global variable {name!r}"
+                    )
+                declaration.initializer = initializer
             if not self.accept(","):
                 break
             current_type = self._pointer_type(c_type)
@@ -1356,7 +1380,11 @@ class _CodeGenerator:
         if expression.kind == "conditional":
             condition = self._constant(expression.children[0])
             return self._constant(expression.children[1] if condition else expression.children[2])
-        if expression.kind == "cast":
+        if (
+            expression.kind == "cast"
+            and expression.children[0].kind == "unary"
+            and expression.children[0].value == "&"
+        ):
             return self._constant(expression.children[0])
         if expression.kind == "address_constant":
             return int(expression.value)
@@ -2153,13 +2181,13 @@ class _CodeGenerator:
             self._emit_store_pointer("R0")
             self.stack_depth += 3
             self.emit("    MOVSP R7")
-            self.emit("    LDI R6, 3")
-            self.emit("    ADD R7, R6")
             self._emit_load_pointer("R1")
             self.emit("    MOVSP R7")
+            self.emit("    LDI R6, 3")
+            self.emit("    ADD R7, R6")
             self._emit_load_pointer("R0")
-            self.emit("    MOV R7, R0")
-            self._emit_store_pointer("R1")
+            self.emit("    MOV R7, R1")
+            self._emit_store_pointer("R0")
             self.emit("    ADJSP 6")
             self.stack_depth -= 6
             return
@@ -2257,7 +2285,8 @@ class _CodeGenerator:
                 declared = self.prototypes.get(name)
                 if declared is not None and declared[1] != len(parameter_types):
                     raise self.error(expression.line, f"invalid declaration for {name}")
-                self.used_libraries.add(LIBRARY_FILES[name])
+                if name in LIBRARY_FILES:
+                    self.used_libraries.add(LIBRARY_FILES[name])
             expected = len(parameter_types)
             if len(arguments) != expected:
                 raise self.error(expression.line, f"{name}() expects {expected} argument(s)")
@@ -2276,7 +2305,9 @@ class _CodeGenerator:
                     self.emit("    PUSH R0")
                 self.stack_depth += width
                 argument_bytes += width
-            if name in LIBRARY_FUNCTIONS and name not in self.function_names:
+            if name == "abort":
+                self.emit("    HALT")
+            elif name in LIBRARY_FUNCTIONS and name not in self.function_names:
                 self.emit(f"    CALLX {name}")
             else:
                 self.emit(f"    CALLX __c_function_{name}")
