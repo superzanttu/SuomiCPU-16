@@ -143,8 +143,8 @@ class CGraphicsTests(unittest.TestCase):
             cpu.step()
             if not cpu.running:
                 break
-        self.assertEqual((cpu.memory[0xE803] << 8) | cpu.memory[0xE804], 4)
-        self.assertEqual((cpu.memory[0xE805] << 8) | cpu.memory[0xE806], 255)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 3), 4)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 5), 255)
     def test_shift_operators(self):
         cpu = run_c(
             "int a; unsigned int b; int c; int d;\n"
@@ -185,13 +185,57 @@ class PreprocessorTests(unittest.TestCase):
                 cpu.step()
             self.assertEqual(cpu.read_16(GLOBAL_BASE), 4)
 
+    def test_function_macros_conditionals_stringification_and_token_pasting(self):
+        source = (
+            "#define JOIN(a, b) a ## b\n"
+            "#define STRINGIFY(value) #value\n"
+            "#define TWICE(value) ((value) + (value))\n"
+            "#define VERSION 3\n"
+            "#if defined(VERSION) && VERSION == 3 && (0 ? 1 / 0 : 1)\n"
+            "#define TARGET JOIN(an, swer)\n"
+            "#else\n"
+            '#error "unexpected conditional branch"\n'
+            "#endif\n"
+            "#undef VERSION\n"
+            "#ifdef VERSION\n"
+            "#error VERSION should have been undefined\n"
+            "#endif\n"
+            "int answer;\n"
+            "char word[3] = STRINGIFY(ok);\n"
+            "int main(void) { TARGET = TWICE(10); return 0; }\n"
+        )
+        cpu = make_cpu(compile_source(source))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 20)
+        self.assertEqual([cpu.read(GLOBAL_BASE + offset) for offset in (2, 3, 4)], [111, 107, 0])
+
+    def test_c90_translation_phases_and_pragma(self):
+        source = (
+            "??=define VALUE 4\\\n"
+            "2\n"
+            "#pragma implementation_specific\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "#if VALUE == 42\n"
+            "  result = VALUE;\n"
+            "#else\n"
+            "  result = 0;\n"
+            "#endif\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 42)
+
     def test_preprocessor_errors(self):
         cases = [
-            "#define F(x) x\nint main(void) { return 0; }\n",
             "#define\nint main(void) { return 0; }\n",
             '#include "missing_file.h"\nint main(void) { return 0; }\n',
             "#include nothing\nint main(void) { return 0; }\n",
-            "#pragma once\nint main(void) { return 0; }\n",
+            "#error deliberate failure\nint main(void) { return 0; }\n",
         ]
         for source in cases:
             with self.subTest(source=source), self.assertRaises(CCompilerError):

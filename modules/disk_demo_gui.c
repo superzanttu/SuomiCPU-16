@@ -23,45 +23,45 @@
 #define GPU_TEXT   7
 #define GPU_PRESENT 8
 
-// RAM buffer for disk data (at RAM_START)
-char *ram_buf = (char *)0x20000;
+// RAM buffer and memory-mapped device pointers.
+char *ram_buf = 0x20000;
+unsigned char *disk_bytes = DISK_BASE;
+unsigned int *disk_words = DISK_BASE;
+unsigned char *gpu_bytes = GPU_BASE;
+unsigned int *gpu_words = GPU_BASE;
+char text_buffer[256];
 
 // UI state
 int disk_inserted = 0;
 int status_msg = 0; // 0: Idle, 1: Loading, 2: Writing, 3: Reading, 4: Error
 
 void draw_rect(int x, int y, int w, int h, int color) {
-    unsigned short *gpu = (unsigned short *)GPU_BASE;
-    gpu[1] = (unsigned short)x; 
-    gpu[2] = (unsigned short)y; 
-    gpu[3] = (unsigned short)w; 
-    gpu[4] = (unsigned short)h; 
-    unsigned char *ctrl = (unsigned char *)GPU_BASE;
-    ctrl[1] = (unsigned char)color;
-    ctrl[0] = (unsigned char)GPU_RECT;
+    gpu_words[1] = x;
+    gpu_words[2] = y;
+    gpu_words[3] = w;
+    gpu_words[4] = h;
+    gpu_bytes[1] = color;
+    gpu_bytes[0] = GPU_RECT;
 }
 
 void draw_text(int x, int y, int color, char *text) {
-    static char text_buffer[256];
     int i = 0;
+    unsigned int addr = 0;
     while(text[i]) {
         text_buffer[i] = text[i];
         i++;
     }
     text_buffer[i] = 0;
     
-    unsigned char *gpu_bytes = (unsigned char *)GPU_BASE;
-    
-    unsigned int addr = (unsigned int)text_buffer;
-    gpu_bytes[10] = (unsigned char)addr;
-    gpu_bytes[11] = (unsigned char)((addr >> 8) & 0xFF);
-    gpu_bytes[12] = (unsigned char)((addr >> 16) & 0xFF);
-    gpu_bytes[13] = (unsigned char)((addr >> 24) & 0xFF);
+    addr = text_buffer;
+    gpu_bytes[10] = addr;
+    gpu_bytes[11] = addr >> 8;
+    gpu_bytes[12] = addr >> 16;
 
-    gpu_bytes[1] = (unsigned char)color;
-    *(unsigned short *)(GPU_BASE + 2) = (unsigned short)x;
-    *(unsigned short *)(GPU_BASE + 4) = (unsigned short)y;
-    gpu_bytes[0] = (unsigned char)GPU_TEXT;
+    gpu_bytes[1] = color;
+    gpu_words[1] = x;
+    gpu_words[2] = y;
+    gpu_bytes[0] = GPU_TEXT;
 }
 
 void main() {
@@ -75,8 +75,8 @@ void main() {
 
     while (1) {
         // 1. Clear screen
-        *(unsigned char *)(GPU_BASE + 1) = bg_color;
-        *(unsigned char *)GPU_CMD = GPU_CLEAR;
+        gpu_bytes[1] = bg_color;
+        gpu_bytes[0] = GPU_CLEAR;
 
         // 2. Draw "Disk Drive" Chassis
         draw_rect(100, 80, 120, 80, drive_color);
@@ -107,10 +107,9 @@ void main() {
         } else if (cycle < 200) {
             // Insert Disk
             disk_inserted = 1;
-            char *id = (char *)DISK_ID;
-            id[0] = 'D'; id[1] = 'I'; id[2] = 'S'; id[3] = 'K'; 
-            id[4] = '0'; id[5] = '0'; id[6] = '0'; id[7] = '1';
-            *(unsigned char *)DISK_CTRL = 0x01; // LOAD
+            disk_bytes[1] = 'D'; disk_bytes[2] = 'I'; disk_bytes[3] = 'S'; disk_bytes[4] = 'K';
+            disk_bytes[5] = '0'; disk_bytes[6] = '0'; disk_bytes[7] = '0'; disk_bytes[8] = '1';
+            disk_bytes[0] = 0x01; // LOAD
             status_msg = 1;
         } else if (cycle < 300) {
             status_msg = 0;
@@ -119,29 +118,29 @@ void main() {
             status_msg = 2;
             ram_buf[0] = 'D'; ram_buf[1] = 'A'; ram_buf[2] = 'T'; ram_buf[3] = 'A';
             ram_buf[4] = 0;
-            *(unsigned short *)DISK_PTR = 0;
-            *(unsigned short *)DISK_OFF = 0;
-            *(unsigned char *)DISK_CTRL = 0x08; // WRITE
+            disk_words[5] = 0;
+            disk_words[6] = 0;
+            disk_bytes[0] = 0x08; // WRITE
         } else if (cycle < 500) {
             status_msg = 0;
         } else if (cycle < 600) {
             // Read block 0
             status_msg = 3;
-            *(unsigned short *)DISK_PTR = 0;
-            *(unsigned short *)DISK_OFF = 100; // Read to offset 100
-            *(unsigned char *)DISK_CTRL = 0x04; // READ
+            disk_words[5] = 0;
+            disk_words[6] = 100; // Read to offset 100
+            disk_bytes[0] = 0x04; // READ
         } else if (cycle < 700) {
             status_msg = 0;
         } else if (cycle < 800) {
             // Eject
             status_msg = 0;
-            *(unsigned char *)DISK_CTRL = 0x02; // UNLOAD
+            disk_bytes[0] = 0x02; // UNLOAD
             disk_inserted = 0;
         } else {
             cycle = 0;
         }
 
         // 5. Present
-        *(unsigned char *) GPU_CMD = GPU_PRESENT;
+        gpu_bytes[0] = GPU_PRESENT;
     }
 }

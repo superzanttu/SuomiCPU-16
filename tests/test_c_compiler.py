@@ -116,9 +116,60 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x04), 1)
         self.assertEqual(cpu.sp, 0x2FFFF)
 
-    def test_reports_unsupported_c_constructs(self):
-        with self.assertRaisesRegex(CCompilerError, "expected int or void type"):
-            compile_source("struct Item { int value; }; int main(void) { return 0; }")
+    def test_typedef_and_enum_declarations(self):
+        image = compile_source(
+            "enum Color { RED = 2, GREEN, BLUE = RED + 4 };\n"
+            "typedef unsigned int counter;\n"
+            "counter result;\n"
+            "int main(void) {\n"
+            "  typedef int local_type;\n"
+            "  local_type value;\n"
+            "  value = BLUE;\n"
+            "  result = value + GREEN;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
+
+    def test_struct_union_member_access_and_aggregate_initializers(self):
+        image = compile_source(
+            "struct Point { unsigned char x; unsigned char y; int value; };\n"
+            "struct Point point = { 7, 8, 3 };\n"
+            "union Number { int word; unsigned char byte; } number = { 5 };\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  struct Point *pointer;\n"
+            "  pointer = &point;\n"
+            "  pointer->value = pointer->x + pointer->y + number.word;\n"
+            "  result = point.value;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 20)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 20)
+
+    def test_c90_casts_conditional_comma_and_sizeof(self):
+        image = compile_source(
+            "int result, first, second;\n"
+            "int main(void) {\n"
+            "  char text[5];\n"
+            "  first = 1;\n"
+            "  second = 2;\n"
+            "  result = (first = 7, second = 8, first + second);\n"
+            "  result += second ? (int)sizeof(char) : sizeof(long *);\n"
+            "  result += sizeof(text) + sizeof(int *);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 24)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 7)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 8)
 
     def test_executes_recursive_factorial_example(self):
         image = compile_source(

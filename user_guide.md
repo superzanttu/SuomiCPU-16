@@ -265,15 +265,15 @@ not update the flags in the current emulator.
 
 ### Integer multiply and divide
 
-| Instruction | Syntax                         | Operation                                                                       |
-| ----------- | ------------------------------ | ------------------------------------------------------------------------------- |
-| `MUL`       | `MUL Rd, Rs` / `MUL Rd, imm`   | `Rd` = low 16 bits of `Rd * source`; `C` is set if the product exceeds 16 bits. |
-| `MULHU`     | `MULHU Rd, Rs` / `imm`         | `Rd` = high 16 bits of the unsigned 32-bit product.                             |
-| `MULHS`     | `MULHS Rd, Rs` / `imm`         | `Rd` = high 16 bits of the signed 32-bit product.                               |
-| `DIV`       | `DIV Rd, Rs` / `imm`           | `Rd = Rd / source`, unsigned.                                                   |
-| `DIVS`      | `DIVS Rd, Rs` / `imm`          | `Rd = Rd / source`, signed, truncating toward zero.                             |
-| `MOD`       | `MOD Rd, Rs` / `imm`           | `Rd = Rd % source`, unsigned.                                                   |
-| `MODS`      | `MODS Rd, Rs` / `imm`          | `Rd = Rd % source`, signed; the sign follows the dividend.                      |
+| Instruction | Syntax                       | Operation                                                                       |
+| ----------- | ---------------------------- | ------------------------------------------------------------------------------- |
+| `MUL`       | `MUL Rd, Rs` / `MUL Rd, imm` | `Rd` = low 16 bits of `Rd * source`; `C` is set if the product exceeds 16 bits. |
+| `MULHU`     | `MULHU Rd, Rs` / `imm`       | `Rd` = high 16 bits of the unsigned 32-bit product.                             |
+| `MULHS`     | `MULHS Rd, Rs` / `imm`       | `Rd` = high 16 bits of the signed 32-bit product.                               |
+| `DIV`       | `DIV Rd, Rs` / `imm`         | `Rd = Rd / source`, unsigned.                                                   |
+| `DIVS`      | `DIVS Rd, Rs` / `imm`        | `Rd = Rd / source`, signed, truncating toward zero.                             |
+| `MOD`       | `MOD Rd, Rs` / `imm`         | `Rd = Rd % source`, unsigned.                                                   |
+| `MODS`      | `MODS Rd, Rs` / `imm`        | `Rd = Rd % source`, signed; the sign follows the dividend.                      |
 
 The source is a register (`R0`-`R7`) or a 16-bit immediate (decimal, `0x` hex,
 or negative). Operands are taken as 16-bit values and the result is always a
@@ -291,23 +291,23 @@ and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
 
 ### Extended ALU, miscellaneous and conditional-branch instructions
 
-| Instruction | Syntax | Operation |
-| ----------- | ------ | --------- |
-| `SHL` `LSR` `ASR` | `SHL Rd, n` / `SHL Rd, Rs` | Shift left, logical right, arithmetic right. Count is 0-15 (a register uses its low 4 bits). `C` = last bit shifted out. |
-| `ROL` `ROR` | `ROL Rd, n` / `ROL Rd, Rs` | Rotate left/right by 0-15. |
-| `ADC` `SBC` | `ADC Rd, Rs` / `imm` | Add/subtract including the carry flag, for multi-word arithmetic. |
-| `NEG` | `NEG Rd` | Two's complement negate. |
-| `TEST` | `TEST Rd, Rs` / `imm` | `Rd AND source`; sets flags only. |
-| `ADD SUB AND OR XOR CMP` | `ADD Rd, imm` | Immediate forms (a non-register second operand selects them). |
-| `SWAP` `SEXT` `CLZ` | `SWAP Rd` | Swap bytes; sign-extend the low byte; count leading zeros (all in place). |
-| `JMPR` `CALLR` | `JMPR Rd` | Jump/call to the 19-bit address held in `Rd`. |
-| `PUSHF` `POPF` | `PUSHF` | Push/pop the flags (Z=1, C=2, N=4, V=8). |
-| `SETC` `CLC` | `SETC` | Set/clear the carry flag. |
-| `SETSP` | `SETSP Rd` | Load the stack pointer from `Rd`. |
-| `NOP` | `NOP` | Do nothing (`MOV R0, R0`). |
-| `BNZX BNCX BNX BNNX BVX BNVX` | `BNZX label` | Far branch if `Z`, `C`, `N`, `V` is clear (`BNZ`, `BNC`, `BNV`) or set (`BN`, `BV`); `BNNX` = `N` clear. |
-| `BLT BGE BGT BLE` | `BLT label` | Signed compare branches after `CMP` (use `N` and `V`). |
-| `BHI BLS` | `BHI label` | Unsigned higher / lower-or-same after `CMP`. |
+| Instruction                   | Syntax                     | Operation                                                                                                                |
+| ----------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `SHL` `LSR` `ASR`             | `SHL Rd, n` / `SHL Rd, Rs` | Shift left, logical right, arithmetic right. Count is 0-15 (a register uses its low 4 bits). `C` = last bit shifted out. |
+| `ROL` `ROR`                   | `ROL Rd, n` / `ROL Rd, Rs` | Rotate left/right by 0-15.                                                                                               |
+| `ADC` `SBC`                   | `ADC Rd, Rs` / `imm`       | Add/subtract including the carry flag, for multi-word arithmetic.                                                        |
+| `NEG`                         | `NEG Rd`                   | Two's complement negate.                                                                                                 |
+| `TEST`                        | `TEST Rd, Rs` / `imm`      | `Rd AND source`; sets flags only.                                                                                        |
+| `ADD SUB AND OR XOR CMP`      | `ADD Rd, imm`              | Immediate forms (a non-register second operand selects them).                                                            |
+| `SWAP` `SEXT` `CLZ`           | `SWAP Rd`                  | Swap bytes; sign-extend the low byte; count leading zeros (all in place).                                                |
+| `JMPR` `CALLR`                | `JMPR Rd`                  | Jump/call to the 19-bit address held in `Rd`.                                                                            |
+| `PUSHF` `POPF`                | `PUSHF`                    | Push/pop the flags (Z=1, C=2, N=4, V=8).                                                                                 |
+| `SETC` `CLC`                  | `SETC`                     | Set/clear the carry flag.                                                                                                |
+| `SETSP`                       | `SETSP Rd`                 | Load the stack pointer from `Rd`.                                                                                        |
+| `NOP`                         | `NOP`                      | Do nothing (`MOV R0, R0`).                                                                                               |
+| `BNZX BNCX BNX BNNX BVX BNVX` | `BNZX label`               | Far branch if `Z`, `C`, `N`, `V` is clear (`BNZ`, `BNC`, `BNV`) or set (`BN`, `BV`); `BNNX` = `N` clear.                 |
+| `BLT BGE BGT BLE`             | `BLT label`                | Signed compare branches after `CMP` (use `N` and `V`).                                                                   |
+| `BHI BLS`                     | `BHI label`                | Unsigned higher / lower-or-same after `CMP`.                                                                             |
 
 Every branch also has an `X` spelling (`BLTX`, ...); all conditional branches
 here are 6-byte, full-address forms. `ADD`, `SUB` and `CMP` now also set the
@@ -423,7 +423,7 @@ memory ranges:
 | Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
 | Speed register (0 = fixed, 1 = maximum)  |           `0x43003` |       1 byte |
 | Held-key bitmask                         |           `0x43004` |       1 byte |
-| Disk storage device                     |           `0x43100` |     16 bytes |
+| Disk storage device                      |           `0x43100` |     16 bytes |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
 | Graphics coprocessor registers           | `0x43020`-`0x4302E` |     15 bytes |
 | Back buffer (coprocessor drawing target) | `0x44000`-`0x56BFF` | 76,800 bytes |
@@ -479,7 +479,7 @@ ordinary ASCII and UTF-8 strings containing those Finnish letters. The reusable
 graphics include provides a renderer that uses this table and a small mask
 table to unpack the pixels.
 
-## 9. Minimal C89 compiler
+## 9. ANSI C90 compiler
 
 [`tools/c_compiler.py`](tools/c_compiler.py) implements a small, dependency-free C89 subset
 compiler; it is not a complete C89 implementation. Supported types are signed
@@ -564,27 +564,27 @@ font. All drawing goes to an off-screen back buffer; `gfx_present()` copies it
 to VRAM in one step and ends the current emulator frame (vsync), so there is
 no flicker.
 
-| Function                                                                                | Behavior                                                                      |
-| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `void gfx_clear(unsigned char color)`                                                   | Fill the back buffer.                                                         |
-| `void gfx_pixel(int x, int y, unsigned char color)`                                     | Plot one pixel.                                                               |
-| `void gfx_rect(int x, int y, int w, int h, unsigned char color)`                        | Filled rectangle.                                                             |
-| `void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)`                    | Line (clipped).                                                               |
-| `void gfx_poly(int x, int y, int n, char *pts, unsigned char color)`                    | Closed outline through `n` signed-byte `(dx, dy)` pairs relative to `(x, y)`. |
-| `void gfx_sprite(int x, int y, int w, int h, unsigned char *data)`                      | Draw `w*h` palette bytes; 0 is transparent.                                   |
-| `void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char color)` | 1 bit per pixel, MSB first, `(w+7)/8` bytes per row.                          |
-| `void gfx_text(int x, int y, char *text, unsigned char color)`                          | 6x8-cell text from the 5x7 font; UTF-8 `??????` and `\n` supported.           |
-| `void gfx_present(void)`                                                                | Show the back buffer and wait for the next frame.                             |
-| `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                             |
-| `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.   |
-| `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                          |
-| `int gfx_mouse_x(void)` / `int gfx_mouse_y(void)`                                       | Mouse position in screen pixels (0-319, 0-239).                               |
-| `unsigned int gfx_mouse_buttons(void)`                                                  | Held buttons: `MOUSE_LEFT` 1, `MOUSE_RIGHT` 2 (use with position for dragging). |
+| Function                                                                                | Behavior                                                                                                                                                   |
+| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `void gfx_clear(unsigned char color)`                                                   | Fill the back buffer.                                                                                                                                      |
+| `void gfx_pixel(int x, int y, unsigned char color)`                                     | Plot one pixel.                                                                                                                                            |
+| `void gfx_rect(int x, int y, int w, int h, unsigned char color)`                        | Filled rectangle.                                                                                                                                          |
+| `void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)`                    | Line (clipped).                                                                                                                                            |
+| `void gfx_poly(int x, int y, int n, char *pts, unsigned char color)`                    | Closed outline through `n` signed-byte `(dx, dy)` pairs relative to `(x, y)`.                                                                              |
+| `void gfx_sprite(int x, int y, int w, int h, unsigned char *data)`                      | Draw `w*h` palette bytes; 0 is transparent.                                                                                                                |
+| `void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char color)` | 1 bit per pixel, MSB first, `(w+7)/8` bytes per row.                                                                                                       |
+| `void gfx_text(int x, int y, char *text, unsigned char color)`                          | 6x8-cell text from the 5x7 font; UTF-8 `??????` and `\n` supported.                                                                                        |
+| `void gfx_present(void)`                                                                | Show the back buffer and wait for the next frame.                                                                                                          |
+| `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                                                                                                          |
+| `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.                                                                                |
+| `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                                                                                                       |
+| `int gfx_mouse_x(void)` / `int gfx_mouse_y(void)`                                       | Mouse position in screen pixels (0-319, 0-239).                                                                                                            |
+| `unsigned int gfx_mouse_buttons(void)`                                                  | Held buttons: `MOUSE_LEFT` 1, `MOUSE_RIGHT` 2 (use with position for dragging).                                                                            |
 | `unsigned int gfx_mouse_events(void)`                                                   | One-frame events: press `MOUSE_LEFT_DOWN`/`RIGHT_DOWN` 1/2, double-click `MOUSE_LEFT_DOUBLE`/`RIGHT_DOUBLE` 4/8, release `MOUSE_LEFT_UP`/`RIGHT_UP` 16/32. |
-| `void gfx_sound(int channel, int freq, int frames, int wave, int volume)`                | Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. `WAVE_SQUARE/NOISE/TRIANGLE`. |
-| `void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y)` | Fill the screen from a tile map (1 byte per tile = palette colour, 0 = black; 16x16 px tiles; camera in pixels; outside the map is black). |
-| `int gfx_getchar(void)` | Next typed ASCII character (8 backspace, 13 enter), 0 if none; consumes it. |
-| `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store the back buffer as a static layer / redraw it in one call.              |
+| `void gfx_sound(int channel, int freq, int frames, int wave, int volume)`               | Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. `WAVE_SQUARE/NOISE/TRIANGLE`.                                                                 |
+| `void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y)`      | Fill the screen from a tile map (1 byte per tile = palette colour, 0 = black; 16x16 px tiles; camera in pixels; outside the map is black).                 |
+| `int gfx_getchar(void)`                                                                 | Next typed ASCII character (8 backspace, 13 enter), 0 if none; consumes it.                                                                                |
+| `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store the back buffer as a static layer / redraw it in one call.                                                                                           |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
@@ -616,17 +616,17 @@ an already settled player keeps its slot against a newcomer). Peers that vanish 
 Broadcasts are not delivered back to the sender. Delivery is UDP: messages can be lost or reordered,
 so send state continuously rather than relying on single events.
 
-| Function | Description |
-|---|---|
-| `int net_open(char *title)` | Join the group for `title`; 1 = ok. |
-| `void net_close(void)` | Leave the group. |
-| `int net_send(unsigned char *data, int len)` | Broadcast 1..`NET_MAX_MSG` (48) bytes to all other instances; 1 = sent. |
-| `int net_recv(unsigned char *buf)` | Pop the next message into `buf`; returns its length, 0 if none. |
-| `int net_sender(void)` | Slot of the sender of the last received message. |
-| `int net_players(void)` | Live instances including this one. |
-| `int net_slot(void)` | Own slot 0-7, -1 when not joined. |
-| `int net_active(int slot)` | 1 if a player occupies `slot`. |
-| `int net_ready(void)` / `int net_full(void)` / `int net_is_open(void)` | Slot settled / group had no free slot / joined. |
+| Function                                                               | Description                                                             |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `int net_open(char *title)`                                            | Join the group for `title`; 1 = ok.                                     |
+| `void net_close(void)`                                                 | Leave the group.                                                        |
+| `int net_send(unsigned char *data, int len)`                           | Broadcast 1..`NET_MAX_MSG` (48) bytes to all other instances; 1 = sent. |
+| `int net_recv(unsigned char *buf)`                                     | Pop the next message into `buf`; returns its length, 0 if none.         |
+| `int net_sender(void)`                                                 | Slot of the sender of the last received message.                        |
+| `int net_players(void)`                                                | Live instances including this one.                                      |
+| `int net_slot(void)`                                                   | Own slot 0-7, -1 when not joined.                                       |
+| `int net_active(int slot)`                                             | 1 if a player occupies `slot`.                                          |
+| `int net_ready(void)` / `int net_full(void)` / `int net_is_open(void)` | Slot settled / group had no free slot / joined.                         |
 
 Windows may need to allow Python through the firewall for private networks.
 [`examples/net_game_demo.c`](examples/net_game_demo.c) shows the pattern.

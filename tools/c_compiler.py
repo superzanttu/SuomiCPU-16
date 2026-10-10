@@ -1,8 +1,9 @@
-"""A small, self-contained C89 subset compiler for the SC-16."""
+"""A small C90-oriented compiler for the SC-16."""
 
 import argparse
 import ast
 import decimal
+import datetime
 import os
 import re
 import struct
@@ -15,7 +16,7 @@ from tools.assembler import AssemblyError, AssemblyImage, assemble
 
 WORD_MASK = 0xFFFF
 CODE_BASE = 0x4800
-GLOBAL_BASE = 0xE800
+GLOBAL_BASE = 0x2000
 STACK_OFFSET_LIMIT = 0xFF
 FRAME_SIZE_LIMIT = 126
 SCREEN_LIBRARY_FUNCTIONS = {
@@ -90,6 +91,12 @@ class Token:
     line: int
 
 
+@dataclass(frozen=True)
+class _Macro:
+    parameters: tuple[str, ...] | None
+    replacement: str
+
+
 @dataclass
 class Expr:
     kind: str
@@ -135,14 +142,32 @@ class Global:
     array_size: int = 0
 
 
+@dataclass(frozen=True)
+class _Field:
+    name: str
+    c_type: str
+    offset: int
+    array_size: int = 0
+
+
+@dataclass
+class _Record:
+    tag: str
+    is_union: bool
+    fields: dict[str, _Field] = field(default_factory=dict)
+    size: int = 0
+    complete: bool = False
+
+
 _MULTI_OPERATORS = (
-    "++", "--", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=",
-    "/=", "%=", "&=", "|=", "^=", "<<", ">>",
+    "<<=", ">>=", "++", "--", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=",
+    "/=", "%=", "&=", "|=", "^=", "<<", ">>", "##", "->",
 )
-_SINGLE_OPERATORS = set("{}();,:[]=+-*/%<>!~&|^")
+_SINGLE_OPERATORS = set("{}();,:.[]=+-*/%<>!~&|^#?")
 _STORAGE_WORDS = {"static", "extern", "register", "auto", "const", "volatile"}
 _TYPE_WORDS = {"int", "void", "char", "short", "long", "float", "double", "signed", "unsigned"}
 _PRECEDENCE = {
+    ",": 0,
     "||": 1,
     "&&": 2,
     "|": 3,
@@ -154,25 +179,33 @@ _PRECEDENCE = {
     "<=": 7,
     ">": 7,
     ">=": 7,
-    "+": 8,
-    "-": 8,
     "<<": 8,
     ">>": 8,
-    "*": 9,
-    "/": 9,
-    "%": 9,
+    "+": 9,
+    "-": 9,
+    "*": 10,
+    "/": 10,
+    "%": 10,
 }
-_ASSIGNMENTS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="}
+_ASSIGNMENTS = {
+    "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+}
 
 
-def _type_size(c_type: str) -> int:
+def _type_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
     if c_type.endswith("*"):
         return 3
+    if records is not None and c_type in records:
+        return records[c_type].size
     return 1 if c_type in ("char", "unsigned char") else 2
 
 
-def _object_size(c_type: str) -> int:
-    return 3 if c_type.endswith("*") else 2
+def _object_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
+    if c_type.endswith("*"):
+        return 3
+    if records is not None and c_type in records:
+        return records[c_type].size
+    return 2
 
 
 def _lex_raw(source: str, filename: str) -> list[Token]:
@@ -319,6 +352,11 @@ class _Parser:
         self.functions: list[Function] = []
         self.prototypes: dict[str, tuple[str, int]] = {}
         self._local_count = 0
+        self.typedef_scopes: list[dict[str, str]] = [{}]
+        self.enum_constants: dict[str, int] = {}
+        self.enum_tags: set[str] = set()
+        self.records: dict[str, _Record] = {}
+        self._anonymous_record_index = 0
 
     @property
     def token(self) -> Token:
@@ -348,8 +386,42 @@ class _Parser:
         return self.take()
 
     def parse_type(self) -> str:
+        if self.token.value == "enum":
+            self.take()
+            tag = None
+            if re.fullmatch(r"[A-Za-z_]\w*", self.token.value):
+                tag = self.take().value
+            if self.accept("{"):
+                if tag is not None:
+                    self.enum_tags.add(tag)
+                value = -1
+                while self.token.value != "}":
+                    name = self.expect_identifier("expected an enumerator name")
+                    value += 1
+                    if self.accept("="):
+                        value = self._enum_constant_value(self.parse_expression(1))
+                    if name.value in self.enum_constants:
+                        raise CCompilerError(
+                            f"{self.filename}:{name.line}: duplicate enumerator {name.value!r}"
+                        )
+                    self.enum_constants[name.value] = value
+                    if not self.accept(","):
+                        break
+                    if self.token.value == "}":
+                        break
+                self.expect("}")
+            elif tag is None or tag not in self.enum_tags:
+                raise self.fail("enum reference requires a previously declared tag")
+            return "int"
+        if self.token.value in ("struct", "union"):
+            return self._parse_record_specifier()
+        for scope in reversed(self.typedef_scopes):
+            if self.token.value in scope:
+                return scope[self.take().value]
         unsigned = False
         signed = False
+        short = False
+        long = False
         base = None
         while self.token.value in _STORAGE_WORDS | _TYPE_WORDS:
             if self.token.value == "unsigned":
@@ -358,27 +430,144 @@ class _Parser:
                 signed = True
             elif self.token.value in _TYPE_WORDS - {"signed", "unsigned"}:
                 current = self.take().value
-                if current not in ("short", "long"):
-                    if base is not None and base != current:
-                        raise self.fail("invalid combination of type specifiers")
+                if current == "short":
+                    short = True
+                elif current == "long":
+                    long = True
+                elif base is not None:
+                    raise self.fail("invalid combination of type specifiers")
+                else:
                     base = current
                 continue
             self.take()
+        if short and long:
+            raise self.fail("short and long cannot be combined")
+        if base is None and (short or long):
+            base = "int"
         if base is None:
             raise self.fail("expected int or void type")
         if signed and unsigned:
             raise self.fail("both signed and unsigned were specified")
         if base == "void":
-            if unsigned or signed:
-                raise self.fail("void cannot be signed or unsigned")
+            if unsigned or signed or short or long:
+                raise self.fail("void cannot be combined with other type specifiers")
             return "void"
         if base in ("float", "double"):
-            if unsigned or signed:
-                raise self.fail("floating types cannot be signed or unsigned")
+            if unsigned or signed or short or (long and base != "double"):
+                raise self.fail("invalid combination of floating type specifiers")
             return "float"
+        if base == "char" and (short or long):
+            raise self.fail("char cannot be combined with short or long")
         if base == "char":
             return "unsigned char" if unsigned else "char"
         return "unsigned int" if unsigned else "int"
+
+    def _parse_record_specifier(self) -> str:
+        keyword = self.take().value
+        is_union = keyword == "union"
+        tag = None
+        if re.fullmatch(r"[A-Za-z_]\w*", self.token.value):
+            tag = self.take().value
+        if tag is None:
+            self._anonymous_record_index += 1
+            tag = f"__anonymous_{self._anonymous_record_index}"
+        record_type = f"{keyword} {tag}"
+        record = self.records.setdefault(record_type, _Record(record_type, is_union))
+        if self.accept("{"):
+            if record.complete:
+                raise self.fail(f"redefinition of {record_type}")
+            fields: dict[str, _Field] = {}
+            offset = 0
+            maximum_size = 0
+            while self.token.value != "}":
+                if self.token.value == "<eof>":
+                    raise self.fail(f"unterminated {record_type} definition")
+                field_type = self.parse_type()
+                while True:
+                    declarator_type = self._pointer_type(field_type)
+                    field_name = self.expect_identifier("expected a field name")
+                    declarator_type, array_size = self._declarator_suffix(declarator_type)
+                    if declarator_type == "void":
+                        raise CCompilerError(
+                            f"{self.filename}:{field_name.line}: fields cannot have void type"
+                        )
+                    if declarator_type in self.records and not self.records[declarator_type].complete:
+                        raise CCompilerError(
+                            f"{self.filename}:{field_name.line}: field has incomplete type"
+                        )
+                    field_width = (
+                        array_size * _type_size(declarator_type, self.records)
+                        if array_size else _type_size(declarator_type, self.records)
+                    )
+                    if not is_union and _type_size(declarator_type, self.records) > 1:
+                        offset = (offset + 1) & ~1
+                    field_offset = 0 if is_union else offset
+                    if field_name.value in fields:
+                        raise CCompilerError(
+                            f"{self.filename}:{field_name.line}: duplicate field "
+                            f"{field_name.value!r}"
+                        )
+                    fields[field_name.value] = _Field(
+                        field_name.value, declarator_type, field_offset, array_size
+                    )
+                    if is_union:
+                        maximum_size = max(maximum_size, field_width)
+                    else:
+                        offset += field_width
+                    if not self.accept(","):
+                        break
+                self.expect(";")
+            self.expect("}")
+            size = maximum_size if is_union else offset
+            record.fields = fields
+            record.size = (size + 1) & ~1
+            record.complete = True
+        elif not record.complete and tag.startswith("__anonymous_"):
+            raise self.fail("anonymous record references are invalid")
+        return record_type
+
+    def expect_identifier(self, message: str) -> Token:
+        if not re.fullmatch(r"[A-Za-z_]\w*", self.token.value):
+            raise self.fail(message)
+        return self.take()
+
+    def _enum_constant_value(self, expression: Expr) -> int:
+        if expression.kind == "constant":
+            return int(expression.value)
+        if expression.kind == "name" and expression.value in self.enum_constants:
+            return self.enum_constants[str(expression.value)]
+        if expression.kind == "unary":
+            value = self._enum_constant_value(expression.children[0])
+            operator = str(expression.value)
+            if operator == "+":
+                return value
+            if operator == "-":
+                return -value
+            if operator == "~":
+                return ~value
+            if operator == "!":
+                return int(not value)
+        if expression.kind == "binary":
+            left = self._enum_constant_value(expression.children[0])
+            right = self._enum_constant_value(expression.children[1])
+            operations = {
+                "+": lambda: left + right, "-": lambda: left - right,
+                "*": lambda: left * right, "/": lambda: int(left / right),
+                "%": lambda: left % right, "<<": lambda: left << right,
+                ">>": lambda: left >> right, "&": lambda: left & right,
+                "|": lambda: left | right, "^": lambda: left ^ right,
+                "==": lambda: int(left == right), "!=": lambda: int(left != right),
+                "<": lambda: int(left < right), "<=": lambda: int(left <= right),
+                ">": lambda: int(left > right), ">=": lambda: int(left >= right),
+                "&&": lambda: int(bool(left) and bool(right)),
+                "||": lambda: int(bool(left) or bool(right)),
+            }
+            if expression.value in operations:
+                try:
+                    return operations[str(expression.value)]()
+                except (ZeroDivisionError, ValueError) as exc:
+                    raise self.fail("invalid enum constant expression") from exc
+        raise self.fail("enumerator value is not an integer constant expression")
 
     def _pointer_type(self, c_type: str) -> str:
         pointer_count = 0
@@ -398,8 +587,6 @@ class _Parser:
         if size <= 0 or size > 0xFFFF:
             raise CCompilerError(f"{self.filename}:{size_token.line}: array size is out of range")
         self.expect("]")
-        if c_type.endswith("*"):
-            raise self.fail("arrays of pointers are not supported")
         return c_type, size
 
     def _initializer(self) -> Expr:
@@ -411,7 +598,7 @@ class _Parser:
                     break
             self.expect("}")
             return Expr("init_list", children=tuple(values), line=self.token.line)
-        return self.parse_expression()
+        return self.parse_expression(1)
 
     def parse(self) -> tuple[list[Global], list[Function]]:
         while self.token.value != "<eof>":
@@ -421,7 +608,13 @@ class _Parser:
         return self.globals, self.functions
 
     def parse_external_declaration(self) -> None:
+        is_typedef = self.accept("typedef")
         c_type = self.parse_type()
+        if is_typedef:
+            self.parse_typedef_declarators(c_type)
+            return
+        if self.accept(";"):
+            return
         declarator_type = self._pointer_type(c_type)
         name_token = self.take()
         if not re.fullmatch(r"[A-Za-z_]\w*", name_token.value):
@@ -463,6 +656,20 @@ class _Parser:
             return
         self.parse_global_declarators(c_type, name_token, declarator_type)
 
+    def parse_typedef_declarators(self, c_type: str) -> None:
+        while True:
+            alias_type = self._pointer_type(c_type)
+            token = self.expect_identifier("expected a typedef name")
+            alias_type, array_size = self._declarator_suffix(alias_type)
+            if array_size:
+                raise CCompilerError(
+                    f"{self.filename}:{token.line}: array typedefs are not supported"
+                )
+            self.typedef_scopes[-1][token.value] = alias_type
+            if not self.accept(","):
+                break
+        self.expect(";")
+
     def parse_parameters(self) -> list[tuple[str, str | None]]:
         if self.accept(")"):
             return []
@@ -497,6 +704,10 @@ class _Parser:
                 raise CCompilerError(
                     f"{self.filename}:{name_token.line}: objects cannot have void type"
                 )
+            if current_type in self.records and not self.records[current_type].complete:
+                raise CCompilerError(
+                    f"{self.filename}:{name_token.line}: object has incomplete record type"
+                )
             initializer = self._initializer() if self.accept("=") else None
             self.globals.append(
                 Global(name, current_type, initializer, name_token.line, array_size)
@@ -510,27 +721,40 @@ class _Parser:
         self.expect(";")
 
     def _is_declaration(self) -> bool:
-        return self.token.value in _STORAGE_WORDS | _TYPE_WORDS
+        return (
+            self.token.value in _STORAGE_WORDS | _TYPE_WORDS | {
+                "enum", "struct", "union", "typedef",
+            }
+            or any(self.token.value in scope for scope in self.typedef_scopes)
+        )
 
     def parse_compound(self) -> Stmt:
         brace = self.expect("{")
         statements: list[Stmt] = []
         declarations_allowed = True
+        self.typedef_scopes.append({})
         while self.token.value != "}":
             if self.token.value == "<eof>":
                 raise self.fail("unterminated compound statement")
             if self._is_declaration():
                 if not declarations_allowed:
-                    raise self.fail("C89 declarations must precede statements in a block")
+                    raise self.fail("C90 declarations must precede statements in a block")
                 statements.extend(self.parse_local_declarations())
             else:
                 declarations_allowed = False
                 statements.append(self.parse_statement())
         self.take()
+        self.typedef_scopes.pop()
         return Stmt("block", children=statements, line=brace.line)
 
     def parse_local_declarations(self) -> list[Stmt]:
+        is_typedef = self.accept("typedef")
         c_type = self.parse_type()
+        if is_typedef:
+            self.parse_typedef_declarators(c_type)
+            return []
+        if self.accept(";"):
+            return []
         declarations = []
         while True:
             current_type = self._pointer_type(c_type)
@@ -540,14 +764,18 @@ class _Parser:
             current_type, array_size = self._declarator_suffix(current_type)
             if current_type == "void":
                 raise self.fail("local objects cannot have void type")
+            if current_type in self.records and not self.records[current_type].complete:
+                raise CCompilerError(
+                    f"{self.filename}:{token.line}: object has incomplete record type"
+                )
             initializer = self._initializer() if self.accept("=") else None
             local = Local(
                 token.value, current_type, initializer, self._local_count, token.line, array_size
             )
             self._local_count += (
-                _object_size(current_type)
+                _object_size(current_type, self.records)
                 if array_size == 0
-                else array_size * _type_size(current_type)
+                else array_size * _type_size(current_type, self.records)
             )
             declarations.append(Stmt("decl", value=local, line=token.line))
             if not self.accept(","):
@@ -604,7 +832,7 @@ class _Parser:
             while self.token.value != "}":
                 case_token = self.token
                 if self.accept("case"):
-                    case_value = self.parse_expression()
+                    case_value = self.parse_expression(1)
                     self.expect(":")
                     if case_value.kind not in ("constant", "unary", "binary"):
                         raise self.fail("case labels must be constant integer expressions")
@@ -641,14 +869,15 @@ class _Parser:
         self.expect(";")
         return Stmt("expression", children=[expression], line=token.line)
 
-    def parse_expression(self, minimum: int = 1) -> Expr:
+    def parse_expression(self, minimum: int = 0) -> Expr:
         left = self.parse_unary()
         while True:
             operator = self.token.value
             if operator in _ASSIGNMENTS and minimum <= 1:
                 token = self.take()
                 if left.kind != "name" and not (
-                    left.kind == "index" or (left.kind == "unary" and left.value == "*")
+                    left.kind in ("index", "member")
+                    or (left.kind == "unary" and left.value == "*")
                 ):
                     raise CCompilerError(
                         f"{self.filename}:{token.line}: assignment requires a scalar variable"
@@ -656,20 +885,58 @@ class _Parser:
                 right = self.parse_expression(1)
                 left = Expr("assign", (operator, left), (right,), token.line)
                 continue
-            precedence = _PRECEDENCE.get(operator, 0)
-            if precedence < minimum:
+            if operator == "?" and minimum <= 1:
+                token = self.take()
+                when_true = self.parse_expression()
+                self.expect(":")
+                when_false = self.parse_expression(1)
+                left = Expr(
+                    "conditional",
+                    None,
+                    (left, when_true, when_false),
+                    token.line,
+                )
+                continue
+            if operator not in _PRECEDENCE or _PRECEDENCE[operator] < minimum:
                 break
             token = self.take()
-            right = self.parse_expression(precedence + 1)
+            right = self.parse_expression(_PRECEDENCE[operator] + 1)
             left = Expr("binary", operator, (left, right), token.line)
         return left
 
     def parse_unary(self) -> Expr:
         token = self.token
+        if self.accept("sizeof"):
+            if self.token.value == "(":
+                saved_position = self.position
+                self.take()
+                try:
+                    c_type = self.parse_type()
+                    c_type = self._pointer_type(c_type)
+                    self.expect(")")
+                except CCompilerError:
+                    self.position = saved_position
+                else:
+                    return Expr("sizeof_type", c_type, line=token.line)
+            return Expr("sizeof_expr", children=(self.parse_unary(),), line=token.line)
+        if self.token.value == "(":
+            saved_position = self.position
+            self.take()
+            try:
+                c_type = self.parse_type()
+                c_type = self._pointer_type(c_type)
+                self.expect(")")
+            except CCompilerError:
+                self.position = saved_position
+            else:
+                child = self.parse_unary()
+                return Expr("cast", c_type, (child,), token.line)
         if token.value in ("+", "-", "!", "~", "&", "*", "++", "--"):
             operator = self.take().value
             child = self.parse_unary()
-            if operator in ("++", "--") and child.kind != "name":
+            if operator in ("++", "--") and child.kind not in (
+                "name", "index", "member",
+            ) and not (child.kind == "unary" and child.value == "*"):
                 raise CCompilerError(
                     f"{self.filename}:{token.line}: increment requires a scalar variable"
                 )
@@ -681,14 +948,16 @@ class _Parser:
                 self.expect("]")
                 expression = Expr("index", None, (expression, index), expression.line)
             elif self.accept("("):
-                if expression.kind != "name":
+                if expression.kind not in ("name", "index", "member") and not (
+                    expression.kind == "unary" and expression.value == "*"
+                ):
                     raise CCompilerError(
                         f"{self.filename}:{expression.line}: only direct function calls are supported"
                     )
                 arguments = []
                 if self.token.value != ")":
                     while True:
-                        arguments.append(self.parse_expression())
+                        arguments.append(self.parse_expression(1))
                         if not self.accept(","):
                             break
                 self.expect(")")
@@ -700,6 +969,12 @@ class _Parser:
                         f"{self.filename}:{operator.line}: increment requires a scalar variable"
                     )
                 expression = Expr("postfix", operator.value, (expression,), operator.line)
+            elif self.token.value in (".", "->"):
+                operator = self.take()
+                field_name = self.expect_identifier("expected a member name")
+                expression = Expr(
+                    "member", (operator.value, field_name.value), (expression,), operator.line
+                )
             else:
                 break
         return expression
@@ -731,7 +1006,10 @@ class _Parser:
                         f"{self.filename}:{token.line}: floating constant is out of range"
                     ) from exc
                 return Expr("float_constant", int.from_bytes(bits, "big"), line=token.line)
-            match = re.fullmatch(r"(0[xX][0-9a-fA-F]+|[0-9]+)", token.value)
+            match = re.fullmatch(
+                r"(0[xX][0-9a-fA-F]+|[0-9]+)(?:[uU]?[lL]?|[lL][uU]?)",
+                token.value,
+            )
             if match is None:
                 raise CCompilerError(
                     f"{self.filename}:{token.line}: invalid integer constant {token.value!r}"
@@ -747,6 +1025,8 @@ class _Parser:
                     f"{self.filename}:{token.line}: invalid integer constant {token.value!r}"
                 ) from exc
             if number > WORD_MASK:
+                if digits.lower().startswith("0x") and number < (1 << 19):
+                    return Expr("address_constant", number, line=token.line)
                 raise CCompilerError(
                     f"{self.filename}:{token.line}: integer constant exceeds 16 bits"
                 )
@@ -766,6 +1046,7 @@ class _Variable:
     global_address: int | None = None
     c_type: str = "int"
     array_size: int = 0
+    constant_value: int | None = None
 
 
 class _CodeGenerator:
@@ -774,10 +1055,12 @@ class _CodeGenerator:
         globals_: list[Global],
         functions: list[Function],
         filename: str,
+        records: dict[str, _Record] | None = None,
     ):
         self.globals = globals_
         self.functions = functions
         self.filename = filename
+        self.records = records or {}
         self.lines: list[str] = []
         self.label_index = 0
         self.stack_depth = 0
@@ -797,6 +1080,7 @@ class _CodeGenerator:
         self.current_function: Function | None = None
         self.prototypes: dict[str, tuple[str, int]] = {}
         self.used_libraries: set[str] = set()
+        self.enum_constants: dict[str, int] = {}
 
     def emit(self, line: str) -> None:
         self.lines.append(line)
@@ -857,8 +1141,8 @@ class _CodeGenerator:
 
     def _global_size(self, global_: Global) -> int:
         if global_.array_size:
-            return global_.array_size * _type_size(global_.c_type)
-        return _object_size(global_.c_type)
+            return global_.array_size * _type_size(global_.c_type, self.records)
+        return _type_size(global_.c_type, self.records)
 
     def _allocate_globals(self) -> None:
         address = GLOBAL_BASE
@@ -913,45 +1197,84 @@ class _CodeGenerator:
             self.emit(f".data hex {values}")
 
     def _emit_global(self, global_: Global) -> None:
-        size = self._global_size(global_)
-        initializer = global_.initializer
-        if global_.array_size:
+        data = self._serialize_initializer(
+            global_.c_type, global_.array_size, global_.initializer, global_.line
+        )
+        self._emit_bytes(data)
+
+    def _serialize_initializer(
+        self,
+        c_type: str,
+        array_size: int,
+        initializer: Expr | None,
+        line: int,
+    ) -> bytes:
+        if array_size:
+            size = array_size * _type_size(c_type, self.records)
             if initializer is None:
-                self._emit_bytes(bytes(size))
-                return
+                return bytes(size)
             if initializer.kind == "string":
-                if global_.c_type not in ("char", "unsigned char"):
-                    raise self.error(global_.line, "string initializer requires a char array")
-                data = initializer.value
+                if c_type not in ("char", "unsigned char"):
+                    raise self.error(line, "string initializer requires a char array")
+                data = bytes(initializer.value)
                 if len(data) > size:
-                    raise self.error(global_.line, "string initializer is too long for array")
-                self._emit_bytes(data + bytes(size - len(data)))
-                return
+                    raise self.error(line, "string initializer is too long for array")
+                return data + bytes(size - len(data))
             if initializer.kind != "init_list":
-                raise self.error(global_.line, "array initializer must be a brace list or string")
-            if len(initializer.children) > global_.array_size:
-                raise self.error(global_.line, "too many elements in array initializer")
-            values = [self._constant(item) for item in initializer.children]
-            values.extend([0] * (global_.array_size - len(values)))
-            if _type_size(global_.c_type) == 1:
-                self._emit_bytes(bytes(value & 0xFF for value in values))
-            else:
-                self._emit_bytes(b"".join(value.to_bytes(2, "big") for value in values))
-            return
-        if initializer is not None and initializer.kind == "string":
-            raise self.error(global_.line, "a string literal cannot initialize a scalar")
-        value = self._constant(initializer) if initializer else 0
-        if global_.c_type in ("char", "unsigned char"):
-            value &= 0xFF
-        if global_.c_type.endswith("*") and not 0 <= value < (1 << 19):
-            raise self.error(global_.line, "pointer initializer is outside the 19-bit address range")
-        self._emit_bytes(value.to_bytes(_object_size(global_.c_type), "big"))
+                raise self.error(line, "array initializer must be a brace list or string")
+            if len(initializer.children) > array_size:
+                raise self.error(line, "too many elements in array initializer")
+            values = [
+                self._serialize_initializer(c_type, 0, child, line)
+                for child in initializer.children
+            ]
+            return b"".join(values) + bytes(size - sum(map(len, values)))
+        if c_type in self.records:
+            record = self.records[c_type]
+            if not record.complete:
+                raise self.error(line, "initializer has incomplete record type")
+            data = bytearray(record.size)
+            if initializer is None:
+                return bytes(data)
+            if initializer.kind != "init_list":
+                raise self.error(line, "record initializer must be a brace list")
+            fields = list(record.fields.values())
+            if len(initializer.children) > len(fields) or (
+                record.is_union and len(initializer.children) > 1
+            ):
+                raise self.error(line, "too many values in record initializer")
+            for field_, value in zip(fields, initializer.children):
+                field_data = self._serialize_initializer(
+                    field_.c_type, field_.array_size, value, line
+                )
+                data[field_.offset:field_.offset + len(field_data)] = field_data
+            return bytes(data)
+        if initializer is None:
+            return bytes(_type_size(c_type, self.records))
+        if initializer.kind == "string":
+            raise self.error(line, "a string literal cannot initialize a scalar")
+        value = self._constant(initializer)
+        size = _type_size(c_type, self.records)
+        if c_type.endswith("*") and not 0 <= value < (1 << 19):
+            raise self.error(line, "pointer initializer is outside the 19-bit address range")
+        return (value & ((1 << (size * 8)) - 1)).to_bytes(size, "big")
 
     def _constant(self, expression: Expr | None) -> int:
         if expression is None:
             return 0
         if expression.kind == "constant":
             return int(expression.value) & WORD_MASK
+        if expression.kind == "name" and str(expression.value) in self.enum_constants:
+            return self.enum_constants[str(expression.value)] & WORD_MASK
+        if expression.kind == "sizeof_type":
+            return _type_size(str(expression.value), self.records)
+        if expression.kind == "sizeof_expr":
+            return self._sizeof_expression(expression.children[0])
+        if expression.kind == "conditional":
+            condition = self._constant(expression.children[0])
+            return self._constant(expression.children[1] if condition else expression.children[2])
+        if expression.kind == "address_constant":
+            return int(expression.value)
         if expression.kind == "float_constant":
             return int(expression.value) & WORD_MASK
         if expression.kind == "unary":
@@ -969,6 +1292,8 @@ class _CodeGenerator:
             left = self._constant(expression.children[0])
             right = self._constant(expression.children[1])
             operator = str(expression.value)
+            if operator == ",":
+                return right
             if operator == "+":
                 return (left + right) & WORD_MASK
             if operator == "-":
@@ -1032,7 +1357,9 @@ class _CodeGenerator:
                 f"function frame exceeds {FRAME_SIZE_LIMIT} bytes",
             )
         self.frame_size = function.local_count
-        parameter_bytes = sum(_object_size(c_type) for c_type, _ in function.parameters)
+        parameter_bytes = sum(
+            _object_size(c_type, self.records) for c_type, _ in function.parameters
+        )
         if self.frame_size + 2 + parameter_bytes > STACK_OFFSET_LIMIT:
             raise self.error(function.line, "parameters exceed stack-relative address range")
         self.stack_depth = 0
@@ -1040,7 +1367,7 @@ class _CodeGenerator:
         parameter_offset = self.frame_size + 2
         for c_type, name in function.parameters:
             if name is None:
-                parameter_offset += _object_size(c_type)
+                parameter_offset += _object_size(c_type, self.records)
                 continue
             if name in self.scopes[0]:
                 raise self.error(function.line, f"duplicate parameter name {name!r}")
@@ -1048,7 +1375,7 @@ class _CodeGenerator:
                 parameter_offset=parameter_offset,
                 c_type=c_type,
             )
-            parameter_offset += _object_size(c_type)
+            parameter_offset += _object_size(c_type, self.records)
         self.emit(f"__c_function_{function.name}:")
         if self.frame_size:
             self.emit(f"    ADJSP -{self.frame_size}")
@@ -1073,6 +1400,8 @@ class _CodeGenerator:
                 c_type=global_.c_type,
                 array_size=global_.array_size,
             )
+        if name in self.enum_constants:
+            return _Variable(c_type="int", constant_value=self.enum_constants[name])
         raise self.error(line, f"undeclared identifier {name!r}")
 
     def _stack_offset(self, offset: int, line: int) -> int:
@@ -1124,6 +1453,9 @@ class _CodeGenerator:
         self.emit("    ST R7, R6")
 
     def _load_variable(self, variable: _Variable, register: str, line: int) -> None:
+        if variable.constant_value is not None:
+            self.emit(f"    LDI {register}, {variable.constant_value & WORD_MASK}")
+            return
         if variable.array_size:
             self._array_address(variable, register, line)
             return
@@ -1144,7 +1476,10 @@ class _CodeGenerator:
             return
         if variable.global_address is not None:
             self.emit(f"    LDI R7, {variable.global_address}")
-            self.emit(f"    LDW {register}, R7")
+            self.emit(
+                f"    {'LD' if _type_size(variable.c_type, self.records) == 1 else 'LDW'} "
+                f"{register}, R7"
+            )
             self._convert_loaded(register, variable.c_type)
             return
         offset = variable.local_offset
@@ -1157,6 +1492,8 @@ class _CodeGenerator:
     def _store_variable(
         self, variable: _Variable, register: str, line: int, source_type: str = "int"
     ) -> None:
+        if variable.constant_value is not None:
+            raise self.error(line, "cannot assign to an enumerator")
         self._convert_to_type(register, variable.c_type, source_type)
         if variable.c_type.endswith("*"):
             if variable.global_address is not None:
@@ -1175,7 +1512,10 @@ class _CodeGenerator:
             return
         if variable.global_address is not None:
             self.emit(f"    LDI R7, {variable.global_address}")
-            self.emit(f"    STW R7, {register}")
+            self.emit(
+                f"    {'ST' if _type_size(variable.c_type, self.records) == 1 else 'STW'} "
+                f"R7, {register}"
+            )
             return
         offset = variable.local_offset
         if offset is None:
@@ -1239,6 +1579,11 @@ class _CodeGenerator:
             current[local.name] = variable
             if local.array_size:
                 self._initialize_local_array(variable, local, statement.line)
+            elif local.c_type in self.records and local.initializer is not None:
+                data = self._serialize_initializer(
+                    local.c_type, 0, local.initializer, local.line
+                )
+                self._initialize_local_bytes(variable, data, local.line)
             elif local.initializer is not None:
                 self._expression(local.initializer)
                 self._store_variable(
@@ -1418,32 +1763,22 @@ class _CodeGenerator:
         self.stack_depth -= 2
 
     def _initialize_local_array(self, variable: _Variable, local: Local, line: int) -> None:
-        initializer = local.initializer
-        if initializer is None:
-            return
-        if initializer.kind == "string":
-            if local.c_type not in ("char", "unsigned char"):
-                raise self.error(line, "string initializer requires a char array")
-            string_data = initializer.value
-            if isinstance(string_data, str):
-                values = list(string_data.encode("utf-8")) + [0]
-            else:
-                values = list(string_data)
-        elif initializer.kind == "init_list":
-            values = [self._constant(value) for value in initializer.children]
-        else:
-            raise self.error(line, "array initializer must be a brace list or string")
-        if len(values) > local.array_size:
-            raise self.error(line, "too many values in array initializer")
-        width = _type_size(local.c_type)
-        for index, value in enumerate(values):
+        data = self._serialize_initializer(
+            local.c_type, local.array_size, local.initializer, line
+        )
+        self._initialize_local_bytes(variable, data, line)
+
+    def _initialize_local_bytes(
+        self, variable: _Variable, data: bytes, line: int
+    ) -> None:
+        for index, value in enumerate(data):
             self.emit("    MOVSP R7")
-            offset = int(variable.local_offset or 0) + self.stack_depth + index * width
+            offset = int(variable.local_offset or 0) + self.stack_depth + index
             if offset:
                 self.emit(f"    LDI R6, {offset}")
                 self.emit("    ADD R7, R6")
-            self.emit(f"    LDI R0, {value & (0xFF if width == 1 else WORD_MASK)}")
-            self.emit(f"    {'ST' if width == 1 else 'STW'} R7, R0")
+            self.emit(f"    LDI R0, {value}")
+            self.emit("    ST R7, R0")
 
     def _expression_type(self, expression: Expr) -> str:
         if expression.kind == "constant":
@@ -1452,6 +1787,8 @@ class _CodeGenerator:
             return "float"
         if expression.kind == "string":
             return "char*"
+        if expression.kind in ("sizeof_type", "sizeof_expr"):
+            return "unsigned int"
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), expression.line)
             if variable.array_size:
@@ -1470,9 +1807,24 @@ class _CodeGenerator:
             if base_type.endswith("*"):
                 return base_type[:-1]
             raise self.error(expression.line, "subscripted expression is not a pointer or array")
+        if expression.kind == "member":
+            operator, field_name = expression.value
+            base_type = self._expression_type(expression.children[0])
+            if operator == "->":
+                if not base_type.endswith("*"):
+                    raise self.error(expression.line, "-> requires a pointer to a record")
+                base_type = base_type[:-1]
+            field_ = self._record_field(base_type, field_name, expression.line)
+            return field_.c_type + "*" if field_.array_size else field_.c_type
         if expression.kind == "assign":
             target = expression.value[1]
             return self._expression_type(target)
+        if expression.kind == "cast":
+            return str(expression.value)
+        if expression.kind == "conditional":
+            true_type = self._expression_type(expression.children[1])
+            false_type = self._expression_type(expression.children[2])
+            return self._usual_arithmetic_type(true_type, false_type)
         if expression.kind == "unary":
             operator = str(expression.value)
             child_type = self._expression_type(expression.children[0])
@@ -1487,6 +1839,8 @@ class _CodeGenerator:
             return self._expression_type(expression.children[0])
         if expression.kind == "binary":
             operator = str(expression.value)
+            if operator == ",":
+                return self._expression_type(expression.children[1])
             left_type = self._expression_type(expression.children[0])
             right_type = self._expression_type(expression.children[1])
             if operator in ("==", "!=", "<", "<=", ">", ">=", "&&", "||"):
@@ -1504,9 +1858,50 @@ class _CodeGenerator:
             return "int"
         raise self.error(expression.line, "could not determine expression type")
 
+    @staticmethod
+    def _usual_arithmetic_type(left_type: str, right_type: str) -> str:
+        if left_type == "float" or right_type == "float":
+            return "float"
+        if left_type.endswith("*") and right_type.endswith("*"):
+            return left_type if left_type == right_type else "int"
+        if left_type.endswith("*"):
+            return left_type
+        if right_type.endswith("*"):
+            return right_type
+        if left_type.startswith("unsigned") or right_type.startswith("unsigned"):
+            return "unsigned int"
+        return "int"
+
+    def _sizeof_expression(self, expression: Expr) -> int:
+        if expression.kind == "name":
+            variable = self._lookup(str(expression.value), expression.line)
+            if variable.array_size:
+                return variable.array_size * _type_size(variable.c_type, self.records)
+        return _type_size(self._expression_type(expression), self.records)
+
+    def _record_field(self, c_type: str, name: str, line: int) -> _Field:
+        record = self.records.get(c_type)
+        if record is None or not record.complete:
+            raise self.error(line, "member access requires a complete struct or union")
+        field_ = record.fields.get(name)
+        if field_ is None:
+            raise self.error(line, f"record has no member {name!r}")
+        return field_
+
+    def _scale_index(self, register: str, stride: int) -> None:
+        if stride == 1:
+            return
+        if stride == 2:
+            self.emit(f"    ADD {register}, {register}")
+            return
+        self.emit(f"    LDI R7, {stride}")
+        self.emit(f"    MUL {register}, R7")
+
     def _lvalue_address(self, expression: Expr, line: int) -> str:
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), line)
+            if variable.constant_value is not None:
+                raise self.error(line, "enumerators do not have an address")
             if variable.array_size:
                 self._array_address(variable, "R0", line)
             elif variable.global_address is not None:
@@ -1526,17 +1921,16 @@ class _CodeGenerator:
         if expression.kind == "index":
             base, index = expression.children
             element_type = self._expression_type(expression)
-            if base.kind == "name" and _type_size(element_type) in (1, 2):
+            element_size = _type_size(element_type, self.records)
+            if base.kind == "name":
                 array = self._lookup(str(base.value), line)
                 if array.array_size:
-                    # Direct array element: base + index * size, no pointer spill.
                     if index.kind == "constant" and array.global_address is not None:
-                        element = array.global_address + int(index.value) * _type_size(element_type)
+                        element = array.global_address + int(index.value) * element_size
                         self.emit(f"    LDI R0, {element & WORD_MASK}")
                         return element_type
                     self._expression(index)
-                    if _type_size(element_type) == 2:
-                        self.emit("    ADD R0, R0")
+                    self._scale_index("R0", element_size)
                     self._array_address(array, "R1", line)
                     self.emit("    ADD R0, R1")
                     return element_type
@@ -1546,8 +1940,7 @@ class _CodeGenerator:
             self._emit_store_pointer("R0")
             self.stack_depth += 3
             self._expression(index)
-            if _type_size(element_type) == 2:
-                self.emit("    ADD R0, R0")
+            self._scale_index("R0", element_size)
             self.emit("    MOV R2, R0")
             self.emit("    MOVSP R7")
             self._emit_load_pointer("R1")
@@ -1556,6 +1949,22 @@ class _CodeGenerator:
             self.emit("    ADJSP 3")
             self.stack_depth -= 3
             return element_type
+        if expression.kind == "member":
+            operator, field_name = expression.value
+            base = expression.children[0]
+            base_type = self._expression_type(base)
+            if operator == "->":
+                if not base_type.endswith("*"):
+                    raise self.error(line, "-> requires a pointer to a record")
+                self._expression(base)
+                base_type = base_type[:-1]
+            else:
+                base_type = self._lvalue_address(base, line)
+            field_ = self._record_field(base_type, field_name, line)
+            if field_.offset:
+                self.emit(f"    LDI R7, {field_.offset}")
+                self.emit("    ADD R0, R7")
+            return field_.c_type
         if expression.kind == "unary" and expression.value == "*":
             self._expression(expression.children[0])
             return self._expression_type(expression)
@@ -1566,20 +1975,32 @@ class _CodeGenerator:
             variable = self._lookup(str(expression.value), line)
             if variable.array_size:
                 raise self.error(line, "array expression requires an index")
+            if variable.c_type in self.records:
+                raise self.error(line, "record value operations are not supported")
             self._load_variable(variable, "R0", line)
             return
         c_type = self._lvalue_address(expression, line)
+        if c_type in self.records:
+            raise self.error(line, "record value operations are not supported")
         if c_type.endswith("*"):
             self.emit("    MOV R7, R0")
             self._emit_load_pointer("R0")
         else:
-            self.emit(f"    {'LD' if _type_size(c_type) == 1 else 'LDW'} R0, R0")
-        self._convert_loaded("R0", c_type, _type_size(c_type) == 1 and not c_type.endswith("*"))
+            self.emit(
+                f"    {'LD' if _type_size(c_type, self.records) == 1 else 'LDW'} R0, R0"
+            )
+        self._convert_loaded(
+            "R0",
+            c_type,
+            _type_size(c_type, self.records) == 1 and not c_type.endswith("*"),
+        )
 
     def _store_lvalue(
         self, expression: Expr, register: str, source_type: str, line: int
     ) -> None:
         c_type = self._expression_type(expression)
+        if c_type in self.records:
+            raise self.error(line, "record assignment is not supported")
         self._convert_to_type(register, c_type, source_type)
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), line)
@@ -1612,7 +2033,9 @@ class _CodeGenerator:
         self.stack_depth += 2
         self._lvalue_address(expression, line)
         self.emit("    LDWS R1, 0")
-        self.emit(f"    {'ST' if _type_size(c_type) == 1 else 'STW'} R0, R1")
+        self.emit(
+            f"    {'ST' if _type_size(c_type, self.records) == 1 else 'STW'} R0, R1"
+        )
         self.emit("    ADJSP 2")
         self.stack_depth -= 2
 
@@ -1621,14 +2044,66 @@ class _CodeGenerator:
         if kind == "constant":
             self.emit(f"    LDI R0, {int(expression.value) & WORD_MASK}")
             return
+        if kind == "sizeof_type":
+            self.emit(f"    LDI R0, {_type_size(str(expression.value), self.records)}")
+            return
+        if kind == "sizeof_expr":
+            self.emit(f"    LDI R0, {self._sizeof_expression(expression.children[0])}")
+            return
+        if kind == "address_constant":
+            self.emit(f"    LDA R0, 0x{int(expression.value):05X}")
+            return
         if kind == "float_constant":
             self.emit(f"    LDI R0, 0x{int(expression.value) & WORD_MASK:04X}")
             return
         if kind == "string":
             self.emit(f"    LDA R0, {expression.value}")
             return
+        if kind == "member":
+            operator, field_name = expression.value
+            base_type = self._expression_type(expression.children[0])
+            if operator == "->":
+                if not base_type.endswith("*"):
+                    raise self.error(expression.line, "-> requires a pointer to a record")
+                base_type = base_type[:-1]
+            field_ = self._record_field(base_type, field_name, expression.line)
+            if field_.array_size:
+                self._lvalue_address(expression, expression.line)
+            else:
+                self._load_lvalue(expression, expression.line)
+            return
+        if kind == "cast":
+            child = expression.children[0]
+            self._expression(child)
+            self._convert_to_type(
+                "R0", str(expression.value), self._expression_type(child)
+            )
+            return
+        if kind == "conditional":
+            false_label = self.label("conditional_false")
+            done = self.label("conditional_end")
+            condition, when_true, when_false = expression.children
+            result_type = self._expression_type(expression)
+            self._branch_if_false(condition, false_label)
+            self._expression(when_true)
+            self._convert_to_type(
+                "R0", result_type, self._expression_type(when_true)
+            )
+            self.emit(f"    JMPX {done}")
+            self.emit(f"{false_label}:")
+            self._expression(when_false)
+            self._convert_to_type(
+                "R0", result_type, self._expression_type(when_false)
+            )
+            self.emit(f"{done}:")
+            return
         if kind == "name":
             variable = self._lookup(str(expression.value), expression.line)
+            if variable.constant_value is not None:
+                self.emit(f"    LDI R0, {variable.constant_value & WORD_MASK}")
+                return
+            if variable.c_type in self.records and not variable.array_size:
+                raise self.error(expression.line, "record values are only supported as lvalues")
             if variable.array_size:
                 self._array_address(variable, "R0", expression.line)
             else:
@@ -1658,7 +2133,7 @@ class _CodeGenerator:
             for index in range(len(arguments) - 1, -1, -1):
                 argument = arguments[index]
                 self._expression(argument)
-                width = _object_size(parameter_types[index])
+                width = _object_size(parameter_types[index], self.records)
                 if width == 3:
                     self.emit("    ADJSP -3")
                     self.emit("    MOVSP R7")
@@ -1691,7 +2166,24 @@ class _CodeGenerator:
                 self._expression(expression.children[0])
                 self.emit("    MOV R1, R0")
                 self.emit("    LDWS R0, 0")
-                self._binary_operation(str(operator[:-1]), expression.line, target_type, not discarded)
+                binary_operator = str(operator[:-1])
+                if binary_operator in ("<<", ">>"):
+                    helper = (
+                        "__runtime_shl"
+                        if binary_operator == "<<"
+                        else (
+                            "__runtime_shr"
+                            if target_type.startswith("unsigned")
+                            or target_type in ("char", "unsigned char")
+                            else "__runtime_sar"
+                        )
+                    )
+                    self.used_helpers.add(helper)
+                    self.emit(f"    CALLX {helper}")
+                else:
+                    self._binary_operation(
+                        binary_operator, expression.line, target_type, not discarded
+                    )
                 self.emit("    ADJSP 2")
                 self.stack_depth -= 2
             source_type = (
@@ -1716,7 +2208,7 @@ class _CodeGenerator:
                 self._discard = None
                 self._load_lvalue(child, expression.line)
                 if c_type.endswith("*"):
-                    self.emit(f"    LDI R7, {_type_size(c_type[:-1])}")
+                    self.emit(f"    LDI R7, {_type_size(c_type[:-1], self.records)}")
                     self.emit(f"    {'ADD' if operator == '++' else 'SUB'} R0, R7")
                 else:
                     self.emit(f"    {'INC' if operator == '++' else 'DEC'} R0")
@@ -1748,7 +2240,7 @@ class _CodeGenerator:
                 self.emit("    MOVSP R7")
                 self._emit_store_pointer("R0")
                 self.stack_depth += 3
-                self.emit(f"    LDI R7, {_type_size(c_type[:-1])}")
+                self.emit(f"    LDI R7, {_type_size(c_type[:-1], self.records)}")
                 if expression.value == "++":
                     self.emit("    ADD R0, R7")
                 else:
@@ -1781,6 +2273,10 @@ class _CodeGenerator:
     def _binary_expression(self, expression: Expr) -> None:
         operator = str(expression.value)
         left, right = expression.children
+        if operator == ",":
+            self._discarded_expression(left)
+            self._expression(right)
+            return
         jump_false, self._jump_false = self._jump_false, None
         if operator in ("&&", "||"):
             true_label = self.label("logic_true")
@@ -1806,7 +2302,7 @@ class _CodeGenerator:
         if right.kind == "constant" and self._constant_binary(expression, operator, left, left_type, jump_false):
             return
         self._expression(left)
-        left_size = _object_size(left_type)
+        left_size = _object_size(left_type, self.records)
         if left_type.endswith("*"):
             self.emit("    ADJSP -3")
             self.emit("    MOVSP R7")
@@ -1819,13 +2315,8 @@ class _CodeGenerator:
             right_type if right_type.endswith("*") and operator == "+" else None
         )
         if pointer_type is not None and left_type.endswith("*") and not right_type.endswith("*"):
-            stride = _type_size(pointer_type[:-1])
-            if stride == 2:
-                self.emit("    ADD R0, R0")
-            elif stride == 3:
-                self.emit("    MOV R7, R0")
-                self.emit("    ADD R0, R7")
-                self.emit("    ADD R0, R7")
+            stride = _type_size(pointer_type[:-1], self.records)
+            self._scale_index("R0", stride)
         if pointer_type is not None and left_type.endswith("*"):
             self.emit("    MOV R1, R0")
             self.emit("    MOVSP R7")
@@ -1834,13 +2325,8 @@ class _CodeGenerator:
             self.emit("    MOV R1, R0")
             self.emit("    LDWS R0, 0")
             if pointer_type is not None:
-                stride = _type_size(pointer_type[:-1])
-                if stride == 2:
-                    self.emit("    ADD R0, R0")
-                elif stride == 3:
-                    self.emit("    MOV R7, R0")
-                    self.emit("    ADD R0, R7")
-                    self.emit("    ADD R0, R7")
+                stride = _type_size(pointer_type[:-1], self.records)
+                self._scale_index("R0", stride)
         self.emit(f"    ADJSP {left_size}")
         self.stack_depth -= left_size
         result_type = self._expression_type(expression)
@@ -2057,8 +2543,9 @@ class _CodeGenerator:
 def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
     parser = _Parser(source, filename)
     globals_, functions = parser.parse()
-    generator = _CodeGenerator(globals_, functions, filename)
+    generator = _CodeGenerator(globals_, functions, filename, parser.records)
     generator.prototypes = parser.prototypes
+    generator.enum_constants = parser.enum_constants
     assembly = generator.generate()
     try:
         source_directory = Path(filename).resolve().parent
@@ -2069,7 +2556,7 @@ def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
 
 
 def compile_to_assembly(source: str, filename: str = "<input>") -> str:
-    """Compile the supported C89 subset to SC-16 assembly source."""
+    """Compile the supported C90 subset to SC-16 assembly source."""
     assembly, _ = _compile(source, filename)
     return assembly
 
@@ -2100,7 +2587,7 @@ def _flat_binary(image: AssemblyImage) -> bytes:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Compile the SC-16 C89 subset.")
+    parser = argparse.ArgumentParser(description="Compile the supported SC-16 C90 subset.")
     parser.add_argument("source", help="input C source file")
     parser.add_argument("-o", "--output", help="output path; defaults to input .bin")
     parser.add_argument(
@@ -2138,70 +2625,481 @@ def main(argv: list[str] | None = None) -> int:
 
 
 _DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(\w+)[ \t]*(.*?)[ \t]*$")
+_TRIGRAPHS = str.maketrans({
+    "=": "#", "/": "\\", "'": "^", "(": "[", ")": "]", "!": "|",
+    "<": "{", ">": "}", "-": "~",
+})
 
 
-def _preprocess(source: str, filename: str, defines: dict[str, str], depth: int = 0) -> str:
-    """Handle #define NAME value and #include lines; other text is passed through."""
-    if depth > 8:
-        raise CCompilerError(f"{filename}: #include nested too deeply")
-    output: list[str] = []
-    for number, text in enumerate(source.split("\n"), 1):
-        match = _DIRECTIVE.match(text)
-        if match is None:
-            output.append(text)
-            continue
-        name, rest = match.groups()
-        where = f"{filename}:{number}"
-        if name == "define":
-            parts = re.match(r"([A-Za-z_]\w*)(\(?)\s*(.*)$", rest)
-            if parts is None:
-                raise CCompilerError(f"{where}: invalid #define")
-            if parts.group(2):
-                raise CCompilerError(f"{where}: function-like macros are not supported")
-            defines[parts.group(1)] = re.sub(r"//.*$", "", parts.group(3)).strip()
-            output.append("")
-        elif name == "include":
-            quoted = re.fullmatch(r'"([^"]+)"|<([^>]+)>', rest)
-            if quoted is None:
-                raise CCompilerError(f"{where}: invalid #include")
-            target = quoted.group(1) or quoted.group(2)
-            candidates = [Path(filename).resolve().parent / target,
-                          Path(__file__).resolve().parent.parent / "lib" / target]
-            found = next((path for path in candidates if path.is_file()), None)
-            if found is None:
-                raise CCompilerError(f"{where}: cannot find include file {target!r}")
-            included = found.read_text(encoding="utf-8")
-            output.append(_preprocess(included, str(found), defines, depth + 1).replace("\n", " "))
-        else:
-            raise CCompilerError(f"{where}: unsupported directive #{name}")
-    return "\n".join(output)
+def _translation_lines(source: str) -> list[str]:
+    source = re.sub(r"\?\?(.)", lambda match: match.group(1).translate(_TRIGRAPHS), source)
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
+    source = re.sub(r"\\\n", "", source)
+    return source.split("\n")
 
 
-def _expand_macros(tokens: list[Token], defines: dict[str, str], filename: str) -> list[Token]:
-    cache: dict[str, list[str]] = {}
+def _token_spelling(token: Token) -> str:
+    value = token.value
+    if value.startswith("<string:") and value.endswith(">"):
+        contents = bytes.fromhex(value[8:-1]).decode("utf-8", errors="replace")
+        return '"' + contents.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value
 
-    def body(name: str, active: tuple[str, ...]) -> list[str]:
-        if name not in cache:
-            values: list[str] = []
-            for token in _lex_raw(defines[name], filename)[:-1]:
-                if token.value in defines and token.value not in active + (name,):
-                    values.extend(body(token.value, active + (name,)))
-                else:
-                    values.append(token.value)
-            cache[name] = values
-        return cache[name]
 
+def _macro_tokens(
+    macro: _Macro,
+    defines: dict[str, _Macro],
+    filename: str,
+    line: int,
+    disabled: frozenset[str],
+    depth: int,
+) -> list[Token]:
+    return _expand_macros(
+        [Token(token.value, line) for token in _lex_raw(macro.replacement, filename)[:-1]],
+        defines,
+        filename,
+        disabled,
+        depth + 1,
+    )
+
+
+def _expand_macros(
+    tokens: list[Token],
+    defines: dict[str, _Macro],
+    filename: str,
+    disabled: frozenset[str] = frozenset(),
+    depth: int = 0,
+) -> list[Token]:
+    if depth > 100:
+        raise CCompilerError(f"{filename}: macro expansion nested too deeply")
     result: list[Token] = []
-    for token in tokens:
-        if token.value in defines:
-            result.extend(Token(value, token.line) for value in body(token.value, ()))
-        else:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.value == "__LINE__" and token.value not in disabled:
+            result.append(Token(str(token.line), token.line))
+            index += 1
+            continue
+        macro = defines.get(token.value)
+        if macro is None or token.value in disabled:
             result.append(token)
+            index += 1
+            continue
+        if macro.parameters is None:
+            replacement = _macro_tokens(
+                macro, defines, filename, token.line, disabled | {token.value}, depth
+            )
+            result.extend(replacement)
+            index += 1
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1].value != "(":
+            result.append(token)
+            index += 1
+            continue
+        arguments: list[list[Token]] = [[]]
+        nesting = 0
+        cursor = index + 2
+        while cursor < len(tokens):
+            value = tokens[cursor].value
+            if value == "(":
+                nesting += 1
+            elif value == ")":
+                if nesting == 0:
+                    break
+                nesting -= 1
+            elif value == "," and nesting == 0:
+                arguments.append([])
+                cursor += 1
+                continue
+            arguments[-1].append(tokens[cursor])
+            cursor += 1
+        if cursor == len(tokens):
+            raise CCompilerError(f"{filename}:{token.line}: unterminated macro invocation")
+        if not macro.parameters and len(arguments) == 1 and not arguments[0]:
+            arguments.clear()
+        if len(arguments) != len(macro.parameters):
+            raise CCompilerError(
+                f"{filename}:{token.line}: macro {token.value} expects "
+                f"{len(macro.parameters)} argument(s), got {len(arguments)}"
+            )
+        raw_arguments = dict(zip(macro.parameters, arguments))
+        expanded_arguments = {
+            name: _expand_macros(value, defines, filename, disabled, depth + 1)
+            for name, value in raw_arguments.items()
+        }
+        replacement_tokens = [
+            Token(item.value, token.line)
+            for item in _lex_raw(macro.replacement, filename)[:-1]
+        ]
+        substituted: list[Token] = []
+        position = 0
+        while position < len(replacement_tokens):
+            current = replacement_tokens[position]
+            if (
+                current.value == "#"
+                and position + 1 < len(replacement_tokens)
+                and replacement_tokens[position + 1].value in raw_arguments
+            ):
+                parameter = replacement_tokens[position + 1].value
+                text = " ".join(_token_spelling(item) for item in raw_arguments[parameter])
+                literal = '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                substituted.extend(_lex_raw(literal, filename)[:-1])
+                position += 2
+                continue
+            if current.value in raw_arguments:
+                use_raw = (
+                    (position > 0 and replacement_tokens[position - 1].value == "##")
+                    or (
+                        position + 1 < len(replacement_tokens)
+                        and replacement_tokens[position + 1].value == "##"
+                    )
+                )
+                argument = raw_arguments[current.value] if use_raw else expanded_arguments[current.value]
+                substituted.extend(argument)
+            else:
+                substituted.append(current)
+            position += 1
+        pasted: list[Token] = []
+        position = 0
+        while position < len(substituted):
+            if substituted[position].value != "##":
+                pasted.append(substituted[position])
+                position += 1
+                continue
+            if not pasted or position + 1 >= len(substituted):
+                raise CCompilerError(f"{filename}:{token.line}: invalid ## in macro replacement")
+            left = pasted.pop()
+            right = substituted[position + 1]
+            spelling = _token_spelling(left) + _token_spelling(right)
+            joined = _lex_raw(spelling, filename)[:-1]
+            if len(joined) != 1:
+                raise CCompilerError(f"{filename}:{token.line}: ## does not form one token")
+            pasted.append(joined[0])
+            position += 2
+        rescanned = _expand_macros(
+            pasted,
+            defines,
+            filename,
+            disabled | {token.value},
+            depth + 1,
+        )
+        result.extend(rescanned)
+        index = cursor + 1
     return result
 
 
+def _pp_integer(token: Token, filename: str) -> int:
+    match = re.fullmatch(
+        r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)(?:[uU][lL]?|[lL][uU]?)?",
+        token.value,
+    )
+    if match is None:
+        raise CCompilerError(f"{filename}:{token.line}: invalid integer in #if: {token.value!r}")
+    value = re.match(r"(0[xX][0-9a-fA-F]+|[0-9]+)", token.value)
+    assert value is not None
+    digits = value.group(1)
+    base = 16 if digits.lower().startswith("0x") else (
+        8 if len(digits) > 1 and digits.startswith("0") else 10
+    )
+    try:
+        return int(digits, base)
+    except ValueError as exc:
+        raise CCompilerError(
+            f"{filename}:{token.line}: invalid integer in #if: {token.value!r}"
+        ) from exc
+
+
+def _evaluate_pp_expression(
+    expression: str, defines: dict[str, _Macro], filename: str, line: int
+) -> int:
+    tokens = [Token(token.value, line) for token in _lex_raw(expression, filename)[:-1]]
+    defined_tokens: list[Token] = []
+    index = 0
+    while index < len(tokens):
+        if tokens[index].value != "defined":
+            defined_tokens.append(tokens[index])
+            index += 1
+            continue
+        index += 1
+        parenthesized = index < len(tokens) and tokens[index].value == "("
+        if parenthesized:
+            index += 1
+        if index >= len(tokens) or not re.fullmatch(r"[A-Za-z_]\w*", tokens[index].value):
+            raise CCompilerError(f"{filename}:{line}: expected identifier after defined")
+        name = tokens[index].value
+        index += 1
+        if parenthesized:
+            if index >= len(tokens) or tokens[index].value != ")":
+                raise CCompilerError(f"{filename}:{line}: expected ')' after defined")
+            index += 1
+        defined_tokens.append(Token("1" if name in defines or name == "__LINE__" else "0", line))
+    expanded = _expand_macros(defined_tokens, defines, filename)
+    normalized: list[Token] = []
+    for token in expanded:
+        if re.fullmatch(r"[A-Za-z_]\w*", token.value):
+            normalized.append(Token("0", token.line))
+        elif token.value.startswith("<string:"):
+            raise CCompilerError(f"{filename}:{line}: strings are invalid in #if expressions")
+        else:
+            normalized.append(token)
+
+    precedence = {
+        "||": 1, "&&": 2, "|": 3, "^": 4, "&": 5,
+        "==": 6, "!=": 6, "<": 7, "<=": 7, ">": 7, ">=": 7,
+        "<<": 8, ">>": 8, "+": 9, "-": 9, "*": 10, "/": 10, "%": 10,
+    }
+    position = 0
+
+    def primary() -> Any:
+        nonlocal position
+        if position >= len(normalized):
+            raise CCompilerError(f"{filename}:{line}: incomplete #if expression")
+        current = normalized[position]
+        position += 1
+        if current.value in ("+", "-", "!", "~"):
+            return ("unary", current.value, primary())
+        if current.value == "(":
+            value = parse_expression(1)
+            if position >= len(normalized) or normalized[position].value != ")":
+                raise CCompilerError(f"{filename}:{line}: expected ')' in #if expression")
+            position += 1
+            return value
+        if re.match(r"[0-9]", current.value):
+            return ("value", _pp_integer(current, filename))
+        raise CCompilerError(
+            f"{filename}:{line}: invalid token in #if expression: {current.value!r}"
+        )
+
+    def parse_expression(minimum: int) -> Any:
+        nonlocal position
+        left = primary()
+        while position < len(normalized):
+            operator = normalized[position].value
+            level = precedence.get(operator, 0)
+            if level < minimum:
+                if operator == "?" and minimum <= 1:
+                    position += 1
+                    when_true = parse_expression(1)
+                    if position >= len(normalized) or normalized[position].value != ":":
+                        raise CCompilerError(
+                            f"{filename}:{line}: expected ':' in #if conditional expression"
+                        )
+                    position += 1
+                    when_false = parse_expression(1)
+                    left = ("conditional", left, when_true, when_false)
+                    continue
+                break
+            position += 1
+            right = parse_expression(level + 1)
+            left = ("binary", operator, left, right)
+        return left
+
+    tree = parse_expression(1)
+    if position != len(normalized):
+        raise CCompilerError(
+            f"{filename}:{line}: unexpected token in #if expression: "
+            f"{normalized[position].value!r}"
+        )
+
+    def evaluate(node: Any) -> int:
+        if node[0] == "value":
+            return int(node[1])
+        if node[0] == "unary":
+            operator, value = node[1], evaluate(node[2])
+            return {"+": lambda: value, "-": lambda: -value,
+                    "!": lambda: int(not value), "~": lambda: ~value}[operator]()
+        if node[0] == "conditional":
+            return evaluate(node[2] if evaluate(node[1]) else node[3])
+        operator = node[1]
+        left = evaluate(node[2])
+        if operator == "&&" and not left:
+            return 0
+        if operator == "||" and left:
+            return 1
+        right = evaluate(node[3])
+        operations = {
+            "||": lambda: int(bool(left) or bool(right)),
+            "&&": lambda: int(bool(left) and bool(right)),
+            "|": lambda: left | right,
+            "^": lambda: left ^ right,
+            "&": lambda: left & right,
+            "==": lambda: int(left == right),
+            "!=": lambda: int(left != right),
+            "<": lambda: int(left < right),
+            "<=": lambda: int(left <= right),
+            ">": lambda: int(left > right),
+            ">=": lambda: int(left >= right),
+            "<<": lambda: left << right,
+            ">>": lambda: left >> right,
+            "+": lambda: left + right,
+            "-": lambda: left - right,
+            "*": lambda: left * right,
+            "/": lambda: (
+                abs(left) // abs(right) * (-1 if (left < 0) != (right < 0) else 1)
+            ),
+            "%": lambda: left - (
+                abs(left) // abs(right) * (-1 if (left < 0) != (right < 0) else 1)
+            ) * right,
+        }
+        try:
+            return operations[operator]()
+        except (KeyError, ZeroDivisionError, ValueError, OverflowError) as exc:
+            raise CCompilerError(f"{filename}:{line}: invalid operation in #if expression") from exc
+
+    return evaluate(tree)
+
+
+def _preprocess(
+    source: str,
+    filename: str,
+    defines: dict[str, _Macro],
+    depth: int = 0,
+) -> str:
+    if depth > 8:
+        raise CCompilerError(f"{filename}: #include nested too deeply")
+    lines = _translation_lines(source)
+    output: list[str] = []
+    conditionals: list[dict[str, bool]] = []
+    active = True
+    number = 0
+    while number < len(lines):
+        text = lines[number]
+        number += 1
+        directive = _DIRECTIVE.match(text)
+        if directive is None:
+            output.append(text if active else "")
+            continue
+        name, rest = directive.groups()
+        rest = rest.strip()
+        where = f"{filename}:{number}"
+        if name in ("if", "ifdef", "ifndef"):
+            parent_active = active
+            if name == "if":
+                selected = bool(_evaluate_pp_expression(rest, defines, filename, number)) if active else False
+            else:
+                identifier = re.fullmatch(r"[A-Za-z_]\w*", rest)
+                if identifier is None:
+                    raise CCompilerError(f"{where}: expected one identifier after #{name}")
+                selected = identifier.group(0) in defines
+                if name == "ifndef":
+                    selected = not selected
+                selected = selected and active
+            conditionals.append({
+                "parent": parent_active,
+                "taken": selected,
+                "else": False,
+            })
+            active = selected
+            output.append("")
+            continue
+        if name == "elif":
+            if not conditionals or conditionals[-1]["else"]:
+                raise CCompilerError(f"{where}: #elif without matching #if")
+            frame = conditionals[-1]
+            selected = (
+                bool(_evaluate_pp_expression(rest, defines, filename, number))
+                if frame["parent"] and not frame["taken"] else False
+            )
+            frame["taken"] = frame["taken"] or selected
+            active = frame["parent"] and selected
+            output.append("")
+            continue
+        if name in ("else", "endif"):
+            if not conditionals:
+                raise CCompilerError(f"{where}: #{name} without matching #if")
+            if name == "else":
+                frame = conditionals[-1]
+                if frame["else"]:
+                    raise CCompilerError(f"{where}: duplicate #else")
+                frame["else"] = True
+                active = frame["parent"] and not frame["taken"]
+                frame["taken"] = True
+            else:
+                frame = conditionals.pop()
+                active = frame["parent"]
+            output.append("")
+            continue
+        if not active:
+            output.append("")
+            continue
+        if name == "define":
+            definition = re.match(r"([A-Za-z_]\w*)(.*)$", rest)
+            if definition is None:
+                raise CCompilerError(f"{where}: invalid #define")
+            macro_name, tail = definition.groups()
+            parameters = None
+            replacement = tail.lstrip()
+            if tail.startswith("("):
+                signature = re.match(r"\(([^)]*)\)(.*)$", tail)
+                if signature is None:
+                    raise CCompilerError(f"{where}: invalid function-like macro definition")
+                parameter_text, replacement = signature.groups()
+                parameters = tuple(item.strip() for item in parameter_text.split(",") if item.strip())
+                if (
+                    (parameter_text.strip() and len(parameters) != len(parameter_text.split(",")))
+                    or any(not re.fullmatch(r"[A-Za-z_]\w*", item) for item in parameters)
+                    or len(set(parameters)) != len(parameters)
+                ):
+                    raise CCompilerError(f"{where}: invalid macro parameter list")
+                replacement = replacement.lstrip()
+            replacement = re.sub(r"/\*.*?\*/", " ", replacement)
+            macro = _Macro(parameters, replacement)
+            previous = defines.get(macro_name)
+            if previous is not None and previous != macro:
+                raise CCompilerError(f"{where}: incompatible redefinition of {macro_name}")
+            defines[macro_name] = macro
+        elif name == "undef":
+            identifier = re.fullmatch(r"[A-Za-z_]\w*", rest)
+            if identifier is None:
+                raise CCompilerError(f"{where}: invalid #undef")
+            defines.pop(identifier.group(0), None)
+        elif name == "include":
+            expanded = _expand_macros(_lex_raw(rest, filename)[:-1], defines, filename)
+            if len(expanded) == 1 and expanded[0].value.startswith("<string:"):
+                target = bytes.fromhex(expanded[0].value[8:-1]).decode("utf-8")
+                quoted = True
+            else:
+                spelling = "".join(_token_spelling(item) for item in expanded)
+                match = re.fullmatch(r'"([^"]+)"|<([^>]+)>', spelling)
+                if match is None:
+                    raise CCompilerError(f"{where}: invalid #include")
+                target = match.group(1) or match.group(2)
+                quoted = match.group(1) is not None
+            candidates = []
+            if quoted:
+                candidates.append(Path(filename).resolve().parent / target)
+            candidates.append(Path(__file__).resolve().parent.parent / "lib" / target)
+            found = next((path for path in candidates if path.is_file()), None)
+            if found is None:
+                raise CCompilerError(f"{where}: cannot find include file {target!r}")
+            try:
+                included = found.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise CCompilerError(f"{where}: cannot read include file {target!r}: {exc}") from exc
+            output.append(_preprocess(included, str(found), defines, depth + 1))
+        elif name == "error":
+            raise CCompilerError(f"{where}: #error {rest}".rstrip())
+        elif name == "pragma":
+            pass
+        elif name == "line":
+            if re.fullmatch(r"[0-9]+(?:\s+\"[^\"]*\")?", rest) is None:
+                raise CCompilerError(f"{where}: invalid #line")
+        else:
+            raise CCompilerError(f"{where}: unsupported directive #{name}")
+        output.append("")
+    if conditionals:
+        raise CCompilerError(f"{filename}: unterminated conditional directive")
+    return "\n".join(output)
+
+
 def _lex(source: str, filename: str) -> list[Token]:
-    defines: dict[str, str] = {}
+    timestamp = datetime.datetime.now()
+    defines: dict[str, _Macro] = {
+        "__STDC__": _Macro(None, "1"),
+        "__FILE__": _Macro(None, '"' + filename.replace("\\", "\\\\").replace('"', '\\"') + '"'),
+        "__DATE__": _Macro(None, '"' + timestamp.strftime("%b %d %Y") + '"'),
+        "__TIME__": _Macro(None, '"' + timestamp.strftime("%H:%M:%S") + '"'),
+    }
     source = _preprocess(source, filename, defines)
     tokens = _lex_raw(source, filename)
     return _expand_macros(tokens, defines, filename) if defines else tokens
