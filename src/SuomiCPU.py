@@ -188,7 +188,7 @@ def _load_jit():
                 if src_dir not in sys.path:
                     sys.path.insert(0, src_dir)
                 import sc16_jit
-                if sc16_jit.CONSTANTS == (MEM_MASK, GPU_BASE, ICR_ADDR):
+                if sc16_jit.CONSTANTS == (MEM_MASK, GPU_BASE, ICR_ADDR, DISK_BASE):
                     _JIT = sc16_jit
             except Exception:
                 _JIT = None
@@ -370,10 +370,18 @@ class SuomiCompute16:
             data = self.disk.read_block(ptr)
             for i, char in enumerate(data):
                 self.write(RAM_START + offset + i, ord(char))
+        if command & 0x10: # Directory: name of disk number [ptr] to RAM, count to +14
+            index = self.read_16(DISK_BASE + 10)
+            offset = self.read_16(DISK_BASE + 12)
+            names = self.disk.list_disks()
+            self.write_16(DISK_BASE + 14, len(names))
+            text = names[index] if index < len(names) else ""
+            for i, char in enumerate(text + "\0"):
+                self.write(RAM_START + offset + i, ord(char))
         if command & 0x08: # Write block
             ptr = self.read_16(DISK_BASE + 10)
             offset = self.read_16(DISK_BASE + 12)
-            data = "".join(chr(self.read(RAM_START + offset + i)) for i in range(255))
+            data = "".join(chr(self.read(RAM_START + offset + i)) for i in range(256))
             self.disk.write_block(ptr, data)
 
     def _gpu_net(self, command, query, arg):

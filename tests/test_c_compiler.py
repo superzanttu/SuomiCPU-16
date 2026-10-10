@@ -24,6 +24,53 @@ def run_image(image, maximum_steps=100_000):
 
 
 class CCompilerTests(unittest.TestCase):
+    def test_c90_unary_operators_require_valid_operand_types(self):
+        invalid_sources = (
+            "int main(void) { int *pointer; -pointer; return 0; }\n",
+            "int main(void) { int *pointer; ~pointer; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError, "requires an (arithmetic|integer) operand"
+                ):
+                    compile_source(source)
+
+    def test_c90_logical_negation_accepts_pointer_operands(self):
+        image = compile_source(
+            "int main(void) { int *pointer = 0; return !pointer ? 0 : 1; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_global_pointer_initializer_uses_runtime_pointer_layout(self):
+        image = compile_source(
+            "unsigned char *device = 0x43101;\n"
+            "int main(void) { device[0] = 0x41; return 0; }\n"
+        )
+
+        cpu, _ = run_image(image)
+
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read(0x43101), 0x41)
+
+    def test_c90_global_pointer_initializer_requires_null_or_address_constant(self):
+        with self.assertRaisesRegex(
+            CCompilerError, "pointer initializer must be an address constant"
+        ):
+            compile_source(
+                "int *pointer = 1;\n"
+                "int main(void) { return 0; }\n"
+            )
+
+    def test_c90_global_pointer_initializer_accepts_null_constant_expression(self):
+        image = compile_source(
+            "int *pointer = 1 - 1;\n"
+            "int main(void) { return pointer != 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
     def test_compiles_functions_locals_and_loops(self):
         image = compile_source(
             "int sum(int, int);\n"
@@ -43,6 +90,77 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 12)
         self.assertEqual(cpu.sp, 0x2FFFF)
+
+    def test_c90_function_arguments_convert_to_parameter_types(self):
+        image = compile_source(
+            "int result;\n"
+            "int narrow(unsigned char value) { return value; }\n"
+            "float as_float(float value) { return value; }\n"
+            "int main(void) {\n"
+            "  result = narrow(258) + (int)as_float(7);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
+
+    def test_c90_function_arguments_reject_incompatible_pointer_and_scalar(self):
+        sources = (
+            "int take_pointer(int *value) { return value != 0; }\n"
+            "int main(void) { return take_pointer(1); }\n",
+            "int take_integer(int value) { return value; }\n"
+            "int main(void) { int *pointer; return take_integer(pointer); }\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError, "argument 1 .* is incompatible"
+                ):
+                    compile_source(source)
+
+    def test_c90_function_arguments_accept_null_pointer_constant_expression(self):
+        image = compile_source(
+            "int is_null(int *value) { return value == 0; }\n"
+            "int main(void) { return is_null(1 - 1) ? 0 : 1; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_assignment_converts_arithmetic_values(self):
+        image = compile_source(
+            "float floating;\n"
+            "int integral;\n"
+            "int main(void) {\n"
+            "  floating = 7;\n"
+            "  integral = floating;\n"
+            "  return integral != 7;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 7)
+
+    def test_c90_assignment_rejects_incompatible_pointer_scalar_values(self):
+        sources = (
+            "int *pointer; int main(void) { pointer = 1; return 0; }\n",
+            "int *pointer; int main(void) { int value; pointer = value; return 0; }\n",
+            "int result; int main(void) { int *pointer; result = pointer; return 0; }\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError, "assignment expression is incompatible"
+                ):
+                    compile_source(source)
+
+    def test_c90_assignment_accepts_null_pointer_constant_expression(self):
+        image = compile_source(
+            "int *pointer;\n"
+            "int main(void) { pointer = 2 - 2; return pointer != 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
 
     def test_c90_return_values_convert_to_declared_function_type(self):
         image = compile_source(
@@ -166,6 +284,55 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
+
+    def test_c90_signed_and_unsigned_without_int_are_int_types(self):
+        image = compile_source(
+            "signed signed_value;\n"
+            "unsigned unsigned_value;\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  signed_value = -2;\n"
+            "  unsigned_value = 3;\n"
+            "  result = signed_value + unsigned_value;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 0xFFFE)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 3)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 1)
+
+    def test_c90_unsigned_char_expressions_promote_to_int(self):
+        image = compile_source(
+            "unsigned char byte_value;\n"
+            "int divided;\n"
+            "int complemented;\n"
+            "int main(void) {\n"
+            "  byte_value = 0;\n"
+            "  divided = (byte_value - 1) / 2;\n"
+            "  complemented = ~byte_value;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 1), 0)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 3), 0xFFFF)
+
+    def test_c90_rejects_repeated_and_long_long_type_specifiers(self):
+        declarations = (
+            "signed signed value;\n",
+            "unsigned unsigned value;\n",
+            "short short value;\n",
+            "long long value;\n",
+        )
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                with self.assertRaisesRegex(CCompilerError, "duplicate type specifier"):
+                    compile_source(
+                        declaration + "int main(void) { return 0; }\n"
+                    )
 
     def test_struct_union_member_access_and_aggregate_initializers(self):
         image = compile_source(
@@ -386,6 +553,20 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 47)
+
+    def test_c90_function_declarations_require_compatible_parameter_types(self):
+        sources = (
+            "int convert(int value);\n"
+            "int convert(float value);\n"
+            "int main(void) { return 0; }\n",
+            "int convert(int value);\n"
+            "int convert(float value) { return (int)value; }\n"
+            "int main(void) { return 0; }\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(CCompilerError, "conflicting declaration"):
+                    compile_source(source)
 
     def test_c90_void_function_prototype_rejects_arguments(self):
         with self.assertRaisesRegex(CCompilerError, "expects 0 argument"):

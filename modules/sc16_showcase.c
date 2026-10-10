@@ -542,7 +542,7 @@ void page_text(void)
     gfx_text(8, 84, "GLYPH ROM AT 0x4400, 8 BYTES PER GLYPH:", GRAY);
     gfx_text(8, 94, "BITS 7-3 = PIXELS, BIT 2 = BLANK COLUMN", GRAY);
     idx = (frame / 30) % 6;
-    glyph = FONT_ROM + (logo_text[idx] - 32) * 8;
+    glyph = (unsigned char *)FONT_ROM + (logo_text[idx] - 32) * 8;
     for (row = 0; row < 7; row++)
     {
         bits = glyph[row];

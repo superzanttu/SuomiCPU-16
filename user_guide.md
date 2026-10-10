@@ -444,16 +444,24 @@ a keyboard interrupt pending. The RTC writes seconds, minutes, and hours to its
 three declared byte addresses.
 
 The disk storage device is accessible starting at `0x43100`. It uses JSON files
-to store data blocks of 255 characters.
+to store data blocks of 256 characters.
 - Write `0x01` to `0x43100` to load a disk; the 8-character disk ID must be placed
   at `0x43101` through `0x43108`.
 - Write `0x02` to `0x43100` to unload and save the current disk.
 - Write `0x04` to `0x43100` to read a block; the 16-bit block pointer is at
-  `0x43110` and the RAM destination offset is at `0x43112`. The block is copied
+  `0x4310A` and the RAM destination offset is at `0x4310C`. The block is copied
   to `0x20000 + offset`.
 - Write `0x08` to `0x43100` to write a block; the 16-bit block pointer is at
-  `0x43110` and the RAM source offset is at `0x43112`. Data is read from
+  `0x4310A` and the RAM source offset is at `0x4310C`. Data is read from
   `0x20000 + offset`.
+- Write `0x10` to `0x43100` to read the disk directory: the disk number (0-based)
+  is taken from `0x4310A`, and the ID of that disk (zero terminated, empty when
+  out of range) is copied to `0x20000 + offset` (offset at `0x4310C`). The number
+  of disks in the `disks/` folder is returned in the word at `0x4310E`.
+
+`modules/disk_editor.c` is a disk editor built on this interface: it lists the
+disks, creates new ones, and lets you edit and save blocks with the keyboard.
+
 ## 8. Bitmap font
 
 [`fonts/font5x7.asm`](fonts/font5x7.asm) contains an original 5x7 bitmap font
@@ -498,7 +506,14 @@ Supported language features include:
   prototypes using `f(void)`; recursion; and C90 declarations before statements
   within a block.
 - `typedef` names, enumerations, structure and union declarations, member access
-  with `.` and `->`, and scalar, array, and aggregate initialization.
+  with `.` and `->`, scalar, array, and aggregate initialization, and C90
+  integer type specifiers including standalone `signed` and `unsigned`;
+  `char` and `unsigned char` operands receive integer promotions. Global
+  pointer initializers accept null pointer constant expressions and the
+  compiler's SC-16 hexadecimal address-constant extension. Redeclarations with
+  incompatible function parameter types are diagnosed. Unary arithmetic,
+  bitwise complement, and logical operators diagnose operands that do not meet
+  their C90 type constraints.
 - One-dimensional bounded arrays and initialized arrays with an omitted bound,
   integer constant expression bounds (including arithmetic, enum constants,
   casts, `sizeof(type)`, and conditional expressions), array parameters
@@ -506,7 +521,9 @@ Supported language features include:
   operators.
 - Blocks, expression statements, `if`/`else`, loops, `switch` with integer
   constant-expression `case` labels, `default`, `break`, `continue`, `goto`,
-  labeled statements, and `return`.
+  labeled statements, and `return`; supported scalar arguments and return
+  expressions are converted to their declared parameter or function return
+  types, with incompatible pointer/scalar conversions rejected.
 - Integer and floating constants, character constants, strings (including
   adjacent string-literal concatenation), assignment and compound assignment,
   increment/decrement, arithmetic, bitwise and shift operations, comparisons,

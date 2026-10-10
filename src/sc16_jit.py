@@ -19,7 +19,8 @@ from numba import njit
 MEM_MASK = 2**19 - 1
 GPU_BASE = 0x43020
 ICR_ADDR = 0x43002
-CONSTANTS = (MEM_MASK, GPU_BASE, ICR_ADDR)
+DISK_BASE = 0x43100
+CONSTANTS = (MEM_MASK, GPU_BASE, ICR_ADDR, DISK_BASE)
 
 
 @njit(cache=True)
@@ -35,7 +36,9 @@ def _wr16(mem, a, v):
 
 @njit(cache=True)
 def _hits_gpu(a):
-    return (a & MEM_MASK) == GPU_BASE or ((a + 1) & MEM_MASK) == GPU_BASE
+    a0 = a & MEM_MASK
+    a1 = (a + 1) & MEM_MASK
+    return a0 == GPU_BASE or a1 == GPU_BASE or a0 == DISK_BASE or a1 == DISK_BASE
 
 
 @njit(cache=True)
@@ -337,7 +340,7 @@ def run_block(mem, regs, st, budget):
             regs[rd] = np.int64(mem[regs[rs1] & MEM_MASK])
         elif op == 3:
             a = regs[rs1]
-            if (a & MEM_MASK) == GPU_BASE:
+            if (a & MEM_MASK) == GPU_BASE or (a & MEM_MASK) == DISK_BASE:
                 bail = True
             else:
                 mem[a & MEM_MASK] = regs[rd] & 0xFF

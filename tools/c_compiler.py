@@ -408,7 +408,9 @@ class _Parser:
         self.position = 0
         self.globals: list[Global] = []
         self.functions: list[Function] = []
-        self.prototypes: dict[str, tuple[str, int | None]] = {}
+        self.prototypes: dict[
+            str, tuple[str, int | None, tuple[str, ...] | None]
+        ] = {}
         self._local_count = 0
         self.typedef_scopes: list[dict[str, str]] = [{}]
         self.enum_constants: dict[str, int] = {}
@@ -494,14 +496,22 @@ class _Parser:
         base = None
         while self.token.value in _STORAGE_WORDS | _TYPE_WORDS:
             if self.token.value == "unsigned":
+                if unsigned:
+                    raise self.fail("duplicate type specifier 'unsigned'")
                 unsigned = True
             elif self.token.value == "signed":
+                if signed:
+                    raise self.fail("duplicate type specifier 'signed'")
                 signed = True
             elif self.token.value in _TYPE_WORDS - {"signed", "unsigned"}:
                 current = self.take().value
                 if current == "short":
+                    if short:
+                        raise self.fail("duplicate type specifier 'short'")
                     short = True
                 elif current == "long":
+                    if long:
+                        raise self.fail("duplicate type specifier 'long'")
                     long = True
                 elif base is not None:
                     raise self.fail("invalid combination of type specifiers")
@@ -511,7 +521,7 @@ class _Parser:
             self.take()
         if short and long:
             raise self.fail("short and long cannot be combined")
-        if base is None and (short or long):
+        if base is None and (signed or unsigned or short or long):
             base = "int"
         if base is None:
             raise self.fail("expected int or void type")
@@ -790,6 +800,9 @@ class _Parser:
                 signature = (
                     declarator_type,
                     None if empty_parameter_list else len(parameters),
+                    None if empty_parameter_list else tuple(
+                        parameter_type for parameter_type, _ in parameters
+                    ),
                 )
                 self._merge_function_declaration(name, signature, name_token.line)
                 return
@@ -799,10 +812,19 @@ class _Parser:
                 raise CCompilerError(
                     f"{self.filename}:{name_token.line}: duplicate definition of {name}"
                 )
-            signature = (declarator_type, len(parameters))
-            self._merge_function_declaration(name, signature, name_token.line)
             if old_style_names is not None:
                 parameters = self.parse_old_style_parameter_declarations(old_style_names)
+            signature = (
+                declarator_type,
+                len(parameters),
+                tuple(parameter_type for parameter_type, _ in parameters),
+            )
+            self._merge_function_declaration(
+                name,
+                signature,
+                name_token.line,
+                old_style=old_style_names is not None,
+            )
             self._local_count = 0
             body = self.parse_compound()
             if any(param_name is None for _, param_name in parameters):
@@ -816,7 +838,12 @@ class _Parser:
         self.parse_global_declarators(c_type, name_token, declarator_type)
 
     def _merge_function_declaration(
-        self, name: str, signature: tuple[str, int | None], line: int
+        self,
+        name: str,
+        signature: tuple[str, int | None, tuple[str, ...] | None],
+        line: int,
+        *,
+        old_style: bool = False,
     ) -> None:
         previous = self.prototypes.get(name)
         if previous is not None and (
@@ -826,12 +853,29 @@ class _Parser:
                 and signature[1] is not None
                 and previous[1] != signature[1]
             )
+            or (
+                previous[2] is not None
+                and signature[2] is not None
+                and previous[2] != (
+                    tuple(
+                        self._default_argument_promotion(parameter_type)
+                        for parameter_type in signature[2]
+                    )
+                    if old_style else signature[2]
+                )
+            )
         ):
             raise CCompilerError(
                 f"{self.filename}:{line}: conflicting declaration of {name}"
             )
         if previous is None or signature[1] is not None:
             self.prototypes[name] = signature
+
+    @staticmethod
+    def _default_argument_promotion(c_type: str) -> str:
+        if c_type in ("char", "unsigned char"):
+            return "int"
+        return c_type
 
     def parse_old_style_parameter_declarations(
         self, names: list[str]
@@ -1335,7 +1379,9 @@ class _CodeGenerator:
         self.global_variables: dict[str, Global] = {}
         self.string_data: list[tuple[str, bytes]] = []
         self.current_function: Function | None = None
-        self.prototypes: dict[str, tuple[str, int | None]] = {}
+        self.prototypes: dict[
+            str, tuple[str, int | None, tuple[str, ...] | None]
+        ] = {}
         self.used_libraries: set[str] = set()
         self.enum_constants: dict[str, int] = {}
         self.label_names: set[str] = set()
@@ -1511,10 +1557,23 @@ class _CodeGenerator:
             return bytes(_type_size(c_type, self.records))
         if initializer.kind == "string":
             raise self.error(line, "a string literal cannot initialize a scalar")
+        if c_type.endswith("*"):
+            is_address_constant = initializer.kind == "address_constant"
+            is_null_pointer_constant = (
+                self._is_integer_constant_expression(initializer)
+                and self._constant(initializer) == 0
+            )
+            if not is_address_constant and not is_null_pointer_constant:
+                raise self.error(
+                    line,
+                    "pointer initializer must be an address constant or null pointer constant",
+                )
         value = self._constant(initializer)
         size = _type_size(c_type, self.records)
         if c_type.endswith("*") and not 0 <= value < (1 << 19):
             raise self.error(line, "pointer initializer is outside the 19-bit address range")
+        if c_type.endswith("*"):
+            return (value & WORD_MASK).to_bytes(2, "big") + bytes((value >> 16,))
         return (value & ((1 << (size * 8)) - 1)).to_bytes(size, "big")
 
     def _constant(self, expression: Expr | None) -> int:
@@ -1605,6 +1664,41 @@ class _CodeGenerator:
                 return int(left != 0 or right != 0)
         raise self.error(expression.line, "global initializers must be integer constant expressions")
 
+    def _is_integer_constant_expression(self, expression: Expr) -> bool:
+        if expression.kind in {"constant", "sizeof_type", "sizeof_expr"}:
+            return True
+        if expression.kind == "name":
+            return str(expression.value) in self.enum_constants
+        if expression.kind == "cast":
+            return (
+                expression.value
+                in {"char", "unsigned char", "int", "unsigned int"}
+                and self._is_integer_constant_expression(expression.children[0])
+            )
+        if expression.kind == "unary":
+            return (
+                expression.value in {"+", "-", "~", "!"}
+                and self._is_integer_constant_expression(expression.children[0])
+            )
+        if expression.kind == "binary":
+            return (
+                expression.value
+                in {
+                    "+", "-", "*", "/", "%", "<<", ">>", "<", "<=", ">", ">=",
+                    "==", "!=", "&", "^", "|", "&&", "||",
+                }
+                and all(
+                    self._is_integer_constant_expression(child)
+                    for child in expression.children
+                )
+            )
+        if expression.kind == "conditional":
+            return all(
+                self._is_integer_constant_expression(child)
+                for child in expression.children
+            )
+        return False
+
     def _constant_member_offset(self, expression: Expr, line: int) -> int:
         if expression.kind != "member":
             raise self.error(line, "member designator is not an integer constant expression")
@@ -1664,11 +1758,28 @@ class _CodeGenerator:
             name = sorted(undefined_labels)[0]
             raise self.error(function.line, f"goto references undefined label {name!r}")
         declaration = self.prototypes.get(function.name)
-        if declaration is not None and declaration != (
+        function_signature = (
             function.return_type,
             len(function.parameters),
-        ):
-            raise self.error(function.line, f"definition of {function.name!r} conflicts with declaration")
+            tuple(parameter_type for parameter_type, _ in function.parameters),
+        )
+        if declaration is not None and declaration[1] is not None:
+            compatible_parameters = declaration[2]
+            if compatible_parameters is not None and any(
+                declaration_type != definition_type
+                for declaration_type, definition_type in zip(
+                    compatible_parameters, function_signature[2]
+                )
+            ):
+                raise self.error(
+                    function.line,
+                    f"definition of {function.name!r} conflicts with declaration",
+                )
+            if declaration[0] != function_signature[0] or declaration[1] != function_signature[1]:
+                raise self.error(
+                    function.line,
+                    f"definition of {function.name!r} conflicts with declaration",
+                )
         if function.name == "main" and function.parameters:
             raise self.error(function.line, "main() must not have parameters")
         if function.local_count > FRAME_SIZE_LIMIT:
@@ -1962,6 +2073,7 @@ class _CodeGenerator:
                         )
                         null_pointer_constant = (
                             source_type in integer_types
+                            and self._is_integer_constant_expression(expression)
                             and self._constant(expression) == 0
                         )
                         if not compatible_pointer and not null_pointer_constant:
@@ -2209,6 +2321,10 @@ class _CodeGenerator:
                 if not child_type.endswith("*"):
                     raise self.error(expression.line, "cannot dereference a non-pointer")
                 return child_type[:-1]
+            if operator in ("+", "-", "~") and child_type in (
+                "char", "unsigned char"
+            ):
+                return "int"
             return "int" if operator == "!" else child_type
         if expression.kind == "postfix":
             return self._expression_type(expression.children[0])
@@ -2228,10 +2344,14 @@ class _CodeGenerator:
                 return left_type
             if right_type.endswith("*") and operator == "+":
                 return right_type
-            if left_type.startswith("unsigned") or right_type.startswith("unsigned"):
-                return "unsigned int"
-            return "int"
+            return self._usual_arithmetic_type(left_type, right_type)
         raise self.error(expression.line, "could not determine expression type")
+
+    @staticmethod
+    def _integer_promoted_type(c_type: str) -> str:
+        if c_type in ("char", "unsigned char"):
+            return "int"
+        return c_type
 
     @staticmethod
     def _usual_arithmetic_type(left_type: str, right_type: str) -> str:
@@ -2243,6 +2363,8 @@ class _CodeGenerator:
             return left_type
         if right_type.endswith("*"):
             return right_type
+        left_type = _CodeGenerator._integer_promoted_type(left_type)
+        right_type = _CodeGenerator._integer_promoted_type(right_type)
         if left_type.startswith("unsigned") or right_type.startswith("unsigned"):
             return "unsigned int"
         return "int"
@@ -2371,11 +2493,40 @@ class _CodeGenerator:
         )
 
     def _store_lvalue(
-        self, expression: Expr, register: str, source_type: str, line: int
+        self,
+        expression: Expr,
+        register: str,
+        source_type: str,
+        line: int,
+        source_expression: Expr | None = None,
     ) -> None:
         c_type = self._expression_type(expression)
         if c_type in self.records:
             raise self.error(line, "record assignment is not supported")
+        integer_types = {"char", "unsigned char", "int", "unsigned int"}
+        numeric_types = integer_types | {"float"}
+        if c_type in numeric_types:
+            if source_type not in numeric_types:
+                raise self.error(line, "assignment expression is incompatible with target type")
+        elif c_type.endswith("*"):
+            compatible_pointer = (
+                source_type.endswith("*")
+                and (
+                    source_type == c_type
+                    or source_type == "void*"
+                    or c_type == "void*"
+                )
+            )
+            null_pointer_constant = (
+                source_type in integer_types
+                and source_expression is not None
+                and self._is_integer_constant_expression(source_expression)
+                and self._constant(source_expression) == 0
+            )
+            if not compatible_pointer and not null_pointer_constant:
+                raise self.error(line, "assignment expression is incompatible with target type")
+        else:
+            raise self.error(line, "assignment to this type is not supported")
         self._convert_to_type(register, c_type, source_type)
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), line)
@@ -2512,8 +2663,45 @@ class _CodeGenerator:
             argument_bytes = 0
             for index in range(len(arguments) - 1, -1, -1):
                 argument = arguments[index]
+                parameter_type = parameter_types[index]
+                source_type = self._expression_type(argument)
+                integer_types = {"char", "unsigned char", "int", "unsigned int"}
+                numeric_types = integer_types | {"float"}
+                if parameter_type in numeric_types:
+                    if source_type not in numeric_types:
+                        raise self.error(
+                            argument.line,
+                            f"argument {index + 1} to {name}() is incompatible "
+                            "with its parameter type",
+                        )
+                elif parameter_type.endswith("*"):
+                    compatible_pointer = (
+                        source_type.endswith("*")
+                        and (
+                            source_type == parameter_type
+                            or source_type == "void*"
+                            or parameter_type == "void*"
+                        )
+                    )
+                    null_pointer_constant = (
+                        source_type in integer_types
+                        and self._is_integer_constant_expression(argument)
+                        and self._constant(argument) == 0
+                    )
+                    if not compatible_pointer and not null_pointer_constant:
+                        raise self.error(
+                            argument.line,
+                            f"argument {index + 1} to {name}() is incompatible "
+                            "with its parameter type",
+                        )
+                else:
+                    raise self.error(
+                        argument.line,
+                        f"passing this type to {name}() is not supported",
+                    )
                 self._expression(argument)
-                width = _object_size(parameter_types[index], self.records)
+                self._convert_to_type("R0", parameter_type, source_type)
+                width = _object_size(parameter_type, self.records)
                 if width == 3:
                     self.emit("    ADJSP -3")
                     self.emit("    MOVSP R7")
@@ -2573,11 +2761,35 @@ class _CodeGenerator:
                 if operator != "="
                 else self._expression_type(expression.children[0])
             )
-            self._store_lvalue(target, "R0", source_type, expression.line)
+            self._store_lvalue(
+                target, "R0", source_type, expression.line, expression.children[0]
+            )
             return
         if kind == "unary":
             operator = str(expression.value)
             child = expression.children[0]
+            child_type = self._expression_type(child)
+            integer_types = {"char", "unsigned char", "int", "unsigned int"}
+            arithmetic_types = integer_types | {"float"}
+            if operator in ("+", "-") and child_type not in arithmetic_types:
+                raise self.error(
+                    expression.line,
+                    f"unary {operator} requires an arithmetic operand",
+                )
+            if operator == "~" and child_type not in integer_types:
+                raise self.error(
+                    expression.line,
+                    "bitwise complement requires an integer operand",
+                )
+            if (
+                operator == "!"
+                and child_type not in arithmetic_types
+                and not child_type.endswith("*")
+            ):
+                raise self.error(
+                    expression.line,
+                    "logical negation requires a scalar operand",
+                )
             if operator == "&":
                 self._lvalue_address(child, expression.line)
                 return
@@ -2600,16 +2812,14 @@ class _CodeGenerator:
                 return
             self._expression(child)
             if operator == "-":
-                if self._expression_type(child) == "float":
+                if child_type == "float":
                     self.emit("    LDI R7, 0x8000")
                     self.emit("    XOR R0, R7")
                 else:
                     self.emit("    NEG R0")
             elif operator == "!":
-                self._boolean_not(self._expression_type(child))
+                self._boolean_not(child_type)
             elif operator == "~":
-                if self._expression_type(child) == "float":
-                    raise self.error(expression.line, "bitwise complement is invalid for float")
                 self.emit("    LDI R7, 0xFFFF")
                 self.emit("    XOR R0, R7")
             return
@@ -2681,6 +2891,8 @@ class _CodeGenerator:
             return
         left_type = self._expression_type(left)
         right_type = self._expression_type(right)
+        promoted_left_type = self._integer_promoted_type(left_type)
+        promoted_right_type = self._integer_promoted_type(right_type)
         if right.kind == "constant" and self._constant_binary(expression, operator, left, left_type, jump_false):
             return
         self._expression(left)
@@ -2723,15 +2935,19 @@ class _CodeGenerator:
             if operator == "<<":
                 helper = "__runtime_shl"
             else:
-                helper = "__runtime_shr" if left_type.startswith("unsigned") or left_type in ("char", "unsigned char") else "__runtime_sar"
+                helper = (
+                    "__runtime_shr"
+                    if promoted_left_type.startswith("unsigned")
+                    else "__runtime_sar"
+                )
             self.used_helpers.add(helper)
             self.emit(f"    CALLX {helper}")
         elif operator in ("+", "-", "&", "|", "^", "*", "/", "%"):
             self._binary_operation(operator, expression.line, result_type, self._nomask is not expression)
         else:
             compare_type = "float" if left_type == "float" or right_type == "float" else (
-                "unsigned int" if left_type.startswith("unsigned") or right_type.startswith("unsigned")
-                or left_type in ("char", "unsigned char") or right_type in ("char", "unsigned char")
+                "unsigned int" if promoted_left_type.startswith("unsigned")
+                or promoted_right_type.startswith("unsigned")
                 or left_type.endswith("*") or right_type.endswith("*")
                 else "int"
             )
@@ -2755,7 +2971,7 @@ class _CodeGenerator:
                 return False
         elif operator not in ("+", "-", "&", "|", "^", "*", "/", "%") + compares:
             return False
-        unsigned_left = left_type.startswith("unsigned") or left_type in ("char", "unsigned char")
+        unsigned_left = self._integer_promoted_type(left_type).startswith("unsigned")
         self._expression(left)
         if operator in shifts:
             if value:
