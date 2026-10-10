@@ -546,6 +546,20 @@ class CCompilerTests(unittest.TestCase):
             [1, 0, 1],
         )
 
+    def test_c90_exit_terminates_execution(self):
+        image = compile_source(
+            "#include <stdlib.h>\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  exit(EXIT_FAILURE);\n"
+            "  result = 1;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 0)
+
     def test_c90_c_locale_facilities(self):
         image = compile_source(
             "#include <locale.h>\n"
@@ -572,6 +586,28 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(
             [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(6)],
             [1, 1, 1, 1, 1, 1],
+        )
+
+    def test_c90_time_facilities_report_unavailable_clock(self):
+        image = compile_source(
+            "#include <time.h>\n"
+            "#include <stddef.h>\n"
+            "int results[3];\n"
+            "int main(void) {\n"
+            "  time_t captured;\n"
+            "  results[0] = clock() == (clock_t)-1;\n"
+            "  results[1] = time(NULL) == (time_t)-1;\n"
+            "  captured = 0;\n"
+            "  results[2] = time(&captured) == (time_t)-1 && "
+            "captured == (time_t)-1;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(3)],
+            [1, 1, 1],
         )
 
     def test_executes_recursive_factorial_example(self):

@@ -69,6 +69,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
 }
 LIBRARY_FUNCTIONS = {**SCREEN_LIBRARY_FUNCTIONS, **GRAPHICS_LIBRARY_FUNCTIONS}
 LIBRARY_FUNCTIONS["abort"] = ("void", ())
+LIBRARY_FUNCTIONS["exit"] = ("void", ("int",))
 LIBRARY_FILES = {
     **{name: "lib_text.asm" for name in SCREEN_LIBRARY_FUNCTIONS},
     **{name: "lib_cgfx.asm" for name in GRAPHICS_LIBRARY_FUNCTIONS},
@@ -99,6 +100,7 @@ STANDARD_C_SOURCE = {
         )
     },
     **{name: "locale.c" for name in ("setlocale", "localeconv")},
+    **{name: "time.c" for name in ("clock", "time")},
 }
 
 
@@ -2306,7 +2308,7 @@ class _CodeGenerator:
                     self.emit("    PUSH R0")
                 self.stack_depth += width
                 argument_bytes += width
-            if name == "abort":
+            if name in ("abort", "exit"):
                 self.emit("    HALT")
             elif name in LIBRARY_FUNCTIONS and name not in self.function_names:
                 self.emit(f"    CALLX {name}")

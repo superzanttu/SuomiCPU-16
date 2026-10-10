@@ -4,8 +4,11 @@
 #include <stddef.h>
 
 #define RAND_MAX 32767
+#define EXIT_SUCCESS 0
+#define EXIT_FAILURE 1
 
 void abort(void);
+void exit(int status);
 int abs(int value);
 long labs(long value);
 int atoi(const char *text);

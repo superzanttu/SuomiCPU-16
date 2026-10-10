@@ -538,20 +538,29 @@ subsequent diagnostic locations.
 
 The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`,
 `<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`,
-`<string.h>`, and `<locale.h>`. `<stddef.h>` includes `offsetof`, which supports direct
-struct/union member offsets in constant initializers. The string/memory
+`<string.h>`, `<locale.h>`, and `<time.h>`. `<stddef.h>` includes `offsetof`,
+which supports direct struct/union member offsets in constant initializers.
+The string/memory
 routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,
 `labs`, `atoi`, `atol`, `strtol`, `strtoul`, `rand`, `srand`, `getenv`, and
-`system`) are compiled into a program when referenced. `strtol` and `strtoul`
-support base selection, end pointers, and range reporting through `errno`, but
-their `long` range is necessarily limited by the target's 16-bit integer ABI.
+`system`) are compiled into a program when referenced. `exit(status)` and
+`abort()` halt the target; `EXIT_SUCCESS` is zero and `EXIT_FAILURE` is one,
+but the emulator has no host process exit-status channel and cannot perform
+`atexit` callbacks or stream cleanup. `strtol` and `strtoul` support base
+selection, end pointers, and range reporting through `errno`, but their `long`
+range is necessarily limited by the target's 16-bit integer ABI.
 There is no target environment-variable store, so `getenv` returns `NULL`;
 there is no command processor, so `system(NULL)` returns zero and commands
 return -1. `<assert.h>` evaluates assertions unless `NDEBUG` is defined and
 stops the target on a failed assertion. `RAND_MAX` is 32767; the sequence from
 `rand` is implementation-defined. `<locale.h>` exposes only the `"C"` locale;
 `setlocale` rejects other locale names, while `localeconv` reports the C locale
-numeric and monetary conventions. The limit and floating-point macros describe
+numeric and monetary conventions. `<time.h>` defines `clock_t`, `time_t`, and
+`CLOCKS_PER_SEC`, and provides `clock` and `time`; since the target has no
+real-time clock or processor-time counter, both report `(time_t)-1`/
+`(clock_t)-1` (and `time` stores the sentinel when given a non-null pointer).
+Calendar conversion, formatting, and elapsed-time functions are not
+implemented. The limit and floating-point macros describe
 the target's actual types; they also make C90 minimum-range incompatibilities
 visible: `long` has only the same 16-bit range as `int`, and `double` has the
 same binary16 precision and range as `float`; `long double` maps to that same
