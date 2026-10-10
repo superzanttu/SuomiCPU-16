@@ -135,3 +135,18 @@ Buildings are constructed for free, because this is first prototype game.
 ### 7.3 Win/Loss Conditions
 - **Goal**: Build a "Mega-Storage" that holds 10,000 units of total materials.
 - **Loss**: No permanent loss conditions.
+
+## 8. SuomiCPU-16 Specific Constraints
+### 8.1 Memory Layout
+- **Global Storage**: Global variables start at `0xE800`.
+- **Memory Limit**: Total available memory is 512 KiB. Map chunks must be swapped to external storage to avoid exceeding this limit.
+- **Stack**: Local variables and function calls use the machine stack (starts at `0x2FFFF`).
+
+### 8.2 Execution & Timing
+- **Frame Budget**: The emulator executes up to 30,000 instructions per frame (capped at 60 FPS). Pathfinding and map generation must be spread across multiple frames to avoid stuttering.
+- **Precision**: Floating point values use IEEE-754 binary16 (half precision).
+
+### 8.3 Graphics & I/O
+- **Resolution**: 320x240 pixels, 8-bit palette.
+- **Drawing**: All drawing is performed on a back buffer using `gfx_*` functions; `gfx_present()` is called once per frame to update the display.
+- **Input**: Keyboard and mouse are accessed via memory-mapped registers or `gfx_*` helpers.

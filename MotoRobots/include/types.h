@@ -1,6 +1,3 @@
-#ifndef MOTOROBOTS_TYPES_H
-#define MOTOROBOTS_TYPES_H
-
 #include <stdint.h>
 
 typedef enum {
@@ -54,5 +51,3 @@ typedef struct {
     Vec2i target_pos;
     int is_active; // Using int instead of bool
 } Robot;
-
-#endif // MOTOROBOTS_TYPES_H

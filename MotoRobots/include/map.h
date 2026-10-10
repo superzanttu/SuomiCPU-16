@@ -1,6 +1,3 @@
-#ifndef MOTOROBOTS_MAP_H
-#define MOTOROBOTS_MAP_H
-
 #include "types.h"
 
 #define CHUNK_SIZE 16
@@ -19,5 +16,3 @@ typedef struct {
 
 void map_init(GameMap* map);
 TileType map_get_tile(GameMap* map, int x, int y);
-
-#endif // MOTOROBOTS_MAP_H

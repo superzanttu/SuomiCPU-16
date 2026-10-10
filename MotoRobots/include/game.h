@@ -1,11 +1,8 @@
-#ifndef MOTOROBOTS_GAME_H
-#define MOTOROBOTS_GAME_H
+#define MAX_BUILDINGS 100
+#define MAX_ROBOTS 50
 
 #include "types.h"
 #include "map.h"
-
-#define MAX_BUILDINGS 100
-#define MAX_ROBOTS 50
 
 typedef struct {
     GameMap map;
@@ -15,9 +12,12 @@ typedef struct {
     int robot_count;
     
     int total_resources[7]; // Indexed by ResourceType
+    
+    int camera_x;
+    int camera_y;
+    int zoom;
 } GameState;
 
 void game_init(GameState* state);
 void game_update(GameState* state, float delta_time);
-
-#endif // MOTOROBOTS_GAME_H
+void game_draw(GameState* state);
