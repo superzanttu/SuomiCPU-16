@@ -44,6 +44,40 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 12)
         self.assertEqual(cpu.sp, 0x2FFFF)
 
+    def test_c90_return_values_convert_to_declared_function_type(self):
+        image = compile_source(
+            "int result;\n"
+            "int from_float(void) { return 7.75; }\n"
+            "float from_integer(void) { return 7; }\n"
+            "int main(void) {\n"
+            "  result = from_float() + (int)from_integer();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 14)
+
+    def test_c90_return_rejects_incompatible_scalar_pointer_types(self):
+        sources = (
+            "int *pointer_result(void) { return 1; }\n",
+            "int integer_result(void) { int *pointer; return pointer; }\n",
+        )
+        for definition in sources:
+            with self.subTest(definition=definition):
+                with self.assertRaisesRegex(CCompilerError, "return expression is incompatible"):
+                    compile_source(
+                        definition + "int main(void) { return 0; }\n"
+                    )
+
+    def test_c90_pointer_return_accepts_null_pointer_constant_expression(self):
+        image = compile_source(
+            "int *empty_pointer(void) { return 1 - 1; }\n"
+            "int main(void) { return empty_pointer() != 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
     def test_compiles_arithmetic_and_comparisons(self):
         image = compile_source(
             "int a,b,c,d,e,f,g,h,i,j,k,l,m,n;\n"
@@ -187,6 +221,88 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 11), 236)
 
+    def test_line_directive_updates_file_macro(self):
+        image = compile_source(
+            "#define CURRENT_FILE __FILE__\n"
+            '#line 60 "virtual.c"\n'
+            "char file_name[] = CURRENT_FILE;\n"
+            "int main(void) { return 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            bytes(cpu.memory[GLOBAL_BASE:GLOBAL_BASE + 10]),
+            b"virtual.c\0",
+        )
+
+    def test_c90_array_bounds_accept_integer_constant_expressions(self):
+        image = compile_source(
+            "enum { COUNT = 2 };\n"
+            "int values[COUNT * 2 + 1];\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  char local[0 ? (1 / 0) : (int)sizeof(int) + 1];\n"
+            "  values[4] = 9;\n"
+            "  result = sizeof(values) + sizeof(local) + values[4];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 10), 22)
+
+    def test_c90_array_bound_rejects_nonconstant_expression(self):
+        with self.assertRaisesRegex(CCompilerError, "integer constant expression"):
+            compile_source(
+                "int length;\n"
+                "int values[length];\n"
+                "int main(void) { return 0; }\n"
+            )
+
+    def test_c90_enumerator_values_must_fit_int(self):
+        with self.assertRaisesRegex(CCompilerError, "not representable as int"):
+            compile_source(
+                "enum Invalid { TOO_LARGE = 32768 };\n"
+                "int main(void) { return 0; }\n"
+            )
+
+    def test_c90_switch_accepts_enum_and_constant_expression_cases(self):
+        image = compile_source(
+            "enum State { FIRST = 2, SECOND };\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  switch (SECOND) {\n"
+            "    case FIRST + 1: result = 7; break;\n"
+            "    case 2 * 2: result = 9; break;\n"
+            "    default: result = 0;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 7)
+
+    def test_c90_switch_rejects_non_integer_control_expression(self):
+        for controlling_expression in ("1.0", "pointer", "record"):
+            with self.subTest(controlling_expression=controlling_expression):
+                declarations = {
+                    "1.0": "",
+                    "pointer": "int *pointer;\n",
+                    "record": "struct Item { int value; } record;\n",
+                }[controlling_expression]
+                source = (
+                    declarations
+                    + "int main(void) {\n"
+                    + f"  switch ({controlling_expression}) {{ case 0: break; }}\n"
+                    + "  return 0;\n"
+                    + "}\n"
+                )
+                with self.assertRaisesRegex(
+                    CCompilerError, "switch expression must have integer type"
+                ):
+                    compile_source(source)
+
     def test_unsized_local_array_requires_initializer(self):
         with self.assertRaisesRegex(CCompilerError, "requires an initializer"):
             compile_source("int main(void) { int data[]; return 0; }")
@@ -222,6 +338,71 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
+
+    def test_c90_old_style_function_definition(self):
+        image = compile_source(
+            "int combine(first, second)\n"
+            "int second;\n"
+            "int first;\n"
+            "{ return first * 10 + second; }\n"
+            "int implicit_parameter(value) { return value + 3; }\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  result = combine(4, 7) + implicit_parameter(5);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 55)
+
+    def test_c90_old_style_parameter_must_be_in_identifier_list(self):
+        with self.assertRaisesRegex(CCompilerError, "not in the identifier list"):
+            compile_source(
+                "int invalid(value)\n"
+                "int other;\n"
+                "{ return value; }\n"
+                "int main(void) { return invalid(0); }\n"
+            )
+
+    def test_c90_old_style_identifier_list_requires_definition(self):
+        with self.assertRaisesRegex(CCompilerError, "only valid in definitions"):
+            compile_source(
+                "int invalid(value);\n"
+                "int main(void) { return 0; }\n"
+            )
+
+    def test_c90_empty_function_declarator_has_no_prototype(self):
+        image = compile_source(
+            "int combine();\n"
+            "int combine(int first, int second);\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  result = combine(4, 7);\n"
+            "  return 0;\n"
+            "}\n"
+            "int combine(int first, int second) { return first * 10 + second; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 47)
+
+    def test_c90_void_function_prototype_rejects_arguments(self):
+        with self.assertRaisesRegex(CCompilerError, "expects 0 argument"):
+            compile_source(
+                "int no_arguments(void);\n"
+                "int no_arguments(void) { return 0; }\n"
+                "int main(void) { return no_arguments(1); }\n"
+            )
+
+    def test_c90_function_definition_defaults_to_int_return_type(self):
+        image = compile_source(
+            "int result;\n"
+            "main() { result = 42; return 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 42)
 
     def test_c90_standard_string_and_memory_library(self):
         image = compile_source(
@@ -362,7 +543,10 @@ class CCompilerTests(unittest.TestCase):
         image = compile_source(
             "#include <stddef.h>\n"
             "struct Pair { char first; int second; };\n"
+            "struct Inner { char first; int value; };\n"
+            "struct Outer { char head; struct Inner inner; int tail; };\n"
             "size_t result = offsetof(struct Pair, second);\n"
+            "size_t nested = offsetof(struct Outer, inner.value);\n"
             "int main(void) {\n"
             "  return 0;\n"
             "}\n"
@@ -370,6 +554,7 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 2)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 4)
 
     def test_c90_float_header_matches_binary16_target(self):
         image = compile_source(

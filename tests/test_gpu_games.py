@@ -216,6 +216,7 @@ class PreprocessorTests(unittest.TestCase):
             "2\n"
             "#pragma implementation_specific\n"
             "int result;\n"
+            'char unrecognized_trigraph[4] = "??x";\n'
             "int main(void) {\n"
             "#if VALUE == 42\n"
             "  result = VALUE;\n"
@@ -229,6 +230,10 @@ class PreprocessorTests(unittest.TestCase):
         while cpu.running:
             cpu.step()
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 42)
+        self.assertEqual(
+            [cpu.read(GLOBAL_BASE + offset) for offset in (2, 3, 4, 5)],
+            [ord("?"), ord("?"), ord("x"), 0],
+        )
 
     def test_preprocessor_errors(self):
         cases = [
@@ -240,6 +245,41 @@ class PreprocessorTests(unittest.TestCase):
         for source in cases:
             with self.subTest(source=source), self.assertRaises(CCompilerError):
                 compile_source(source)
+
+    def test_line_directive_remaps_diagnostic_line(self):
+        source = (
+            "#define ERROR_LINE 60\n"
+            '#line ERROR_LINE "virtual.c"\n'
+            "int main(void) { int broken = ; return 0; }\n"
+        )
+        with self.assertRaisesRegex(CCompilerError, r"virtual\.c:60:"):
+            compile_source(source)
+
+    def test_line_directive_rejects_zero(self):
+        with self.assertRaisesRegex(CCompilerError, r"<input>:1: invalid #line"):
+            compile_source("#line 0\nint main(void) { return 0; }\n")
+
+    def test_line_directive_remaps_preprocessor_diagnostic(self):
+        with self.assertRaisesRegex(CCompilerError, r"<input>:72: #error"):
+            compile_source("#line 72\n#error deliberate failure\n")
+
+    def test_line_directive_remaps_preprocessor_filename(self):
+        with self.assertRaisesRegex(CCompilerError, r"virtual\.c:72: #error"):
+            compile_source('#line 72 "virtual.c"\n#error deliberate failure\n')
+
+    def test_line_directive_filename_is_restored_after_include(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "main.c"
+            (Path(directory) / "header.h").write_text(
+                '#line 4 "included.c"\nint header_value;\n'
+            )
+            source.write_text(
+                '#line 80 "parent.c"\n'
+                '#include "header.h"\n'
+                "int main(void) { int broken = ; return 0; }\n"
+            )
+            with self.assertRaisesRegex(CCompilerError, r"parent\.c:81:"):
+                compile_source(source.read_text(), str(source))
 
     def test_recursive_include_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

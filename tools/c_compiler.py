@@ -119,6 +119,7 @@ class CCompilerError(ValueError):
 class Token:
     value: str
     line: int
+    filename: str | None = None
 
 
 @dataclass(frozen=True)
@@ -242,12 +243,29 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
     tokens: list[Token] = []
     position = 0
     line = 1
+    token_filename = filename
     while position < len(source):
         char = source[position]
         if char.isspace():
             if char == "\n":
                 line += 1
             position += 1
+            continue
+        if source.startswith("\0SC16_LINE:", position):
+            end = source.find("\n", position)
+            marker = source[position + len("\0SC16_LINE:"):end]
+            fields = marker.split(":", 1)
+            if not fields[0].isdigit() or int(fields[0]) < 1:
+                raise CCompilerError(f"{filename}:{line}: invalid internal line marker")
+            line = int(fields[0]) - 1
+            if len(fields) == 2 and fields[1]:
+                try:
+                    token_filename = bytes.fromhex(fields[1]).decode("utf-8")
+                except (ValueError, UnicodeError) as exc:
+                    raise CCompilerError(
+                        f"{filename}:{line}: invalid internal filename marker"
+                    ) from exc
+            position = end if end >= 0 else len(source)
             continue
         if source.startswith("//", position):
             end = source.find("\n", position)
@@ -256,7 +274,7 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
         if source.startswith("/*", position):
             end = source.find("*/", position + 2)
             if end < 0:
-                raise CCompilerError(f"{filename}:{line}: unterminated comment")
+                raise CCompilerError(f"{token_filename}:{line}: unterminated comment")
             line += source.count("\n", position, end + 2)
             position = end + 2
             continue
@@ -267,7 +285,7 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
         )
         if float_match is not None:
             literal = float_match.group(0)
-            tokens.append(Token(literal, line))
+            tokens.append(Token(literal, line, token_filename))
             position += len(literal)
             continue
         if char == '"':
@@ -278,7 +296,9 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
             while position < len(source):
                 current = source[position]
                 if current == "\n" and not escaped:
-                    raise CCompilerError(f"{filename}:{quote_line}: newline in string literal")
+                    raise CCompilerError(
+                        f"{token_filename}:{quote_line}: newline in string literal"
+                    )
                 if escaped:
                     escaped = False
                 elif current == "\\":
@@ -288,14 +308,22 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
                     break
                 position += 1
             else:
-                raise CCompilerError(f"{filename}:{quote_line}: unterminated string literal")
+                raise CCompilerError(
+                    f"{token_filename}:{quote_line}: unterminated string literal"
+                )
             try:
                 value = ast.literal_eval(source[quote_start:position])
             except (SyntaxError, ValueError) as exc:
-                raise CCompilerError(f"{filename}:{quote_line}: invalid string literal") from exc
+                raise CCompilerError(
+                    f"{token_filename}:{quote_line}: invalid string literal"
+                ) from exc
             if not isinstance(value, str):
-                raise CCompilerError(f"{filename}:{quote_line}: invalid string literal")
-            tokens.append(Token(f"<string:{value.encode('utf-8').hex()}>", quote_line))
+                raise CCompilerError(
+                    f"{token_filename}:{quote_line}: invalid string literal"
+                )
+            tokens.append(Token(
+                f"<string:{value.encode('utf-8').hex()}>", quote_line, token_filename
+            ))
             continue
         if char == "'":
             quote = char
@@ -307,7 +335,7 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
                 current = source[position]
                 if current == "\n" and not escaped:
                     raise CCompilerError(
-                        f"{filename}:{start_line}: newline in character/string literal"
+                        f"{token_filename}:{start_line}: newline in character/string literal"
                     )
                 if escaped:
                     escaped = False
@@ -321,20 +349,20 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
                 position += 1
             else:
                 raise CCompilerError(
-                    f"{filename}:{start_line}: unterminated character/string literal"
+                    f"{token_filename}:{start_line}: unterminated character/string literal"
                 )
             literal = source[start:position]
             try:
                 value = ast.literal_eval(literal)
             except (SyntaxError, ValueError) as exc:
                 raise CCompilerError(
-                    f"{filename}:{start_line}: invalid character constant"
+                    f"{token_filename}:{start_line}: invalid character constant"
                 ) from exc
             if not isinstance(value, str) or len(value) != 1:
                 raise CCompilerError(
-                    f"{filename}:{start_line}: character constants must contain one character"
+                    f"{token_filename}:{start_line}: character constants must contain one character"
                 )
-            tokens.append(Token(str(ord(value)), start_line))
+            tokens.append(Token(str(ord(value)), start_line, token_filename))
             continue
         if char.isalpha() or char == "_":
             start = position
@@ -343,7 +371,7 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
                 source[position].isalnum() or source[position] == "_"
             ):
                 position += 1
-            tokens.append(Token(source[start:position], line))
+            tokens.append(Token(source[start:position], line, token_filename))
             continue
         if char.isdigit():
             start = position
@@ -352,7 +380,7 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
                 source[position].isalnum() or source[position] == "_"
             ):
                 position += 1
-            tokens.append(Token(source[start:position], line))
+            tokens.append(Token(source[start:position], line, token_filename))
             continue
         operator = next(
             (candidate for candidate in _MULTI_OPERATORS
@@ -360,16 +388,16 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
             None,
         )
         if operator is not None:
-            tokens.append(Token(operator, line))
+            tokens.append(Token(operator, line, token_filename))
             position += len(operator)
         elif char in _SINGLE_OPERATORS:
-            tokens.append(Token(char, line))
+            tokens.append(Token(char, line, token_filename))
             position += 1
         else:
             raise CCompilerError(
-                f"{filename}:{line}: unsupported character {char!r}"
+                f"{token_filename}:{line}: unsupported character {char!r}"
             )
-    tokens.append(Token("<eof>", line))
+    tokens.append(Token("<eof>", line, token_filename))
     return tokens
 
 
@@ -380,7 +408,7 @@ class _Parser:
         self.position = 0
         self.globals: list[Global] = []
         self.functions: list[Function] = []
-        self.prototypes: dict[str, tuple[str, int]] = {}
+        self.prototypes: dict[str, tuple[str, int | None]] = {}
         self._local_count = 0
         self.typedef_scopes: list[dict[str, str]] = [{}]
         self.enum_constants: dict[str, int] = {}
@@ -391,7 +419,10 @@ class _Parser:
 
     @property
     def token(self) -> Token:
-        return self.tokens[self.position]
+        token = self.tokens[self.position]
+        if token.filename is not None:
+            self.filename = token.filename
+        return token
 
     def peek(self, distance: int = 1) -> str:
         index = min(self.position + distance, len(self.tokens) - 1)
@@ -403,6 +434,8 @@ class _Parser:
     def take(self) -> Token:
         token = self.token
         self.position += 1
+        if token.filename is not None:
+            self.filename = token.filename
         return token
 
     def accept(self, value: str) -> bool:
@@ -431,6 +464,11 @@ class _Parser:
                     value += 1
                     if self.accept("="):
                         value = self._enum_constant_value(self.parse_expression(1))
+                    if not -0x8000 <= value <= 0x7FFF:
+                        raise CCompilerError(
+                            f"{self.filename}:{name.line}: enumerator value is not "
+                            "representable as int"
+                        )
                     if name.value in self.enum_constants:
                         raise CCompilerError(
                             f"{self.filename}:{name.line}: duplicate enumerator {name.value!r}"
@@ -571,6 +609,12 @@ class _Parser:
             return int(expression.value)
         if expression.kind == "name" and expression.value in self.enum_constants:
             return self.enum_constants[str(expression.value)]
+        if expression.kind == "sizeof_type":
+            return _type_size(str(expression.value), self.records)
+        if expression.kind == "cast" and expression.value in (
+            "char", "unsigned char", "int", "unsigned int"
+        ):
+            return self._enum_constant_value(expression.children[0])
         if expression.kind == "unary":
             value = self._enum_constant_value(expression.children[0])
             operator = str(expression.value)
@@ -582,13 +626,25 @@ class _Parser:
                 return ~value
             if operator == "!":
                 return int(not value)
+        if expression.kind == "conditional":
+            condition = self._enum_constant_value(expression.children[0])
+            selected = expression.children[1] if condition else expression.children[2]
+            return self._enum_constant_value(selected)
         if expression.kind == "binary":
             left = self._enum_constant_value(expression.children[0])
+            if expression.value == "&&" and not left:
+                return 0
+            if expression.value == "||" and left:
+                return 1
             right = self._enum_constant_value(expression.children[1])
             operations = {
                 "+": lambda: left + right, "-": lambda: left - right,
-                "*": lambda: left * right, "/": lambda: int(left / right),
-                "%": lambda: left % right, "<<": lambda: left << right,
+                "*": lambda: left * right,
+                "/": lambda: abs(left) // abs(right) * (-1 if (left < 0) != (right < 0) else 1),
+                "%": lambda: left - (
+                    abs(left) // abs(right) * (-1 if (left < 0) != (right < 0) else 1)
+                ) * right,
+                "<<": lambda: left << right,
                 ">>": lambda: left >> right, "&": lambda: left & right,
                 "|": lambda: left | right, "^": lambda: left ^ right,
                 "==": lambda: int(left == right), "!=": lambda: int(left != right),
@@ -600,9 +656,9 @@ class _Parser:
             if expression.value in operations:
                 try:
                     return operations[str(expression.value)]()
-                except (ZeroDivisionError, ValueError) as exc:
+                except (ZeroDivisionError, ValueError, OverflowError) as exc:
                     raise self.fail("invalid enum constant expression") from exc
-        raise self.fail("enumerator value is not an integer constant expression")
+        raise self.fail("expression is not an integer constant expression")
 
     def _pointer_type(self, c_type: str) -> str:
         pointer_count = 0
@@ -615,15 +671,19 @@ class _Parser:
             return c_type, 0
         if self.accept("]"):
             return c_type, -1
-        size_token = self.take()
-        if not size_token.value.isdigit():
-            raise CCompilerError(
-                f"{self.filename}:{size_token.line}: array size must be a positive integer constant"
-            )
-        size = int(size_token.value, 10)
-        if size <= 0 or size > 0xFFFF:
-            raise CCompilerError(f"{self.filename}:{size_token.line}: array size is out of range")
+        expression = self.parse_expression()
         self.expect("]")
+        try:
+            size = self._enum_constant_value(expression)
+        except CCompilerError as exc:
+            raise CCompilerError(
+                f"{self.filename}:{expression.line}: array size must be a positive "
+                "integer constant expression"
+            ) from exc
+        if size <= 0 or size > 0xFFFF:
+            raise CCompilerError(
+                f"{self.filename}:{expression.line}: array size is out of range"
+            )
         return c_type, size
 
     def _infer_array_size(
@@ -679,7 +739,13 @@ class _Parser:
 
     def parse_external_declaration(self) -> None:
         is_typedef = self.accept("typedef")
-        c_type = self.parse_type()
+        implicit_int_function = (
+            not is_typedef
+            and re.fullmatch(r"[A-Za-z_]\w*", self.token.value) is not None
+            and self.peek() == "("
+            and not any(self.token.value in scope for scope in self.typedef_scopes)
+        )
+        c_type = "int" if implicit_int_function else self.parse_type()
         if is_typedef:
             self.parse_typedef_declarators(c_type)
             return
@@ -691,28 +757,52 @@ class _Parser:
             raise self.fail("expected an external identifier")
         name = name_token.value
         if self.accept("("):
-            parameters = self.parse_parameters()
-            if self.accept(";"):
-                previous = self.prototypes.get(name)
-                signature = (declarator_type, len(parameters))
-                if previous is not None and previous != signature:
-                    raise CCompilerError(
-                        f"{self.filename}:{name_token.line}: conflicting declaration of {name}"
+            empty_parameter_list = self.token.value == ")"
+            old_style_names = None
+            if (
+                re.fullmatch(r"[A-Za-z_]\w*", self.token.value)
+                and self.token.value not in _STORAGE_WORDS | _TYPE_WORDS
+                and self.token.value not in ("struct", "union", "enum")
+                and not any(self.token.value in scope for scope in self.typedef_scopes)
+            ):
+                old_style_names = [self.take().value]
+                while self.accept(","):
+                    old_style_names.append(
+                        self.expect_identifier("expected an old-style parameter name").value
                     )
-                self.prototypes[name] = signature
+                if len(set(old_style_names)) != len(old_style_names):
+                    raise self.fail("duplicate old-style parameter name")
+                self.expect(")")
+                parameters = [("int", parameter_name) for parameter_name in old_style_names]
+            else:
+                parameters = self.parse_parameters()
+            if self.accept(";"):
+                if implicit_int_function:
+                    raise CCompilerError(
+                        f"{self.filename}:{name_token.line}: implicit int is only "
+                        "supported for function definitions"
+                    )
+                if old_style_names is not None:
+                    raise CCompilerError(
+                        f"{self.filename}:{name_token.line}: identifier-list function "
+                        "declarators are only valid in definitions"
+                    )
+                signature = (
+                    declarator_type,
+                    None if empty_parameter_list else len(parameters),
+                )
+                self._merge_function_declaration(name, signature, name_token.line)
                 return
-            if self.token.value != "{":
+            if self.token.value != "{" and old_style_names is None:
                 raise self.fail("expected ';' or function body")
             if any(function.name == name for function in self.functions):
                 raise CCompilerError(
                     f"{self.filename}:{name_token.line}: duplicate definition of {name}"
                 )
-            previous = self.prototypes.get(name)
             signature = (declarator_type, len(parameters))
-            if previous is not None and previous != signature:
-                raise CCompilerError(
-                    f"{self.filename}:{name_token.line}: definition of {name} conflicts with declaration"
-                )
+            self._merge_function_declaration(name, signature, name_token.line)
+            if old_style_names is not None:
+                parameters = self.parse_old_style_parameter_declarations(old_style_names)
             self._local_count = 0
             body = self.parse_compound()
             if any(param_name is None for _, param_name in parameters):
@@ -722,9 +812,62 @@ class _Parser:
             self.functions.append(
                 Function(name, declarator_type, parameters, body, self._local_count, name_token.line)
             )
-            self.prototypes[name] = (declarator_type, len(parameters))
             return
         self.parse_global_declarators(c_type, name_token, declarator_type)
+
+    def _merge_function_declaration(
+        self, name: str, signature: tuple[str, int | None], line: int
+    ) -> None:
+        previous = self.prototypes.get(name)
+        if previous is not None and (
+            previous[0] != signature[0]
+            or (
+                previous[1] is not None
+                and signature[1] is not None
+                and previous[1] != signature[1]
+            )
+        ):
+            raise CCompilerError(
+                f"{self.filename}:{line}: conflicting declaration of {name}"
+            )
+        if previous is None or signature[1] is not None:
+            self.prototypes[name] = signature
+
+    def parse_old_style_parameter_declarations(
+        self, names: list[str]
+    ) -> list[tuple[str, str]]:
+        declared = {name: "int" for name in names}
+        explicitly_declared: set[str] = set()
+        while self.token.value != "{":
+            c_type = self.parse_type()
+            while True:
+                parameter_type = self._pointer_type(c_type)
+                token = self.expect_identifier("expected an old-style parameter name")
+                parameter_type, array_size = self._declarator_suffix(parameter_type)
+                if array_size:
+                    parameter_type += "*"
+                if token.value not in declared:
+                    raise CCompilerError(
+                        f"{self.filename}:{token.line}: declaration for parameter "
+                        f"{token.value!r} is not in the identifier list"
+                    )
+                if token.value in explicitly_declared:
+                    raise CCompilerError(
+                        f"{self.filename}:{token.line}: duplicate declaration for "
+                        f"parameter {token.value!r}"
+                    )
+                if parameter_type == "void":
+                    raise CCompilerError(
+                        f"{self.filename}:{token.line}: parameter cannot have void type"
+                    )
+                declared[token.value] = parameter_type
+                explicitly_declared.add(token.value)
+                if not self.accept(","):
+                    break
+            self.expect(";")
+            if self.token.value == "<eof>":
+                raise self.fail("expected function body after old-style parameter declarations")
+        return [(declared[name], name) for name in names]
 
     def parse_typedef_declarators(self, c_type: str) -> None:
         while True:
@@ -932,8 +1075,13 @@ class _Parser:
                 if self.accept("case"):
                     case_value = self.parse_expression(1)
                     self.expect(":")
-                    if case_value.kind not in ("constant", "unary", "binary"):
+                    try:
+                        constant_value = self._enum_constant_value(case_value)
+                    except CCompilerError as exc:
                         raise self.fail("case labels must be constant integer expressions")
+                    case_value = Expr(
+                        "constant", constant_value & WORD_MASK, line=case_value.line
+                    )
                     body: list[Stmt] = []
                     while self.token.value not in ("case", "default", "}"):
                         body.append(self.parse_statement())
@@ -1187,7 +1335,7 @@ class _CodeGenerator:
         self.global_variables: dict[str, Global] = {}
         self.string_data: list[tuple[str, bytes]] = []
         self.current_function: Function | None = None
-        self.prototypes: dict[str, tuple[str, int]] = {}
+        self.prototypes: dict[str, tuple[str, int | None]] = {}
         self.used_libraries: set[str] = set()
         self.enum_constants: dict[str, int] = {}
         self.label_names: set[str] = set()
@@ -1395,21 +1543,9 @@ class _CodeGenerator:
             return int(expression.value) & WORD_MASK
         if expression.kind == "unary":
             if expression.value == "&" and expression.children[0].kind == "member":
-                member = expression.children[0]
-                operator, field_name = member.value
-                pointer = member.children[0]
-                if (
-                    operator == "->"
-                    and pointer.kind == "cast"
-                    and pointer.children[0].kind == "constant"
-                    and int(pointer.children[0].value) == 0
-                ):
-                    record_type = str(pointer.value)
-                    if record_type.endswith("*"):
-                        record_type = record_type[:-1]
-                    return self._record_field(
-                        record_type, str(field_name), expression.line
-                    ).offset
+                return self._constant_member_offset(
+                    expression.children[0], expression.line
+                )
             value = self._constant(expression.children[0])
             operator = str(expression.value)
             if operator == "+":
@@ -1468,6 +1604,34 @@ class _CodeGenerator:
             if operator == "||":
                 return int(left != 0 or right != 0)
         raise self.error(expression.line, "global initializers must be integer constant expressions")
+
+    def _constant_member_offset(self, expression: Expr, line: int) -> int:
+        if expression.kind != "member":
+            raise self.error(line, "member designator is not an integer constant expression")
+        operator, field_name = expression.value
+        base = expression.children[0]
+        if operator == "->":
+            if (
+                base.kind != "cast"
+                or not base.children
+                or base.children[0].kind != "constant"
+                or int(base.children[0].value) != 0
+            ):
+                raise self.error(line, "member address is not a constant offset")
+            record_type = str(base.value)
+            if not record_type.endswith("*"):
+                raise self.error(line, "member designator does not point to a record")
+            record_type = record_type[:-1]
+            base_offset = 0
+        else:
+            record_type = self._expression_type(base)
+            base_offset = (
+                self._constant_member_offset(base, line)
+                if base.kind == "member"
+                else 0
+            )
+        field_ = self._record_field(record_type, str(field_name), line)
+        return base_offset + field_.offset
 
     @staticmethod
     def _signed(value: int) -> int:
@@ -1763,15 +1927,56 @@ class _CodeGenerator:
             return
         if kind == "return":
             expression = statement.children[0]
+            return_type = (
+                self.current_function.return_type
+                if self.current_function is not None else "void"
+            )
             if self.current_function is not None:
-                if self.current_function.return_type == "void" and expression is not None:
+                if return_type == "void" and expression is not None:
                     raise self.error(statement.line, "void functions cannot return a value")
-                if self.current_function.return_type != "void" and expression is None:
-                    raise self.error(statement.line, "int functions must return a value")
+                if return_type != "void" and expression is None:
+                    raise self.error(statement.line, "non-void functions must return a value")
             if expression is None:
                 self.emit("    LDI R0, 0")
             else:
+                source_type = self._expression_type(expression)
+                if self.current_function is not None:
+                    integer_types = {
+                        "char", "unsigned char", "int", "unsigned int"
+                    }
+                    numeric_types = integer_types | {"float"}
+                    if return_type in numeric_types:
+                        if source_type not in numeric_types:
+                            raise self.error(
+                                statement.line,
+                                "return expression is incompatible with function type",
+                            )
+                    elif return_type.endswith("*"):
+                        compatible_pointer = (
+                            source_type.endswith("*")
+                            and (
+                                source_type == return_type
+                                or source_type == "void*"
+                                or return_type == "void*"
+                            )
+                        )
+                        null_pointer_constant = (
+                            source_type in integer_types
+                            and self._constant(expression) == 0
+                        )
+                        if not compatible_pointer and not null_pointer_constant:
+                            raise self.error(
+                                statement.line,
+                                "return expression is incompatible with function type",
+                            )
+                    else:
+                        raise self.error(
+                            statement.line,
+                            "returning this type is not supported",
+                        )
                 self._expression(expression)
+                if self.current_function is not None:
+                    self._convert_to_type("R0", return_type, source_type)
             self._emit_epilogue()
             return
         if kind == "if":
@@ -1883,6 +2088,11 @@ class _CodeGenerator:
     def _switch_statement(self, statement: Stmt) -> None:
         expression = statement.children[0]
         value_type = self._expression_type(expression)
+        if value_type not in {"char", "unsigned char", "int", "unsigned int"}:
+            raise self.error(
+                expression.line,
+                "switch expression must have integer type",
+            )
         cases = statement.value
         default_label = None
         for value, _, _ in cases:
@@ -1907,7 +2117,7 @@ class _CodeGenerator:
             seen_values.add(constant)
             self.emit("    LDWS R0, 0")
             self.emit(f"    LDI R1, {constant}")
-            self.emit("    FCMP R0, R1" if value_type == "float" else "    CMP R0, R1")
+            self.emit("    CMP R0, R1")
             self.emit(f"    BZX {case_labels[case_index]}")
             case_index += 1
         self.emit(f"    JMPX {default_label or end_label}")
@@ -2286,7 +2496,11 @@ class _CodeGenerator:
             else:
                 parameter_types = list(LIBRARY_FUNCTIONS[name][1])
                 declared = self.prototypes.get(name)
-                if declared is not None and declared[1] != len(parameter_types):
+                if (
+                    declared is not None
+                    and declared[1] is not None
+                    and declared[1] != len(parameter_types)
+                ):
                     raise self.error(expression.line, f"invalid declaration for {name}")
                 if name in LIBRARY_FILES:
                     self.used_libraries.add(LIBRARY_FILES[name])
@@ -2843,10 +3057,13 @@ _TRIGRAPHS = str.maketrans({
     "=": "#", "/": "\\", "'": "^", "(": "[", ")": "]", "!": "|",
     "<": "{", ">": "}", "-": "~",
 })
+_TRIGRAPH_PATTERN = re.compile(r"\?\?[=/\'()!<>-]")
 
 
 def _translation_lines(source: str) -> list[str]:
-    source = re.sub(r"\?\?(.)", lambda match: match.group(1).translate(_TRIGRAPHS), source)
+    source = _TRIGRAPH_PATTERN.sub(
+        lambda match: match.group(0)[2].translate(_TRIGRAPHS), source
+    )
     source = source.replace("\r\n", "\n").replace("\r", "\n")
     source = re.sub(r"\\\n", "", source)
     return source.split("\n")
@@ -2869,7 +3086,10 @@ def _macro_tokens(
     depth: int,
 ) -> list[Token]:
     return _expand_macros(
-        [Token(token.value, line) for token in _lex_raw(macro.replacement, filename)[:-1]],
+        [
+            Token(token.value, line, filename)
+            for token in _lex_raw(macro.replacement, filename)[:-1]
+        ],
         defines,
         filename,
         disabled,
@@ -2890,8 +3110,14 @@ def _expand_macros(
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        token_filename = token.filename or filename
+        if token.value == "__FILE__" and token.value not in disabled:
+            encoded = token_filename.encode("utf-8").hex()
+            result.append(Token(f"<string:{encoded}>", token.line, token_filename))
+            index += 1
+            continue
         if token.value == "__LINE__" and token.value not in disabled:
-            result.append(Token(str(token.line), token.line))
+            result.append(Token(str(token.line), token.line, token_filename))
             index += 1
             continue
         macro = defines.get(token.value)
@@ -2901,7 +3127,7 @@ def _expand_macros(
             continue
         if macro.parameters is None:
             replacement = _macro_tokens(
-                macro, defines, filename, token.line, disabled | {token.value}, depth
+                macro, defines, token_filename, token.line, disabled | {token.value}, depth
             )
             result.extend(replacement)
             index += 1
@@ -2928,22 +3154,24 @@ def _expand_macros(
             arguments[-1].append(tokens[cursor])
             cursor += 1
         if cursor == len(tokens):
-            raise CCompilerError(f"{filename}:{token.line}: unterminated macro invocation")
+            raise CCompilerError(
+                f"{token_filename}:{token.line}: unterminated macro invocation"
+            )
         if not macro.parameters and len(arguments) == 1 and not arguments[0]:
             arguments.clear()
         if len(arguments) != len(macro.parameters):
             raise CCompilerError(
-                f"{filename}:{token.line}: macro {token.value} expects "
+                f"{token_filename}:{token.line}: macro {token.value} expects "
                 f"{len(macro.parameters)} argument(s), got {len(arguments)}"
             )
         raw_arguments = dict(zip(macro.parameters, arguments))
         expanded_arguments = {
-            name: _expand_macros(value, defines, filename, disabled, depth + 1)
+            name: _expand_macros(value, defines, token_filename, disabled, depth + 1)
             for name, value in raw_arguments.items()
         }
         replacement_tokens = [
-            Token(item.value, token.line)
-            for item in _lex_raw(macro.replacement, filename)[:-1]
+            Token(item.value, token.line, token_filename)
+            for item in _lex_raw(macro.replacement, token_filename)[:-1]
         ]
         substituted: list[Token] = []
         position = 0
@@ -2957,7 +3185,7 @@ def _expand_macros(
                 parameter = replacement_tokens[position + 1].value
                 text = " ".join(_token_spelling(item) for item in raw_arguments[parameter])
                 literal = '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-                substituted.extend(_lex_raw(literal, filename)[:-1])
+                substituted.extend(_lex_raw(literal, token_filename)[:-1])
                 position += 2
                 continue
             if current.value in raw_arguments:
@@ -2981,19 +3209,23 @@ def _expand_macros(
                 position += 1
                 continue
             if not pasted or position + 1 >= len(substituted):
-                raise CCompilerError(f"{filename}:{token.line}: invalid ## in macro replacement")
+                raise CCompilerError(
+                    f"{token_filename}:{token.line}: invalid ## in macro replacement"
+                )
             left = pasted.pop()
             right = substituted[position + 1]
             spelling = _token_spelling(left) + _token_spelling(right)
-            joined = _lex_raw(spelling, filename)[:-1]
+            joined = _lex_raw(spelling, token_filename)[:-1]
             if len(joined) != 1:
-                raise CCompilerError(f"{filename}:{token.line}: ## does not form one token")
-            pasted.append(joined[0])
+                raise CCompilerError(
+                    f"{token_filename}:{token.line}: ## does not form one token"
+                )
+            pasted.append(Token(joined[0].value, token.line, token_filename))
             position += 2
         rescanned = _expand_macros(
             pasted,
             defines,
-            filename,
+            token_filename,
             disabled | {token.value},
             depth + 1,
         )
@@ -3176,20 +3408,26 @@ def _preprocess(
     conditionals: list[dict[str, bool]] = []
     active = True
     number = 0
+    line_offset = 0
+    diagnostic_filename = filename
     while number < len(lines):
         text = lines[number]
         number += 1
+        logical_line = number + line_offset
         directive = _DIRECTIVE.match(text)
         if directive is None:
             output.append(text if active else "")
             continue
         name, rest = directive.groups()
         rest = rest.strip()
-        where = f"{filename}:{number}"
+        where = f"{diagnostic_filename}:{logical_line}"
         if name in ("if", "ifdef", "ifndef"):
             parent_active = active
             if name == "if":
-                selected = bool(_evaluate_pp_expression(rest, defines, filename, number)) if active else False
+                selected = (
+                    bool(_evaluate_pp_expression(rest, defines, filename, logical_line))
+                    if active else False
+                )
             else:
                 identifier = re.fullmatch(r"[A-Za-z_]\w*", rest)
                 if identifier is None:
@@ -3211,7 +3449,7 @@ def _preprocess(
                 raise CCompilerError(f"{where}: #elif without matching #if")
             frame = conditionals[-1]
             selected = (
-                bool(_evaluate_pp_expression(rest, defines, filename, number))
+                bool(_evaluate_pp_expression(rest, defines, filename, logical_line))
                 if frame["parent"] and not frame["taken"] else False
             )
             frame["taken"] = frame["taken"] or selected
@@ -3290,14 +3528,39 @@ def _preprocess(
                 included = found.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
                 raise CCompilerError(f"{where}: cannot read include file {target!r}: {exc}") from exc
+            output.append(
+                f"\0SC16_LINE:1:{str(found).encode('utf-8').hex()}"
+            )
             output.append(_preprocess(included, str(found), defines, depth + 1))
+            output.append(
+                f"\0SC16_LINE:{logical_line}:"
+                f"{diagnostic_filename.encode('utf-8').hex()}"
+            )
         elif name == "error":
             raise CCompilerError(f"{where}: #error {rest}".rstrip())
         elif name == "pragma":
             pass
         elif name == "line":
-            if re.fullmatch(r"[0-9]+(?:\s+\"[^\"]*\")?", rest) is None:
+            expanded = _expand_macros(_lex_raw(rest, filename)[:-1], defines, filename)
+            rest = " ".join(_token_spelling(token) for token in expanded)
+            line_directive = re.fullmatch(r'([0-9]+)(?:\s+("(?:\\.|[^"\\])*"))?', rest)
+            if line_directive is None or int(line_directive.group(1)) < 1:
                 raise CCompilerError(f"{where}: invalid #line")
+            line_number = int(line_directive.group(1))
+            if line_directive.group(2) is not None:
+                try:
+                    mapped_filename = ast.literal_eval(line_directive.group(2))
+                except (SyntaxError, ValueError) as exc:
+                    raise CCompilerError(f"{where}: invalid #line filename") from exc
+                if not isinstance(mapped_filename, str):
+                    raise CCompilerError(f"{where}: invalid #line filename")
+                diagnostic_filename = mapped_filename
+            output.append(
+                f"\0SC16_LINE:{line_number}:"
+                f"{diagnostic_filename.encode('utf-8').hex()}"
+            )
+            line_offset = line_number - (number + 1)
+            continue
         else:
             raise CCompilerError(f"{where}: unsupported directive #{name}")
         output.append("")

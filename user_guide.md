@@ -490,15 +490,23 @@ will compile or have identical behavior on SC-16.
 
 Supported language features include:
 
-- File-scope and block-scope declarations; function prototypes and definitions;
-  recursion; and C90 declarations before statements within a block.
+- File-scope and block-scope declarations; function prototypes, modern
+  definitions (including definitions with omitted return type, which defaults
+  to `int`), and identifier-list (old-style) definitions with pre-body
+  parameter declarations (undeclared old-style parameters default to `int`);
+  unspecified-parameter declarations using `f()` distinct from no-argument
+  prototypes using `f(void)`; recursion; and C90 declarations before statements
+  within a block.
 - `typedef` names, enumerations, structure and union declarations, member access
   with `.` and `->`, and scalar, array, and aggregate initialization.
 - One-dimensional bounded arrays and initialized arrays with an omitted bound,
-  array parameters adjusted to pointers, pointers, casts, `sizeof`, and the
-  comma and conditional operators.
-- Blocks, expression statements, `if`/`else`, loops, `switch`, `case`,
-  `default`, `break`, `continue`, `goto`, labeled statements, and `return`.
+  integer constant expression bounds (including arithmetic, enum constants,
+  casts, `sizeof(type)`, and conditional expressions), array parameters
+  adjusted to pointers, pointers, casts, `sizeof`, and the comma and conditional
+  operators.
+- Blocks, expression statements, `if`/`else`, loops, `switch` with integer
+  constant-expression `case` labels, `default`, `break`, `continue`, `goto`,
+  labeled statements, and `return`.
 - Integer and floating constants, character constants, strings (including
   adjacent string-literal concatenation), assignment and compound assignment,
   increment/decrement, arithmetic, bitwise and shift operations, comparisons,
@@ -529,17 +537,19 @@ minimum requirements:
   machine stack.
 
 Important language gaps include multidimensional arrays, array typedefs,
-old-style function definitions, function pointers, structure/union value
-assignment and passing/returning records by value, and parts of C90's
-declarator, initializer, and constant-expression rules. The preprocessor also
-does not implement every translation-phase and directive semantic required for
-strict C90 conformance; for example, `#line` is accepted but does not remap
-subsequent diagnostic locations.
+function pointers, structure/union value assignment and passing/returning
+records by value, and parts of C90's declarator, initializer, and
+constant-expression rules. The preprocessor also does not implement every
+translation-phase and directive semantic required for strict C90 conformance.
+Numeric `#line` directives remap subsequent diagnostic line numbers, including
+preprocessor diagnostics. An optional filename remaps subsequent diagnostic
+filenames and the value of `__FILE__`; without a filename, the current mapped
+filename is retained.
 
 The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`,
 `<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`,
 `<string.h>`, `<locale.h>`, and `<time.h>`. `<stddef.h>` includes `offsetof`,
-which supports direct struct/union member offsets in constant initializers.
+which supports nested struct/union member designators in constant initializers.
 The string/memory
 routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,
 `labs`, `atoi`, `atol`, `strtol`, `strtoul`, `rand`, `srand`, `getenv`, and
