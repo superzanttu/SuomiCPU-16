@@ -2309,9 +2309,52 @@ class _CodeGenerator:
         if expression.kind == "cast":
             return str(expression.value)
         if expression.kind == "conditional":
+            condition_type = self._expression_type(expression.children[0])
             true_type = self._expression_type(expression.children[1])
             false_type = self._expression_type(expression.children[2])
-            return self._usual_arithmetic_type(true_type, false_type)
+            arithmetic_types = {
+                "char", "unsigned char", "int", "unsigned int", "float"
+            }
+            if condition_type not in arithmetic_types and not condition_type.endswith("*"):
+                raise self.error(
+                    expression.line,
+                    "conditional operator requires a scalar condition",
+                )
+            if true_type in arithmetic_types and false_type in arithmetic_types:
+                return self._usual_arithmetic_type(true_type, false_type)
+            if true_type == false_type and true_type == "void":
+                return "void"
+            if true_type.endswith("*") and false_type.endswith("*"):
+                if true_type == false_type:
+                    return true_type
+                if true_type == "void*":
+                    return true_type
+                if false_type == "void*":
+                    return false_type
+                raise self.error(
+                    expression.line,
+                    "conditional pointer operands have incompatible types",
+                )
+            if true_type.endswith("*") and false_type in {
+                "char", "unsigned char", "int", "unsigned int"
+            }:
+                if (
+                    self._is_integer_constant_expression(expression.children[2])
+                    and self._constant(expression.children[2]) == 0
+                ):
+                    return true_type
+            if false_type.endswith("*") and true_type in {
+                "char", "unsigned char", "int", "unsigned int"
+            }:
+                if (
+                    self._is_integer_constant_expression(expression.children[1])
+                    and self._constant(expression.children[1]) == 0
+                ):
+                    return false_type
+            raise self.error(
+                expression.line,
+                "conditional operands have incompatible types",
+            )
         if expression.kind == "unary":
             operator = str(expression.value)
             child_type = self._expression_type(expression.children[0])

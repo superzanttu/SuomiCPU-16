@@ -288,11 +288,14 @@ void draw_screen(void) {
         button(104, 134, 38, 3, "PREV", BLUE);
         button(146, 134, 38, 4, "NEXT", BLUE);
     }
-    if (loaded) {
+    if (loaded && dirty) {
         button(188, 134, 38, 5, "READ", GREEN);
-        button(272, 134, 38, 7, "CLR", ORANGE);
     } else {
         off_button(188, 134, 38, "READ");
+    }
+    if (loaded) {
+        button(272, 134, 38, 7, "CLR", ORANGE);
+    } else {
         off_button(272, 134, 38, "CLR");
     }
     if (dirty && loaded) {
@@ -333,6 +336,7 @@ void click(int mx, int my) {
     if (press == 1 && !loaded) return;
     if (press >= 3 && press <= 7 && !loaded) return;
     if (press == 6 && !dirty) return;
+    if (press == 5 && !dirty) return;
     if (dirty && press >= 0 && press <= 2) {
         status = "SAVE OR READ FIRST";
         return;

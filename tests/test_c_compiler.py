@@ -72,6 +72,30 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
 
+    def test_c90_conditional_operator_checks_operand_types(self):
+        invalid_sources = (
+            "struct S { int value; }; int main(void) { struct S value; "
+            "return value ? 1 : 0; }\n",
+            "int main(void) { int *pointer; return pointer ? pointer : 1; }\n",
+            "int main(void) { int *pointer; float *other; "
+            "return pointer ? pointer : other; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(CCompilerError):
+                    compile_source(source)
+
+    def test_c90_conditional_operator_accepts_arithmetic_and_null_pointer(self):
+        image = compile_source(
+            "int main(void) {\n"
+            "  int *pointer = 0;\n"
+            "  int result = 1 ? (pointer ? 4 : 0) : 6.5;\n"
+            "  return result != 4;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
     def test_global_pointer_initializer_uses_runtime_pointer_layout(self):
         image = compile_source(
             "unsigned char *device = 0x43101;\n"
