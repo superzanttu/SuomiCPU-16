@@ -1,6 +1,8 @@
 # MotoRobots Game Definition
 
-MotoRobots is a Factorio-type automation game focused on resource extraction, processing, and logistics using a fleet of transport robots.
+MotoRobots is a Factorio-type automation game focused on resource extraction, processing, and logistics using a fleet of transport robots. 
+
+**Target Platform**: SuomiCPU-16. The game is designed to fit within the architecture's constraints (16-bit words, limited memory, specific I/O capabilities) and is programmed in the SuomiCPU-16 C-language.
 
 ## 1. Core Gameplay Loop
 Mines extract resources from ground. Robots transport resources from mines to factories, and from factories to storage. Player controls robots by defining source and target locations for each transport task.
@@ -27,7 +29,7 @@ Buildings are constructed for free, because this is first prototype game.
 #### Robot Specifications
 - **Movement**: Robots are autonomous units that follow the instructions given by the player.
 - **Task Execution**: Robots execute transport tasks by moving between the defined source and target locations.
-- **Capacity**: Robots can carry up to 5 items.
+- **Capacity**: Robots can carry up to 5 items. (Limited to fit within register/memory constraints).
 - **Energy**: Robots don't consume energy.
 - **Speed**: Movement speed is 2 tiles per second. Load/unload speed is 0.5 seconds per item.
 - **Movement**: Robots can move forward and backward, turn left and right.
@@ -35,7 +37,7 @@ Buildings are constructed for free, because this is first prototype game.
 
 ## 3. World & Map
 ### 3.1 Map Generation
-- **Map Type**: Infinite procedurally generated tile map.
+- **Map Type**: Procedurally generated tile map. To accommodate SuomiCPU-16 memory, the map uses a **chunk-based loading system** where only active areas are held in memory.
 
 #### Generation Rules
 - **Terrain**: Maps have lakes and rivers. Mountains are formed by clusters of rocks.
@@ -85,13 +87,13 @@ Buildings are constructed for free, because this is first prototype game.
 ### 5.1 Pathfinding
 
 #### Pathfinding Algorithm
-- **Algorithm**: Robots use A* to find routes on the map.
+- **Algorithm**: Robots use a simplified A* or Dijkstra's algorithm. To save CPU cycles on SuomiCPU-16, pathfinding is computed incrementally or cached.
 - **Dynamic Obstacles**: If a robot hits a blocked tile, it recalculates the path to avoid the obstacle.
 
 ### 5.2 Save/Load System
-- **Persistence**: Game state, including the infinite map and all entity states, is saved to a persistent storage system.
-- **Map Storage**: Map is stored as a series of chunks, each containing a portion of the map and its associated entities.
-- **State Restoration**: State of robots and other entities is also saved and restored during the save/load process.
+- **Persistence**: Game state is saved using the SuomiCPU-16 memory-mapped I/O or specific storage registers.
+- **Map Storage**: Map is stored as a series of chunks to minimize RAM usage.
+- **State Restoration**: State of robots and other entities is also saved and restored.
     
 ## 6. User Interface (GUI)
 ### 6.1 Map View
