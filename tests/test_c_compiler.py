@@ -171,6 +171,246 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 7)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 8)
 
+    def test_c90_string_concatenation_and_inferred_array_bounds(self):
+        image = compile_source(
+            'int data[] = { 1, 2, 3 };\n'
+            'char text[] = "ab" "cd";\n'
+            'int result;\n'
+            'int main(void) {\n'
+            '  char local[] = "x" "y";\n'
+            '  result = sizeof(data) + sizeof(text) + sizeof(local)\n'
+            '      + data[2] + text[1] + local[1];\n'
+            '  return 0;\n'
+            '}\n'
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 11), 236)
+
+    def test_unsized_local_array_requires_initializer(self):
+        with self.assertRaisesRegex(CCompilerError, "requires an initializer"):
+            compile_source("int main(void) { int data[]; return 0; }")
+
+    def test_c90_goto_and_labeled_statements(self):
+        image = compile_source(
+            "int result;\n"
+            "int main(void) {\n"
+            "  result = 1;\n"
+            "  goto done;\n"
+            "  result = 2;\n"
+            "done:\n"
+            "  result += 4;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 5)
+
+    def test_c90_goto_requires_a_defined_label(self):
+        with self.assertRaisesRegex(CCompilerError, "undefined label"):
+            compile_source("int main(void) { goto missing; return 0; }")
+
+    def test_c90_array_parameters_adjust_to_pointers(self):
+        image = compile_source(
+            "int sum(int values[3]);\n"
+            "int result;\n"
+            "int sum(int values[]) { return values[0] + values[1] + values[2]; }\n"
+            "int main(void) { int items[3]; items[0] = 2; items[1] = 3; items[2] = 4; "
+            "result = sum(items); return 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
+
+    def test_c90_standard_string_and_memory_library(self):
+        image = compile_source(
+            "#include <string.h>\n"
+            "size_t result;\n"
+            "int comparison;\n"
+            "char buffer[12];\n"
+            "int main(void) {\n"
+            "  char first[8];\n"
+            "  char second[8];\n"
+            "  strcpy(first, \"abc\");\n"
+            "  strcpy(second, \"abd\");\n"
+            "  result = strlen(first);\n"
+            "  comparison = strcmp(first, second);\n"
+            "  strcat(buffer, first);\n"
+            "  memcpy(buffer + 3, second, 3);\n"
+            "  buffer[6] = '\\0';\n"
+            "  comparison += memcmp(buffer, \"abcabd\", 6);\n"
+            "  memmove(buffer + 1, buffer, 5);\n"
+            "  memset(buffer + 6, '!', 2);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 3)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), -1 & 0xFFFF)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 4:GLOBAL_BASE + 12], b"aabcab!!")
+
+    def test_c90_string_search_and_bounded_operations(self):
+        image = compile_source(
+            "#include <string.h>\n"
+            "char text[16];\n"
+            "char copy[16];\n"
+            "int results[10];\n"
+            "int main(void) {\n"
+            "  strcpy(text, \"abc\");\n"
+            "  results[0] = strcspn(text, \"x\");\n"
+            "  results[1] = strspn(text, \"ab\");\n"
+            "  results[2] = strncmp(text, \"abd\", 2);\n"
+            "  results[3] = strchr(text, 'b') == text + 1;\n"
+            "  results[4] = strrchr(text, 'a') == text;\n"
+            "  results[5] = strpbrk(text, \"xb\") == text + 1;\n"
+            "  results[6] = strstr(text, \"bc\") == text + 1;\n"
+            "  results[7] = strcoll(text, \"abd\") < 0;\n"
+            "  results[8] = strxfrm(copy, text, sizeof(copy));\n"
+            "  strncpy(copy, \"xy\", 4);\n"
+            "  strncat(text, \"de\", 1);\n"
+            "  results[9] = strcmp(text, \"abcd\") == 0;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 32 + index * 2) for index in range(10)],
+            [3, 2, 0, 1, 1, 1, 1, 1, 3, 1],
+        )
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 16:GLOBAL_BASE + 20], b"xy\0\0")
+
+    def test_c90_ctype_library(self):
+        image = compile_source(
+            "#include <ctype.h>\n"
+            "int results[14];\n"
+            "int main(void) {\n"
+            "  results[0] = isalnum('z');\n"
+            "  results[1] = isalpha('5');\n"
+            "  results[2] = iscntrl(127);\n"
+            "  results[3] = isdigit('4');\n"
+            "  results[4] = isgraph(' ');\n"
+            "  results[5] = islower('m');\n"
+            "  results[6] = isprint('~');\n"
+            "  results[7] = ispunct('!');\n"
+            "  results[8] = isspace('\\n');\n"
+            "  results[9] = isupper('A');\n"
+            "  results[10] = isxdigit('f');\n"
+            "  results[11] = tolower('Q') == 'q';\n"
+            "  results[12] = toupper('x') == 'X';\n"
+            "  results[13] = tolower('5') == '5';\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(14)],
+            [1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        )
+
+    def test_c90_limits_header_matches_target_types(self):
+        image = compile_source(
+            "#include <limits.h>\n"
+            "#if CHAR_BIT != 8 || SCHAR_MIN != -128 || UCHAR_MAX != 255\n"
+            "#error incorrect character limits\n"
+            "#endif\n"
+            "#if INT_MIN != -32768 || INT_MAX != 32767 || UINT_MAX != 65535\n"
+            "#error incorrect int limits\n"
+            "#endif\n"
+            "#if LONG_MIN != -32768 || LONG_MAX != 32767 || ULONG_MAX != 65535\n"
+            "#error incorrect target long limits\n"
+            "#endif\n"
+            "#if WCHAR_MIN != -32768 || WCHAR_MAX != 32767\n"
+            "#error incorrect wide character limits\n"
+            "#endif\n"
+            "int main(void) { return 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_offsetof_macro(self):
+        image = compile_source(
+            "#include <stddef.h>\n"
+            "struct Pair { char first; int second; };\n"
+            "size_t result = offsetof(struct Pair, second);\n"
+            "int main(void) {\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 2)
+
+    def test_c90_float_header_matches_binary16_target(self):
+        image = compile_source(
+            "#include <float.h>\n"
+            "#if FLT_RADIX != 2 || FLT_MANT_DIG != 11 || FLT_DIG != 3\n"
+            "#error incorrect float characteristics\n"
+            "#endif\n"
+            "#if DBL_MANT_DIG != 11 || DBL_DIG != 3\n"
+            "#error incorrect double characteristics\n"
+            "#endif\n"
+            "#if FLT_MIN_EXP != -13 || FLT_MAX_EXP != 16\n"
+            "#error incorrect float exponent range\n"
+            "#endif\n"
+            "int results[6];\n"
+            "int main(void) {\n"
+            "  results[0] = FLT_MAX == 65504.0;\n"
+            "  results[1] = FLT_EPSILON == 0.0009765625;\n"
+            "  results[2] = FLT_MIN == 0.00006103515625;\n"
+            "  results[3] = DBL_MAX == FLT_MAX;\n"
+            "  results[4] = DBL_EPSILON == FLT_EPSILON;\n"
+            "  results[5] = DBL_MIN == FLT_MIN;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(6)],
+            [1, 1, 1, 1, 1, 1],
+        )
+
+    def test_c90_basic_stdlib_functions(self):
+        image = compile_source(
+            "#include <stdlib.h>\n"
+            "int results[7];\n"
+            "int main(void) {\n"
+            "  results[0] = abs(-12);\n"
+            "  results[1] = labs(-13L);\n"
+            "  results[2] = atoi(\"  -123tail\");\n"
+            "  results[3] = atol(\"+321\");\n"
+            "  srand(7);\n"
+            "  results[4] = rand();\n"
+            "  srand(7);\n"
+            "  results[5] = rand();\n"
+            "  results[6] = rand() <= RAND_MAX;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(7)],
+            [12, 13, -123 & 0xFFFF, 321, 26220, 26220, 1],
+        )
+
+    def test_c90_errno_header(self):
+        image = compile_source(
+            "#include <errno.h>\n"
+            "int main(void) {\n"
+            "  errno = EDOM;\n"
+            "  if (errno != 33) return 1;\n"
+            "  errno = ERANGE;\n"
+            "  return errno != 34;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
     def test_executes_recursive_factorial_example(self):
         image = compile_source(
             "int result;\n"

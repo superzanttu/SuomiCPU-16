@@ -1,0 +1,28 @@
+#ifndef _SC16_FLOAT_H
+#define _SC16_FLOAT_H
+
+#define FLT_RADIX 2
+#define FLT_ROUNDS 1
+
+#define FLT_MANT_DIG 11
+#define DBL_MANT_DIG 11
+#define FLT_DIG 3
+#define DBL_DIG 3
+
+#define FLT_MIN_EXP (-13)
+#define DBL_MIN_EXP (-13)
+#define FLT_MIN_10_EXP (-4)
+#define DBL_MIN_10_EXP (-4)
+#define FLT_MAX_EXP 16
+#define DBL_MAX_EXP 16
+#define FLT_MAX_10_EXP 4
+#define DBL_MAX_10_EXP 4
+
+#define FLT_MAX 65504.0
+#define DBL_MAX 65504.0
+#define FLT_EPSILON 0.0009765625
+#define DBL_EPSILON 0.0009765625
+#define FLT_MIN 0.00006103515625
+#define DBL_MIN 0.00006103515625
+
+#endif

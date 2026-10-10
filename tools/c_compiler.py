@@ -72,6 +72,29 @@ LIBRARY_FILES = {
     **{name: "lib_text.asm" for name in SCREEN_LIBRARY_FUNCTIONS},
     **{name: "lib_cgfx.asm" for name in GRAPHICS_LIBRARY_FUNCTIONS},
 }
+STANDARD_C_SOURCE = {
+    **{
+        name: "string.c"
+        for name in (
+            "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat",
+            "strchr", "strcmp", "strcoll", "strcpy", "strcspn", "strerror",
+            "strlen", "strncat", "strncmp", "strncpy", "strpbrk", "strrchr",
+            "strspn", "strstr", "strtok", "strxfrm",
+        )
+    },
+    **{
+        name: "ctype.c"
+        for name in (
+            "isalnum", "isalpha", "iscntrl", "isdigit", "isgraph", "islower",
+            "isprint", "ispunct", "isspace", "isupper", "isxdigit",
+            "tolower", "toupper",
+        )
+    },
+    **{
+        name: "stdlib.c"
+        for name in ("abs", "labs", "atoi", "atol", "rand", "srand")
+    },
+}
 
 
 ALU_NAMES = {"+": "ADD", "-": "SUB", "&": "AND", "|": "OR", "^": "XOR"}
@@ -487,6 +510,10 @@ class _Parser:
                     declarator_type = self._pointer_type(field_type)
                     field_name = self.expect_identifier("expected a field name")
                     declarator_type, array_size = self._declarator_suffix(declarator_type)
+                    if array_size == -1:
+                        raise CCompilerError(
+                            f"{self.filename}:{field_name.line}: record array fields require a bound"
+                        )
                     if declarator_type == "void":
                         raise CCompilerError(
                             f"{self.filename}:{field_name.line}: fields cannot have void type"
@@ -578,6 +605,8 @@ class _Parser:
     def _declarator_suffix(self, c_type: str) -> tuple[str, int]:
         if not self.accept("["):
             return c_type, 0
+        if self.accept("]"):
+            return c_type, -1
         size_token = self.take()
         if not size_token.value.isdigit():
             raise CCompilerError(
@@ -588,6 +617,39 @@ class _Parser:
             raise CCompilerError(f"{self.filename}:{size_token.line}: array size is out of range")
         self.expect("]")
         return c_type, size
+
+    def _infer_array_size(
+        self,
+        array_size: int,
+        c_type: str,
+        initializer: Expr | None,
+        line: int,
+        *,
+        file_scope: bool = False,
+    ) -> int:
+        if array_size != -1:
+            return array_size
+        if initializer is None:
+            if file_scope:
+                return 1
+            raise CCompilerError(
+                f"{self.filename}:{line}: an array with omitted size requires an initializer"
+            )
+        if initializer.kind == "string":
+            if c_type not in ("char", "unsigned char"):
+                raise CCompilerError(
+                    f"{self.filename}:{line}: string initializer requires a character array"
+                )
+            return len(initializer.value)
+        if initializer.kind == "init_list":
+            if not initializer.children:
+                raise CCompilerError(
+                    f"{self.filename}:{line}: an array initializer cannot be empty"
+                )
+            return len(initializer.children)
+        raise CCompilerError(
+            f"{self.filename}:{line}: an array with omitted size requires an initializer"
+        )
 
     def _initializer(self) -> Expr:
         if self.accept("{"):
@@ -680,12 +742,15 @@ class _Parser:
         parameters = []
         while True:
             c_type = self.parse_type()
+            c_type = self._pointer_type(c_type)
             if c_type == "void":
                 raise self.fail("void is only valid as an empty parameter list")
-            c_type = self._pointer_type(c_type)
             name = None
             if re.fullmatch(r"[A-Za-z_]\w*", self.token.value):
                 name = self.take().value
+            _, array_size = self._declarator_suffix(c_type)
+            if array_size != 0:
+                c_type += "*"
             parameters.append((c_type, name))
             if not self.accept(","):
                 break
@@ -709,6 +774,9 @@ class _Parser:
                     f"{self.filename}:{name_token.line}: object has incomplete record type"
                 )
             initializer = self._initializer() if self.accept("=") else None
+            array_size = self._infer_array_size(
+                array_size, current_type, initializer, name_token.line, file_scope=True
+            )
             self.globals.append(
                 Global(name, current_type, initializer, name_token.line, array_size)
             )
@@ -769,6 +837,9 @@ class _Parser:
                     f"{self.filename}:{token.line}: object has incomplete record type"
                 )
             initializer = self._initializer() if self.accept("=") else None
+            array_size = self._infer_array_size(
+                array_size, current_type, initializer, token.line
+            )
             local = Local(
                 token.value, current_type, initializer, self._local_count, token.line, array_size
             )
@@ -865,6 +936,17 @@ class _Parser:
         if self.accept("continue"):
             self.expect(";")
             return Stmt("continue", line=token.line)
+        if self.accept("goto"):
+            label = self.expect_identifier("expected a label name after goto")
+            self.expect(";")
+            return Stmt("goto", value=label.value, line=token.line)
+        if (
+            re.fullmatch(r"[A-Za-z_]\w*", self.token.value)
+            and self.peek() == ":"
+        ):
+            label = self.take()
+            self.take()
+            return Stmt("label", value=label.value, children=[self.parse_statement()], line=label.line)
         expression = self.parse_expression()
         self.expect(";")
         return Stmt("expression", children=[expression], line=token.line)
@@ -1081,6 +1163,7 @@ class _CodeGenerator:
         self.prototypes: dict[str, tuple[str, int]] = {}
         self.used_libraries: set[str] = set()
         self.enum_constants: dict[str, int] = {}
+        self.label_names: set[str] = set()
 
     def emit(self, line: str) -> None:
         self.lines.append(line)
@@ -1273,11 +1356,29 @@ class _CodeGenerator:
         if expression.kind == "conditional":
             condition = self._constant(expression.children[0])
             return self._constant(expression.children[1] if condition else expression.children[2])
+        if expression.kind == "cast":
+            return self._constant(expression.children[0])
         if expression.kind == "address_constant":
             return int(expression.value)
         if expression.kind == "float_constant":
             return int(expression.value) & WORD_MASK
         if expression.kind == "unary":
+            if expression.value == "&" and expression.children[0].kind == "member":
+                member = expression.children[0]
+                operator, field_name = member.value
+                pointer = member.children[0]
+                if (
+                    operator == "->"
+                    and pointer.kind == "cast"
+                    and pointer.children[0].kind == "constant"
+                    and int(pointer.children[0].value) == 0
+                ):
+                    record_type = str(pointer.value)
+                    if record_type.endswith("*"):
+                        record_type = record_type[:-1]
+                    return self._record_field(
+                        record_type, str(field_name), expression.line
+                    ).offset
             value = self._constant(expression.children[0])
             operator = str(expression.value)
             if operator == "+":
@@ -1343,6 +1444,30 @@ class _CodeGenerator:
 
     def _generate_function(self, function: Function) -> None:
         self.current_function = function
+        self.label_names = set()
+        goto_targets: set[str] = set()
+
+        def collect_labels(statement: Stmt) -> None:
+            if statement.kind == "label":
+                label_name = str(statement.value)
+                if label_name in self.label_names:
+                    raise self.error(statement.line, f"duplicate label {label_name!r}")
+                self.label_names.add(label_name)
+            elif statement.kind == "goto":
+                goto_targets.add(str(statement.value))
+            for child in statement.children:
+                if isinstance(child, Stmt):
+                    collect_labels(child)
+            if statement.kind == "switch":
+                for _, body, _ in statement.value:
+                    for child in body:
+                        collect_labels(child)
+
+        collect_labels(function.body)
+        undefined_labels = goto_targets - self.label_names
+        if undefined_labels:
+            name = sorted(undefined_labels)[0]
+            raise self.error(function.line, f"goto references undefined label {name!r}")
         declaration = self.prototypes.get(function.name)
         if declaration is not None and declaration != (
             function.return_type,
@@ -1558,6 +1683,15 @@ class _CodeGenerator:
 
     def _statement(self, statement: Stmt) -> None:
         kind = statement.kind
+        if kind == "label":
+            self.emit(f"__c_label_{self.current_function.name}_{statement.value}:")
+            self._statement(statement.children[0])
+            return
+        if kind == "goto":
+            self.emit(
+                f"    JMPX __c_label_{self.current_function.name}_{statement.value}"
+            )
+            return
         if kind == "empty":
             return
         if kind == "block":
@@ -2543,6 +2677,25 @@ class _CodeGenerator:
 def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
     parser = _Parser(source, filename)
     globals_, functions = parser.parse()
+    standard_calls = _called_functions(parser) - {
+        function.name for function in functions
+    }
+    runtime_sources = sorted(
+        {STANDARD_C_SOURCE[name] for name in standard_calls if name in STANDARD_C_SOURCE}
+    )
+    if runtime_sources:
+        library_root = Path(__file__).resolve().parent.parent / "lib"
+        library_sources = []
+        for runtime_source in runtime_sources:
+            library_path = library_root / runtime_source
+            try:
+                library_sources.append(library_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError) as exc:
+                raise CCompilerError(
+                    f"{filename}: cannot read standard C library source {library_path}: {exc}"
+                ) from exc
+        parser = _Parser(source + "\n" + "\n".join(library_sources), filename)
+        globals_, functions = parser.parse()
     generator = _CodeGenerator(globals_, functions, filename, parser.records)
     generator.prototypes = parser.prototypes
     generator.enum_constants = parser.enum_constants
@@ -2553,6 +2706,33 @@ def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
     except AssemblyError as exc:
         raise CCompilerError(f"{filename}: generated SC-16 assembly is invalid: {exc}") from exc
     return assembly, image
+
+
+def _called_functions(parser: _Parser) -> set[str]:
+    names: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Expr):
+            if value.kind == "call":
+                names.add(str(value.value))
+            for child in value.children:
+                visit(child)
+        elif isinstance(value, Stmt):
+            visit(value.value)
+            visit(value.children)
+        elif isinstance(value, Local):
+            visit(value.initializer)
+        elif isinstance(value, Global):
+            visit(value.initializer)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    for global_ in parser.globals:
+        visit(global_)
+    for function in parser.functions:
+        visit(function.body)
+    return names
 
 
 def compile_to_assembly(source: str, filename: str = "<input>") -> str:
@@ -3102,7 +3282,26 @@ def _lex(source: str, filename: str) -> list[Token]:
     }
     source = _preprocess(source, filename, defines)
     tokens = _lex_raw(source, filename)
-    return _expand_macros(tokens, defines, filename) if defines else tokens
+    if defines:
+        tokens = _expand_macros(tokens, defines, filename)
+    concatenated: list[Token] = []
+    for token in tokens:
+        if (
+            concatenated
+            and token.value.startswith("<string:")
+            and token.value.endswith(">")
+            and concatenated[-1].value.startswith("<string:")
+            and concatenated[-1].value.endswith(">")
+        ):
+            previous = concatenated[-1]
+            left = bytes.fromhex(previous.value[8:-1])
+            right = bytes.fromhex(token.value[8:-1])
+            concatenated[-1] = Token(
+                f"<string:{(left + right).hex()}>", previous.line
+            )
+        else:
+            concatenated.append(token)
+    return concatenated
 
 
 if __name__ == "__main__":

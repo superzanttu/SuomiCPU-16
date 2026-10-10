@@ -481,40 +481,78 @@ table to unpack the pixels.
 
 ## 9. ANSI C90 compiler
 
-[`tools/c_compiler.py`](tools/c_compiler.py) implements a small, dependency-free C89 subset
-compiler; it is not a complete C89 implementation. Supported types are signed
-`int`, `unsigned int`, `char`, `unsigned char`, `float`, `void`, pointers to
-supported object types, and fixed-size arrays. It accepts global and local
-variables, function prototypes and definitions, recursion, calls, and C89-style
-declarations at the start of each block.
+[`tools/c_compiler.py`](tools/c_compiler.py) is a C90-oriented compiler, **not a
+fully conforming ANSI/ISO C90 implementation**. It implements a substantial
+subset of the language and common preprocessing features, but some required
+C90 constructs, target type requirements, and the standard library are not
+implemented. Do not assume that a program accepted by another C90 compiler
+will compile or have identical behavior on SC-16.
 
-Supported statements are blocks, expression statements, `if`/`else`, `while`,
-`do`/`while`, `for`, `switch`, `break`, `continue`, and `return`. `switch`
-accepts constant `case` labels and one optional `default`; cases fall through
-until a `break`. Expressions include numeric and character constants, string
-literals, scalar and pointer assignment, compound assignment,
-prefix/postfix increment and decrement, unary `+`, `-`, `!`, `~`, arithmetic
-`+`, `-`, `*`, `/`, `%`, bitwise `&`, `|`, `^`, comparisons, and short-circuit
-`&&` and `||`.
+Supported language features include:
 
-Integer and pointer details:
+- File-scope and block-scope declarations; function prototypes and definitions;
+  recursion; and C90 declarations before statements within a block.
+- `typedef` names, enumerations, structure and union declarations, member access
+  with `.` and `->`, and scalar, array, and aggregate initialization.
+- One-dimensional bounded arrays and initialized arrays with an omitted bound,
+  array parameters adjusted to pointers, pointers, casts, `sizeof`, and the
+  comma and conditional operators.
+- Blocks, expression statements, `if`/`else`, loops, `switch`, `case`,
+  `default`, `break`, `continue`, `goto`, labeled statements, and `return`.
+- Integer and floating constants, character constants, strings (including
+  adjacent string-literal concatenation), assignment and compound assignment,
+  increment/decrement, arithmetic, bitwise and shift operations, comparisons,
+  and logical operators with short-circuit evaluation.
+- Object-like and function-like macros, `#`, `##`, `defined`, conditional
+  inclusion, `#include`, `#undef`, `#error`, `#pragma`, trigraph replacement,
+  and backslash-newline splicing. Quoted includes are searched relative to the
+  including file; angle-bracket includes are searched in the repository's
+  `lib/` directory.
 
-- `int` and `unsigned int` are 16-bit values. Arithmetic wraps modulo 65536;
-  signed comparisons and division apply to `int`, unsigned comparisons and
-  division apply to `unsigned int`. Signed division truncates toward zero and
-  signed remainder has the dividend's sign.
-- `char` array elements and string data occupy one byte. Integer and floating
-  objects occupy two bytes. Floating-point values use IEEE-754 binary16.
-- Pointers occupy three bytes, matching the CPU's 19-bit address space.
-  Pointer arithmetic and array indexing scale by the element size.
-- Global storage begins at `0xE800` (`GLOBAL_BASE` in
-  [`tools/c_compiler.py`](tools/c_compiler.py)); uninitialized globals are zeroed. Local
-  variables, arguments, return addresses, and temporaries use the machine stack.
+The compiler's data model is target-specific and does **not** meet all the C90
+minimum requirements:
 
-The subset excludes storage-class and type qualifiers, structures, unions,
-enums, `typedef`, function-like macros, `goto`, casts, and most of the C standard
-library. Global initializers must be constant expressions supported by the
-compiler.
+- `int` and `unsigned int` are 16-bit; `char` and `unsigned char` occupy one
+  byte. Signed and unsigned 16-bit arithmetic wraps modulo 65536.
+- `float` and `double` use the SC-16 IEEE-754 binary16 format. `short` and
+  `long` integer specifiers are accepted but currently map to the same 16-bit
+  integer types; in particular, `long` does not provide C90's required minimum
+  range.
+- Object pointers occupy three bytes for the machine's 19-bit address space.
+  Function pointers and general function-pointer calls are not supported.
+- `static`, `extern`, `auto`, `register`, `const`, and `volatile` specifiers
+  are accepted in supported declarations but do not have their full C linkage,
+  storage-duration, or qualifier semantics.
+- Global storage begins at `0x2000` (`GLOBAL_BASE` in
+  [`tools/c_compiler.py`](tools/c_compiler.py)); uninitialized globals are
+  zeroed. Local variables, arguments, return addresses, and temporaries use the
+  machine stack.
+
+Important language gaps include multidimensional arrays, array typedefs,
+old-style function definitions, function pointers, structure/union value
+assignment and passing/returning records by value, and parts of C90's
+declarator, initializer, and constant-expression rules. The preprocessor also
+does not implement every translation-phase and directive semantic required for
+strict C90 conformance; for example, `#line` is accepted but does not remap
+subsequent diagnostic locations.
+
+The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`, `<float.h>`, `<ctype.h>`,
+`<errno.h>`, `<stdlib.h>`, and `<string.h>`. `<stddef.h>` includes `offsetof`,
+which supports direct struct/union member offsets in constant initializers.
+The string/memory routines,
+C-locale character routines, and a subset of the basic `<stdlib.h>` routines
+(`abs`, `labs`, `atoi`, `atol`, `rand`, and `srand`) are compiled into a
+program when referenced. `RAND_MAX` is 32767; the sequence from `rand` is
+implementation-defined. The limit and floating-point macros describe the
+target's actual types; they also make C90 minimum-range incompatibilities
+visible: `long` has only the same 16-bit range as `int`, and `double` has the
+same binary16 precision and range as `float`. `size_t` is 16-bit and cannot
+represent every object size available in the machine's address space. These
+headers are partial: many required `<stdlib.h>` facilities and other C90
+headers—including `stdio.h`—are not implemented. The project's screen and
+graphics routines are SC-16-specific extensions, not replacements for those
+standard facilities. Global initializers must be constant expressions
+supported by the compiler.
 
 There is no `printf` or separate console device. When a screen routine is
 referenced, the compiler links [`lib/lib_text.asm`](lib/lib_text.asm), which uses
@@ -536,23 +574,21 @@ do not use that region for application data while a screen routine is running.
 See [`examples/text_demo.c`](examples/text_demo.c) for a C example.
 
 Generated C code uses the far control instructions (`JMPX`, `CALLX`, `BZX`,
-`BCX`). Address 0 holds a small entry stub (`JMP` to a boot routine at `0x0006` that runs `CALLX main; HALT`; `0x0002`-`0x0005` hold the interrupt vectors); compiled code
-starts at `0x4800` (above the font and library scratch memory) and must stay\nbelow `0xE800`, where globals begin (and below `0x10000`), because `CALLX` pushes a 16-bit return address. Libraries
-live below that: `lib_gfx` at `0x400`, `lib_text` at `0x700`, and `lib_cgfx`
-at `0x1000`. The compiler reports assembler errors when generated code or
-stack frames exceed supported limits. The command-line compiler writes a flat `.bin` image
-with address gaps zero-filled; the emulator loads it at address zero. In
-[`examples/factorial.c`](examples/factorial.c), the global `result` should
-contain 123 at `0xE800` after execution.
+`BCX`). Address 0 holds an entry stub; `0x0002`-`0x0005` hold interrupt
+vectors, and the boot routine at `0x0006` calls `main`. Compiled code starts at
+`0x4800`; global data starts at `0x2000`, so large code and data sections must
+not overlap. The code and return addresses must also remain below `0x10000`,
+because the call stack stores 16-bit return addresses. Libraries use fixed
+low-memory locations: `lib_gfx` at `0x400`, `lib_text` at `0x700`, and
+`lib_cgfx` at `0x1000`. The compiler/assembler reports errors when emitted
+sections overlap or stack frames exceed supported limits. The command-line
+compiler writes a flat `.bin` image with address gaps zero-filled; the emulator
+loads it at address zero. In [`examples/factorial.c`](examples/factorial.c),
+the global `result` is stored at `0x2000` after execution.
 
-### Preprocessor, shifts and arrays
-
-A minimal preprocessor handles object-like `#define NAME tokens` (replaced as
-tokens, may nest) and `#include "file"` or `#include <file>` (searched next to
-the source file, then next to the compiler). Function-like macros and other
-directives are errors. Binary `<<` and `>>` are supported: `>>` is arithmetic
-for `int` and logical for unsigned types. `x[i]++` and casts are not supported;
-write `x[i] = x[i] + 1`.
+The preprocessor implements the directives and extensions listed above, but is
+not certified against the full C90 translation limits or conformance suite.
+For shifts, `>>` is arithmetic for `int` and logical for unsigned types.
 
 ### C graphics library (`gfx_*`)
 
@@ -792,7 +828,7 @@ C builtins: `gfx_ticks()`, `gfx_rtc(field)`, `gfx_irq_init()` (executes EI),
 Interrupt handlers live in `lib_cgfx.asm` at fixed addresses: `irq_timer` at
 0x0010 (vector 0x0004) and `irq_key` at 0x0030 (vector 0x0002). The C entry stub
 is `JMP __c_boot` at 0 with the boot code at 6. `RTI` restores both Z and C flags.
-C globals start at 0xE800.
+C globals start at 0x2000.
 
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 

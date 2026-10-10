@@ -5,7 +5,11 @@ SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
 ## Features
 - Full emulation of the SC-16 architecture.
 - Integrated assembler for SC-16 assembly language.
-- C90-oriented compiler for SC-16, including C90 preprocessing and core language constructs.
+- C90-oriented compiler for SC-16 with partial language/preprocessor support
+  and selected C90 headers (`stddef.h`, `limits.h`, `float.h`, `ctype.h`,
+  `errno.h`, `stdlib.h`, `string.h`)
+  (not a fully conforming C90 implementation; see the
+  [user guide](user_guide.md#9-ansi-c90-compiler)).
 - Basic graphics and text-mode support.
 
 ## Getting Started
