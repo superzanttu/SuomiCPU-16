@@ -420,9 +420,10 @@ memory ranges:
 | RAM and stack                            | `0x20000`-`0x2FFFF` |       64 KiB |
 | VRAM                                     | `0x30000`-`0x42BFF` | 76,800 bytes |
 | Keyboard                                 |           `0x43000` |       1 byte |
+| Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
 | Speed register (0 = fixed, 1 = maximum)  |           `0x43003` |       1 byte |
 | Held-key bitmask                         |           `0x43004` |       1 byte |
-| Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
+| Disk storage device                     |           `0x43100` |     16 bytes |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
 | Graphics coprocessor registers           | `0x43020`-`0x4302E` |     15 bytes |
 | Back buffer (coprocessor drawing target) | `0x44000`-`0x56BFF` | 76,800 bytes |
@@ -442,6 +443,17 @@ Keyboard key presses write the character byte to the keyboard address and mark
 a keyboard interrupt pending. The RTC writes seconds, minutes, and hours to its
 three declared byte addresses.
 
+The disk storage device is accessible starting at `0x43100`. It uses JSON files
+to store data blocks of 255 characters.
+- Write `0x01` to `0x43100` to load a disk; the 8-character disk ID must be placed
+  at `0x43101` through `0x43108`.
+- Write `0x02` to `0x43100` to unload and save the current disk.
+- Write `0x04` to `0x43100` to read a block; the 16-bit block pointer is at
+  `0x43110` and the RAM destination offset is at `0x43112`. The block is copied
+  to `0x20000 + offset`.
+- Write `0x08` to `0x43100` to write a block; the 16-bit block pointer is at
+  `0x43110` and the RAM source offset is at `0x43112`. Data is read from
+  `0x20000 + offset`.
 ## 8. Bitmap font
 
 [`fonts/font5x7.asm`](fonts/font5x7.asm) contains an original 5x7 bitmap font

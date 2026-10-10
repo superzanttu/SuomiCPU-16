@@ -13,6 +13,7 @@ from pathlib import Path
 from tools.assembler import AssemblyError, AssemblyImage, MemorySegment, assemble_file
 from tools.c_compiler import CCompilerError, compile_file
 from tools.sc16net import DEFAULT_PORT, MAX_PAYLOAD, NetNode, UdpTransport
+from src.lib_disk import DiskDevice
 
 # =============================================================================
 # ISA (Instruction Set Architecture) - Prosessorin "kieli"
@@ -72,7 +73,18 @@ RAM_START   = 0x20000 # Työmuistin alku
 VRAM_START  = 0x30000 # Videomuistin alku (tänne piirretään ruutu)
 KBD_ADDR    = 0x43000 # Näppäimistön osoite
 ICR_ADDR    = 0x43002 # Keskeytysten ohjaus
+DISK_BASE   = 0x43100 # Levylaitteen ohjaus (Disk storage)
+# DISK_BASE:
+# +0: Control register (Byte)
+#     0x01: Load disk (Disk ID in +1..+8)
+#     0x02: Unload disk
+#     0x04: Read block (Pointer in +10..+11, data in RAM_START + offset)
+#     0x08: Write block (Pointer in +10..+11, data from RAM_START + offset)
+# +1..+8: Disk ID (8 chars)
+# +10..+11: Block pointer (16-bit)
+# +12..+13: Buffer offset for RAM (16-bit)
 RTC_START   = 0x43010 # Reaaliaikakello
+
 KEYS_ADDR   = 0x43004 # Mitkä näppäimet on painettuna
 MOUSE_ADDR  = 0x43008 # Mouse: +0 X word, +2 Y word, +4 held buttons, +5 click events (one frame)
 GPU_BASE    = 0x43020 # Grafiikkapiirin ohjausrekisterit
@@ -209,6 +221,7 @@ class SuomiCompute16:
         self.palette[25] = (0, 0, 255)
         self.frame_yield = False
         self.vram_surface = self._create_vram_surface()
+        self.disk = DiskDevice()
 
     def set_fullscreen(self, fullscreen):
         self.fullscreen = bool(fullscreen)
@@ -227,6 +240,8 @@ class SuomiCompute16:
         self.memory[addr] = val & 0xFF
         if addr == GPU_BASE:
             self.gpu_command(val & 0xFF)
+        elif addr == DISK_BASE:
+            self.disk_control(val & 0xFF)
 
     def _gpu_word(self, offset, signed=True):
         value = (self.memory[GPU_BASE + offset] << 8) | self.memory[GPU_BASE + offset + 1]
@@ -341,6 +356,25 @@ class SuomiCompute16:
         value &= 0xFFFF
         self.memory[GPU_BASE + 14] = value >> 8
         self.memory[GPU_BASE + 15] = value & 0xFF
+
+    def disk_control(self, command):
+        """Disk device memory-mapped control."""
+        if command & 0x01: # Load disk
+            disk_id = "".join(chr(self.memory[DISK_BASE + 1 + i]) for i in range(8))
+            self.disk.load_disk(disk_id)
+        if command & 0x02: # Unload disk
+            self.disk.unload_disk()
+        if command & 0x04: # Read block
+            ptr = self.read_16(DISK_BASE + 10)
+            offset = self.read_16(DISK_BASE + 12)
+            data = self.disk.read_block(ptr)
+            for i, char in enumerate(data):
+                self.write(RAM_START + offset + i, ord(char))
+        if command & 0x08: # Write block
+            ptr = self.read_16(DISK_BASE + 10)
+            offset = self.read_16(DISK_BASE + 12)
+            data = "".join(chr(self.read(RAM_START + offset + i)) for i in range(255))
+            self.disk.write_block(ptr, data)
 
     def _gpu_net(self, command, query, arg):
         """Networking commands; see tools/sc16net.py for the protocol."""
