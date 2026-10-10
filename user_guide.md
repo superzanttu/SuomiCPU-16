@@ -263,6 +263,35 @@ where needed to implement its 16-bit integer semantics.
 operand is less than the second. `AND`, `OR`, `XOR`, `NOT`, `INC`, and `DEC` do
 not update the flags in the current emulator.
 
+### 32-bit register-pair arithmetic
+
+`ADD32`, `SUB32`, `CMP32`, `AND32`, `OR32`, `XOR32`, `SHL32`, `LSR32`,
+`ASR32`, `NEG32`, and `MOV32` operate on adjacent register pairs. The even
+register is the high 16 bits and the following odd register is the low 16 bits:
+for example, `R0` names the `R0:R1` pair and `R2` names `R2:R3`. Binary
+arithmetic/logic operations and `MOV32` require even pair registers. Shift
+counts may be an immediate from 0 to 31 or the low five bits of a register.
+
+`ADD32`/`SUB32` set `Z`, `N`, `C` and `V` for 32-bit arithmetic; `CMP32` sets
+the same flags without changing its destination. `AND32`/`OR32`/`XOR32` set
+`Z` and `N` and clear `C` and `V`. Shifts set `Z`, `N`, and `C` (the last bit
+shifted out) and clear `V`. A zero-count shift preserves `C`. `NEG32` sets
+`Z`, `N`, `C` (nonzero input), and `V` (the signed minimum value). `MOV32`
+does not change flags.
+
+These instructions use the extended `0x1A` selector in the `OP_SHR` space and
+are implemented by the Python emulator. The optional JIT hands this group back
+to the emulator. This provides core 32-bit pair arithmetic but does not by
+itself provide a 32-bit C `long` ABI or full C90 compatibility.
+
+Encoding: word 1 is `0xF800 | (high-register << 8) | 0x1A`; word 2 is
+`(operation << 12) | (immediate flag 0x0800) | source/count`. Operation codes
+are `ADD32`=0, `SUB32`=1, `CMP32`=2, `AND32`=3, `OR32`=4, `XOR32`=5,
+`SHL32`=6, `LSR32`=7, `ASR32`=8, `NEG32`=9, and `MOV32`=10. Shift immediates
+use the low five bits and the immediate flag; register shift counts use the
+low five bits of the selected register. The group occupies the previously
+unused `0x1A` selector, distinct from the existing `0x1B`-`0x1F` extensions.
+
 ### Integer multiply and divide
 
 | Instruction | Syntax                       | Operation                                                                       |

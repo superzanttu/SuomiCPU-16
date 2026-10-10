@@ -39,6 +39,25 @@ OP_FCMP = OP_SHR
 OP_ITOF = OP_SHR
 OP_FTOI = OP_SHR
 
+# 32-bit register-pair ALU group. The even register is the high word and the
+# following register is the low word. Pair operations use the reserved 0x1A
+# extension selector in the OP_SHR space.
+WIDE_PREFIX = 0x1A
+WIDE_IMMEDIATE_FLAG = 0x0800
+WIDE_OPERATIONS = {
+    "ADD32": 0,
+    "SUB32": 1,
+    "CMP32": 2,
+    "AND32": 3,
+    "OR32": 4,
+    "XOR32": 5,
+    "SHL32": 6,
+    "LSR32": 7,
+    "ASR32": 8,
+    "NEG32": 9,
+    "MOV32": 10,
+}
+
 # Integer multiply/divide group: a 32-bit (or 48-bit with an immediate) instruction.
 #   word 1: 0xF800 | (Rd << 8) | 0x1E   (OP_SHR extension space, prefix 0x1E)
 #   word 2: (operation << 12) | (immediate flag << 11) | Rs
@@ -168,6 +187,7 @@ OPCODES = {
     "BCX": OP_SHR,
 }
 OPCODES.update({name: OP_SHR for name in MULDIV_OPERATIONS})
+OPCODES.update({name: OP_SHR for name in WIDE_OPERATIONS})
 OPCODES.update({name: OP_SHR for name in MISC_OPERATIONS})
 OPCODES.update({name: OP_SHR for name in BRANCH_CONDITIONS})
 OPCODES.update({name: OP_SHR for name in BRANCH_ALIASES})

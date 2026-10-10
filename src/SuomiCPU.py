@@ -715,6 +715,72 @@ class SuomiCompute16:
         if operation not in (8, 14):
             self.registers[rd] = result
 
+    def _execute_wide(self, instr):
+        """Execute an operation on aligned high-word/low-word register pairs."""
+        rd = (instr >> 8) & 0x7
+        control = self.read_16(self.pc)
+        self.pc += 2
+        operation = control >> 12
+        immediate = bool(control & 0x0800)
+        left = ((self.registers[rd] & 0xFFFF) << 16) | (self.registers[rd + 1] & 0xFFFF)
+        if operation == 9:
+            result = (-left) & 0xFFFFFFFF
+            self._set_flags(
+                result >> 16,
+                left != 0,
+                int(left == 0x80000000),
+            )
+            self.flags["Z"] = int(result == 0)
+            self.flags["N"] = result >> 31
+            self.registers[rd] = result >> 16
+            self.registers[rd + 1] = result & 0xFFFF
+            return
+        if operation == 10:
+            source = control & 0x7
+            self.registers[rd] = self.registers[source] & 0xFFFF
+            self.registers[rd + 1] = self.registers[source + 1] & 0xFFFF
+            return
+        if operation in (6, 7, 8):
+            count = (control & 0x1F) if immediate else (self.registers[control & 0x7] & 0x1F)
+            if operation == 6:
+                carry = (left >> (32 - count)) & 1 if count else self.flags["C"]
+                result = (left << count) & 0xFFFFFFFF
+            elif operation == 7:
+                carry = (left >> (count - 1)) & 1 if count else self.flags["C"]
+                result = left >> count
+            else:
+                signed = left - 0x100000000 if left & 0x80000000 else left
+                carry = (signed >> (count - 1)) & 1 if count else self.flags["C"]
+                result = (signed >> count) & 0xFFFFFFFF
+            self.flags["Z"] = int(result == 0)
+            self.flags["N"] = result >> 31
+            self.flags["C"] = int(carry)
+            self.flags["V"] = 0
+        else:
+            source = control & 0x7
+            right = ((self.registers[source] & 0xFFFF) << 16) | (self.registers[source + 1] & 0xFFFF)
+            if operation in (0, 1, 2):
+                total = left + right if operation == 0 else left - right
+                result = total & 0xFFFFFFFF
+                self.flags["Z"] = int(result == 0)
+                self.flags["N"] = result >> 31
+                self.flags["C"] = int(total > 0xFFFFFFFF if operation == 0 else total < 0)
+                if operation == 0:
+                    overflow = (~(left ^ right) & (left ^ result) & 0x80000000) != 0
+                else:
+                    overflow = ((left ^ right) & (left ^ result) & 0x80000000) != 0
+                self.flags["V"] = int(overflow)
+                if operation == 2:
+                    return
+            else:
+                result = left & right if operation == 3 else left | right if operation == 4 else left ^ right
+                self.flags["Z"] = int(result == 0)
+                self.flags["N"] = result >> 31
+                self.flags["C"] = 0
+                self.flags["V"] = 0
+        self.registers[rd] = (result >> 16) & 0xFFFF
+        self.registers[rd + 1] = result & 0xFFFF
+
     def _execute_shift(self, rd, value, operation, count):
         """Shift or rotate `value` by `count` bits (0-15); C gets the last bit out."""
         if count == 0:
@@ -795,6 +861,8 @@ class SuomiCompute16:
         if opcode == OP_LDI: registers[rd] = imm
         elif opcode == OP_SHR and (instr & 0xF8FF) == 0xF81E:
             self._execute_muldiv(instr)
+        elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81A:
+            self._execute_wide(instr)
         elif opcode == OP_SHR and (instr & 0xF8FF) == 0xF81F:
             self._execute_alu(instr)
         elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81B:

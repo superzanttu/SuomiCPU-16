@@ -10,7 +10,7 @@ sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 import SuomiCPU as emulator  # noqa: E402
 from SuomiCPU import DISK_BASE, GPU_BASE, ICR_ADDR, MEM_SIZE, SuomiCompute16  # noqa: E402
 from tests.gfx_harness import make_cpu  # noqa: E402
-from tools.assembler import AssemblyImage, MemorySegment  # noqa: E402
+from tools.assembler import AssemblyImage, MemorySegment, assemble  # noqa: E402
 
 try:
     import sc16_jit  # noqa: F401
@@ -65,6 +65,25 @@ def reference_run(cpu, count):
 
 @unittest.skipUnless(HAVE_JIT, "numba is not installed")
 class JitEquivalenceTests(unittest.TestCase):
+    def test_32_bit_pair_instructions_fall_back_to_interpreter(self):
+        program = assemble(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\n"
+            "LDI R2, 0\nLDI R3, 1\nADD32 R0, R2\n"
+            "LDI R4, 0x8000\nLDI R5, 0\nNEG32 R4\n"
+            "LDI R6, 0\nLDI R7, 3\nSHL32 R6, 1\nHALT"
+        )
+        slow = make_cpu(program)
+        fast = make_cpu(program)
+        slow.use_jit = False
+        fast.use_jit = True
+        slow.gpu_log = []
+        fast.gpu_log = []
+        slow.gpu_command = lambda command: slow.gpu_log.append(command)
+        fast.gpu_command = lambda command: fast.gpu_log.append(command)
+        reference_run(slow, 100)
+        fast._execute_jit(100)
+        self.assertEqual(state(slow), state(fast))
+
     def test_random_programs_match_step(self):
         compared = 0
         for seed in range(250):

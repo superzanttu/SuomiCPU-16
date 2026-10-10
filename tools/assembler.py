@@ -19,6 +19,9 @@ from src.isa import (
     MULDIV_PREFIX,
     OPCODES,
     OP_LDI_H,
+    WIDE_IMMEDIATE_FLAG,
+    WIDE_OPERATIONS,
+    WIDE_PREFIX,
 )
 
 MEMORY_SIZE = 1 << 19
@@ -252,6 +255,11 @@ def _alu_name(mnemonic: str, operands: list[str]) -> str | None:
 
 def _extended_size(mnemonic: str, operands: list[str], line_number: int) -> int | None:
     """Size in bytes of the extended instructions, or None for other mnemonics."""
+    if mnemonic in WIDE_OPERATIONS:
+        if len(operands) != (1 if mnemonic == "NEG32" else 2):
+            count = 1 if mnemonic == "NEG32" else 2
+            raise _error(line_number, f"{mnemonic} expects {count} operand(s)")
+        return 4
     if mnemonic in BRANCH_CONDITIONS or mnemonic in BRANCH_ALIASES:
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")
@@ -277,6 +285,29 @@ def _assemble_extended(
             raise _error(line_number, "NOP expects no operands")
         return [OPCODES["MOV"] << 11]
     shared = OPCODES["SHR"] << 11
+    if mnemonic in WIDE_OPERATIONS:
+        unary = mnemonic == "NEG32"
+        if len(operands) != (1 if unary else 2):
+            count = 1 if unary else 2
+            raise _error(line_number, f"{mnemonic} expects {count} operand(s)")
+        destination = _parse_register(operands[0], line_number)
+        if destination & 1:
+            raise _error(line_number, f"{mnemonic} destination must be an even register")
+        operation = WIDE_OPERATIONS[mnemonic]
+        control = operation << 12
+        first = shared | (destination << 8) | WIDE_PREFIX
+        if unary:
+            return [first, control]
+        source_text = operands[1].strip()
+        if mnemonic in ("SHL32", "LSR32", "ASR32") and not _is_register(source_text):
+            value = _parse_number(source_text, line_number)
+            if not 0 <= value <= 31:
+                raise _error(line_number, f"{mnemonic} shift count must be between 0 and 31")
+            return [first, control | WIDE_IMMEDIATE_FLAG | value]
+        source = _parse_register(source_text, line_number)
+        if mnemonic not in ("SHL32", "LSR32", "ASR32") and source & 1:
+            raise _error(line_number, f"{mnemonic} source must be an even register")
+        return [first, control | source]
     if mnemonic in BRANCH_CONDITIONS or mnemonic in BRANCH_ALIASES:
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")

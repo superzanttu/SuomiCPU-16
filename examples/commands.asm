@@ -115,6 +115,16 @@ jump_target:
     BLE sample_routine
     BHI sample_routine
     BLS sample_routine
+    ADD32 R0, R2           ; 32-bit pair operations (even register is high word)
+    SUB32 R0, R2
+    CMP32 R0, R2
+    AND32 R0, R2
+    OR32 R0, R2
+    XOR32 R0, R2
+    SHL32 R0, 1
+    LSR32 R0, R1
+    ASR32 R0, 1
+    NEG32 R0
+    MOV32 R0, R2
 sample_routine:
     RET
-

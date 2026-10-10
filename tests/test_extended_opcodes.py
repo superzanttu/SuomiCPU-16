@@ -37,6 +37,33 @@ class ExtendedOpcodeTests(unittest.TestCase):
         r = regs("LDI R0, 0\nLDI R1, 1\nSUB R0, R1\nLDI R2, 5\nLDI R3, 0\nSBC R2, R3")
         self.assertEqual(r[2], 4)
 
+    def test_32_bit_register_pair_arithmetic_and_shifts(self):
+        r = regs(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\n"
+            "LDI R2, 0\nLDI R3, 1\nADD32 R0, R2\n"
+            "LDI R4, 0x8000\nLDI R5, 0\nNEG32 R4\n"
+            "LDI R6, 0\nLDI R7, 3\nSHL32 R6, 1"
+        )
+        self.assertEqual((r[0], r[1]), (0, 0))
+        self.assertEqual((r[4], r[5]), (0x8000, 0))
+        self.assertEqual((r[6], r[7]), (0, 6))
+
+    def test_32_bit_compare_and_pair_validation(self):
+        cpu = run(
+            "LDI R0, 1\nLDI R1, 0\nLDI R2, 1\nLDI R3, 0\nCMP32 R0, R2\nHALT"
+        )
+        self.assertEqual(cpu.flags["Z"], 1)
+        cpu = run(
+            "LDI R0, 0x7FFF\nLDI R1, 0xFFFF\n"
+            "LDI R2, 0\nLDI R3, 1\nADD32 R0, R2\nHALT"
+        )
+        self.assertEqual((cpu.registers[0], cpu.registers[1]), (0x8000, 0))
+        self.assertEqual((cpu.flags["N"], cpu.flags["V"], cpu.flags["C"]), (1, 1, 0))
+        for source in ("ADD32 R1, R2", "ADD32 R0, R3", "NEG32 R3", "SHL32 R0, 32"):
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    assemble(source)
+
     def test_neg_swap_sext_clz(self):
         r = regs("LDI R0, 1\nNEG R0\nLDI R1, 0x1234\nSWAP R1\nLDI R2, 0x80\nSEXT R2\nLDI R4, 1\nCLZ R4")
         self.assertEqual(r[0], 0xFFFF)
