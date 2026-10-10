@@ -43,6 +43,35 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
 
+    def test_c90_binary_operators_reject_invalid_operand_types(self):
+        invalid_sources = (
+            "int main(void) { int *pointer; pointer * pointer; return 0; }\n",
+            "int main(void) { int *pointer; pointer + pointer; return 0; }\n",
+            "int main(void) { float value; value & value; return 0; }\n",
+            "int main(void) { int *pointer; pointer < 1; return 0; }\n",
+            "struct S { int value; }; int main(void) { struct S value; "
+            "value && 1.0; return 0; }\n",
+            "int main(void) { void *pointer; pointer + 1; return 0; }\n",
+            "struct Incomplete; int main(void) { struct Incomplete *pointer; "
+            "pointer + 1; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(CCompilerError):
+                    compile_source(source)
+
+    def test_c90_pointer_arithmetic_and_comparisons_accept_valid_operands(self):
+        image = compile_source(
+            "int main(void) {\n"
+            "  int values[2];\n"
+            "  int *first = values;\n"
+            "  int *second = values + 1;\n"
+            "  return (second - first != 1) || (first == 0);\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
     def test_global_pointer_initializer_uses_runtime_pointer_layout(self):
         image = compile_source(
             "unsigned char *device = 0x43101;\n"

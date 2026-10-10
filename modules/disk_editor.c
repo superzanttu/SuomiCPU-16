@@ -130,6 +130,10 @@ void do_save(void) {
         status = "NO DISK LOADED";
         return;
     }
+    if (!dirty) {
+        status = "NOTHING TO SAVE";
+        return;
+    }
     dw[5] = block;
     dw[6] = 0;
     disk_cmd(8);
@@ -195,6 +199,11 @@ int inside(int mx, int my, int x, int y, int w, int h) {
     return 1;
 }
 
+void off_button(int x, int y, int w, char *name) {
+    gfx_rect(x, y, w, 16, DARK_GRAY);
+    gfx_text(x + 5, y + 4, name, GRAY);
+}
+
 void button(int x, int y, int w, int idx, char *name, unsigned char color) {
     int off;
     off = 0;
@@ -250,15 +259,16 @@ void draw_screen(void) {
     button(72, 34, 16, 10, "^", DARK_GRAY);
     button(72, 78, 16, 11, "v", DARK_GRAY);
     if (dirty) {
-        gfx_rect(8, 100, 38, 16, DARK_GRAY);
-        gfx_text(13, 104, "LOAD", GRAY);
-        gfx_rect(50, 100, 42, 16, DARK_GRAY);
-        gfx_text(55, 104, "EJECT", GRAY);
-        gfx_rect(8, 120, 38, 16, DARK_GRAY);
-        gfx_text(13, 124, "NEW", GRAY);
+        off_button(8, 100, 38, "LOAD");
+        off_button(50, 100, 42, "EJECT");
+        off_button(8, 120, 38, "NEW");
     } else {
         button(8, 100, 38, 0, "LOAD", BLUE);
-        button(50, 100, 42, 1, "EJECT", ORANGE);
+        if (loaded) {
+            button(50, 100, 42, 1, "EJECT", ORANGE);
+        } else {
+            off_button(50, 100, 42, "EJECT");
+        }
         button(8, 120, 38, 2, "NEW", GREEN);
     }
 
@@ -271,17 +281,25 @@ void draw_screen(void) {
     if (dirty) gfx_text(278, 24, "UNSAVED", DARK_RED);
     draw_text_area();
 
-    if (dirty) {
-        gfx_rect(104, 134, 80, 16, DARK_GRAY);
-        gfx_text(109, 138, "PREV", GRAY);
-        gfx_text(151, 138, "NEXT", GRAY);
+    if (dirty || !loaded) {
+        off_button(104, 134, 38, "PREV");
+        off_button(146, 134, 38, "NEXT");
     } else {
         button(104, 134, 38, 3, "PREV", BLUE);
         button(146, 134, 38, 4, "NEXT", BLUE);
     }
-    button(188, 134, 38, 5, "READ", DARK_GRAY);
-    button(230, 134, 38, 6, "SAVE", DARK_RED);
-    button(272, 134, 38, 7, "CLR", ORANGE);
+    if (loaded) {
+        button(188, 134, 38, 5, "READ", GREEN);
+        button(272, 134, 38, 7, "CLR", ORANGE);
+    } else {
+        off_button(188, 134, 38, "READ");
+        off_button(272, 134, 38, "CLR");
+    }
+    if (dirty && loaded) {
+        button(230, 134, 38, 6, "SAVE", DARK_RED);
+    } else {
+        off_button(230, 134, 38, "SAVE");
+    }
 
     gfx_rect(104, 158, 12, 6, DARK_GRAY);
     if (led) gfx_rect(104, 158, 12, 6, GREEN);
@@ -312,6 +330,9 @@ int which_button(int mx, int my) {
 
 void click(int mx, int my) {
     int i;
+    if (press == 1 && !loaded) return;
+    if (press >= 3 && press <= 7 && !loaded) return;
+    if (press == 6 && !dirty) return;
     if (dirty && press >= 0 && press <= 2) {
         status = "SAVE OR READ FIRST";
         return;

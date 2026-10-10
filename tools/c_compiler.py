@@ -2334,18 +2334,136 @@ class _CodeGenerator:
                 return self._expression_type(expression.children[1])
             left_type = self._expression_type(expression.children[0])
             right_type = self._expression_type(expression.children[1])
-            if operator in ("==", "!=", "<", "<=", ">", ">=", "&&", "||"):
+            integer_types = {"char", "unsigned char", "int", "unsigned int"}
+            arithmetic_types = integer_types | {"float"}
+            left_integer = left_type in integer_types
+            right_integer = right_type in integer_types
+            left_arithmetic = left_type in arithmetic_types
+            right_arithmetic = right_type in arithmetic_types
+            left_pointer = left_type.endswith("*")
+            right_pointer = right_type.endswith("*")
+            if operator in ("&&", "||"):
+                if not (
+                    (left_arithmetic or left_pointer)
+                    and (right_arithmetic or right_pointer)
+                ):
+                    raise self.error(
+                        expression.line,
+                        f"operator {operator} requires scalar operands",
+                    )
                 return "int"
+            if operator in ("==", "!=", "<", "<=", ">", ">="):
+                if left_arithmetic and right_arithmetic:
+                    return "int"
+                compatible_pointers = (
+                    left_pointer
+                    and right_pointer
+                    and (
+                        left_type == right_type
+                        or (
+                            operator in ("==", "!=")
+                            and (left_type == "void*" or right_type == "void*")
+                        )
+                    )
+                )
+                if compatible_pointers and operator not in ("==", "!="):
+                    self._require_pointer_arithmetic_type(left_type, expression.line)
+                null_pointer_comparison = (
+                    operator in ("==", "!=")
+                    and (
+                        (
+                            left_pointer
+                            and right_integer
+                            and self._is_integer_constant_expression(
+                                expression.children[1]
+                            )
+                            and self._constant(expression.children[1]) == 0
+                        )
+                        or (
+                            right_pointer
+                            and left_integer
+                            and self._is_integer_constant_expression(
+                                expression.children[0]
+                            )
+                            and self._constant(expression.children[0]) == 0
+                        )
+                    )
+                )
+                if compatible_pointers or null_pointer_comparison:
+                    return "int"
+                raise self.error(
+                    expression.line,
+                    f"operator {operator} requires arithmetic operands or "
+                    "compatible pointers",
+                )
+            if operator in ("<<", ">>", "%", "&", "|", "^"):
+                if not left_integer or not right_integer:
+                    raise self.error(
+                        expression.line,
+                        f"operator {operator} requires integer operands",
+                    )
+                return self._usual_arithmetic_type(left_type, right_type)
+            if operator in ("*", "/"):
+                if not left_arithmetic or not right_arithmetic:
+                    raise self.error(
+                        expression.line,
+                        f"operator {operator} requires arithmetic operands",
+                    )
+                if left_type == "float" or right_type == "float":
+                    return "float"
+                return self._usual_arithmetic_type(left_type, right_type)
+            if operator == "+":
+                if left_arithmetic and right_arithmetic:
+                    return (
+                        "float"
+                        if left_type == "float" or right_type == "float"
+                        else self._usual_arithmetic_type(left_type, right_type)
+                    )
+                if left_pointer and right_integer:
+                    self._require_pointer_arithmetic_type(left_type, expression.line)
+                    return left_type
+                if right_pointer and left_integer:
+                    self._require_pointer_arithmetic_type(right_type, expression.line)
+                    return right_type
+                raise self.error(
+                    expression.line,
+                    "operator + requires arithmetic operands or a pointer and integer",
+                )
+            if operator == "-":
+                if left_arithmetic and right_arithmetic:
+                    return (
+                        "float"
+                        if left_type == "float" or right_type == "float"
+                        else self._usual_arithmetic_type(left_type, right_type)
+                    )
+                if left_pointer and right_integer:
+                    self._require_pointer_arithmetic_type(left_type, expression.line)
+                    return left_type
+                if (
+                    left_pointer
+                    and right_pointer
+                    and left_type == right_type
+                ):
+                    self._require_pointer_arithmetic_type(left_type, expression.line)
+                    return "int"
+                raise self.error(
+                    expression.line,
+                    "operator - requires arithmetic operands, a pointer and integer, "
+                    "or compatible pointers",
+                )
             if left_type == "float" or right_type == "float":
                 return "float"
-            if left_type.endswith("*"):
-                if operator == "-" and right_type.endswith("*"):
-                    return "int"
-                return left_type
-            if right_type.endswith("*") and operator == "+":
-                return right_type
-            return self._usual_arithmetic_type(left_type, right_type)
+            raise self.error(expression.line, f"unsupported binary operator {operator}")
         raise self.error(expression.line, "could not determine expression type")
+
+    def _require_pointer_arithmetic_type(self, pointer_type: str, line: int) -> None:
+        pointed_type = pointer_type[:-1]
+        record = self.records.get(pointed_type)
+        if pointed_type == "void" or (record is not None and not record.complete):
+            raise self.error(
+                line,
+                "pointer arithmetic requires a pointer to a complete object type",
+            )
 
     @staticmethod
     def _integer_promoted_type(c_type: str) -> str:
@@ -2870,6 +2988,7 @@ class _CodeGenerator:
             self._expression(right)
             return
         jump_false, self._jump_false = self._jump_false, None
+        self._expression_type(expression)
         if operator in ("&&", "||"):
             true_label = self.label("logic_true")
             false_label = self.label("logic_false")

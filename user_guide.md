@@ -527,7 +527,9 @@ Supported language features include:
 - Integer and floating constants, character constants, strings (including
   adjacent string-literal concatenation), assignment and compound assignment,
   increment/decrement, arithmetic, bitwise and shift operations, comparisons,
-  and logical operators with short-circuit evaluation.
+  and logical operators with short-circuit evaluation. Binary operators check
+  arithmetic, integer, and scalar operand requirements and reject invalid
+  pointer arithmetic and comparisons.
 - Object-like and function-like macros, `#`, `##`, `defined`, conditional
   inclusion, `#include`, `#undef`, `#error`, `#pragma`, trigraph replacement,
   and backslash-newline splicing. Quoted includes are searched relative to the
