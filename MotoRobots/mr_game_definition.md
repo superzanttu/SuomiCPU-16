@@ -3,32 +3,36 @@
 MotoRobots is a Factorio-type automation game focused on resource extraction, processing, and logistics using a fleet of transport robots.
 
 ## 1. Core Gameplay Loop
-(Define the high-level game loop: extraction -> processing -> storage -> expansion)
+Mines extracts resources from ground. Robots transport resources from mines to factories, and from facotoris to storage. Player controls robots byt defining source and targer locations for each transport task.
+
 
 ## 2. Entities
 ### 2.1 Buildings
 - **Mine**: Produces raw resources (ores, coal, iron, or copper).
 - **Factory**: Processes raw ores into refined materials.
 - **Storage**: Stores resources and processed materials.
+- **Base**: The central hub for the player, where robots are managed and resources are initially stored.
 
 #### Building Construction
-(Define how buildings are placed, upgraded, and destroyed here)
+Building are constructed for free, because this is first prototype game.
+
 
 ### 2.2 Logistics
-- **Transport Robot**: Transports items between mines, factories, and storage units. Uses a pathfinding algorithm to determine the optimal route.
+- **Transport Robot**: Transports items between mines, factories, and storage units. Uses a pathfinding algorithm to determine the optimal route.  RObots are programmed by defining source and target locations for transport tasks.
 
 #### Robot Specifications
-(Define robot movement speed, carrying capacity, and battery/energy limits here)
+Robots are autonomous units that follow the instructions given by the player. Robots execute transport tasks by moving between the defined source and target locations. Robots can carry a limited number of items. Robots don't consume energy. Robots have defined movement speed and load/unload speed. Robots can move forward and backward, turn left and right. Robots avoid obstacles and other robots to prevent collisions.
 
 ## 3. World & Map
 ### 3.1 Map Generation
 - **Map Type**: Infinite procedurally generated tile map.
 
 #### Generation Rules
-(Define noise functions or algorithms used to generate landmasses, rivers, and mountains here)
+Maps have lakes and rivers. Mountains are formed by clusters of rocks.
+Building can exist on ground tiles only. Mines can only be placed on ground tiles that contain the corresponding resource.
 
 #### Biomes
-(Define different terrain types or resource distributions across the map here)
+Resources are formed on clusted or resource-rich ground tiles. Resources are infinite. Resources cluster are distributed evenly on map.
 
 ### 3.2 Tile Types
 - **Ground**: Walkable by robots; suitable for building construction.
@@ -37,14 +41,30 @@ MotoRobots is a Factorio-type automation game focused on resource extraction, pr
 
 ## 4. Resources & Economy
 ### 4.1 Materials
-(Define all raw and refined materials here)
+- **Coal**: A basic fuel resource used in various production processes.
+- **Iron Ore**: A raw material used to produce iron plates.
+- **Copper Ore**: A raw material used to produce copper plates.
+- **Iron Plate**: A refined material produced from iron ore.
+- **Copper Plate**: A refined material produced from copper ore.    
 
 ### 4.2 Production & Recipes
+- **Mine**: Extracts raw resources from the ground.
+- **Factory**: Processes raw resources into refined materials.
+- **Storage**: Holds raw and refined materials for later use.
+- **Base**: The central hub for the player, where robots are managed and resources are initially stored.
 
 #### Resource Rates
-(Define production rates for mines and processing speeds for factories here)
+| Resource     | Production Rate |
+| ------------ | --------------- |
+| Coal         | 1 unit/sec      |
+| Iron Ore     | 1 unit/sec      |
+| Copper Ore   | 1 unit/sec      |
+| Iron Plate   | 1 unit/sec      |
+| Copper Plate | 1 unit/sec      |
 
 #### Recipe List
+
+
 (Define detailed list of what ores the factories process and what the resulting outputs are here)
 
 ### 4.3 Costs
@@ -56,11 +76,12 @@ MotoRobots is a Factorio-type automation game focused on resource extraction, pr
 ### 5.1 Pathfinding
 
 #### Pathfinding Algorithm
-(Define specifics of the algorithm used, e.g., A*, Dijkstra and how it handles dynamic obstacles here)
+RRobots use A* to find routes on the map. If robot hits a blocked tile, it recalculates the path to avoid the obstacle.
 
 ### 5.2 Save/Load System
-(Define how the infinite map and entity states are persisted)
-
+Game state, including the infinite map and all entity states, is saved to a persistent storage system. When loading, the game reconstructs the map and entities from this saved state. Map is stored as a series of chunks, each containing a portion of the map and its associated entities.
+State of robots and other entities is also saved and restored during the save/load process.
+    
 ## 6. User Interface (GUI)
 ### 6.1 Map View
 - **View**: Zoomable map view.
