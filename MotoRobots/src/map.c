@@ -1,4 +1,4 @@
-#include "map.h"
+#include "../include/map.h"
 #include <stdlib.h>
 
 void map_init(GameMap* map) {

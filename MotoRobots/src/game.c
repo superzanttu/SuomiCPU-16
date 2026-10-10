@@ -1,4 +1,4 @@
-#include "game.h"
+#include "../include/game.h"
 #include <string.h>
 
 void game_init(GameState* state) {

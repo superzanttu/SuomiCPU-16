@@ -1,7 +1,6 @@
 #ifndef MOTOROBOTS_TYPES_H
 #define MOTOROBOTS_TYPES_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 typedef enum {
@@ -53,7 +52,7 @@ typedef struct {
     ResourceType carrying_type;
     Vec2i source_pos;
     Vec2i target_pos;
-    bool is_active;
+    int is_active; // Using int instead of bool
 } Robot;
 
 #endif // MOTOROBOTS_TYPES_H
