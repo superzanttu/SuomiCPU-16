@@ -98,6 +98,7 @@ STANDARD_C_SOURCE = {
             "getenv", "system",
         )
     },
+    **{name: "locale.c" for name in ("setlocale", "localeconv")},
 }
 
 

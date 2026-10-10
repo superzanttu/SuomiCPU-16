@@ -537,8 +537,8 @@ strict C90 conformance; for example, `#line` is accepted but does not remap
 subsequent diagnostic locations.
 
 The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`,
-`<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`, and
-`<string.h>`. `<stddef.h>` includes `offsetof`, which supports direct
+`<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`,
+`<string.h>`, and `<locale.h>`. `<stddef.h>` includes `offsetof`, which supports direct
 struct/union member offsets in constant initializers. The string/memory
 routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,
 `labs`, `atoi`, `atol`, `strtol`, `strtoul`, `rand`, `srand`, `getenv`, and
@@ -549,8 +549,9 @@ There is no target environment-variable store, so `getenv` returns `NULL`;
 there is no command processor, so `system(NULL)` returns zero and commands
 return -1. `<assert.h>` evaluates assertions unless `NDEBUG` is defined and
 stops the target on a failed assertion. `RAND_MAX` is 32767; the sequence from
-`rand` is implementation-defined. The limit and floating-point macros describe the
-`rand` is implementation-defined. The limit and floating-point macros describe
+`rand` is implementation-defined. `<locale.h>` exposes only the `"C"` locale;
+`setlocale` rejects other locale names, while `localeconv` reports the C locale
+numeric and monetary conventions. The limit and floating-point macros describe
 the target's actual types; they also make C90 minimum-range incompatibilities
 visible: `long` has only the same 16-bit range as `int`, and `double` has the
 same binary16 precision and range as `float`; `long double` maps to that same

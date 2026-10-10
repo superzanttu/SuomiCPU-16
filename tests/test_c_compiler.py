@@ -546,6 +546,34 @@ class CCompilerTests(unittest.TestCase):
             [1, 0, 1],
         )
 
+    def test_c90_c_locale_facilities(self):
+        image = compile_source(
+            "#include <locale.h>\n"
+            "#include <limits.h>\n"
+            "#include <stddef.h>\n"
+            "int results[6];\n"
+            "int main(void) {\n"
+            "  char *name;\n"
+            "  struct lconv *format;\n"
+            "  name = setlocale(LC_ALL, NULL);\n"
+            "  results[0] = name[0] == 'C' && name[1] == '\\0';\n"
+            "  results[1] = setlocale(LC_NUMERIC, \"C\") != NULL;\n"
+            "  results[2] = setlocale(LC_ALL, \"en_US\") == NULL;\n"
+            "  results[3] = setlocale(99, NULL) == NULL;\n"
+            "  format = localeconv();\n"
+            "  results[4] = format->decimal_point[0] == '.';\n"
+            "  results[5] = format->thousands_sep[0] == '\\0' && "
+            "format->frac_digits == CHAR_MAX;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(6)],
+            [1, 1, 1, 1, 1, 1],
+        )
+
     def test_executes_recursive_factorial_example(self):
         image = compile_source(
             "int result;\n"
