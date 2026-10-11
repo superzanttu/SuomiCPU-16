@@ -21,13 +21,15 @@ class BIOSSelection:
     module_path: Path | None
     image: object | None
     disk_id: str | None
+    module_name: str | None = None
 
 
 @dataclass(frozen=True)
 class BootModule:
-    path: Path
+    path: Path | None
     name: str
     description: str
+    error: str | None = None
 
 
 def initialize_bios(cpu):
@@ -66,18 +68,46 @@ def discover_boot_modules(modules_dir=None):
         raise FileNotFoundError(f"Modules folder does not exist: {directory}")
 
     modules = []
-    for path in sorted(directory.glob("*.c"), key=lambda item: item.name.casefold()):
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
-        description = lines[0].strip() if lines else ""
-        if description.startswith("//"):
+    for module_dir in sorted(
+        (path for path in directory.iterdir() if path.is_dir()),
+        key=lambda item: item.name.casefold(),
+    ):
+        source_files = sorted(
+            (
+                path
+                for path in module_dir.iterdir()
+                if path.is_file() and path.suffix.casefold() == ".c"
+            ),
+            key=lambda item: item.name.casefold(),
+        )
+        error = None
+        if len(source_files) == 1:
+            source_path = source_files[0]
+        elif len(source_files) > 1:
+            source_path = next(
+                (path for path in source_files if path.name.casefold() == "main.c"),
+                None,
+            )
+            if source_path is None:
+                error = "Multiple .c files found; expected main.c."
+        else:
+            source_path = None
+            error = "No .c files found in module folder."
+
+        description = error or "No description"
+        if source_path is not None:
+            lines = source_path.read_text(encoding="utf-8-sig").splitlines()
+            description = lines[0].strip() if lines else ""
+        if source_path is not None and description.startswith("//"):
             description = description[2:].strip()
-        elif description.startswith("/*"):
+        elif source_path is not None and description.startswith("/*"):
             description = description[2:].removesuffix("*/").strip().lstrip("*").strip()
         modules.append(
             BootModule(
-                path=path,
-                name=path.stem,
+                path=source_path,
+                name=module_dir.name,
                 description=description or "No description",
+                error=error,
             )
         )
     return modules
@@ -123,6 +153,12 @@ def select_boot_program(cpu, modules_dir=None, initial_disk=None):
         cpu.module_name = module.name
         if hasattr(cpu, "console_log"):
             cpu.console_log(f"Loading module: {module.name}")
+        if module.error is not None or module.path is None:
+            error = module.error or "No .c files found in module folder."
+            if hasattr(cpu, "console_log"):
+                cpu.console_log(f"ERROR loading {module.name}: {error}")
+            message = f"{module.name}: {error}"
+            return None
         try:
             from src.SuomiCPU import CCompilerError, load_program_file
             from tools.assembler import AssemblyError
@@ -131,7 +167,7 @@ def select_boot_program(cpu, modules_dir=None, initial_disk=None):
             if logger is None:
                 logger = getattr(cpu, "console_log", None)
             image = load_program_file(module.path, logger)
-            return BIOSSelection(module.path, image, selected_disk)
+            return BIOSSelection(module.path, image, selected_disk, module.name)
         except (
             AssemblyError,
             CCompilerError,
@@ -220,7 +256,7 @@ def select_boot_program(cpu, modules_dir=None, initial_disk=None):
                     (64, list_top + visible_rows * 44),
                 )
         else:
-            item = item_font.render("No C programs found in modules/.", True, (235, 170, 150))
+            item = item_font.render("No modules found in modules/.", True, (235, 170, 150))
             cpu.screen.blit(item, (64, list_top))
         footer = small_font.render(
             "Wheel: scroll modules    Click: select; double-click: load    "

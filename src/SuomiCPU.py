@@ -1566,7 +1566,7 @@ def main():
                         mount_data_disk(sc16, selection.disk_id)
                     except BIOSError as exc:
                         parser.error(str(exc))
-                sc16.module_name = selection.module_path.stem
+                sc16.module_name = selection.module_name or selection.module_path.stem
                 sc16.load_program(selection.image)
 
             first_boot = False

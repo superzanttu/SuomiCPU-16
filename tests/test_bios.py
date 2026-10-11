@@ -21,26 +21,95 @@ class BIOSBootTests(unittest.TestCase):
     def tearDownClass(cls):
         pygame.quit()
 
-    def test_discovers_c_modules_in_filename_order(self):
+    def test_discovers_folder_modules_and_selects_single_c_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "zeta.c").write_text("// Zeta program\n")
-            (root / "Alpha.c").write_text("/* Alpha program */\n")
-            (root / "ignore.txt").write_text("Not a program\n")
+            alpha = root / "Alpha"
+            alpha.mkdir()
+            (alpha / "alpha.c").write_text("/* Alpha program */\n")
+            zeta = root / "zeta"
+            zeta.mkdir()
+            (zeta / "zeta.c").write_text("// Zeta program\n")
+            (root / "ignored.c").write_text("Not a module\n")
 
             modules = bios.discover_boot_modules(root)
 
         self.assertEqual(
-            [(module.name, module.description) for module in modules],
-            [("Alpha", "Alpha program"), ("zeta", "Zeta program")],
+            [(module.name, module.path.name, module.description) for module in modules],
+            [("Alpha", "alpha.c", "Alpha program"), ("zeta", "zeta.c", "Zeta program")],
         )
+
+    def test_multiple_c_files_require_main_c_and_empty_folders_are_modules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broken = root / "broken"
+            broken.mkdir()
+            (broken / "first.c").write_text("// First\n")
+            (broken / "second.c").write_text("// Second\n")
+            empty = root / "empty"
+            empty.mkdir()
+            valid = root / "valid"
+            valid.mkdir()
+            main_path = valid / "main.c"
+            main_path.write_text("// Main program\n")
+            (valid / "helper.c").write_text("// Helper\n")
+
+            modules = bios.discover_boot_modules(root)
+
+        self.assertEqual(
+            [module.name for module in modules],
+            ["broken", "empty", "valid"],
+        )
+        self.assertIsNone(modules[0].path)
+        self.assertEqual(modules[0].error, "Multiple .c files found; expected main.c.")
+        self.assertEqual(modules[1].error, "No .c files found in module folder.")
+        self.assertEqual(modules[2].path, main_path)
+        self.assertIsNone(modules[2].error)
+
+    def test_loading_module_without_main_c_displays_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            modules_dir = Path(directory)
+            module_dir = modules_dir / "broken"
+            module_dir.mkdir()
+            (module_dir / "first.c").write_text("// First\n")
+            (module_dir / "second.c").write_text("// Second\n")
+            cpu = type("TestCPU", (), {})()
+            cpu.disk = DiskDevice(modules_dir.parent / "disks")
+            cpu.screen = pygame.Surface((960, 400))
+            cpu.messages = []
+            cpu.console_log = cpu.messages.append
+            rendered_text = []
+
+            class CaptureFont:
+                def render(self, text, _antialias, _color):
+                    rendered_text.append(text)
+                    return pygame.Surface((1, 1))
+
+            with patch("pygame.font.Font", side_effect=lambda *_args: CaptureFont()):
+                with patch(
+                    "pygame.event.get",
+                    side_effect=[
+                        [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN)],
+                        [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE)],
+                    ],
+                ):
+                    selection = bios.select_boot_program(cpu, modules_dir)
+
+        self.assertIsNone(selection.image)
+        self.assertIn(
+            "ERROR loading broken: Multiple .c files found; expected main.c.",
+            cpu.messages,
+        )
+        self.assertIn("broken: Multiple .c files found; expected main.c.", rendered_text)
 
     def test_bios_compiles_selected_module_and_keeps_data_disk_optional(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             modules_dir = root / "modules"
             modules_dir.mkdir()
-            module_path = modules_dir / "sample.c"
+            module_dir = modules_dir / "sample"
+            module_dir.mkdir()
+            module_path = module_dir / "sample.c"
             module_path.write_text(
                 "// BIOS program\nint main(void) { return 0; }\n",
                 encoding="utf-8",
@@ -60,6 +129,7 @@ class BIOSBootTests(unittest.TestCase):
                 selection = bios.select_boot_program(cpu, modules_dir)
 
         self.assertEqual(selection.module_path, module_path)
+        self.assertEqual(selection.module_name, "sample")
         self.assertIsNotNone(selection.image)
         self.assertEqual(selection.disk_id, "DATA0001")
 
@@ -68,8 +138,12 @@ class BIOSBootTests(unittest.TestCase):
             root = Path(directory)
             modules_dir = root / "modules"
             modules_dir.mkdir()
-            (modules_dir / "alpha.c").write_text("// Alpha\n")
-            beta_path = modules_dir / "beta.c"
+            alpha_dir = modules_dir / "alpha"
+            alpha_dir.mkdir()
+            (alpha_dir / "alpha.c").write_text("// Alpha\n")
+            beta_dir = modules_dir / "beta"
+            beta_dir.mkdir()
+            beta_path = beta_dir / "beta.c"
             beta_path.write_text("// Beta\n")
             disk = DiskDevice(root / "disks")
             disk.load_disk("DATA0001")
@@ -99,12 +173,14 @@ class BIOSBootTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             modules_dir = Path(directory)
             for index in range(8):
-                (modules_dir / f"module{index}.c").write_text(
+                module_dir = modules_dir / f"module{index}"
+                module_dir.mkdir()
+                (module_dir / f"module{index}.c").write_text(
                     f"// Module {index}\n",
                     encoding="utf-8",
                 )
             cpu = type("TestCPU", (), {})()
-            cpu.disk = DiskDevice(modules_dir / "disks")
+            cpu.disk = DiskDevice(modules_dir.parent / "disks")
             cpu.screen = pygame.Surface((960, 400))
             rendered_text = []
 
@@ -133,6 +209,7 @@ class BIOSBootTests(unittest.TestCase):
                         selection = bios.select_boot_program(cpu, modules_dir)
 
         self.assertEqual(selection.module_path.name, "module3.c")
+        self.assertEqual(selection.module_name, "module3")
         self.assertIn("^ 3 more module(s) above", rendered_text)
         self.assertIn("v 3 more module(s) below", rendered_text)
         self.assertIn("Wheel: scroll modules", rendered_text[-1])

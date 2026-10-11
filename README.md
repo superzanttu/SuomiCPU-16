@@ -15,9 +15,10 @@ SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
 
 ## Getting Started
 Start SC-16 without arguments to show the BIOS module selector. Select a
-program from `modules/` to compile and load it into memory. Press **D** to cycle
-through available data disks or choose no disk; virtual disks store application
-data only.
+module folder from `modules/` to compile and load its C program into memory.
+Folders with multiple `.c` files use `main.c` as the entry source. Press **D**
+to cycle through available data disks or choose no disk; virtual disks store
+application data only.
 ```console
 python main.py
 ```

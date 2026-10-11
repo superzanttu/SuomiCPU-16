@@ -32,9 +32,13 @@ On Windows, run the PowerShell launcher with a source or binary path:
 
 `run.ps1` changes to the repository directory and starts the emulator through
 `main.py`. It requires Python to be available as `python` on `PATH`. At startup,
-the BIOS lists `.c` files in `modules/`, using each filename as its module name
-and the first source line as its description. Use the arrow keys to select a
-program and press Enter to load it; hover or click a program to select it and
+the BIOS lists each subfolder in `modules/` as a module, using the folder name
+as its module name. A folder with one `.c` file loads that file; a folder with
+multiple `.c` files must contain `main.c`, which is loaded instead. The first
+source line is shown as the module description. Folders with no `.c` file or
+with multiple `.c` files but no `main.c` remain selectable and show an error
+when loaded. Use the arrow keys to select a program and press Enter to load it;
+hover or click a program to select it and
 double-click to load it. Use the mouse wheel over the module list to scroll;
 indicators show how many modules remain above or below the visible rows. Click
 the data-disk line or press **D** to cycle through available data disks or no
@@ -540,8 +544,9 @@ to store data blocks of 256 characters.
   as `"protected": true`, and writes to a protected disk are ignored. After a
   load (`0x01`) or `0x20`, the word at `0x4310E` holds the protection state.
 
-`modules/disk_editor.c` is a disk editor built on this interface: it lists the
-disks, creates new ones, and lets you edit and save blocks with the keyboard.
+`modules/DiskEditor/disk_editor.c` is a disk editor built on this interface: it
+lists the disks, creates new ones, and lets you edit and save blocks with the
+keyboard.
 
 ## 8. Bitmap font
 
