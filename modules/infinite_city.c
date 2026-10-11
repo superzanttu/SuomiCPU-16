@@ -41,6 +41,9 @@ typedef struct
     int h;
     int roof_y;
     int ladder;
+    int balcony;
+    int balcony_y;
+    int balcony_w;
 } Building;
 
 typedef struct
@@ -119,6 +122,8 @@ int frame_count;
 int spawn_timer;
 int game_over;
 int restart_wait;
+int crosshair_x;
+int crosshair_y;
 int kills_mr;
 int kills_bird;
 int kills_spring;
@@ -181,7 +186,21 @@ void init_city(void)
             roof = 60;
         }
         city[i].roof_y = roof;
-        city[i].ladder = ((gfx_random() & 3) == 0) ? 1 : 0;
+        city[i].ladder = 0;
+        city[i].balcony = 0;
+        city[i].balcony_y = 0;
+        city[i].balcony_w = 0;
+        if ((i % 5) == 0)
+        {
+            city[i].ladder = 1;
+        }
+        if ((i % 7) == 2 || (i % 7) == 5)
+        {
+            city[i].balcony = 1;
+            city[i].balcony_w = 12 + (gfx_random() % 18);
+            city[i].balcony_y = roof - 12;
+            city[i].ladder = 1;
+        }
         x += city[i].w + 16 + (gfx_random() % 18);
     }
 }
@@ -211,6 +230,7 @@ void reset_game(void)
     player.climb_dir = 0;
     player.facing = 1;
     player.hp = 100;
+    player.on_ground = 1;
     player.ammo = 10;
     player.fire_cd = 0;
     player.anim = 0;
@@ -219,6 +239,8 @@ void reset_game(void)
     player.invuln = 0;
     player.carried_by = -1;
     player.last_y = player.y;
+    crosshair_x = 160;
+    crosshair_y = 120;
     for (i = 0; i < ENEMY_MAX; i++)
     {
         enemies[i].alive = 0;
@@ -348,8 +370,8 @@ void fire_rocket(void)
     {
         return;
     }
-    dx = gfx_mouse_x() - (player.x - camera_x + 6);
-    dy = gfx_mouse_y() - (player.y + 8);
+    dx = crosshair_x - (player.x - camera_x + 6);
+    dy = crosshair_y - (player.y + 8);
     if (dx == 0 && dy == 0)
     {
         dx = 1;
@@ -380,8 +402,8 @@ void fire_rocket(void)
         {
             rockets[i].x = rocket_x;
             rockets[i].y = rocket_y;
-            rockets[i].vx = (gfx_mouse_x() - rocket_x) * 6 / length;
-            rockets[i].vy = (gfx_mouse_y() - rocket_y) * 6 / length;
+            rockets[i].vx = (crosshair_x - rocket_x) * 6 / length;
+            rockets[i].vy = (crosshair_y - rocket_y) * 6 / length;
             rockets[i].life = 120;
             rockets[i].active = 1;
             rockets[i].damage = 50;
@@ -441,6 +463,11 @@ void update_player(unsigned int keys)
         player.vx += 2;
         player.facing = 1;
     }
+    if ((keys & KEY_FIRE) && player.on_ground)
+    {
+        player.vy = -5;
+        player.on_ground = 0;
+    }
     ladder_x = building_ladder_at_world(player.x + 6);
     player.on_ladder = 0;
     if (ladder_x >= 0 && abs(player.x + 6 - ladder_x) < 6)
@@ -462,14 +489,6 @@ void update_player(unsigned int keys)
         player.y += player.vy;
         player.y = clamp_to_range(player.y, 20, 190);
         player.on_ground = 0;
-    }
-    else
-    {
-        if (keys & KEY_UP && player.on_ground)
-        {
-            player.vy = -5;
-            player.on_ground = 0;
-        }
     }
     if (keys & KEY_DOWN && player.on_ground)
     {
@@ -650,6 +669,11 @@ void draw_city(void)
         sx = city[i].x - camera_x;
         gfx_rect(sx, city[i].roof_y, city[i].w, 200 - city[i].roof_y, DARK_GRAY);
         gfx_rect(sx + 2, city[i].roof_y + 2, city[i].w - 4, 6, CYAN);
+        if (city[i].balcony)
+        {
+            gfx_rect(sx + (city[i].w - city[i].balcony_w) / 2, city[i].balcony_y, city[i].balcony_w, 4, GRAY);
+            gfx_line(sx + city[i].w / 2, city[i].balcony_y + 4, sx + city[i].w / 2, GROUND_Y - 2, CYAN);
+        }
         for (row = 0; row < 6; row++)
         {
             for (cell = 0; cell < 3; cell++)
@@ -673,10 +697,10 @@ void draw_city(void)
         {
             lx = sx + city[i].w / 2;
             ly = city[i].roof_y + 2;
-            gfx_rect(lx, ly, 2, 18, GRAY);
-            for (row = 0; row < 6; row++)
+            gfx_rect(lx, ly, 2, GROUND_Y - ly, GRAY);
+            for (row = 0; row < 12; row++)
             {
-                gfx_line(lx - 4, ly + row * 4, lx + 4, ly + row * 4, CYAN);
+                gfx_line(lx - 4, ly + row * 16, lx + 4, ly + row * 16, CYAN);
             }
         }
     }
@@ -701,10 +725,11 @@ void draw_pickups(void)
         {
             continue;
         }
-        gfx_rect(sx, sy, 8, 8, GREEN);
-        gfx_rect(sx + 2, sy + 2, 4, 4, YELLOW);
-        gfx_line(sx + 4, sy - 2, sx + 4, sy + 10, WHITE);
-        gfx_line(sx - 2, sy + 4, sx + 10, sy + 4, WHITE);
+        gfx_rect(sx, sy + 1, 2, 6, RED);
+        gfx_rect(sx + 2, sy, 4, 8, YELLOW);
+        gfx_rect(sx + 6, sy + 1, 2, 6, RED);
+        gfx_rect(sx + 2, sy - 2, 4, 2, ORANGE);
+        gfx_rect(sx + 1, sy + 8, 6, 2, RED);
     }
 }
 
@@ -761,10 +786,33 @@ void draw_enemy(Enemy *e)
             gfx_rect(sx - 2, sy + 6, 4, 3, DARK_RED);
             break;
         case ENEMY_SPRINGU:
-            gfx_rect(sx - 7, sy - 2, 14, 12, CYAN);
-            gfx_rect(sx - 6, sy + 4, 12, 4, BLUE);
-            gfx_pixel(sx, sy + 2, RED);
-            gfx_line(sx - 8, sy + 8, sx + 8, sy + 8, WHITE);
+            {
+                int spring = (frame_count + e->phase) & 3;
+                gfx_rect(sx - 7, sy - 2, 14, 12, CYAN);
+                gfx_rect(sx - 6, sy + 4, 12, 4, BLUE);
+                gfx_pixel(sx, sy + 2, RED);
+                gfx_line(sx - 8, sy + 8, sx + 8, sy + 8, WHITE);
+                if (spring == 0)
+                {
+                    gfx_rect(sx - 9, sy, 3, 3, WHITE);
+                    gfx_rect(sx + 6, sy, 3, 3, WHITE);
+                }
+                else if (spring == 1)
+                {
+                    gfx_rect(sx - 10, sy - 1, 3, 4, WHITE);
+                    gfx_rect(sx + 7, sy - 1, 3, 4, WHITE);
+                }
+                else if (spring == 2)
+                {
+                    gfx_rect(sx - 9, sy + 1, 3, 2, WHITE);
+                    gfx_rect(sx + 6, sy + 1, 3, 2, WHITE);
+                }
+                else
+                {
+                    gfx_rect(sx - 10, sy + 2, 3, 3, WHITE);
+                    gfx_rect(sx + 7, sy + 2, 3, 3, WHITE);
+                }
+            }
             break;
     }
 }
@@ -809,9 +857,35 @@ void draw_rocket(Rocket *r)
     gfx_rect(sx, sy, 1, 1, RED);
 }
 
+void draw_rocket_icon(int x, int y, int small)
+{
+    int w = small ? 4 : 6;
+    int h = small ? 6 : 10;
+    gfx_rect(x, y + 1, 2, h - 2, RED);
+    gfx_rect(x + 2, y, w - 2, h, YELLOW);
+    gfx_rect(x + w - 1, y + 1, 2, h - 2, RED);
+    gfx_rect(x + 2, y - 2, w - 2, 2, ORANGE);
+    if (small)
+    {
+        gfx_rect(x + 1, y + h, w - 1, 2, RED);
+    }
+    else
+    {
+        gfx_rect(x + 1, y + h - 1, w - 1, 2, RED);
+    }
+}
+
+void draw_crosshair(void)
+{
+    gfx_line(crosshair_x - 4, crosshair_y, crosshair_x + 4, crosshair_y, WHITE);
+    gfx_line(crosshair_x, crosshair_y - 4, crosshair_x, crosshair_y + 4, WHITE);
+    gfx_rect(crosshair_x - 1, crosshair_y - 1, 3, 3, RED);
+}
+
 void draw_hud(void)
 {
     char s[32];
+    int i;
     gfx_rect(0, 0, 320, 24, DARK_GRAY);
     gfx_rect(0, 0, 320, 2, WHITE);
     number_text(player.hp, s);
@@ -832,8 +906,10 @@ void draw_hud(void)
     gfx_rect(8, 18, 100, 5, DARK_GRAY);
     gfx_rect(8, 18, (player.hp * 100) / 100, 5, GREEN);
     gfx_text(8, 28, "AMMO", WHITE);
-    number_text(player.ammo, s);
-    gfx_text(55, 28, s, YELLOW);
+    for (i = 0; i < player.ammo; i++)
+    {
+        draw_rocket_icon(52 + i * 9, 28, 1);
+    }
     gfx_text(116, 28, "FIRED", WHITE);
     number_text(rockets_fired, s);
     gfx_text(170, 28, s, YELLOW);
@@ -860,19 +936,18 @@ void update_enemies(void)
         switch (e->kind)
         {
             case ENEMY_MRSIREN:
-                if (player.x > e->x)
-                {
-                    e->x += 1;
-                }
-                else
-                {
-                    e->x -= 1;
-                }
-                if (player.vx != 0 && abs(player.x - e->x) < 40)
-                {
-                    e->x += player.facing;
-                }
                 e->y = GROUND_Y - 10;
+                if (player.vx != 0 && abs(player.x - e->x) < 60)
+                {
+                    if (player.x > e->x)
+                    {
+                        e->x += 1;
+                    }
+                    else if (player.x < e->x)
+                    {
+                        e->x -= 1;
+                    }
+                }
                 if (abs(player.x - e->x) < 12 && abs(player.y - e->y) < 12)
                 {
                     player.hp -= 10;
@@ -883,18 +958,17 @@ void update_enemies(void)
                 }
                 break;
             case ENEMY_MEGABIRD:
-                e->x -= 2;
                 if (e->carried)
                 {
                     e->phase++;
                     player.x = e->x + 12;
-                    player.y = e->y - 6;
-                    if (e->phase > 36)
+                    player.y = e->y - 8;
+                    if (e->phase > 28)
                     {
                         e->carried = 0;
+                        player.carried_by = -1;
                         player.vy = 2;
                         player.on_ground = 0;
-                        player.carried_by = -1;
                         e->alive = 0;
                         kills_bird++;
                         total_kills++;
@@ -902,14 +976,15 @@ void update_enemies(void)
                 }
                 else
                 {
-                    if (abs(player.x - e->x) < 70 && abs(player.y - e->y) < 46)
+                    e->x -= 2;
+                    e->y = 44 + ((frame_count + i * 9) % 54);
+                    if (abs(player.x - e->x) < 30 && abs(player.y - e->y) < 26)
                     {
                         e->carried = 1;
                         e->phase = 0;
                         player.carried_by = i;
                         player.vx = 0;
                     }
-                    e->y += ((frame_count + i) & 1) ? 1 : -1;
                     if (e->bomb_cd <= 0)
                     {
                         int b;
@@ -924,14 +999,14 @@ void update_enemies(void)
                                 break;
                             }
                         }
-                        e->bomb_cd = 36;
+                        e->bomb_cd = 40;
                     }
                     else
                     {
                         e->bomb_cd--;
                     }
                 }
-                if (abs(player.x - e->x) < 14 && abs(player.y - e->y) < 12 && !e->carried)
+                if (!e->carried && abs(player.x - e->x) < 12 && abs(player.y - e->y) < 12)
                 {
                     player.hp -= 30;
                     player.invuln = 20;
@@ -947,24 +1022,30 @@ void update_enemies(void)
             case ENEMY_SPRINGU:
                 if (e->on_ground)
                 {
-                    e->vy = -4;
-                    e->on_ground = 0;
+                    if ((frame_count + i * 7) % 46 == 0)
+                    {
+                        e->vy = -5;
+                        e->on_ground = 0;
+                    }
                 }
-                e->vy += 1;
-                e->y += e->vy;
-                if (e->y >= GROUND_Y - 10)
+                if (!e->on_ground)
                 {
-                    e->y = GROUND_Y - 10;
-                    e->vy = 0;
-                    e->on_ground = 1;
+                    e->vy += 1;
+                    e->y += e->vy;
+                    if (e->y >= GROUND_Y - 10)
+                    {
+                        e->y = GROUND_Y - 10;
+                        e->vy = 0;
+                        e->on_ground = 1;
+                    }
                 }
-                if (e->x > player.x)
+                if (player.x > e->x)
                 {
-                    e->x -= 1;
+                    e->x += 1;
                 }
                 else
                 {
-                    e->x += 1;
+                    e->x -= 1;
                 }
                 if (abs(player.x - e->x) < 10 && abs(player.y - e->y) < 12)
                 {
@@ -1116,6 +1197,10 @@ int main(void)
     {
         keys = gfx_keys();
         pressed = keys & (~prev_keys);
+        crosshair_x = gfx_mouse_x();
+        crosshair_y = gfx_mouse_y();
+        crosshair_x = clamp_to_range(crosshair_x, 0, 319);
+        crosshair_y = clamp_to_range(crosshair_y, 0, 239);
         if (!game_over)
         {
             if (keys & KEY_LEFT)
@@ -1126,15 +1211,11 @@ int main(void)
             {
                 player.x += 2;
             }
-            if ((keys & KEY_FIRE) && !prev_keys)
+            if (gfx_mouse_buttons() & MOUSE_LEFT)
             {
                 fire_rocket();
             }
             update_player(keys);
-            if (keys & KEY_FIRE && player.fire_cd == 0 && player.ammo > 0)
-            {
-                fire_rocket();
-            }
             if (keys & KEY_START)
             {
                 if (restart_wait <= 0)
@@ -1186,6 +1267,7 @@ int main(void)
         }
         draw_bombs();
         draw_player(player.x - camera_x, player.y);
+        draw_crosshair();
         draw_hud();
         draw_terrain_hud();
         if (game_over)
