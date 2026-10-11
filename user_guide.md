@@ -595,7 +595,11 @@ Supported language features include:
   arithmetic and pointer rules, including pointer scaling and floating
   conversions. Pointer subtraction returns an element difference rather than
   a byte difference. Arrays and enumerators are rejected as modifiable
-  lvalues; aggregate assignment remains unsupported. Duplicate storage-class
+  lvalues; compatible structure and union assignments copy the complete object
+  representation, and fixed-parameter structure and union arguments are copied
+  by value. Structure and union returns use caller-owned result storage and are
+  tested with nested calls and recursion; members of a returned temporary are
+  readable but are not modifiable lvalues. Duplicate storage-class
   specifiers and duplicate `const`/`volatile` qualifiers are diagnosed.
   Scalar initializers may use nested braces around exactly one value.
 - Object-like and function-like macros, `#`, `##`, `defined`, conditional
@@ -611,20 +615,27 @@ minimum requirements:
   byte. `short` is 16-bit, and `long`/`unsigned long` are 32-bit with the
   minimum ranges required by C90. The compiler implements pair-based storage,
   scalar arithmetic, `switch`, and function argument/return handling for these
-  `long` types. Indirect 32-bit lvalues work with the compiler's current
-  16-bit-address operations; full 19-bit pointer arithmetic and dereferencing
-  are not yet implemented. Integer literal types use the target's `int`,
-  `unsigned int`, and 32-bit `long` candidate ranges. For compatibility with
-  existing programs, a file-scope pointer initializer also accepts an integer
-  constant in the SC-16 19-bit address range as an implementation extension.
+  `long` types. The compiler supports indirect 32-bit lvalues and current
+  19-bit pointer address paths. Regression tests cover high-address byte, word,
+  and `long` accesses as well as indexed accesses across `0xFFFF`, but not every
+  pointer conversion, arithmetic, alignment, or wraparound case. Integer
+  literal types use the target's `int`, `unsigned int`, and 32-bit `long`
+  candidate ranges. An explicit cast from a 32-bit integer to an object pointer
+  uses its low 19 bits as the address; this is the target's implementation-
+  defined conversion. For compatibility with existing programs, a file-scope
+  pointer initializer also accepts an integer constant in the SC-16 19-bit
+  address range as an implementation extension. Converting an object pointer
+  to a 32-bit integer preserves its 19-bit address value; conversion to 16-bit
+  `int` preserves the low 16 bits. These pointer/integer conversions are
+  implementation-defined.
 - `float`, `double`, and `long double` use the SC-16 IEEE-754 binary16 format.
   In particular, `double` does not meet C90's required minimum range or
   precision.
 - Object pointers occupy three bytes for the machine's 19-bit address space.
   `size_t` is unsigned 32-bit `long`, and `ptrdiff_t` is signed 32-bit `long`;
   compatible object-pointer subtraction produces a signed 32-bit element
-  difference. Pointer arithmetic and dereferencing still have limitations
-  outside the compiler's currently supported address and offset paths.
+  difference. Pointer arithmetic and dereferencing have not yet been
+  exhaustively checked for all address, alignment, and overflow cases.
   Function pointers and general function-pointer calls are not supported.
 - `static`, `extern`, `auto`, `register`, `const`, and `volatile` specifiers
   are accepted in supported declarations but do not have their full C linkage,
@@ -635,8 +646,7 @@ minimum requirements:
   machine stack.
 
 Important language gaps include multidimensional array function-parameter
-declarators beyond the supported forms, function pointers, structure/union value
-assignment and passing/returning records by value, and parts of C90's
+declarators beyond the supported forms, function pointers, and parts of C90's
 declarator, initializer, and
 constant-expression rules. The preprocessor also does not implement every
 translation-phase and directive semantic required for strict C90 conformance.

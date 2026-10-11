@@ -31,7 +31,10 @@ Pointer representations use the low 16 address bits in the first two bytes and
 the remaining three address bits in the third byte. Pointer arithmetic is
 defined over the flat byte-addressed machine space but must still obey C90's
 same-array object rules. The compiler must not silently truncate addresses or
-offsets.
+offsets. Explicit pointer-to-integer conversions preserve the complete address
+in a 32-bit `long` and the low 16 bits in a 16-bit `int`. Explicit integer-to-
+pointer conversions use the low 19 bits. These conversion choices are
+implementation-defined.
 
 ## Alignment and aggregates
 
@@ -69,10 +72,14 @@ in-memory object representations on the stack, including the 3-byte pointer
 representation.
 
 Structure and union parameters are passed as copies of their complete object
+representations; this caller-side copy convention is implemented for fixed
+parameters. Structure and union assignment also copies complete object
 representations. Structure and union returns use a caller-provided result
 address as an implicit first argument; this pointer is removed with the
-ordinary arguments by the caller. This convention must remain reentrant and
-must not use shared global scratch storage.
+ordinary arguments by the caller. The compiler reserves per-call result
+temporaries in the caller's stack frame, so recursive calls do not share
+scratch storage. Runtime regressions cover nested return/argument expressions
+and recursive returns.
 
 ## Hosted execution environment
 
@@ -86,9 +93,13 @@ implementation extensions and do not replace required C90 library interfaces.
 ## Conformance gates
 
 The current code does not yet satisfy this target. In particular, binary16 is
-still used for all floating types, some pointer paths use 16-bit addressing,
-function pointers and indirect calls are incomplete, aggregate values are not
-passed or returned, and the hosted library is partial.
+still used for all floating types, function pointers and indirect calls are
+incomplete, and the hosted library is partial. Aggregate assignment, fixed-
+parameter copies, and caller-owned record returns are implemented, but other
+declarator and ABI requirements remain incomplete. Regression tests now cover 19-bit pointer encodings, explicit
+32-bit-integer-to-pointer casts, high-address byte/word/long accesses, and
+indexed accesses crossing `0xFFFF`; these cases do not establish every pointer
+conversion, arithmetic, alignment, or wraparound behavior.
 
 Do not remove the compiler's nonconformance disclaimer until all of the
 following pass:

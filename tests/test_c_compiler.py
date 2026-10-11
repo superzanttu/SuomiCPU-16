@@ -693,6 +693,197 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 20)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 20)
 
+    def test_c90_struct_arguments_are_copied_by_value(self):
+        image = compile_source(
+            "struct Pair { int first; unsigned char second; };\n"
+            "struct Pair original = { 40, 2 };\n"
+            "int result;\n"
+            "int update_copy(struct Pair pair) {\n"
+            "  pair.first = 99;\n"
+            "  return pair.first + pair.second;\n"
+            "}\n"
+            "int main(void) {\n"
+            "  result = update_copy(original);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 40)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 2], 2)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 101)
+
+    def test_c90_record_assignment_copies_complete_value_and_expression(self):
+        image = compile_source(
+            "struct Pair { int first; unsigned char second; };\n"
+            "struct Pair original = { 40, 2 };\n"
+            "struct Pair copy;\n"
+            "struct Pair chained;\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  copy = original;\n"
+            "  chained = (copy = original);\n"
+            "  result = copy.first + copy.second + chained.first + chained.second;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 40)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 2], 2)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 40)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 6], 2)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 8), 40)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 10], 2)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 12), 84)
+
+    def test_c90_union_assignment_copies_complete_representation(self):
+        image = compile_source(
+            "union Number { unsigned long wide; unsigned char bytes[4]; };\n"
+            "union Number original;\n"
+            "union Number copy;\n"
+            "unsigned long result;\n"
+            "int main(void) {\n"
+            "  original.wide = 0x12345678UL;\n"
+            "  copy = original;\n"
+            "  result = copy.wide;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 0x1234)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 0x5678)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 0x1234)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 0x5678)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 8), 0x1234)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 10), 0x5678)
+
+    def test_c90_struct_returns_use_caller_owned_storage(self):
+        image = compile_source(
+            "struct Pair { int first; int second; };\n"
+            "struct Pair make_pair(int value) {\n"
+            "  struct Pair result;\n"
+            "  result.first = value;\n"
+            "  result.second = value + 1;\n"
+            "  return result;\n"
+            "}\n"
+            "struct Pair pass_pair(struct Pair value) { return value; }\n"
+            "int main(void) {\n"
+            "  struct Pair result;\n"
+            "  result = pass_pair(make_pair(30));\n"
+            "  return result.first != 30 || result.second != 31 || "
+            "make_pair(40).first != 40;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_recursive_struct_returns_keep_temporaries_reentrant(self):
+        image = compile_source(
+            "struct Value { int value; };\n"
+            "struct Value descend(int count) {\n"
+            "  struct Value result;\n"
+            "  if (count) return descend(count - 1);\n"
+            "  result.value = 7;\n"
+            "  return result;\n"
+            "}\n"
+            "int main(void) {\n"
+            "  struct Value result;\n"
+            "  result = descend(4);\n"
+            "  return result.value != 7;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_record_return_member_is_not_a_modifiable_lvalue(self):
+        with self.assertRaisesRegex(CCompilerError, "not a modifiable lvalue"):
+            compile_source(
+                "struct Value { int value; };\n"
+                "struct Value make_value(void) { struct Value result; "
+                "return result; }\n"
+                "int main(void) { make_value().value = 3; return 0; }\n"
+            )
+
+    def test_c90_record_return_temporaries_count_toward_frame_limit(self):
+        with self.assertRaisesRegex(CCompilerError, "function frame exceeds"):
+            compile_source(
+                "struct Block { char bytes[64]; };\n"
+                "struct Block make_block(void) {\n"
+                "  struct Block value;\n"
+                "  return value;\n"
+                "}\n"
+                "struct Block choose(struct Block left, struct Block right) {\n"
+                "  return left;\n"
+                "}\n"
+                "int main(void) {\n"
+                "  choose(make_block(), make_block());\n"
+                "  return 0;\n"
+                "}\n"
+            )
+
+    def test_c90_union_returns_preserve_complete_representation(self):
+        image = compile_source(
+            "union Value { int words[2]; long number; };\n"
+            "union Value make_value(void) {\n"
+            "  union Value result;\n"
+            "  result.words[0] = 0x1234;\n"
+            "  result.words[1] = 0x5678;\n"
+            "  return result;\n"
+            "}\n"
+            "int main(void) {\n"
+            "  union Value result;\n"
+            "  result = make_value();\n"
+            "  return result.words[0] != 0x1234 || result.words[1] != 0x5678;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_postfix_increment_accepts_indirect_and_indexed_lvalues(self):
+        image = compile_source(
+            "int values[2];\n"
+            "int result;\n"
+            "int after;\n"
+            "int main(void) {\n"
+            "  int *pointer;\n"
+            "  values[0] = 10;\n"
+            "  values[1] = 20;\n"
+            "  pointer = &values[0];\n"
+            "  result = (*pointer)++;\n"
+            "  after = values[1]--;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 11)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 19)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 10)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 20)
+
+    def test_c90_increment_accepts_record_member_lvalues(self):
+        image = compile_source(
+            "struct Pair { int first; int second; };\n"
+            "struct Pair pair;\n"
+            "int previous;\n"
+            "int current;\n"
+            "int main(void) {\n"
+            "  pair.first = 4;\n"
+            "  pair.second = 8;\n"
+            "  previous = pair.first++;\n"
+            "  current = ++pair.second;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 5)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 9)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 4)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 9)
+
     def test_c90_casts_conditional_comma_and_sizeof(self):
         image = compile_source(
             "int result, first, second;\n"
@@ -1083,6 +1274,62 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(bytes(cpu.memory[GLOBAL_BASE:GLOBAL_BASE + 3]), b"\x23\x45\x01")
+
+    def test_c90_pointer_accesses_read_and_write_across_19_bit_address_space(self):
+        image = compile_source(
+            "int *word = 0x0FFFFUL;\n"
+            "unsigned char *bytes = 0x12345UL;\n"
+            "long *wide = 0x12347UL;\n"
+            "int observed;\n"
+            "unsigned char observed_byte;\n"
+            "long observed_long;\n"
+            "int main(void) {\n"
+            "  word[0] = 0x1234;\n"
+            "  word[1] = 0x5678;\n"
+            "  observed = word[0] + word[1];\n"
+            "  bytes[0] = 0xAB;\n"
+            "  observed_byte = bytes[0];\n"
+            "  *wide = 0x12345678L;\n"
+            "  observed_long = *wide;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 9), 0x68AC)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 11], 0xAB)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 12), 0x1234)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 14), 0x5678)
+        self.assertEqual(cpu.read_16(0xFFFF), 0x1234)
+        self.assertEqual(cpu.read_16(0x10001), 0x5678)
+        self.assertEqual(cpu.memory[0x12345], 0xAB)
+        self.assertEqual(bytes(cpu.memory[0x12347:0x1234B]), b"\x12\x34\x56\x78")
+
+    def test_c90_pointer_integer_casts_preserve_defined_address_bits(self):
+        image = compile_source(
+            "int observed;\n"
+            "unsigned long pointer_integer;\n"
+            "unsigned int pointer_low;\n"
+            "unsigned char *identity(unsigned char *pointer) { return pointer; }\n"
+            "int main(void) {\n"
+            "  unsigned char *bytes = identity((unsigned char *)0x812345UL);\n"
+            "  long *wide = (long *)0x812347UL;\n"
+            "  bytes[0] = 0xAB;\n"
+            "  *wide = 0x12345678L;\n"
+            "  pointer_integer = (unsigned long)bytes;\n"
+            "  pointer_low = (unsigned int)bytes;\n"
+            "  observed = bytes[0] == 0xAB && *wide == 0x12345678L;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 0x0001)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 0x2345)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 0x2345)
+        self.assertEqual(cpu.memory[0x12345], 0xAB)
+        self.assertEqual(bytes(cpu.memory[0x12347:0x1234B]), b"\x12\x34\x56\x78")
 
     def test_c90_string_search_and_bounded_operations(self):
         image = compile_source(

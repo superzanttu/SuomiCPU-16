@@ -149,6 +149,7 @@ class Local:
     slot: int
     line: int
     array_size: int = 0
+    is_const: bool = False
 
 
 @dataclass
@@ -177,6 +178,7 @@ class Global:
     initializer: Expr | None
     line: int
     array_size: int = 0
+    is_const: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,7 @@ class _Field:
     c_type: str
     offset: int
     array_size: int = 0
+    is_const: bool = False
 
 
 @dataclass
@@ -460,6 +463,7 @@ class _Parser:
         self.records: dict[str, _Record] = {}
         self.global_declarations: dict[str, Global] = {}
         self._anonymous_record_index = 0
+        self._last_type_const = False
 
     @property
     def token(self) -> Token:
@@ -494,6 +498,7 @@ class _Parser:
         return self.take()
 
     def parse_type(self) -> str:
+        self._last_type_const = False
         if self.token.value == "enum":
             self.take()
             tag = None
@@ -544,6 +549,8 @@ class _Parser:
                 if current in qualifiers:
                     raise self.fail(f"duplicate type qualifier {current!r}")
                 qualifiers.add(current)
+                if current == "const":
+                    self._last_type_const = True
                 self.take()
                 continue
             if current in ("static", "extern", "register", "auto"):
@@ -652,7 +659,11 @@ class _Parser:
                             f"{field_name.value!r}"
                         )
                     fields[field_name.value] = _Field(
-                        field_name.value, declarator_type, field_offset, array_size
+                        field_name.value,
+                        declarator_type,
+                        field_offset,
+                        array_size,
+                        self._last_type_const and not declarator_type.endswith("*"),
                     )
                     if is_union:
                         maximum_size = max(maximum_size, field_width)
@@ -1069,7 +1080,12 @@ class _Parser:
             declaration = self.global_declarations.get(name)
             if declaration is None:
                 declaration = Global(
-                    name, current_type, initializer, name_token.line, array_size
+                    name,
+                    current_type,
+                    initializer,
+                    name_token.line,
+                    array_size,
+                    self._last_type_const and not current_type.endswith("*"),
                 )
                 self.global_declarations[name] = declaration
                 self.globals.append(declaration)
@@ -1149,7 +1165,13 @@ class _Parser:
                 array_size, current_type, initializer, token.line
             )
             local = Local(
-                token.value, current_type, initializer, self._local_count, token.line, array_size
+                token.value,
+                current_type,
+                initializer,
+                self._local_count,
+                token.line,
+                array_size,
+                self._last_type_const and not current_type.endswith("*"),
             )
             self._local_count += (
                 _object_size(current_type, self.records)
@@ -1338,7 +1360,7 @@ class _Parser:
                 "name", "index", "member",
             ) and not (child.kind == "unary" and child.value == "*"):
                 raise CCompilerError(
-                    f"{self.filename}:{token.line}: increment requires a scalar variable"
+                    f"{self.filename}:{token.line}: increment requires a modifiable lvalue"
                 )
             return Expr("unary", operator, (child,), token.line)
         expression = self.parse_primary()
@@ -1364,9 +1386,11 @@ class _Parser:
                 expression = Expr("call", expression.value, tuple(arguments), expression.line)
             elif self.token.value in ("++", "--"):
                 operator = self.take()
-                if expression.kind != "name":
+                if expression.kind not in ("name", "index", "member") and not (
+                    expression.kind == "unary" and expression.value == "*"
+                ):
                     raise CCompilerError(
-                        f"{self.filename}:{operator.line}: increment requires a scalar variable"
+                        f"{self.filename}:{operator.line}: increment requires a modifiable lvalue"
                     )
                 expression = Expr("postfix", operator.value, (expression,), operator.line)
             elif self.token.value in (".", "->"):
@@ -1473,6 +1497,7 @@ class _Variable:
     c_type: str = "int"
     array_size: int = 0
     constant_value: int | None = None
+    is_const: bool = False
 
 
 class _CodeGenerator:
@@ -1504,6 +1529,7 @@ class _CodeGenerator:
         self.global_variables: dict[str, Global] = {}
         self.string_data: list[tuple[str, bytes]] = []
         self.current_function: Function | None = None
+        self._aggregate_return_slots: dict[int, int] = {}
         self.prototypes: dict[
             str, tuple[str, int | None, tuple[str, ...] | None, bool]
         ] = {}
@@ -1949,6 +1975,34 @@ class _CodeGenerator:
     def _generate_function(self, function: Function) -> None:
         self.current_function = function
         self.label_names = set()
+        self._aggregate_return_slots = {}
+        aggregate_temporary_size = 0
+
+        def collect_aggregate_return_calls(value: Any) -> None:
+            nonlocal aggregate_temporary_size
+            if isinstance(value, Expr):
+                if (
+                    value.kind == "call"
+                    and self._expression_type(value) in self.records
+                ):
+                    self._aggregate_return_slots[id(value)] = (
+                        function.local_count + aggregate_temporary_size
+                    )
+                    aggregate_temporary_size += _object_size(
+                        self._expression_type(value), self.records
+                    )
+                for child in value.children:
+                    collect_aggregate_return_calls(child)
+            elif isinstance(value, Stmt):
+                collect_aggregate_return_calls(value.value)
+                collect_aggregate_return_calls(value.children)
+            elif isinstance(value, Local):
+                collect_aggregate_return_calls(value.initializer)
+            elif isinstance(value, (tuple, list)):
+                for child in value:
+                    collect_aggregate_return_calls(child)
+
+        collect_aggregate_return_calls(function.body)
         goto_targets: set[str] = set()
 
         def collect_labels(statement: Stmt) -> None:
@@ -1997,20 +2051,26 @@ class _CodeGenerator:
                 )
         if function.name == "main" and function.parameters:
             raise self.error(function.line, "main() must not have parameters")
-        if function.local_count > FRAME_SIZE_LIMIT:
+        self.frame_size = function.local_count + aggregate_temporary_size
+        if self.frame_size > FRAME_SIZE_LIMIT:
             raise self.error(
                 function.line,
                 f"function frame exceeds {FRAME_SIZE_LIMIT} bytes",
             )
-        self.frame_size = function.local_count
         parameter_bytes = sum(
             _object_size(c_type, self.records) for c_type, _ in function.parameters
         )
-        if self.frame_size + 2 + parameter_bytes > STACK_OFFSET_LIMIT:
+        hidden_return_bytes = 3 if function.return_type in self.records else 0
+        if (
+            self.frame_size + 2 + hidden_return_bytes + parameter_bytes
+            > STACK_OFFSET_LIMIT
+        ):
             raise self.error(function.line, "parameters exceed stack-relative address range")
         self.stack_depth = 0
         self.scopes = [{}]
         parameter_offset = self.frame_size + 2
+        if function.return_type in self.records:
+            parameter_offset += 3
         for c_type, name in function.parameters:
             if name is None:
                 parameter_offset += _object_size(c_type, self.records)
@@ -2219,8 +2279,14 @@ class _CodeGenerator:
             self.emit(f"    SUB {register}, R7")
 
     def _convert_to_type(self, register: str, c_type: str, source_type: str) -> None:
+        if c_type.endswith("*") and source_type in ("long", "unsigned long"):
+            self._convert_long_to_pointer(register)
+            return
         if c_type in ("long", "unsigned long"):
             if source_type in ("long", "unsigned long"):
+                return
+            if source_type.endswith("*"):
+                self._convert_pointer_to_long(register)
                 return
             if source_type in ("int", "unsigned int", "char", "unsigned char"):
                 if source_type in ("char", "unsigned char"):
@@ -2236,6 +2302,10 @@ class _CodeGenerator:
             self.emit(f"    ITOF {register}")
         elif c_type != "float" and source_type == "float":
             self.emit(f"    FTOI {register}")
+        elif c_type in ("int", "unsigned int") and source_type.endswith("*"):
+            mask = "R6" if register == "R7" else "R7"
+            self.emit(f"    LDI {mask}, 0xFFFF")
+            self.emit(f"    AND {register}, {mask}")
         elif c_type in ("int", "unsigned int") and source_type in (
             "long", "unsigned long"
         ):
@@ -2244,6 +2314,50 @@ class _CodeGenerator:
         if c_type in ("char", "unsigned char"):
             self.emit("    LDI R7, 0x00FF")
             self.emit(f"    AND {register}, R7")
+
+    def _convert_long_to_pointer(self, register: str) -> None:
+        """Pack the low 19 bits of the long result into the pointer register form."""
+        scratch = [f"R{index}" for index in range(2, 8) if f"R{index}" != register]
+        high, increment, mask, zero = scratch[:4]
+        repeat = self.label("long_to_pointer")
+        done = self.label("long_to_pointer_done")
+        self.emit(f"    MOV {high}, R0")
+        if register != "R1":
+            self.emit(f"    MOV {register}, R1")
+        self.emit(f"    LDI {mask}, 7")
+        self.emit(f"    AND {high}, {mask}")
+        self.emit(f"    LDI {increment}, 0xFFFF")
+        self.emit(f"    INC {increment}")
+        self.emit(f"    LDI {zero}, 0")
+        self.emit(f"{repeat}:")
+        self.emit(f"    CMP {high}, {zero}")
+        self.emit(f"    BZX {done}")
+        self.emit(f"    ADD {register}, {increment}")
+        self.emit(f"    DEC {high}")
+        self.emit(f"    CMP {high}, {zero}")
+        self.emit(f"    BZX {done}")
+        self.emit(f"    JMPX {repeat}")
+        self.emit(f"{done}:")
+
+    def _convert_pointer_to_long(self, register: str) -> None:
+        """Split the compiler's expanded 19-bit pointer value into a long pair."""
+        scratch = [f"R{index}" for index in range(2, 8) if f"R{index}" != register]
+        remaining, low_word, word_size = scratch[:3]
+        repeat = self.label("pointer_to_long")
+        done = self.label("pointer_to_long_done")
+        self.emit(f"    MOV {remaining}, {register}")
+        self.emit(f"    LDI {low_word}, 0")
+        self.emit(f"    LDI {word_size}, 0xFFFF")
+        self.emit(f"    INC {word_size}")
+        self.emit(f"{repeat}:")
+        self.emit(f"    CMP {remaining}, {word_size}")
+        self.emit(f"    BCX {done}")
+        self.emit(f"    SUB {remaining}, {word_size}")
+        self.emit(f"    INC {low_word}")
+        self.emit(f"    JMPX {repeat}")
+        self.emit(f"{done}:")
+        self.emit(f"    MOV {register}, {low_word}")
+        self.emit(f"    MOV R1, {remaining}")
 
     def _statement(self, statement: Stmt) -> None:
         kind = statement.kind
@@ -2337,13 +2451,52 @@ class _CodeGenerator:
                                 statement.line,
                                 "return expression is incompatible with function type",
                             )
+                    elif return_type in self.records:
+                        if source_type != return_type:
+                            raise self.error(
+                                statement.line,
+                                "return expression is incompatible with function type",
+                            )
                     else:
                         raise self.error(
                             statement.line,
                             "returning this type is not supported",
                         )
                 self._expression(expression)
-                if self.current_function is not None:
+                if self.current_function is not None and return_type in self.records:
+                    self.emit("    ADJSP -3")
+                    self.stack_depth += 3
+                    self.emit("    MOVSP R7")
+                    self._emit_store_pointer("R0")
+                    self.emit("    MOVSP R7")
+                    destination_offset = self.frame_size + 2 + self.stack_depth
+                    if destination_offset:
+                        self.emit(f"    LDI R6, {destination_offset}")
+                        self.emit("    ADD R7, R6")
+                    self._emit_load_pointer("R0")
+                    self.emit("    MOV R2, R0")
+                    self.emit("    MOVSP R7")
+                    self._emit_load_pointer("R0")
+                    self.emit("    MOV R4, R0")
+                    self.emit("    MOV R5, R2")
+                    self.emit("    MOV R3, R5")
+                    width = _object_size(return_type, self.records)
+                    self.emit(f"    LDI R6, {width}")
+                    repeat = self.label("return_record_copy")
+                    done = self.label("return_record_copy_done")
+                    self.emit(f"{repeat}:")
+                    self.emit("    CMP R6, 0")
+                    self.emit(f"    BZX {done}")
+                    self.emit("    LD R2, R4")
+                    self.emit("    ST R5, R2")
+                    self.emit("    INC R4")
+                    self.emit("    INC R5")
+                    self.emit("    DEC R6")
+                    self.emit(f"    JMPX {repeat}")
+                    self.emit(f"{done}:")
+                    self.emit("    ADJSP 3")
+                    self.stack_depth -= 3
+                elif self.current_function is not None:
                     self._convert_to_type("R0", return_type, source_type)
             self._emit_epilogue()
             return
@@ -2598,7 +2751,17 @@ class _CodeGenerator:
             self._require_modifiable_lvalue(target, expression.line)
             target_type = self._expression_type(target)
             if target_type in self.records:
-                raise self.error(expression.line, "aggregate assignment is not supported")
+                if operator != "=":
+                    raise self.error(
+                        expression.line, "compound assignment requires a scalar lvalue"
+                    )
+                source = expression.children[0]
+                if self._expression_type(source) != target_type:
+                    raise self.error(
+                        expression.line,
+                        "record assignment requires compatible structure or union types",
+                    )
+                return target_type
             if operator != "=":
                 operation_type = self._expression_type(
                     Expr(
@@ -2828,11 +2991,14 @@ class _CodeGenerator:
             c_type = self._expression_type(expression)
         elif expression.kind == "member":
             operator, field_name = expression.value
-            base_type = self._expression_type(expression.children[0])
+            base = expression.children[0]
+            base_type = self._expression_type(base)
             if operator == "->":
                 if not base_type.endswith("*"):
                     raise self.error(line, "-> requires a pointer to a record")
                 base_type = base_type[:-1]
+            elif base_type in self.records:
+                self._require_modifiable_lvalue(base, line)
             field_ = self._record_field(base_type, field_name, line)
             if field_.array_size:
                 raise self.error(line, "arrays are not modifiable lvalues")
@@ -3035,7 +3201,10 @@ class _CodeGenerator:
                 self._expression(base)
                 base_type = base_type[:-1]
             else:
-                base_type = self._lvalue_address(base, line)
+                if base.kind == "call" and base_type in self.records:
+                    self._expression(base)
+                else:
+                    base_type = self._lvalue_address(base, line)
             field_ = self._record_field(base_type, field_name, line)
             if field_.offset:
                 self.emit(f"    LDI R7, {field_.offset}")
@@ -3052,12 +3221,13 @@ class _CodeGenerator:
             if variable.array_size:
                 raise self.error(line, "array expression requires an index")
             if variable.c_type in self.records:
-                raise self.error(line, "record value operations are not supported")
+                self._lvalue_address(expression, line)
+                return
             self._load_variable(variable, "R0", line)
             return
         c_type = self._lvalue_address(expression, line)
         if c_type in self.records:
-            raise self.error(line, "record value operations are not supported")
+            return
         if c_type.endswith("*"):
             self.emit("    MOV R7, R0")
             self._emit_load_pointer("R0")
@@ -3087,7 +3257,7 @@ class _CodeGenerator:
     ) -> None:
         c_type = self._expression_type(expression)
         if c_type in self.records:
-            raise self.error(line, "record assignment is not supported")
+            raise self.error(line, "record assignment must use the aggregate assignment path")
         integer_types = INTEGER_TYPES
         numeric_types = ARITHMETIC_TYPES
         if c_type in numeric_types:
@@ -3164,6 +3334,43 @@ class _CodeGenerator:
         )
         self.emit("    ADJSP 2")
         self.stack_depth -= 2
+
+    def _store_record_lvalue(
+        self, target: Expr, source: Expr, line: int
+    ) -> None:
+        c_type = self._expression_type(target)
+        if c_type not in self.records or self._expression_type(source) != c_type:
+            raise self.error(
+                line, "record assignment requires compatible structure or union types"
+            )
+        width = _type_size(c_type, self.records)
+        self._expression(source)
+        self.emit("    ADJSP -3")
+        self.stack_depth += 3
+        self.emit("    MOVSP R7")
+        self._emit_store_pointer("R0")
+        self._lvalue_address(target, line)
+        self.emit("    MOVSP R7")
+        self._emit_load_pointer("R1")
+        self.emit("    MOV R4, R1")
+        self.emit("    MOV R5, R0")
+        self.emit("    MOV R3, R5")
+        self.emit(f"    LDI R6, {width}")
+        repeat = self.label("record_copy")
+        done = self.label("record_copy_done")
+        self.emit(f"{repeat}:")
+        self.emit("    CMP R6, 0")
+        self.emit(f"    BZX {done}")
+        self.emit("    LD R2, R4")
+        self.emit("    ST R5, R2")
+        self.emit("    INC R4")
+        self.emit("    INC R5")
+        self.emit("    DEC R6")
+        self.emit(f"    JMPX {repeat}")
+        self.emit(f"{done}:")
+        self.emit("    ADJSP 3")
+        self.stack_depth -= 3
+        self.emit("    MOV R0, R3")
 
     def _expression(self, expression: Expr) -> None:
         kind = expression.kind
@@ -3249,7 +3456,8 @@ class _CodeGenerator:
                 self.emit(f"    LDI R0, {variable.constant_value & WORD_MASK}")
                 return
             if variable.c_type in self.records and not variable.array_size:
-                raise self.error(expression.line, "record values are only supported as lvalues")
+                self._lvalue_address(expression, expression.line)
+                return
             if variable.array_size:
                 self._array_address(variable, "R0", expression.line)
             else:
@@ -3297,7 +3505,15 @@ class _CodeGenerator:
                         parameter_type = "int"
                 integer_types = INTEGER_TYPES
                 numeric_types = ARITHMETIC_TYPES
-                if parameter_type in numeric_types:
+                record_argument = parameter_type in self.records
+                if record_argument:
+                    if index >= expected or source_type != parameter_type:
+                        raise self.error(
+                            argument.line,
+                            f"argument {index + 1} to {name}() is incompatible "
+                            "with its record parameter type",
+                        )
+                elif parameter_type in numeric_types:
                     if source_type not in numeric_types:
                         raise self.error(
                             argument.line,
@@ -3331,21 +3547,55 @@ class _CodeGenerator:
                     )
                 if array_argument is not None:
                     self._lvalue_address(argument, argument.line)
+                elif record_argument:
+                    if argument.kind == "call":
+                        self._expression(argument)
+                    else:
+                        self._lvalue_address(argument, argument.line)
                 else:
                     self._expression(argument)
-                self._convert_to_type("R0", parameter_type, source_type)
                 width = _object_size(parameter_type, self.records)
-                if width == 3:
-                    self.emit("    ADJSP -3")
-                    self.emit("    MOVSP R7")
-                    self._emit_store_pointer("R0")
-                elif width == 4:
-                    self.emit("    PUSH R1")
-                    self.emit("    PUSH R0")
+                if record_argument:
+                    self.emit("    MOV R4, R0")
+                    self.emit(f"    ADJSP -{width}")
+                    self.stack_depth += width
+                    self.emit("    MOVSP R5")
+                    for _ in range(width):
+                        self.emit("    LD R2, R4")
+                        self.emit("    ST R5, R2")
+                        self.emit("    INC R4")
+                        self.emit("    INC R5")
                 else:
-                    self.emit("    PUSH R0")
-                self.stack_depth += width
+                    self._convert_to_type("R0", parameter_type, source_type)
+                    if width == 3:
+                        self.emit("    ADJSP -3")
+                        self.emit("    MOVSP R7")
+                        self._emit_store_pointer("R0")
+                    elif width == 4:
+                        self.emit("    PUSH R1")
+                        self.emit("    PUSH R0")
+                    else:
+                        self.emit("    PUSH R0")
+                    self.stack_depth += width
                 argument_bytes += width
+            return_type = self._expression_type(expression)
+            if return_type in self.records:
+                result_slot = self._aggregate_return_slots.get(id(expression))
+                if result_slot is None:
+                    raise self.error(
+                        expression.line,
+                        "aggregate return temporary was not allocated",
+                    )
+                self.emit("    MOVSP R0")
+                result_offset = result_slot + self.stack_depth
+                if result_offset:
+                    self.emit(f"    LDI R7, {result_offset}")
+                    self.emit("    ADD R0, R7")
+                self.emit("    ADJSP -3")
+                self.stack_depth += 3
+                self.emit("    MOVSP R7")
+                self._emit_store_pointer("R0")
+                argument_bytes += 3
             if name in ("abort", "exit"):
                 self.emit("    HALT")
             elif name in LIBRARY_FUNCTIONS and name not in self.function_names:
@@ -3355,13 +3605,25 @@ class _CodeGenerator:
             if argument_bytes:
                 self.emit(f"    ADJSP {argument_bytes}")
                 self.stack_depth -= argument_bytes
+            if return_type in self.records:
+                self.emit("    MOVSP R0")
+                if result_slot:
+                    self.emit(f"    LDI R7, {result_slot}")
+                    self.emit("    ADD R0, R7")
             return
         if kind == "assign":
             operator, target = expression.value
             self._require_modifiable_lvalue(target, expression.line)
             target_type = self._expression_type(target)
             if target_type in self.records:
-                raise self.error(expression.line, "aggregate assignment is not supported")
+                if operator != "=":
+                    raise self.error(
+                        expression.line, "compound assignment requires a scalar lvalue"
+                    )
+                self._store_record_lvalue(
+                    target, expression.children[0], expression.line
+                )
+                return
             discarded = self._discard is expression
             self._discard = None
             if operator == "=":
@@ -3484,7 +3746,24 @@ class _CodeGenerator:
                     self.emit(f"    {'INC' if operator == '++' else 'DEC'} R0")
                     if not discarded:
                         self._mask_result()
+                saved_result_size = 0
+                if child.kind != "name":
+                    if c_type in ("long", "unsigned long"):
+                        self.emit("    PUSH R1")
+                        self.stack_depth += 2
+                        saved_result_size = 4
+                    self.emit("    PUSH R0")
+                    self.stack_depth += 2
+                    saved_result_size += 2
                 self._store_lvalue(child, "R0", c_type, expression.line)
+                if saved_result_size:
+                    if saved_result_size == 4:
+                        self.emit("    LDWS R0, 0")
+                        self.emit("    LDWS R1, 2")
+                    else:
+                        self.emit("    LDWS R0, 0")
+                    self.emit(f"    ADJSP {saved_result_size}")
+                    self.stack_depth -= saved_result_size
                 return
             self._expression(child)
             if operator == "-":

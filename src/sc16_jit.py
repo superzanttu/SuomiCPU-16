@@ -135,8 +135,6 @@ def run_block(mem, regs, st, budget):
             c = carry
         elif op == 31 and (instr & 0xF81F) == 0xF81A:
             bail = True
-        elif op == 31 and (instr & 0xF81F) == 0xF81C:
-            bail = True
         elif op == 31 and (instr & 0xF8FF) == 0xF81F:
             control = _rd16(mem, npc)
             npc += 2

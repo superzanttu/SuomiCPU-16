@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.isa import (
-    ADDRESS_OPERATIONS,
-    ADDRESS_PREFIX,
     ALU_IMMEDIATE_FLAG,
     ALU_IMMEDIATE_OPERATIONS,
     ALU_MISC_OPERATION,
@@ -257,10 +255,6 @@ def _alu_name(mnemonic: str, operands: list[str]) -> str | None:
 
 def _extended_size(mnemonic: str, operands: list[str], line_number: int) -> int | None:
     """Size in bytes of the extended instructions, or None for other mnemonics."""
-    if mnemonic in ADDRESS_OPERATIONS:
-        if len(operands) != 2:
-            raise _error(line_number, f"{mnemonic} expects two registers")
-        return 4
     if mnemonic in WIDE_OPERATIONS:
         if len(operands) != (1 if mnemonic == "NEG32" else 2):
             count = 1 if mnemonic == "NEG32" else 2
@@ -291,20 +285,6 @@ def _assemble_extended(
             raise _error(line_number, "NOP expects no operands")
         return [OPCODES["MOV"] << 11]
     shared = OPCODES["SHR"] << 11
-    if mnemonic in ADDRESS_OPERATIONS:
-        if len(operands) != 2:
-            raise _error(line_number, f"{mnemonic} expects two registers")
-        data_register = _parse_register(operands[0], line_number)
-        address_register = _parse_register(operands[1], line_number)
-        if address_register & 1:
-            raise _error(
-                line_number, f"{mnemonic} address register must be an even register"
-            )
-        control = ADDRESS_OPERATIONS[mnemonic] << 12
-        return [
-            shared | (data_register << 8) | ADDRESS_PREFIX,
-            control | address_register,
-        ]
     if mnemonic in WIDE_OPERATIONS:
         unary = mnemonic == "NEG32"
         if len(operands) != (1 if unary else 2):
@@ -376,9 +356,7 @@ def _assemble_extended(
         return [first, control | ALU_IMMEDIATE_FLAG | value]
     if not -0x8000 <= value <= 0xFFFF:
         raise _error(line_number, f"{mnemonic} immediate must fit in 16 bits")
-    return [first, control |     ADDRESS_OPERATIONS,
-    ADDRESS_PREFIX,
-    ALU_IMMEDIATE_FLAG, value & 0xFFFF]
+    return [first, control | ALU_IMMEDIATE_FLAG, value & 0xFFFF]
 
 def _instruction_size(text: str, line_number: int) -> int:
     mnemonic, operands = _parse_instruction(text, line_number)
