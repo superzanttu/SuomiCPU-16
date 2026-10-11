@@ -126,5 +126,13 @@ jump_target:
     ASR32 R0, 1
     NEG32 R0
     MOV32 R0, R2
+    LD32 R0, R2
+    ST32 R0, R2
+    MUL32 R0, R2
+    DIV32 R0, R2
+    DIV32S R0, R2
+    MOD32 R0, R2
+    MOD32S R0, R2
+    MOVSPH R0
 sample_routine:
     RET

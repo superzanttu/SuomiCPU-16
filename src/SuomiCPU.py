@@ -722,6 +722,12 @@ class SuomiCompute16:
         self.pc += 2
         operation = control >> 12
         immediate = bool(control & 0x0800)
+        if rd & 1 or rd > 6:
+            raise ValueError("32-bit instructions require an even register pair")
+        if operation not in (6, 7, 8, 9):
+            source = control & 0x7
+            if source & 1 or source > 6:
+                raise ValueError("32-bit instructions require an even register pair")
         left = ((self.registers[rd] & 0xFFFF) << 16) | (self.registers[rd + 1] & 0xFFFF)
         if operation == 9:
             result = (-left) & 0xFFFFFFFF
@@ -739,6 +745,70 @@ class SuomiCompute16:
             source = control & 0x7
             self.registers[rd] = self.registers[source] & 0xFFFF
             self.registers[rd + 1] = self.registers[source + 1] & 0xFFFF
+            return
+        if operation in (11, 12):
+            address_pair = control & 0x7
+            address = (
+                ((self.registers[address_pair] & 0xFFFF) << 16)
+                | (self.registers[address_pair + 1] & 0xFFFF)
+            ) & MEM_MASK
+            if operation == 11:
+                result = 0
+                for offset in range(4):
+                    result = (result << 8) | self.read(address + offset)
+                self.registers[rd] = (result >> 16) & 0xFFFF
+                self.registers[rd + 1] = result & 0xFFFF
+            else:
+                value = (
+                    ((self.registers[rd] & 0xFFFF) << 16)
+                    | (self.registers[rd + 1] & 0xFFFF)
+                )
+                for offset in range(4):
+                    self.write(address + offset, (value >> (24 - offset * 8)) & 0xFF)
+            return
+        if operation in (13, 14, 15):
+            source = control & 0x7
+            right = ((self.registers[source] & 0xFFFF) << 16) | (self.registers[source + 1] & 0xFFFF)
+            if operation == 13:
+                product = left * right
+                result = product & 0xFFFFFFFF
+                signed_left = left - 0x100000000 if left & 0x80000000 else left
+                signed_right = right - 0x100000000 if right & 0x80000000 else right
+                signed_product = signed_left * signed_right
+                self.flags["C"] = int(product > 0xFFFFFFFF)
+                self.flags["V"] = int(not -0x80000000 <= signed_product <= 0x7FFFFFFF)
+            else:
+                signed = bool(control & 0x0800)
+                if signed:
+                    signed_left = left - 0x100000000 if left & 0x80000000 else left
+                    signed_right = right - 0x100000000 if right & 0x80000000 else right
+                else:
+                    signed_left = left
+                    signed_right = right
+                if right == 0:
+                    result = left if operation == 15 else 0
+                    self.flags["C"] = 1
+                elif signed:
+                    quotient = abs(signed_left) // abs(signed_right)
+                    if (signed_left < 0) != (signed_right < 0):
+                        quotient = -quotient
+                    result = (
+                        quotient if operation == 14
+                        else signed_left - quotient * signed_right
+                    ) & 0xFFFFFFFF
+                    self.flags["C"] = 0
+                else:
+                    result = (
+                        left // right if operation == 14 else left % right
+                    )
+                    self.flags["C"] = 0
+            result &= 0xFFFFFFFF
+            self.flags["Z"] = int(result == 0)
+            self.flags["N"] = result >> 31
+            if operation != 13:
+                self.flags["V"] = 0
+            self.registers[rd] = (result >> 16) & 0xFFFF
+            self.registers[rd + 1] = result & 0xFFFF
             return
         if operation in (6, 7, 8):
             count = (control & 0x1F) if immediate else (self.registers[control & 0x7] & 0x1F)
@@ -832,6 +902,8 @@ class SuomiCompute16:
         elif selector == 9:
             self.registers[rd] = 16 - value.bit_length()
             self.flags['Z'] = int(value == 0)
+        elif selector == 10:
+            self.registers[rd] = (self.sp >> 16) & 0x7
 
     def _pack_flags(self):
         flags = self.flags

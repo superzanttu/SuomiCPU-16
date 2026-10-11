@@ -1,8 +1,8 @@
 #ifndef _SC16_TIME_H
 #define _SC16_TIME_H
 
-typedef long clock_t;
-typedef long time_t;
+typedef int clock_t;
+typedef int time_t;
 
 #define CLOCKS_PER_SEC 1
 

@@ -15,6 +15,11 @@ from typing import Any, Sequence
 from tools.assembler import AssemblyError, AssemblyImage, assemble
 
 WORD_MASK = 0xFFFF
+DWORD_MASK = 0xFFFFFFFF
+INTEGER_TYPES = frozenset({
+    "char", "unsigned char", "int", "unsigned int", "long", "unsigned long",
+})
+ARITHMETIC_TYPES = INTEGER_TYPES | {"float"}
 CODE_BASE = 0x4800
 GLOBAL_BASE = 0x2000
 STACK_OFFSET_LIMIT = 0xFF
@@ -228,6 +233,8 @@ def _type_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
         return 3
     if records is not None and c_type in records:
         return records[c_type].size
+    if c_type in ("long", "unsigned long"):
+        return 4
     return 1 if c_type in ("char", "unsigned char") else 2
 
 
@@ -236,7 +243,38 @@ def _object_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
         return 3
     if records is not None and c_type in records:
         return records[c_type].size
+    if c_type in ("long", "unsigned long"):
+        return 4
     return 2
+
+
+def _cast_integer_constant(value: int, c_type: str) -> int:
+    if c_type in ("long", "unsigned long"):
+        value &= DWORD_MASK
+        return value if c_type == "unsigned long" else (
+            value - 0x100000000 if value & 0x80000000 else value
+        )
+    if c_type == "unsigned char":
+        return value & 0xFF
+    if c_type == "char":
+        value &= 0xFF
+        return value - 0x100 if value & 0x80 else value
+    if c_type == "unsigned int":
+        return value & WORD_MASK
+    if c_type in ("int", "short", "unsigned short"):
+        value &= WORD_MASK
+        if c_type == "unsigned short":
+            return value
+        return value - 0x10000 if value & 0x8000 else value
+    return value
+
+
+def _is_integer_type(c_type: str) -> bool:
+    return c_type in INTEGER_TYPES
+
+
+def _is_arithmetic_type(c_type: str) -> bool:
+    return c_type in ARITHMETIC_TYPES
 
 
 def _lex_raw(source: str, filename: str) -> list[Token]:
@@ -556,6 +594,8 @@ class _Parser:
             raise self.fail("char cannot be combined with short or long")
         if base == "char":
             return "unsigned char" if unsigned else "char"
+        if long:
+            return "unsigned long" if unsigned else "long"
         return "unsigned int" if unsigned else "int"
 
     def _parse_record_specifier(self) -> str:
@@ -634,14 +674,17 @@ class _Parser:
     def _enum_constant_value(self, expression: Expr) -> int:
         if expression.kind == "constant":
             return int(expression.value)
+        if expression.kind == "wide_constant":
+            return int(expression.value[0])
         if expression.kind == "name" and expression.value in self.enum_constants:
             return self.enum_constants[str(expression.value)]
         if expression.kind == "sizeof_type":
             return _type_size(str(expression.value), self.records)
-        if expression.kind == "cast" and expression.value in (
-            "char", "unsigned char", "int", "unsigned int"
-        ):
-            return self._enum_constant_value(expression.children[0])
+        if expression.kind == "cast" and expression.value in INTEGER_TYPES:
+            return _cast_integer_constant(
+                self._enum_constant_value(expression.children[0]),
+                str(expression.value),
+            )
         if expression.kind == "unary":
             value = self._enum_constant_value(expression.children[0])
             operator = str(expression.value)
@@ -1137,12 +1180,9 @@ class _Parser:
                     case_value = self.parse_expression(1)
                     self.expect(":")
                     try:
-                        constant_value = self._enum_constant_value(case_value)
+                        self._enum_constant_value(case_value)
                     except CCompilerError as exc:
                         raise self.fail("case labels must be constant integer expressions")
-                    case_value = Expr(
-                        "constant", constant_value & WORD_MASK, line=case_value.line
-                    )
                     body: list[Stmt] = []
                     while self.token.value not in ("case", "default", "}"):
                         body.append(self.parse_statement())
@@ -1346,12 +1386,38 @@ class _Parser:
                 raise CCompilerError(
                     f"{self.filename}:{token.line}: invalid integer constant {token.value!r}"
                 ) from exc
-            if number > WORD_MASK:
-                if digits.lower().startswith("0x") and number < (1 << 19):
-                    return Expr("address_constant", number, line=token.line)
+            suffix = token.value[len(digits):].lower()
+            if number > DWORD_MASK:
                 raise CCompilerError(
-                    f"{self.filename}:{token.line}: integer constant exceeds 16 bits"
+                    f"{self.filename}:{token.line}: integer constant exceeds 32 bits"
                 )
+            is_decimal = base == 10
+            if "l" in suffix:
+                integer_type = (
+                    "unsigned long"
+                    if "u" in suffix or number > 0x7FFFFFFF
+                    else "long"
+                )
+                return Expr("wide_constant", (number, integer_type), line=token.line)
+            if "u" in suffix:
+                integer_type = "unsigned int" if number <= WORD_MASK else "unsigned long"
+                return Expr("wide_constant", (number, integer_type), line=token.line)
+            if is_decimal:
+                if number > 0x7FFFFFFF:
+                    return Expr(
+                        "wide_constant", (number, "unsigned long"), line=token.line
+                    )
+                if number > 0x7FFF:
+                    return Expr("wide_constant", (number, "long"), line=token.line)
+            else:
+                if number > 0x7FFFFFFF:
+                    return Expr(
+                        "wide_constant", (number, "unsigned long"), line=token.line
+                    )
+                if number > WORD_MASK:
+                    return Expr("wide_constant", (number, "long"), line=token.line)
+                if number > 0x7FFF:
+                    return Expr("wide_constant", (number, "unsigned int"), line=token.line)
             return Expr("constant", number & WORD_MASK, line=token.line)
         if token.value.startswith("<string:") and token.value.endswith(">"):
             value = bytes.fromhex(token.value[8:-1]) + b"\0"
@@ -1585,12 +1651,16 @@ class _CodeGenerator:
         if initializer.kind == "string":
             raise self.error(line, "a string literal cannot initialize a scalar")
         if c_type.endswith("*"):
-            is_address_constant = initializer.kind == "address_constant"
+            address_extension = (
+                initializer.kind == "wide_constant"
+                and self._is_integer_constant_expression(initializer)
+                and 0 <= self._constant(initializer) < (1 << 19)
+            )
             is_null_pointer_constant = (
                 self._is_integer_constant_expression(initializer)
                 and self._constant(initializer) == 0
             )
-            if not is_address_constant and not is_null_pointer_constant:
+            if not address_extension and not is_null_pointer_constant:
                 raise self.error(
                     line,
                     "pointer initializer must be an address constant or null pointer constant",
@@ -1615,6 +1685,8 @@ class _CodeGenerator:
             return self._constant(expression.children[0])
         if expression.kind == "constant":
             return int(expression.value) & WORD_MASK
+        if expression.kind == "wide_constant":
+            return int(expression.value[0]) & DWORD_MASK
         if expression.kind == "name" and str(expression.value) in self.enum_constants:
             return self.enum_constants[str(expression.value)] & WORD_MASK
         if expression.kind == "sizeof_type":
@@ -1624,6 +1696,10 @@ class _CodeGenerator:
         if expression.kind == "conditional":
             condition = self._constant(expression.children[0])
             return self._constant(expression.children[1] if condition else expression.children[2])
+        if expression.kind == "cast" and expression.value in INTEGER_TYPES:
+            return _cast_integer_constant(
+                self._constant(expression.children[0]), str(expression.value)
+            )
         if (
             expression.kind == "cast"
             and expression.children[0].kind == "unary"
@@ -1641,38 +1717,79 @@ class _CodeGenerator:
                 )
             value = self._constant(expression.children[0])
             operator = str(expression.value)
+            result_type = self._expression_type(expression)
+            mask = DWORD_MASK if result_type in ("long", "unsigned long") else WORD_MASK
             if operator == "+":
                 return value
             if operator == "-":
-                return -value & WORD_MASK
+                return -value & mask
             if operator == "~":
-                return ~value & WORD_MASK
+                return ~value & mask
             if operator == "!":
                 return int(value == 0)
         if expression.kind == "binary":
             left = self._constant(expression.children[0])
             right = self._constant(expression.children[1])
             operator = str(expression.value)
+            result_type = self._expression_type(expression)
+            mask = DWORD_MASK if result_type in ("long", "unsigned long") else WORD_MASK
             if operator == ",":
                 return right
             if operator == "+":
-                return (left + right) & WORD_MASK
+                return (left + right) & mask
             if operator == "-":
-                return (left - right) & WORD_MASK
+                return (left - right) & mask
             if operator == "*":
-                return (left * right) & WORD_MASK
+                return (left * right) & mask
             if operator == "/" and right:
-                dividend, divisor = self._signed(left), self._signed(right)
+                if result_type == "unsigned long":
+                    dividend, divisor = left & DWORD_MASK, right & DWORD_MASK
+                elif result_type == "unsigned int":
+                    dividend, divisor = left & WORD_MASK, right & WORD_MASK
+                elif result_type == "long":
+                    dividend, divisor = self._signed32(left), self._signed32(right)
+                else:
+                    dividend, divisor = self._signed(left), self._signed(right)
                 quotient = abs(dividend) // abs(divisor)
-                if (dividend < 0) != (divisor < 0):
+                if result_type not in ("unsigned int", "unsigned long") and (
+                    (dividend < 0) != (divisor < 0)
+                ):
                     quotient = -quotient
-                return quotient & WORD_MASK
+                return quotient & mask
             if operator == "%" and right:
-                dividend, divisor = self._signed(left), self._signed(right)
+                if result_type == "unsigned long":
+                    dividend, divisor = left & DWORD_MASK, right & DWORD_MASK
+                elif result_type == "unsigned int":
+                    dividend, divisor = left & WORD_MASK, right & WORD_MASK
+                elif result_type == "long":
+                    dividend, divisor = self._signed32(left), self._signed32(right)
+                else:
+                    dividend, divisor = self._signed(left), self._signed(right)
                 quotient = abs(dividend) // abs(divisor)
-                if (dividend < 0) != (divisor < 0):
+                if result_type not in ("unsigned int", "unsigned long") and (
+                    (dividend < 0) != (divisor < 0)
+                ):
                     quotient = -quotient
-                return (dividend - quotient * divisor) & WORD_MASK
+                return (dividend - quotient * divisor) & mask
+            if operator == "<<":
+                width = 32 if result_type in ("long", "unsigned long") else 16
+                if right >= width:
+                    raise self.error(
+                        expression.line,
+                        "shift count is outside the integer constant type width",
+                    )
+                return (left << right) & mask
+            if operator == ">>":
+                width = 32 if result_type in ("long", "unsigned long") else 16
+                if right >= width:
+                    raise self.error(
+                        expression.line,
+                        "shift count is outside the integer constant type width",
+                    )
+                if result_type in ("unsigned int", "unsigned long"):
+                    return left >> right
+                value = self._signed32(left) if result_type == "long" else self._signed(left)
+                return (value >> right) & mask
             if operator == "&":
                 return left & right
             if operator == "|":
@@ -1683,7 +1800,18 @@ class _CodeGenerator:
                 return int(left == right)
             if operator == "!=":
                 return int(left != right)
-            signed_left, signed_right = self._signed(left), self._signed(right)
+            comparison_type = self._usual_arithmetic_type(
+                self._expression_type(expression.children[0]),
+                self._expression_type(expression.children[1]),
+            )
+            if comparison_type == "long":
+                signed_left, signed_right = self._signed32(left), self._signed32(right)
+            elif comparison_type == "unsigned long":
+                signed_left, signed_right = left & DWORD_MASK, right & DWORD_MASK
+            elif comparison_type.startswith("unsigned"):
+                signed_left, signed_right = left & WORD_MASK, right & WORD_MASK
+            else:
+                signed_left, signed_right = self._signed(left), self._signed(right)
             if operator == "<":
                 return int(signed_left < signed_right)
             if operator == "<=":
@@ -1698,20 +1826,25 @@ class _CodeGenerator:
                 return int(left != 0 or right != 0)
         raise self.error(expression.line, "global initializers must be integer constant expressions")
 
+    @staticmethod
+    def _signed32(value: int) -> int:
+        value &= DWORD_MASK
+        return value - 0x100000000 if value & 0x80000000 else value
+
     def _is_integer_constant_expression(self, expression: Expr) -> bool:
         if expression.kind == "init_list":
             return (
                 len(expression.children) == 1
                 and self._is_integer_constant_expression(expression.children[0])
             )
-        if expression.kind in {"constant", "sizeof_type", "sizeof_expr"}:
+        if expression.kind in {"constant", "wide_constant", "sizeof_type", "sizeof_expr"}:
             return True
         if expression.kind == "name":
             return str(expression.value) in self.enum_constants
         if expression.kind == "cast":
             return (
                 expression.value
-                in {"char", "unsigned char", "int", "unsigned int"}
+                in INTEGER_TYPES
                 and self._is_integer_constant_expression(expression.children[0])
             )
         if expression.kind == "unary":
@@ -1944,6 +2077,10 @@ class _CodeGenerator:
                     self.emit("    ADD R7, R6")
             self._emit_load_pointer(register)
             return
+        if variable.c_type in ("long", "unsigned long"):
+            self._wide_variable_address(variable, line)
+            self.emit(f"    LD32 {register}, R6")
+            return
         if variable.global_address is not None:
             self.emit(f"    LDI R7, {variable.global_address}")
             self.emit(
@@ -1980,6 +2117,10 @@ class _CodeGenerator:
                     self.emit("    ADD R7, R6")
             self._emit_store_pointer(register)
             return
+        if variable.c_type in ("long", "unsigned long"):
+            self._wide_variable_address(variable, line)
+            self.emit(f"    ST32 {register}, R6")
+            return
         if variable.global_address is not None:
             self.emit(f"    LDI R7, {variable.global_address}")
             self.emit(
@@ -1992,6 +2133,23 @@ class _CodeGenerator:
             offset = variable.parameter_offset
         assert offset is not None
         self.emit(f"    STWS {register}, {self._stack_offset(offset, line)}")
+
+    def _wide_variable_address(self, variable: _Variable, line: int) -> None:
+        self.emit("    LDI R6, 0")
+        if variable.global_address is not None:
+            self.emit(f"    LDI R7, {variable.global_address}")
+            return
+        offset = variable.local_offset
+        if offset is None:
+            offset = variable.parameter_offset
+        assert offset is not None
+        self.emit("    MOVSP R7")
+        self.emit("    MOVSPH R6")
+        adjusted = self._stack_offset(offset, line)
+        if adjusted:
+            self.emit("    LDI R4, 0")
+            self.emit(f"    LDI R5, {adjusted}")
+            self.emit("    ADD32 R6, R4")
 
     def _array_address(self, variable: _Variable, register: str, line: int) -> None:
         if variable.global_address is not None:
@@ -2018,10 +2176,28 @@ class _CodeGenerator:
             self.emit(f"    SUB {register}, R7")
 
     def _convert_to_type(self, register: str, c_type: str, source_type: str) -> None:
+        if c_type in ("long", "unsigned long"):
+            if source_type in ("long", "unsigned long"):
+                return
+            if source_type in ("int", "unsigned int", "char", "unsigned char"):
+                if source_type in ("char", "unsigned char"):
+                    self._convert_loaded(register, source_type)
+                self.emit(f"    MOV R1, {register}")
+                self.emit(f"    LDI {register}, 0")
+                if source_type in ("int", "char"):
+                    self.emit("    MOV R6, R1")
+                    self.emit("    ASR R6, 15")
+                    self.emit(f"    MOV {register}, R6")
+                return
         if c_type == "float" and source_type != "float":
             self.emit(f"    ITOF {register}")
         elif c_type != "float" and source_type == "float":
             self.emit(f"    FTOI {register}")
+        elif c_type in ("int", "unsigned int") and source_type in (
+            "long", "unsigned long"
+        ):
+            self.emit(f"    MOV {register}, R1")
+            return
         if c_type in ("char", "unsigned char"):
             self.emit("    LDI R7, 0x00FF")
             self.emit(f"    AND {register}, R7")
@@ -2091,10 +2267,8 @@ class _CodeGenerator:
             else:
                 source_type = self._expression_type(expression)
                 if self.current_function is not None:
-                    integer_types = {
-                        "char", "unsigned char", "int", "unsigned int"
-                    }
-                    numeric_types = integer_types | {"float"}
+                    integer_types = INTEGER_TYPES
+                    numeric_types = ARITHMETIC_TYPES
                     if return_type in numeric_types:
                         if source_type not in numeric_types:
                             raise self.error(
@@ -2170,10 +2344,15 @@ class _CodeGenerator:
     def _branch_if_false(self, condition: Expr, target: str) -> None:
         """Jump to target when the condition is zero; comparisons and && / || branch directly."""
         condition_type = self._expression_type(condition)
-        if condition_type not in {
-            "char", "unsigned char", "int", "unsigned int", "float"
-        } and not condition_type.endswith("*"):
+        if condition_type not in ARITHMETIC_TYPES and not condition_type.endswith("*"):
             raise self.error(condition.line, "control-flow condition must be scalar")
+        if condition_type in ("long", "unsigned long"):
+            self._expression(condition)
+            self.emit("    LDI R2, 0")
+            self.emit("    LDI R3, 0")
+            self.emit("    CMP32 R0, R2")
+            self.emit(f"    BZX {target}")
+            return
         if condition.kind == "binary":
             operator = str(condition.value)
             left, right = condition.children
@@ -2244,7 +2423,7 @@ class _CodeGenerator:
     def _switch_statement(self, statement: Stmt) -> None:
         expression = statement.children[0]
         value_type = self._expression_type(expression)
-        if value_type not in {"char", "unsigned char", "int", "unsigned int"}:
+        if value_type not in INTEGER_TYPES:
             raise self.error(
                 expression.line,
                 "switch expression must have integer type",
@@ -2260,20 +2439,31 @@ class _CodeGenerator:
             self.label("switch_case") for value, _, _ in cases if value is not None
         ]
         self._expression(expression)
+        wide_switch = value_type in ("long", "unsigned long")
+        if wide_switch:
+            self.emit("    PUSH R1")
         self.emit("    PUSH R0")
-        self.stack_depth += 2
+        self.stack_depth += 4 if wide_switch else 2
         case_index = 0
         seen_values: set[int] = set()
         for value, _, line in cases:
             if value is None:
                 continue
-            constant = self._constant(value)
+            constant = self._constant(value) & (
+                DWORD_MASK if wide_switch else WORD_MASK
+            )
             if constant in seen_values:
                 raise self.error(line, "duplicate case value")
             seen_values.add(constant)
             self.emit("    LDWS R0, 0")
-            self.emit(f"    LDI R1, {constant}")
-            self.emit("    CMP R0, R1")
+            if wide_switch:
+                self.emit("    LDWS R1, 2")
+                self.emit(f"    LDI R2, 0x{constant >> 16:04X}")
+                self.emit(f"    LDI R3, 0x{constant & WORD_MASK:04X}")
+                self.emit("    CMP32 R0, R2")
+            else:
+                self.emit(f"    LDI R1, {constant}")
+                self.emit("    CMP R0, R1")
             self.emit(f"    BZX {case_labels[case_index]}")
             case_index += 1
         self.emit(f"    JMPX {default_label or end_label}")
@@ -2290,8 +2480,9 @@ class _CodeGenerator:
                 self._statement(child)
         self.break_labels.pop()
         self.emit(f"{end_label}:")
-        self.emit("    ADJSP 2")
-        self.stack_depth -= 2
+        saved_size = 4 if wide_switch else 2
+        self.emit(f"    ADJSP {saved_size}")
+        self.stack_depth -= saved_size
 
     def _initialize_local_array(self, variable: _Variable, local: Local, line: int) -> None:
         data = self._serialize_initializer(
@@ -2314,6 +2505,8 @@ class _CodeGenerator:
     def _expression_type(self, expression: Expr) -> str:
         if expression.kind == "constant":
             return "int"
+        if expression.kind == "wide_constant":
+            return str(expression.value[1])
         if expression.kind == "float_constant":
             return "float"
         if expression.kind == "string":
@@ -2380,9 +2573,7 @@ class _CodeGenerator:
             condition_type = self._expression_type(expression.children[0])
             true_type = self._expression_type(expression.children[1])
             false_type = self._expression_type(expression.children[2])
-            arithmetic_types = {
-                "char", "unsigned char", "int", "unsigned int", "float"
-            }
+            arithmetic_types = ARITHMETIC_TYPES
             if condition_type not in arithmetic_types and not condition_type.endswith("*"):
                 raise self.error(
                     expression.line,
@@ -2403,17 +2594,13 @@ class _CodeGenerator:
                     expression.line,
                     "conditional pointer operands have incompatible types",
                 )
-            if true_type.endswith("*") and false_type in {
-                "char", "unsigned char", "int", "unsigned int"
-            }:
+            if true_type.endswith("*") and false_type in INTEGER_TYPES:
                 if (
                     self._is_integer_constant_expression(expression.children[2])
                     and self._constant(expression.children[2]) == 0
                 ):
                     return true_type
-            if false_type.endswith("*") and true_type in {
-                "char", "unsigned char", "int", "unsigned int"
-            }:
+            if false_type.endswith("*") and true_type in INTEGER_TYPES:
                 if (
                     self._is_integer_constant_expression(expression.children[1])
                     and self._constant(expression.children[1]) == 0
@@ -2445,8 +2632,8 @@ class _CodeGenerator:
                 return self._expression_type(expression.children[1])
             left_type = self._expression_type(expression.children[0])
             right_type = self._expression_type(expression.children[1])
-            integer_types = {"char", "unsigned char", "int", "unsigned int"}
-            arithmetic_types = integer_types | {"float"}
+            integer_types = INTEGER_TYPES
+            arithmetic_types = ARITHMETIC_TYPES
             left_integer = left_type in integer_types
             right_integer = right_type in integer_types
             left_arithmetic = left_type in arithmetic_types
@@ -2628,6 +2815,10 @@ class _CodeGenerator:
             return right_type
         left_type = _CodeGenerator._integer_promoted_type(left_type)
         right_type = _CodeGenerator._integer_promoted_type(right_type)
+        if "unsigned long" in (left_type, right_type):
+            return "unsigned long"
+        if "long" in (left_type, right_type):
+            return "long"
         if left_type.startswith("unsigned") or right_type.startswith("unsigned"):
             return "unsigned int"
         return "int"
@@ -2679,6 +2870,29 @@ class _CodeGenerator:
         self.emit(f"    LDI R7, {stride}")
         self.emit(f"    MUL {register}, R7")
 
+    def _emit_scaled_index(self, index: Expr, stride: int) -> None:
+        self._expression(index)
+        if self._expression_type(index) in ("long", "unsigned long"):
+            self.emit("    MOV R0, R1")
+        self._scale_index("R0", stride)
+
+    def _pointer_offset_expression(
+        self, pointer: Expr, offset: Expr, stride: int, subtract: bool
+    ) -> None:
+        self._expression(pointer)
+        self.emit("    ADJSP -3")
+        self.emit("    MOVSP R7")
+        self._emit_store_pointer("R0")
+        self.stack_depth += 3
+        self._emit_scaled_index(offset, stride)
+        self.emit("    MOV R2, R0")
+        self.emit("    MOVSP R7")
+        self._emit_load_pointer("R1")
+        self.emit(f"    {'SUB' if subtract else 'ADD'} R1, R2")
+        self.emit("    MOV R0, R1")
+        self.emit("    ADJSP 3")
+        self.stack_depth -= 3
+
     def _lvalue_address(self, expression: Expr, line: int) -> str:
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), line)
@@ -2711,8 +2925,7 @@ class _CodeGenerator:
                         element = array.global_address + int(index.value) * element_size
                         self.emit(f"    LDI R0, {element & WORD_MASK}")
                         return element_type
-                    self._expression(index)
-                    self._scale_index("R0", element_size)
+                    self._emit_scaled_index(index, element_size)
                     self._array_address(array, "R1", line)
                     self.emit("    ADD R0, R1")
                     return element_type
@@ -2721,8 +2934,7 @@ class _CodeGenerator:
             self.emit("    MOVSP R7")
             self._emit_store_pointer("R0")
             self.stack_depth += 3
-            self._expression(index)
-            self._scale_index("R0", element_size)
+            self._emit_scaled_index(index, element_size)
             self.emit("    MOV R2, R0")
             self.emit("    MOVSP R7")
             self._emit_load_pointer("R1")
@@ -2767,6 +2979,10 @@ class _CodeGenerator:
         if c_type.endswith("*"):
             self.emit("    MOV R7, R0")
             self._emit_load_pointer("R0")
+        elif c_type in ("long", "unsigned long"):
+            self.emit("    MOV R7, R0")
+            self.emit("    LDI R6, 0")
+            self.emit("    LD32 R0, R6")
         else:
             self.emit(
                 f"    {'LD' if _type_size(c_type, self.records) == 1 else 'LDW'} R0, R0"
@@ -2788,8 +3004,8 @@ class _CodeGenerator:
         c_type = self._expression_type(expression)
         if c_type in self.records:
             raise self.error(line, "record assignment is not supported")
-        integer_types = {"char", "unsigned char", "int", "unsigned int"}
-        numeric_types = integer_types | {"float"}
+        integer_types = INTEGER_TYPES
+        numeric_types = ARITHMETIC_TYPES
         if c_type in numeric_types:
             if source_type not in numeric_types:
                 raise self.error(line, "assignment expression is incompatible with target type")
@@ -2818,6 +3034,19 @@ class _CodeGenerator:
             if variable.array_size:
                 raise self.error(line, "cannot assign to an array")
             self._store_variable(variable, register, line, c_type)
+            return
+        if c_type in ("long", "unsigned long"):
+            self.emit("    PUSH R1")
+            self.emit("    PUSH R0")
+            self.stack_depth += 4
+            self._lvalue_address(expression, line)
+            self.emit("    MOV R7, R0")
+            self.emit("    LDI R6, 0")
+            self.emit("    LDWS R0, 0")
+            self.emit("    LDWS R1, 2")
+            self.emit("    ST32 R0, R6")
+            self.emit("    ADJSP 4")
+            self.stack_depth -= 4
             return
         if c_type.endswith("*"):
             self.emit("    ADJSP -3")
@@ -2862,6 +3091,14 @@ class _CodeGenerator:
             return
         if kind == "constant":
             self.emit(f"    LDI R0, {int(expression.value) & WORD_MASK}")
+            return
+        if kind == "wide_constant":
+            value = int(expression.value[0]) & DWORD_MASK
+            if expression.value[1] in ("long", "unsigned long"):
+                self.emit(f"    LDI R0, 0x{value >> 16:04X}")
+                self.emit(f"    LDI R1, 0x{value & WORD_MASK:04X}")
+            else:
+                self.emit(f"    LDI R0, 0x{value & WORD_MASK:04X}")
             return
         if kind == "sizeof_type":
             self._validate_sizeof_type(str(expression.value), expression.line)
@@ -2959,8 +3196,8 @@ class _CodeGenerator:
                 argument = arguments[index]
                 parameter_type = parameter_types[index]
                 source_type = self._expression_type(argument)
-                integer_types = {"char", "unsigned char", "int", "unsigned int"}
-                numeric_types = integer_types | {"float"}
+                integer_types = INTEGER_TYPES
+                numeric_types = ARITHMETIC_TYPES
                 if parameter_type in numeric_types:
                     if source_type not in numeric_types:
                         raise self.error(
@@ -3000,6 +3237,9 @@ class _CodeGenerator:
                     self.emit("    ADJSP -3")
                     self.emit("    MOVSP R7")
                     self._emit_store_pointer("R0")
+                elif width == 4:
+                    self.emit("    PUSH R1")
+                    self.emit("    PUSH R0")
                 else:
                     self.emit("    PUSH R0")
                 self.stack_depth += width
@@ -3035,42 +3275,44 @@ class _CodeGenerator:
                     expression.line,
                 )
                 result_type = self._expression_type(operation)
-                self._load_lvalue(target, expression.line)
-                self.emit("    PUSH R0")
-                self.stack_depth += 2
-                self._expression(expression.children[0])
-                self.emit("    MOV R1, R0")
-                self.emit("    LDWS R0, 0")
-                binary_operator = str(operator[:-1])
-                if binary_operator in ("<<", ">>"):
-                    helper = (
-                        "__runtime_shl"
-                        if binary_operator == "<<"
-                        else (
-                            "__runtime_shr"
-                            if target_type.startswith("unsigned")
-                            or target_type in ("char", "unsigned char")
-                            else "__runtime_sar"
-                        )
-                    )
-                    self.used_helpers.add(helper)
-                    self.emit(f"    CALLX {helper}")
+                if target_type in ("long", "unsigned long"):
+                    self._expression(operation)
                 else:
-                    target_type = self._expression_type(target)
-                    if target_type.endswith("*"):
-                        self._scale_index(
-                            "R1", _type_size(target_type[:-1], self.records)
+                    self._load_lvalue(target, expression.line)
+                    self.emit("    PUSH R0")
+                    self.stack_depth += 2
+                    self._expression(expression.children[0])
+                    self.emit("    MOV R1, R0")
+                    self.emit("    LDWS R0, 0")
+                    binary_operator = str(operator[:-1])
+                    if binary_operator in ("<<", ">>"):
+                        helper = (
+                            "__runtime_shl"
+                            if binary_operator == "<<"
+                            else (
+                                "__runtime_shr"
+                                if target_type.startswith("unsigned")
+                                or target_type in ("char", "unsigned char")
+                                else "__runtime_sar"
+                            )
                         )
-                    elif result_type == "float":
-                        if target_type != "float":
-                            self.emit("    ITOF R0")
-                        if right_type != "float":
-                            self.emit("    ITOF R1")
-                    self._binary_operation(
-                        binary_operator, expression.line, result_type, not discarded
-                    )
-                self.emit("    ADJSP 2")
-                self.stack_depth -= 2
+                        self.used_helpers.add(helper)
+                        self.emit(f"    CALLX {helper}")
+                    else:
+                        if target_type.endswith("*"):
+                            self._scale_index(
+                                "R1", _type_size(target_type[:-1], self.records)
+                            )
+                        elif result_type == "float":
+                            if target_type != "float":
+                                self.emit("    ITOF R0")
+                            if right_type != "float":
+                                self.emit("    ITOF R1")
+                        self._binary_operation(
+                            binary_operator, expression.line, result_type, not discarded
+                        )
+                    self.emit("    ADJSP 2")
+                    self.stack_depth -= 2
             source_type = (
                 result_type
                 if operator != "="
@@ -3084,8 +3326,8 @@ class _CodeGenerator:
             operator = str(expression.value)
             child = expression.children[0]
             child_type = self._expression_type(child)
-            integer_types = {"char", "unsigned char", "int", "unsigned int"}
-            arithmetic_types = integer_types | {"float"}
+            integer_types = INTEGER_TYPES
+            arithmetic_types = ARITHMETIC_TYPES
             if operator in ("+", "-") and child_type not in arithmetic_types:
                 raise self.error(
                     expression.line,
@@ -3114,9 +3356,7 @@ class _CodeGenerator:
             if operator in ("++", "--"):
                 self._require_modifiable_lvalue(child, expression.line)
                 c_type = self._expression_type(child)
-                if c_type not in {
-                    "char", "unsigned char", "int", "unsigned int", "float"
-                } and not c_type.endswith("*"):
+                if c_type not in ARITHMETIC_TYPES and not c_type.endswith("*"):
                     raise self.error(
                         expression.line,
                         "increment and decrement require an arithmetic or pointer operand",
@@ -3129,6 +3369,10 @@ class _CodeGenerator:
                 if c_type.endswith("*"):
                     self.emit(f"    LDI R7, {_type_size(c_type[:-1], self.records)}")
                     self.emit(f"    {'ADD' if operator == '++' else 'SUB'} R0, R7")
+                elif c_type in ("long", "unsigned long"):
+                    self.emit("    LDI R2, 0")
+                    self.emit("    LDI R3, 1")
+                    self.emit(f"    {'ADD32' if operator == '++' else 'SUB32'} R0, R2")
                 elif c_type == "float":
                     self.emit("    LDI R7, 0x3C00")
                     self.emit(f"    {'FADD' if operator == '++' else 'FSUB'} R0, R7")
@@ -3143,21 +3387,26 @@ class _CodeGenerator:
                 if child_type == "float":
                     self.emit("    LDI R7, 0x8000")
                     self.emit("    XOR R0, R7")
+                elif child_type in ("long", "unsigned long"):
+                    self.emit("    NEG32 R0")
                 else:
                     self.emit("    NEG R0")
             elif operator == "!":
                 self._boolean_not(child_type)
             elif operator == "~":
-                self.emit("    LDI R7, 0xFFFF")
-                self.emit("    XOR R0, R7")
+                if child_type in ("long", "unsigned long"):
+                    self.emit("    LDI R2, 0xFFFF")
+                    self.emit("    LDI R3, 0xFFFF")
+                    self.emit("    XOR32 R0, R2")
+                else:
+                    self.emit("    LDI R7, 0xFFFF")
+                    self.emit("    XOR R0, R7")
             return
         if kind == "postfix":
             child = expression.children[0]
             self._require_modifiable_lvalue(child, expression.line)
             c_type = self._expression_type(child)
-            if c_type not in {
-                "char", "unsigned char", "int", "unsigned int", "float"
-            } and not c_type.endswith("*"):
+            if c_type not in ARITHMETIC_TYPES and not c_type.endswith("*"):
                 raise self.error(
                     expression.line,
                     "increment and decrement require an arithmetic or pointer operand",
@@ -3165,7 +3414,15 @@ class _CodeGenerator:
             if c_type.endswith("*"):
                 self._require_pointer_arithmetic_type(c_type, expression.line)
             self._load_lvalue(child, expression.line)
-            if c_type.endswith("*"):
+            if c_type in ("long", "unsigned long"):
+                self.emit("    PUSH R1")
+                self.emit("    PUSH R0")
+                self.stack_depth += 4
+                self.emit("    LDI R2, 0")
+                self.emit("    LDI R3, 1")
+                self.emit(f"    {'ADD32' if expression.value == '++' else 'SUB32'} R0, R2")
+                saved_size = 4
+            elif c_type.endswith("*"):
                 self.emit("    ADJSP -3")
                 self.emit("    MOVSP R7")
                 self._emit_store_pointer("R0")
@@ -3190,7 +3447,10 @@ class _CodeGenerator:
                     self.emit("    AND R0, R7")
                 saved_size = 2
             self._store_lvalue(child, "R0", c_type, expression.line)
-            if saved_size == 3:
+            if saved_size == 4:
+                self.emit("    LDWS R0, 0")
+                self.emit("    LDWS R1, 2")
+            elif saved_size == 3:
                 self.emit("    MOVSP R7")
                 self._emit_load_pointer("R0")
             else:
@@ -3238,6 +3498,36 @@ class _CodeGenerator:
         right_type = self._expression_type(right)
         promoted_left_type = self._integer_promoted_type(left_type)
         promoted_right_type = self._integer_promoted_type(right_type)
+        wide_type = (
+            promoted_left_type
+            if operator in ("<<", ">>")
+            else self._usual_arithmetic_type(left_type, right_type)
+        )
+        if operator == "+" and left_type.endswith("*") and right_type in INTEGER_TYPES:
+            self._pointer_offset_expression(
+                left, right, _type_size(left_type[:-1], self.records), False
+            )
+            return
+        if (
+            operator == "+"
+            and right_type.endswith("*")
+            and left_type in INTEGER_TYPES
+        ):
+            self._pointer_offset_expression(
+                right, left, _type_size(right_type[:-1], self.records), False
+            )
+            return
+        if operator == "-" and left_type.endswith("*") and right_type in INTEGER_TYPES:
+            self._pointer_offset_expression(
+                left, right, _type_size(left_type[:-1], self.records), True
+            )
+            return
+        if wide_type in ("long", "unsigned long"):
+            self._wide_binary_expression(
+                expression, left, right, left_type, right_type, wide_type,
+                jump_false,
+            )
+            return
         if right.kind == "constant" and self._constant_binary(expression, operator, left, left_type, jump_false):
             return
         self._expression(left)
@@ -3309,6 +3599,71 @@ class _CodeGenerator:
                 if right_type != "float":
                     self.emit("    ITOF R1")
             self._comparison(operator, expression.line, compare_type, jump_false=jump_false)
+
+    def _wide_binary_expression(
+        self,
+        expression: Expr,
+        left: Expr,
+        right: Expr,
+        left_type: str,
+        right_type: str,
+        wide_type: str,
+        jump_false: str | None,
+    ) -> None:
+        operator = str(expression.value)
+        if operator not in {
+            "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>",
+            "==", "!=", "<", "<=", ">", ">=",
+        }:
+            raise self.error(expression.line, f"unsupported 32-bit operator {operator!r}")
+        self._expression(left)
+        self._convert_to_type("R0", wide_type, left_type)
+        if operator in ("<<", ">>"):
+            self.emit("    PUSH R1")
+            self.emit("    PUSH R0")
+            self.stack_depth += 4
+            self._expression(right)
+            if right_type in ("long", "unsigned long"):
+                self.emit("    MOV R2, R1")
+            else:
+                self.emit("    MOV R2, R0")
+            self.emit("    LDWS R0, 0")
+            self.emit("    LDWS R1, 2")
+            self.emit("    ADJSP 4")
+            self.stack_depth -= 4
+            self.emit(f"    {'SHL32' if operator == '<<' else ('LSR32' if wide_type == 'unsigned long' else 'ASR32')} R0, R2")
+            return
+
+        self.emit("    PUSH R1")
+        self.emit("    PUSH R0")
+        self.stack_depth += 4
+        self._expression(right)
+        self._convert_to_type("R0", wide_type, right_type)
+        self.emit("    MOV R2, R0")
+        self.emit("    MOV R3, R1")
+        self.emit("    LDWS R0, 0")
+        self.emit("    LDWS R1, 2")
+        self.emit("    ADJSP 4")
+        self.stack_depth -= 4
+        if operator in ("==", "!=", "<", "<=", ">", ">="):
+            self.emit("    CMP32 R0, R2")
+            compare_type = "int" if wide_type == "long" else "unsigned long"
+            self._comparison(
+                operator, expression.line, compare_type, compared=True,
+                jump_false=jump_false,
+            )
+            return
+        mnemonic = {
+            "+": "ADD32",
+            "-": "SUB32",
+            "*": "MUL32",
+            "/": "DIV32" if wide_type == "unsigned long" else "DIV32S",
+            "%": "MOD32" if wide_type == "unsigned long" else "MOD32S",
+            "&": "AND32",
+            "|": "OR32",
+            "^": "XOR32",
+        }[operator]
+        self.emit(f"    {mnemonic} R0, R2")
 
     def _constant_binary(self, expression: Expr, operator: str, left: Expr, left_type: str,
                          jump_false: str | None = None) -> bool:
@@ -3451,6 +3806,10 @@ class _CodeGenerator:
         if c_type == "float":
             self.emit("    LDI R1, 0")
             self.emit("    FCMP R0, R1")
+        elif c_type in ("long", "unsigned long"):
+            self.emit("    LDI R2, 0")
+            self.emit("    LDI R3, 0")
+            self.emit("    CMP32 R0, R2")
         else:
             self.emit("    CMP R0, 0")
         self.emit(f"    BZX {end_label}")

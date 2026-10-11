@@ -299,6 +299,11 @@ def _assemble_extended(
         if unary:
             return [first, control]
         source_text = operands[1].strip()
+        if mnemonic in ("LD32", "ST32"):
+            address_register = _parse_register(source_text, line_number)
+            if address_register & 1:
+                raise _error(line_number, f"{mnemonic} address must be an even register")
+            return [first, control | address_register]
         if mnemonic in ("SHL32", "LSR32", "ASR32") and not _is_register(source_text):
             value = _parse_number(source_text, line_number)
             if not 0 <= value <= 31:
@@ -307,6 +312,8 @@ def _assemble_extended(
         source = _parse_register(source_text, line_number)
         if mnemonic not in ("SHL32", "LSR32", "ASR32") and source & 1:
             raise _error(line_number, f"{mnemonic} source must be an even register")
+        if mnemonic in ("DIV32S", "MOD32S"):
+            control |= WIDE_IMMEDIATE_FLAG
         return [first, control | source]
     if mnemonic in BRANCH_CONDITIONS or mnemonic in BRANCH_ALIASES:
         if len(operands) != 1:

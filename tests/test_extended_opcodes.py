@@ -59,10 +59,61 @@ class ExtendedOpcodeTests(unittest.TestCase):
         )
         self.assertEqual((cpu.registers[0], cpu.registers[1]), (0x8000, 0))
         self.assertEqual((cpu.flags["N"], cpu.flags["V"], cpu.flags["C"]), (1, 1, 0))
-        for source in ("ADD32 R1, R2", "ADD32 R0, R3", "NEG32 R3", "SHL32 R0, 32"):
+        for source in (
+            "ADD32 R1, R2",
+            "ADD32 R0, R3",
+            "NEG32 R3",
+            "SHL32 R0, 32",
+            "LD32 R0, R3",
+            "ST32 R0, R1",
+        ):
             with self.subTest(source=source):
                 with self.assertRaises(ValueError):
                     assemble(source)
+
+    def test_movsph_reads_high_bits_of_stack_pointer(self):
+        cpu = run("MOVSPH R0\nHALT")
+        self.assertEqual(cpu.registers[0], 2)
+
+    def test_32_bit_memory_access_is_big_endian_and_wraps(self):
+        cpu = run(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\n"
+            "LDI R2, 0x1234\nLDI R3, 0x5678\n"
+            "ST32 R2, R0\nLD32 R4, R0\nHALT"
+        )
+        self.assertEqual((cpu.registers[4], cpu.registers[5]), (0x1234, 0x5678))
+        self.assertEqual(bytes(cpu.memory[:3]), b"\x34\x56\x78")
+        self.assertEqual(cpu.memory[0x7FFFF], 0x12)
+
+    def test_32_bit_multiply_divide_and_remainder(self):
+        cpu = run(
+            "LDI R0, 0\nLDI R1, 100\nLDI R2, 0\nLDI R3, 9\n"
+            "MUL32 R0, R2\nLDI R4, 0\nLDI R5, 10\n"
+            "DIV32 R0, R4\nHALT"
+        )
+        self.assertEqual((cpu.registers[0], cpu.registers[1]), (0, 90))
+        cpu = run(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFF9C\n"
+            "LDI R2, 0\nLDI R3, 7\nDIV32S R0, R2\nHALT"
+        )
+        self.assertEqual((cpu.registers[0], cpu.registers[1]), (0xFFFF, 0xFFF2))
+        cpu = run(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFF9C\n"
+            "LDI R2, 0\nLDI R3, 7\nMOD32S R0, R2\nHALT"
+        )
+        self.assertEqual((cpu.registers[0], cpu.registers[1]), (0xFFFF, 0xFFFE))
+
+    def test_32_bit_subtract_logic_copy_and_shift(self):
+        cpu = run(
+            "LDI R0, 0\nLDI R1, 10\nLDI R2, 0\nLDI R3, 3\n"
+            "SUB32 R0, R2\nMOV32 R4, R0\nAND32 R0, R2\nOR32 R0, R2\n"
+            "XOR32 R0, R2\nLDI R6, 0x8000\nLDI R7, 0\n"
+            "ASR32 R6, 1\nHALT"
+        )
+        self.assertEqual((cpu.registers[0], cpu.registers[1]), (0, 0))
+        self.assertEqual((cpu.registers[4], cpu.registers[5]), (0, 7))
+        self.assertEqual((cpu.registers[6], cpu.registers[7]), (0xC000, 0))
+        self.assertEqual(cpu.flags["N"], 1)
 
     def test_neg_swap_sext_clz(self):
         r = regs("LDI R0, 1\nNEG R0\nLDI R1, 0x1234\nSWAP R1\nLDI R2, 0x80\nSEXT R2\nLDI R4, 1\nCLZ R4")

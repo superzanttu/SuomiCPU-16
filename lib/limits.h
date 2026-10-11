@@ -14,9 +14,9 @@
 #define INT_MIN (-32768)
 #define INT_MAX 32767
 #define UINT_MAX 65535
-#define LONG_MIN (-32768)
-#define LONG_MAX 32767
-#define ULONG_MAX 65535
+#define LONG_MIN (-2147483647L - 1L)
+#define LONG_MAX 2147483647L
+#define ULONG_MAX 4294967295UL
 
 #define WCHAR_MIN (-32768)
 #define WCHAR_MAX 32767

@@ -266,11 +266,23 @@ not update the flags in the current emulator.
 ### 32-bit register-pair arithmetic
 
 `ADD32`, `SUB32`, `CMP32`, `AND32`, `OR32`, `XOR32`, `SHL32`, `LSR32`,
-`ASR32`, `NEG32`, and `MOV32` operate on adjacent register pairs. The even
+`ASR32`, `NEG32`, `MOV32`, `LD32`, `ST32`, `MUL32`, `DIV32`, `DIV32S`, `MOD32`,
+and `MOD32S` operate on adjacent register pairs. The even
 register is the high 16 bits and the following odd register is the low 16 bits:
 for example, `R0` names the `R0:R1` pair and `R2` names `R2:R3`. Binary
 arithmetic/logic operations and `MOV32` require even pair registers. Shift
 counts may be an immediate from 0 to 31 or the low five bits of a register.
+`LD32 Rd, Ra` loads four big-endian bytes at the 19-bit address in pair `Ra`
+into pair `Rd`; `ST32 Rs, Ra` stores the value in pair `Rs` there. Both
+register-pair operands must start at an even register. Memory access wraps at
+the end of the 512 KiB address space and follows normal memory-mapped-device
+read/write behavior.
+`MUL32` writes the low 32 product bits; it sets `C` for unsigned overflow and
+`V` for signed overflow. `DIV32`/`MOD32` are unsigned; the `S` forms are signed,
+with division truncated toward zero and remainder following the dividend.
+Division by zero yields zero for quotient or the dividend for remainder and
+sets `C`; nonzero divisors clear `C`. These arithmetic instructions set `Z`
+and `N` from the result.
 
 `ADD32`/`SUB32` set `Z`, `N`, `C` and `V` for 32-bit arithmetic; `CMP32` sets
 the same flags without changing its destination. `AND32`/`OR32`/`XOR32` set
@@ -281,16 +293,20 @@ does not change flags.
 
 These instructions use the extended `0x1A` selector in the `OP_SHR` space and
 are implemented by the Python emulator. The optional JIT hands this group back
-to the emulator. This provides core 32-bit pair arithmetic but does not by
-itself provide a 32-bit C `long` ABI or full C90 compatibility.
+to the emulator. The `MOVSPH` miscellaneous instruction reads the high three
+bits of the 19-bit stack pointer; together with `MOVSP`, it lets compiler code
+form full stack addresses for 32-bit objects.
 
 Encoding: word 1 is `0xF800 | (high-register << 8) | 0x1A`; word 2 is
 `(operation << 12) | (immediate flag 0x0800) | source/count`. Operation codes
 are `ADD32`=0, `SUB32`=1, `CMP32`=2, `AND32`=3, `OR32`=4, `XOR32`=5,
 `SHL32`=6, `LSR32`=7, `ASR32`=8, `NEG32`=9, and `MOV32`=10. Shift immediates
 use the low five bits and the immediate flag; register shift counts use the
-low five bits of the selected register. The group occupies the previously
+low five bits of the selected register. `LD32`=11 and `ST32`=12. The group occupies the previously
 unused `0x1A` selector, distinct from the existing `0x1B`-`0x1F` extensions.
+`MUL32`=13, `DIV32`/`DIV32S`=14, and `MOD32`/`MOD32S`=15. The signed `S`
+forms set the immediate/modifier flag in word 2; division and remainder
+operands otherwise use an even source register pair.
 
 ### Integer multiply and divide
 
@@ -581,11 +597,18 @@ The compiler's data model is target-specific and does **not** meet all the C90
 minimum requirements:
 
 - `int` and `unsigned int` are 16-bit; `char` and `unsigned char` occupy one
-  byte. Signed and unsigned 16-bit arithmetic wraps modulo 65536.
-- `float` and `double` use the SC-16 IEEE-754 binary16 format. `short` and
-  `long` integer specifiers are accepted but currently map to the same 16-bit
-  integer types; in particular, `long` does not provide C90's required minimum
-  range.
+  byte. `short` is 16-bit, and `long`/`unsigned long` are 32-bit with the
+  minimum ranges required by C90. The compiler implements pair-based storage,
+  scalar arithmetic, `switch`, and function argument/return handling for these
+  `long` types. Indirect 32-bit lvalues work with the compiler's current
+  16-bit-address operations; full 19-bit pointer arithmetic and dereferencing
+  are not yet implemented. Integer literal types use the target's `int`,
+  `unsigned int`, and 32-bit `long` candidate ranges. For compatibility with
+  existing programs, a file-scope pointer initializer also accepts an integer
+  constant in the SC-16 19-bit address range as an implementation extension.
+- `float`, `double`, and `long double` use the SC-16 IEEE-754 binary16 format.
+  In particular, `double` does not meet C90's required minimum range or
+  precision.
 - Object pointers occupy three bytes for the machine's 19-bit address space.
   Function pointers and general function-pointer calls are not supported.
 - `static`, `extern`, `auto`, `register`, `const`, and `volatile` specifiers
@@ -617,8 +640,8 @@ routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,
 `abort()` halt the target; `EXIT_SUCCESS` is zero and `EXIT_FAILURE` is one,
 but the emulator has no host process exit-status channel and cannot perform
 `atexit` callbacks or stream cleanup. `strtol` and `strtoul` support base
-selection, end pointers, and range reporting through `errno`, but their `long`
-range is necessarily limited by the target's 16-bit integer ABI.
+selection, end pointers, and `errno` range reporting using the target's 32-bit
+`long` limits; tests cover signed and unsigned boundary values and overflow.
 There is no target environment-variable store, so `getenv` returns `NULL`;
 there is no command processor, so `system(NULL)` returns zero and commands
 return -1. `<assert.h>` evaluates assertions unless `NDEBUG` is defined and
@@ -632,10 +655,10 @@ real-time clock or processor-time counter, both report `(time_t)-1`/
 Calendar conversion, formatting, and elapsed-time functions are not
 implemented. The limit and floating-point macros describe
 the target's actual types; they also make C90 minimum-range incompatibilities
-visible: `long` has only the same 16-bit range as `int`, and `double` has the
-same binary16 precision and range as `float`; `long double` maps to that same
-format as well. `size_t` is 16-bit and cannot represent every object size
-available in the machine's address space. These headers are partial: many
+visible: `double` has the same binary16 precision and range as `float`, and
+`long double` maps to that same format as well. `size_t` is an unsigned 32-bit
+`long`, so it can represent the target's 19-bit address range; full 19-bit
+pointer arithmetic and object allocation remain unimplemented. These headers are partial: many
 required `<stdlib.h>` facilities and other C90 headers—including `stdio.h`—are
 not implemented. The project's screen and graphics routines are SC-16-specific
 extensions, not replacements for those standard facilities. Global

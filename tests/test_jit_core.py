@@ -70,7 +70,8 @@ class JitEquivalenceTests(unittest.TestCase):
             "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\n"
             "LDI R2, 0\nLDI R3, 1\nADD32 R0, R2\n"
             "LDI R4, 0x8000\nLDI R5, 0\nNEG32 R4\n"
-            "LDI R6, 0\nLDI R7, 3\nSHL32 R6, 1\nHALT"
+            "LDI R6, 0\nLDI R7, 3\nSHL32 R6, 1\n"
+            "LDI R2, 0\nLDI R3, 0x100\nST32 R0, R2\nLD32 R4, R2\nHALT"
         )
         slow = make_cpu(program)
         fast = make_cpu(program)

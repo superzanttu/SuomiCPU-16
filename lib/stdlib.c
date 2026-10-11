@@ -41,8 +41,8 @@ long strtol(const char *text, char **endptr, int base)
     int negative;
     int digit;
     int any;
-    long value;
-    long limit;
+    unsigned long magnitude;
+    unsigned long limit;
 
     start = text;
     while (*text == ' ' || (*text >= '\t' && *text <= '\r'))
@@ -71,16 +71,16 @@ long strtol(const char *text, char **endptr, int base)
     }
 
     any = 0;
-    value = 0;
-    limit = negative ? 32768L : 32767L;
+    magnitude = 0UL;
+    limit = negative ? 2147483648UL : 2147483647UL;
     errno = 0;
     while ((digit = __sc16_digit_value(*text)) >= 0 && digit < base) {
         any = 1;
-        if (value > (limit - digit) / base) {
+        if (magnitude > (limit - (unsigned long)digit) / (unsigned long)base) {
             errno = ERANGE;
-            value = limit;
+            magnitude = limit;
         } else if (errno != ERANGE) {
-            value = value * base + digit;
+            magnitude = magnitude * (unsigned long)base + (unsigned long)digit;
         }
         ++text;
     }
@@ -91,9 +91,12 @@ long strtol(const char *text, char **endptr, int base)
     }
     if (endptr != NULL)
         *endptr = (char *)text;
-    if (negative)
-        return -value;
-    return value;
+    if (negative) {
+        if (magnitude == 2147483648UL)
+            return -2147483647L - 1L;
+        return -(long)magnitude;
+    }
+    return (long)magnitude;
 }
 
 unsigned long strtoul(const char *text, char **endptr, int base)
@@ -137,12 +140,12 @@ unsigned long strtoul(const char *text, char **endptr, int base)
     errno = 0;
     while ((digit = __sc16_digit_value(*text)) >= 0 && digit < base) {
         any = 1;
-        if (value > (65535UL - digit) / base) {
+        if (value > (4294967295UL - (unsigned long)digit) / (unsigned long)base) {
             errno = ERANGE;
             overflow = 1;
-            value = 65535UL;
+            value = 4294967295UL;
         } else if (errno != ERANGE) {
-            value = value * base + digit;
+            value = value * (unsigned long)base + (unsigned long)digit;
         }
         ++text;
     }
@@ -154,7 +157,7 @@ unsigned long strtoul(const char *text, char **endptr, int base)
     if (endptr != NULL)
         *endptr = (char *)text;
     if (overflow)
-        return 65535UL;
+        return 4294967295UL;
     if (negative)
         return 0UL - value;
     return value;

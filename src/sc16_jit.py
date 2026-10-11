@@ -3,10 +3,10 @@
 `run_block` executes instructions exactly like `SuomiCompute16.step()`, but compiled to
 machine code. It handles the instruction set (classic opcodes, extended ALU, MUL/DIV,
 far branches and jumps) and stops ("bails out") *before* executing an instruction that
-needs the Python emulator: a store to the graphics command register, HALT and the
-half-precision float instructions. The caller then runs that one instruction with
-`step()` and resumes. After an instruction that leaves an interrupt pending the loop
-returns so Python can dispatch it.
+needs the Python emulator: a store to the graphics command register, HALT, half-precision
+float instructions and 32-bit register-pair instructions. The caller then runs that one
+instruction with `step()` and resumes. After an instruction that leaves an interrupt
+pending the loop returns so Python can dispatch it.
 
 State is passed in `regs` (8 registers) and `st` = [pc, sp, Z, C, N, V].
 Returns (executed instruction count, status): 0 = budget used up,
@@ -186,6 +186,8 @@ def run_block(mem, regs, st, budget):
                         tmp >>= 1
                     regs[rd] = 16 - bits
                     z = 1 if left == 0 else 0
+                elif sel == 10:
+                    regs[rd] = (sp >> 16) & 7
             elif oper <= 4:
                 if control & 0x0800:
                     cnt = control & 0xF

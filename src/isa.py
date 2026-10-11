@@ -56,6 +56,13 @@ WIDE_OPERATIONS = {
     "ASR32": 8,
     "NEG32": 9,
     "MOV32": 10,
+    "LD32": 11,
+    "ST32": 12,
+    "MUL32": 13,
+    "DIV32": 14,
+    "DIV32S": 14,
+    "MOD32": 15,
+    "MOD32S": 15,
 }
 
 # Integer multiply/divide group: a 32-bit (or 48-bit with an immediate) instruction.
@@ -118,6 +125,7 @@ MISC_OPERATIONS = {
     "CLC": 7,     # C = 0
     "SETSP": 8,   # SP = Rd (low 16 bits)
     "CLZ": 9,     # Rd = number of leading zero bits of Rd
+    "MOVSPH": 10, # Rd = high three bits of SP
 }
 
 # Far conditional branches: 6 bytes, 24-bit target.

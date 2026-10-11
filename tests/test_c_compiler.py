@@ -87,6 +87,22 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 1)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 1)
 
+    def test_c90_pointer_arithmetic_accepts_long_offsets(self):
+        image = compile_source(
+            "int result;\n"
+            "int main(void) {\n"
+            "  int values[5];\n"
+            "  int *pointer = &values[0];\n"
+            "  result = (pointer + 3L == &values[3])\n"
+            "    && (2UL + pointer == &values[2])\n"
+            "    && (pointer + 4L - 1UL == &values[3]);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+
     def test_c90_conditional_operator_checks_operand_types(self):
         invalid_sources = (
             "struct S { int value; }; int main(void) { struct S value; "
@@ -835,9 +851,24 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE), 3)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), -1 & 0xFFFF)
-        self.assertEqual(cpu.memory[GLOBAL_BASE + 4:GLOBAL_BASE + 12], b"aabcab!!")
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 0)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 3)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), -1 & 0xFFFF)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 6:GLOBAL_BASE + 14], b"aabcab!!")
+
+    def test_c90_size_t_uses_32_bit_unsigned_storage(self):
+        image = compile_source(
+            "#include <stddef.h>\n"
+            "size_t value;\n"
+            "int main(void) {\n"
+            "  value = 70000UL;\n"
+            "  return sizeof(size_t) != 4 || value != 70000UL;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 70000 & 0xFFFF)
 
     def test_c90_string_search_and_bounded_operations(self):
         image = compile_source(
@@ -935,7 +966,7 @@ class CCompilerTests(unittest.TestCase):
             "#if INT_MIN != -32768 || INT_MAX != 32767 || UINT_MAX != 65535\n"
             "#error incorrect int limits\n"
             "#endif\n"
-            "#if LONG_MIN != -32768 || LONG_MAX != 32767 || ULONG_MAX != 65535\n"
+            "#if LONG_MIN != -2147483648 || LONG_MAX != 2147483647 || ULONG_MAX != 4294967295\n"
             "#error incorrect target long limits\n"
             "#endif\n"
             "#if WCHAR_MIN != -32768 || WCHAR_MAX != 32767\n"
@@ -945,6 +976,208 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
+
+    def test_long_values_use_32_bit_storage_and_calling_convention(self):
+        image = compile_source(
+            "long wide_global = 0x12345678L;\n"
+            "unsigned long unsigned_global = 4294967295UL;\n"
+            "long observed;\n"
+            "long negative_quotient;\n"
+            "int failed;\n"
+            "long add_long(long left, long right) { return left + right; }\n"
+            "int main(void) {\n"
+            "  long local;\n"
+            "  local = wide_global;\n"
+            "  observed = add_long(local, 1L);\n"
+            "  negative_quotient = -3L / 2L;\n"
+            "  if (observed != 0x12345679L) failed = 1;\n"
+            "  if (unsigned_global != 4294967295UL) failed = 1;\n"
+            "  if (0x80000000UL <= 0x7FFFFFFFUL) failed = 1;\n"
+            "  if (negative_quotient != -1L) failed = 1;\n"
+            "  if (sizeof(long) != 4) failed = 1;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 4) << 16) | cpu.read_16(GLOBAL_BASE + 6),
+            0xFFFFFFFF,
+        )
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 8) << 16) | cpu.read_16(GLOBAL_BASE + 10),
+            0x12345679,
+        )
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 16), 0)
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 12) << 16) | cpu.read_16(GLOBAL_BASE + 14),
+            0xFFFFFFFF,
+        )
+
+    def test_long_indirect_lvalues_cover_arrays_members_and_pointers(self):
+        image = compile_source(
+            "struct Holder { long value; } holder;\n"
+            "long values[2];\n"
+            "long *pointer;\n"
+            "long result;\n"
+            "int main(void) {\n"
+            "  holder.value = 0x12345678L;\n"
+            "  values[1] = holder.value;\n"
+            "  pointer = &values[1];\n"
+            "  *pointer = *pointer + 1L;\n"
+            "  result = values[1];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        holder_address = GLOBAL_BASE
+        values_address = holder_address + 4
+        result_address = values_address + 8 + 3
+        self.assertEqual(
+            (cpu.read_16(holder_address) << 16) | cpu.read_16(holder_address + 2),
+            0x12345678,
+        )
+        self.assertEqual(
+            (cpu.read_16(values_address + 4) << 16)
+            | cpu.read_16(values_address + 6),
+            0x12345679,
+        )
+        self.assertEqual(
+            (cpu.read_16(result_address) << 16) | cpu.read_16(result_address + 2),
+            0x12345679,
+        )
+
+    def test_switch_accepts_32_bit_long_control_and_case_values(self):
+        image = compile_source(
+            "long input;\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  input = 0x12345678L;\n"
+            "  switch (input) {\n"
+            "    case 0x12345677L: result = 1; break;\n"
+            "    case 0x12345678L: result = 2; break;\n"
+            "    default: result = 3;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 2)
+
+    def test_integer_literal_types_follow_c90_candidate_ranges(self):
+        image = compile_source(
+            "int results[4];\n"
+            "long signed_cast = (int)0x8000UL;\n"
+            "unsigned int unsigned_cast = (unsigned int)0xFFFFFFFFUL;\n"
+            "long address_sized_integer = 0x43101 + 1;\n"
+            "int main(void) {\n"
+            "  results[0] = 0xFFFF > 0;\n"
+            "  results[1] = 32768 > 0;\n"
+            "  results[2] = 65535U > 32767;\n"
+            "  results[3] = 2147483648 > 0;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + offset) for offset in (0, 2, 4, 6)],
+            [1, 1, 1, 1],
+        )
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 8) << 16)
+            | cpu.read_16(GLOBAL_BASE + 10),
+            0xFFFF8000,
+        )
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 12), 0xFFFF)
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 14) << 16)
+            | cpu.read_16(GLOBAL_BASE + 16),
+            0x43102,
+        )
+
+    def test_long_compound_updates_shifts_and_postfix_preserve_pair_values(self):
+        image = compile_source(
+            "unsigned long value;\n"
+            "unsigned long result;\n"
+            "int main(void) {\n"
+            "  value = 0xFFFFFFFFUL;\n"
+            "  result = value++;\n"
+            "  if (value != 0UL) return 1;\n"
+            "  if (result != 0xFFFFFFFFUL) return 2;\n"
+            "  --value;\n"
+            "  value += 3UL;\n"
+            "  value <<= 2;\n"
+            "  if (value != 8UL) return 3;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE) << 16) | cpu.read_16(GLOBAL_BASE + 2),
+            8,
+        )
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 4) << 16)
+            | cpu.read_16(GLOBAL_BASE + 6),
+            0xFFFFFFFF,
+        )
+
+    def test_long_conversions_and_signed_comparison_boundaries(self):
+        image = compile_source(
+            "long signed_value;\n"
+            "unsigned long unsigned_value;\n"
+            "long extended_int;\n"
+            "int narrowed_long;\n"
+            "int checks[5];\n"
+            "int main(void) {\n"
+            "  signed_value = -32769L;\n"
+            "  unsigned_value = 65535U;\n"
+            "  extended_int = -32768;\n"
+            "  narrowed_long = (int)0x12348000UL;\n"
+            "  checks[0] = signed_value < -32768L;\n"
+            "  checks[1] = signed_value > -32770L;\n"
+            "  checks[2] = unsigned_value == 65535UL;\n"
+            "  checks[3] = extended_int == -32768L;\n"
+            "  checks[4] = narrowed_long == 0x8000;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 14 + index * 2) for index in range(5)],
+            [1, 1, 1, 1, 1],
+        )
+
+    def test_wide_integer_constant_expressions_preserve_unsigned_semantics(self):
+        image = compile_source(
+            "unsigned long quotient = 4294967295UL / 2UL;\n"
+            "unsigned long remainder = 4294967295UL % 10UL;\n"
+            "unsigned int shifted = 0x8000U >> 1;\n"
+            "long signed_quotient = -7L / 3L;\n"
+            "int main(void) { return 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE) << 16) | cpu.read_16(GLOBAL_BASE + 2),
+            0x7FFFFFFF,
+        )
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 4) << 16)
+            | cpu.read_16(GLOBAL_BASE + 6),
+            5,
+        )
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 8), 0x4000)
+        self.assertEqual(
+            (cpu.read_16(GLOBAL_BASE + 10) << 16)
+            | cpu.read_16(GLOBAL_BASE + 12),
+            0xFFFFFFFE,
+        )
 
     def test_c90_offsetof_macro(self):
         image = compile_source(
@@ -960,8 +1193,10 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE), 2)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 4)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 0)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 2)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 0)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 4)
 
     def test_c90_float_header_matches_binary16_target(self):
         image = compile_source(
@@ -1029,7 +1264,7 @@ class CCompilerTests(unittest.TestCase):
             "#include <stdlib.h>\n"
             "#include <errno.h>\n"
             "#include <string.h>\n"
-            "int results[10];\n"
+            "int results[16];\n"
             "int main(void) {\n"
             "  char *end;\n"
             "  char text[12];\n"
@@ -1064,9 +1299,56 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(
             [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(16)],
             [
-                -47 & 0xFFFF, 7, 0, 63, 3, 32767, 5, 34, 0, 1,
-                65535, 2, 65535, 34, 65535, 34,
+                -47 & 0xFFFF, 7, 0, 63, 3, 32768, 5, 0, 0, 1,
+                65535, 2, 0, 0, 0, 0,
             ],
+        )
+
+    def test_strto_functions_cover_full_32_bit_long_ranges(self):
+        image = compile_source(
+            "#include <stdlib.h>\n"
+            "#include <errno.h>\n"
+            "long signed_values[4];\n"
+            "unsigned long unsigned_values[4];\n"
+            "int errors[4];\n"
+            "int main(void) {\n"
+            "  char *end;\n"
+            "  signed_values[0] = strtol(\"2147483647\", &end, 10);\n"
+            "  errors[0] = errno;\n"
+            "  signed_values[1] = strtol(\"-2147483648\", &end, 10);\n"
+            "  errors[1] = errno;\n"
+            "  signed_values[2] = strtol(\"2147483648\", &end, 10);\n"
+            "  errors[2] = errno;\n"
+            "  signed_values[3] = strtol(\"-2147483649\", &end, 10);\n"
+            "  errors[3] = errno;\n"
+            "  unsigned_values[0] = strtoul(\"4294967295\", &end, 10);\n"
+            "  unsigned_values[1] = strtoul(\"4294967296\", &end, 10);\n"
+            "  unsigned_values[2] = strtoul(\"-1\", &end, 10);\n"
+            "  unsigned_values[3] = strtoul(\"-4294967295\", &end, 10);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        signed_values = [
+            (cpu.read_16(GLOBAL_BASE + 2 + index * 4) << 16)
+            | cpu.read_16(GLOBAL_BASE + 4 + index * 4)
+            for index in range(4)
+        ]
+        unsigned_base = GLOBAL_BASE + 18
+        unsigned_values = [
+            (cpu.read_16(unsigned_base + index * 4) << 16)
+            | cpu.read_16(unsigned_base + index * 4 + 2)
+            for index in range(4)
+        ]
+        self.assertEqual(
+            signed_values,
+            [0x7FFFFFFF, 0x80000000, 0x7FFFFFFF, 0x80000000],
+        )
+        self.assertEqual(unsigned_values, [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 1])
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 34 + index * 2) for index in range(4)],
+            [0, 0, 34, 34],
         )
 
     def test_c90_errno_header(self):
