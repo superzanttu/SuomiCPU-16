@@ -20,6 +20,10 @@ MEM_MASK = 2**19 - 1
 GPU_BASE = 0x43020
 ICR_ADDR = 0x43002
 DISK_BASE = 0x43100
+FAR_CONTROL_MASK = 0xF83F
+FAR_CONTROL_PREFIX = 0xF83E
+FAR_BRANCH_MASK = 0xF80F
+FAR_BRANCH_PREFIX = 0xF80D
 CONSTANTS = (MEM_MASK, GPU_BASE, ICR_ADDR, DISK_BASE)
 
 
@@ -35,10 +39,28 @@ def _wr16(mem, a, v):
 
 
 @njit(cache=True)
-def _hits_gpu(a):
-    a0 = a & MEM_MASK
-    a1 = (a + 1) & MEM_MASK
-    return a0 == GPU_BASE or a1 == GPU_BASE or a0 == DISK_BASE or a1 == DISK_BASE
+def _wr_pc(mem, a, pc):
+    mem[a & MEM_MASK] = (pc >> 16) & 0x7
+    mem[(a + 1) & MEM_MASK] = (pc >> 8) & 0xFF
+    mem[(a + 2) & MEM_MASK] = pc & 0xFF
+
+
+@njit(cache=True)
+def _rd_pc(mem, a):
+    return (
+        (np.int64(mem[a & MEM_MASK]) << 16)
+        | (np.int64(mem[(a + 1) & MEM_MASK]) << 8)
+        | np.int64(mem[(a + 2) & MEM_MASK])
+    ) & MEM_MASK
+
+
+@njit(cache=True)
+def _hits_gpu(a, width=2):
+    for offset in range(width):
+        address = (a + offset) & MEM_MASK
+        if address == GPU_BASE or address == DISK_BASE:
+            return True
+    return False
 
 
 @njit(cache=True)
@@ -141,7 +163,7 @@ def run_block(mem, regs, st, budget):
             oper = control >> 12
             left = regs[rd] & 0xFFFF
             if oper == 15:
-                sel = control & 0xF
+                sel = control & 0x1F
                 if sel == 0:
                     regs[rd] = ((left << 8) | (left >> 8)) & 0xFFFF
                 elif sel == 1:
@@ -153,11 +175,11 @@ def run_block(mem, regs, st, budget):
                 elif sel == 2:
                     npc = left
                 elif sel == 3:
-                    if _hits_gpu(sp - 2):
+                    if _hits_gpu(sp - 3, 3):
                         bail = True
                     else:
-                        sp -= 2
-                        _wr16(mem, sp, npc)
+                        sp -= 3
+                        _wr_pc(mem, sp, npc)
                         npc = left
                 elif sel == 4:
                     if _hits_gpu(sp - 2):
@@ -188,6 +210,18 @@ def run_block(mem, regs, st, budget):
                     z = 1 if left == 0 else 0
                 elif sel == 10:
                     regs[rd] = (sp >> 16) & 7
+                elif sel == 11:
+                    if _hits_gpu(sp - 3, 3):
+                        bail = True
+                    else:
+                        high_register = (control >> 9) & 7
+                        target = ((regs[high_register] & 7) << 16) | left
+                        sp -= 3
+                        _wr_pc(mem, sp, npc)
+                        npc = target
+                elif sel == 12:
+                    high_register = (control >> 9) & 7
+                    npc = ((regs[high_register] & 7) << 16) | left
             elif oper <= 4:
                 if control & 0x0800:
                     cnt = control & 0xF
@@ -253,28 +287,29 @@ def run_block(mem, regs, st, budget):
                 n = result >> 15
                 if oper != 8 and oper != 14:
                     regs[rd] = result
-        elif op == 31 and (instr & 0xF81F) == 0xF81B:
-            cond = rd | (rs1 << 3)
-            target = _rd16(mem, npc) | (_rd16(mem, npc + 2) << 16)
-            npc += 4
-            if _condition(cond, z, c, n, v):
-                npc = target
-        elif op == 31 and (instr == 0xF81D or instr == 0xF91D or instr == 0xFA1D or instr == 0xFB1D):
-            target = _rd16(mem, npc) | (_rd16(mem, npc + 2) << 16)
-            npc += 4
-            if instr == 0xF91D:
-                if _hits_gpu(sp - 2):
+        elif op == 31 and (instr & FAR_CONTROL_MASK) == FAR_CONTROL_PREFIX:
+            operation = (instr >> 9) & 3
+            high_address = (instr >> 6) & 7
+            target = (high_address << 16) | _rd16(mem, npc)
+            npc += 2
+            if operation == 1:
+                if _hits_gpu(sp - 3, 3):
                     bail = True
                 else:
-                    sp -= 2
-                    _wr16(mem, sp, npc)
+                    sp -= 3
+                    _wr_pc(mem, sp, npc)
                     npc = target
-            elif instr == 0xF81D:
+            elif operation == 0:
                 npc = target
-            elif instr == 0xFA1D:
-                if z:
-                    npc = target
-            elif c:
+            elif operation == 2 and z:
+                npc = target
+            elif operation == 3 and c:
+                npc = target
+        elif op == 31 and (instr & FAR_BRANCH_MASK) == FAR_BRANCH_PREFIX:
+            cond = (instr >> 7) & 0xF
+            target = _rd16(mem, npc) | (((instr >> 4) & 0x7) << 16)
+            npc += 2
+            if _condition(cond, z, c, n, v):
                 npc = target
         elif op == 31:
             if rs1 == 0:
@@ -320,8 +355,8 @@ def run_block(mem, regs, st, budget):
             n = r16 >> 15
             v = 1 if ((a ^ b) & (a ^ r16) & 0x8000) else 0
         elif op == 23:
-            npc = _rd16(mem, sp)
-            sp += 2
+            npc = _rd_pc(mem, sp)
+            sp += 3
         elif op == 7:
             regs[rd] = regs[rs1] & regs[rs2]
         elif op == 25:
@@ -376,12 +411,12 @@ def run_block(mem, regs, st, budget):
             if regs[rd] == 0:
                 npc = imm
         elif op == 22:
-            nsp = sp - 2
-            if _hits_gpu(nsp):
+            nsp = sp - 3
+            if _hits_gpu(nsp, 3):
                 bail = True
             else:
                 sp = nsp
-                _wr16(mem, sp, npc)
+                _wr_pc(mem, sp, npc)
                 npc = instr & 0x7FF
         elif op == 21:
             regs[rd] = _rd16(mem, sp) & 0xFFFF
@@ -395,8 +430,8 @@ def run_block(mem, regs, st, budget):
             c = (saved >> 1) & 1
             n = (saved >> 2) & 1
             v = (saved >> 3) & 1
-            npc = _rd16(mem, sp)
-            sp += 2
+            npc = _rd_pc(mem, sp)
+            sp += 3
         elif op == 17:
             mem[ICR_ADDR] = mem[ICR_ADDR] | 1
         elif op == 18:

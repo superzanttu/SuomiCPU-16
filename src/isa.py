@@ -30,6 +30,19 @@ OP_STWS = 0x1C
 OP_ADJSP = 0x1D
 OP_BC = 0x1E
 OP_SHR = 0x1F
+# Far control instructions use the reserved 0x3E low-six-bit selector in the
+# OP_SHR space. The five intervening bits carry a 2-bit operation and the
+# high three bits of a 19-bit target; the following word carries its low bits.
+FAR_CONTROL_MASK = 0xF83F
+FAR_CONTROL_PREFIX = 0xF83E
+FAR_CONTROL_OPERATIONS = {
+    "JMPX": 0,
+    "CALLX": 1,
+    "BZX": 2,
+    "BCX": 3,
+}
+FAR_BRANCH_MASK = 0xF80F
+FAR_BRANCH_PREFIX = 0xF80D
 OP_MOVSP = OP_SHR
 OP_FADD = OP_SHR
 OP_FSUB = OP_SHR
@@ -126,12 +139,13 @@ MISC_OPERATIONS = {
     "SETSP": 8,   # SP = Rd (low 16 bits)
     "CLZ": 9,     # Rd = number of leading zero bits of Rd
     "MOVSPH": 10, # Rd = high three bits of SP
+    "CALLRP": 11, # call the 19-bit address in Rd and the selected high register
+    "JMPRP": 12,  # jump to the 19-bit address in Rd and the selected high register
 }
 
-# Far conditional branches: 6 bytes, 24-bit target.
-#   word 1: 0xF800 | ((cond & 7) << 8) | ((cond >> 3) << 5) | 0x1B
-#   words 2-3: target low and high
-BRANCH_PREFIX = 0x1B
+# Far conditional branches: 4 bytes, 19-bit target.
+#   word 1: 0xF80D | (condition << 7) | (target[18:16] << 4)
+#   word 2: target[15:0]
 BRANCH_CONDITIONS = {
     "BNZX": 0,   # Z = 0
     "BNCX": 1,   # C = 0

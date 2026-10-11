@@ -139,10 +139,25 @@ class AssemblerTests(unittest.TestCase):
 
         self.assertEqual(
             image.segments[0].data,
-            b"\xF8\x1D\x23\x45\x00\x01"
-            b"\xF9\x1D\x23\x45\x00\x01"
-            b"\xFA\x1D\x23\x45\x00\x01"
-            b"\xFB\x1D\x23\x45\x00\x01",
+            b"\xF8\x7E\x23\x45"
+            b"\xFA\x7E\x23\x45"
+            b"\xFC\x7E\x23\x45"
+            b"\xFE\x7E\x23\x45",
+        )
+
+    def test_encodes_far_conditional_branches_in_four_bytes(self):
+        image = assemble("BNZX 0x12345\nBLTX 0x23456\n")
+        self.assertEqual(
+            image.segments[0].data,
+            b"\xF8\x1D\x23\x45"
+            b"\xFB\x2D\x34\x56",
+        )
+
+    def test_encodes_register_pair_far_call(self):
+        image = assemble("CALLRP R0, R1\nJMPRP R2, R3")
+        self.assertEqual(
+            image.segments[0].data,
+            b"\xF8\x1F\xF2\x0B\xFA\x1F\xF6\x0C",
         )
 
     def test_encodes_word_stack_and_carry_instructions(self):

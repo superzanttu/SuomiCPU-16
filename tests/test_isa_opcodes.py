@@ -185,13 +185,17 @@ class AssemblerEncodingTests(unittest.TestCase):
                 self.assertEqual(encode(f"JZ R{rd}, {target}"), be(word(isa.OP_JZ, rd, imm=target)))
 
     def test_far_control_boundary_targets(self):
-        sentinels = {"JMPX": 0xF81D, "CALLX": 0xF91D, "BZX": 0xFA1D, "BCX": 0xFB1D}
-        for name, sentinel in sentinels.items():
+        for name, operation in isa.FAR_CONTROL_OPERATIONS.items():
             for target in (0, 1, 0xFFFF, 0x10000, 0x12345, MEM_SIZE - 1):
                 with self.subTest(name=name, target=target):
+                    first = (
+                        isa.FAR_CONTROL_PREFIX
+                        | (operation << 9)
+                        | (((target >> 16) & 0x7) << 6)
+                    )
                     self.assertEqual(
                         encode(f"{name} {target}"),
-                        be(sentinel, target & 0xFFFF, target >> 16),
+                        be(first, target & 0xFFFF),
                     )
 
     def test_labels_resolve_for_every_branch(self):
@@ -465,33 +469,102 @@ class CpuExecutionTests(unittest.TestCase):
             with self.subTest(target=target):
                 cpu = self.run_one((isa.OP_CALL << 11) | target)
                 self.assertEqual(cpu.pc, target)
-                self.assertEqual(cpu.sp, 0x2FFFD)
-                self.assertEqual(cpu.read_16(cpu.sp), CODE + 2)
+                self.assertEqual(cpu.sp, 0x2FFFC)
+                self.assertEqual(
+                    cpu.memory[cpu.sp:cpu.sp + 3],
+                    bytes((0, (CODE + 2) >> 8, (CODE + 2) & 0xFF)),
+                )
                 cpu.memory[target:target + 2] = be(isa.OP_RET << 11)
                 cpu.step()
                 self.assertEqual((cpu.pc, cpu.sp), (CODE + 2, 0x2FFFF))
 
     def test_far_control_taken_and_not_taken(self):
-        sentinels = {"JMPX": 0xF81D, "CALLX": 0xF91D, "BZX": 0xFA1D, "BCX": 0xFB1D}
-        for name, sentinel in sentinels.items():
+        for name, operation in isa.FAR_CONTROL_OPERATIONS.items():
             for z, c in itertools.product((0, 1), repeat=2):
                 for target in (0, 0x12345, MEM_SIZE - 1):
                     with self.subTest(name=name, z=z, c=c, target=target):
-                        program = be(sentinel, target & 0xFFFF, target >> 16)
+                        first = (
+                            isa.FAR_CONTROL_PREFIX
+                            | (operation << 9)
+                            | (((target >> 16) & 0x7) << 6)
+                        )
+                        program = be(first, target & 0xFFFF)
                         cpu = make_cpu(program, flags={"Z": z, "C": c})
                         cpu.step()
                         taken = {"JMPX": True, "CALLX": True, "BZX": z, "BCX": c}[name]
-                        self.assertEqual(cpu.pc, target if taken else CODE + 6)
+                        self.assertEqual(cpu.pc, target if taken else CODE + 4)
                         if name == "CALLX":
-                            self.assertEqual(cpu.sp, 0x2FFFD)
-                            self.assertEqual(cpu.read_16(cpu.sp), CODE + 6)
+                            self.assertEqual(cpu.sp, 0x2FFFC)
+                            self.assertEqual(
+                                cpu.memory[cpu.sp:cpu.sp + 3],
+                                bytes((0, (CODE + 4) >> 8, (CODE + 4) & 0xFF)),
+                            )
                         else:
                             self.assertEqual(cpu.sp, 0x2FFFF)
 
-    def test_far_return_via_ret_truncates_to_16_bit_pc(self):
+    def test_far_conditional_branches_cover_19_bit_targets(self):
+        for name, condition in isa.BRANCH_CONDITIONS.items():
+            for target in (0, 0x12345, MEM_SIZE - 1):
+                for taken in (False, True):
+                    with self.subTest(name=name, target=target, taken=taken):
+                        flags = {
+                            "Z": int(taken), "C": int(taken),
+                            "N": int(taken), "V": 0,
+                        }
+                        encoded = (
+                            isa.FAR_BRANCH_PREFIX
+                            | (condition << 7)
+                            | (((target >> 16) & 7) << 4)
+                        )
+                        cpu = make_cpu(be(encoded, target & 0xFFFF), flags=flags)
+                        expected_taken = cpu._flag_condition(condition)
+                        cpu.step()
+                        self.assertEqual(
+                            cpu.pc,
+                            target if expected_taken else CODE + 4,
+                        )
+
+    def test_far_call_and_ret_preserve_all_pc_bits(self):
         cpu = make_cpu(encode("CALLX 0x20000"))
         cpu.step()
         self.assertEqual(cpu.pc, 0x20000)
+        self.assertEqual(cpu.sp, 0x2FFFC)
+        cpu.memory[0x20000:0x20002] = be(isa.OP_RET << 11)
+        cpu.step()
+        self.assertEqual((cpu.pc, cpu.sp), (CODE + 4, 0x2FFFF))
+
+    def test_callr_and_ret_preserve_high_pc(self):
+        cpu = make_cpu(be(0xFFFF), pc=0x20000)
+        cpu.registers[0] = 0
+        cpu.registers[1] = 3
+        cpu.memory[0x20000:0x20004] = encode("CALLRP R0, R1")
+        cpu.memory[0x30000:0x30002] = be(isa.OP_RET << 11)
+        cpu.step()
+        self.assertEqual(cpu.pc, 0x30000)
+        cpu.step()
+        self.assertEqual((cpu.pc, cpu.sp), (0x20004, 0x2FFFF))
+
+    def test_jmprp_jumps_to_19_bit_register_pair_address(self):
+        cpu = make_cpu(be(0xFFFF), pc=0x20000)
+        cpu.registers[2] = 0x3456
+        cpu.registers[3] = 2
+        cpu.memory[0x20000:0x20004] = encode("JMPRP R2, R3")
+        cpu.step()
+        self.assertEqual((cpu.pc, cpu.sp), (0x23456, 0x2FFFF))
+
+    def test_interrupt_return_restores_a_19_bit_pc(self):
+        cpu = make_cpu(be(0xFFFF), pc=0x20000)
+        cpu.memory[0x0002:0x0004] = be(0x300)
+        cpu.memory[0x300:0x302] = be(isa.OP_RTI << 11)
+        cpu.flags = {"Z": 1, "C": 0, "N": 1, "V": 0}
+
+        cpu.handle_interrupt(0x0002)
+
+        self.assertEqual(cpu.pc, 0x300)
+        self.assertEqual(cpu.sp, 0x2FFFA)
+        cpu.step()
+        self.assertEqual((cpu.pc, cpu.sp), (0x20000, 0x2FFFF))
+        self.assertEqual(cpu.flags, {"Z": 1, "C": 0, "N": 1, "V": 0})
 
     def test_ei_di_toggle_only_enable_bit(self):
         for initial in range(256):
@@ -513,9 +586,10 @@ class CpuExecutionTests(unittest.TestCase):
                     cpu.memory[ICR_ADDR] = pending
                     cpu.step()
                     self.assertEqual(cpu.pc, 0x300)
-                    self.assertEqual(cpu.sp, 0x2FFFF - 4)
+                    self.assertEqual(cpu.sp, 0x2FFFF - 5)
                     self.assertEqual(cpu.read_16(cpu.sp), z)
-                    self.assertEqual(cpu.read_16(cpu.sp + 2), CODE + 2)
+                    self.assertEqual(cpu.read(cpu.sp + 2), 0)
+                    self.assertEqual(cpu.read_16(cpu.sp + 3), CODE + 2)
                     self.assertEqual(cpu.memory[ICR_ADDR] & 0x0B, 0)
                     cpu.flags["Z"] = 1 - z
                     cpu.step()

@@ -12,7 +12,9 @@ from src.isa import (
     ALU_SHIFTS,
     BRANCH_ALIASES,
     BRANCH_CONDITIONS,
-    BRANCH_PREFIX,
+    FAR_CONTROL_OPERATIONS,
+    FAR_CONTROL_PREFIX,
+    FAR_BRANCH_PREFIX,
     MISC_OPERATIONS,
     MULDIV_IMMEDIATE_FLAG,
     MULDIV_OPERATIONS,
@@ -263,7 +265,7 @@ def _extended_size(mnemonic: str, operands: list[str], line_number: int) -> int 
     if mnemonic in BRANCH_CONDITIONS or mnemonic in BRANCH_ALIASES:
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")
-        return 6
+        return 4
     if mnemonic == "NOP":
         return 2
     if mnemonic in MISC_OPERATIONS:
@@ -325,9 +327,23 @@ def _assemble_extended(
             target = _parse_number(operands[0], line_number)
         if not 0 <= target < MEMORY_SIZE:
             raise _error(line_number, f"{mnemonic} target is outside available memory")
-        first = shared | ((condition & 7) << 8) | ((condition >> 3) << 5) | BRANCH_PREFIX
-        return [first, target & 0xFFFF, target >> 16]
+        first = FAR_BRANCH_PREFIX | (condition << 7) | (((target >> 16) & 0x7) << 4)
+        return [first, target & 0xFFFF]
     if mnemonic in MISC_OPERATIONS:
+        if mnemonic in ("CALLRP", "JMPRP"):
+            if len(operands) != 2:
+                raise _error(
+                    line_number,
+                    f"{mnemonic} expects low-address and high-address registers",
+                )
+            low_register = _parse_register(operands[0], line_number)
+            high_register = _parse_register(operands[1], line_number)
+            control = (
+                (ALU_MISC_OPERATION << 12)
+                | (high_register << 9)
+                | MISC_OPERATIONS[mnemonic]
+            )
+            return [shared | (low_register << 8) | ALU_PREFIX, control]
         wanted = 0 if mnemonic in _MISC_ZERO_OPERAND else 1
         if len(operands) != wanted:
             raise _error(line_number, f"{mnemonic} expects {wanted} operand(s)")
@@ -366,7 +382,7 @@ def _instruction_size(text: str, line_number: int) -> int:
     if mnemonic in ("JMPX", "CALLX", "BZX", "BCX"):
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")
-        return 6
+        return 4
     if mnemonic in MULDIV_OPERATIONS:
         if len(operands) != 2:
             raise _error(line_number, f"{mnemonic} expects a register and a register or immediate")
@@ -412,13 +428,14 @@ def _assemble_instruction(
             return labels[value]
         return _parse_number(value, line_number)
 
-    far_control = {"JMPX": 0xF81D, "CALLX": 0xF91D, "BZX": 0xFA1D, "BCX": 0xFB1D}
-    if mnemonic in far_control:
+    if mnemonic in FAR_CONTROL_OPERATIONS:
         require_count(1)
         target = target_address(operands[0])
         if not 0 <= target < MEMORY_SIZE:
             raise _error(line_number, f"{mnemonic} target is outside available memory")
-        return [far_control[mnemonic], target & 0xFFFF, target >> 16]
+        first = FAR_CONTROL_PREFIX | (FAR_CONTROL_OPERATIONS[mnemonic] << 9)
+        first |= ((target >> 16) & 0x7) << 6
+        return [first, target & 0xFFFF]
 
     if mnemonic in MULDIV_OPERATIONS:
         require_count(2)

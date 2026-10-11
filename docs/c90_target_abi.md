@@ -59,13 +59,17 @@ order, unit size, and boundary behavior as implementation-defined choices.
 
 Arguments are evaluated and pushed right-to-left. The stack grows toward
 lower addresses. The caller removes arguments after return. The return address
-occupies two bytes. At function entry, the first named parameter begins at
-`SP + 2`, followed by subsequent parameters in declaration order; locals are
+occupies three bytes and stores the 19-bit PC in big-endian order (the high
+byte uses only its low three bits). At function entry, the first named
+parameter begins at `SP + 3`, followed by subsequent parameters in declaration
+order; locals are
 allocated below the entry stack position.
 
 16-bit integer results use `R0`; 32-bit integer results use `R0:R1`, with the
 high word in the even register. Pointer results use `R0` for the low 16 address
-bits and the low three bits of `R1` for the high address bits. Once implemented,
+bits and the low three bits of `R1` for the high address bits. Indirect
+function-pointer calls and jumps use `CALLRP R0, R1` and `JMPRP R0, R1` with
+this same representation. Once implemented,
 32-bit floating results use `R0:R1` and 64-bit floating results use
 `R0:R1:R2:R3`, from most- to least-significant word. Arguments use their
 in-memory object representations on the stack, including the 3-byte pointer
@@ -108,7 +112,9 @@ following pass:
    alignment, aggregate offsets, pointer encoding, and all scalar/aggregate
    calling conventions.
 2. Emulator, JIT, and assembler execute identical tests for every C-visible
-   memory, control-flow, and floating-point opcode.
+   memory, control-flow, and floating-point opcode. Calls and returns,
+   including indirect calls, preserve all 19 PC bits; interrupt frames contain
+   the three-byte PC and two-byte flags value.
 3. An independent C90 conformance suite passes, with each remaining failure
    categorized as a documented implementation-defined/unspecified behavior
    or fixed as a defect.

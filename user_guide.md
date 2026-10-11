@@ -85,8 +85,8 @@ window, display, and input.
 - Numeric instruction operands use Python-style integer prefixes: decimal
   (`25`), hexadecimal (`0x19`), octal (`0o31`), or binary (`0b11001`).
 - There is no implicit `CALL`, `RET`, `NOP`, expression evaluation, or data
-  alignment directive. Every instruction has a two-byte encoding, except a
-  wide `LDI`, which expands to two instructions.
+  alignment directive. Base instructions occupy two bytes; extended
+  instructions use two, four, or six bytes depending on their operands.
 
 ## 4. Directives
 
@@ -184,8 +184,9 @@ produces a duplicate-label error.
 
 ## 5. Instruction reference
 
-All instructions occupy one 16-bit word (two bytes), stored most-significant
-byte first. Registers are selected from `R0` through `R7`. Unless stated
+Base instructions occupy one 16-bit word (two bytes), stored most-significant
+byte first. Extended instructions may use additional words as noted in their
+descriptions. Registers are selected from `R0` through `R7`. Unless stated
 otherwise, instructions do not change the condition flags.
 
 ### Program and immediate instructions
@@ -345,7 +346,8 @@ and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
 | `TEST`                        | `TEST Rd, Rs` / `imm`      | `Rd AND source`; sets flags only.                                                                                        |
 | `ADD SUB AND OR XOR CMP`      | `ADD Rd, imm`              | Immediate forms (a non-register second operand selects them).                                                            |
 | `SWAP` `SEXT` `CLZ`           | `SWAP Rd`                  | Swap bytes; sign-extend the low byte; count leading zeros (all in place).                                                |
-| `JMPR` `CALLR`                | `JMPR Rd`                  | Jump/call to the 19-bit address held in `Rd`.                                                                            |
+| `JMPR` `CALLR`                | `JMPR Rd`                  | Jump/call to the 16-bit address held in `Rd`.                                                                            |
+| `JMPRP` `CALLRP`              | `JMPRP Rlow, Rhigh`        | Jump/call through a 19-bit pointer: low 16 bits in `Rlow`, high 3 bits in `Rhigh`.                                      |
 | `PUSHF` `POPF`                | `PUSHF`                    | Push/pop the flags (Z=1, C=2, N=4, V=8).                                                                                 |
 | `SETC` `CLC`                  | `SETC`                     | Set/clear the carry flag.                                                                                                |
 | `SETSP`                       | `SETSP Rd`                 | Load the stack pointer from `Rd`.                                                                                        |
@@ -355,13 +357,15 @@ and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
 | `BHI BLS`                     | `BHI label`                | Unsigned higher / lower-or-same after `CMP`.                                                                             |
 
 Every branch also has an `X` spelling (`BLTX`, ...); all conditional branches
-here are 6-byte, full-address forms. `ADD`, `SUB` and `CMP` now also set the
+here are four-byte, full-address forms. `ADD`, `SUB` and `CMP` now also set the
 `N` (negative) and `V` (signed overflow) flags. `NOT` and `POP` now produce
 full 16-bit values. Encoding: opcode `0x1F` with low-byte prefix `0x1F`
 (ALU/misc group: `(op<<12) | 0x0800 immediate flag | operand`, ops `SHL`=0,
 `LSR`=1, `ASR`=2, `ROL`=3, `ROR`=4, `ADC`=5, `SBC`=6, `NEG`=7, `TEST`=8,
-`ADD`=9, `SUB`=10, `AND`=11, `OR`=12, `XOR`=13, `CMP`=14, misc=15) or `0x1B`
-(conditional far branch; condition in the prefix word, then a 24-bit target).
+`ADD`=9, `SUB`=10, `AND`=11, `OR`=12, `XOR`=13, `CMP`=14, misc=15).
+Compact far control uses prefix `0xF83E` and carries the operation plus the
+target's upper three bits in the prefix word. Far conditional branches use
+prefix `0xF80D`, with the condition and upper address bits in that word.
 ### Branches
 
 | Instruction | Syntax                    | Operation                                               |
@@ -375,6 +379,7 @@ full 16-bit values. Encoding: opcode `0x1F` with low-byte prefix `0x1F`
 | `BZX`       | `BZX address_or_label`    | Jump to a full 19-bit address if `Z` is set.            |
 | `BCX`       | `BCX address_or_label`    | Jump to a full 19-bit address if `C` is set.            |
 | `CALLX`     | `CALLX address_or_label`  | Call a full 19-bit byte address.                        |
+| `CALLRP`    | `CALLRP Rlow, Rhigh`      | Call the 19-bit address in `Rlow` and the low 3 bits of `Rhigh`. |
 | `RET`       | `RET`                     | Pop the return PC from the stack.                       |
 
 Example:
@@ -394,8 +399,19 @@ encodes an 8-bit target (`0` to `0xFF`). These are absolute **byte** addresses,
 not instruction indexes or offsets. `JZ` tests the named register directly; it
 does not test the `Z` flag. `BZ` and `BC` test the `Z` and `C` flags,
 respectively, commonly after `SUB` or `CMP`.
-`JMPX`, `BZX`, `BCX`, and `CALLX` use six bytes and encode a full 19-bit address;
+`JMPX`, `BZX`, `BCX`, and `CALLX` use four bytes and encode a full 19-bit address;
 use them when code or routines are outside the short-address range.
+All `CALL`, `CALLX`, `CALLR`, and `CALLRP` instructions push the following
+19-bit PC as three big-endian bytes; `RET` restores all 19 bits. `CALLRP` uses
+the register-pair layout of C object pointers: low 16 address bits in `Rlow`
+and high three bits in `Rhigh`.
+
+The compact far-control prefix word uses bits 10-9 for the operation, bits 8-6
+for address bits 18-16, and fixed selector `0x3E` in bits 5-0. Its second word
+contains address bits 15-0. Far conditional branches use bits 10-7 for the
+condition code, bits 6-4 for address bits 18-16, and fixed selector `0xD` in
+bits 3-0; their second word also contains address bits 15-0. Both encodings
+therefore cover the full 512 KiB address space in four bytes.
 
 ### Stack and interrupt instructions
 
@@ -405,7 +421,7 @@ use them when code or routines are outside the short-address range.
 | `POP`       | `POP Rd`            | Pop a value from the stack into `Rd`; the register is masked to one byte. |
 | `EI`        | `EI`                | Set the interrupt-enable bit in the interrupt control register.           |
 | `DI`        | `DI`                | Clear the interrupt-enable bit.                                           |
-| `RTI`       | `RTI`               | Restore `Z` and the PC from the interrupt stack frame.                    |
+| `RTI`       | `RTI`               | Restore the flags and 19-bit PC from the five-byte interrupt frame.       |
 | `ADJSP`     | `ADJSP signed_byte` | Add a signed -128 to 127 byte adjustment to the stack pointer.            |
 
 The stack pointer starts at `0x2FFFF`. `PUSH` decrements the pointer by two and
@@ -731,8 +747,8 @@ Generated C code uses the far control instructions (`JMPX`, `CALLX`, `BZX`,
 `BCX`). Address 0 holds an entry stub; `0x0002`-`0x0005` hold interrupt
 vectors, and the boot routine at `0x0006` calls `main`. Compiled code starts at
 `0x4800`; global data starts at `0x2000`, so large code and data sections must
-not overlap. The code and return addresses must also remain below `0x10000`,
-because the call stack stores 16-bit return addresses. Libraries use fixed
+not overlap. Return addresses preserve the full 19-bit PC; code is no longer
+restricted to addresses below `0x10000` for call/return correctness. Libraries use fixed
 low-memory locations: `lib_gfx` at `0x400`, `lib_text` at `0x700`, and
 `lib_cgfx` at `0x1000`. The compiler/assembler reports errors when emitted
 sections overlap or stack frames exceed supported limits. The command-line

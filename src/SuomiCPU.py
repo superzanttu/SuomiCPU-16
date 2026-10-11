@@ -14,6 +14,13 @@ from tools.assembler import AssemblyError, AssemblyImage, MemorySegment, assembl
 from tools.c_compiler import CCompilerError, compile_file
 from tools.sc16net import DEFAULT_PORT, MAX_PAYLOAD, NetNode, UdpTransport
 from src.lib_disk import DiskDevice
+from src.isa import (
+    FAR_BRANCH_MASK,
+    FAR_BRANCH_PREFIX,
+    FAR_CONTROL_MASK,
+    FAR_CONTROL_OPERATIONS,
+    FAR_CONTROL_PREFIX,
+)
 
 # =============================================================================
 # ISA (Instruction Set Architecture) - Prosessorin "kieli"
@@ -585,6 +592,22 @@ class SuomiCompute16:
         self.sp += 2
         return val
 
+    def push_pc(self, value):
+        value &= MEM_MASK
+        self.sp -= 3
+        self.write(self.sp, value >> 16)
+        self.write(self.sp + 1, value >> 8)
+        self.write(self.sp + 2, value)
+
+    def pop_pc(self):
+        value = (
+            (self.read(self.sp) << 16)
+            | (self.read(self.sp + 1) << 8)
+            | self.read(self.sp + 2)
+        )
+        self.sp += 3
+        return value & MEM_MASK
+
     def _execute_muldiv(self, instr):
         """Run the MUL/DIV/MOD group; `instr` is the 0xF81E prefix word."""
         rd = (instr >> 8) & 0x7
@@ -676,7 +699,7 @@ class SuomiCompute16:
         operation = control >> 12
         left = self.registers[rd] & 0xFFFF
         if operation == 15:
-            self._execute_misc(rd, left, control & 0xF)
+            self._execute_misc(rd, left, control & 0x1F, control)
             return
         immediate = bool(control & 0x0800)
         if operation <= 4:
@@ -876,7 +899,7 @@ class SuomiCompute16:
         self._set_flags(result, carry, 0)
         self.registers[rd] = result
 
-    def _execute_misc(self, rd, value, selector):
+    def _execute_misc(self, rd, value, selector, control=0):
         """Run the miscellaneous register instructions (ALU operation 15)."""
         if selector == 0:
             self.registers[rd] = ((value << 8) | (value >> 8)) & 0xFFFF
@@ -887,7 +910,7 @@ class SuomiCompute16:
         elif selector == 2:
             self.pc = value
         elif selector == 3:
-            self.push(self.pc)
+            self.push_pc(self.pc)
             self.pc = value
         elif selector == 4:
             self.push(self._pack_flags())
@@ -904,6 +927,14 @@ class SuomiCompute16:
             self.flags['Z'] = int(value == 0)
         elif selector == 10:
             self.registers[rd] = (self.sp >> 16) & 0x7
+        elif selector == 11:
+            high_register = (control >> 9) & 0x7
+            target = ((self.registers[high_register] & 0x7) << 16) | value
+            self.push_pc(self.pc)
+            self.pc = target
+        elif selector == 12:
+            high_register = (control >> 9) & 0x7
+            self.pc = ((self.registers[high_register] & 0x7) << 16) | value
 
     def _pack_flags(self):
         flags = self.flags
@@ -937,23 +968,25 @@ class SuomiCompute16:
             self._execute_wide(instr)
         elif opcode == OP_SHR and (instr & 0xF8FF) == 0xF81F:
             self._execute_alu(instr)
-        elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81B:
-            condition = ((instr >> 8) & 0x7) | (((instr >> 5) & 0x7) << 3)
-            target = self.read_16(self.pc) | (self.read_16(self.pc + 2) << 16)
-            self.pc += 4
+        elif opcode == OP_SHR and (instr & FAR_BRANCH_MASK) == FAR_BRANCH_PREFIX:
+            condition = (instr >> 7) & 0xF
+            target = self.read_16(self.pc) | (((instr >> 4) & 0x7) << 16)
+            self.pc += 2
             if self._flag_condition(condition):
                 self.pc = target
-        elif opcode == OP_SHR and instr in (0xF81D, 0xF91D, 0xFA1D, 0xFB1D):
-            target = self.read_16(self.pc) | (self.read_16(self.pc + 2) << 16)
-            self.pc += 4
-            if instr == 0xF91D:
-                self.push(self.pc)
+        elif opcode == OP_SHR and (instr & FAR_CONTROL_MASK) == FAR_CONTROL_PREFIX:
+            operation = (instr >> 9) & 0x3
+            high_address = (instr >> 6) & 0x7
+            target = self.read_16(self.pc) | (high_address << 16)
+            self.pc += 2
+            if operation == FAR_CONTROL_OPERATIONS["CALLX"]:
+                self.push_pc(self.pc)
                 self.pc = target
-            elif instr == 0xF81D:
+            elif operation == FAR_CONTROL_OPERATIONS["JMPX"]:
                 self.pc = target
-            elif instr == 0xFA1D and self.flags["Z"]:
+            elif operation == FAR_CONTROL_OPERATIONS["BZX"] and self.flags["Z"]:
                 self.pc = target
-            elif instr == 0xFB1D and self.flags["C"]:
+            elif operation == FAR_CONTROL_OPERATIONS["BCX"] and self.flags["C"]:
                 self.pc = target
         elif opcode == OP_LDWS:
             addr = self.sp + imm
@@ -994,7 +1027,7 @@ class SuomiCompute16:
             r16 = res & 0xFFFF
             flags['N'] = r16 >> 15
             flags['V'] = 1 if ((a ^ b) & (a ^ r16) & 0x8000) else 0
-        elif opcode == OP_RET: self.pc = self.pop()
+        elif opcode == OP_RET: self.pc = self.pop_pc()
         elif opcode == OP_AND: registers[rd] = registers[rs1] & registers[rs2]
         elif opcode == OP_LDW:
             addr = registers[rs1]
@@ -1033,7 +1066,7 @@ class SuomiCompute16:
         elif opcode == OP_JZ:
             if registers[rd] == 0: self.pc = imm
         elif opcode == OP_CALL:
-            self.push(self.pc)
+            self.push_pc(self.pc)
             self.pc = instr & 0x7FF
         elif opcode == OP_POP: registers[rd] = self.pop() & 0xFFFF
         elif opcode == OP_NOT: registers[rd] = (~registers[rs1]) & 0xFFFF
@@ -1076,7 +1109,7 @@ class SuomiCompute16:
         elif opcode == OP_HALT: self.running = False
         elif opcode == OP_RTI:
             self._restore_flags(self.pop())
-            self.pc = self.pop()
+            self.pc = self.pop_pc()
         elif opcode == OP_EI: self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x01)
         elif opcode == OP_DI: self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x01)
 
@@ -1089,7 +1122,7 @@ class SuomiCompute16:
         elif (icr & 0x01) and (icr & 0x08): self.handle_interrupt(0x0004)
 
     def handle_interrupt(self, vector_addr):
-        self.push(self.pc)
+        self.push_pc(self.pc)
         self.push(self._pack_flags())
         self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x01)
         self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x02 & ~0x08)

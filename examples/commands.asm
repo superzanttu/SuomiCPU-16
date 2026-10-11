@@ -90,7 +90,9 @@ jump_target:
     SETSP R2
     NOP
     JMPR R2
+    JMPRP R0, R1         ; 19-bit indirect jump through the pointer pair R0:R1
     CALLR R2
+    CALLRP R0, R1         ; Indirect call through the 19-bit pointer pair R0:R1
     BNZX sample_routine    ; Far conditional branches (flag/signed/unsigned)
     BNCX sample_routine
     BNX sample_routine

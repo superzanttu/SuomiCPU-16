@@ -159,7 +159,7 @@ class SyntaxTests(unittest.TestCase):
         image = assemble("LDA R2, end\nJMPX end\n.address 0x12345\nend: HALT")
         self.assertEqual(image.entry_point, 0)
         self.assertEqual(bytes(image.segments[0].data)[:2], b"\x0a\x45")
-        self.assertEqual(bytes(image.segments[0].data)[4:], b"\xf8\x1d\x23\x45\x00\x01")
+        self.assertEqual(bytes(image.segments[0].data)[4:], b"\xf8\x7e\x23\x45")
 
 
 class IncludeTests(unittest.TestCase):

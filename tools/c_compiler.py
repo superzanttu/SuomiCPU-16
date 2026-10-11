@@ -2224,13 +2224,13 @@ class _CodeGenerator:
         )
         hidden_return_bytes = 3 if function.return_type in self.records else 0
         if (
-            self.frame_size + 2 + hidden_return_bytes + parameter_bytes
+            self.frame_size + 3 + hidden_return_bytes + parameter_bytes
             > STACK_OFFSET_LIMIT
         ):
             raise self.error(function.line, "parameters exceed stack-relative address range")
         self.stack_depth = 0
         self.scopes = [{}]
-        parameter_offset = self.frame_size + 2
+        parameter_offset = self.frame_size + 3
         if function.return_type in self.records:
             parameter_offset += 3
         for c_type, name in function.parameters:
@@ -2643,7 +2643,7 @@ class _CodeGenerator:
                     self.emit("    MOVSP R7")
                     self._emit_store_pointer("R0")
                     self.emit("    MOVSP R7")
-                    destination_offset = self.frame_size + 2 + self.stack_depth
+                    destination_offset = self.frame_size + 3 + self.stack_depth
                     if destination_offset:
                         self.emit(f"    LDI R6, {destination_offset}")
                         self.emit("    ADD R7, R6")

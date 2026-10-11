@@ -18,7 +18,7 @@ try:
 except ImportError:
     HAVE_JIT = False
 
-PREFIXES = (0xF81E, 0xF81F, 0xF81B, 0xF81D, 0xF91D, 0xFA1D, 0xFB1D, 0xF81C)
+PREFIXES = (0xF81E, 0xF81F, 0xF80D, 0xF83E, 0xF81C)
 
 
 def random_cpu(seed, use_jit):
@@ -79,11 +79,66 @@ class JitEquivalenceTests(unittest.TestCase):
         fast.use_jit = True
         slow.gpu_log = []
         fast.gpu_log = []
+        slow.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        fast.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
         slow.gpu_command = lambda command: slow.gpu_log.append(command)
         fast.gpu_command = lambda command: fast.gpu_log.append(command)
         reference_run(slow, 100)
         fast._execute_jit(100)
         self.assertEqual(state(slow), state(fast))
+
+    def test_19_bit_return_addresses_match_for_calls_above_0xffff(self):
+        program = assemble(
+            ".address 0x20000\n"
+            "entry: CALLX far_routine\n"
+            "LDI R0, 0x400\n"
+            "LDI R1, 0\n"
+            "CALLRP R0, R1\n"
+            "HALT\n"
+            ".address 0x30000\n"
+            "far_routine: RET\n"
+            ".address 0x400\n"
+            "indirect_routine: RET\n"
+        )
+        slow = make_cpu(program)
+        fast = make_cpu(program)
+        slow.use_jit = False
+        fast.use_jit = True
+        slow.gpu_log = []
+        fast.gpu_log = []
+        slow.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        fast.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+
+        reference_run(slow, 20)
+        fast._execute_jit(20)
+
+        self.assertEqual(state(slow), state(fast))
+        self.assertEqual(slow.pc, 0x20010)
+        self.assertEqual(slow.sp, 0x2FFFF)
+
+    def test_19_bit_indirect_jump_matches_interpreter(self):
+        program = assemble(
+            ".address 0x20000\n"
+            "LDI R0, 0\n"
+            "LDI R1, 1\n"
+            "JMPRP R0, R1\n"
+            ".address 0x10000\n"
+            "HALT\n"
+        )
+        slow = make_cpu(program)
+        fast = make_cpu(program)
+        slow.use_jit = False
+        fast.use_jit = True
+        slow.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        fast.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        slow.gpu_log = []
+        fast.gpu_log = []
+
+        reference_run(slow, 10)
+        fast._execute_jit(10)
+
+        self.assertEqual(state(slow), state(fast))
+        self.assertEqual(slow.pc, 0x10002)
 
     def test_random_programs_match_step(self):
         compared = 0

@@ -15,8 +15,8 @@ SCREEN_CLEAR:
     RET
 
 SCREEN_SET_CURSOR:
-    LDWS R0, 2
-    LDWS R1, 4
+    LDWS R0, 3
+    LDWS R1, 5
     LDI R7, 0x430A
     ST R7, R0
     INC R7
@@ -41,16 +41,16 @@ SCREEN_GET_CURSOR_PACK:
     RET
 
 SCREEN_PRINT:
-    LDWS R0, 2
+    LDWS R0, 3
     LDI R7, 0x430C
     STW R7, R0
     MOVSP R7
-    LDI R6, 4
+    LDI R6, 5
     ADD R7, R6
     LD R0, R7
     LDI R7, 0x431C
     ST R7, R0
-    LDWS R0, 5
+    LDWS R0, 6
     LDI R7, 0x4318
     ST R7, R0
 SCREEN_PRINT_NEXT:
@@ -283,22 +283,22 @@ SCREEN_NEWLINE_TOP:
     RET
 
 SCREEN_INPUT:
-    LDWS R0, 2
+    LDWS R0, 3
     LDI R7, 0x4310
     STW R7, R0
     MOVSP R7
-    LDI R6, 4
+    LDI R6, 5
     ADD R7, R6
     LD R0, R7
     LDI R7, 0x431D
     ST R7, R0
-    LDWS R0, 5
+    LDWS R0, 6
     LDI R7, 0x430E
     ST R7, R0
     LDI R0, 0
     LDI R7, 0x430F
     ST R7, R0
-    LDWS R0, 7
+    LDWS R0, 8
     LDI R7, 0x4313
     ST R7, R0
 SCREEN_INPUT_POLL:
