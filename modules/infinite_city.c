@@ -18,21 +18,21 @@
 //   5. main-funktio: peli-silmukka, joka pyorii koko ajan
 //
 // ICON
-// ################
-// #..............#
-// #..............#
-// #..#...........#
-// #..#..########.#
-// #..#..#......#.#
-// #..#..########.#
-// #..#...........#
-// #..#############
-// #..............#
-// #..##..##..##..#
-// #..##..##..##..#
-// #..............#
-// #....########..#
-// #..............#
+// ..#.........#...
+// ..#........###..
+// .#####.....###..
+// .#.#.#.....###..
+// .#####.....###..
+// .#.#.#.###.###..
+// .#####.#.#.###..
+// .#.#.#.###.###..
+// .#####.#.#..#...
+// .#.#.#.###..#...
+// .#####.#.#......
+// .#.#.#.###......
+// .#####.#.#......
+// .#.#.#.###......
+// .#####.#.#......
 // ################
 #include "suomi_gfx.h"
 
@@ -43,6 +43,7 @@
 #define ROCKET_MAX 6         // raketteja yhteensa
 #define PICKUP_MAX 8         // poimittavia laatikoita yhtaaikaa
 #define BOMB_MAX 12          // lintujen pudottamia pommeja yhtaaikaa
+#define BOTTLE_MAX 6         // asukkaiden heittamia pulloja yhtaaikaa
 #define BOOM_MAX 8           // rajahdyksia yhtaaikaa
 #define PLAYER_W 12          // pelaajan leveys pikseleina
 #define PLAYER_H 16          // pelaajan korkeus pikseleina
@@ -113,6 +114,16 @@ typedef struct
     int alive;
 } Bomb;
 
+// Pullo, jonka ikkunasta heittaa vihainen asukas (osuessaan vie 10 elamaa)
+typedef struct
+{
+    int x;
+    int y;
+    int vx;           // nopeus sivusuunnassa
+    int vy;           // nopeus ylos-alas
+    int alive;
+} Bottle;
+
 // Rajahdys (pelkka kuva, ei vahingoita)
 typedef struct
 {
@@ -158,6 +169,7 @@ Building city[BUILDING_MAX];
 Enemy enemies[ENEMY_MAX];
 Rocket rockets[ROCKET_MAX];
 Bomb bombs[BOMB_MAX];
+Bottle bottles[BOTTLE_MAX];
 Boom booms[BOOM_MAX];
 Pickup pickups[PICKUP_MAX];
 Player player;
@@ -284,6 +296,59 @@ void hurt_player(int amount, int inv)
         player.hp = 0;
         game_over = 1;
     }
+}
+
+// ---------- ASUKKAAT ----------
+// Joissakin rakennuksissa asuu ihminen yhden ikkunan takana. Asukas on aina samassa
+// ikkunassa (paikka lasketaan rakennuksen numerosta), joten ei tarvita muistia.
+// Tyyppi: 0 = ei asukasta, 1 = ystavallinen (vilkuttaa), 2 = tarvitsee apua
+// (vilkuttaa ja huutaa HELP!), 3 = vihainen (heittaa pulloja pelaajaa kohti).
+int res_rows(int i)
+{
+    return (GROUND_Y - city[i].roof_y - 22) / 14;
+}
+
+int res_cells(int i)
+{
+    return (city[i].w - 16) / 10;
+}
+
+int res_row(int i)
+{
+    return (city[i].id * 3) % res_rows(i);
+}
+
+int res_cell(int i)
+{
+    return (city[i].id * 7) % res_cells(i);
+}
+
+int res_type(int i)
+{
+    int h;
+    if (res_rows(i) < 1 || res_cells(i) < 1)
+    {
+        return 0;
+    }
+    // Pimeassa ikkunassa ei asu ketaan (sama kaava kuin ikkunoiden piirrossa)
+    if (((res_row(i) * 5) + (res_cell(i) * 3) + city[i].id) % 4 == 0)
+    {
+        return 0;
+    }
+    h = (city[i].id * 5) % 6;
+    if (h < 2)
+    {
+        return 0;
+    }
+    if (h < 4)
+    {
+        return 1;
+    }
+    if (h == 4)
+    {
+        return 2;
+    }
+    return 3;
 }
 
 // Rakennusten teko: rakennukset luodaan vasemmalta oikealle. Kun rakennus jaa
@@ -498,6 +563,10 @@ void reset_game(void)
     for (i = 0; i < BOMB_MAX; i++)
     {
         bombs[i].alive = 0;
+    }
+    for (i = 0; i < BOTTLE_MAX; i++)
+    {
+        bottles[i].alive = 0;
     }
     for (i = 0; i < BOOM_MAX; i++)
     {
@@ -1069,14 +1138,38 @@ void draw_city(void)
     int by;
     int roof;
     int w;
-    gfx_rect(0, 0, 320, GROUND_Y, BLUE);   // sininen taivas
+    // Taivas: yla sininen, alaspain illan varit (magenta, oranssi, keltainen)
+    gfx_rect(0, 0, 320, 110, BLUE);
+    gfx_rect(0, 110, 320, 40, MAGENTA);
+    gfx_rect(0, 150, 320, 30, ORANGE);
+    gfx_rect(0, 180, 320, 20, YELLOW);
     // Tahdet liikkuvat hitaammin kuin kaupunki, joten tausta nayttaa kaukaiselta
     for (i = 0; i < 32; i++)
     {
         x0 = (i * 47 + 320 - (camera_x / 4) % 320) % 320;
         y = 44 + ((i * 13) & 63);
-        gfx_pixel(x0, y, WHITE);
-        gfx_pixel(x0 + 1, y - 2, WHITE);
+        if (y < 106)
+        {
+            gfx_pixel(x0, y, WHITE);
+        }
+    }
+    // Aurinko laskee horisonttiin (pyoreahko, tehty vaakaviivoista)
+    for (k = -20; k < 0; k += 2)
+    {
+        w = 20 - (k * k) / 22;
+        gfx_rect(250 - w, 190 + k, w * 2, 2, WHITE);
+    }
+    // Kaukainen kaupunki: mustat siluetit liikkuvat hitaasti (syvyysvaikutelma)
+    for (i = 0; i < 9; i++)
+    {
+        k = camera_x / 4 / 40 + i;
+        sx = i * 40 - (camera_x / 4) % 40;
+        roof = 120 + ((k * 37) & 31) * 2;
+        gfx_rect(sx, roof, 36, GROUND_Y - roof, DARK_RED);
+        gfx_rect(sx + 34, roof, 2, GROUND_Y - roof, BLACK);
+        gfx_pixel(sx + 6, roof + 6, YELLOW);
+        gfx_pixel(sx + 18, roof + 14, YELLOW);
+        gfx_pixel(sx + 26, roof + 24, YELLOW);
     }
     for (i = 0; i < BUILDING_MAX; i++)
     {
@@ -1088,31 +1181,70 @@ void draw_city(void)
             // Rakennus on ruudun ulkopuolella, ei piirreta
             continue;
         }
-        gfx_rect(sx, roof, w, GROUND_Y - roof, DARK_GRAY);   // seina
-        gfx_rect(sx, roof, w, 3, GRAY);                      // katto
-        gfx_rect(sx + w - 3, roof + 3, 3, GROUND_Y - roof - 3, BLACK);  // varjo
+        // Seinan vari vaihtelee: harmaa betoni tai punatiili
+        if (city[i].id % 3 == 1)
+        {
+            gfx_rect(sx, roof, w, GROUND_Y - roof, DARK_RED);
+        }
+        else
+        {
+            gfx_rect(sx, roof, w, GROUND_Y - roof, DARK_GRAY);
+        }
+        gfx_rect(sx, roof + 3, 1, GROUND_Y - roof - 3, GRAY);           // valoisa vasen reuna
+        gfx_rect(sx + w - 3, roof + 3, 3, GROUND_Y - roof - 3, BLACK);  // varjo oikealla
+        gfx_rect(sx - 1, roof, w + 2, 1, WHITE);                        // katon reuna
+        gfx_rect(sx - 1, roof + 1, w + 2, 2, GRAY);
+        gfx_rect(sx, roof + 3, w, 1, BLACK);                            // varjo katon alla
         cells = (w - 16) / 10;
         rows = (GROUND_Y - roof - 22) / 14;
-        // Ikkunat: joka rivilla ja sarakkeella, osa palaa (keltainen), osa ei (musta)
+        // Ikkunat: kehys, lasi ja ikkunalauta. Osa palaa (keltainen), osa on pimea
         for (row = 0; row < rows; row++)
         {
+            if (row > 0)
+            {
+                gfx_rect(sx + 1, roof + 5 + row * 14, w - 4, 1, BLACK);   // kerroksen raja
+            }
             for (cell = 0; cell < cells; cell++)
             {
+                lx = sx + 4 + cell * 10;
+                by = roof + 8 + row * 14;
+                gfx_rect(lx - 1, by - 1, 8, 10, GRAY);
                 if (((row * 5) + (cell * 3) + city[i].id) % 4 != 0)
                 {
-                    gfx_rect(sx + 4 + cell * 10, roof + 8 + row * 14, 6, 8, YELLOW);
+                    gfx_rect(lx, by, 6, 8, YELLOW);
+                    gfx_rect(lx, by + 5, 6, 3, ORANGE);
                 }
                 else
                 {
-                    gfx_rect(sx + 4 + cell * 10, roof + 8 + row * 14, 6, 8, BLACK);
+                    gfx_rect(lx, by, 6, 8, BLACK);
+                    gfx_pixel(lx + 1, by + 1, BLUE);
                 }
+                gfx_rect(lx - 1, by + 9, 8, 1, WHITE);
             }
         }
-        gfx_rect(sx + w / 2 - 4, GROUND_Y - 12, 8, 12, BLACK);   // ovi
+        // Ovi: kehys, markisi ja ovenripa
+        gfx_rect(sx + w / 2 - 5, GROUND_Y - 14, 10, 14, GRAY);
+        gfx_rect(sx + w / 2 - 4, GROUND_Y - 13, 8, 13, BLACK);
+        gfx_rect(sx + w / 2 - 7, GROUND_Y - 17, 14, 3, RED);
+        gfx_pixel(sx + w / 2 + 2, GROUND_Y - 6, YELLOW);
+        // Kattotekniikkaa: ilmastointilaite tai vesisailio
+        if ((city[i].id % 4) == 1)
+        {
+            gfx_rect(sx + 10, roof - 5, 10, 5, GRAY);
+            gfx_rect(sx + 12, roof - 4, 3, 3, BLACK);
+        }
+        if ((city[i].id % 4) == 2)
+        {
+            gfx_rect(sx + 10, roof - 4, 1, 4, BLACK);
+            gfx_rect(sx + 17, roof - 4, 1, 4, BLACK);
+            gfx_rect(sx + 9, roof - 10, 10, 6, DARK_RED);
+            gfx_rect(sx + 9, roof - 10, 10, 1, GRAY);
+        }
         if ((city[i].id % 3) == 0)
         {
             // Joillakin taloilla on antenni, jonka punainen valo vilkkuu
             gfx_line(sx + 6, roof - 10, sx + 6, roof, GRAY);
+            gfx_line(sx + 3, roof - 7, sx + 9, roof - 7, GRAY);
             if (frame_count & 16)
             {
                 gfx_pixel(sx + 6, roof - 11, RED);
@@ -1124,29 +1256,179 @@ void draw_city(void)
             bx = sx + w - 8;
             by = city[i].balcony_y;
             gfx_rect(bx, by, 18, 3, GRAY);
+            gfx_rect(bx, by, 18, 1, WHITE);
             gfx_line(bx + 17, by - 8, bx + 17, by, WHITE);
             gfx_line(bx + 8, by - 8, bx + 17, by - 8, WHITE);
+            gfx_line(bx + 12, by - 8, bx + 12, by, WHITE);
             gfx_line(bx + 17, by + 3, bx + 8, by + 10, GRAY);
         }
         if (city[i].ladder)
         {
             // Tikkaat: kaksi pystytolppaa ja poikittaisia askelmia
             lx = sx + w - 5;
-            gfx_rect(lx - 3, roof, 1, GROUND_Y - roof, GRAY);
-            gfx_rect(lx + 3, roof, 1, GROUND_Y - roof, GRAY);
+            gfx_rect(lx - 3, roof, 1, GROUND_Y - roof, WHITE);
+            gfx_rect(lx + 3, roof, 1, GROUND_Y - roof, WHITE);
             for (y = roof + 4; y < GROUND_Y; y += 8)
             {
                 gfx_line(lx - 3, y, lx + 3, y, CYAN);
             }
         }
     }
-    gfx_rect(0, GROUND_Y, 320, 40, DARK_GRAY);   // katu
-    gfx_line(0, GROUND_Y, 319, GROUND_Y, GRAY);
+    // Katulamput: tolppa, varsi ja kirkas lamppu
+    for (i = 0; i < 4; i++)
+    {
+        sx = ((camera_x / 150) + i) * 150 + 70 - camera_x;
+        gfx_rect(sx, GROUND_Y - 36, 2, 36, BLACK);
+        gfx_rect(sx - 5, GROUND_Y - 37, 7, 2, BLACK);
+        gfx_rect(sx - 6, GROUND_Y - 35, 4, 2, YELLOW);
+        gfx_rect(sx - 7, GROUND_Y - 33, 6, 1, ORANGE);
+    }
+    // Maa: jalkakaytava (vaalea), reunakivi ja asfalttitie
+    gfx_rect(0, GROUND_Y, 320, 6, GRAY);
+    gfx_line(0, GROUND_Y, 319, GROUND_Y, WHITE);
+    x0 = -(camera_x % 24);
+    for (k = 0; k < 14; k++)
+    {
+        gfx_rect(x0 + k * 24, GROUND_Y + 1, 1, 5, DARK_GRAY);
+    }
+    gfx_rect(0, GROUND_Y + 6, 320, 2, BLACK);
+    gfx_rect(0, GROUND_Y + 8, 320, 32, DARK_GRAY);
     // Tien keskiviiva liikkuu kameran mukana
     x0 = -(camera_x % 48);
     for (k = 0; k < 8; k++)
     {
-        gfx_rect(x0 + k * 48, 220, 20, 2, GRAY);
+        gfx_rect(x0 + k * 48, 220, 22, 2, YELLOW);
+    }
+}
+
+// Piirtaa asukkaat ikkunoihin: paa, vartalo ja kasi. Kun pelaaja on lahella,
+// asukas vilkuttaa ja joskus puhekupla ilmestyy ikkunan ylapuolelle.
+// Vihainen asukas (punainen paita) heiluttaa nyrkkia.
+void draw_residents(void)
+{
+    int i;
+    int t;
+    int sx;
+    int lx;
+    int by;
+    int dx;
+    int near;
+    int wave;
+    int shirt;
+    int bw;
+    int bx;
+    int bby;
+    for (i = 0; i < BUILDING_MAX; i++)
+    {
+        t = res_type(i);
+        sx = city[i].x - camera_x;
+        if (t == 0 || sx > 330 || sx + city[i].w < -20)
+        {
+            continue;
+        }
+        lx = sx + 4 + res_cell(i) * 10;
+        by = city[i].roof_y + 8 + res_row(i) * 14;
+        dx = player.x - (city[i].x + 4 + res_cell(i) * 10 + 3);
+        near = 0;
+        if (abs(dx) < 140)
+        {
+            near = 1;
+        }
+        wave = (frame_count >> 3) & 1;
+        shirt = GREEN;
+        if (t == 2)
+        {
+            shirt = CYAN;
+        }
+        if (t == 3)
+        {
+            shirt = RED;
+        }
+        gfx_rect(lx + 1, by + 3, 4, 5, shirt);     // vartalo
+        gfx_rect(lx + 2, by + 1, 2, 2, ORANGE);    // paa
+        gfx_pixel(lx + 2, by + 1, BLACK);          // tukka
+        gfx_pixel(lx + 3, by + 1, BLACK);
+        if (t == 3)
+        {
+            // Vihainen: nyrkki ylhaalla, vuorotellen
+            if (wave)
+            {
+                gfx_rect(lx, by + 1, 1, 3, ORANGE);
+            }
+            else
+            {
+                gfx_rect(lx + 5, by + 1, 1, 3, ORANGE);
+            }
+        }
+        else if (t == 2 && near)
+        {
+            // Apua tarvitseva nostaa molemmat kadet ylos
+            gfx_rect(lx, by + wave, 1, 3, ORANGE);
+            gfx_rect(lx + 5, by + 1 - wave, 1, 3, ORANGE);
+        }
+        else if (near)
+        {
+            // Vilkuttaa pelaajalle: kasi heiluu ylhaalla
+            gfx_rect(lx + 5, by + wave * 2, 1, 3, ORANGE);
+        }
+        else
+        {
+            gfx_rect(lx + 5, by + 4, 1, 3, ORANGE);
+        }
+        // Puhekupla vaihtuu ajan mukaan: nakyy kolmasosan ajasta
+        if (near && ((frame_count / 70) + city[i].id) % 3 == 0)
+        {
+            bw = 28;
+            if (t == 2)
+            {
+                bw = 36;
+            }
+            bx = lx + 3 - bw / 2;
+            bby = by - 14;
+            gfx_rect(bx, bby, bw, 11, WHITE);
+            gfx_rect(lx + 2, bby + 11, 2, 2, WHITE);
+            if (t == 2)
+            {
+                gfx_text(bx + 3, bby + 2, "HELP!", RED);
+            }
+            else if (t == 3)
+            {
+                gfx_text(bx + 3, bby + 2, "GRR!", RED);
+            }
+            else if (city[i].id & 1)
+            {
+                gfx_text(bx + 3, bby + 2, "HI!", BLACK);
+            }
+            else
+            {
+                gfx_text(bx + 3, bby + 2, "HEY!", BLACK);
+            }
+        }
+    }
+}
+
+// Piirtaa pullot: pyorivat ilmassa (vuorotellen pysty- ja vaakasuorassa).
+void draw_bottles(void)
+{
+    int i;
+    int sx;
+    for (i = 0; i < BOTTLE_MAX; i++)
+    {
+        if (!bottles[i].alive)
+        {
+            continue;
+        }
+        sx = bottles[i].x - camera_x;
+        if (frame_count & 2)
+        {
+            gfx_rect(sx - 1, bottles[i].y - 2, 3, 4, GREEN);
+            gfx_rect(sx, bottles[i].y - 4, 1, 2, CYAN);
+        }
+        else
+        {
+            gfx_rect(sx - 2, bottles[i].y - 1, 4, 3, GREEN);
+            gfx_rect(sx + 2, bottles[i].y, 2, 1, CYAN);
+        }
     }
 }
 
@@ -1788,6 +2070,97 @@ void update_bombs(void)
     }
 }
 
+// Asukkaat heittavat pulloja: vihainen asukas heittaa pelaajaa kohti kun tama on
+// lahella. Pullo lentaa kaaressa (painovoima vetaa alas) ja osuessaan vie 10 elamaa.
+void update_residents(void)
+{
+    int i;
+    int b;
+    int wx;
+    int wy;
+    int dx;
+    int vx;
+    int every;
+    every = 110 - level * 3;
+    for (i = 0; i < BUILDING_MAX; i++)
+    {
+        if (res_type(i) != 3)
+        {
+            continue;
+        }
+        wx = city[i].x + 4 + res_cell(i) * 10 + 3;
+        wy = city[i].roof_y + 8 + res_row(i) * 14 + 4;
+        dx = player.x + 6 - wx;
+        if (wx < camera_x + 10 || wx > camera_x + 310 || abs(dx) < 20 || abs(dx) > 170)
+        {
+            continue;
+        }
+        if ((frame_count + city[i].id * 23) % every != 0)
+        {
+            continue;
+        }
+        for (b = 0; b < BOTTLE_MAX; b++)
+        {
+            if (!bottles[b].alive)
+            {
+                vx = dx / 22;
+                if (vx > 4)
+                {
+                    vx = 4;
+                }
+                if (vx < -4)
+                {
+                    vx = -4;
+                }
+                if (vx == 0)
+                {
+                    vx = 1;
+                    if (dx < 0)
+                    {
+                        vx = -1;
+                    }
+                }
+                bottles[b].alive = 1;
+                bottles[b].x = wx;
+                bottles[b].y = wy;
+                bottles[b].vx = vx;
+                bottles[b].vy = -3;
+                gfx_sound(1, 300, 4, WAVE_TRIANGLE, 30);
+                break;
+            }
+        }
+    }
+    for (i = 0; i < BOTTLE_MAX; i++)
+    {
+        if (!bottles[i].alive)
+        {
+            continue;
+        }
+        bottles[i].x += bottles[i].vx;
+        bottles[i].y += bottles[i].vy;
+        if ((frame_count & 1) == 0 && bottles[i].vy < 6)
+        {
+            bottles[i].vy++;
+        }
+        if (abs(player.x + 6 - bottles[i].x) < 8 && abs(player.y + 8 - bottles[i].y) < 11)
+        {
+            hurt_player(10, 24);
+            add_boom(bottles[i].x, bottles[i].y);
+            bottles[i].alive = 0;
+        }
+        else if (bottles[i].y >= GROUND_Y - 2)
+        {
+            add_boom(bottles[i].x, GROUND_Y - 4);
+            gfx_sound(2, 400, 4, WAVE_NOISE, 25);
+            bottles[i].alive = 0;
+        }
+        else if (bottles[i].x < camera_x - 30 || bottles[i].x > camera_x + 350)
+        {
+            bottles[i].alive = 0;
+        }
+    }
+}
+
 // Raketti-laatikko poimitaan koskemalla siihen: +5 rakettia (enintaan 10).
 void update_pickups(void)
 {
@@ -2013,6 +2386,7 @@ int main(void)
             // Paivitetaan kaikki pelin osat yksi kerrallaan
             update_enemies();
             update_bombs();
+            update_residents();
             update_pickups();
             update_rockets();
             update_booms();
@@ -2028,12 +2402,14 @@ int main(void)
             }
         }
         draw_city();    // piirretaan taustasta eteenpain: kauimmainen ensin
+        draw_residents();
         draw_pickups();
         for (i = 0; i < ENEMY_MAX; i++)
         {
             draw_enemy(&enemies[i]);
         }
         draw_bombs();
+        draw_bottles();
         for (i = 0; i < ROCKET_MAX; i++)
         {
             draw_rocket(&rockets[i]);
