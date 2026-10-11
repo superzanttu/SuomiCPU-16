@@ -32,9 +32,18 @@ class ConsoleDeviceTests(unittest.TestCase):
         self.assertEqual(cpu.read(CONSOLE_DATA), ord("B"))
         self.assertEqual(cpu.console_device.output, b"")
 
+    def test_empty_input_poll_yields_to_host_event_loop(self):
+        cpu = self.make_cpu()
+        cpu.running = True
+        cpu.frame_yield = False
+
+        self.assertFalse(cpu.read(CONSOLE_STATUS) & 1)
+        self.assertTrue(cpu.frame_yield)
+
     def test_console_input_fifo_reports_overrun(self):
         cpu = self.make_cpu()
-        cpu.console_device.receive(b"x" * (cpu._console_device().RX_CAPACITY + 1))
+        console = cpu._console_device()
+        console.receive(b"x" * (console.RX_CAPACITY + 1))
 
         self.assertTrue(cpu.read(CONSOLE_STATUS) & 0x04)
         cpu.write(CONSOLE_STATUS, 0x04)

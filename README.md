@@ -7,20 +7,24 @@ SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
 - Integrated assembler for SC-16 assembly language.
 - C90-oriented compiler for SC-16 with partial language/preprocessor support
   and selected C90 headers (`stddef.h`, `limits.h`, `float.h`, `ctype.h`,
-  `errno.h`, `assert.h`, `stdlib.h`, `string.h`, `locale.h`, `time.h`)
+  `errno.h`, `assert.h`, `stdio.h`, `stdlib.h`, `string.h`, `locale.h`, `time.h`)
   (not a fully conforming C90 implementation; see the
   [user guide](user_guide.md#9-ansi-c90-compiler)).
-- Basic graphics and text-mode support.
+- Memory-mapped console, BIOS data-disk selection, JSON-backed virtual disks,
+  and basic graphics.
 
 ## Getting Started
-Start SC-16 without arguments to open SC-launcher. It lists the `.c` modules in
-the `modules/` folder. Click a module, then click **LOAD MODULE** to run it;
-the first source line is shown as its description:
+Start SC-16 without arguments to show the BIOS module selector. Select a
+program from `modules/` to compile and load it into memory. Press **D** to cycle
+through available data disks or choose no disk; virtual disks store application
+data only.
 ```console
 python main.py
 ```
-Press **F11** in the launcher or a running program to toggle windowed/fullscreen
-display. Start directly in fullscreen with `python main.py --fullscreen` or
+
+Use `--disk ID` to mount a data disk directly without the BIOS selector.
+Press **F11** in a running program to toggle windowed/fullscreen display. Start
+directly in fullscreen with `python main.py --fullscreen` or
 `.\run.ps1 -Fullscreen`.
 
 Run an example directly from the repository root:

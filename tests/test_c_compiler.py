@@ -29,12 +29,36 @@ class CCompilerTests(unittest.TestCase):
             '#include <stdio.h>\n'
             'int main(void) {\n'
             '    int count;\n'
-            '    count = printf("N=%d U=%u H=%04x S=%s %%", -12, 7U, 42U, "ok");\n'
-            '    return count != 23;\n'
+            '    count = printf("N=%d U=%u L=%ld H=%04x S=%s %%", '
+            '-12, 7U, 70000L, 42U, "ok");\n'
+            '    return count != 31;\n'
             '}\n'
         )
         cpu, _ = run_image(image)
-        self.assertEqual(cpu.console_device.output.decode("ascii"), "N=-12 U=7 H=002a S=ok %")
+        self.assertEqual(
+            cpu.console_device.output.decode("ascii"),
+            "N=-12 U=7 L=70000 H=002a S=ok %",
+        )
+
+    def test_c90_getchar_poll_yields_to_the_emulator_event_loop(self):
+        image = compile_source(
+            "#include <stdio.h>\n"
+            "int main(void) { return getchar(); }\n"
+        )
+        cpu = SuomiCompute16.__new__(SuomiCompute16)
+        cpu.memory = bytearray(MEM_SIZE)
+        cpu.registers = [0] * 8
+        cpu.flags = {"Z": 0, "C": 0}
+        cpu.running = True
+        cpu.sp = 0x2FFFF
+        cpu.load_program(image)
+        cpu.reset()
+        cpu.use_jit = False
+
+        cpu.execute_frame()
+
+        self.assertTrue(cpu.frame_yield)
+        self.assertTrue(cpu.running)
 
     def test_c90_unary_operators_require_valid_operand_types(self):
         invalid_sources = (

@@ -7,8 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 
 from SuomiCPU import BIOS_BASE, DISK_BASE, MEM_SIZE, SuomiCompute16  # noqa: E402
-from bios import BIOSError, initialize_bios, mount_data_disk  # noqa: E402
-from lib_disk import DiskDevice, DiskDeviceError  # noqa: E402
+from src.bios import BIOSError, initialize_bios, mount_data_disk  # noqa: E402
+from src.lib_disk import DiskDevice, DiskDeviceError  # noqa: E402
 
 
 class StorageBIOSIntegrationTests(unittest.TestCase):

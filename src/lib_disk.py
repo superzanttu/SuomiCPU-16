@@ -31,7 +31,11 @@ class DiskDevice:
 
     @classmethod
     def _block_text(cls, data):
-        if len(data) != cls.BLOCK_SIZE or any(ord(char) > 0xFF for char in data):
+        if (
+            not isinstance(data, str)
+            or len(data) != cls.BLOCK_SIZE
+            or any(ord(char) > 0xFF for char in data)
+        ):
             raise DiskDeviceError("disk blocks must contain exactly 256 bytes")
         return data
 
@@ -124,8 +128,13 @@ class DiskDevice:
     def set_protected(self, value):
         if self.current_disk is None:
             raise DiskDeviceError("no virtual disk is mounted")
+        previous = self.write_protected
         self.write_protected = bool(value)
-        self._save()
+        try:
+            self._save()
+        except DiskDeviceError:
+            self.write_protected = previous
+            raise
 
     def unload_disk(self):
         if self.current_disk is None:
@@ -146,5 +155,17 @@ class DiskDevice:
             raise DiskDeviceError("no virtual disk is mounted")
         if self.write_protected:
             raise DiskDeviceError(f"disk {self.current_disk} is write-protected")
-        self.disk_data[pointer & 0xFFFF] = self._block_text(data.ljust(self.BLOCK_SIZE)[:self.BLOCK_SIZE])
-        self._save()
+        if not isinstance(data, str):
+            raise DiskDeviceError("disk block data must be text")
+        block = pointer & 0xFFFF
+        previous = self.disk_data.get(block)
+        block_data = self._block_text(data.ljust(self.BLOCK_SIZE)[:self.BLOCK_SIZE])
+        self.disk_data[block] = block_data
+        try:
+            self._save()
+        except DiskDeviceError:
+            if previous is None:
+                self.disk_data.pop(block, None)
+            else:
+                self.disk_data[block] = previous
+            raise

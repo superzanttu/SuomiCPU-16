@@ -7,9 +7,13 @@ eight general-purpose registers and a 16-bit instruction format. Assembly source
 files use the `.asm` extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
 
-The emulator has no BIOS. On reset, it starts executing at the assembly image's
-entry point. The first instruction in the source determines that entry point,
-regardless of the numeric order of the image's memory segments.
+The emulator presents a BIOS startup screen before launching a program. The
+BIOS selects and compiles a program from `modules/`, optionally mounts an
+existing virtual data disk, and loads the resulting image into machine memory.
+Disks hold application data only; they are not boot media. Once started, CPU
+reset begins execution at the loaded image's entry point. The first instruction
+in the source determines that entry point, regardless of the numeric order of
+the image's memory segments.
 
 ## 2. Running the emulator
 
@@ -27,14 +31,13 @@ On Windows, run the PowerShell launcher with a source or binary path:
 ```
 
 `run.ps1` changes to the repository directory and starts the emulator through
-`main.py`. It requires Python to be available as `python` on `PATH`. Without a
-program path, SC-16 opens SC-launcher. The launcher lists `.c` files in
-`modules/`, using each filename as its module name and the first source line as
-its description. Click a module to select it, then click **LOAD MODULE**; the
-16x16 outlined square is reserved for a module icon. Use the mouse wheel to
-scroll through the list. Press Escape to close the launcher.
-Press F11 in the launcher or a running program to toggle fullscreen and windowed
-display. Start in fullscreen with `python main.py --fullscreen` or
+`main.py`. It requires Python to be available as `python` on `PATH`. At startup,
+the BIOS lists `.c` files in `modules/`, using each filename as its module name
+and the first source line as its description. Use the arrow keys to select a
+program and press Enter to load it; press **D** to cycle through available data
+disks or no disk. Press Escape to exit the BIOS.
+Press F11 in a running program to toggle fullscreen and windowed display. Start
+in fullscreen with `python main.py --fullscreen` or
 `.\run.ps1 -Fullscreen`.
 
 Additional examples are in [`examples/commands.asm`](examples/commands.asm)
@@ -58,9 +61,10 @@ The compiler defaults to an output file with the input name and a `.bin`
 extension. `-S` emits readable SC-16 assembly instead. The emulator accepts
 `.asm`, `.c`, and flat `.bin` inputs.
 
-The input file argument is optional. With no file, the launcher starts instead
-of opening an empty emulator. The emulator and launcher use Pygame for their
-window, display, and input.
+The input file argument is optional. Without it, the BIOS compiles and loads a
+selected program from `modules/`; storage disks are only for program data. Use
+`--disk ID` to preselect a data disk in the BIOS. The emulator uses Pygame for
+its window, display, and input.
 
 ## 3. Assembly source syntax
 
@@ -718,14 +722,58 @@ the target's actual types; they also make C90 minimum-range incompatibilities
 visible: `double` has the same binary16 precision and range as `float`, and
 `long double` maps to that same format as well. `size_t` is an unsigned 32-bit
 `long`, so it can represent the target's 19-bit address range; full 19-bit
-pointer arithmetic and object allocation remain unimplemented. These headers are partial: many
-required `<stdlib.h>` facilities and other C90 headers—including `stdio.h`—are
+pointer arithmetic and object allocation remain unimplemented. These headers
+are partial: many required `<stdlib.h>` facilities and other C90 headers are
 not implemented. The project's screen and graphics routines are SC-16-specific
 extensions, not replacements for those standard facilities. Global
 initializers must be constant expressions supported by the compiler.
 
-There is no `printf` or separate console device. When a screen routine is
-referenced, the compiler links [`lib/lib_text.asm`](lib/lib_text.asm), which uses
+### Console, BIOS, and virtual disks
+
+The emulator starts with a BIOS selection screen. It lists C programs from
+`modules/` for selection and can optionally mount any valid 8-character `*.json`
+virtual disk found in the repository's `disks/` folder. The selected disk is
+made available to the program; it is **not** used to load executable code. The
+BIOS compiles the selected source and the emulator loads it into machine memory.
+The optional `--disk ID` command-line option preselects a data disk in the BIOS.
+
+The BIOS information block starts at `0x43040`: bytes `0..3` are the `SC16`
+signature, bytes `4..5` are the BIOS version, bytes `6..8` contain the memory
+size, bytes `9..11` contain the console data-register address, bytes `12..14`
+contain the disk-control address, and byte `15` is the startup status.
+The status is `0` after successful initialization or disk selection and `1`
+when a disk cannot be mounted.
+
+The console is a memory-mapped UART-like device:
+
+| Address | Register | Meaning |
+| ------- | -------- | ------- |
+| `0x43200` | Data | Write one output byte; read and remove one input byte. |
+| `0x43201` | Status | Bit 0: input available; bit 1: output ready; bit 2: input overflow. Write bit 2 as 1 to clear overflow. |
+| `0x43202` | Control | Bit 0 enables local echo; bit 1 enables host keyboard input. Both are enabled at reset. |
+
+The emulator displays console text beside the 320×240 graphics display.
+Keyboard text, Enter, and Backspace are queued as console input. An empty
+console-status poll yields the current instruction frame to the host event loop,
+so a C `getchar` wait does not prevent keyboard events from being processed.
+
+The virtual disk device retains its JSON-backed, 256-byte block format.
+`0x43100` is the command register; the command bits load/unload a disk,
+read/write a block, list disk IDs, and set write protection. The 16-bit block
+index is at `+10`, the RAM buffer offset at `+12`, and command results are at
+`+14`; `+16` reports status (`0` success, `1` operation error). Invalid IDs,
+absent media, malformed images, and write-protected writes set the error
+status. Disk IDs are exactly eight ASCII letters, digits, `_`, or `-`.
+
+`<stdio.h>` currently provides console `getchar`, `putchar`, `puts`, `fgetc`,
+`fputc`, `fputs`, `printf`, `fprintf`, `vprintf`, and `vfprintf`. The formatter
+handles integer, character, string, and pointer conversions (`d`, `i`, `u`,
+`o`, `x`, `X`, `c`, `s`, `p`, `n`, and `%%`) with field width and precision.
+Unsupported conversions return `EOF`. File-backed streams and floating-point
+conversions are still unimplemented; this is a useful hosted-I/O subset, not a
+claim of complete C90 `stdio` conformance.
+
+When a screen routine is referenced, the compiler links [`lib/lib_text.asm`](lib/lib_text.asm), which uses
 [`fonts/font5x7.asm`](fonts/font5x7.asm) to provide a 53-column by 30-row text
 grid of 6x8 cells:
 

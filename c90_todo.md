@@ -248,6 +248,12 @@ required before claiming full C90 compatibility.
 ### C6. Implement all required C90 headers
 
 - [ ] **Implement all required C90 headers** (`c90-required-headers`)
+  - Partial implementation now includes the console-only `<stdio.h>` interface
+    and a `printf` integer/text formatter; floating conversions and file-backed
+    streams remain outstanding.
+  - The emulator now supplies a text console, BIOS device descriptor and
+    startup data-disk selection. This does not load programs from disk:
+    programs selected by the BIOS still come from `modules/`.
   - Audit all required headers: `assert.h`, `ctype.h`, `errno.h`, `float.h`,
     `limits.h`, `locale.h`, `math.h`, `setjmp.h`, `signal.h`, `stdarg.h`,
     `stddef.h`, `stdio.h`, `stdlib.h`, `string.h`, and `time.h`.

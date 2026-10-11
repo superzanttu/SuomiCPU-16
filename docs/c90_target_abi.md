@@ -88,11 +88,15 @@ and recursive returns.
 ## Hosted execution environment
 
 The hosted implementation uses the emulator's byte-addressable 512 KiB
-address space. Device-mapped addresses retain their documented SC-16 behavior.
-The implementation must define and test which C standard-library stream and
-device facilities are available, error behavior for unavailable host resources,
-and process termination/status behavior. Screen/graphics APIs remain
-implementation extensions and do not replace required C90 library interfaces.
+address space. Startup firmware exposes a descriptor at `0x43040`, an
+interactive data-disk selector, and a memory-mapped console at `0x43200`.
+Selected modules are still loaded into memory by the emulator; virtual disks
+store program data only. The console currently supports a subset of standard
+text streams and formatted output. File-backed streams, floating-point format
+conversions, and several required C90 I/O facilities remain unimplemented.
+Device-mapped addresses retain their documented SC-16 behavior. Screen and
+graphics APIs remain implementation extensions and do not replace required
+C90 library interfaces.
 
 ## Conformance gates
 

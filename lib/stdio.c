@@ -271,7 +271,7 @@ int vfprintf(FILE *stream, const char *format, va_list arguments)
             const char *text;
             int length;
 
-            text = va_arg(arguments, const char *);
+            text = va_arg(arguments, char *);
             if (!text)
                 text = "(null)";
             length = 0;

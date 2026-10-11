@@ -145,7 +145,7 @@ def _display_viewport(screen_size, virtual_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT))
 def _screen_to_logical(
     position,
     screen_size,
-    virtual_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT),
+    virtual_size=(SCREEN_WIDTH, SCREEN_HEIGHT),
 ):
     left, top, width, height = _display_viewport(screen_size, virtual_size)
     virtual_width, virtual_height = virtual_size
@@ -305,7 +305,10 @@ class SuomiCompute16:
         if addr == CONSOLE_DATA:
             return self._console_device().read_data()
         if addr == CONSOLE_STATUS:
-            return self._console_device().status
+            status = self._console_device().status
+            if not status & 0x01 and getattr(self, "running", False):
+                self.frame_yield = True
+            return status
         if addr == CONSOLE_CONTROL:
             return self._console_device().control
         return self.memory[addr]
@@ -1054,7 +1057,7 @@ class SuomiCompute16:
                 self.pc = target
         elif opcode == OP_LDWS:
             addr = self.sp + imm
-            registers[rd] = (memory[addr & MEM_MASK] << 8) | memory[(addr + 1) & MEM_MASK]
+            registers[rd] = self.read_16(addr)
         elif opcode == OP_ADD:
             a = registers[rs1]
             b = registers[rs2]
@@ -1070,13 +1073,7 @@ class SuomiCompute16:
         elif opcode == OP_PUSH:
             sp = self.sp - 2
             self.sp = sp
-            addr = sp & MEM_MASK
-            if GPU_BASE - 1 <= addr <= GPU_BASE:
-                self.write_16(sp, registers[rd])
-            else:
-                value = registers[rd]
-                memory[addr] = (value >> 8) & 0xFF
-                memory[(addr + 1) & MEM_MASK] = value & 0xFF
+            self.write_16(sp, registers[rd])
         elif opcode == OP_ADJSP:
             offset = imm if imm < 0x80 else imm - 0x100
             self.sp = (self.sp + offset) & (MEM_SIZE - 1)
@@ -1095,15 +1092,10 @@ class SuomiCompute16:
         elif opcode == OP_AND: registers[rd] = registers[rs1] & registers[rs2]
         elif opcode == OP_LDW:
             addr = registers[rs1]
-            registers[rd] = (memory[addr & MEM_MASK] << 8) | memory[(addr + 1) & MEM_MASK]
+            registers[rd] = self.read_16(addr)
         elif opcode == OP_STWS:
             addr = (self.sp + imm) & MEM_MASK
-            if GPU_BASE - 1 <= addr <= GPU_BASE:
-                self.write_16(addr, registers[rd])
-            else:
-                value = registers[rd]
-                memory[addr] = (value >> 8) & 0xFF
-                memory[(addr + 1) & MEM_MASK] = value & 0xFF
+            self.write_16(addr, registers[rd])
         elif opcode == OP_BZ:
             if self.flags['Z']: self.pc = instr & 0x7FF
         elif opcode == OP_BC:
@@ -1300,7 +1292,13 @@ class SuomiCompute16:
 
     def begin_mouse_frame(self):
         px, py = pygame.mouse.get_pos()
-        self.set_mouse_position(*_screen_to_logical((px, py), self.screen.get_size()))
+        self.set_mouse_position(
+            *_screen_to_logical(
+                (px, py),
+                self.screen.get_size(),
+                (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+            )
+        )
         node = getattr(self, 'net', None)
         if node is not None:
             node.poll()
@@ -1339,7 +1337,11 @@ class SuomiCompute16:
                 if event.type == pygame.QUIT:
                     self.window_open = False
                 if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (1, 3):
-                    mx, my = _screen_to_logical(event.pos, self.screen.get_size())
+                    mx, my = _screen_to_logical(
+                        event.pos,
+                        self.screen.get_size(),
+                        (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+                    )
                     self.set_mouse_position(mx, my)
                     self.mouse_button(0 if event.button == 1 else 1, event.type == pygame.MOUSEBUTTONDOWN,
                                       mx, my, pygame.time.get_ticks())
@@ -1404,7 +1406,7 @@ def main():
     parser.add_argument(
         "--disk",
         metavar="ID",
-        help="mount an existing 8-character virtual data disk and skip the BIOS menu",
+        help="preselect an existing 8-character virtual data disk in the BIOS menu",
     )
     args = parser.parse_args()
 
@@ -1421,34 +1423,26 @@ def main():
         sc16.net_port = args.net_port
         if program is not None:
             sc16.load_program(program)
+            if args.disk:
+                from src.bios import BIOSError, mount_data_disk
 
-        if args.disk:
-            from src.bios import BIOSError, mount_data_disk
-
-            try:
-                mount_data_disk(sc16, args.disk)
-            except BIOSError as exc:
-                parser.error(str(exc))
-            selected = args.disk
-        else:
-            from src.bios import select_data_disk
-
-            selected = select_data_disk(sc16)
-
-        if selected == "launcher" or (program is None and selected is not None):
-            from src.sc_launcher import run_launcher
-
-            run_launcher(
-                net_port=args.net_port,
-                fullscreen=args.fullscreen,
-                startup_disk=(
-                    selected
-                    if selected not in ("launcher", "none")
-                    else None
-                ),
-            )
-        elif program is not None and selected is not None:
+                try:
+                    mount_data_disk(sc16, args.disk)
+                except BIOSError as exc:
+                    parser.error(str(exc))
             sc16.run()
+        else:
+            from src.bios import BIOSError, mount_data_disk, select_boot_program
+
+            selection = select_boot_program(sc16, initial_disk=args.disk)
+            if selection.image is not None:
+                if selection.disk_id is not None:
+                    try:
+                        mount_data_disk(sc16, selection.disk_id)
+                    except BIOSError as exc:
+                        parser.error(str(exc))
+                sc16.load_program(selection.image)
+                sc16.run()
     finally:
         if sc16 is not None and getattr(sc16, 'net', None) is not None:
             sc16.net.close()

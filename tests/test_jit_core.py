@@ -74,6 +74,38 @@ def reference_run(cpu, count):
 
 @unittest.skipUnless(HAVE_JIT, "numba is not installed")
 class JitEquivalenceTests(unittest.TestCase):
+    def test_console_mmio_reads_and_writes_fall_back_to_interpreter(self):
+        input_program = assemble("LD R0, R1\nHALT")
+        slow = make_cpu(input_program)
+        fast = make_cpu(input_program)
+        slow.use_jit = False
+        fast.use_jit = True
+        for cpu in (slow, fast):
+            cpu.registers[1] = CONSOLE_DATA
+            cpu._console_device().receive(b"A")
+
+        slow.step()
+        fast._execute_jit(1)
+
+        self.assertEqual(slow.registers, fast.registers)
+        self.assertEqual(slow._console_device().status, fast._console_device().status)
+        self.assertEqual(slow.console_device.output, fast.console_device.output)
+
+        output_program = assemble("ST R1, R0\nHALT")
+        slow = make_cpu(output_program)
+        fast = make_cpu(output_program)
+        slow.use_jit = False
+        fast.use_jit = True
+        for cpu in (slow, fast):
+            cpu.registers[0] = ord("Z")
+            cpu.registers[1] = CONSOLE_DATA
+
+        slow.step()
+        fast._execute_jit(1)
+
+        self.assertEqual(slow._console_device().output, b"Z")
+        self.assertEqual(slow._console_device().output, fast._console_device().output)
+
     def test_32_bit_pair_instructions_fall_back_to_interpreter(self):
         program = assemble(
             "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\n"

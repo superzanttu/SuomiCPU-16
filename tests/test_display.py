@@ -78,7 +78,7 @@ class DisplayTests(unittest.TestCase):
 
         with patch("pygame.display.set_mode") as set_mode:
             _set_display_mode(False)
-            set_mode.assert_called_once_with((960, 720))
+            set_mode.assert_called_once_with((1440, 600))
 
     def test_halt_keeps_display_open_until_keypress(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
