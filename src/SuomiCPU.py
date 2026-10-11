@@ -1365,7 +1365,7 @@ class SuomiCompute16:
         self.sp = 0x2FFFF
         self.pc = self.entry_point
         self.running = True
-        self._console_device().reset()
+        self._console_device().reset(preserve_history=True)
         self.paused = False
         self.reboot_requested = False
         self.bios_reset_requested = False

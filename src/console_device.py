@@ -12,13 +12,14 @@ class ConsoleDevice:
     def __init__(self):
         self.reset()
 
-    def reset(self):
+    def reset(self, preserve_history=False):
         self.receive_buffer = deque()
-        self.output = bytearray()
-        self.lines = [bytearray(b" " * self.COLUMNS) for _ in range(self.ROWS)]
-        self.scrollback = deque(maxlen=self.SCROLLBACK_ROWS)
-        self.column = 0
-        self.row = 0
+        if not preserve_history:
+            self.output = bytearray()
+            self.lines = [bytearray(b" " * self.COLUMNS) for _ in range(self.ROWS)]
+            self.scrollback = deque(maxlen=self.SCROLLBACK_ROWS)
+            self.column = 0
+            self.row = 0
         self.overrun = False
         self.control = 0x03
 
