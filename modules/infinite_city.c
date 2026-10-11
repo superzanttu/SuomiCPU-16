@@ -1,6 +1,22 @@
-// Infinite City for SC-16
-// Controls: LEFT/RIGHT move, SPACE jump (hold = higher), UP/DOWN climb ladders / drop through roofs,
-//           mouse aims, left mouse button fires rockets.
+// Infinite City (Ikuinen kaupunki) SC-16-koneelle
+//
+// MIKA TAMA ON? (selitys 10-vuotiaalle):
+//   Tama on peli, jossa juokset kaupungissa oikealle. Kaupunki ei lopu koskaan!
+//   Vihollisia tulee vastaan, ja ammut niita raketeilla. Mita pidemmalle paaset
+//   ja mita enemman vihollisia tuhoat, sita isompi pistemaara tulee.
+//
+// OHJAUS:
+//   VASEN/OIKEA = juokse, VÄLILYÖNTI = hyppaa (pida pohjassa = korkeampi hyppy),
+//   YLOS/ALAS = kiipea tikkaita / tippua katon lapi,
+//   hiiri tahtaa, hiiren vasen nappi ampuu raketin.
+//
+// OHJELMAN RAKENNE:
+//   1. Vakiot ja tietorakenteet (mita pelissa on: rakennukset, viholliset, raketit...)
+//   2. Kaupungin luonti ja tormaykset (mihin pelaaja voi astua)
+//   3. Paivitysfunktiot (mita tapahtuu joka kuvassa)
+//   4. Piirtofunktiot (miten asiat nayttavat)
+//   5. main-funktio: peli-silmukka, joka pyorii koko ajan
+//
 // ICON
 // ################
 // #..............#
@@ -20,99 +36,115 @@
 // ################
 #include "suomi_gfx.h"
 
-#define BUILDING_MAX 20
-#define ENEMY_MAX 10
-#define ROCKET_MAX 6
-#define PICKUP_MAX 8
-#define BOMB_MAX 12
-#define BOOM_MAX 8
-#define PLAYER_W 12
-#define PLAYER_H 16
-#define ENEMY_H 14
-#define GROUND_Y 200
-#define JUMP_V 13
-#define MOVE_SPEED 3
-#define MAX_ROCKETS_AIR 4
-#define WORLD_LIMIT 30000
+// ---------- VAKIOT ----------
+// Vakio on numero, jolle annetaan nimi. Silloin koodista nakee mita luku tarkoittaa.
+#define BUILDING_MAX 20      // kuinka monta rakennusta on kerralla muistissa
+#define ENEMY_MAX 10         // enintaan 10 vihollista yhtaaikaa
+#define ROCKET_MAX 6         // raketteja yhteensa
+#define PICKUP_MAX 8         // poimittavia laatikoita yhtaaikaa
+#define BOMB_MAX 12          // lintujen pudottamia pommeja yhtaaikaa
+#define BOOM_MAX 8           // rajahdyksia yhtaaikaa
+#define PLAYER_W 12          // pelaajan leveys pikseleina
+#define PLAYER_H 16          // pelaajan korkeus pikseleina
+#define ENEMY_H 14           // vihollisen korkeus
+#define GROUND_Y 200         // maan korkeus ruudulla (y kasvaa alaspain!)
+#define JUMP_V 13            // hypyn alkunopeus (suurempi = korkeampi hyppy)
+#define MOVE_SPEED 3         // pelaajan juoksunopeus
+#define MAX_ROCKETS_AIR 4    // ilmassa saa olla enintaan 4 rakettia
+#define WORLD_LIMIT 30000    // maailman raja (turvaraja)
+#define START_LEVEL 4        // vaikeustaso pelin alussa
+#define MAX_LEVEL 16         // vaikein taso
 
-#define ENEMY_MRSIREN 0
-#define ENEMY_MEGABIRD 1
-#define ENEMY_SPRINGU 2
+// Vihollistyypit
+#define ENEMY_MRSIREN 0      // Herra Sireeni: kavelee ja jahtaa
+#define ENEMY_MEGABIRD 1     // Megalintu: lentaa ja pudottaa pommeja
+#define ENEMY_SPRINGU 2      // Springu: pomppiva jousi
 
+// ---------- TIETORAKENTEET ----------
+// "struct" on kuin lomake: se kokoaa yhden asian tiedot yhteen.
+
+// Rakennus
 typedef struct
 {
-    int x;
-    int w;
-    int roof_y;
-    int ladder;
-    int balcony;
-    int balcony_y;
-    int id;
+    int x;            // vasen reuna maailmassa
+    int w;            // leveys
+    int roof_y;       // katon korkeus
+    int ladder;       // 1 = rakennuksella on tikkaat
+    int balcony;      // 1 = rakennuksella on parveke
+    int balcony_y;    // parvekkeen korkeus
+    int id;           // rakennuksen numero (vaikuttaa ulkonakoon)
 } Building;
 
+// Vihollinen
 typedef struct
 {
-    int x;
-    int y;
-    int vx;
-    int vy;
-    int alive;
-    int kind;
-    int hp;
-    int anim;
-    int phase;
-    int on_ground;
-    int carried;
-    int bomb_cd;
-    int dir;
+    int x;            // paikka sivusuunnassa
+    int y;            // paikka ylos-alas
+    int vx;           // nopeus sivusuunnassa
+    int vy;           // nopeus ylos-alas
+    int alive;        // 1 = elossa, 0 = ei ole kaytossa
+    int kind;         // vihollistyyppi (ks. ENEMY_-vakiot)
+    int hp;           // elamapisteet: kuinka monta osumaa kestaa
+    int anim;         // animaatiolaskuri (liikuttaa jalkoja, siipia jne.)
+    int phase;        // vihollisen tila (esim. jahtaa / odottaa)
+    int on_ground;    // 1 = seisoo maassa
+    int carried;      // 1 = lintu kantaa pelaajaa
+    int bomb_cd;      // aika seuraavaan pommiin
+    int dir;          // suunta: -1 vasen, 1 oikea
 } Enemy;
 
+// Raketti
 typedef struct
 {
     int x;
     int y;
-    int vx;
-    int vy;
-    int life;
-    int active;
+    int vx;           // nopeus sivusuunnassa
+    int vy;           // nopeus ylos-alas
+    int life;         // kuinka kauan raketti vielä lentaa
+    int active;       // 1 = lentaa
 } Rocket;
 
+// Linnun pudottama pommi
 typedef struct
 {
     int x;
     int y;
-    int vy;
+    int vy;           // putoamisnopeus
     int alive;
 } Bomb;
 
+// Rajahdys (pelkka kuva, ei vahingoita)
 typedef struct
 {
     int x;
     int y;
-    int t;
+    int t;            // kuinka kauan rajahdys on kestanyt
+    int big;          // 1 = iso rajahdys (pommi osui maahan)
     int alive;
 } Boom;
 
+// Pelaaja
 typedef struct
 {
     int x;
     int y;
     int vx;
     int vy;
-    int on_ground;
-    int on_ladder;
-    int facing;
-    int hp;
-    int ammo;
-    int ammo_timer;
-    int fire_cd;
-    int walk;
-    int fall_start;
-    int invuln;
-    int carried_by;
-    int drop;
+    int on_ground;    // 1 = seisoo jollain pinnalla
+    int on_ladder;    // 1 = kiipeaa tikkailla
+    int facing;       // katsomissuunta
+    int hp;           // elamat (100 alussa)
+    int ammo;         // raketteja jaljella
+    int ammo_timer;   // laskuri: uusi raketti ilmestyy ajan kuluttua
+    int fire_cd;      // laukaisun jaahtyminen (ei voi ampua koko ajan)
+    int walk;         // kavelyanimaation laskuri
+    int fall_start;   // korkein kohta ilmassa (putoamisvahinkoa varten)
+    int invuln;       // vahingoittumattomuusaika osuman jalkeen
+    int carried_by;   // minka linnun kantama, -1 = ei kenenkaan
+    int drop;         // aika jonka katot eivat pysayta (kun painat ALAS)
 } Player;
 
+// Poimittava raketti-laatikko
 typedef struct
 {
     int x;
@@ -120,6 +152,8 @@ typedef struct
     int alive;
 } Pickup;
 
+// ---------- GLOBAALIT MUUTTUJAT ----------
+// Taulukot, joissa on kaikki pelin oliot.
 Building city[BUILDING_MAX];
 Enemy enemies[ENEMY_MAX];
 Rocket rockets[ROCKET_MAX];
@@ -127,31 +161,33 @@ Bomb bombs[BOMB_MAX];
 Boom booms[BOOM_MAX];
 Pickup pickups[PICKUP_MAX];
 Player player;
-int camera_x;
-int frame_count;
-int spawn_timer;
-int pickup_timer;
-int pickup_flip;
-int game_over;
-int crosshair_x;
+int camera_x;        // kameran paikka: kuinka pitkalle kaupunkia on vieritetty
+int frame_count;     // kuinka monta kuvaa on piirretty
+int spawn_timer;     // aika seuraavaan vihollisen ilmestymiseen
+int pickup_timer;    // aika seuraavaan laatikkoon
+int pickup_flip;     // vuorottelee: katto / maa
+int game_over;       // 1 = peli on loppu
+int crosshair_x;     // tahtain (hiiren paikka)
 int crosshair_y;
-int kills_mr;
-int kills_bird;
-int kills_spring;
-int rockets_fired;
-int rockets_hit;
-int world_end;
-int last_roof;
-int build_count;
-int ladder_top;
-int max_x;
-int meters;
-int best_meters;
-int bonus;
-int new_best;
-int score;
-int level;
+int kills_mr;        // tuhotut Herra Sireenit
+int kills_bird;      // tuhotut Megalinnut
+int kills_spring;    // tuhotut Springut
+int rockets_fired;   // ammuttuja raketteja
+int rockets_hit;     // osuneita raketteja
+int world_end;       // kaupungin oikea reuna
+int last_roof;       // edellisen rakennuksen katon korkeus
+int build_count;     // kuinka monta rakennusta on tehty
+int ladder_top;      // loydetyn tikkaan ylapaa
+int max_x;           // pisin matka mihin pelaaja on paassyt
+int meters;          // matka metreina
+int best_meters;     // paras pistemaara (nimi on historiallinen)
+int bonus;           // pisteet tuhotuista vihollisista
+int new_best;        // 1 = uusi ennatys
+int score;           // lopullinen pistemaara = matka + bonus
+int level;           // vaikeustaso: kasvaa matkan mukana
 
+// Muuttaa numeron tekstiksi, jotta sen voi piirtaa ruudulle.
+// Esim. 123 -> "123". Tekee numerot yksi kerrallaan lopusta alkuun.
 void number_text(int value, char *out)
 {
     char tmp[16];
@@ -180,6 +216,7 @@ void number_text(int value, char *out)
     out[i] = 0;
 }
 
+// Pitaa luvun alarajan (lo) ja ylarajan (hi) valissa.
 int clamp_to_range(int value, int lo, int hi)
 {
     if (value < lo)
@@ -193,6 +230,7 @@ int clamp_to_range(int value, int lo, int hi)
     return value;
 }
 
+// Luo rajahdyksen kohtaan x,y. Etsitaan ensin vapaa paikka taulukosta.
 void add_boom(int x, int y)
 {
     int i;
@@ -204,17 +242,40 @@ void add_boom(int x, int y)
             booms[i].x = x;
             booms[i].y = y;
             booms[i].t = 0;
+            booms[i].big = 0;
             return;
         }
     }
 }
 
+// Iso rajahdys: kestaa pidempaan ja on paljon suurempi. Kaytetaan kun pommi osuu maahan.
+void add_big_boom(int x, int y)
+{
+    int i;
+    for (i = 0; i < BOOM_MAX; i++)
+    {
+        if (!booms[i].alive)
+        {
+            booms[i].alive = 1;
+            booms[i].x = x;
+            booms[i].y = y;
+            booms[i].t = 0;
+            booms[i].big = 1;
+            gfx_sound(2, 60, 24, WAVE_NOISE, 60);
+            return;
+        }
+    }
+}
+
+// Pelaaja saa vahinkoa. Osuman jalkeen pelaaja on hetken vahingoittumaton (inv),
+// jotta kaikki elamat eivat lopu yhdella kertaa.
 void hurt_player(int amount, int inv)
 {
     if (player.invuln > 0 || game_over)
     {
         return;
     }
+    // Korkeammalla tasolla vahinko on isompi
     player.hp -= amount + level / 3;
     player.invuln = inv;
     gfx_sound(3, 150, 8, WAVE_SQUARE, 40);
@@ -225,24 +286,25 @@ void hurt_player(int amount, int inv)
     }
 }
 
-// Buildings are generated left to right; a building that fell far behind the camera is
-// regenerated beyond the current end of the city, so the city never ends.
-// Roof heights are limited so that neighbouring roofs can be reached with a jump (JUMP_V = 78 px),
-// while the tallest roofs need a ladder.
+// Rakennusten teko: rakennukset luodaan vasemmalta oikealle. Kun rakennus jaa
+// kauas kameran taakse, se tehdaan uudelleen kaupungin oikeaan paahan,
+// joten kaupunki ei lopu koskaan (kuin liukuhihna!).
+// Kattojen korkeus rajoitetaan niin, etta naapuritalon katolle paasee hyppaamalla
+// (hyppy on noin 78 pikselia). Korkeimmille katoille pitaa kiivet tikkaita.
 void gen_building(int i)
 {
-    int w = 28 + (gfx_random() % 40);
-    int h = 50 + (gfx_random() % 80);
+    int w = 28 + (gfx_random() % 40);       // leveys arvotaan
+    int h = 50 + (gfx_random() % 80);       // korkeus arvotaan
     int roof = GROUND_Y - h;
-    int x = world_end + 18 + (gfx_random() % 20);
+    int x = world_end + 18 + (gfx_random() % 20);   // pieni rako edelliseen taloon
     int k;
     if (roof < last_roof - 64)
     {
-        roof = last_roof - 64;
+        roof = last_roof - 64;   // ei liian paljon korkeampi kuin edellinen
     }
     if (roof < 60)
     {
-        roof = 60;
+        roof = 60;               // ei aivan ruudun ylareunaan
     }
     build_count++;
     k = build_count % 4;
@@ -253,6 +315,7 @@ void gen_building(int i)
     city[i].id = build_count;
     city[i].ladder = 0;
     city[i].balcony = 0;
+    // Joka neljas talo: tikkaat. Joka neljas toinen: tikkaat ja parveke.
     if (k == 1)
     {
         city[i].ladder = 1;
@@ -266,6 +329,7 @@ void gen_building(int i)
     world_end = x + w;
 }
 
+// Tekee pelin alussa kaikki rakennukset.
 void init_city(void)
 {
     int i;
@@ -278,6 +342,7 @@ void init_city(void)
     }
 }
 
+// Uusii rakennukset, jotka ovat jaaneet kameran taakse.
 void recycle_city(void)
 {
     int i;
@@ -290,6 +355,7 @@ void recycle_city(void)
     }
 }
 
+// Kertoo katon korkeuden kohdassa wx (jos ei rakennusta, palauttaa maan korkeuden).
 int building_roof_at_world(int wx)
 {
     int i;
@@ -303,7 +369,8 @@ int building_roof_at_world(int wx)
     return GROUND_Y;
 }
 
-// Returns the ladder x near wx (or -1) and stores its top in ladder_top.
+// Palauttaa tikkaiden x-paikan lahella kohtaa wx (tai -1 jos tikkaita ei ole)
+// ja tallentaa tikkaiden ylapaan muuttujaan ladder_top.
 int find_ladder(int wx)
 {
     int i;
@@ -324,7 +391,10 @@ int find_ladder(int wx)
     return -1;
 }
 
-// Highest standable surface (roof, balcony or ground) crossed while the feet moved prev -> now.
+// Etsii pinnan (katto, parveke tai maa), jolle jalat osuvat pudotessa.
+// Verrataan jalkojen vanhaa (feet_prev) ja uutta (feet) korkeutta:
+// jos pinta jaa niiden valiin, jalat menivat pinnan lapi eli pelaaja laskeutuu.
+// Palauttaa -1, jos mikaan pinta ei osunut kohdalle.
 int find_support(int px, int feet_prev, int feet)
 {
     int i;
@@ -336,6 +406,7 @@ int find_support(int px, int feet_prev, int feet)
     }
     if (player.drop > 0)
     {
+        // Pelaaja putoaa katon lapi: ohitetaan katot ja parvekkeet, vain maa pysayttaa
         return best;
     }
     for (i = 0; i < BUILDING_MAX; i++)
@@ -360,6 +431,7 @@ int find_support(int px, int feet_prev, int feet)
     return best;
 }
 
+// Lisaa poimittavan raketti-laatikon kohtaan x,y.
 void spawn_pickup(int x, int y)
 {
     int i;
@@ -375,13 +447,14 @@ void spawn_pickup(int x, int y)
     }
 }
 
+// Aloittaa pelin alusta: nollaa pisteet, pelaajan ja kaikki viholliset.
 void reset_game(void)
 {
     int i;
     init_city();
     camera_x = 0;
     frame_count = 0;
-    spawn_timer = 90;
+    spawn_timer = 30;      // ensimmainen vihollinen tulee heti
     pickup_timer = 240;
     pickup_flip = 0;
     game_over = 0;
@@ -389,7 +462,7 @@ void reset_game(void)
     meters = 0;
     bonus = 0;
     score = 0;
-    level = 0;
+    level = START_LEVEL;   // peli alkaa jo haastavalla tasolla
     new_best = 0;
     kills_mr = 0;
     kills_bird = 0;
@@ -438,6 +511,8 @@ void reset_game(void)
     spawn_pickup(520, GROUND_Y - 12);
 }
 
+// Luo uuden vihollisen ruudun oikean reunan taakse. Tyyppi arvotaan:
+// mita korkeampi taso, sita enemman vaarallisia lintuja.
 void spawn_enemy(void)
 {
     int i;
@@ -448,7 +523,7 @@ void spawn_enemy(void)
     {
         kind = ENEMY_MRSIREN;
     }
-    else if (r < 7 - (level < 3 ? level : 3) || player.x < 600)
+    else if (r < 7 - (level < 3 ? level : 3) || player.x < 200)
     {
         kind = ENEMY_SPRINGU;
     }
@@ -488,6 +563,8 @@ void spawn_enemy(void)
     }
 }
 
+// Tuhoaa vihollisen numero j: antaa pisteita, tekee rajahdyksen
+// ja joskus pudottaa raketti-laatikon.
 void kill_enemy(int j)
 {
     Enemy *e = &enemies[j];
@@ -497,6 +574,7 @@ void kill_enemy(int j)
     }
     if (e->carried)
     {
+        // Jos lintu kantoi pelaajaa, pelaaja vapautuu ja alkaa pudota
         e->carried = 0;
         player.carried_by = -1;
         player.vy = 0;
@@ -504,6 +582,7 @@ void kill_enemy(int j)
         player.fall_start = player.y;
     }
     e->alive = 0;
+    // Pisteet: vaikeampi vihollinen ja korkeampi taso antavat enemman pisteita
     if (e->kind == ENEMY_MRSIREN)
     {
         kills_mr++;
@@ -521,6 +600,7 @@ void kill_enemy(int j)
     }
     add_boom(e->x, e->y + 7);
     gfx_sound(2, 90, 12, WAVE_NOISE, 50);
+    // Joka neljas vihollinen jattaa jalkeensa raketti-laatikon
     if (gfx_random() % 4 == 0)
     {
         if (e->kind == ENEMY_MEGABIRD)
@@ -534,7 +614,9 @@ void kill_enemy(int j)
     }
 }
 
-// Rockets live in world coordinates (like everything else except the HUD and crosshair).
+// Ampuu raketin kohti tahtainta. Raketit elavat "maailman koordinaateissa"
+// (kuten kaikki muukin paitsi tahtain ja pistetaulu), jotta ne pysyvat oikeassa
+// paikassa kun kamera liikkuu.
 void fire_rocket(void)
 {
     int i;
@@ -544,10 +626,12 @@ void fire_rocket(void)
     int ay;
     int length;
     int active_rockets = 0;
+    // Ei voi ampua jos jaahtyminen kesken, ammukset loppu tai lintu kantaa
     if (player.fire_cd > 0 || player.ammo <= 0 || player.carried_by >= 0)
     {
         return;
     }
+    // Lasketaan kuinka monta rakettia on jo ilmassa
     for (i = 0; i < ROCKET_MAX; i++)
     {
         if (rockets[i].active)
@@ -559,6 +643,8 @@ void fire_rocket(void)
     {
         return;
     }
+    // dx,dy = suunta pelaajasta tahtaimeen. length = pisin akseli,
+    // jolla jaetaan niin etta raketin nopeus on aina suunnilleen 6.
     dx = crosshair_x - (player.x - camera_x + 6);
     dy = crosshair_y - (player.y + 8);
     ax = abs(dx);
@@ -593,6 +679,7 @@ void fire_rocket(void)
     }
 }
 
+// Kamera seuraa pelaajaa, mutta vain eteenpain (oikealle). Taakse ei voi palata.
 void follow_camera(void)
 {
     if (player.x - 120 > camera_x)
@@ -601,6 +688,7 @@ void follow_camera(void)
     }
 }
 
+// Paivittaa pelaajan joka kuvassa: nappaimet, hyppy, painovoima, tikkaat, putoaminen.
 void update_player(unsigned int keys)
 {
     int lx;
@@ -647,6 +735,7 @@ void update_player(unsigned int keys)
     }
     if (!player.on_ladder && lx >= 0)
     {
+        // Tikkaille noustaan painamalla YLOS tai ALAS tikkaiden kohdalla
         if (((keys & KEY_UP) && feet_prev > ladder_top && feet_prev <= GROUND_Y) ||
             ((keys & KEY_DOWN) && feet_prev >= ladder_top && feet_prev < GROUND_Y))
         {
@@ -658,6 +747,7 @@ void update_player(unsigned int keys)
     }
     if (player.on_ladder)
     {
+        // Tikkailla: YLOS/ALAS liikuttaa pelaajaa 2 pikselia kerrallaan
         dir = 0;
         if (keys & KEY_UP)
         {
@@ -677,6 +767,7 @@ void update_player(unsigned int keys)
         feet = player.y + PLAYER_H;
         if (feet <= ladder_top)
         {
+            // Paastiin tikkaiden ylapaahan: astutaan katolle
             player.y = ladder_top - PLAYER_H;
             player.on_ladder = 0;
             player.on_ground = 1;
@@ -685,6 +776,7 @@ void update_player(unsigned int keys)
         }
         else if (feet >= GROUND_Y)
         {
+            // Paastiin alas maahan
             player.y = GROUND_Y - PLAYER_H;
             player.on_ladder = 0;
             player.on_ground = 1;
@@ -693,6 +785,7 @@ void update_player(unsigned int keys)
         }
         else if (keys & KEY_FIRE)
         {
+            // VALILYONTI tikkailla: hypataan pois tikkailta
             player.on_ladder = 0;
             player.vy = -6;
             player.fall_start = player.y;
@@ -701,6 +794,7 @@ void update_player(unsigned int keys)
         follow_camera();
         return;
     }
+    // Vasen/oikea nappi asettaa sivuttaisnopeuden
     player.vx = 0;
     if (keys & KEY_LEFT)
     {
@@ -712,6 +806,7 @@ void update_player(unsigned int keys)
     }
     if ((keys & KEY_FIRE) && player.on_ground)
     {
+        // Hyppy: annetaan ylospain nopeus (y pienenee ylos mentaessa)
         player.vy = -JUMP_V;
         player.on_ground = 0;
         player.fall_start = player.y;
@@ -719,14 +814,17 @@ void update_player(unsigned int keys)
     }
     else if (!(keys & KEY_FIRE) && player.vy < -6)
     {
+        // Jos valilyonti paastetaan irti kesken hypyn, hyppy jaa matalammaksi
         player.vy = -6;
     }
     if ((keys & KEY_DOWN) && player.on_ground && feet_prev < GROUND_Y)
     {
+        // ALAS katolla: pudotaan katon lapi alas
         player.drop = 10;
         player.on_ground = 0;
         player.fall_start = player.y;
     }
+    // Painovoima vetaa alas: nopeus kasvaa 1 joka kuva, mutta enintaan 9
     player.vy += 1;
     if (player.vy > 9)
     {
@@ -734,6 +832,7 @@ void update_player(unsigned int keys)
     }
     player.x += player.vx;
     player.y += player.vy;
+    // Pelaaja ei voi menna ruudun vasemman reunan taakse
     if (player.x < camera_x + 4)
     {
         player.x = camera_x + 4;
@@ -746,13 +845,16 @@ void update_player(unsigned int keys)
     surf = -1;
     if (player.vy >= 0)
     {
+        // Vain alaspain pudotessa voi laskeutua pinnalle
         surf = find_support(player.x + 6, feet_prev, feet);
     }
     if (surf >= 0)
     {
+        // Laskeuduttiin: asetetaan pelaaja pinnan paalle
         player.y = surf - PLAYER_H;
         if (!player.on_ground)
         {
+            // Putoamisvahinko: jos putosi yli 100 pikselia, sattuu
             fall = player.y - player.fall_start;
             if (fall > 100)
             {
@@ -797,7 +899,8 @@ void update_player(unsigned int keys)
     follow_camera();
 }
 
-// Mirrors an x offset inside the player sprite according to the facing direction.
+// Kaantaa pelaajan kuvan x-siirtyman katsomissuunnan mukaan,
+// jotta pelaaja nayttaa katsovan vasemmalle tai oikealle.
 int pm(int sx, int off, int w)
 {
     if (player.facing >= 0)
@@ -807,6 +910,9 @@ int pm(int sx, int off, int w)
     return sx + PLAYER_W - off - w;
 }
 
+// Piirtaa pelaajan kohtaan sx,sy (ruudun koordinaatit). Hahmo koostuu pienista
+// suorakulmioista: jalat, vartalo, paa, laukku ja raketinheitin.
+// Jalkojen asento riippuu siita kavelevatko, hyppaako vai kiipeaako pelaaja.
 void draw_player(int sx, int sy)
 {
     int s;
@@ -826,8 +932,10 @@ void draw_player(int sx, int sy)
     int ey;
     if (player.invuln > 0 && (frame_count & 2))
     {
+        // Vilkkuu osuman jalkeen: joka toinen kuva jaa piirtamatta
         return;
     }
+    // s = kavelyanimaation vaihe 0..3
     s = (player.walk >> 2) & 3;
     by = sy;
     if (player.on_ground && player.vx != 0 && (s & 1))
@@ -943,6 +1051,8 @@ void draw_player(int sx, int sy)
     }
 }
 
+// Piirtaa koko kaupungin: taivas, tahdet, rakennukset (ikkunat, ovet, antennit,
+// parvekkeet, tikkaat) ja maan. Rakennuksen paikka ruudulla = maailman x - kameran x.
 void draw_city(void)
 {
     int i;
@@ -959,7 +1069,8 @@ void draw_city(void)
     int by;
     int roof;
     int w;
-    gfx_rect(0, 0, 320, GROUND_Y, BLUE);
+    gfx_rect(0, 0, 320, GROUND_Y, BLUE);   // sininen taivas
+    // Tahdet liikkuvat hitaammin kuin kaupunki, joten tausta nayttaa kaukaiselta
     for (i = 0; i < 32; i++)
     {
         x0 = (i * 47 + 320 - (camera_x / 4) % 320) % 320;
@@ -974,13 +1085,15 @@ void draw_city(void)
         roof = city[i].roof_y;
         if (sx > 330 || sx + w < -20)
         {
+            // Rakennus on ruudun ulkopuolella, ei piirreta
             continue;
         }
-        gfx_rect(sx, roof, w, GROUND_Y - roof, DARK_GRAY);
-        gfx_rect(sx, roof, w, 3, GRAY);
-        gfx_rect(sx + w - 3, roof + 3, 3, GROUND_Y - roof - 3, BLACK);
+        gfx_rect(sx, roof, w, GROUND_Y - roof, DARK_GRAY);   // seina
+        gfx_rect(sx, roof, w, 3, GRAY);                      // katto
+        gfx_rect(sx + w - 3, roof + 3, 3, GROUND_Y - roof - 3, BLACK);  // varjo
         cells = (w - 16) / 10;
         rows = (GROUND_Y - roof - 22) / 14;
+        // Ikkunat: joka rivilla ja sarakkeella, osa palaa (keltainen), osa ei (musta)
         for (row = 0; row < rows; row++)
         {
             for (cell = 0; cell < cells; cell++)
@@ -995,9 +1108,10 @@ void draw_city(void)
                 }
             }
         }
-        gfx_rect(sx + w / 2 - 4, GROUND_Y - 12, 8, 12, BLACK);
+        gfx_rect(sx + w / 2 - 4, GROUND_Y - 12, 8, 12, BLACK);   // ovi
         if ((city[i].id % 3) == 0)
         {
+            // Joillakin taloilla on antenni, jonka punainen valo vilkkuu
             gfx_line(sx + 6, roof - 10, sx + 6, roof, GRAY);
             if (frame_count & 16)
             {
@@ -1006,6 +1120,7 @@ void draw_city(void)
         }
         if (city[i].balcony)
         {
+            // Parveke: lattia, kaide ja tukipalkki
             bx = sx + w - 8;
             by = city[i].balcony_y;
             gfx_rect(bx, by, 18, 3, GRAY);
@@ -1015,6 +1130,7 @@ void draw_city(void)
         }
         if (city[i].ladder)
         {
+            // Tikkaat: kaksi pystytolppaa ja poikittaisia askelmia
             lx = sx + w - 5;
             gfx_rect(lx - 3, roof, 1, GROUND_Y - roof, GRAY);
             gfx_rect(lx + 3, roof, 1, GROUND_Y - roof, GRAY);
@@ -1024,8 +1140,9 @@ void draw_city(void)
             }
         }
     }
-    gfx_rect(0, GROUND_Y, 320, 40, DARK_GRAY);
+    gfx_rect(0, GROUND_Y, 320, 40, DARK_GRAY);   // katu
     gfx_line(0, GROUND_Y, 319, GROUND_Y, GRAY);
+    // Tien keskiviiva liikkuu kameran mukana
     x0 = -(camera_x % 48);
     for (k = 0; k < 8; k++)
     {
@@ -1033,6 +1150,7 @@ void draw_city(void)
     }
 }
 
+// Piirtaa pienen raketin kuvakkeen (kaytetaan pistetaulussa ja laatikoissa).
 void draw_rocket_icon(int x, int y)
 {
     gfx_pixel(x + 2, y, RED);
@@ -1045,6 +1163,7 @@ void draw_rocket_icon(int x, int y)
     gfx_rect(x + 2, y + 9, 1, 2, ORANGE);
 }
 
+// Piirtaa raketti-laatikot. Laatikko "kelluu" ylos ja alas yhden pikselin.
 void draw_pickups(void)
 {
     int i;
@@ -1068,7 +1187,7 @@ void draw_pickups(void)
     }
 }
 
-// Mirrors an x offset of an enemy sprite according to its direction.
+// Kaantaa vihollisen kuvan x-siirtyman sen kulkusuunnan mukaan.
 int em(int sx, int dir, int off, int w)
 {
     if (dir >= 0)
@@ -1078,6 +1197,10 @@ int em(int sx, int dir, int off, int w)
     return sx - off - w;
 }
 
+// Piirtaa vihollisen tyypin mukaan:
+//   Herra Sireeni = kavelee, paassa vilkkuva sireenivalo
+//   Megalintu     = lyo siipiaan, kantaessa kynnet roikkuvat alas
+//   Springu       = jousi joka painuu kasaan ennen hyppya ja venyy ilmassa
 void draw_enemy(Enemy *e)
 {
     int sx;
@@ -1232,6 +1355,7 @@ void draw_enemy(Enemy *e)
     }
 }
 
+// Piirtaa linnun pudottamat pommit (musta pommi, sytytyslanka ja kipina).
 void draw_bombs(void)
 {
     int i;
@@ -1260,7 +1384,8 @@ void draw_bombs(void)
     }
 }
 
-// A rocket drawn along its flight direction: white body, red nose and fins, flickering flame.
+// Piirtaa raketin lentosuuntaan kaannettyna: valkoinen runko, punainen karki ja
+// siivet seka vilkkuva liekki perassa. vx,vy kertovat mihin suuntaan raketti menee.
 void draw_rocket(Rocket *r)
 {
     int sx;
@@ -1298,6 +1423,7 @@ void draw_rocket(Rocket *r)
     gfx_line(fx, fy, tx + ox, ty + oy, RED);
     gfx_line(fx, fy, tx - ox, ty - oy, RED);
     gfx_rect(nx - 1, ny - 1, 3, 3, RED);
+    // Liekki vaihtaa vuorotellen oranssin ja keltaisen -> nayttaa liekehtivalta
     if (frame_count & 1)
     {
         gfx_rect(tx - r->vx / 2 - 1, ty - r->vy / 2 - 1, 3, 3, ORANGE);
@@ -1308,6 +1434,8 @@ void draw_rocket(Rocket *r)
     }
 }
 
+// Piirtaa rajahdykset. Rajahdys kasvaa ajan mukana ja vaihtaa varia:
+// keltainen -> oranssi -> punainen.
 void draw_booms(void)
 {
     int i;
@@ -1325,6 +1453,10 @@ void draw_booms(void)
         sx = booms[i].x - camera_x;
         sy = booms[i].y;
         r = 2 + booms[i].t * 2;
+        if (booms[i].big)
+        {
+            r = 4 + booms[i].t * 4;   // iso rajahdys kasvaa kaksi kertaa nopeammin
+        }
         c = RED;
         if (booms[i].t < 4)
         {
@@ -1343,6 +1475,7 @@ void draw_booms(void)
     }
 }
 
+// Piirtaa tahtaimen (hiiren kohdalle) ja "NO AMMO" -varoituksen kun raketit loppuvat.
 void draw_crosshair(void)
 {
     gfx_line(crosshair_x - 7, crosshair_y, crosshair_x - 3, crosshair_y, WHITE);
@@ -1356,6 +1489,7 @@ void draw_crosshair(void)
     }
 }
 
+// Piirtaa ylhaalla olevan pistetaulun: elamat, pisteet, matka, taso, raketit.
 void draw_hud(void)
 {
     char s[32];
@@ -1381,8 +1515,8 @@ void draw_hud(void)
     {
         c = RED;
     }
-    gfx_rect(8, 15, 100, 5, BLACK);
-    gfx_rect(8, 15, player.hp, 5, c);
+    gfx_rect(8, 15, 100, 5, BLACK);          // elamapalkin tausta
+    gfx_rect(8, 15, player.hp, 5, c);        // elamapalkki: pituus = elamat
     gfx_text(8, 24, "AMMO", WHITE);
     for (i = 0; i < player.ammo; i++)
     {
@@ -1394,6 +1528,7 @@ void draw_hud(void)
     gfx_text(226, 26, "HITS", WHITE);
     number_text(rockets_hit, s);
     gfx_text(262, 26, s, YELLOW);
+    // Pelin alussa nayteteaan ohje hetken (240 kuvaa = noin 4 sekuntia)
     if (frame_count < 240)
     {
         gfx_text(24, 120, "SPACE JUMP   MOUSE AIM + LEFT BUTTON FIRE", WHITE);
@@ -1401,6 +1536,8 @@ void draw_hud(void)
     }
 }
 
+// Paivittaa kaikki viholliset: liike, tekoaly (ketä jahtaa) ja osumat pelaajaan.
+// "adx" on vihollisen ja pelaajan etaisyys sivusuunnassa.
 void update_enemies(void)
 {
     int i;
@@ -1409,7 +1546,14 @@ void update_enemies(void)
     int dxp;
     int dir;
     int target;
+    int crouch;
     Enemy *e;
+    // Springu valmistautuu hyppyyn lyhyemman aikaa mita korkeampi taso on
+    crouch = 36 - level;
+    if (crouch < 18)
+    {
+        crouch = 18;
+    }
     for (i = 0; i < ENEMY_MAX; i++)
     {
         e = &enemies[i];
@@ -1427,16 +1571,18 @@ void update_enemies(void)
         }
         if (e->kind == ENEMY_MRSIREN)
         {
-            if (adx < 110)
+            // Herra Sireeni: kavelee vasemmalle, mutta alkaa jahdata kun pelaaja on lahella
+            if (adx < 110 + level * 4)
             {
                 e->phase = 1;
             }
-            else if (adx > 160)
+            else if (adx > 160 + level * 4)
             {
                 e->phase = 0;
             }
             if (e->phase)
             {
+                // Jahtaa pelaajaa, ja juoksee nopeammin kun on aivan lahella
                 e->dir = dir;
                 if (adx < 50)
                 {
@@ -1457,6 +1603,7 @@ void update_enemies(void)
             }
             if (player.invuln == 0 && adx < 11 && abs(player.y + 8 - (e->y + 7)) < 14)
             {
+                // Sireeni osuu pelaajaan: pelaaja saa vahinkoa ja Sireeni rajahtaa
                 hurt_player(12, 24);
                 kill_enemy(i);
             }
@@ -1465,6 +1612,7 @@ void update_enemies(void)
         {
             if (e->carried)
             {
+                // Lintu kantaa pelaajaa ylos ja eteenpain, ja pudottaa hetken kuluttua
                 e->phase++;
                 if (e->y > 44)
                 {
@@ -1487,12 +1635,14 @@ void update_enemies(void)
             }
             else if (e->phase >= 100)
             {
+                // Pudotuksen jalkeen lintu pakenee
                 e->x -= 3;
                 e->y -= 1;
             }
             else
             {
-                e->x -= 2;
+                // Lintu lentaa vasemmalle ja seuraa pelaajan korkeutta
+                e->x -= 2 + level / 6;
                 if (adx < 150 && (e->anim & 1))
                 {
                     target = player.y - 10;
@@ -1512,6 +1662,7 @@ void update_enemies(void)
                 }
                 else if (adx < 28 && e->y < player.y - 4)
                 {
+                    // Pelaaja on suoraan alapuolella: pudotetaan pommi
                     for (b = 0; b < BOMB_MAX; b++)
                     {
                         if (!bombs[b].alive)
@@ -1523,10 +1674,11 @@ void update_enemies(void)
                             break;
                         }
                     }
-                    e->bomb_cd = 70;
+                    e->bomb_cd = 70 - level * 2;
                 }
                 if (player.carried_by < 0 && player.invuln == 0 && adx < 14 && abs(player.y + 4 - (e->y + 8)) < 14)
                 {
+                    // Lintu tarttuu pelaajaan kynsillaan
                     e->carried = 1;
                     e->phase = 0;
                     player.carried_by = i;
@@ -1537,28 +1689,31 @@ void update_enemies(void)
         }
         else
         {
+            // Springu: odottaa (jousi painuu kasaan) ja hyppaa sitten pelaajaa kohti
             if (e->on_ground)
             {
                 e->phase++;
                 e->dir = dir;
-                if (e->phase >= 36 && adx < 200)
+                if (e->phase >= crouch && adx < 200)
                 {
                     e->vy = -9;
                     if (player.y + PLAYER_H < e->y + ENEMY_H - 30)
                     {
+                        // Pelaaja on korkealla: hypataan korkeammalle
                         e->vy = -12;
                     }
-                    e->vx = dir * 2;
+                    e->vx = dir * (2 + level / 8);
                     e->on_ground = 0;
                     e->phase = 0;
                 }
-                else if (e->phase > 36)
+                else if (e->phase > crouch)
                 {
-                    e->phase = 36;
+                    e->phase = crouch;
                 }
             }
             else
             {
+                // Ilmassa: painovoima vetaa alas, kunnes osutaan maahan
                 e->x += e->vx;
                 e->vy += 1;
                 e->y += e->vy;
@@ -1594,11 +1749,13 @@ void update_enemies(void)
     }
 }
 
+// Paivittaa pommit: ne putoavat alas kiihtyvalla vauhdilla.
+// Pommi putoaa kattojen ja parvekkeiden lapi. Se rajahtaa osuessaan pelaajaan
+// (pieni rajahdys) tai maahan (iso rajahdys).
 void update_bombs(void)
 {
     int i;
     int prev;
-    int roof;
     for (i = 0; i < BOMB_MAX; i++)
     {
         if (!bombs[i].alive)
@@ -1611,16 +1768,16 @@ void update_bombs(void)
             bombs[i].vy++;
         }
         bombs[i].y += bombs[i].vy;
-        roof = building_roof_at_world(bombs[i].x);
         if (abs(player.x + 6 - bombs[i].x) < 9 && abs(player.y + 8 - bombs[i].y) < 11)
         {
             hurt_player(15, 20);
             add_boom(bombs[i].x, bombs[i].y);
             bombs[i].alive = 0;
         }
-        else if (prev < roof && bombs[i].y >= roof)
+        else if (prev < GROUND_Y && bombs[i].y >= GROUND_Y)
         {
-            add_boom(bombs[i].x, roof - 2);
+            // Pommi lentaa kattojen lapi ja rajahtaa vasta maahan: iso rajahdys
+            add_big_boom(bombs[i].x, GROUND_Y - 4);
             gfx_sound(2, 110, 8, WAVE_NOISE, 35);
             bombs[i].alive = 0;
         }
@@ -1631,6 +1788,7 @@ void update_bombs(void)
     }
 }
 
+// Raketti-laatikko poimitaan koskemalla siihen: +5 rakettia (enintaan 10).
 void update_pickups(void)
 {
     int i;
@@ -1658,12 +1816,13 @@ void update_pickups(void)
     }
 }
 
+// Liikuttaa raketteja. Raketti lentaa kattojen ja parvekkeiden lapi. Se katoaa
+// kun sen aika loppuu, se poistuu ruudulta, osuu maahan tai osuu viholliseen.
 void update_rockets(void)
 {
     int i;
     int j;
     int prev;
-    int roof;
     int sx;
     Enemy *e;
     for (i = 0; i < ROCKET_MAX; i++)
@@ -1682,10 +1841,9 @@ void update_rockets(void)
             rockets[i].active = 0;
             continue;
         }
-        roof = building_roof_at_world(rockets[i].x);
-        if (prev < roof && rockets[i].y >= roof)
+        if (prev < GROUND_Y && rockets[i].y >= GROUND_Y)
         {
-            add_boom(rockets[i].x, roof - 2);
+            add_boom(rockets[i].x, GROUND_Y - 2);
             gfx_sound(2, 110, 8, WAVE_NOISE, 35);
             rockets[i].active = 0;
             continue;
@@ -1717,6 +1875,7 @@ void update_rockets(void)
     }
 }
 
+// Paivittaa rajahdykset: ne kestavat 10 kuvaa ja katoavat.
 void update_booms(void)
 {
     int i;
@@ -1725,7 +1884,11 @@ void update_booms(void)
         if (booms[i].alive)
         {
             booms[i].t++;
-            if (booms[i].t > 9)
+            if (booms[i].t > 9 && !booms[i].big)
+            {
+                booms[i].alive = 0;
+            }
+            else if (booms[i].t > 14)
             {
                 booms[i].alive = 0;
             }
@@ -1733,6 +1896,7 @@ void update_booms(void)
     }
 }
 
+// Alapalkki: pelin nimi ja matka.
 void draw_terrain_hud(void)
 {
     char s[32];
@@ -1742,6 +1906,7 @@ void draw_terrain_hud(void)
     gfx_text(220, 228, s, YELLOW);
 }
 
+// Pelin loppuruutu: lopullinen pistemaara ja ennatys.
 void end_game_screen(void)
 {
     char s[32];
@@ -1764,6 +1929,9 @@ void end_game_screen(void)
     gfx_text(100, 154, "PRESS START", WHITE);
 }
 
+// PAAOHJELMA: peli-silmukka. Se toistuu koko ajan, noin 60 kertaa sekunnissa.
+// Joka kierroksella: 1) luetaan nappaimet ja hiiri, 2) paivitetaan peli,
+// 3) piirretaan kaikki ruudulle.
 int main(void)
 {
     unsigned int keys;
@@ -1782,37 +1950,42 @@ int main(void)
             {
                 max_x = player.x;
             }
-            meters = max_x / 10;
-            level = meters / 50;
-            if (level > 12)
+            meters = max_x / 10;           // 10 pikselia = 1 metri
+            // Vaikeustaso nousee 1 joka 40. metrilla, alkaen START_LEVEL:sta
+            level = START_LEVEL + meters / 40;
+            if (level > MAX_LEVEL)
             {
-                level = 12;
+                level = MAX_LEVEL;
             }
+            // Lopullinen pistemaara = matka metreina + vihollisista saadut pisteet
             score = meters + bonus;
             if (score > best_meters)
             {
                 best_meters = score;
                 new_best = 1;
             }
+            // Hiiren vasen nappi ampuu
             if (gfx_mouse_buttons() & MOUSE_LEFT)
             {
                 fire_rocket();
             }
+            // Vihollisia ilmestyy sita useammin mita korkeampi taso on
             spawn_timer--;
             if (spawn_timer <= 0)
             {
                 spawn_enemy();
                 if (level >= 4 && gfx_random() % 3 == 0)
                 {
-                    spawn_enemy();
+                    spawn_enemy();   // joskus kaksi kerralla
                 }
-                interval = 90 - level * 6;
+                interval = 80 - level * 4;
                 if (interval < 20)
                 {
                     interval = 20;
                 }
                 spawn_timer = interval;
             }
+            // Raketti-laatikko ilmestyy vuorotellen katolle ja maahan
             pickup_timer--;
             if (pickup_timer <= 0)
             {
@@ -1827,6 +2000,7 @@ int main(void)
                 }
                 pickup_timer = 360;
             }
+            // Raketteja palautuu hitaasti itsestaan, ettei peli jaa jumiin (enintaan 3)
             player.ammo_timer++;
             if (player.ammo >= 3 || player.ammo_timer > 240)
             {
@@ -1836,6 +2010,7 @@ int main(void)
                 }
                 player.ammo_timer = 0;
             }
+            // Paivitetaan kaikki pelin osat yksi kerrallaan
             update_enemies();
             update_bombs();
             update_pickups();
@@ -1845,13 +2020,14 @@ int main(void)
         }
         else
         {
+            // Peli on loppu: START-nappi aloittaa uuden pelin
             update_booms();
             if (keys & KEY_START)
             {
                 reset_game();
             }
         }
-        draw_city();
+        draw_city();    // piirretaan taustasta eteenpain: kauimmainen ensin
         draw_pickups();
         for (i = 0; i < ENEMY_MAX; i++)
         {
@@ -1871,7 +2047,7 @@ int main(void)
         {
             end_game_screen();
         }
-        gfx_present();
+        gfx_present();    // nayttaa valmiin kuvan ruudulla
         frame_count++;
     }
     return 0;
