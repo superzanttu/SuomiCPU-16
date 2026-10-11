@@ -24,6 +24,18 @@ def run_image(image, maximum_steps=100_000):
 
 
 class CCompilerTests(unittest.TestCase):
+    def test_c90_stdio_printf_writes_to_the_console_device(self):
+        image = compile_source(
+            '#include <stdio.h>\n'
+            'int main(void) {\n'
+            '    int count;\n'
+            '    count = printf("N=%d U=%u H=%04x S=%s %%", -12, 7U, 42U, "ok");\n'
+            '    return count != 23;\n'
+            '}\n'
+        )
+        cpu, _ = run_image(image)
+        self.assertEqual(cpu.console_device.output.decode("ascii"), "N=-12 U=7 H=002a S=ok %")
+
     def test_c90_unary_operators_require_valid_operand_types(self):
         invalid_sources = (
             "int main(void) { int *pointer; -pointer; return 0; }\n",

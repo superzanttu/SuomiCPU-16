@@ -7,13 +7,14 @@ import array
 import struct
 import random
 import os
+from src.console_device import ConsoleDevice
 from pathlib import Path
 
 # Tuomme tarvittavat asiat työkaluista
 from tools.assembler import AssemblyError, AssemblyImage, MemorySegment, assemble_file
 from tools.c_compiler import CCompilerError, compile_file
 from tools.sc16net import DEFAULT_PORT, MAX_PAYLOAD, NetNode, UdpTransport
-from src.lib_disk import DiskDevice
+from src.lib_disk import DiskDevice, DiskDeviceError
 from src.isa import (
     FAR_BRANCH_MASK,
     FAR_BRANCH_PREFIX,
@@ -81,6 +82,7 @@ VRAM_START  = 0x30000 # Videomuistin alku (tänne piirretään ruutu)
 KBD_ADDR    = 0x43000 # Näppäimistön osoite
 ICR_ADDR    = 0x43002 # Keskeytysten ohjaus
 DISK_BASE   = 0x43100 # Levylaitteen ohjaus (Disk storage)
+DISK_STATUS = DISK_BASE + 16
 # DISK_BASE:
 # +0: Control register (Byte)
 #     0x01: Load disk (Disk ID in +1..+8)
@@ -90,7 +92,12 @@ DISK_BASE   = 0x43100 # Levylaitteen ohjaus (Disk storage)
 # +1..+8: Disk ID (8 chars)
 # +10..+11: Block pointer (16-bit)
 # +12..+13: Buffer offset for RAM (16-bit)
+# +16: Last command status (0 = success, 1 = device/operation error)
 RTC_START   = 0x43010 # Reaaliaikakello
+CONSOLE_DATA = 0x43200
+CONSOLE_STATUS = 0x43201
+CONSOLE_CONTROL = 0x43202
+BIOS_BASE = 0x43040
 
 KEYS_ADDR   = 0x43004 # Mitkä näppäimet on painettuna
 MOUSE_ADDR  = 0x43008 # Mouse: +0 X word, +2 Y word, +4 held buttons, +5 click events (one frame)
@@ -115,6 +122,11 @@ TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
+DISPLAY_WIDTH = 960
+DISPLAY_HEIGHT = 400
+CONSOLE_X = SCREEN_WIDTH
+CONSOLE_Y = 0
+GAME_Y = 80
 DOUBLE_CLICK_MS = 400  # Max gap between two clicks counted as a double click
 WINDOW_SCALE = 3   # Tehdään ikkunasta isompi, jotta näkyy paremmin
 DISPLAY_FPS = 30
@@ -122,29 +134,44 @@ MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed regi
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
 
 
-def _display_viewport(screen_size):
-    scale = min(screen_size[0] / SCREEN_WIDTH, screen_size[1] / SCREEN_HEIGHT)
-    width = int(SCREEN_WIDTH * scale)
-    height = int(SCREEN_HEIGHT * scale)
+def _display_viewport(screen_size, virtual_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT)):
+    virtual_width, virtual_height = virtual_size
+    scale = min(screen_size[0] / virtual_width, screen_size[1] / virtual_height)
+    width = int(virtual_width * scale)
+    height = int(virtual_height * scale)
     return (screen_size[0] - width) // 2, (screen_size[1] - height) // 2, width, height
 
 
-def _screen_to_logical(position, screen_size):
-    left, top, width, height = _display_viewport(screen_size)
-    x = max(0, min(SCREEN_WIDTH - 1, int((position[0] - left) * SCREEN_WIDTH / width)))
-    y = max(0, min(SCREEN_HEIGHT - 1, int((position[1] - top) * SCREEN_HEIGHT / height)))
+def _screen_to_logical(
+    position,
+    screen_size,
+    virtual_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT),
+):
+    left, top, width, height = _display_viewport(screen_size, virtual_size)
+    virtual_width, virtual_height = virtual_size
+    display_x = int((position[0] - left) * virtual_width / width)
+    display_y = int((position[1] - top) * virtual_height / height)
+    if virtual_size == (SCREEN_WIDTH, SCREEN_HEIGHT):
+        return (
+            max(0, min(SCREEN_WIDTH - 1, display_x)),
+            max(0, min(SCREEN_HEIGHT - 1, display_y)),
+        )
+    x = max(0, min(SCREEN_WIDTH - 1, display_x))
+    y = max(0, min(SCREEN_HEIGHT - 1, display_y - GAME_Y))
     return x, y
 
 
 def _set_display_mode(fullscreen):
     if fullscreen:
         return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-    return pygame.display.set_mode((SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE))
+    return pygame.display.set_mode(
+        (DISPLAY_WIDTH * WINDOW_SCALE // 2, DISPLAY_HEIGHT * WINDOW_SCALE // 2)
+    )
 
 
 def _present_scaled(canvas, screen):
     screen.fill((0, 0, 0))
-    viewport = _display_viewport(screen.get_size())
+    viewport = _display_viewport(screen.get_size(), canvas.get_size())
     scaled = pygame.transform.scale(canvas, viewport[2:])
     screen.blit(scaled, viewport[:2])
     pygame.display.flip()
@@ -195,7 +222,16 @@ def _load_jit():
                 if src_dir not in sys.path:
                     sys.path.insert(0, src_dir)
                 import sc16_jit
-                if sc16_jit.CONSTANTS == (MEM_MASK, GPU_BASE, ICR_ADDR, DISK_BASE):
+                expected_constants = (
+                    MEM_MASK,
+                    GPU_BASE,
+                    ICR_ADDR,
+                    DISK_BASE,
+                    CONSOLE_DATA,
+                    CONSOLE_STATUS,
+                    CONSOLE_CONTROL,
+                )
+                if sc16_jit.CONSTANTS == expected_constants:
                     _JIT = sc16_jit
             except Exception:
                 _JIT = None
@@ -222,6 +258,9 @@ class SuomiCompute16:
         self.screen = _set_display_mode(self.fullscreen)
         pygame.display.set_caption("SuomiCPU-16 Emulator")
         self.clock = pygame.time.Clock()
+        self.console_device = ConsoleDevice()
+        self.console_font = pygame.font.Font(None, 13)
+        self.display_surface = pygame.Surface((DISPLAY_WIDTH, DISPLAY_HEIGHT))
         self.palette = [pygame.Color(i, i, i) for i in range(256)]
         for index, color in enumerate(PALETTE_COLORS):
             self.palette[index] = color
@@ -249,6 +288,30 @@ class SuomiCompute16:
             self.gpu_command(val & 0xFF)
         elif addr == DISK_BASE:
             self.disk_control(val & 0xFF)
+        elif addr == CONSOLE_DATA:
+            self._console_device().write_data(val)
+        elif addr == CONSOLE_CONTROL:
+            self._console_device().control = val & 0x03
+        elif addr == CONSOLE_STATUS and val & 0x04:
+            self._console_device().clear_overrun()
+
+    def _console_device(self):
+        if not hasattr(self, "console_device"):
+            self.console_device = ConsoleDevice()
+        return self.console_device
+
+    def read(self, addr):
+        addr &= MEM_SIZE - 1
+        if addr == CONSOLE_DATA:
+            return self._console_device().read_data()
+        if addr == CONSOLE_STATUS:
+            return self._console_device().status
+        if addr == CONSOLE_CONTROL:
+            return self._console_device().control
+        return self.memory[addr]
+
+    def read_16(self, addr):
+        return (self.read(addr) << 8) | self.read(addr + 1)
 
     def _gpu_word(self, offset, signed=True):
         value = (self.memory[GPU_BASE + offset] << 8) | self.memory[GPU_BASE + offset + 1]
@@ -366,35 +429,41 @@ class SuomiCompute16:
 
     def disk_control(self, command):
         """Disk device memory-mapped control."""
-        if command & 0x01: # Load disk
-            disk_id = "".join(chr(self.memory[DISK_BASE + 1 + i]) for i in range(8))
-            self.disk.load_disk(disk_id)
-            self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
-        if command & 0x20: # Set write protect from [ptr] (0/1)
-            self.disk.set_protected(self.read_16(DISK_BASE + 10) != 0)
-            self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
-        if command & 0x02: # Unload disk
-            self.disk.unload_disk()
-        if command & 0x04: # Read block
-            ptr = self.read_16(DISK_BASE + 10)
-            offset = self.read_16(DISK_BASE + 12)
-            data = self.disk.read_block(ptr)
-            for i, char in enumerate(data):
-                self.write(RAM_START + offset + i, ord(char))
-        if command & 0x10: # Directory: name of disk number [ptr] to RAM, count to +14
-            index = self.read_16(DISK_BASE + 10)
-            offset = self.read_16(DISK_BASE + 12)
-            names = self.disk.list_disks()
-            self.write_16(DISK_BASE + 14, len(names))
-            text = names[index] if index < len(names) else ""
-            for i, char in enumerate(text + "\0"):
-                self.write(RAM_START + offset + i, ord(char))
-            self.write(RAM_START + offset + 9, 1 if text and self.disk.is_protected(text) else 0)
-        if command & 0x08: # Write block
-            ptr = self.read_16(DISK_BASE + 10)
-            offset = self.read_16(DISK_BASE + 12)
-            data = "".join(chr(self.read(RAM_START + offset + i)) for i in range(256))
-            self.disk.write_block(ptr, data)
+        if not hasattr(self, "disk"):
+            self.disk = DiskDevice()
+        self.memory[DISK_STATUS] = 0
+        try:
+            if command & 0x01: # Load disk
+                disk_id = "".join(chr(self.memory[DISK_BASE + 1 + i]) for i in range(8))
+                self.disk.load_disk(disk_id)
+                self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
+            if command & 0x20: # Set write protect from [ptr] (0/1)
+                self.disk.set_protected(self.read_16(DISK_BASE + 10) != 0)
+                self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
+            if command & 0x02: # Unload disk
+                self.disk.unload_disk()
+            if command & 0x04: # Read block
+                ptr = self.read_16(DISK_BASE + 10)
+                offset = self.read_16(DISK_BASE + 12)
+                data = self.disk.read_block(ptr)
+                for i, char in enumerate(data):
+                    self.write(RAM_START + offset + i, ord(char))
+            if command & 0x10: # Directory: name of disk number [ptr] to RAM, count to +14
+                index = self.read_16(DISK_BASE + 10)
+                offset = self.read_16(DISK_BASE + 12)
+                names = self.disk.list_disks()
+                self.write_16(DISK_BASE + 14, len(names))
+                text = names[index] if index < len(names) else ""
+                for i, char in enumerate(text + "\0"):
+                    self.write(RAM_START + offset + i, ord(char))
+                self.write(RAM_START + offset + 9, 1 if text and self.disk.is_protected(text) else 0)
+            if command & 0x08: # Write block
+                ptr = self.read_16(DISK_BASE + 10)
+                offset = self.read_16(DISK_BASE + 12)
+                data = "".join(chr(self.read(RAM_START + offset + i)) for i in range(256))
+                self.disk.write_block(ptr, data)
+        except DiskDeviceError:
+            self.memory[DISK_STATUS] = 1
 
     def _gpu_net(self, command, query, arg):
         """Networking commands; see tools/sc16net.py for the protocol."""
@@ -552,11 +621,6 @@ class SuomiCompute16:
                     if bits & (0x80 >> column):
                         self._back_pixel(x + column, y + row, color)
             x += 6
-
-    def read(self, addr): return self.memory[addr & (MEM_SIZE - 1)]
-    def read_16(self, addr):
-        memory = self.memory
-        return (memory[addr & (MEM_SIZE - 1)] << 8) | memory[(addr + 1) & (MEM_SIZE - 1)]
 
     def write_16(self, addr, val):
         self.write(addr, (val >> 8) & 0xFF)
@@ -1136,7 +1200,29 @@ class SuomiCompute16:
         if now.second % 1 == 0: self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x08)
 
     def update_display(self):
-        _present_scaled(self.vram_surface, self.screen)
+        self.display_surface.fill((0, 0, 0))
+        self.display_surface.blit(self.vram_surface, (0, GAME_Y))
+        pygame.draw.rect(self.display_surface, (36, 45, 58), (0, 0, SCREEN_WIDTH, 24))
+        pygame.draw.rect(
+            self.display_surface,
+            (14, 20, 28),
+            (CONSOLE_X, CONSOLE_Y, DISPLAY_WIDTH - CONSOLE_X, DISPLAY_HEIGHT),
+        )
+        pygame.draw.rect(
+            self.display_surface,
+            (36, 45, 58),
+            (CONSOLE_X, CONSOLE_Y, DISPLAY_WIDTH - CONSOLE_X, 22),
+        )
+        label = self.console_font.render("SC-16 CONSOLE  |  F11: fullscreen", True, (220, 230, 240))
+        self.display_surface.blit(label, (CONSOLE_X + 8, CONSOLE_Y + 3))
+        self._console_device().render(
+            self.display_surface,
+            self.console_font,
+            (190, 220, 190),
+            origin=(CONSOLE_X + 8, CONSOLE_Y + 24),
+            line_height=15,
+        )
+        _present_scaled(self.display_surface, self.screen)
 
     def _max_speed(self):
         memory = getattr(self, 'memory', None)
@@ -1236,10 +1322,15 @@ class SuomiCompute16:
         self.sp = 0x2FFFF
         self.pc = self.entry_point
         self.running = True
+        self._console_device().reset()
+        from src.bios import initialize_bios
+
+        initialize_bios(self)
 
     def run(self):
         self.reset()
         self.window_open = True
+        pygame.key.start_text_input()
         deferred_release = 0
         turbo_frames = 0
         while self.window_open:
@@ -1255,6 +1346,8 @@ class SuomiCompute16:
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
                     self.set_fullscreen(not self.fullscreen)
                     continue
+                if event.type == pygame.TEXTINPUT:
+                    self._console_device().receive(event.text.encode("utf-8"))
                 if event.type == pygame.KEYUP and event.key in KEY_BITS:
                     # A tap shorter than one frame stays visible for that frame.
                     if KEY_BITS[event.key] & fresh_keys:
@@ -1271,8 +1364,10 @@ class SuomiCompute16:
                         self.press_keys(KEY_BITS[event.key])
                     if event.key == pygame.K_RETURN:
                         key = 13
+                        self._console_device().receive(b"\n")
                     elif event.key == pygame.K_BACKSPACE:
                         key = 8
+                        self._console_device().receive(b"\x08")
                     else:
                         key = ord(event.unicode) if event.unicode else 0
                     self.write(KBD_ADDR, key)
@@ -1293,6 +1388,7 @@ class SuomiCompute16:
                 self.update_display()
             if not self._max_speed():
                 self.clock.tick(DISPLAY_FPS)
+        pygame.key.stop_text_input()
 
 def main():
     parser = argparse.ArgumentParser(description="Run the SC-16 emulator.")
@@ -1305,6 +1401,11 @@ def main():
                         help="UDP port for LAN games (all players must use the same port)")
     parser.add_argument("--fullscreen", action="store_true",
                         help="start in fullscreen mode (toggle at runtime with F11)")
+    parser.add_argument(
+        "--disk",
+        metavar="ID",
+        help="mount an existing 8-character virtual data disk and skip the BIOS menu",
+    )
     args = parser.parse_args()
 
     try:
@@ -1316,14 +1417,37 @@ def main():
 
     try:
         sc16 = None
-        if program is None:
+        sc16 = SuomiCompute16(fullscreen=args.fullscreen)
+        sc16.net_port = args.net_port
+        if program is not None:
+            sc16.load_program(program)
+
+        if args.disk:
+            from src.bios import BIOSError, mount_data_disk
+
+            try:
+                mount_data_disk(sc16, args.disk)
+            except BIOSError as exc:
+                parser.error(str(exc))
+            selected = args.disk
+        else:
+            from src.bios import select_data_disk
+
+            selected = select_data_disk(sc16)
+
+        if selected == "launcher" or (program is None and selected is not None):
             from src.sc_launcher import run_launcher
 
-            run_launcher(net_port=args.net_port, fullscreen=args.fullscreen)
-        else:
-            sc16 = SuomiCompute16(fullscreen=args.fullscreen)
-            sc16.net_port = args.net_port
-            sc16.load_program(program)
+            run_launcher(
+                net_port=args.net_port,
+                fullscreen=args.fullscreen,
+                startup_disk=(
+                    selected
+                    if selected not in ("launcher", "none")
+                    else None
+                ),
+            )
+        elif program is not None and selected is not None:
             sc16.run()
     finally:
         if sc16 is not None and getattr(sc16, 'net', None) is not None:

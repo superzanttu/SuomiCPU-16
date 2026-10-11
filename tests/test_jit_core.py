@@ -8,7 +8,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 
 import SuomiCPU as emulator  # noqa: E402
-from SuomiCPU import DISK_BASE, GPU_BASE, ICR_ADDR, MEM_SIZE, SuomiCompute16  # noqa: E402
+from SuomiCPU import (  # noqa: E402
+    CONSOLE_CONTROL,
+    CONSOLE_DATA,
+    CONSOLE_STATUS,
+    DISK_BASE,
+    GPU_BASE,
+    ICR_ADDR,
+    MEM_SIZE,
+    SuomiCompute16,
+)
 from tests.gfx_harness import make_cpu  # noqa: E402
 from tools.assembler import AssemblyImage, MemorySegment, assemble  # noqa: E402
 
@@ -155,7 +164,18 @@ class JitEquivalenceTests(unittest.TestCase):
                 self.assertTrue(state(slow) == state(fast), f"seed {seed} diverged")
         self.assertGreater(compared, 200)
     def test_constants_match(self):
-        self.assertEqual(sc16_jit.CONSTANTS, (emulator.MEM_MASK, GPU_BASE, ICR_ADDR, DISK_BASE))
+        self.assertEqual(
+            sc16_jit.CONSTANTS,
+            (
+                emulator.MEM_MASK,
+                GPU_BASE,
+                ICR_ADDR,
+                DISK_BASE,
+                CONSOLE_DATA,
+                CONSOLE_STATUS,
+                CONSOLE_CONTROL,
+            ),
+        )
         self.assertEqual(MEM_SIZE - 1, emulator.MEM_MASK)
 
 

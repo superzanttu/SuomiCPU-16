@@ -20,11 +20,22 @@ MEM_MASK = 2**19 - 1
 GPU_BASE = 0x43020
 ICR_ADDR = 0x43002
 DISK_BASE = 0x43100
+CONSOLE_DATA = 0x43200
+CONSOLE_STATUS = 0x43201
+CONSOLE_CONTROL = 0x43202
 FAR_CONTROL_MASK = 0xF83F
 FAR_CONTROL_PREFIX = 0xF83E
 FAR_BRANCH_MASK = 0xF80F
 FAR_BRANCH_PREFIX = 0xF80D
-CONSTANTS = (MEM_MASK, GPU_BASE, ICR_ADDR, DISK_BASE)
+CONSTANTS = (
+    MEM_MASK,
+    GPU_BASE,
+    ICR_ADDR,
+    DISK_BASE,
+    CONSOLE_DATA,
+    CONSOLE_STATUS,
+    CONSOLE_CONTROL,
+)
 
 
 @njit(cache=True)
@@ -58,7 +69,13 @@ def _rd_pc(mem, a):
 def _hits_gpu(a, width=2):
     for offset in range(width):
         address = (a + offset) & MEM_MASK
-        if address == GPU_BASE or address == DISK_BASE:
+        if address in (
+            GPU_BASE,
+            DISK_BASE,
+            CONSOLE_DATA,
+            CONSOLE_STATUS,
+            CONSOLE_CONTROL,
+        ):
             return True
     return False
 
@@ -320,7 +337,11 @@ def run_block(mem, regs, st, budget):
             else:
                 bail = True
         elif op == 27:
-            regs[rd] = _rd16(mem, sp + imm)
+            addr = (sp + imm) & MEM_MASK
+            if _hits_gpu(addr):
+                bail = True
+            else:
+                regs[rd] = _rd16(mem, addr)
         elif op == 5:
             a = regs[rs1]
             b = regs[rs2]
@@ -360,7 +381,11 @@ def run_block(mem, regs, st, budget):
         elif op == 7:
             regs[rd] = regs[rs1] & regs[rs2]
         elif op == 25:
-            regs[rd] = _rd16(mem, regs[rs1])
+            addr = regs[rs1]
+            if _hits_gpu(addr):
+                bail = True
+            else:
+                regs[rd] = _rd16(mem, addr)
         elif op == 28:
             addr = (sp + imm) & MEM_MASK
             if _hits_gpu(addr):
@@ -376,10 +401,14 @@ def run_block(mem, regs, st, budget):
         elif op == 11:
             npc = instr & 0x7FF
         elif op == 2:
-            regs[rd] = np.int64(mem[regs[rs1] & MEM_MASK])
+            addr = regs[rs1] & MEM_MASK
+            if _hits_gpu(addr, 1):
+                bail = True
+            else:
+                regs[rd] = np.int64(mem[addr])
         elif op == 3:
             a = regs[rs1]
-            if (a & MEM_MASK) == GPU_BASE or (a & MEM_MASK) == DISK_BASE:
+            if _hits_gpu(a, 1):
                 bail = True
             else:
                 mem[a & MEM_MASK] = regs[rd] & 0xFF

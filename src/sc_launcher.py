@@ -17,6 +17,7 @@ from src.SuomiCPU import (
 )
 from tools.assembler import AssemblyError
 from tools.sc16net import DEFAULT_PORT
+from src.lib_disk import DiskDeviceError
 
 
 BACKGROUND = (10, 18, 31)
@@ -95,6 +96,7 @@ class SCLauncher:
         modules_dir: str | Path,
         net_port: int = DEFAULT_PORT,
         fullscreen: bool = False,
+        startup_disk: str | None = None,
     ):
         pygame.init()
         self.fullscreen = fullscreen
@@ -108,6 +110,7 @@ class SCLauncher:
         self.small_font = pygame.font.Font(None, 13)
         self.modules_dir = Path(modules_dir)
         self.net_port = net_port
+        self.startup_disk = startup_disk
         self.modules: list[Module] = []
         self.selected = 0
         self.scroll = 0
@@ -243,8 +246,12 @@ class SCLauncher:
         emulator = SuomiCompute16(fullscreen=self.fullscreen)
         emulator.net_port = self.net_port
         try:
+            if self.startup_disk is not None:
+                emulator.disk.load_disk(self.startup_disk)
             emulator.load_program(image)
             emulator.run()
+        except DiskDeviceError as exc:
+            self.error_message = f"{module.name}: cannot mount disk: {exc}"
         finally:
             network = getattr(emulator, "net", None)
             if network is not None:
@@ -257,7 +264,11 @@ class SCLauncher:
         self.error_message = ""
 
     def _handle_click(self, position: tuple[int, int]) -> None:
-        x, y = _screen_to_logical(position, self.screen.get_size())
+        x, y = _screen_to_logical(
+            position,
+            self.screen.get_size(),
+            (SCREEN_WIDTH, SCREEN_HEIGHT),
+        )
         if 217 <= x < 310 and 215 <= y < 235:
             self._launch_selected()
             return
@@ -308,7 +319,13 @@ def run_launcher(
     modules_dir: str | Path | None = None,
     net_port: int = DEFAULT_PORT,
     fullscreen: bool = False,
+    startup_disk: str | None = None,
 ) -> None:
     root = Path(__file__).resolve().parent.parent
-    launcher = SCLauncher(modules_dir or root / "modules", net_port, fullscreen)
+    launcher = SCLauncher(
+        modules_dir or root / "modules",
+        net_port,
+        fullscreen,
+        startup_disk,
+    )
     launcher.run()

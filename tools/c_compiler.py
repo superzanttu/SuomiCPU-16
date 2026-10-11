@@ -106,6 +106,13 @@ STANDARD_C_SOURCE = {
     },
     **{name: "locale.c" for name in ("setlocale", "localeconv")},
     **{name: "time.c" for name in ("clock", "time")},
+    **{
+        name: "stdio.c"
+        for name in (
+            "fgetc", "fputc", "fputs", "getchar", "putchar", "puts",
+            "printf", "fprintf", "vprintf", "vfprintf",
+        )
+    },
 }
 
 
