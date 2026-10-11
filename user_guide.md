@@ -546,6 +546,12 @@ C90 constructs, target type requirements, and the standard library are not
 implemented. Do not assume that a program accepted by another C90 compiler
 will compile or have identical behavior on SC-16.
 
+The ABI choices targeted for full conformance, including type representations,
+pointer encoding, aggregate layout, and function-call conventions, are recorded
+in [`docs/c90_target_abi.md`](docs/c90_target_abi.md). The document describes
+the intended target and does not imply that the current compiler implements
+those choices completely.
+
 Supported language features include:
 
 - File-scope and block-scope declarations; function prototypes, modern
@@ -554,9 +560,13 @@ Supported language features include:
   parameter declarations (undeclared old-style parameters default to `int`);
   unspecified-parameter declarations using `f()` distinct from no-argument
   prototypes using `f(void)`; recursion; and C90 declarations before statements
-  within a block.
-- `typedef` names, enumerations, structure and union declarations, member access
-  with `.` and `->`, scalar, array, and aggregate initialization, and C90
+  within a block. Variadic prototypes and definitions accept calls with the
+  required fixed arguments followed by additional arguments, applying the
+  default promotions needed by the current target types. `<stdarg.h>` provides
+  `va_list`, `va_start`, `va_arg`, and `va_end` for accessing variadic arguments.
+- `typedef` names, including one-dimensional array typedefs, enumerations,
+  structure and union declarations, member access with `.` and `->`, scalar,
+  array, and aggregate initialization, and C90
   integer type specifiers including standalone `signed` and `unsigned`;
   `char` and `unsigned char` operands receive integer promotions. Global
   pointer initializers accept null pointer constant expressions and the
@@ -564,7 +574,8 @@ Supported language features include:
   incompatible function parameter types are diagnosed. Unary arithmetic,
   bitwise complement, and logical operators diagnose operands that do not meet
   their C90 type constraints.
-- One-dimensional bounded arrays and initialized arrays with an omitted bound,
+- Bounded arrays, including multidimensional arrays and initialized arrays with
+  an omitted outer bound,
   integer constant expression bounds (including arithmetic, enum constants,
   casts, `sizeof` on complete object types, and conditional expressions), array parameters
   adjusted to pointers, pointers, casts, `sizeof`, and the comma and conditional
@@ -610,6 +621,10 @@ minimum requirements:
   In particular, `double` does not meet C90's required minimum range or
   precision.
 - Object pointers occupy three bytes for the machine's 19-bit address space.
+  `size_t` is unsigned 32-bit `long`, and `ptrdiff_t` is signed 32-bit `long`;
+  compatible object-pointer subtraction produces a signed 32-bit element
+  difference. Pointer arithmetic and dereferencing still have limitations
+  outside the compiler's currently supported address and offset paths.
   Function pointers and general function-pointer calls are not supported.
 - `static`, `extern`, `auto`, `register`, `const`, and `volatile` specifiers
   are accepted in supported declarations but do not have their full C linkage,
@@ -619,9 +634,10 @@ minimum requirements:
   zeroed. Local variables, arguments, return addresses, and temporaries use the
   machine stack.
 
-Important language gaps include multidimensional arrays, array typedefs,
-function pointers, structure/union value assignment and passing/returning
-records by value, and parts of C90's declarator, initializer, and
+Important language gaps include multidimensional array function-parameter
+declarators beyond the supported forms, function pointers, structure/union value
+assignment and passing/returning records by value, and parts of C90's
+declarator, initializer, and
 constant-expression rules. The preprocessor also does not implement every
 translation-phase and directive semantic required for strict C90 conformance.
 Numeric `#line` directives remap subsequent diagnostic line numbers, including
@@ -631,7 +647,7 @@ filename is retained.
 
 The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`,
 `<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`,
-`<string.h>`, `<locale.h>`, and `<time.h>`. `<stddef.h>` includes `offsetof`,
+`<string.h>`, `<stdarg.h>`, `<locale.h>`, and `<time.h>`. `<stddef.h>` includes `offsetof`,
 which supports nested struct/union member designators in constant initializers.
 The string/memory
 routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,
@@ -645,8 +661,9 @@ selection, end pointers, and `errno` range reporting using the target's 32-bit
 There is no target environment-variable store, so `getenv` returns `NULL`;
 there is no command processor, so `system(NULL)` returns zero and commands
 return -1. `<assert.h>` evaluates assertions unless `NDEBUG` is defined and
-stops the target on a failed assertion. `RAND_MAX` is 32767; the sequence from
-`rand` is implementation-defined. `<locale.h>` exposes only the `"C"` locale;
+stops the target on a failed assertion; enabled assertions expand to a `void`
+expression and evaluate their argument once. `RAND_MAX` is 32767; the sequence
+from `rand` is implementation-defined. `<locale.h>` exposes only the `"C"` locale;
 `setlocale` rejects other locale names, while `localeconv` reports the C locale
 numeric and monetary conventions. `<time.h>` defines `clock_t`, `time_t`, and
 `CLOCKS_PER_SEC`, and provides `clock` and `time`; since the target has no

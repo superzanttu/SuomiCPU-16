@@ -2,7 +2,7 @@
 #define _SC16_STDDEF_H
 
 typedef unsigned long size_t;
-typedef int ptrdiff_t;
+typedef long ptrdiff_t;
 typedef int wchar_t;
 
 #define NULL 0

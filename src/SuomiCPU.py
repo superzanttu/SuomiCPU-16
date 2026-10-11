@@ -851,6 +851,30 @@ class SuomiCompute16:
         self.registers[rd] = (result >> 16) & 0xFFFF
         self.registers[rd + 1] = result & 0xFFFF
 
+    def _execute_address(self, instr):
+        """Execute byte/word access through a full 19-bit register-pair address."""
+        data_register = (instr >> 8) & 0x7
+        control = self.read_16(self.pc)
+        self.pc += 2
+        operation = control >> 12
+        address_register = control & 0x7
+        if address_register & 1 or address_register > 6:
+            raise ValueError("19-bit memory operations require an even address pair")
+        address = (
+            ((self.registers[address_register] & 0xFFFF) << 16)
+            | (self.registers[address_register + 1] & 0xFFFF)
+        ) & MEM_MASK
+        if operation == 0:
+            self.registers[data_register] = self.read(address)
+        elif operation == 1:
+            self.write(address, self.registers[data_register] & 0xFF)
+        elif operation == 2:
+            self.registers[data_register] = self.read_16(address)
+        elif operation == 3:
+            self.write_16(address, self.registers[data_register])
+        else:
+            raise ValueError("invalid 19-bit memory operation")
+
     def _execute_shift(self, rd, value, operation, count):
         """Shift or rotate `value` by `count` bits (0-15); C gets the last bit out."""
         if count == 0:
@@ -935,6 +959,8 @@ class SuomiCompute16:
             self._execute_muldiv(instr)
         elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81A:
             self._execute_wide(instr)
+        elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81C:
+            self._execute_address(instr)
         elif opcode == OP_SHR and (instr & 0xF8FF) == 0xF81F:
             self._execute_alu(instr)
         elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81B:

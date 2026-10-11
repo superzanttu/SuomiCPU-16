@@ -5,7 +5,7 @@
 #define assert(expression) ((void)0)
 #else
 void abort(void);
-#define assert(expression) ((expression) ? 0 : (abort(), 0))
+#define assert(expression) ((void)((expression) || (abort(), 0)))
 #endif
 
 #endif

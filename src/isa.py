@@ -65,6 +65,16 @@ WIDE_OPERATIONS = {
     "MOD32S": 15,
 }
 
+# Full-address byte/word memory operations. The address is a 19-bit value in an
+# even/odd register pair; the data register may be any general-purpose register.
+ADDRESS_PREFIX = 0x1C
+ADDRESS_OPERATIONS = {
+    "LD19": 0,
+    "ST19": 1,
+    "LDW19": 2,
+    "STW19": 3,
+}
+
 # Integer multiply/divide group: a 32-bit (or 48-bit with an immediate) instruction.
 #   word 1: 0xF800 | (Rd << 8) | 0x1E   (OP_SHR extension space, prefix 0x1E)
 #   word 2: (operation << 12) | (immediate flag << 11) | Rs

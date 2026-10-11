@@ -167,6 +167,7 @@ class Function:
     body: Stmt
     local_count: int
     line: int
+    variadic: bool = False
 
 
 @dataclass
@@ -231,6 +232,9 @@ _ASSIGNMENTS = {
 def _type_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
     if c_type.endswith("*"):
         return 3
+    array_type = re.fullmatch(r"(.+)\[(\d+)\]", c_type)
+    if array_type is not None:
+        return int(array_type.group(2)) * _type_size(array_type.group(1), records)
     if records is not None and c_type in records:
         return records[c_type].size
     if c_type in ("long", "unsigned long"):
@@ -447,7 +451,7 @@ class _Parser:
         self.globals: list[Global] = []
         self.functions: list[Function] = []
         self.prototypes: dict[
-            str, tuple[str, int | None, tuple[str, ...] | None]
+            str, tuple[str, int | None, tuple[str, ...] | None, bool]
         ] = {}
         self._local_count = 0
         self.typedef_scopes: list[dict[str, str]] = [{}]
@@ -679,7 +683,7 @@ class _Parser:
         if expression.kind == "name" and expression.value in self.enum_constants:
             return self.enum_constants[str(expression.value)]
         if expression.kind == "sizeof_type":
-            return _type_size(str(expression.value), self.records)
+            return int(expression.value)
         if expression.kind == "cast" and expression.value in INTEGER_TYPES:
             return _cast_integer_constant(
                 self._enum_constant_value(expression.children[0]),
@@ -738,23 +742,37 @@ class _Parser:
 
     def _declarator_suffix(self, c_type: str) -> tuple[str, int]:
         if not self.accept("["):
+            array_typedef = re.fullmatch(r"(.+)\[(\d+)\]", c_type)
+            if array_typedef is not None:
+                return array_typedef.group(1), int(array_typedef.group(2))
             return c_type, 0
-        if self.accept("]"):
-            return c_type, -1
-        expression = self.parse_expression()
-        self.expect("]")
-        try:
-            size = self._enum_constant_value(expression)
-        except CCompilerError as exc:
-            raise CCompilerError(
-                f"{self.filename}:{expression.line}: array size must be a positive "
-                "integer constant expression"
-            ) from exc
-        if size <= 0 or size > 0xFFFF:
-            raise CCompilerError(
-                f"{self.filename}:{expression.line}: array size is out of range"
-            )
-        return c_type, size
+        dimensions = []
+        while True:
+            if self.accept("]"):
+                size = -1
+            else:
+                expression = self.parse_expression()
+                self.expect("]")
+                try:
+                    size = self._enum_constant_value(expression)
+                except CCompilerError as exc:
+                    raise CCompilerError(
+                        f"{self.filename}:{expression.line}: array size must be a positive "
+                        "integer constant expression"
+                    ) from exc
+                if size <= 0 or size > 0xFFFF:
+                    raise CCompilerError(
+                        f"{self.filename}:{expression.line}: array size is out of range"
+                    )
+            dimensions.append(size)
+            if self.token.value != "[":
+                break
+            self.take()
+        if any(size < 0 for size in dimensions[1:]):
+            raise self.fail("only the outermost array bound may be omitted")
+        for size in reversed(dimensions[1:]):
+            c_type += f"[{size}]"
+        return c_type, dimensions[0]
 
     def _infer_array_size(
         self,
@@ -844,8 +862,9 @@ class _Parser:
                     raise self.fail("duplicate old-style parameter name")
                 self.expect(")")
                 parameters = [("int", parameter_name) for parameter_name in old_style_names]
+                variadic = False
             else:
-                parameters = self.parse_parameters()
+                parameters, variadic = self.parse_parameters()
             if self.accept(";"):
                 if implicit_int_function:
                     raise CCompilerError(
@@ -863,6 +882,7 @@ class _Parser:
                     None if empty_parameter_list else tuple(
                         parameter_type for parameter_type, _ in parameters
                     ),
+                    variadic,
                 )
                 self._merge_function_declaration(name, signature, name_token.line)
                 return
@@ -878,6 +898,7 @@ class _Parser:
                 declarator_type,
                 len(parameters),
                 tuple(parameter_type for parameter_type, _ in parameters),
+                variadic,
             )
             self._merge_function_declaration(
                 name,
@@ -892,7 +913,10 @@ class _Parser:
                     f"{self.filename}:{name_token.line}: function definitions require parameter names"
                 )
             self.functions.append(
-                Function(name, declarator_type, parameters, body, self._local_count, name_token.line)
+                Function(
+                    name, declarator_type, parameters, body, self._local_count,
+                    name_token.line, variadic
+                )
             )
             return
         self.parse_global_declarators(c_type, name_token, declarator_type)
@@ -900,7 +924,7 @@ class _Parser:
     def _merge_function_declaration(
         self,
         name: str,
-        signature: tuple[str, int | None, tuple[str, ...] | None],
+        signature: tuple[str, int | None, tuple[str, ...] | None, bool],
         line: int,
         *,
         old_style: bool = False,
@@ -908,6 +932,7 @@ class _Parser:
         previous = self.prototypes.get(name)
         if previous is not None and (
             previous[0] != signature[0]
+            or previous[3] != signature[3]
             or (
                 previous[1] is not None
                 and signature[1] is not None
@@ -978,23 +1003,26 @@ class _Parser:
             alias_type = self._pointer_type(c_type)
             token = self.expect_identifier("expected a typedef name")
             alias_type, array_size = self._declarator_suffix(alias_type)
-            if array_size:
+            if array_size < 0:
                 raise CCompilerError(
-                    f"{self.filename}:{token.line}: array typedefs are not supported"
+                    f"{self.filename}:{token.line}: typedef array size must be specified"
                 )
+            if array_size:
+                alias_type += f"[{array_size}]"
             self.typedef_scopes[-1][token.value] = alias_type
             if not self.accept(","):
                 break
         self.expect(";")
 
-    def parse_parameters(self) -> list[tuple[str, str | None]]:
+    def parse_parameters(self) -> tuple[list[tuple[str, str | None]], bool]:
         if self.accept(")"):
-            return []
+            return [], False
         if self.token.value == "void" and self.peek() == ")":
             self.take()
             self.expect(")")
-            return []
+            return [], False
         parameters = []
+        variadic = False
         while True:
             c_type = self.parse_type()
             c_type = self._pointer_type(c_type)
@@ -1003,14 +1031,20 @@ class _Parser:
             name = None
             if re.fullmatch(r"[A-Za-z_]\w*", self.token.value):
                 name = self.take().value
-            _, array_size = self._declarator_suffix(c_type)
+            c_type, array_size = self._declarator_suffix(c_type)
             if array_size != 0:
                 c_type += "*"
             parameters.append((c_type, name))
             if not self.accept(","):
                 break
+            if self.token.value == ".":
+                self.take()
+                self.expect(".")
+                self.expect(".")
+                variadic = True
+                break
         self.expect(")")
-        return parameters
+        return parameters, variadic
 
     def parse_global_declarators(
         self, c_type: str, first_name: Token, first_type: str
@@ -1271,15 +1305,19 @@ class _Parser:
                 try:
                     c_type = self.parse_type()
                     c_type = self._pointer_type(c_type)
+                    c_type, array_size = self._declarator_suffix(c_type)
                     self.expect(")")
                 except CCompilerError:
                     self.position = saved_position
                 else:
-                    if c_type == "void" or (
+                    if array_size < 0 or c_type == "void" or (
                         c_type in self.records and not self.records[c_type].complete
                     ):
                         raise self.fail("sizeof requires a complete object type")
-                    return Expr("sizeof_type", c_type, line=token.line)
+                    size = _type_size(c_type, self.records)
+                    if array_size:
+                        size *= array_size
+                    return Expr("sizeof_type", size, line=token.line)
             return Expr("sizeof_expr", children=(self.parse_unary(),), line=token.line)
         if self.token.value == "(":
             saved_position = self.position
@@ -1467,7 +1505,7 @@ class _CodeGenerator:
         self.string_data: list[tuple[str, bytes]] = []
         self.current_function: Function | None = None
         self.prototypes: dict[
-            str, tuple[str, int | None, tuple[str, ...] | None]
+            str, tuple[str, int | None, tuple[str, ...] | None, bool]
         ] = {}
         self.used_libraries: set[str] = set()
         self.enum_constants: dict[str, int] = {}
@@ -1600,6 +1638,11 @@ class _CodeGenerator:
         initializer: Expr | None,
         line: int,
     ) -> bytes:
+        if array_size == 0:
+            array_type = re.fullmatch(r"(.+)\[(\d+)\]", c_type)
+            if array_type is not None:
+                c_type = array_type.group(1)
+                array_size = int(array_type.group(2))
         if array_size:
             size = array_size * _type_size(c_type, self.records)
             if initializer is None:
@@ -1690,7 +1733,7 @@ class _CodeGenerator:
         if expression.kind == "name" and str(expression.value) in self.enum_constants:
             return self.enum_constants[str(expression.value)] & WORD_MASK
         if expression.kind == "sizeof_type":
-            return _type_size(str(expression.value), self.records)
+            return int(expression.value)
         if expression.kind == "sizeof_expr":
             return self._sizeof_expression(expression.children[0])
         if expression.kind == "conditional":
@@ -2512,7 +2555,7 @@ class _CodeGenerator:
         if expression.kind == "string":
             return "char*"
         if expression.kind in ("sizeof_type", "sizeof_expr"):
-            return "unsigned int"
+            return "unsigned long"
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), expression.line)
             if variable.array_size:
@@ -2537,6 +2580,9 @@ class _CodeGenerator:
             base_type = self._expression_type(expression.children[0])
             if base_type.endswith("*"):
                 return base_type[:-1]
+            array_type = re.fullmatch(r"(.+)\[(\d+)\]", base_type)
+            if array_type is not None:
+                return array_type.group(1)
             raise self.error(expression.line, "subscripted expression is not a pointer or array")
         if expression.kind == "member":
             operator, field_name = expression.value
@@ -2750,7 +2796,7 @@ class _CodeGenerator:
                     and left_type == right_type
                 ):
                     self._require_pointer_arithmetic_type(left_type, expression.line)
-                    return "int"
+                    return "long"
                 raise self.error(
                     expression.line,
                     "operator - requires arithmetic operands, a pointer and integer, "
@@ -2893,6 +2939,38 @@ class _CodeGenerator:
         self.emit("    ADJSP 3")
         self.stack_depth -= 3
 
+    def _pointer_value_to_wide_pair(self) -> None:
+        self.emit("    MOV R1, R0")
+        self.emit("    LDI R7, 0xFFFF")
+        self.emit("    AND R1, R7")
+        self.emit("    LSR R0, 15")
+        self.emit("    LSR R0, 1")
+
+    def _pointer_difference_expression(
+        self, left: Expr, right: Expr, stride: int
+    ) -> None:
+        self._expression(left)
+        self._pointer_value_to_wide_pair()
+        self.emit("    PUSH R1")
+        self.emit("    PUSH R0")
+        self.stack_depth += 4
+
+        self._expression(right)
+        self._pointer_value_to_wide_pair()
+        self.emit("    MOV R2, R0")
+        self.emit("    MOV R3, R1")
+        self.emit("    LDWS R0, 0")
+        self.emit("    LDWS R1, 2")
+        self.emit("    ADJSP 4")
+        self.stack_depth -= 4
+        self.emit("    SUB32 R0, R2")
+        if stride == 2:
+            self.emit("    ASR32 R0, 1")
+        elif stride > 2:
+            self.emit(f"    LDI R2, {(stride >> 16) & WORD_MASK}")
+            self.emit(f"    LDI R3, {stride & WORD_MASK}")
+            self.emit("    DIV32S R0, R2")
+
     def _lvalue_address(self, expression: Expr, line: int) -> str:
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), line)
@@ -2929,7 +3007,11 @@ class _CodeGenerator:
                     self._array_address(array, "R1", line)
                     self.emit("    ADD R0, R1")
                     return element_type
-            self._expression(base)
+            base_type = self._expression_type(base)
+            if re.fullmatch(r".+\[\d+\]", base_type):
+                self._lvalue_address(base, line)
+            else:
+                self._expression(base)
             self.emit("    ADJSP -3")
             self.emit("    MOVSP R7")
             self._emit_store_pointer("R0")
@@ -2981,8 +3063,10 @@ class _CodeGenerator:
             self._emit_load_pointer("R0")
         elif c_type in ("long", "unsigned long"):
             self.emit("    MOV R7, R0")
-            self.emit("    LDI R6, 0")
-            self.emit("    LD32 R0, R6")
+            self.emit("    LDW R0, R7")
+            self.emit("    INC R7")
+            self.emit("    INC R7")
+            self.emit("    LDW R1, R7")
         else:
             self.emit(
                 f"    {'LD' if _type_size(c_type, self.records) == 1 else 'LDW'} R0, R0"
@@ -3041,10 +3125,12 @@ class _CodeGenerator:
             self.stack_depth += 4
             self._lvalue_address(expression, line)
             self.emit("    MOV R7, R0")
-            self.emit("    LDI R6, 0")
             self.emit("    LDWS R0, 0")
             self.emit("    LDWS R1, 2")
-            self.emit("    ST32 R0, R6")
+            self.emit("    STW R7, R0")
+            self.emit("    INC R7")
+            self.emit("    INC R7")
+            self.emit("    STW R7, R1")
             self.emit("    ADJSP 4")
             self.stack_depth -= 4
             return
@@ -3101,11 +3187,14 @@ class _CodeGenerator:
                 self.emit(f"    LDI R0, 0x{value & WORD_MASK:04X}")
             return
         if kind == "sizeof_type":
-            self._validate_sizeof_type(str(expression.value), expression.line)
-            self.emit(f"    LDI R0, {_type_size(str(expression.value), self.records)}")
+            size = int(expression.value)
+            self.emit(f"    LDI R0, {(size >> 16) & WORD_MASK}")
+            self.emit(f"    LDI R1, {size & WORD_MASK}")
             return
         if kind == "sizeof_expr":
-            self.emit(f"    LDI R0, {self._sizeof_expression(expression.children[0])}")
+            size = self._sizeof_expression(expression.children[0])
+            self.emit(f"    LDI R0, {(size >> 16) & WORD_MASK}")
+            self.emit(f"    LDI R1, {size & WORD_MASK}")
             return
         if kind == "address_constant":
             self.emit(f"    LDA R0, 0x{int(expression.value):05X}")
@@ -3175,8 +3264,10 @@ class _CodeGenerator:
                 parameter_types = [
                     c_type for c_type, _ in self.functions_by_name[name].parameters
                 ]
+                variadic = self.functions_by_name[name].variadic
             else:
                 parameter_types = list(LIBRARY_FUNCTIONS[name][1])
+                variadic = False
                 declared = self.prototypes.get(name)
                 if (
                     declared is not None
@@ -3187,15 +3278,23 @@ class _CodeGenerator:
                 if name in LIBRARY_FILES:
                     self.used_libraries.add(LIBRARY_FILES[name])
             expected = len(parameter_types)
-            if len(arguments) != expected:
+            if len(arguments) < expected or (not variadic and len(arguments) != expected):
                 raise self.error(expression.line, f"{name}() expects {expected} argument(s)")
             if len(arguments) > 63:
                 raise self.error(expression.line, "too many function arguments")
             argument_bytes = 0
             for index in range(len(arguments) - 1, -1, -1):
                 argument = arguments[index]
-                parameter_type = parameter_types[index]
                 source_type = self._expression_type(argument)
+                array_argument = re.fullmatch(r"(.+)\[(\d+)\]", source_type)
+                if array_argument is not None:
+                    source_type = array_argument.group(1) + "*"
+                if index < expected:
+                    parameter_type = parameter_types[index]
+                else:
+                    parameter_type = source_type
+                    if source_type in ("char", "unsigned char"):
+                        parameter_type = "int"
                 integer_types = INTEGER_TYPES
                 numeric_types = ARITHMETIC_TYPES
                 if parameter_type in numeric_types:
@@ -3230,7 +3329,10 @@ class _CodeGenerator:
                         argument.line,
                         f"passing this type to {name}() is not supported",
                     )
-                self._expression(argument)
+                if array_argument is not None:
+                    self._lvalue_address(argument, argument.line)
+                else:
+                    self._expression(argument)
                 self._convert_to_type("R0", parameter_type, source_type)
                 width = _object_size(parameter_type, self.records)
                 if width == 3:
@@ -3275,7 +3377,9 @@ class _CodeGenerator:
                     expression.line,
                 )
                 result_type = self._expression_type(operation)
-                if target_type in ("long", "unsigned long"):
+                if target_type in ("long", "unsigned long") or result_type in (
+                    "long", "unsigned long"
+                ):
                     self._expression(operation)
                 else:
                     self._load_lvalue(target, expression.line)
@@ -3520,6 +3624,15 @@ class _CodeGenerator:
         if operator == "-" and left_type.endswith("*") and right_type in INTEGER_TYPES:
             self._pointer_offset_expression(
                 left, right, _type_size(left_type[:-1], self.records), True
+            )
+            return
+        if (
+            operator == "-"
+            and left_type.endswith("*")
+            and right_type == left_type
+        ):
+            self._pointer_difference_expression(
+                left, right, _type_size(left_type[:-1], self.records)
             )
             return
         if wide_type in ("long", "unsigned long"):

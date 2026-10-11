@@ -103,6 +103,26 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
 
+    def test_c90_ptrdiff_t_uses_signed_32_bit_pointer_differences(self):
+        image = compile_source(
+            "#include <stddef.h>\n"
+            "ptrdiff_t forward;\n"
+            "ptrdiff_t reverse;\n"
+            "int main(void) {\n"
+            "  int values[5];\n"
+            "  forward = &values[4] - &values[1];\n"
+            "  reverse = &values[1] - &values[4];\n"
+            "  return sizeof(ptrdiff_t) != 4\n"
+            "    || forward != 3L || reverse != -3L;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 0)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 3)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 0xFFFF)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 0xFFFD)
+
     def test_c90_conditional_operator_checks_operand_types(self):
         invalid_sources = (
             "struct S { int value; }; int main(void) { struct S value; "
@@ -527,6 +547,84 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
 
+    def test_c90_array_typedef_declarations(self):
+        image = compile_source(
+            "#include <stddef.h>\n"
+            "typedef unsigned int Vector[3];\n"
+            "typedef Vector VectorAlias;\n"
+            "VectorAlias global_vector;\n"
+            "int result;\n"
+            "int third(VectorAlias values) { return values[2]; }\n"
+            "int main(void) {\n"
+            "  typedef char Text[4];\n"
+            "  Text local_text;\n"
+            "  global_vector[2] = 19;\n"
+            "  local_text[1] = 'x';\n"
+            "  result = (sizeof(VectorAlias) == 6)\n"
+            "    && (sizeof(local_text) == 4)\n"
+            "    && (global_vector[2] == 19)\n"
+            "    && (third(global_vector) == 19)\n"
+            "    && (local_text[1] == 'x');\n"
+            "  return result != 1;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 1)
+
+    def test_c90_multidimensional_arrays_index_initialize_and_pass_rows(self):
+        image = compile_source(
+            "typedef int Row[3];\n"
+            "typedef Row Grid[2];\n"
+            "Grid matrix = { {1, 2, 3}, {4, 5, 6} };\n"
+            "int result;\n"
+            "int inferred[][3] = { {14, 15, 16} };\n"
+            "int row_value(int row[3]) { return row[1]; }\n"
+            "int matrix_value(int values[][3]) { return values[1][2]; }\n"
+            "int main(void) {\n"
+            "  int local[2][3] = { {7, 8, 9}, {10, 11, 12} };\n"
+            "  local[1][2] = 13;\n"
+            "  result = sizeof(matrix) == 12\n"
+            "    && sizeof(matrix[0]) == 6\n"
+            "    && sizeof(inferred) == 6\n"
+            "    && matrix[1][0] == 4\n"
+            "    && row_value(matrix[1]) == 5\n"
+            "    && matrix_value(matrix) == 6\n"
+            "    && local[0][2] == 9\n"
+            "    && local[1][2] == 13;\n"
+            "  return result != 1;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 12), 1)
+
+    def test_c90_three_dimensional_array_extents_keep_declarator_order(self):
+        image = compile_source(
+            "int cube[2][3][4];\n"
+            "int size_cube;\n"
+            "int size_plane;\n"
+            "int size_row;\n"
+            "int indexed_value;\n"
+            "int read_element(int values[][3][4]) {\n"
+            "  return values[1][2][3];\n"
+            "}\n"
+            "int main(void) {\n"
+            "  cube[1][2][3] = 27;\n"
+            "  size_cube = sizeof(cube);\n"
+            "  size_plane = sizeof(cube[0]);\n"
+            "  size_row = sizeof(cube[0][0]);\n"
+            "  indexed_value = read_element(cube);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 48), 48)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 50), 24)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 52), 8)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 54), 27)
+
     def test_c90_signed_and_unsigned_without_int_are_int_types(self):
         image = compile_source(
             "signed signed_value;\n"
@@ -818,6 +916,113 @@ class CCompilerTests(unittest.TestCase):
                 "int main(void) { return no_arguments(1); }\n"
             )
 
+    def test_c90_variadic_function_prototype_and_definition(self):
+        image = compile_source(
+            "int first_argument(int fixed, ...);\n"
+            "int first_argument(int fixed, ...) { return fixed; }\n"
+            "int result;\n"
+            "char character;\n"
+            "int main(void) {\n"
+            "  character = 'x';\n"
+            "  result = first_argument(23, character, 70000L, \"tail\");\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 23)
+
+    def test_c90_variadic_calls_require_fixed_parameters(self):
+        with self.assertRaisesRegex(CCompilerError, "expects 1 argument"):
+            compile_source(
+                "int first_argument(int fixed, ...);\n"
+                "int first_argument(int fixed, ...) { return fixed; }\n"
+                "int main(void) { return first_argument(); }\n"
+            )
+
+    def test_c90_variadic_and_nonvariadic_declarations_conflict(self):
+        with self.assertRaisesRegex(CCompilerError, "conflicting declaration"):
+            compile_source(
+                "int first_argument(int fixed, ...);\n"
+                "int first_argument(int fixed);\n"
+                "int first_argument(int fixed) { return fixed; }\n"
+                "int main(void) { return 0; }\n"
+            )
+
+    def test_c90_stdarg_reads_promoted_and_wide_arguments(self):
+        image = compile_source(
+            "#include <stdarg.h>\n"
+            "long result;\n"
+            "long sum_values(long count, ...) {\n"
+            "  va_list arguments;\n"
+            "  int promoted;\n"
+            "  long first;\n"
+            "  long second;\n"
+            "  va_start(arguments, count);\n"
+            "  promoted = va_arg(arguments, int);\n"
+            "  first = va_arg(arguments, long);\n"
+            "  second = va_arg(arguments, long);\n"
+            "  va_end(arguments);\n"
+            "  return (long)promoted + first + second;\n"
+            "}\n"
+            "int main(void) {\n"
+            "  char character;\n"
+            "  character = 7;\n"
+            "  result = sum_values(3L, character, 70000L, 90000L);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 2)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 28935)
+
+    def test_c90_stdarg_starts_after_narrow_fixed_parameter(self):
+        image = compile_source(
+            "#include <stdarg.h>\n"
+            "int result;\n"
+            "int first_variadic(int fixed, ...) {\n"
+            "  va_list arguments;\n"
+            "  va_start(arguments, fixed);\n"
+            "  return va_arg(arguments, int);\n"
+            "}\n"
+            "int main(void) {\n"
+            "  char promoted;\n"
+            "  promoted = 9;\n"
+            "  result = first_variadic(1, promoted, 12);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
+
+    def test_c90_stdarg_reads_pointer_and_double_arguments(self):
+        image = compile_source(
+            "#include <stdarg.h>\n"
+            "int results[2];\n"
+            "int read_arguments(int count, ...) {\n"
+            "  va_list arguments;\n"
+            "  char *text;\n"
+            "  double value;\n"
+            "  va_start(arguments, count);\n"
+            "  text = va_arg(arguments, char *);\n"
+            "  value = va_arg(arguments, double);\n"
+            "  va_end(arguments);\n"
+            "  results[0] = text[0];\n"
+            "  results[1] = value == 3.5;\n"
+            "  return 0;\n"
+            "}\n"
+            "int main(void) {\n"
+            "  read_arguments(2, \"ok\", 3.5f);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), ord("o"))
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 1)
+
     def test_c90_function_definition_defaults_to_int_return_type(self):
         image = compile_source(
             "int result;\n"
@@ -869,6 +1074,15 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 70000 & 0xFFFF)
+
+    def test_c90_target_abi_pointer_encoding_is_19_bit_big_endian(self):
+        image = compile_source(
+            "int *pointer = 0x12345UL;\n"
+            "int main(void) { return 0; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE:GLOBAL_BASE + 3]), b"\x23\x45\x01")
 
     def test_c90_string_search_and_bounded_operations(self):
         image = compile_source(
@@ -1369,8 +1583,8 @@ class CCompilerTests(unittest.TestCase):
             "#include <assert.h>\n"
             "int result;\n"
             "int main(void) {\n"
+            "  assert(++result);\n"
             "  assert(2 + 2 == 4);\n"
-            "  result = 1;\n"
             "  return 0;\n"
             "}\n"
         )
@@ -1387,6 +1601,17 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(failure_image)
         self.assertFalse(cpu.running)
+
+    def test_c90_assert_expands_to_void_expression(self):
+        with self.assertRaises(CCompilerError):
+            compile_source(
+                "#include <assert.h>\n"
+                "int main(void) {\n"
+                "  int value;\n"
+                "  value = assert(1);\n"
+                "  return value;\n"
+                "}\n"
+            )
 
     def test_c90_assert_is_disabled_by_ndebug(self):
         image = compile_source(
