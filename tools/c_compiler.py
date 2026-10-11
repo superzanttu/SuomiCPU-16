@@ -4643,12 +4643,18 @@ def compile_source(source: str, filename: str = "<input>") -> AssemblyImage:
 
 
 def compile_file(path: str | Path) -> AssemblyImage:
+    return compile_file_with_assembly(path)[0]
+
+
+def compile_file_with_assembly(path: str | Path) -> tuple[AssemblyImage, str]:
+    """Compile a source file once and return its image and generated assembly."""
     source_path = Path(path).resolve()
     try:
         source = source_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise CCompilerError(f"cannot read {source_path}: {exc}") from exc
-    return compile_source(source, str(source_path))
+    assembly, image = _compile(source, str(source_path))
+    return image, assembly
 
 
 def _flat_binary(image: AssemblyImage) -> bytes:

@@ -22,9 +22,16 @@ data only.
 python main.py
 ```
 
-Use `--disk ID` to mount a data disk directly without the BIOS selector.
-Press **F11** in a running program to toggle windowed/fullscreen display. Start
-directly in fullscreen with `python main.py --fullscreen` or
+Use `--disk ID` to preselect a data disk in BIOS, or mount it with a directly
+launched program.
+The game fills its own window by default. The 80×25 console opens in a separate
+window with **REBOOT**, **RESET** (return to BIOS), **COPY**, and
+**PAUSE/CONTINUE** controls and emulator status. Select console text and press
+Ctrl+C to copy it; **COPY** copies the selection or the visible screen. The
+console retains 1,000 rows of scrollback, accessible with the mouse wheel.
+Press **F2** in the emulator window to hide/show the console; **F11** toggles
+windowed/fullscreen game display. Start directly in fullscreen with
+`python main.py --fullscreen` or
 `.\run.ps1 -Fullscreen`.
 
 Run an example directly from the repository root:

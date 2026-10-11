@@ -54,6 +54,13 @@ class StorageBIOSIntegrationTests(unittest.TestCase):
             cpu.disk = DiskDevice(directory)
             cpu.write(DISK_BASE, 0x04)
             self.assertEqual(cpu.read(DISK_BASE + 16), 1)
+            self.assertIn(
+                "Disk operation failed",
+                bytes(cpu._console_device().output).decode(
+                    "ascii",
+                    errors="replace",
+                ),
+            )
 
     def test_bios_reports_missing_data_disk(self):
         with tempfile.TemporaryDirectory() as directory:

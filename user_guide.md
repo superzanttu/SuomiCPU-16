@@ -34,10 +34,21 @@ On Windows, run the PowerShell launcher with a source or binary path:
 `main.py`. It requires Python to be available as `python` on `PATH`. At startup,
 the BIOS lists `.c` files in `modules/`, using each filename as its module name
 and the first source line as its description. Use the arrow keys to select a
-program and press Enter to load it; press **D** to cycle through available data
-disks or no disk. Press Escape to exit the BIOS.
-Press F11 in a running program to toggle fullscreen and windowed display. Start
-in fullscreen with `python main.py --fullscreen` or
+program and press Enter to load it; hover or click a program to select it and
+double-click to load it. Use the mouse wheel over the module list to scroll;
+indicators show how many modules remain above or below the visible rows. Click
+the data-disk line or press **D** to cycle through available data disks or no
+disk. Press Escape to exit the BIOS.
+The game fills its own window by default. The 80×25 console runs in a separate
+window. Its **RESET** button returns to BIOS module selection; **REBOOT**
+restarts the current program. Select text and press Ctrl+C to copy it; the
+**COPY** button copies selected text or the visible console screen. The console
+keeps a 1,000-row scrollback buffer, navigated with the mouse wheel. It logs
+source and generated assembly file sizes, program image size, address span, and
+emulator memory capacity/remaining memory when a program loads. Press F2 in the
+emulator window to hide/show the console, and F11 to toggle fullscreen and
+windowed game display. Start in fullscreen with
+`python main.py --fullscreen` or
 `.\run.ps1 -Fullscreen`.
 
 Additional examples are in [`examples/commands.asm`](examples/commands.asm)
@@ -735,6 +746,9 @@ The emulator starts with a BIOS selection screen. It lists C programs from
 virtual disk found in the repository's `disks/` folder. The selected disk is
 made available to the program; it is **not** used to load executable code. The
 BIOS compiles the selected source and the emulator loads it into machine memory.
+Use the mouse to hover or click a program to select it, then double-click to
+load it. Click the data-disk line to cycle disks; keyboard controls remain
+available.
 The optional `--disk ID` command-line option preselects a data disk in the BIOS.
 
 The BIOS information block starts at `0x43040`: bytes `0..3` are the `SC16`
@@ -752,10 +766,21 @@ The console is a memory-mapped UART-like device:
 | `0x43201` | Status | Bit 0: input available; bit 1: output ready; bit 2: input overflow. Write bit 2 as 1 to clear overflow. |
 | `0x43202` | Control | Bit 0 enables local echo; bit 1 enables host keyboard input. Both are enabled at reset. |
 
-The emulator displays console text beside the 320×240 graphics display.
-Keyboard text, Enter, and Backspace are queued as console input. An empty
-console-status poll yields the current instruction frame to the host event loop,
-so a C `getchar` wait does not prevent keyboard events from being processed.
+The game and 80×25 text console run in separate windows. The console has
+**REBOOT**, **RESET**, **COPY**, and **PAUSE/CONTINUE** buttons in its top row.
+**COPY** copies selected text or the visible console screen; Ctrl+C copies
+selected text. The 1,000-row scrollback can be navigated with the mouse wheel.
+Program loading logs source and generated assembly file sizes, image size,
+address span, and available SC-16 memory. **RESET**
+returns to BIOS module selection, while **REBOOT** restarts the current program.
+The status line below
+shows local time, uptime, mounted data disk, and loaded module. It also displays
+host lifecycle messages such as emulator startup, C compilation/assembly,
+program loading, disk operations, and errors. Type into the console text area
+to send input; Enter and Backspace are supported. Press F2 in the emulator window
+to hide/show the console. An empty console-status poll yields the current
+instruction frame to the host event loop, so a C `getchar` wait does not prevent
+keyboard events from being processed.
 
 The virtual disk device retains its JSON-backed, 256-byte block format.
 `0x43100` is the command register; the command bits load/unload a disk,

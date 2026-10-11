@@ -7,12 +7,14 @@ import array
 import struct
 import random
 import os
-from src.console_device import ConsoleDevice
+import time
+from collections.abc import Callable
+from src.console_device import ConsoleDevice, ConsoleWindow
 from pathlib import Path
 
 # Tuomme tarvittavat asiat työkaluista
 from tools.assembler import AssemblyError, AssemblyImage, MemorySegment, assemble_file
-from tools.c_compiler import CCompilerError, compile_file
+from tools.c_compiler import CCompilerError
 from tools.sc16net import DEFAULT_PORT, MAX_PAYLOAD, NetNode, UdpTransport
 from src.lib_disk import DiskDevice, DiskDeviceError
 from src.isa import (
@@ -122,19 +124,14 @@ TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
 SCREEN_HEIGHT = 240
-DISPLAY_WIDTH = 960
-DISPLAY_HEIGHT = 400
-CONSOLE_X = SCREEN_WIDTH
-CONSOLE_Y = 0
-GAME_Y = 80
 DOUBLE_CLICK_MS = 400  # Max gap between two clicks counted as a double click
-WINDOW_SCALE = 3   # Tehdään ikkunasta isompi, jotta näkyy paremmin
+WINDOW_SCALE = 3
 DISPLAY_FPS = 30
 MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed register selects maximum speed
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
 
 
-def _display_viewport(screen_size, virtual_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT)):
+def _display_viewport(screen_size, virtual_size=(SCREEN_WIDTH, SCREEN_HEIGHT)):
     virtual_width, virtual_height = virtual_size
     scale = min(screen_size[0] / virtual_width, screen_size[1] / virtual_height)
     width = int(virtual_width * scale)
@@ -151,21 +148,17 @@ def _screen_to_logical(
     virtual_width, virtual_height = virtual_size
     display_x = int((position[0] - left) * virtual_width / width)
     display_y = int((position[1] - top) * virtual_height / height)
-    if virtual_size == (SCREEN_WIDTH, SCREEN_HEIGHT):
-        return (
-            max(0, min(SCREEN_WIDTH - 1, display_x)),
-            max(0, min(SCREEN_HEIGHT - 1, display_y)),
-        )
-    x = max(0, min(SCREEN_WIDTH - 1, display_x))
-    y = max(0, min(SCREEN_HEIGHT - 1, display_y - GAME_Y))
-    return x, y
+    return (
+        max(0, min(virtual_width - 1, display_x)),
+        max(0, min(virtual_height - 1, display_y)),
+    )
 
 
 def _set_display_mode(fullscreen):
     if fullscreen:
         return pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     return pygame.display.set_mode(
-        (DISPLAY_WIDTH * WINDOW_SCALE // 2, DISPLAY_HEIGHT * WINDOW_SCALE // 2)
+        (SCREEN_WIDTH * WINDOW_SCALE, SCREEN_HEIGHT * WINDOW_SCALE)
     )
 
 
@@ -196,17 +189,59 @@ KEY_BITS = {
     pygame.K_LCTRL: 0x800, pygame.K_RCTRL: 0x800, pygame.K_z: 0x800,
 }
 
-def load_program_file(path: str | Path) -> AssemblyImage:
+def load_program_file(
+    path: str | Path,
+    logger: Callable[[str], None] | None = None,
+) -> AssemblyImage:
     """Lataa ohjelman tiedostosta (.asm, .c tai .bin)."""
     program_path = Path(path)
+    report = logger if logger is not None else (lambda message: None)
     if program_path.suffix.lower() == ".c":
-        return compile_file(program_path)
-    if program_path.suffix.lower() == ".bin":
-        binary = program_path.read_bytes()
-        if len(binary) > MEM_SIZE:
-            raise ValueError("Ohjelma on liian suuri muistiin")
-        return AssemblyImage((MemorySegment(0, binary),), 0)
-    return assemble_file(program_path)
+        report(f"Compiling C source: {program_path.name}")
+        try:
+            from tools.c_compiler import compile_file_with_assembly
+
+            image, assembly = compile_file_with_assembly(program_path)
+        except (CCompilerError, OSError, ValueError) as exc:
+            report(f"ERROR: C compilation failed: {exc}")
+            raise
+        report(f"C source file size: {program_path.stat().st_size} bytes")
+        report(f"Generated assembly size: {len(assembly.encode('utf-8'))} bytes")
+        report("C compilation complete; SC-16 image ready")
+    elif program_path.suffix.lower() == ".bin":
+        report(f"Loading binary program: {program_path.name}")
+        try:
+            binary = program_path.read_bytes()
+            if len(binary) > MEM_SIZE:
+                raise ValueError("Ohjelma on liian suuri muistiin")
+            image = AssemblyImage((MemorySegment(0, binary),), 0)
+            report(f"Binary file size: {len(binary)} bytes")
+        except (OSError, ValueError) as exc:
+            report(f"ERROR: Binary load failed: {exc}")
+            raise
+    else:
+        report(f"Assembling source: {program_path.name}")
+        try:
+            image = assemble_file(program_path)
+            report(f"Assembly source file size: {program_path.stat().st_size} bytes")
+        except (AssemblyError, OSError, ValueError) as exc:
+            report(f"ERROR: Assembly failed: {exc}")
+            raise
+        report("Assembly complete; SC-16 image ready")
+    image_size = sum(len(segment.data) for segment in image.segments)
+    if image.segments:
+        image_start = min(segment.address for segment in image.segments)
+        image_end = max(
+            segment.address + len(segment.data) for segment in image.segments
+        )
+        image_span = image_end - image_start
+    else:
+        image_span = 0
+    report(
+        f"Program image: {image_size} bytes across {len(image.segments)} segments; "
+        f"address span {image_span} bytes; memory capacity {MEM_SIZE} bytes"
+    )
+    return image
 
 _JIT = False  # False = not tried yet, None = unavailable
 
@@ -259,8 +294,14 @@ class SuomiCompute16:
         pygame.display.set_caption("SuomiCPU-16 Emulator")
         self.clock = pygame.time.Clock()
         self.console_device = ConsoleDevice()
-        self.console_font = pygame.font.Font(None, 13)
-        self.display_surface = pygame.Surface((DISPLAY_WIDTH, DISPLAY_HEIGHT))
+        self.module_name = None
+        self.program_loaded = False
+        self.program_image_bytes = 0
+        self.program_image_span = 0
+        self.program_memory_remaining = MEM_SIZE
+        self.paused = False
+        self.reboot_requested = False
+        self.bios_reset_requested = False
         self.palette = [pygame.Color(i, i, i) for i in range(256)]
         for index, color in enumerate(PALETTE_COLORS):
             self.palette[index] = color
@@ -440,11 +481,14 @@ class SuomiCompute16:
                 disk_id = "".join(chr(self.memory[DISK_BASE + 1 + i]) for i in range(8))
                 self.disk.load_disk(disk_id)
                 self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
+                self.console_log(f"Data disk mounted: {disk_id}")
             if command & 0x20: # Set write protect from [ptr] (0/1)
                 self.disk.set_protected(self.read_16(DISK_BASE + 10) != 0)
                 self.write_16(DISK_BASE + 14, 1 if self.disk.write_protected else 0)
             if command & 0x02: # Unload disk
+                disk_id = self.disk.current_disk
                 self.disk.unload_disk()
+                self.console_log(f"Data disk unloaded: {disk_id or 'none'}")
             if command & 0x04: # Read block
                 ptr = self.read_16(DISK_BASE + 10)
                 offset = self.read_16(DISK_BASE + 12)
@@ -465,8 +509,9 @@ class SuomiCompute16:
                 offset = self.read_16(DISK_BASE + 12)
                 data = "".join(chr(self.read(RAM_START + offset + i)) for i in range(256))
                 self.disk.write_block(ptr, data)
-        except DiskDeviceError:
+        except DiskDeviceError as exc:
             self.memory[DISK_STATUS] = 1
+            self.console_log(f"ERROR: Disk operation failed: {exc}")
 
     def _gpu_net(self, command, query, arg):
         """Networking commands; see tools/sc16net.py for the protocol."""
@@ -644,11 +689,34 @@ class SuomiCompute16:
         for segment in image.segments:
             end = segment.address + len(segment.data)
             if segment.address < 0 or end > MEM_SIZE:
+                self.console_log("ERROR: Program segment does not fit in memory")
                 raise ValueError("program segment does not fit in memory")
             self.memory[segment.address:end] = segment.data
         if not 0 <= image.entry_point < MEM_SIZE:
+            self.console_log("ERROR: Program entry point is outside memory")
             raise ValueError("program entry point is outside memory")
         self.entry_point = image.entry_point
+        image_size = sum(len(segment.data) for segment in image.segments)
+        if image.segments:
+            image_start = min(segment.address for segment in image.segments)
+            image_end = max(
+                segment.address + len(segment.data) for segment in image.segments
+            )
+            image_span = image_end - image_start
+        else:
+            image_span = 0
+        self.program_image_bytes = image_size
+        self.program_image_span = image_span
+        self.program_memory_remaining = MEM_SIZE - image_size
+        self.program_loaded = True
+        self.console_log("Program image loaded into memory")
+        self.console_log(
+            f"Program memory: {image_size} image bytes used; "
+            f"{self.program_memory_remaining} bytes remaining of {MEM_SIZE} "
+            f"({MEM_SIZE // 1024} KiB)"
+        )
+        if getattr(self, "module_name", None):
+            self.console_log(f"Loaded module: {self.module_name}")
 
     def push(self, val):
         self.sp -= 2
@@ -1192,29 +1260,7 @@ class SuomiCompute16:
         if now.second % 1 == 0: self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x08)
 
     def update_display(self):
-        self.display_surface.fill((0, 0, 0))
-        self.display_surface.blit(self.vram_surface, (0, GAME_Y))
-        pygame.draw.rect(self.display_surface, (36, 45, 58), (0, 0, SCREEN_WIDTH, 24))
-        pygame.draw.rect(
-            self.display_surface,
-            (14, 20, 28),
-            (CONSOLE_X, CONSOLE_Y, DISPLAY_WIDTH - CONSOLE_X, DISPLAY_HEIGHT),
-        )
-        pygame.draw.rect(
-            self.display_surface,
-            (36, 45, 58),
-            (CONSOLE_X, CONSOLE_Y, DISPLAY_WIDTH - CONSOLE_X, 22),
-        )
-        label = self.console_font.render("SC-16 CONSOLE  |  F11: fullscreen", True, (220, 230, 240))
-        self.display_surface.blit(label, (CONSOLE_X + 8, CONSOLE_Y + 3))
-        self._console_device().render(
-            self.display_surface,
-            self.console_font,
-            (190, 220, 190),
-            origin=(CONSOLE_X + 8, CONSOLE_Y + 24),
-            line_height=15,
-        )
-        _present_scaled(self.display_surface, self.screen)
+        _present_scaled(self.vram_surface, self.screen)
 
     def _max_speed(self):
         memory = getattr(self, 'memory', None)
@@ -1296,7 +1342,6 @@ class SuomiCompute16:
             *_screen_to_logical(
                 (px, py),
                 self.screen.get_size(),
-                (DISPLAY_WIDTH, DISPLAY_HEIGHT),
             )
         )
         node = getattr(self, 'net', None)
@@ -1321,76 +1366,147 @@ class SuomiCompute16:
         self.pc = self.entry_point
         self.running = True
         self._console_device().reset()
+        self.paused = False
+        self.reboot_requested = False
+        self.bios_reset_requested = False
+        self._prepared_for_run = True
         from src.bios import initialize_bios
 
         initialize_bios(self)
 
+    def console_log(self, message):
+        self._console_device().write_text(message)
+
+    def console_progress(self, message):
+        self.console_log(message)
+        window = getattr(self, "console_window", None)
+        if window is not None:
+            window.refresh(
+                getattr(self, "module_name", None),
+                getattr(getattr(self, "disk", None), "current_disk", None),
+                getattr(self, "boot_time", time.monotonic()),
+                getattr(self, "paused", False),
+            )
+            window.pump()
+
+    def request_reboot(self):
+        self.console_log("Reboot requested")
+        self.reboot_requested = True
+
+    def request_bios_reset(self):
+        self.console_log("Reset requested; returning to BIOS")
+        self.bios_reset_requested = True
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.console_log("Emulation paused" if self.paused else "Emulation continued")
+
+    def _log_startup(self, message):
+        self.console_log(message)
+        self.console_log(f"Loaded module: {getattr(self, 'module_name', None) or 'unnamed program'}")
+        disk_name = getattr(getattr(self, "disk", None), "current_disk", None)
+        self.console_log(f"Loaded data disk: {disk_name or 'none'}")
+
     def run(self):
-        self.reset()
+        if not getattr(self, "_prepared_for_run", False):
+            self.reset()
+            self.boot_time = time.monotonic()
+            self._log_startup("SC-16 emulator started")
+        self._prepared_for_run = False
         self.window_open = True
+        console_window = getattr(self, "console_window", None)
+        if console_window is None:
+            console_window = ConsoleWindow(self)
+            self.console_window = console_window
+        self.console_log("Program execution started")
         pygame.key.start_text_input()
         deferred_release = 0
         turbo_frames = 0
-        while self.window_open:
-            fresh_keys = 0
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
+        last_console_update = 0.0
+        try:
+            while self.window_open:
+                if getattr(self, "bios_reset_requested", False):
                     self.window_open = False
-                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (1, 3):
-                    mx, my = _screen_to_logical(
-                        event.pos,
-                        self.screen.get_size(),
-                        (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+                    break
+                if self.reboot_requested:
+                    self.reset()
+                    self._prepared_for_run = False
+                    self.boot_time = time.monotonic()
+                    self._log_startup("SC-16 system rebooted")
+                    self.console_log("Program execution restarted")
+                now = time.monotonic()
+                if now - last_console_update >= 1 / DISPLAY_FPS:
+                    console_window.pump()
+                    console_window.refresh(
+                        self.module_name,
+                        getattr(getattr(self, "disk", None), "current_disk", None),
+                        self.boot_time,
+                        self.paused,
                     )
-                    self.set_mouse_position(mx, my)
-                    self.mouse_button(0 if event.button == 1 else 1, event.type == pygame.MOUSEBUTTONDOWN,
-                                      mx, my, pygame.time.get_ticks())
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
-                    self.set_fullscreen(not self.fullscreen)
-                    continue
-                if event.type == pygame.TEXTINPUT:
-                    self._console_device().receive(event.text.encode("utf-8"))
-                if event.type == pygame.KEYUP and event.key in KEY_BITS:
-                    # A tap shorter than one frame stays visible for that frame.
-                    if KEY_BITS[event.key] & fresh_keys:
-                        deferred_release |= KEY_BITS[event.key]
-                    else:
-                        self.release_keys(KEY_BITS[event.key])
-                if event.type == pygame.KEYDOWN:
-                    if not self.running:
-                        self.window_open = False
-                        continue
-                    if event.key in KEY_BITS:
-                        fresh_keys |= KEY_BITS[event.key]
-                        deferred_release &= ~KEY_BITS[event.key]
-                        self.press_keys(KEY_BITS[event.key])
-                    if event.key == pygame.K_RETURN:
-                        key = 13
-                        self._console_device().receive(b"\n")
-                    elif event.key == pygame.K_BACKSPACE:
-                        key = 8
-                        self._console_device().receive(b"\x08")
-                    else:
-                        key = ord(event.unicode) if event.unicode else 0
-                    self.write(KBD_ADDR, key)
-                    self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x02)
+                    last_console_update = now
 
-            if not self.window_open:
-                break
-            self.begin_mouse_frame()
-            self.update_rtc()
-            was_turbo = self._max_speed()
-            self.execute_frame()
-            self.end_mouse_frame()
-            if deferred_release:
-                self.release_keys(deferred_release)
-                deferred_release = 0
-            turbo_frames += 1
-            if not (was_turbo and self._max_speed()) or turbo_frames % 32 == 0:
-                self.update_display()
-            if not self._max_speed():
-                self.clock.tick(DISPLAY_FPS)
-        pygame.key.stop_text_input()
+                fresh_keys = 0
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.window_open = False
+                    if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (1, 3):
+                        mx, my = _screen_to_logical(event.pos, self.screen.get_size())
+                        self.set_mouse_position(mx, my)
+                        self.mouse_button(0 if event.button == 1 else 1, event.type == pygame.MOUSEBUTTONDOWN,
+                                          mx, my, pygame.time.get_ticks())
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+                        self.set_fullscreen(not self.fullscreen)
+                        continue
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_F2:
+                        console_window.toggle()
+                        continue
+                    if event.type == pygame.TEXTINPUT:
+                        self._console_device().receive(event.text.encode("utf-8"))
+                    if event.type == pygame.KEYUP and event.key in KEY_BITS:
+                        if KEY_BITS[event.key] & fresh_keys:
+                            deferred_release |= KEY_BITS[event.key]
+                        else:
+                            self.release_keys(KEY_BITS[event.key])
+                    if event.type == pygame.KEYDOWN:
+                        if not self.running:
+                            self.window_open = False
+                            continue
+                        if event.key in KEY_BITS:
+                            fresh_keys |= KEY_BITS[event.key]
+                            deferred_release &= ~KEY_BITS[event.key]
+                            self.press_keys(KEY_BITS[event.key])
+                        if event.key == pygame.K_RETURN:
+                            key = 13
+                            self._console_device().receive(b"\n")
+                        elif event.key == pygame.K_BACKSPACE:
+                            key = 8
+                            self._console_device().receive(b"\x08")
+                        else:
+                            key = ord(event.unicode) if event.unicode else 0
+                        self.write(KBD_ADDR, key)
+                        self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x02)
+
+                if not self.window_open:
+                    break
+                self.begin_mouse_frame()
+                self.update_rtc()
+                was_turbo = self._max_speed()
+                if not self.paused:
+                    self.execute_frame()
+                self.end_mouse_frame()
+                if deferred_release:
+                    self.release_keys(deferred_release)
+                    deferred_release = 0
+                turbo_frames += 1
+                if not (was_turbo and self._max_speed()) or turbo_frames % 32 == 0:
+                    self.update_display()
+                if self.paused or not self._max_speed():
+                    self.clock.tick(DISPLAY_FPS)
+        finally:
+            pygame.key.stop_text_input()
+            if not getattr(self, "bios_reset_requested", False):
+                console_window.close()
+                self.console_window = None
 
 def main():
     parser = argparse.ArgumentParser(description="Run the SC-16 emulator.")
@@ -1410,40 +1526,64 @@ def main():
     )
     args = parser.parse_args()
 
+    sc16 = None
+    console_window = None
     try:
-        program = None
-        if args.program_file:
-            program = load_program_file(args.program_file)
-    except (AssemblyError, CCompilerError, OSError, ValueError) as exc:
-        parser.error(str(exc))
-
-    try:
-        sc16 = None
         sc16 = SuomiCompute16(fullscreen=args.fullscreen)
         sc16.net_port = args.net_port
-        if program is not None:
-            sc16.load_program(program)
-            if args.disk:
-                from src.bios import BIOSError, mount_data_disk
+        program_file = args.program_file
+        sc16.module_name = Path(program_file).stem if program_file else None
+        sc16.reset()
+        sc16.boot_time = time.monotonic()
+        console_window = ConsoleWindow(sc16)
+        sc16.console_window = console_window
+        sc16.console_log("SC-16 emulator started")
 
+        from src.bios import BIOSError, mount_data_disk, select_boot_program
+
+        first_boot = True
+        while True:
+            if program_file:
+                sc16.module_name = Path(program_file).stem
                 try:
-                    mount_data_disk(sc16, args.disk)
-                except BIOSError as exc:
+                    program = load_program_file(program_file, sc16.console_progress)
+                except (AssemblyError, CCompilerError, OSError, ValueError) as exc:
                     parser.error(str(exc))
-            sc16.run()
-        else:
-            from src.bios import BIOSError, mount_data_disk, select_boot_program
-
-            selection = select_boot_program(sc16, initial_disk=args.disk)
-            if selection.image is not None:
+                sc16.load_program(program)
+                if args.disk:
+                    try:
+                        mount_data_disk(sc16, args.disk)
+                    except BIOSError as exc:
+                        parser.error(str(exc))
+                program_file = None
+            else:
+                initial_disk = args.disk if first_boot else getattr(sc16.disk, "current_disk", None)
+                selection = select_boot_program(sc16, initial_disk=initial_disk)
+                if selection.image is None:
+                    break
                 if selection.disk_id is not None:
                     try:
                         mount_data_disk(sc16, selection.disk_id)
                     except BIOSError as exc:
                         parser.error(str(exc))
+                sc16.module_name = selection.module_path.stem
                 sc16.load_program(selection.image)
-                sc16.run()
+
+            first_boot = False
+            sc16.bios_reset_requested = False
+            sc16.run()
+            if not sc16.bios_reset_requested:
+                break
+
+            sc16.module_name = None
+            sc16.program_loaded = False
+            sc16.reset()
+            sc16._prepared_for_run = False
+            sc16.boot_time = time.monotonic()
+            sc16.console_log("System reset complete; BIOS ready")
     finally:
+        if console_window is not None:
+            console_window.close()
         if sc16 is not None and getattr(sc16, 'net', None) is not None:
             sc16.net.close()
         pygame.quit()
