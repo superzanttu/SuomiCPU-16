@@ -276,6 +276,254 @@ class CCompilerTests(unittest.TestCase):
                 with self.assertRaises(CCompilerError):
                     compile_source(source)
 
+    def test_c90_const_objects_are_initialized_and_readable(self):
+        image = compile_source(
+            "const int global_value = 12;\n"
+            "typedef const int Immutable;\n"
+            "int result;\n"
+            "struct Pair { const int first; int second; };\n"
+            "int main(void) {\n"
+            "  const int local_value = 5;\n"
+            "  Immutable aliased_value = 2;\n"
+            "  const int values[2] = {3, 4};\n"
+            "  const struct Pair pair = {6, 7};\n"
+            "  result = global_value + local_value + aliased_value + "
+            "values[1] + pair.first;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 29)
+
+    def test_c90_const_qualifier_survives_inline_record_definition(self):
+        with self.assertRaisesRegex(
+            CCompilerError, "const-qualified objects are not modifiable"
+        ):
+            compile_source(
+                "const struct Pair { int first; } pair = {1};\n"
+                "int main(void) { pair.first = 2; return 0; }\n"
+            )
+
+    def test_c90_const_objects_cannot_be_modified(self):
+        invalid_sources = (
+            "int main(void) { const int value = 1; value = 2; return 0; }\n",
+            "int main(void) { const int value = 1; value++; return 0; }\n",
+            "typedef const int Immutable; int main(void) { "
+            "Immutable value = 1; value = 2; return 0; }\n",
+            "const int value = 1; int main(void) { value = 2; return 0; }\n",
+            "int main(void) { const int values[2] = {1, 2}; "
+            "values[0] = 3; return 0; }\n",
+            "struct Pair { const int first; int second; }; "
+            "int main(void) { struct Pair pair = {1, 2}; "
+            "pair.first = 3; return 0; }\n",
+            "struct Pair { int first; int second; }; "
+            "int main(void) { const struct Pair pair = {1, 2}; "
+            "pair.second = 3; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(CCompilerError):
+                    compile_source(source)
+
+    def test_c90_const_pointer_targets_are_read_only(self):
+        invalid_sources = (
+            "int main(void) { const int value = 1; "
+            "const int *pointer = &value; *pointer = 2; return 0; }\n",
+            "int main(void) { const int values[2] = {1, 2}; "
+            "const int *pointer = values; pointer[0] = 3; return 0; }\n",
+            "int update(const int *pointer) { *pointer = 4; return 0; }\n"
+            "int main(void) { int value = 1; return update(&value); }\n",
+            "typedef const int *ConstIntPointer; "
+            "int main(void) { int value = 1; ConstIntPointer pointer = &value; "
+            "*pointer = 2; return 0; }\n",
+            "struct Holder { const int *pointer; }; "
+            "int main(void) { int value = 1; struct Holder holder; "
+            "holder.pointer = &value; *holder.pointer = 2; return 0; }\n",
+            "int main(void) { const int value = 1; const int *source = &value; "
+            "int *target; target = source; return 0; }\n",
+            "int main(void) { const int value = 1; int *target; "
+            "target = (const int *)&value; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(CCompilerError):
+                    compile_source(source)
+
+    def test_c90_const_pointer_parameters_and_members_remain_readable(self):
+        image = compile_source(
+            "struct Point { int x; int y; };\n"
+            "struct Point point;\n"
+            "int read_point(const struct Point *value) {\n"
+            "  return value->x + value->y;\n"
+            "}\n"
+            "int main(void) {\n"
+            "  point.x = 3;\n"
+            "  point.y = 4;\n"
+            "  return read_point(&point) != 7;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_const_pointer_target_does_not_const_qualify_pointer_object(self):
+        image = compile_source(
+            "int first;\n"
+            "int second;\n"
+            "int main(void) {\n"
+            "  const int *pointer;\n"
+            "  first = 5;\n"
+            "  second = 8;\n"
+            "  pointer = &first;\n"
+            "  pointer = &second;\n"
+            "  return *pointer != 8;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_nested_pointer_const_qualification_is_rejected_explicitly(self):
+        for source in (
+            "int main(void) { const int **pointer; return 0; }\n",
+            "int function(const int **pointer) { return 0; }\n"
+            "int main(void) { return function(0); }\n",
+            "struct Holder { const int **pointer; }; "
+            "int main(void) { return 0; }\n",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError,
+                    "const qualification through multiple pointer levels",
+                ):
+                    compile_source(source)
+
+    def test_c90_pointer_assignment_can_add_target_const_qualification(self):
+        image = compile_source(
+            "int value;\n"
+            "int main(void) {\n"
+            "  int *source;\n"
+            "  const int *target;\n"
+            "  value = 6;\n"
+            "  source = &value;\n"
+            "  target = source;\n"
+            "  return *target != 6;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_global_redeclarations_preserve_const_qualification(self):
+        for source in (
+            "const int value; int value; int main(void) { return 0; }\n",
+            "int value; const int value; int main(void) { return 0; }\n",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError, "conflicting declaration"
+                ):
+                    compile_source(source)
+
+    def test_c90_register_objects_cannot_have_their_address_taken(self):
+        invalid_sources = (
+            "int main(void) { register int value; &value; return 0; }\n",
+            "struct Pair { int first; int second; }; "
+            "int main(void) { register struct Pair pair; "
+            "&pair.first; return 0; }\n",
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    CCompilerError, "address-of operator cannot be applied"
+                ):
+                    compile_source(source)
+
+    def test_c90_register_parameters_cannot_have_their_address_taken(self):
+        with self.assertRaisesRegex(
+            CCompilerError, "address-of operator cannot be applied"
+        ):
+            compile_source(
+                "int read_value(register int value) { &value; return value; }\n"
+                "int main(void) { return read_value(4) != 4; }\n"
+            )
+
+    def test_c90_register_parameters_remain_readable_and_assignable(self):
+        image = compile_source(
+            "int update(register int value) {\n"
+            "  value++;\n"
+            "  return value;\n"
+            "}\n"
+            "int main(void) { return update(4) != 5; }\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_parameter_storage_classes_only_allow_register(self):
+        for storage_class in ("auto", "extern", "static"):
+            for declaration in ("int f({0} int value);", "int f({0} int value) {{ return value; }}"):
+                source = (
+                    declaration.format(storage_class)
+                    + "\nint main(void) { return 0; }\n"
+                )
+                with self.subTest(storage_class=storage_class, declaration=declaration):
+                    with self.assertRaisesRegex(
+                        CCompilerError,
+                        f"{storage_class} is not valid in a parameter declaration",
+                    ):
+                        compile_source(source)
+
+    def test_c90_register_locals_remain_readable_and_assignable(self):
+        image = compile_source(
+            "int result;\n"
+            "int main(void) {\n"
+            "  register int value = 4;\n"
+            "  value++;\n"
+            "  result = value;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 5)
+
+    def test_c90_const_member_blocks_whole_record_assignment(self):
+        with self.assertRaisesRegex(
+            CCompilerError,
+            "record objects with const-qualified members are not modifiable",
+        ):
+            compile_source(
+                "struct Pair { const int first; int second; };\n"
+                "int main(void) {\n"
+                "  struct Pair source = {1, 2};\n"
+                "  struct Pair target = {3, 4};\n"
+                "  target = source;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+
+    def test_c90_const_member_does_not_block_mutable_sibling_assignment(self):
+        image = compile_source(
+            "struct Pair { const int first; int second; };\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  struct Pair value = {1, 2};\n"
+            "  value.second = 8;\n"
+            "  result = value.first + value.second;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 9)
+
+    def test_c90_auto_and_register_are_rejected_at_file_scope(self):
+        for storage_class in ("auto", "register"):
+            with self.subTest(storage_class=storage_class):
+                with self.assertRaisesRegex(CCompilerError, "not valid at file scope"):
+                    compile_source(
+                        f"{storage_class} int value; "
+                        "int main(void) { return 0; }\n"
+                    )
+
     def test_c90_scalar_brace_initializers(self):
         image = compile_source(
             "int global_value = {{{7}}};\n"
@@ -380,6 +628,79 @@ class CCompilerTests(unittest.TestCase):
                     CCompilerError, "argument 1 .* is incompatible"
                 ):
                     compile_source(source)
+
+    def test_c90_function_arguments_preserve_pointer_target_const(self):
+        image = compile_source(
+            "int read_value(const int *value);\n"
+            "int read_value(const int *value) { return *value; }\n"
+            "int main(void) {\n"
+            "  const int immutable = 8;\n"
+            "  int mutable = 3;\n"
+            "  return read_value(&immutable) + read_value(&mutable) == 11 ? 0 : 1;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_function_arguments_reject_discarding_pointer_target_const(self):
+        with self.assertRaisesRegex(
+            CCompilerError, "argument 1 .* is incompatible with its parameter type"
+        ):
+            compile_source(
+                "int update(int *value) { *value = 2; return 0; }\n"
+                "int main(void) {\n"
+                "  const int immutable = 1;\n"
+                "  return update(&immutable);\n"
+                "}\n"
+            )
+
+    def test_c90_prototypes_conflict_on_pointer_target_const(self):
+        with self.assertRaisesRegex(CCompilerError, "conflicting declaration"):
+            compile_source(
+                "int read_value(const int *value);\n"
+                "int read_value(int *value);\n"
+                "int main(void) { return 0; }\n"
+            )
+
+    def test_c90_const_pointer_return_preserves_target_qualification(self):
+        image = compile_source(
+            "const int *read_value(const int *value);\n"
+            "const int *read_value(const int *value) { return value; }\n"
+            "int main(void) {\n"
+            "  const int immutable = 8;\n"
+            "  return *read_value(&immutable) == 8 ? 0 : 1;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
+    def test_c90_const_pointer_return_rejects_qualifier_loss(self):
+        with self.assertRaisesRegex(
+            CCompilerError, "return expression is incompatible with function type"
+        ):
+            compile_source(
+                "const int value = 1;\n"
+                "int *get_value(void) { return &value; }\n"
+                "int main(void) { return 0; }\n"
+            )
+
+    def test_c90_const_pointer_return_is_read_only_at_call_site(self):
+        with self.assertRaisesRegex(
+            CCompilerError, "const-qualified objects are not modifiable lvalues"
+        ):
+            compile_source(
+                "const int value = 1;\n"
+                "const int *get_value(void) { return &value; }\n"
+                "int main(void) { *get_value() = 2; return 0; }\n"
+            )
+
+    def test_c90_function_prototypes_conflict_on_return_target_const(self):
+        with self.assertRaisesRegex(CCompilerError, "conflicting declaration"):
+            compile_source(
+                "const int *get_value(void);\n"
+                "int *get_value(void);\n"
+                "int main(void) { return 0; }\n"
+            )
 
     def test_c90_function_arguments_accept_null_pointer_constant_expression(self):
         image = compile_source(

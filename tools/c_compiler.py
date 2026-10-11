@@ -139,6 +139,7 @@ class Expr:
     value: Any = None
     children: tuple["Expr", ...] = ()
     line: int = 0
+    pointee_const: bool = False
 
 
 @dataclass
@@ -150,6 +151,8 @@ class Local:
     line: int
     array_size: int = 0
     is_const: bool = False
+    is_register: bool = False
+    pointee_const: bool = False
 
 
 @dataclass
@@ -169,6 +172,11 @@ class Function:
     local_count: int
     line: int
     variadic: bool = False
+    register_parameters: frozenset[str] = frozenset()
+    const_parameters: frozenset[str] = frozenset()
+    const_pointer_parameters: frozenset[str] = frozenset()
+    const_pointer_parameter_indices: frozenset[int] = frozenset()
+    return_pointee_const: bool = False
 
 
 @dataclass
@@ -179,6 +187,7 @@ class Global:
     line: int
     array_size: int = 0
     is_const: bool = False
+    pointee_const: bool = False
 
 
 @dataclass(frozen=True)
@@ -188,6 +197,7 @@ class _Field:
     offset: int
     array_size: int = 0
     is_const: bool = False
+    pointee_const: bool = False
 
 
 @dataclass
@@ -454,16 +464,21 @@ class _Parser:
         self.globals: list[Global] = []
         self.functions: list[Function] = []
         self.prototypes: dict[
-            str, tuple[str, int | None, tuple[str, ...] | None, bool]
+            str, tuple[
+                str, int | None, tuple[str, ...] | None, bool,
+                tuple[int, ...] | None, bool,
+            ]
         ] = {}
         self._local_count = 0
         self.typedef_scopes: list[dict[str, str]] = [{}]
+        self.typedef_const_scopes: list[dict[str, bool]] = [{}]
         self.enum_constants: dict[str, int] = {}
         self.enum_tags: set[str] = set()
         self.records: dict[str, _Record] = {}
         self.global_declarations: dict[str, Global] = {}
         self._anonymous_record_index = 0
         self._last_type_const = False
+        self._last_storage_class: str | None = None
 
     @property
     def token(self) -> Token:
@@ -499,6 +514,24 @@ class _Parser:
 
     def parse_type(self) -> str:
         self._last_type_const = False
+        self._last_storage_class = None
+        qualifiers: set[str] = set()
+        storage_class: str | None = None
+        while self.token.value in _STORAGE_WORDS:
+            current = self.take().value
+            if current in ("const", "volatile"):
+                if current in qualifiers:
+                    raise self.fail(f"duplicate type qualifier {current!r}")
+                qualifiers.add(current)
+                if current == "const":
+                    self._last_type_const = True
+            else:
+                if storage_class is not None:
+                    raise self.fail(
+                        "multiple storage-class specifiers in declaration"
+                    )
+                storage_class = current
+                self._last_storage_class = current
         if self.token.value == "enum":
             self.take()
             tag = None
@@ -532,17 +565,24 @@ class _Parser:
                 raise self.fail("enum reference requires a previously declared tag")
             return "int"
         if self.token.value in ("struct", "union"):
-            return self._parse_record_specifier()
-        for scope in reversed(self.typedef_scopes):
+            record_type = self._parse_record_specifier()
+            self._last_type_const = bool(qualifiers) and "const" in qualifiers
+            return record_type
+        for scope_index in range(len(self.typedef_scopes) - 1, -1, -1):
+            scope = self.typedef_scopes[scope_index]
             if self.token.value in scope:
-                return scope[self.take().value]
+                alias = self.take().value
+                self._last_type_const = (
+                    self._last_type_const
+                    or self.typedef_const_scopes[scope_index].get(alias, False)
+                )
+                return scope[alias]
         unsigned = False
         signed = False
         short = False
         long = False
         base = None
-        storage_class = None
-        qualifiers: set[str] = set()
+        storage_class = self._last_storage_class
         while self.token.value in _STORAGE_WORDS | _TYPE_WORDS:
             current = self.token.value
             if current in ("const", "volatile"):
@@ -559,6 +599,7 @@ class _Parser:
                         "multiple storage-class specifiers in declaration"
                     )
                 storage_class = current
+                self._last_storage_class = current
                 self.take()
                 continue
             if self.token.value == "unsigned":
@@ -630,10 +671,18 @@ class _Parser:
                 if self.token.value == "<eof>":
                     raise self.fail(f"unterminated {record_type} definition")
                 field_type = self.parse_type()
+                field_base_const = self._last_type_const
+                if self._last_storage_class is not None:
+                    raise self.fail(
+                        "storage-class specifiers are not valid on record members"
+                    )
                 while True:
                     declarator_type = self._pointer_type(field_type)
                     field_name = self.expect_identifier("expected a field name")
                     declarator_type, array_size = self._declarator_suffix(declarator_type)
+                    self._reject_unsupported_nested_const_pointer(
+                        declarator_type, field_base_const
+                    )
                     if array_size == -1:
                         raise CCompilerError(
                             f"{self.filename}:{field_name.line}: record array fields require a bound"
@@ -663,7 +712,8 @@ class _Parser:
                         declarator_type,
                         field_offset,
                         array_size,
-                        self._last_type_const and not declarator_type.endswith("*"),
+                        field_base_const and not declarator_type.endswith("*"),
+                        field_base_const and declarator_type.endswith("*"),
                     )
                     if is_union:
                         maximum_size = max(maximum_size, field_width)
@@ -785,6 +835,14 @@ class _Parser:
             c_type += f"[{size}]"
         return c_type, dimensions[0]
 
+    def _reject_unsupported_nested_const_pointer(
+        self, c_type: str, base_const: bool
+    ) -> None:
+        if base_const and c_type.count("*") > 1:
+            raise self.fail(
+                "const qualification through multiple pointer levels is not supported"
+            )
+
     def _infer_array_size(
         self,
         array_size: int,
@@ -845,6 +903,11 @@ class _Parser:
             and not any(self.token.value in scope for scope in self.typedef_scopes)
         )
         c_type = "int" if implicit_int_function else self.parse_type()
+        base_const = False if implicit_int_function else self._last_type_const
+        if self._last_storage_class in ("auto", "register"):
+            raise self.fail(
+                f"{self._last_storage_class} is not valid at file scope"
+            )
         if is_typedef:
             self.parse_typedef_declarators(c_type)
             return
@@ -858,6 +921,11 @@ class _Parser:
         if self.accept("("):
             empty_parameter_list = self.token.value == ")"
             old_style_names = None
+            register_parameters: frozenset[str] = frozenset()
+            const_parameters: frozenset[str] = frozenset()
+            const_pointer_parameters: frozenset[str] = frozenset()
+            const_pointer_parameter_indices: tuple[int, ...] = ()
+            return_pointee_const = base_const and declarator_type.endswith("*")
             if (
                 re.fullmatch(r"[A-Za-z_]\w*", self.token.value)
                 and self.token.value not in _STORAGE_WORDS | _TYPE_WORDS
@@ -875,7 +943,14 @@ class _Parser:
                 parameters = [("int", parameter_name) for parameter_name in old_style_names]
                 variadic = False
             else:
-                parameters, variadic = self.parse_parameters()
+                (
+                    parameters,
+                    variadic,
+                    register_parameters,
+                    const_parameters,
+                    const_pointer_parameters,
+                    const_pointer_parameter_indices,
+                ) = self.parse_parameters()
             if self.accept(";"):
                 if implicit_int_function:
                     raise CCompilerError(
@@ -894,6 +969,8 @@ class _Parser:
                         parameter_type for parameter_type, _ in parameters
                     ),
                     variadic,
+                    None if empty_parameter_list else const_pointer_parameter_indices,
+                    return_pointee_const,
                 )
                 self._merge_function_declaration(name, signature, name_token.line)
                 return
@@ -910,6 +987,8 @@ class _Parser:
                 len(parameters),
                 tuple(parameter_type for parameter_type, _ in parameters),
                 variadic,
+                const_pointer_parameter_indices,
+                return_pointee_const,
             )
             self._merge_function_declaration(
                 name,
@@ -926,7 +1005,13 @@ class _Parser:
             self.functions.append(
                 Function(
                     name, declarator_type, parameters, body, self._local_count,
-                    name_token.line, variadic
+                    name_token.line,
+                    variadic,
+                    register_parameters,
+                    const_parameters,
+                    const_pointer_parameters,
+                    frozenset(const_pointer_parameter_indices),
+                    return_pointee_const,
                 )
             )
             return
@@ -935,7 +1020,10 @@ class _Parser:
     def _merge_function_declaration(
         self,
         name: str,
-        signature: tuple[str, int | None, tuple[str, ...] | None, bool],
+        signature: tuple[
+            str, int | None, tuple[str, ...] | None, bool,
+            tuple[int, ...] | None, bool,
+        ],
         line: int,
         *,
         old_style: bool = False,
@@ -960,11 +1048,20 @@ class _Parser:
                     if old_style else signature[2]
                 )
             )
+            or (
+                not old_style
+                and previous[4] is not None
+                and signature[4] is not None
+                and previous[4] != signature[4]
+            )
+            or previous[5] != signature[5]
         ):
             raise CCompilerError(
                 f"{self.filename}:{line}: conflicting declaration of {name}"
             )
         if previous is None or signature[1] is not None:
+            if old_style and previous is not None and previous[4] is not None:
+                signature = (*signature[:4], previous[4])
             self.prototypes[name] = signature
 
     @staticmethod
@@ -1021,30 +1118,59 @@ class _Parser:
             if array_size:
                 alias_type += f"[{array_size}]"
             self.typedef_scopes[-1][token.value] = alias_type
+            self.typedef_const_scopes[-1][token.value] = self._last_type_const
             if not self.accept(","):
                 break
         self.expect(";")
 
-    def parse_parameters(self) -> tuple[list[tuple[str, str | None]], bool]:
+    def parse_parameters(
+        self,
+    ) -> tuple[
+        list[tuple[str, str | None]],
+        bool,
+        frozenset[str],
+        frozenset[str],
+        frozenset[str],
+        tuple[int, ...],
+    ]:
         if self.accept(")"):
-            return [], False
+            return [], False, frozenset(), frozenset(), frozenset(), ()
         if self.token.value == "void" and self.peek() == ")":
             self.take()
             self.expect(")")
-            return [], False
+            return [], False, frozenset(), frozenset(), frozenset(), ()
         parameters = []
+        register_parameters = set()
+        const_parameters = set()
+        const_pointer_parameters = set()
+        const_pointer_parameter_indices = set()
         variadic = False
         while True:
             c_type = self.parse_type()
+            if self._last_storage_class not in (None, "register"):
+                raise self.fail(
+                    f"{self._last_storage_class} is not valid in a parameter declaration"
+                )
             c_type = self._pointer_type(c_type)
             if c_type == "void":
                 raise self.fail("void is only valid as an empty parameter list")
+            base_const = self._last_type_const
             name = None
             if re.fullmatch(r"[A-Za-z_]\w*", self.token.value):
                 name = self.take().value
+                if self._last_storage_class == "register":
+                    register_parameters.add(name)
             c_type, array_size = self._declarator_suffix(c_type)
             if array_size != 0:
                 c_type += "*"
+            self._reject_unsupported_nested_const_pointer(c_type, base_const)
+            if base_const:
+                if c_type.endswith("*"):
+                    const_pointer_parameter_indices.add(len(parameters))
+                    if name is not None:
+                        const_pointer_parameters.add(name)
+                elif name is not None:
+                    const_parameters.add(name)
             parameters.append((c_type, name))
             if not self.accept(","):
                 break
@@ -1055,16 +1181,25 @@ class _Parser:
                 variadic = True
                 break
         self.expect(")")
-        return parameters, variadic
+        return (
+            parameters,
+            variadic,
+            frozenset(register_parameters),
+            frozenset(const_parameters),
+            frozenset(const_pointer_parameters),
+            tuple(sorted(const_pointer_parameter_indices)),
+        )
 
     def parse_global_declarators(
         self, c_type: str, first_name: Token, first_type: str
     ) -> None:
         name_token = first_name
         current_type = first_type
+        base_const = self._last_type_const
         while True:
             name = name_token.value
             current_type, array_size = self._declarator_suffix(current_type)
+            self._reject_unsupported_nested_const_pointer(current_type, base_const)
             if current_type == "void":
                 raise CCompilerError(
                     f"{self.filename}:{name_token.line}: objects cannot have void type"
@@ -1085,13 +1220,18 @@ class _Parser:
                     initializer,
                     name_token.line,
                     array_size,
-                    self._last_type_const and not current_type.endswith("*"),
+                    base_const and not current_type.endswith("*"),
+                    base_const and current_type.endswith("*"),
                 )
                 self.global_declarations[name] = declaration
                 self.globals.append(declaration)
             elif (
                 declaration.c_type != current_type
                 or declaration.array_size != array_size
+                or declaration.is_const
+                != (base_const and not current_type.endswith("*"))
+                or declaration.pointee_const
+                != (base_const and current_type.endswith("*"))
             ):
                 raise CCompilerError(
                     f"{self.filename}:{name_token.line}: conflicting declaration "
@@ -1125,6 +1265,7 @@ class _Parser:
         statements: list[Stmt] = []
         declarations_allowed = True
         self.typedef_scopes.append({})
+        self.typedef_const_scopes.append({})
         while self.token.value != "}":
             if self.token.value == "<eof>":
                 raise self.fail("unterminated compound statement")
@@ -1137,12 +1278,17 @@ class _Parser:
                 statements.append(self.parse_statement())
         self.take()
         self.typedef_scopes.pop()
+        self.typedef_const_scopes.pop()
         return Stmt("block", children=statements, line=brace.line)
 
     def parse_local_declarations(self) -> list[Stmt]:
         is_typedef = self.accept("typedef")
         c_type = self.parse_type()
+        base_const = self._last_type_const
+        is_register = self._last_storage_class == "register"
         if is_typedef:
+            if self._last_storage_class is not None:
+                raise self.fail("storage-class specifier is not valid on typedef")
             self.parse_typedef_declarators(c_type)
             return []
         if self.accept(";"):
@@ -1154,6 +1300,7 @@ class _Parser:
             if not re.fullmatch(r"[A-Za-z_]\w*", token.value):
                 raise self.fail("expected a local variable name")
             current_type, array_size = self._declarator_suffix(current_type)
+            self._reject_unsupported_nested_const_pointer(current_type, base_const)
             if current_type == "void":
                 raise self.fail("local objects cannot have void type")
             if current_type in self.records and not self.records[current_type].complete:
@@ -1171,7 +1318,9 @@ class _Parser:
                 self._local_count,
                 token.line,
                 array_size,
-                self._last_type_const and not current_type.endswith("*"),
+                base_const and not current_type.endswith("*"),
+                is_register,
+                base_const and current_type.endswith("*"),
             )
             self._local_count += (
                 _object_size(current_type, self.records)
@@ -1346,13 +1495,21 @@ class _Parser:
             self.take()
             try:
                 c_type = self.parse_type()
+                base_const = self._last_type_const
                 c_type = self._pointer_type(c_type)
                 self.expect(")")
             except CCompilerError:
                 self.position = saved_position
             else:
+                self._reject_unsupported_nested_const_pointer(c_type, base_const)
                 child = self.parse_unary()
-                return Expr("cast", c_type, (child,), token.line)
+                return Expr(
+                    "cast",
+                    c_type,
+                    (child,),
+                    token.line,
+                    base_const and c_type.endswith("*"),
+                )
         if token.value in ("+", "-", "!", "~", "&", "*", "++", "--"):
             operator = self.take().value
             child = self.parse_unary()
@@ -1498,6 +1655,8 @@ class _Variable:
     array_size: int = 0
     constant_value: int | None = None
     is_const: bool = False
+    is_register: bool = False
+    pointee_const: bool = False
 
 
 class _CodeGenerator:
@@ -1531,7 +1690,10 @@ class _CodeGenerator:
         self.current_function: Function | None = None
         self._aggregate_return_slots: dict[int, int] = {}
         self.prototypes: dict[
-            str, tuple[str, int | None, tuple[str, ...] | None, bool]
+            str, tuple[
+                str, int | None, tuple[str, ...] | None, bool,
+                tuple[int, ...] | None, bool,
+            ]
         ] = {}
         self.used_libraries: set[str] = set()
         self.enum_constants: dict[str, int] = {}
@@ -2080,6 +2242,9 @@ class _CodeGenerator:
             self.scopes[0][name] = _Variable(
                 parameter_offset=parameter_offset,
                 c_type=c_type,
+                is_register=name in function.register_parameters,
+                is_const=name in function.const_parameters,
+                pointee_const=name in function.const_pointer_parameters,
             )
             parameter_offset += _object_size(c_type, self.records)
         self.emit(f"__c_function_{function.name}:")
@@ -2105,6 +2270,8 @@ class _CodeGenerator:
                 global_address=self.global_addresses[name],
                 c_type=global_.c_type,
                 array_size=global_.array_size,
+                is_const=global_.is_const,
+                pointee_const=global_.pointee_const,
             )
         if name in self.enum_constants:
             return _Variable(c_type="int", constant_value=self.enum_constants[name])
@@ -2387,6 +2554,9 @@ class _CodeGenerator:
                 local_offset=local.slot,
                 c_type=local.c_type,
                 array_size=local.array_size,
+                is_const=local.is_const,
+                is_register=local.is_register,
+                pointee_const=local.pointee_const,
             )
             current[local.name] = variable
             if local.array_size:
@@ -2439,6 +2609,10 @@ class _CodeGenerator:
                                 source_type == return_type
                                 or source_type == "void*"
                                 or return_type == "void*"
+                            )
+                            and (
+                                not self._pointer_target_is_const(expression)
+                                or self.current_function.return_pointee_const
                             )
                         )
                         null_pointer_constant = (
@@ -2979,15 +3153,21 @@ class _CodeGenerator:
                 "pointer arithmetic requires a pointer to a complete object type",
             )
 
-    def _require_modifiable_lvalue(self, expression: Expr, line: int) -> str:
+    def _require_modifiable_lvalue(
+        self, expression: Expr, line: int, *, check_aggregate_members: bool = True
+    ) -> str:
         if expression.kind == "name":
             variable = self._lookup(str(expression.value), line)
             if variable.constant_value is not None:
                 raise self.error(line, "enumerators are not modifiable lvalues")
             if variable.array_size:
                 raise self.error(line, "arrays are not modifiable lvalues")
+            if variable.is_const:
+                raise self.error(line, "const-qualified objects are not modifiable lvalues")
             c_type = variable.c_type
         elif expression.kind == "index":
+            if self._lvalue_is_const(expression):
+                raise self.error(line, "const-qualified objects are not modifiable lvalues")
             c_type = self._expression_type(expression)
         elif expression.kind == "member":
             operator, field_name = expression.value
@@ -2998,16 +3178,132 @@ class _CodeGenerator:
                     raise self.error(line, "-> requires a pointer to a record")
                 base_type = base_type[:-1]
             elif base_type in self.records:
-                self._require_modifiable_lvalue(base, line)
+                self._require_modifiable_lvalue(
+                    base, line, check_aggregate_members=False
+                )
             field_ = self._record_field(base_type, field_name, line)
             if field_.array_size:
                 raise self.error(line, "arrays are not modifiable lvalues")
+            if field_.is_const or (
+                operator == "." and self._lvalue_is_const(expression.children[0])
+            ):
+                raise self.error(line, "const-qualified objects are not modifiable lvalues")
             c_type = field_.c_type
         elif expression.kind == "unary" and expression.value == "*":
+            if self._lvalue_is_const(expression):
+                raise self.error(line, "const-qualified objects are not modifiable lvalues")
             c_type = self._expression_type(expression)
         else:
             raise self.error(line, "expression is not a modifiable lvalue")
+        if (
+            check_aggregate_members
+            and c_type in self.records
+            and self._record_has_const_member(c_type)
+        ):
+            raise self.error(
+                line,
+                "record objects with const-qualified members are not modifiable lvalues",
+            )
         return c_type
+
+    def _record_has_const_member(self, c_type: str) -> bool:
+        array_type = re.fullmatch(r"(.+)\[\d+\]", c_type)
+        if array_type is not None:
+            return self._record_has_const_member(array_type.group(1))
+        record = self.records.get(c_type)
+        if record is None:
+            return False
+        return any(
+            field_.is_const or self._record_has_const_member(field_.c_type)
+            for field_ in record.fields.values()
+        )
+
+    def _lvalue_is_const(self, expression: Expr) -> bool:
+        if expression.kind == "name":
+            return self._lookup(str(expression.value), expression.line).is_const
+        if expression.kind == "index":
+            base = expression.children[0]
+            base_type = self._expression_type(base)
+            if self._is_array_lvalue(base):
+                return self._lvalue_is_const(base)
+            if base_type.endswith("*"):
+                return self._pointer_target_is_const(base)
+            return self._lvalue_is_const(base)
+        if expression.kind == "member":
+            operator, field_name = expression.value
+            base = expression.children[0]
+            if operator == "." and self._lvalue_is_const(base):
+                return True
+            base_type = self._expression_type(base)
+            if operator == "->" and base_type.endswith("*"):
+                if self._pointer_target_is_const(base):
+                    return True
+                base_type = base_type[:-1]
+            return self._record_field(base_type, field_name, expression.line).is_const
+        if expression.kind == "unary" and expression.value == "*":
+            return self._pointer_target_is_const(expression.children[0])
+        return False
+
+    def _is_array_lvalue(self, expression: Expr) -> bool:
+        if expression.kind == "name":
+            return bool(self._lookup(str(expression.value), expression.line).array_size)
+        if expression.kind == "member":
+            operator, field_name = expression.value
+            base_type = self._expression_type(expression.children[0])
+            if operator == "->":
+                if not base_type.endswith("*"):
+                    return False
+                base_type = base_type[:-1]
+            return bool(
+                self._record_field(base_type, field_name, expression.line).array_size
+            )
+        return False
+
+    def _pointer_target_is_const(self, expression: Expr) -> bool:
+        if expression.kind == "call":
+            function = self.functions_by_name.get(str(expression.value))
+            return function is not None and function.return_pointee_const
+        if expression.kind == "cast":
+            return expression.pointee_const
+        if expression.kind == "name":
+            return self._lookup(str(expression.value), expression.line).pointee_const
+        if expression.kind == "member":
+            operator, field_name = expression.value
+            base = expression.children[0]
+            base_type = self._expression_type(base)
+            if operator == "->":
+                if not base_type.endswith("*"):
+                    return False
+                base_type = base_type[:-1]
+            elif self._lvalue_is_const(base):
+                return True
+            return self._record_field(base_type, field_name, expression.line).pointee_const
+        if expression.kind == "unary" and expression.value == "&":
+            return self._lvalue_is_const(expression.children[0])
+        if expression.kind == "binary" and expression.value in (",", "+", "-"):
+            left, right = expression.children
+            if expression.value == ",":
+                return self._pointer_target_is_const(right)
+            if self._expression_type(left).endswith("*"):
+                return self._pointer_target_is_const(left)
+            if self._expression_type(right).endswith("*"):
+                return self._pointer_target_is_const(right)
+        if expression.kind == "conditional":
+            return (
+                self._pointer_target_is_const(expression.children[1])
+                or self._pointer_target_is_const(expression.children[2])
+            )
+        return False
+
+    def _lvalue_is_register(self, expression: Expr) -> bool:
+        if expression.kind == "name":
+            return self._lookup(str(expression.value), expression.line).is_register
+        if expression.kind in ("index", "member"):
+            operator = expression.value[0] if expression.kind == "member" else None
+            if operator == "->":
+                return False
+            return self._lvalue_is_register(expression.children[0])
+        return False
 
     @staticmethod
     def _integer_promoted_type(c_type: str) -> str:
@@ -3272,6 +3568,16 @@ class _CodeGenerator:
                     or c_type == "void*"
                 )
             )
+            if (
+                compatible_pointer
+                and source_expression is not None
+                and self._pointer_target_is_const(source_expression)
+                and not self._pointer_target_is_const(expression)
+            ):
+                raise self.error(
+                    line,
+                    "assignment discards const qualification from pointer target",
+                )
             null_pointer_constant = (
                 source_type in integer_types
                 and source_expression is not None
@@ -3503,6 +3809,13 @@ class _CodeGenerator:
                     parameter_type = source_type
                     if source_type in ("char", "unsigned char"):
                         parameter_type = "int"
+                const_pointer_parameter = (
+                    index < expected
+                    and index
+                    in self.functions_by_name[name].const_pointer_parameter_indices
+                    if name in self.functions_by_name
+                    else False
+                )
                 integer_types = INTEGER_TYPES
                 numeric_types = ARITHMETIC_TYPES
                 record_argument = parameter_type in self.records
@@ -3527,6 +3840,10 @@ class _CodeGenerator:
                             source_type == parameter_type
                             or source_type == "void*"
                             or parameter_type == "void*"
+                        )
+                        and (
+                            not self._pointer_target_is_const(argument)
+                            or const_pointer_parameter
                         )
                     )
                     null_pointer_constant = (
@@ -3714,6 +4031,11 @@ class _CodeGenerator:
                     "logical negation requires a scalar operand",
                 )
             if operator == "&":
+                if self._lvalue_is_register(child):
+                    raise self.error(
+                        expression.line,
+                        "address-of operator cannot be applied to a register object",
+                    )
                 self._lvalue_address(child, expression.line)
                 return
             if operator == "*":

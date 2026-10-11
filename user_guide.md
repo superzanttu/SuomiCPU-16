@@ -601,6 +601,11 @@ Supported language features include:
   tested with nested calls and recursion; members of a returned temporary are
   readable but are not modifiable lvalues. Duplicate storage-class
   specifiers and duplicate `const`/`volatile` qualifiers are diagnosed.
+  `const` is enforced for supported non-pointer scalar and array objects,
+  structure/union objects and members, including `typedef const` aliases;
+  initializers and reads remain supported. Whole-record assignment is rejected
+  when the record contains a const-qualified member, while assignments to its
+  other mutable members remain valid.
   Scalar initializers may use nested braces around exactly one value.
 - Object-like and function-like macros, `#`, `##`, `defined`, conditional
   inclusion, `#include`, `#undef`, `#error`, `#pragma`, trigraph replacement,
@@ -637,9 +642,21 @@ minimum requirements:
   difference. Pointer arithmetic and dereferencing have not yet been
   exhaustively checked for all address, alignment, and overflow cases.
   Function pointers and general function-pointer calls are not supported.
-- `static`, `extern`, `auto`, `register`, `const`, and `volatile` specifiers
-  are accepted in supported declarations but do not have their full C linkage,
-  storage-duration, or qualifier semantics.
+- `static`, `extern`, `auto`, `register`, and `volatile` specifiers do not have
+  their full C linkage, storage-duration, or volatile-access semantics.
+  The address-of constraint is enforced for local objects declared `register`,
+  and `auto`/`register` file-scope declarations and storage classes on record
+  members are diagnosed. Named `register` parameters in supported prototypes
+  and definitions also reject address-taking.
+  `const` objects, one-level const-qualified pointer targets, named function
+  parameters, and one-level const-qualified pointer returns are supported for
+  the implemented forms. Reads through const pointers, including casts to
+  `const T *`, are allowed; writes are rejected, and assignment, function
+  arguments, and return statements prevent discarding the target's const
+  qualifier. Function declarations also diagnose conflicting one-level
+  pointer-target qualifications. Const qualification through multiple pointer
+  levels and const-qualified pointer objects are not supported; do not treat
+  other accepted pointer qualifier combinations as strictly conforming.
 - Global storage begins at `0x2000` (`GLOBAL_BASE` in
   [`tools/c_compiler.py`](tools/c_compiler.py)); uninitialized globals are
   zeroed. Local variables, arguments, return addresses, and temporaries use the
