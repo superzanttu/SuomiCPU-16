@@ -641,26 +641,36 @@ void reset_game(void)
     spawn_pickup(520, GROUND_Y - 12);
 }
 
-// Luo uuden vihollisen ruudun oikean reunan taakse. Tyyppi arvotaan:
-// mita korkeampi taso, sita enemman vaarallisia lintuja.
+// Luo uuden vihollisen ruudun oikean reunan taakse. Tyyppi arvotaan painotetusti:
+// MrSirenia on aina paljon, lintujen osuus kasvaa tason mukana (18% -> 42%),
+// loput on Springuja. Sama tyyppi ei tule kahta kertaa perakkain liian usein.
+int last_kind;
+
+int pick_kind(void)
+{
+    int r;
+    r = gfx_random() % 100;
+    if (r < 35)
+    {
+        return ENEMY_MRSIREN;
+    }
+    if (r >= 90 - level * 2)
+    {
+        return ENEMY_MEGABIRD;
+    }
+    return ENEMY_SPRINGU;
+}
+
 void spawn_enemy(void)
 {
     int i;
     int kind;
-    int r;
-    r = gfx_random() % 10;
-    if (r < 4)
+    kind = pick_kind();
+    if (kind == last_kind)
     {
-        kind = ENEMY_MRSIREN;
+        kind = pick_kind();
     }
-    else if (r < 7 - (level < 3 ? level : 3) || player.x < 200)
-    {
-        kind = ENEMY_SPRINGU;
-    }
-    else
-    {
-        kind = ENEMY_MEGABIRD;
-    }
+    last_kind = kind;
     for (i = 0; i < ENEMY_MAX; i++)
     {
         if (!enemies[i].alive)
@@ -2370,19 +2380,24 @@ int main(void)
             {
                 fire_rocket();
             }
-            // Vihollisia ilmestyy sita useammin mita korkeampi taso on
+            // Vihollisia tulee aalloissa: jokaisella kerralla 1-3 vihollista, ja
+            // aallot tihenevat tason noustessa.
             spawn_timer--;
             if (spawn_timer <= 0)
             {
                 spawn_enemy();
-                if (level >= 4 && gfx_random() % 3 == 0)
+                if (gfx_random() % 100 < 20 + level * 3)
                 {
-                    spawn_enemy();   // joskus kaksi kerralla
+                    spawn_enemy();
                 }
-                interval = 80 - level * 4;
-                if (interval < 20)
+                if (level >= 8 && gfx_random() % 100 < 15 + level * 2)
                 {
-                    interval = 20;
+                    spawn_enemy();
+                }
+                interval = 54 - level * 2;
+                if (interval < 18)
+                {
+                    interval = 18;
                 }
                 spawn_timer = interval;
             }
