@@ -74,6 +74,9 @@ typedef struct
     int balcony;      // 1 = rakennuksella on parveke
     int balcony_y;    // parvekkeen korkeus
     int id;           // rakennuksen numero (vaikuttaa ulkonakoon)
+    int res_t;        // asukkaan tyyppi (0 = ei asukasta), lasketaan kerran talon teossa
+    int res_lx;       // asukkaan ikkunan vasen reuna (talon x:sta laskettuna)
+    int res_ly;       // asukkaan ikkunan ylareuna (maailman y)
 } Building;
 
 // Vihollinen
@@ -228,6 +231,57 @@ void number_text(int value, char *out)
     out[i] = 0;
 }
 
+// Pistetaulun numerot: tekstit muistetaan, ja ne lasketaan uudestaan vain kun luku
+// muuttuu. Se on paljon nopeampaa kuin laskea ne joka kuva (jakolasku on hidasta).
+char hud_txt[64];    // 8 tekstia, 8 merkkia kukin
+int hud_last[8];     // viimeksi piirretty luku kussakin paikassa
+
+char *hud_num(int slot, int value)
+{
+    if (hud_last[slot] != value)
+    {
+        hud_last[slot] = value;
+        number_text(value, hud_txt + slot * 8);
+    }
+    return hud_txt + slot * 8;
+}
+
+// Raketin kuva (5 x 11 pikselia) muistissa, jotta sen piirtaa yhdella kaskylla.
+// Vari 0 = lapinakyva. Tehdaan kerran pelin alussa (make_rocket_sprite).
+unsigned char rocket_spr[55];
+
+void rocket_px(int x, int y, int c)
+{
+    rocket_spr[y * 5 + x] = c;
+}
+
+void make_rocket_sprite(void)
+{
+    int y;
+    rocket_px(2, 0, RED);
+    for (y = 1; y < 3; y++)
+    {
+        rocket_px(1, y, RED);
+        rocket_px(2, y, RED);
+        rocket_px(3, y, RED);
+    }
+    for (y = 3; y < 9; y++)
+    {
+        rocket_px(1, y, WHITE);
+        rocket_px(2, y, WHITE);
+        rocket_px(3, y, WHITE);
+    }
+    rocket_px(2, 4, CYAN);
+    rocket_px(2, 5, CYAN);
+    for (y = 7; y < 10; y++)
+    {
+        rocket_px(0, y, RED);
+        rocket_px(4, y, RED);
+    }
+    rocket_px(2, 9, ORANGE);
+    rocket_px(2, 10, ORANGE);
+}
+
 // Pitaa luvun alarajan (lo) ja ylarajan (hi) valissa.
 int clamp_to_range(int value, int lo, int hi)
 {
@@ -299,56 +353,62 @@ void hurt_player(int amount, int inv)
 }
 
 // ---------- ASUKKAAT ----------
-// Joissakin rakennuksissa asuu ihminen yhden ikkunan takana. Asukas on aina samassa
-// ikkunassa (paikka lasketaan rakennuksen numerosta), joten ei tarvita muistia.
+// Joissakin rakennuksissa asuu ihminen yhden ikkunan takana. Asukkaan tiedot lasketaan
+// vain kerran, kun talo tehdaan (res_setup), ja tallennetaan rakennuksen tietoihin.
+// Nain peli ei laske niita joka kuva uudestaan, ja pysyy nopeana.
 // Tyyppi: 0 = ei asukasta, 1 = ystavallinen (vilkuttaa), 2 = tarvitsee apua
 // (vilkuttaa ja huutaa HELP!), 3 = vihainen (heittaa pulloja pelaajaa kohti).
+// Ikkunat: vaaka-ak 14 pikselin valein, pysty-ak 18 pikselin valein, lasi 8 x 11.
 int res_rows(int i)
 {
-    return (GROUND_Y - city[i].roof_y - 22) / 14;
+    return (GROUND_Y - city[i].roof_y - 26) / 18;
 }
 
 int res_cells(int i)
 {
-    return (city[i].w - 16) / 10;
+    return (city[i].w - 12) / 14;
 }
 
-int res_row(int i)
-{
-    return (city[i].id * 3) % res_rows(i);
-}
-
-int res_cell(int i)
-{
-    return (city[i].id * 7) % res_cells(i);
-}
-
-int res_type(int i)
+void res_setup(int i)
 {
     int h;
-    if (res_rows(i) < 1 || res_cells(i) < 1)
+    int row;
+    int cell;
+    int rows;
+    int cells;
+    city[i].res_t = 0;
+    rows = res_rows(i);
+    cells = res_cells(i);
+    if (rows < 1 || cells < 1)
     {
-        return 0;
+        return;
     }
+    row = (city[i].id * 3) % rows;
+    cell = (city[i].id * 7) % cells;
     // Pimeassa ikkunassa ei asu ketaan (sama kaava kuin ikkunoiden piirrossa)
-    if (((res_row(i) * 5) + (res_cell(i) * 3) + city[i].id) % 4 == 0)
+    if ((((row * 5) + (cell * 3) + city[i].id) & 1) == 0)
     {
-        return 0;
+        return;
     }
     h = (city[i].id * 5) % 6;
     if (h < 2)
     {
-        return 0;
+        return;
     }
     if (h < 4)
     {
-        return 1;
+        city[i].res_t = 1;
     }
-    if (h == 4)
+    else if (h == 4)
     {
-        return 2;
+        city[i].res_t = 2;
     }
-    return 3;
+    else
+    {
+        city[i].res_t = 3;
+    }
+    city[i].res_lx = 4 + cell * 14;
+    city[i].res_ly = city[i].roof_y + 8 + row * 18;
 }
 
 // Rakennusten teko: rakennukset luodaan vasemmalta oikealle. Kun rakennus jaa
@@ -392,6 +452,7 @@ void gen_building(int i)
     }
     last_roof = roof;
     world_end = x + w;
+    res_setup(i);
 }
 
 // Tekee pelin alussa kaikki rakennukset.
@@ -1144,32 +1205,27 @@ void draw_city(void)
     gfx_rect(0, 150, 320, 30, ORANGE);
     gfx_rect(0, 180, 320, 20, YELLOW);
     // Tahdet liikkuvat hitaammin kuin kaupunki, joten tausta nayttaa kaukaiselta
-    for (i = 0; i < 32; i++)
+    for (i = 0; i < 7; i++)
     {
-        x0 = (i * 47 + 320 - (camera_x / 4) % 320) % 320;
-        y = 44 + ((i * 13) & 63);
-        if (y < 106)
+        x0 = (i * 61 - (camera_x >> 2)) & 511;
+        if (x0 < 320)
         {
-            gfx_pixel(x0, y, WHITE);
+            gfx_pixel(x0, 44 + ((i * 13) & 63), WHITE);
         }
     }
     // Aurinko laskee horisonttiin (pyoreahko, tehty vaakaviivoista)
-    for (k = -20; k < 0; k += 2)
+    for (k = -20; k < 0; k += 4)
     {
         w = 20 - (k * k) / 22;
-        gfx_rect(250 - w, 190 + k, w * 2, 2, WHITE);
+        gfx_rect(250 - w, 190 + k, w * 2, 4, WHITE);
     }
-    // Kaukainen kaupunki: mustat siluetit liikkuvat hitaasti (syvyysvaikutelma)
-    for (i = 0; i < 9; i++)
+    // Kaukainen kaupunki: tummat siluetit liikkuvat hitaasti (syvyysvaikutelma)
+    for (i = 0; i < 6; i++)
     {
-        k = camera_x / 4 / 40 + i;
-        sx = i * 40 - (camera_x / 4) % 40;
+        k = (camera_x >> 8) + i;
+        sx = i * 64 - ((camera_x >> 2) & 63);
         roof = 120 + ((k * 37) & 31) * 2;
-        gfx_rect(sx, roof, 36, GROUND_Y - roof, DARK_RED);
-        gfx_rect(sx + 34, roof, 2, GROUND_Y - roof, BLACK);
-        gfx_pixel(sx + 6, roof + 6, YELLOW);
-        gfx_pixel(sx + 18, roof + 14, YELLOW);
-        gfx_pixel(sx + 26, roof + 24, YELLOW);
+        gfx_rect(sx, roof, 56, GROUND_Y - roof, DARK_RED);
     }
     for (i = 0; i < BUILDING_MAX; i++)
     {
@@ -1192,41 +1248,30 @@ void draw_city(void)
         }
         gfx_rect(sx, roof + 3, 1, GROUND_Y - roof - 3, GRAY);           // valoisa vasen reuna
         gfx_rect(sx + w - 3, roof + 3, 3, GROUND_Y - roof - 3, BLACK);  // varjo oikealla
-        gfx_rect(sx - 1, roof, w + 2, 1, WHITE);                        // katon reuna
-        gfx_rect(sx - 1, roof + 1, w + 2, 2, GRAY);
-        gfx_rect(sx, roof + 3, w, 1, BLACK);                            // varjo katon alla
-        cells = (w - 16) / 10;
-        rows = (GROUND_Y - roof - 22) / 14;
-        // Ikkunat: kehys, lasi ja ikkunalauta. Osa palaa (keltainen), osa on pimea
+        gfx_rect(sx - 1, roof, w + 2, 3, GRAY);                         // katon reuna
+        cells = res_cells(i);
+        rows = res_rows(i);
+        // Ikkunat: vain yksi piirto per ikkuna (nopeus!). Lasi on keltainen (valo paalla)
+        // tai musta. Ruudun ulkopuolella olevat ikkunat jatetaan piirtamatta.
         for (row = 0; row < rows; row++)
         {
-            if (row > 0)
-            {
-                gfx_rect(sx + 1, roof + 5 + row * 14, w - 4, 1, BLACK);   // kerroksen raja
-            }
+            by = roof + 8 + row * 18;
             for (cell = 0; cell < cells; cell++)
             {
-                lx = sx + 4 + cell * 10;
-                by = roof + 8 + row * 14;
-                gfx_rect(lx - 1, by - 1, 8, 10, GRAY);
-                if (((row * 5) + (cell * 3) + city[i].id) % 4 != 0)
+                lx = sx + 4 + cell * 14;
+                if (lx < -8 || lx > 320)
                 {
-                    gfx_rect(lx, by, 6, 8, YELLOW);
-                    gfx_rect(lx, by + 5, 6, 3, ORANGE);
+                    continue;
                 }
-                else
+                if ((((row * 5) + (cell * 3) + city[i].id) & 1) != 0)
                 {
-                    gfx_rect(lx, by, 6, 8, BLACK);
-                    gfx_pixel(lx + 1, by + 1, BLUE);
+                    gfx_rect(lx, by, 8, 11, YELLOW);
                 }
-                gfx_rect(lx - 1, by + 9, 8, 1, WHITE);
             }
         }
-        // Ovi: kehys, markisi ja ovenripa
-        gfx_rect(sx + w / 2 - 5, GROUND_Y - 14, 10, 14, GRAY);
+        // Ovi: musta aukko ja punainen markisi
         gfx_rect(sx + w / 2 - 4, GROUND_Y - 13, 8, 13, BLACK);
         gfx_rect(sx + w / 2 - 7, GROUND_Y - 17, 14, 3, RED);
-        gfx_pixel(sx + w / 2 + 2, GROUND_Y - 6, YELLOW);
         // Kattotekniikkaa: ilmastointilaite tai vesisailio
         if ((city[i].id % 4) == 1)
         {
@@ -1268,36 +1313,29 @@ void draw_city(void)
             lx = sx + w - 5;
             gfx_rect(lx - 3, roof, 1, GROUND_Y - roof, WHITE);
             gfx_rect(lx + 3, roof, 1, GROUND_Y - roof, WHITE);
-            for (y = roof + 4; y < GROUND_Y; y += 8)
+            for (y = roof + 4; y < GROUND_Y; y += 18)
             {
-                gfx_line(lx - 3, y, lx + 3, y, CYAN);
+                gfx_rect(lx - 3, y, 7, 1, CYAN);
             }
         }
     }
-    // Katulamput: tolppa, varsi ja kirkas lamppu
-    for (i = 0; i < 4; i++)
+    // Katulamput: tolppa ja kirkas lamppu
+    for (i = 0; i < 2; i++)
     {
-        sx = ((camera_x / 150) + i) * 150 + 70 - camera_x;
+        sx = (((camera_x >> 7) + i) << 7) + 70 - camera_x;
         gfx_rect(sx, GROUND_Y - 36, 2, 36, BLACK);
-        gfx_rect(sx - 5, GROUND_Y - 37, 7, 2, BLACK);
-        gfx_rect(sx - 6, GROUND_Y - 35, 4, 2, YELLOW);
-        gfx_rect(sx - 7, GROUND_Y - 33, 6, 1, ORANGE);
+        gfx_rect(sx - 6, GROUND_Y - 36, 8, 3, YELLOW);
     }
     // Maa: jalkakaytava (vaalea), reunakivi ja asfalttitie
     gfx_rect(0, GROUND_Y, 320, 6, GRAY);
-    gfx_line(0, GROUND_Y, 319, GROUND_Y, WHITE);
-    x0 = -(camera_x % 24);
-    for (k = 0; k < 14; k++)
-    {
-        gfx_rect(x0 + k * 24, GROUND_Y + 1, 1, 5, DARK_GRAY);
-    }
+    gfx_rect(0, GROUND_Y, 320, 1, WHITE);
     gfx_rect(0, GROUND_Y + 6, 320, 2, BLACK);
     gfx_rect(0, GROUND_Y + 8, 320, 32, DARK_GRAY);
     // Tien keskiviiva liikkuu kameran mukana
-    x0 = -(camera_x % 48);
-    for (k = 0; k < 8; k++)
+    x0 = -(camera_x & 63);
+    for (k = 0; k < 6; k++)
     {
-        gfx_rect(x0 + k * 48, 220, 22, 2, YELLOW);
+        gfx_rect(x0 + k * 64, 220, 28, 2, YELLOW);
     }
 }
 
@@ -1320,15 +1358,15 @@ void draw_residents(void)
     int bby;
     for (i = 0; i < BUILDING_MAX; i++)
     {
-        t = res_type(i);
+        t = city[i].res_t;
         sx = city[i].x - camera_x;
         if (t == 0 || sx > 330 || sx + city[i].w < -20)
         {
             continue;
         }
-        lx = sx + 4 + res_cell(i) * 10;
-        by = city[i].roof_y + 8 + res_row(i) * 14;
-        dx = player.x - (city[i].x + 4 + res_cell(i) * 10 + 3);
+        lx = sx + city[i].res_lx + 1;
+        by = city[i].res_ly + 3;
+        dx = player.x - (city[i].x + city[i].res_lx + 4);
         near = 0;
         if (abs(dx) < 140)
         {
@@ -1435,14 +1473,7 @@ void draw_bottles(void)
 // Piirtaa pienen raketin kuvakkeen (kaytetaan pistetaulussa ja laatikoissa).
 void draw_rocket_icon(int x, int y)
 {
-    gfx_pixel(x + 2, y, RED);
-    gfx_rect(x + 1, y + 1, 3, 2, RED);
-    gfx_rect(x + 1, y + 3, 3, 6, WHITE);
-    gfx_pixel(x + 2, y + 4, CYAN);
-    gfx_pixel(x + 2, y + 5, CYAN);
-    gfx_rect(x, y + 7, 1, 3, RED);
-    gfx_rect(x + 4, y + 7, 1, 3, RED);
-    gfx_rect(x + 2, y + 9, 1, 2, ORANGE);
+    gfx_sprite(x, y, 5, 11, rocket_spr);
 }
 
 // Piirtaa raketti-laatikot. Laatikko "kelluu" ylos ja alas yhden pikselin.
@@ -1615,12 +1646,10 @@ void draw_enemy(Enemy *e)
             if ((k & 1) == 0)
             {
                 gfx_line(sx - 6, ya, sx + 6, yb, CYAN);
-                gfx_line(sx - 6, ya - 1, sx + 6, yb - 1, CYAN);
             }
             else
             {
                 gfx_line(sx + 6, ya, sx - 6, yb, CYAN);
-                gfx_line(sx + 6, ya - 1, sx - 6, yb - 1, CYAN);
             }
         }
         gfx_rect(sx - 6, hy, 12, 6, GREEN);
@@ -1774,42 +1803,38 @@ void draw_crosshair(void)
 // Piirtaa ylhaalla olevan pistetaulun: elamat, pisteet, matka, taso, raketit.
 void draw_hud(void)
 {
-    char s[32];
     int i;
     int c;
     gfx_rect(0, 0, 320, 38, DARK_GRAY);
     gfx_rect(0, 0, 320, 2, WHITE);
-    number_text(player.hp, s);
     gfx_text(8, 5, "HP:", WHITE);
-    gfx_text(38, 5, s, WHITE);
-    number_text(score, s);
+    gfx_text(38, 5, hud_num(0, player.hp), WHITE);
     gfx_text(80, 5, "SCORE", WHITE);
-    gfx_text(120, 5, s, YELLOW);
-    number_text(meters, s);
+    gfx_text(120, 5, hud_num(1, score), YELLOW);
     gfx_text(170, 5, "DIST", WHITE);
-    gfx_text(200, 5, s, WHITE);
+    gfx_text(200, 5, hud_num(2, meters), WHITE);
     gfx_text(224, 5, "M", WHITE);
-    number_text(level + 1, s);
     gfx_text(250, 5, "LVL", WHITE);
-    gfx_text(274, 5, s, RED);
+    gfx_text(274, 5, hud_num(3, level + 1), RED);
     c = GREEN;
     if (player.hp < 30)
     {
         c = RED;
     }
     gfx_rect(8, 15, 100, 5, BLACK);          // elamapalkin tausta
-    gfx_rect(8, 15, player.hp, 5, c);        // elamapalkki: pituus = elamat
+    if (player.hp > 0)
+    {
+        gfx_rect(8, 15, player.hp, 5, c);    // elamapalkki: pituus = elamat
+    }
     gfx_text(8, 24, "AMMO", WHITE);
     for (i = 0; i < player.ammo; i++)
     {
         draw_rocket_icon(52 + i * 8, 24);
     }
     gfx_text(140, 26, "FIRED", WHITE);
-    number_text(rockets_fired, s);
-    gfx_text(190, 26, s, YELLOW);
+    gfx_text(190, 26, hud_num(4, rockets_fired), YELLOW);
     gfx_text(226, 26, "HITS", WHITE);
-    number_text(rockets_hit, s);
-    gfx_text(262, 26, s, YELLOW);
+    gfx_text(262, 26, hud_num(5, rockets_hit), YELLOW);
     // Pelin alussa nayteteaan ohje hetken (240 kuvaa = noin 4 sekuntia)
     if (frame_count < 240)
     {
@@ -2084,12 +2109,12 @@ void update_residents(void)
     every = 110 - level * 3;
     for (i = 0; i < BUILDING_MAX; i++)
     {
-        if (res_type(i) != 3)
+        if (city[i].res_t != 3)
         {
             continue;
         }
-        wx = city[i].x + 4 + res_cell(i) * 10 + 3;
-        wy = city[i].roof_y + 8 + res_row(i) * 14 + 4;
+        wx = city[i].x + city[i].res_lx + 4;
+        wy = city[i].res_ly + 5;
         dx = player.x + 6 - wx;
         if (wx < camera_x + 10 || wx > camera_x + 310 || abs(dx) < 20 || abs(dx) > 170)
         {
@@ -2272,11 +2297,9 @@ void update_booms(void)
 // Alapalkki: pelin nimi ja matka.
 void draw_terrain_hud(void)
 {
-    char s[32];
     gfx_text(8, 228, "Infinite City", WHITE);
-    number_text(meters, s);
     gfx_text(200, 228, "M:", WHITE);
-    gfx_text(220, 228, s, YELLOW);
+    gfx_text(220, 228, hud_num(2, meters), YELLOW);
 }
 
 // Pelin loppuruutu: lopullinen pistemaara ja ennatys.
@@ -2310,6 +2333,11 @@ int main(void)
     unsigned int keys;
     int i;
     int interval;
+    for (i = 0; i < 8; i++)
+    {
+        hud_last[i] = -1;
+    }
+    make_rocket_sprite();
     reset_game();
     while (1)
     {
