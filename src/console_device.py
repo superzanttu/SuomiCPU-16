@@ -44,6 +44,14 @@ class ConsoleDevice:
             self.write_data(value)
         return value
 
+    def _advance_line(self):
+        self.column = 0
+        self.row += 1
+        if self.row >= self.ROWS:
+            self.scrollback.append(self.lines.pop(0))
+            self.lines.append(bytearray(b" " * self.COLUMNS))
+            self.row = self.ROWS - 1
+
     def write_data(self, value):
         value &= 0xFF
         self.output.append(value)
@@ -51,8 +59,7 @@ class ConsoleDevice:
             del self.output[:self.OUTPUT_CAPACITY // 4]
 
         if value == 10:
-            self.column = 0
-            self.row += 1
+            self._advance_line()
         elif value == 13:
             self.column = 0
         elif value == 8:
@@ -62,15 +69,9 @@ class ConsoleDevice:
             self.column = min(self.COLUMNS, (self.column // 8 + 1) * 8)
         elif value >= 32:
             if self.column >= self.COLUMNS:
-                self.column = 0
-                self.row += 1
+                self._advance_line()
             self.lines[self.row][self.column] = value
             self.column += 1
-
-        if self.row >= self.ROWS:
-            self.scrollback.append(self.lines.pop(0))
-            self.lines.append(bytearray(b" " * self.COLUMNS))
-            self.row = self.ROWS - 1
 
     def clear_overrun(self):
         self.overrun = False

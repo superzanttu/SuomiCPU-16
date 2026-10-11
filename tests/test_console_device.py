@@ -71,6 +71,19 @@ class ConsoleDeviceTests(unittest.TestCase):
         self.assertFalse(any(line.startswith("line-0 ") for line in snapshot))
         self.assertTrue(any(line.startswith("line-1099") for line in snapshot))
 
+    def test_console_wraps_after_full_width_last_row_without_index_error(self):
+        console = self.make_cpu()._console_device()
+        for _ in range(console.ROWS - 1):
+            console.write_text("")
+        for _ in range(console.COLUMNS):
+            console.write_data(ord("x"))
+        console.write_data(ord("y"))
+
+        snapshot = console.text_snapshot()
+        self.assertEqual(snapshot[-1][0], "y")
+        self.assertEqual(len(console.scrollback), 1)
+        self.assertTrue(all(len(line) == console.COLUMNS for line in snapshot))
+
     def test_host_lifecycle_messages_share_the_console_output(self):
         cpu = self.make_cpu()
         cpu.module_name = "asteroids"
