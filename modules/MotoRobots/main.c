@@ -1,8 +1,9 @@
 #include "game.c"
 #include "map.c"
 
+GameState state;
+
 int main() {
-    GameState state;
     game_init(&state);
     
     while (1) {

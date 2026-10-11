@@ -710,7 +710,12 @@ filename is retained.
 
 The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`,
 `<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`,
-`<string.h>`, `<stdarg.h>`, `<locale.h>`, and `<time.h>`. `<stddef.h>` includes `offsetof`,
+`<string.h>`, `<stdarg.h>`, `<locale.h>`, and `<time.h>`. It also provides the
+C99 `<stdint.h>` header as a target-specific extension; this is not a C90
+standard header. It defines 8-, 16-, and 32-bit integer types, corresponding
+least/fast types, pointer-sized and maximum-width types, limits, and constant
+macros. The target has no 64-bit integer type, so 64-bit typedefs and macros
+are not provided. `<stddef.h>` includes `offsetof`,
 which supports nested struct/union member designators in constant initializers.
 The string/memory
 routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,

@@ -5,7 +5,7 @@
 #define MAX_ROBOTS 50
 #define TILE_PIXELS 16
 #define MAP_VIEW_TOP 32
-#define MAP_VIEW_BOTTOM 220
+#define MAP_VIEW_BOTTOM 216
 
 #include "types.h"
 #include "map.h"
@@ -21,11 +21,11 @@ typedef struct {
 
     int camera_x;
     int camera_y;
+    unsigned int pan_keys_was_down;
+    float pan_repeat_timer;
     BuildingType build_tool;
     int selected_building;
     int tab_was_down;
-    char* notification;
-    float notification_time;
 } GameState;
 
 void game_init(GameState* state);

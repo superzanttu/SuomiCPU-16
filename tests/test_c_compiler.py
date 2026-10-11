@@ -1795,6 +1795,62 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
 
+    def test_c99_stdint_header_matches_available_target_integer_types(self):
+        image = compile_source(
+            "#include <stdint.h>\n"
+            "#include <stdint.h>\n"
+            "#if INT8_MIN != -128 || INT8_MAX != 127 || UINT8_MAX != 255\n"
+            "#error incorrect 8-bit limits\n"
+            "#endif\n"
+            "#if INT16_MIN != -32768 || INT16_MAX != 32767 || UINT16_MAX != 65535\n"
+            "#error incorrect 16-bit limits\n"
+            "#endif\n"
+            "#if INT32_MIN != -2147483648 || INT32_MAX != 2147483647 || "
+            "UINT32_MAX != 4294967295\n"
+            "#error incorrect 32-bit limits\n"
+            "#endif\n"
+            "#if INTPTR_MAX != LONG_MAX || UINTPTR_MAX != ULONG_MAX || "
+            "SIZE_MAX != ULONG_MAX\n"
+            "#error incorrect pointer or size limits\n"
+            "#endif\n"
+            "#if PTRDIFF_MIN != LONG_MIN || PTRDIFF_MAX != LONG_MAX || "
+            "SIG_ATOMIC_MIN != INT_MIN || SIG_ATOMIC_MAX != INT_MAX\n"
+            "#error incorrect auxiliary integer limits\n"
+            "#endif\n"
+            "#if WCHAR_MIN != -32768 || WCHAR_MAX != 32767 || "
+            "WINT_MIN != 0 || WINT_MAX != UINT_MAX\n"
+            "#error incorrect wide character limits\n"
+            "#endif\n"
+            "int main(void) {\n"
+            "  int8_t i8;\n"
+            "  uint8_t u8;\n"
+            "  int16_t i16;\n"
+            "  uint16_t u16;\n"
+            "  int32_t i32;\n"
+            "  uint32_t u32;\n"
+            "  intmax_t imax;\n"
+            "  uintptr_t address;\n"
+            "  i8 = -INT8_C(128);\n"
+            "  u8 = UINT8_C(255);\n"
+            "  i16 = INT16_MIN;\n"
+            "  u16 = UINT16_MAX;\n"
+            "  i32 = INT32_MIN;\n"
+            "  u32 = UINT32_C(4294967295);\n"
+            "  imax = INTMAX_C(2147483647);\n"
+            "  address = (uintptr_t)0x7FFFF;\n"
+            "  return sizeof(i8) != 1 || sizeof(u8) != 1 ||\n"
+            "    sizeof(i16) != 2 || sizeof(u16) != 2 ||\n"
+            "    sizeof(i32) != 4 || sizeof(u32) != 4 ||\n"
+            "    sizeof(intptr_t) != 4 || sizeof(uintptr_t) != 4 ||\n"
+            "    i8 != INT8_MIN || u8 != UINT8_MAX ||\n"
+            "    i16 != INT16_MIN || u16 != UINT16_MAX ||\n"
+            "    i32 != INT32_MIN || u32 != UINT32_MAX ||\n"
+            "    imax != INTMAX_MAX || address != 0x7FFFF;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+
     def test_long_values_use_32_bit_storage_and_calling_convention(self):
         image = compile_source(
             "long wide_global = 0x12345678L;\n"

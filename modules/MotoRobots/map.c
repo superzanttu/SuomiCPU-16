@@ -1,10 +1,28 @@
 #include "map.h"
 #include "../../lib/suomi_gfx.h"
 
-#define RESOURCE_PATCHES 8
-#define TERRAIN_PATCHES 24
-#define MAP_BASE_X 80
-#define MAP_BASE_Y 80
+#define RESOURCE_PATCHES 2
+#define TERRAIN_PATCHES 8
+#define MAP_BASE_X 24
+#define MAP_BASE_Y 24
+#define CELL_TILE_MASK 3
+#define CELL_RESOURCE_SHIFT 2
+#define CELL_RESOURCE_MASK 28
+
+static unsigned char cell_tile(unsigned char cell) {
+    return cell & CELL_TILE_MASK;
+}
+
+static unsigned char cell_resource(unsigned char cell) {
+    return (cell & CELL_RESOURCE_MASK) >> CELL_RESOURCE_SHIFT;
+}
+
+static void set_cell(GameMap* map, int x, int y, TileType tile,
+                     ResourceType resource) {
+    map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
+        .cells[x % CHUNK_SIZE][y % CHUNK_SIZE] =
+        (unsigned char)(tile | (resource << CELL_RESOURCE_SHIFT));
+}
 
 static void map_paint_patch(GameMap* map, int center_x, int center_y,
                             int radius, TileType tile, ResourceType resource) {
@@ -20,14 +38,9 @@ static void map_paint_patch(GameMap* map, int center_x, int center_y,
             if (dx * dx + dy * dy > radius * radius) continue;
             if (x < 0 || x >= map->width || y < 0 || y >= map->height) continue;
             if (tile != TILE_GROUND) {
-                map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-                    .tiles[x % CHUNK_SIZE][y % CHUNK_SIZE] = tile;
-                map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-                    .resources[x % CHUNK_SIZE][y % CHUNK_SIZE] = RES_NONE;
-            } else if (map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-                           .tiles[x % CHUNK_SIZE][y % CHUNK_SIZE] == TILE_GROUND) {
-                map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-                    .resources[x % CHUNK_SIZE][y % CHUNK_SIZE] = resource;
+                set_cell(map, x, y, tile, RES_NONE);
+            } else if (map_get_tile(map, x, y) == TILE_GROUND) {
+                set_cell(map, x, y, TILE_GROUND, resource);
             }
         }
     }
@@ -51,8 +64,7 @@ void map_init(GameMap* map) {
         for (cy = 0; cy < MAP_CHUNKS; cy++) {
             for (x = 0; x < CHUNK_SIZE; x++) {
                 for (y = 0; y < CHUNK_SIZE; y++) {
-                    map->chunks[cx][cy].tiles[x][y] = TILE_GROUND;
-                    map->chunks[cx][cy].resources[x][y] = RES_NONE;
+                    map->chunks[cx][cy].cells[x][y] = TILE_GROUND;
                 }
             }
         }
@@ -79,21 +91,19 @@ void map_init(GameMap* map) {
     for (x = MAP_BASE_X - 4; x <= MAP_BASE_X + 4; x++) {
         for (y = MAP_BASE_Y - 4; y <= MAP_BASE_Y + 4; y++) {
             map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-                .tiles[x % CHUNK_SIZE][y % CHUNK_SIZE] = TILE_GROUND;
-            map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-                .resources[x % CHUNK_SIZE][y % CHUNK_SIZE] = RES_NONE;
+                .cells[x % CHUNK_SIZE][y % CHUNK_SIZE] = TILE_GROUND;
         }
     }
 }
 
 TileType map_get_tile(GameMap* map, int x, int y) {
     if (x < 0 || x >= map->width || y < 0 || y >= map->height) return TILE_ROCK;
-    return map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-        .tiles[x % CHUNK_SIZE][y % CHUNK_SIZE];
+    return (TileType)cell_tile(map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
+        .cells[x % CHUNK_SIZE][y % CHUNK_SIZE]);
 }
 
 ResourceType map_get_resource(GameMap* map, int x, int y) {
     if (x < 0 || x >= map->width || y < 0 || y >= map->height) return RES_NONE;
-    return map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-        .resources[x % CHUNK_SIZE][y % CHUNK_SIZE];
+    return (ResourceType)cell_resource(map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
+        .cells[x % CHUNK_SIZE][y % CHUNK_SIZE]);
 }

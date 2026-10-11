@@ -4,11 +4,10 @@
 #include "types.h"
 
 #define CHUNK_SIZE 16
-#define MAP_CHUNKS 10
+#define MAP_CHUNKS 3
 
 typedef struct {
-    TileType tiles[CHUNK_SIZE][CHUNK_SIZE];
-    ResourceType resources[CHUNK_SIZE][CHUNK_SIZE];
+    unsigned char cells[CHUNK_SIZE][CHUNK_SIZE];
 } Chunk;
 
 typedef struct {

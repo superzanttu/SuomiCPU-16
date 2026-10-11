@@ -160,10 +160,14 @@ second. Mines hold up to five extracted units. The resource bar counts items
 currently held by buildings.
 
 Controls:
-- **Arrow keys**: Pan the map.
-- **Tab**: Cycle between Mine, Factory, Storage, and selection mode.
+- **WASD**: Pan the map one tile per press; holding a key repeats every 0.15
+  seconds.
+- **Bottom buttons**: Choose Mine, Factory, Storage, or Select mode.
+- **Tab**: Cycle between the same four modes.
 - **Left click**: Place the selected building, or select an existing building.
 - **Right click**: Cancel building placement.
+- **Console**: Displays build-mode changes, selections, placement results, and
+  placement errors; no transient notification log is drawn over the map.
 
 Factory recipes, robot task assignment and transport, pathfinding, save/load,
 zoom, and the remaining progression systems are not implemented yet.

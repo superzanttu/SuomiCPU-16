@@ -1,3 +1,8 @@
+#include <stdint.h>
+
+#ifndef MOTOROBOTS_TYPES_H
+#define MOTOROBOTS_TYPES_H
+
 typedef enum {
     TILE_GROUND,
     TILE_ROCK,
@@ -50,3 +55,5 @@ typedef struct {
     Vec2i target_pos;
     int is_active; // Using int instead of bool
 } Robot;
+
+#endif
