@@ -1,14 +1,13 @@
-#include "../include/game.h"
-#include "../lib/suomi_gfx.h"
-#include <stdlib.h>
+#include "game.c"
+#include "map.c"
 
 int main() {
     GameState state;
     game_init(&state);
     
     while (1) {
-        // Basic game loop
-        float dt = 0.016f; // Assume ~60fps for prototype
+        float dt;
+        dt = 0.016f;
         game_update(&state, dt);
         game_draw(&state);
         gfx_present();

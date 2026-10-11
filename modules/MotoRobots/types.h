@@ -1,5 +1,3 @@
-#include <stdint.h>
-
 typedef enum {
     TILE_GROUND,
     TILE_ROCK,
@@ -13,7 +11,7 @@ typedef enum {
     RES_COPPER_ORE,
     RES_IRON_PLATE,
     RES_COPPER_PLATE,
-    RES_STEEL
+    RES_ROMBONENT
 } ResourceType;
 
 typedef struct {
@@ -40,6 +38,7 @@ typedef struct {
     ResourceType resource_type; // Only used for Mines
     int inventory_count;
     ResourceType inventory_type;
+    float production_timer;
 } Building;
 
 typedef struct {

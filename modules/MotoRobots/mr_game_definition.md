@@ -150,3 +150,20 @@ Buildings are constructed for free, because this is first prototype game.
 - **Resolution**: 320x240 pixels, 8-bit palette.
 - **Drawing**: All drawing is performed on a back buffer using `gfx_*` functions; `gfx_present()` is called once per frame to update the display.
 - **Input**: Keyboard and mouse are accessed via memory-mapped registers or `gfx_*` helpers.
+
+## 9. Current Prototype Status
+
+The current playable prototype implements procedural ground, rock, and water
+terrain; clustered coal, iron, and copper deposits; camera panning; free
+placement of mines, factories, and storage; and mine extraction at one unit per
+second. Mines hold up to five extracted units. The resource bar counts items
+currently held by buildings.
+
+Controls:
+- **Arrow keys**: Pan the map.
+- **Tab**: Cycle between Mine, Factory, Storage, and selection mode.
+- **Left click**: Place the selected building, or select an existing building.
+- **Right click**: Cancel building placement.
+
+Factory recipes, robot task assignment and transport, pathfinding, save/load,
+zoom, and the remaining progression systems are not implemented yet.
