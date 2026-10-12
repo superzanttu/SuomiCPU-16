@@ -8,7 +8,7 @@ int main() {
     
     while (1) {
         float dt;
-        dt = 0.016f;
+        dt = 0.03333f;
         game_update(&state, dt);
         game_draw(&state);
         gfx_present();

@@ -23,6 +23,7 @@ DISK_BASE = 0x43100
 CONSOLE_DATA = 0x43200
 CONSOLE_STATUS = 0x43201
 CONSOLE_CONTROL = 0x43202
+MOUSE_EVENTS_ADDR = 0x4300D
 FAR_CONTROL_MASK = 0xF83F
 FAR_CONTROL_PREFIX = 0xF83E
 FAR_BRANCH_MASK = 0xF80F
@@ -35,6 +36,7 @@ CONSTANTS = (
     CONSOLE_DATA,
     CONSOLE_STATUS,
     CONSOLE_CONTROL,
+    MOUSE_EVENTS_ADDR,
 )
 
 
@@ -66,7 +68,7 @@ def _rd_pc(mem, a):
 
 
 @njit(cache=True)
-def _hits_gpu(a, width=2):
+def _hits_mmio(a, width=2):
     for offset in range(width):
         address = (a + offset) & MEM_MASK
         if address in (
@@ -75,6 +77,7 @@ def _hits_gpu(a, width=2):
             CONSOLE_DATA,
             CONSOLE_STATUS,
             CONSOLE_CONTROL,
+            MOUSE_EVENTS_ADDR,
         ):
             return True
     return False
@@ -196,25 +199,28 @@ def run_block(mem, regs, st, budget):
                 elif sel == 2:
                     npc = left
                 elif sel == 3:
-                    if _hits_gpu(sp - 3, 3):
+                    if _hits_mmio(sp - 3, 3):
                         bail = True
                     else:
                         sp -= 3
                         _wr_pc(mem, sp, npc)
                         npc = left
                 elif sel == 4:
-                    if _hits_gpu(sp - 2):
+                    if _hits_mmio(sp - 2):
                         bail = True
                     else:
                         sp -= 2
                         _wr16(mem, sp, z | (c << 1) | (n << 2) | (v << 3))
                 elif sel == 5:
-                    saved = _rd16(mem, sp)
-                    sp += 2
-                    z = saved & 1
-                    c = (saved >> 1) & 1
-                    n = (saved >> 2) & 1
-                    v = (saved >> 3) & 1
+                    if _hits_mmio(sp):
+                        bail = True
+                    else:
+                        saved = _rd16(mem, sp)
+                        sp += 2
+                        z = saved & 1
+                        c = (saved >> 1) & 1
+                        n = (saved >> 2) & 1
+                        v = (saved >> 3) & 1
                 elif sel == 6:
                     c = 1
                 elif sel == 7:
@@ -232,7 +238,7 @@ def run_block(mem, regs, st, budget):
                 elif sel == 10:
                     regs[rd] = (sp >> 16) & 7
                 elif sel == 11:
-                    if _hits_gpu(sp - 3, 3):
+                    if _hits_mmio(sp - 3, 3):
                         bail = True
                     else:
                         high_register = (control >> 9) & 7
@@ -316,7 +322,7 @@ def run_block(mem, regs, st, budget):
             target = (high_address << 16) | _rd16(mem, npc)
             npc += 2
             if operation == 1:
-                if _hits_gpu(sp - 3, 3):
+                if _hits_mmio(sp - 3, 3):
                     bail = True
                 else:
                     sp -= 3
@@ -344,7 +350,7 @@ def run_block(mem, regs, st, budget):
                 bail = True
         elif op == 27:
             addr = (sp + imm) & MEM_MASK
-            if _hits_gpu(addr):
+            if _hits_mmio(addr):
                 bail = True
             else:
                 regs[rd] = _rd16(mem, addr)
@@ -362,7 +368,7 @@ def run_block(mem, regs, st, budget):
             regs[rd] = (imm << 8) | regs[rd]
         elif op == 20:
             nsp = sp - 2
-            if _hits_gpu(nsp):
+            if _hits_mmio(nsp):
                 bail = True
             else:
                 sp = nsp
@@ -382,19 +388,22 @@ def run_block(mem, regs, st, budget):
             n = r16 >> 15
             v = 1 if ((a ^ b) & (a ^ r16) & 0x8000) else 0
         elif op == 23:
-            npc = _rd_pc(mem, sp)
-            sp += 3
+            if _hits_mmio(sp, 3):
+                bail = True
+            else:
+                npc = _rd_pc(mem, sp)
+                sp += 3
         elif op == 7:
             regs[rd] = regs[rs1] & regs[rs2]
         elif op == 25:
             addr = regs[rs1]
-            if _hits_gpu(addr):
+            if _hits_mmio(addr):
                 bail = True
             else:
                 regs[rd] = _rd16(mem, addr)
         elif op == 28:
             addr = (sp + imm) & MEM_MASK
-            if _hits_gpu(addr):
+            if _hits_mmio(addr):
                 bail = True
             else:
                 _wr16(mem, addr, regs[rd])
@@ -408,19 +417,19 @@ def run_block(mem, regs, st, budget):
             npc = instr & 0x7FF
         elif op == 2:
             addr = regs[rs1] & MEM_MASK
-            if _hits_gpu(addr, 1):
+            if _hits_mmio(addr, 1):
                 bail = True
             else:
                 regs[rd] = np.int64(mem[addr])
         elif op == 3:
             a = regs[rs1]
-            if _hits_gpu(a, 1):
+            if _hits_mmio(a, 1):
                 bail = True
             else:
                 mem[a & MEM_MASK] = regs[rd] & 0xFF
         elif op == 26:
             a = regs[rs1]
-            if _hits_gpu(a):
+            if _hits_mmio(a):
                 bail = True
             else:
                 _wr16(mem, a, regs[rd])
@@ -447,26 +456,32 @@ def run_block(mem, regs, st, budget):
                 npc = imm
         elif op == 22:
             nsp = sp - 3
-            if _hits_gpu(nsp, 3):
+            if _hits_mmio(nsp, 3):
                 bail = True
             else:
                 sp = nsp
                 _wr_pc(mem, sp, npc)
                 npc = instr & 0x7FF
         elif op == 21:
-            regs[rd] = _rd16(mem, sp) & 0xFFFF
-            sp += 2
+            if _hits_mmio(sp):
+                bail = True
+            else:
+                regs[rd] = _rd16(mem, sp) & 0xFFFF
+                sp += 2
         elif op == 10:
             regs[rd] = (~regs[rs1]) & 0xFFFF
         elif op == 19:
-            saved = _rd16(mem, sp)
-            sp += 2
-            z = saved & 1
-            c = (saved >> 1) & 1
-            n = (saved >> 2) & 1
-            v = (saved >> 3) & 1
-            npc = _rd_pc(mem, sp)
-            sp += 3
+            if _hits_mmio(sp, 5):
+                bail = True
+            else:
+                saved = _rd16(mem, sp)
+                sp += 2
+                z = saved & 1
+                c = (saved >> 1) & 1
+                n = (saved >> 2) & 1
+                v = (saved >> 3) & 1
+                npc = _rd_pc(mem, sp)
+                sp += 3
         elif op == 17:
             mem[ICR_ADDR] = mem[ICR_ADDR] | 1
         elif op == 18:

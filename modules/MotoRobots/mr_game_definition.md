@@ -1,6 +1,6 @@
 # MotoRobots Game Definition
 
-MotoRobots is a Factorio-type automation game focused on resource extraction, processing, and logistics using a fleet of transport robots. 
+MotoRobots is a Factorio-type automation game focused on resource extraction, processing, and logistics using a fleet of transport robots.
 
 **Target Platform**: SuomiCPU-16. The game is designed to fit within the architecture's constraints (16-bit words, limited memory, specific I/O capabilities) and is programmed in the SuomiCPU-16 C-language.
 
@@ -12,6 +12,7 @@ The loop follows:
 3. **Processing**: Factories refine raw ores into usable components.
 4. **Storage**: Refined components are stored for future construction.
 5. **Expansion**: Use stored components to build more Mines and Factories.
+
 
 ## 2. Entities
 ### 2.1 Buildings
@@ -32,7 +33,7 @@ Buildings are constructed for free, because this is first prototype game.
 - **Capacity**: Robots can carry up to 5 items. (Limited to fit within register/memory constraints).
 - **Energy**: Robots don't consume energy.
 - **Speed**: Movement speed is 2 tiles per second. Load/unload speed is 0.5 seconds per item.
-- **Collision**: Robots use breadth-first search to avoid rocks, water, other buildings, and other active robots. They retry their path on each movement step.
+- **Collision**: Robots plan a complete breadth-first route in small per-frame steps, avoiding rocks, water, buildings, and other active robots. Before moving, they check the next tile and asynchronously replan if it has become blocked.
 - **Fleet**: Routes use an existing idle robot when possible and otherwise create a robot, up to a limit of eight.
 - **Buffers**: Mines hold up to 5 items; other buildings hold up to 20 items of one resource type. A robot waits if its destination is full or contains another resource type.
 
@@ -88,15 +89,16 @@ Buildings are constructed for free, because this is first prototype game.
 ### 5.1 Pathfinding
 
 #### Pathfinding Algorithm
-- **Algorithm**: Robots run breadth-first search when selecting each next movement tile.
-- **Dynamic Obstacles**: The route is recalculated before each move so newly blocked paths are handled.
+- **Algorithm**: Breadth-first search records a complete route before a robot starts moving toward a source or target.
+- **Incremental Search**: Path searches expand a bounded number of map tiles per game update so route finding does not stall rendering, input, or simulation.
+- **Dynamic Obstacles**: Before each movement step, the robot checks whether its next tile remains clear. If blocked, it pauses and requests a new incremental path from its current position.
 
 ### 5.2 Save/Load System
 - **Status**: Save/load is not implemented in the current prototype.
     
 ## 6. User Interface (GUI)
 ### 6.1 Map View
-- **View**: Zoomable map view with three discrete zoom levels.
+- **View**: Zoomable map view with three discrete zoom levels. 3 zoom levels are available for different levels of detail.
 
 #### Map Navigation
 - **Panning**: Right-click and drag or hold WASD keys.
@@ -104,16 +106,19 @@ Buildings are constructed for free, because this is first prototype game.
 
 ### 6.2 Interaction & Controls
 - **Input**: Full mouse support for navigation and interaction.
+- **Keyboard**: WASD keys for panning the map.
+- **Mouse**: Left click for selection and placement, right click for deletion.
 
 #### Control Scheme
 - **Left Click**: Select building / Place building.
-- **Right Click**: Cancel action / Pan map.
+- **Right Click**: Delete a building / Pan map by dragging.
 
 ### 6.3 HUD & Feedback
 
 #### HUD Elements
 - **Resource Bar**: Top of screen showing totals of Coal, Iron Ore, Copper Ore, Iron Plate, and Copper Plate.
 - **Robot Status**: Bottom toolbar showing active robots versus the total fleet.
+- **Status LED**: One character cell wide and blinking at approximately one hertz, synchronized to rendered frames.
 - **Mini-map**: Bottom right showing terrain landmarks, buildings, active robots, and the approximate map-view center.
 
 #### Feedback
@@ -141,11 +146,11 @@ Buildings are constructed for free, because this is first prototype game.
 - **Stack**: Local variables and function calls use the machine stack (starts at `0x2FFFF`).
 
 ### 8.2 Execution & Timing
-- **Frame Budget**: The emulator executes up to 30,000 instructions per frame (capped at 60 FPS). Robot pathfinding runs synchronously before each movement step; longer routes may take multiple instruction windows to render.
+- **Frame Budget**: The emulator executes up to 30,000 instructions per frame at 60 FPS. Static terrain, buildings, and HUD layers are cached until the camera, selection, or toolbar changes. Robot pathfinding runs synchronously before each movement step.
 - **Precision**: Floating point values use IEEE-754 binary16 (half precision).
 
 ### 8.3 Graphics & I/O
-- **Resolution**: 320x240 pixels, 8-bit palette.
+- **Resolution**: 320x240 pixels, 8-bit palette. Maximum framerate is 30.
 - **Drawing**: All drawing is performed on a back buffer using `gfx_*` functions; `gfx_present()` is called once per frame to update the display.
 - **Input**: Keyboard and mouse are accessed via memory-mapped registers or `gfx_*` helpers.
 
@@ -158,13 +163,18 @@ and a bottom toolbar with Mine, Factory, Storage, Select, and Route modes.
 Buildings can be placed for free. Mines extract one unit per second into a
 five-item buffer. Robots can be assigned mine-to-building routes, carry up to
 five items, and deliver them while avoiding terrain and active robots. The
-resource bar includes items carried by robots.
+resource bar includes items carried by robots. Factories refine iron ore into
+iron plates and copper ore into copper plates at one item per second; they
+process their current input batch before accepting more deliveries.
+The renderer caches the static world and HUD layers between changes so normal
+frames redraw only moving robots and changing status values.
 
 Controls:
 - **WASD**: Pan the map; holding a key repeats every 0.15 seconds.
-- **Right mouse drag**: Pan the map; right-click without dragging cancels the
-  current build tool.
+- **Right mouse drag**: Pan the map.
+- **Right click on a building**: Delete it. The base cannot be removed.
 - **Mouse wheel**: Zoom in or out at the pointer across three levels.
+- **Zoom steps**: Each wheel update moves one level, even for high-delta events.
 - **Bottom buttons**: Choose Mine, Factory, Storage, Select, or Route mode.
 - **Tab**: Cycle between all five modes.
 - **Left click**: Place the selected building, or select an existing building.
@@ -174,5 +184,5 @@ Controls:
 - **Console**: Displays build-mode changes, selections, placement results, and
   placement errors; no transient notification log is drawn over the map.
 
-Factory recipes, save/load, and the remaining progression systems are not
-implemented yet.
+Rombonent and robot recipes, save/load, and the remaining progression systems
+are not implemented yet.

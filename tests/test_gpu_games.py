@@ -4,7 +4,10 @@ from pathlib import Path
 
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
-from src.SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, MEM_SIZE, MOUSE_ADDR, SCREEN_WIDTH, SuomiCompute16
+from src.SuomiCPU import (
+    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, MEM_SIZE,
+    MOUSE_ADDR, SCREEN_WIDTH, SuomiCompute16, _load_jit,
+)
 
 HEADER = '#include "suomi_gfx.h"\n'
 
@@ -129,6 +132,32 @@ class CGraphicsTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 0x15)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 1)
 
+    def test_mouse_click_events_remain_latched_until_guest_reads_them(self):
+        cpu = make_cpu(compile_source(
+            HEADER + "int click_events;\n"
+            "int main(void) { click_events = gfx_mouse_events(); return 0; }\n",
+            str(ROOT / "mouse_events.c")))
+        cpu.set_mouse_position(70, 225)
+        cpu.mouse_button(0, True, 70, 225, 1000)
+        cpu.end_mouse_frame()
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+        self.assertEqual(cpu.read(MOUSE_ADDR + 5), 0)
+
+    def test_jit_mouse_event_read_consumes_latched_click(self):
+        if _load_jit() is None:
+            self.skipTest("Numba JIT is unavailable")
+        cpu = make_cpu(compile_source(
+            HEADER + "int click_events;\n"
+            "int main(void) { click_events = gfx_mouse_events(); return 0; }\n",
+            str(ROOT / "mouse_events_jit.c")))
+        cpu.set_mouse_position(70, 225)
+        cpu.mouse_button(0, True, 70, 225, 1000)
+        cpu._execute_jit(30000)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+        self.assertEqual(cpu.memory[MOUSE_ADDR + 5], 0)
+
 
     def test_signed_char_loads_are_sign_extended(self):
         source = ROOT / "tests" / "_sc.c"
@@ -175,6 +204,55 @@ class CGraphicsTests(unittest.TestCase):
 
 
 class MotoRobotsTests(unittest.TestCase):
+    def test_toolbar_button_activates_on_press(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+            if any(vram(cpu)):
+                break
+
+        cpu.set_mouse_position(70, 225)
+        cpu.mouse_button(0, True, 70, 225, 1000)
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+            if "Build tool: Factory" in cpu.console_device.output.decode("ascii"):
+                break
+        self.assertIn("Build tool: Factory",
+                      cpu.console_device.output.decode("ascii"))
+
+    def test_toolbar_led_blinks_with_frame_counter(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
+        seen_colors = set()
+        for _ in range(70):
+            run_frame(cpu, limit=30000)
+            if any(vram(cpu)):
+                seen_colors.add(vram(cpu)[207 * 320 + 309])
+        self.assertTrue({3, 11}.issubset(seen_colors))
+
+    def test_toolbar_ignores_footer_header_and_button_gaps(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+            if any(vram(cpu)):
+                break
+
+        cpu.set_mouse_position(70, 207)
+        cpu.mouse_button(0, True, 70, 207, 1000)
+        run_frame(cpu, limit=30000)
+        cpu.end_mouse_frame()
+        cpu.mouse_button(0, False, 70, 207, 1010)
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+        self.assertNotIn("Build tool: Factory",
+                         cpu.console_device.output.decode("ascii"))
+
+        cpu.set_mouse_position(64, 225)
+        cpu.mouse_button(0, True, 64, 225, 1100)
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+        self.assertNotIn("Build tool: Factory",
+                         cpu.console_device.output.decode("ascii"))
+
     def test_initial_screen_presents_within_four_frame_budgets(self):
         cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
         for _ in range(4):
@@ -182,6 +260,51 @@ class MotoRobotsTests(unittest.TestCase):
             if any(vram(cpu)):
                 break
         self.assertTrue(any(vram(cpu)))
+
+    def test_static_scene_cache_keeps_later_frames_within_budget(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
+        run_frame(cpu, limit=120000)
+        cached_frame_instructions = run_frame(cpu, limit=120000)
+        self.assertLess(cached_frame_instructions, INSTRUCTIONS_PER_FRAME)
+
+    def test_buildings_and_carrying_robot_use_distinct_pixel_art(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "GameState preview;\n"
+            "int main(void) {\n"
+            "  game_init(&preview);\n"
+            "  preview.buildings[1].type = BUILDING_MINE;\n"
+            "  preview.buildings[1].position.x = 15;\n"
+            "  preview.buildings[1].position.y = 19;\n"
+            "  preview.buildings[1].resource_type = RES_COAL;\n"
+            "  preview.buildings[2].type = BUILDING_FACTORY;\n"
+            "  preview.buildings[2].position.x = 20;\n"
+            "  preview.buildings[2].position.y = 24;\n"
+            "  preview.buildings[3].type = BUILDING_STORAGE;\n"
+            "  preview.buildings[3].position.x = 28;\n"
+            "  preview.buildings[3].position.y = 24;\n"
+            "  preview.building_count = 4;\n"
+            "  preview.selected_building = -1;\n"
+            "  preview.robots[0].state = ROBOT_TO_TARGET;\n"
+            "  preview.robots[0].position.x = 22;\n"
+            "  preview.robots[0].position.y = 24;\n"
+            "  preview.robots[0].carrying_type = RES_IRON_ORE;\n"
+            "  game_draw(&preview);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "graphics_test.c")))
+        while cpu.running:
+            cpu.step()
+
+        self.assertEqual(pixel(cpu, 106, 119), 8)
+        self.assertEqual(pixel(cpu, 20, 43), 2)
+        self.assertEqual(pixel(cpu, 98, 123), 4)
+        self.assertEqual(pixel(cpu, 230, 123), 6)
+        self.assertEqual(pixel(cpu, 138, 125), 8)
 
     def test_irregular_map_has_rock_water_and_mineable_deposits(self):
         source = (
@@ -219,8 +342,8 @@ class MotoRobotsTests(unittest.TestCase):
             "  mine->type = BUILDING_MINE;\n"
             "  mine->position.x = 15;\n"
             "  mine->position.y = 19;\n"
-            "  mine->resource_type = RES_COAL;\n"
-            "  mine->inventory_type = RES_COAL;\n"
+            "  mine->resource_type = RES_IRON_ORE;\n"
+            "  mine->inventory_type = RES_IRON_ORE;\n"
             "  mine->inventory_count = 3;\n"
             "  factory = &test_state.buildings[2];\n"
             "  factory->type = BUILDING_FACTORY;\n"
@@ -232,8 +355,10 @@ class MotoRobotsTests(unittest.TestCase):
             "  assign_robot_route(&test_state, 1, 2);\n"
             "  test_state.robots[0].position.x = 15;\n"
             "  test_state.robots[0].position.y = 19;\n"
-            "  for (step = 0; step < 9; step++)\n"
+            "  for (step = 0; step < 30; step++) {\n"
+            "    update_pathfinding(&test_state);\n"
             "    update_robots(&test_state, 0.5f);\n"
+            "  }\n"
             "  results[0] = mine->inventory_count;\n"
             "  results[1] = factory->inventory_count;\n"
             "  results[2] = test_state.robots[0].carrying_amount;\n"
@@ -248,6 +373,174 @@ class MotoRobotsTests(unittest.TestCase):
         values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(4)]
         self.assertEqual(values[:3], [0, 3, 0])
         self.assertEqual(values[3], 1)
+
+    def test_robot_plans_incrementally_and_replans_when_next_tile_is_blocked(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[10];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  int step;\n"
+            "  int direction;\n"
+            "  int blocked_x;\n"
+            "  int blocked_y;\n"
+            "  game_init(&test_state);\n"
+            "  test_state.buildings[1].type = BUILDING_MINE;\n"
+            "  test_state.buildings[1].position.x = 20;\n"
+            "  test_state.buildings[1].position.y = 30;\n"
+            "  test_state.buildings[1].resource_type = RES_IRON_ORE;\n"
+            "  test_state.buildings[2].type = BUILDING_FACTORY;\n"
+            "  test_state.buildings[2].position.x = 26;\n"
+            "  test_state.buildings[2].position.y = 30;\n"
+            "  test_state.building_count = 3;\n"
+            "  assign_robot_route(&test_state, 1, 2);\n"
+            "  update_pathfinding(&test_state);\n"
+            "  results[0] = test_state.robots[0].position.x;\n"
+            "  results[1] = test_state.robots[0].position.y;\n"
+            "  results[2] = test_state.robots[0].path_status;\n"
+            "  results[6] = test_state.path_queue_head;\n"
+            "  results[7] = test_state.path_queue_tail;\n"
+            "  results[8] = test_state.pathfinding_robot;\n"
+            "  results[9] = map_get_tile(&test_state.map, 24, 24);\n"
+            "  for (step = 0; step < 120 &&\n"
+            "       test_state.robots[0].path_status != ROBOT_PATH_READY;\n"
+            "       step++) update_pathfinding(&test_state);\n"
+            "  results[3] = test_state.robots[0].path_status;\n"
+            "  direction = test_state.robot_paths[0][0];\n"
+            "  blocked_x = test_state.robots[0].position.x;\n"
+            "  blocked_y = test_state.robots[0].position.y;\n"
+            "  if (direction == 0) blocked_x--;\n"
+            "  else if (direction == 1) blocked_x++;\n"
+            "  else if (direction == 2) blocked_y--;\n"
+            "  else blocked_y++;\n"
+            "  test_state.buildings[3].type = BUILDING_STORAGE;\n"
+            "  test_state.buildings[3].position.x = blocked_x;\n"
+            "  test_state.buildings[3].position.y = blocked_y;\n"
+            "  test_state.building_count = 4;\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  results[4] = test_state.robots[0].path_status;\n"
+            "  for (step = 0; step < 120 &&\n"
+            "       test_state.robots[0].path_status != ROBOT_PATH_READY;\n"
+            "       step++) update_pathfinding(&test_state);\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  results[5] = test_state.robots[0].position.x == blocked_x &&\n"
+            "       test_state.robots[0].position.y == blocked_y;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "path_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(10)]
+        self.assertEqual(values[:4], [
+            24, 24, 2, 3,
+        ], values)
+        self.assertEqual(values[4:], [1, 0])
+
+    def test_factory_refines_iron_and_copper_ore_in_batches(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[9];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Building* iron;\n"
+            "  Building* copper;\n"
+            "  Building* coal;\n"
+            "  Robot* waiting;\n"
+            "  game_init(&test_state);\n"
+            "  iron = &test_state.buildings[1];\n"
+            "  iron->type = BUILDING_FACTORY;\n"
+            "  iron->inventory_type = RES_IRON_ORE;\n"
+            "  iron->inventory_count = 2;\n"
+            "  copper = &test_state.buildings[2];\n"
+            "  copper->type = BUILDING_FACTORY;\n"
+            "  copper->inventory_type = RES_COPPER_ORE;\n"
+            "  copper->inventory_count = 1;\n"
+            "  coal = &test_state.buildings[3];\n"
+            "  coal->type = BUILDING_FACTORY;\n"
+            "  coal->inventory_type = RES_COAL;\n"
+            "  coal->inventory_count = 1;\n"
+            "  test_state.building_count = 4;\n"
+            "  waiting = &test_state.robots[1];\n"
+            "  waiting->state = ROBOT_UNLOADING;\n"
+            "  waiting->source_building = 0;\n"
+            "  waiting->target_building = 1;\n"
+            "  waiting->carrying_type = RES_IRON_ORE;\n"
+            "  waiting->carrying_amount = 1;\n"
+            "  test_state.robot_count = 2;\n"
+            "  update_factories(&test_state, 0.5f);\n"
+            "  results[0] = iron->inventory_type;\n"
+            "  results[1] = copper->inventory_type;\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  results[2] = iron->inventory_count;\n"
+            "  results[3] = waiting->carrying_amount;\n"
+            "  update_factories(&test_state, 0.5f);\n"
+            "  results[4] = copper->inventory_type;\n"
+            "  update_factories(&test_state, 1.0f);\n"
+            "  results[5] = iron->inventory_type;\n"
+            "  results[6] = iron->inventory_count;\n"
+            "  results[7] = coal->inventory_type;\n"
+            "  assign_robot_route(&test_state, 3, 1);\n"
+            "  results[8] = test_state.robot_count;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "factory_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(9)]
+        self.assertEqual(values, [
+            2, 3, 2, 1, 5, 4, 2, 1, 2,
+        ])
+
+    def test_right_click_deletes_building_but_preserves_base(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[1];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  game_init(&test_state);\n"
+            "  test_state.buildings[1].type = BUILDING_FACTORY;\n"
+            "  test_state.buildings[1].position.x = 25;\n"
+            "  test_state.buildings[1].position.y = 24;\n"
+            "  test_state.building_count = 2;\n"
+            "  while (1) {\n"
+            "    game_update(&test_state, 0.016f);\n"
+            "    results[0] = test_state.building_count;\n"
+            "    game_draw(&test_state);\n"
+            "    gfx_present();\n"
+            "  }\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "delete_test.c")))
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+            if any(vram(cpu)):
+                break
+
+        cpu.set_mouse_position(176, 119)
+        cpu.mouse_button(1, True, 176, 119, 1000)
+        cpu.end_mouse_frame()
+        cpu.mouse_button(1, False, 176, 119, 1010)
+        for _ in range(5):
+            run_frame(cpu, limit=30000)
+            if cpu.read_16(GLOBAL_BASE) == 1:
+                break
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
+
+        cpu.set_mouse_position(160, 119)
+        cpu.mouse_button(1, True, 160, 119, 1200)
+        cpu.end_mouse_frame()
+        cpu.mouse_button(1, False, 160, 119, 1210)
+        for _ in range(5):
+            run_frame(cpu, limit=30000)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
 
     def test_mouse_wheel_changes_map_zoom(self):
         cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
@@ -265,6 +558,31 @@ class MotoRobotsTests(unittest.TestCase):
                 break
         self.assertNotEqual(before, vram(cpu))
         self.assertIn("Zoom level 3 of 3", cpu.console_device.output.decode("ascii"))
+
+    def test_mouse_wheel_multi_notch_input_advances_only_one_zoom_level(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int zoom_result;\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  game_init(&test_state);\n"
+            "  test_state.zoom = 0;\n"
+            "  while (1) {\n"
+            "    game_update(&test_state, 0.016f);\n"
+            "    zoom_result = test_state.zoom;\n"
+            "    game_draw(&test_state);\n"
+            "    gfx_present();\n"
+            "  }\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "zoom_step_test.c")))
+        run_frame(cpu, limit=200000)
+        cpu.set_mouse_position(160, 120)
+        cpu.set_mouse_wheel(2)
+        run_frame(cpu, limit=50000)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
 
 
 class PreprocessorTests(unittest.TestCase):

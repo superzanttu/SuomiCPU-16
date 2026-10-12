@@ -46,6 +46,12 @@ typedef enum {
     ROBOT_UNLOADING
 } RobotState;
 
+#define ROBOT_PATH_NONE 0
+#define ROBOT_PATH_QUEUED 1
+#define ROBOT_PATH_SEARCHING 2
+#define ROBOT_PATH_READY 3
+#define ROBOT_PATH_FAILED 4
+
 typedef struct {
     BuildingType type;
     Vec2i position;
@@ -53,6 +59,7 @@ typedef struct {
     int inventory_count;
     ResourceType inventory_type;
     float production_timer;
+    int processing_batch;
 } Building;
 
 typedef struct {
@@ -63,6 +70,9 @@ typedef struct {
     int target_building;
     RobotState state;
     float timer;
+    int path_length;
+    int path_position;
+    int path_status;
 } Robot;
 
 #endif

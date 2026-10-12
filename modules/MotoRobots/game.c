@@ -87,11 +87,124 @@ static char* resource_name(ResourceType type) {
     return "None";
 }
 
+static int toolbar_button_at(int x, int y) {
+    int button;
+    int button_offset;
+
+    if (y < TOOLBAR_Y + 18 || y >= TOOLBAR_Y + 37 || x < 4) return -1;
+    button_offset = x - 4;
+    button = button_offset / (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP);
+    if (button >= TOOL_BUTTON_COUNT ||
+        button_offset % (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP) >=
+            TOOL_BUTTON_WIDTH) return -1;
+    return button;
+}
+
+static BuildingType toolbar_button_tool(int button) {
+    if (button == 0) return BUILDING_MINE;
+    if (button == 1) return BUILDING_FACTORY;
+    if (button == 2) return BUILDING_STORAGE;
+    if (button == 3) return BUILDING_NONE;
+    return BUILDING_ROUTE;
+}
+
+static void select_toolbar_button(GameState* state, int button) {
+    state->build_tool = toolbar_button_tool(button);
+    state->selected_building = -1;
+    state->route_source = -1;
+    state->pathfinding_robot = -1;
+    printf("Build tool: %s\n", building_name(state->build_tool));
+}
+
+static void delete_building(GameState* state, int index) {
+    int i;
+    Robot* robot;
+    BuildingType removed_type;
+
+    if (index < 0 || index >= state->building_count) return;
+    if (state->buildings[index].type == BUILDING_BASE) {
+        printf("Delete failed: the base cannot be removed\n");
+        return;
+    }
+    removed_type = state->buildings[index].type;
+    for (i = 0; i < state->robot_count; i++) {
+        robot = &state->robots[i];
+        if (robot->state != ROBOT_IDLE &&
+            (robot->source_building == index ||
+             robot->target_building == index)) {
+            robot->state = ROBOT_IDLE;
+            robot->source_building = -1;
+            robot->target_building = -1;
+            robot->carrying_amount = 0;
+            robot->carrying_type = RES_NONE;
+            robot->timer = 0.0f;
+            robot->path_status = ROBOT_PATH_NONE;
+            robot->path_length = 0;
+            robot->path_position = 0;
+            if (state->pathfinding_robot == i)
+                state->pathfinding_robot = -1;
+        } else {
+            if (robot->source_building > index) robot->source_building--;
+            if (robot->target_building > index) robot->target_building--;
+        }
+    }
+    for (i = index; i < state->building_count - 1; i++)
+        state->buildings[i] = state->buildings[i + 1];
+    state->building_count--;
+    if (state->selected_building == index) state->selected_building = -1;
+    else if (state->selected_building > index) state->selected_building--;
+    if (state->route_source == index) state->route_source = -1;
+    else if (state->route_source > index) state->route_source--;
+    printf("Deleted %s\n", building_name(removed_type));
+}
+
 static unsigned char resource_color(ResourceType type) {
     if (type == RES_COAL) return DARK_GRAY;
     if (type == RES_IRON_ORE) return ORANGE;
     if (type == RES_COPPER_ORE) return CYAN;
     return WHITE;
+}
+
+static void draw_building_sprite(Building* building, int x, int y, int size,
+                                 int selected) {
+    int unit;
+    unsigned char material;
+
+    unit = size / 8;
+    if (unit < 1) unit = 1;
+    if (building->type == BUILDING_BASE) {
+        gfx_rect(x + unit, y + 2 * unit, 6 * unit, 5 * unit, DARK_GRAY);
+        gfx_rect(x + 2 * unit, y + unit, 4 * unit, 6 * unit, YELLOW);
+        gfx_rect(x + 3 * unit, y, 2 * unit, 2 * unit, CYAN);
+        gfx_rect(x + 3 * unit, y + 3 * unit, 2 * unit, 2 * unit, ORANGE);
+        gfx_rect(x + 3 * unit, y + 6 * unit, 2 * unit, unit, GRAY);
+    } else if (building->type == BUILDING_MINE) {
+        material = resource_color(building->resource_type);
+        gfx_rect(x + unit, y + 5 * unit, 6 * unit, 2 * unit, DARK_GRAY);
+        gfx_rect(x + 2 * unit, y + 2 * unit, 4 * unit, 4 * unit, RED);
+        gfx_rect(x + 3 * unit, y + unit, 2 * unit, 2 * unit, GRAY);
+        gfx_rect(x + 3 * unit, y + 4 * unit, 2 * unit, unit, material);
+        gfx_rect(x + 6 * unit, y + 2 * unit, unit, 3 * unit, WHITE);
+    } else if (building->type == BUILDING_FACTORY) {
+        gfx_rect(x + unit, y + 3 * unit, 6 * unit, 4 * unit, DARK_GRAY);
+        gfx_rect(x + unit, y + 2 * unit, 5 * unit, 4 * unit, BLUE);
+        gfx_rect(x + 5 * unit, y + unit, 2 * unit, 4 * unit, GRAY);
+        gfx_rect(x + 5 * unit, y, 2 * unit, 2 * unit, ORANGE);
+        gfx_rect(x + 2 * unit, y + 3 * unit, 2 * unit, unit, CYAN);
+        gfx_rect(x + 2 * unit, y + 5 * unit, 2 * unit, 2 * unit, DARK_GRAY);
+    } else {
+        gfx_rect(x + unit, y + 2 * unit, 6 * unit, 5 * unit, CYAN);
+        gfx_rect(x + unit, y + unit, 6 * unit, unit, WHITE);
+        gfx_rect(x + 2 * unit, y + 3 * unit, unit, 3 * unit, DARK_GRAY);
+        gfx_rect(x + 5 * unit, y + 3 * unit, unit, 3 * unit, DARK_GRAY);
+        gfx_rect(x + 3 * unit, y + 4 * unit, 2 * unit, 3 * unit, BLUE);
+    }
+    if (selected) {
+        gfx_rect(x, y, size, 1, WHITE);
+        gfx_rect(x, y + size - 1, size, 1, WHITE);
+        gfx_rect(x, y, 1, size, WHITE);
+        gfx_rect(x + size - 1, y, 1, size, WHITE);
+    }
 }
 
 static void format_count(char* output, int value) {
@@ -180,9 +293,16 @@ static void place_building(GameState* state, int x, int y) {
     building->inventory_count = 0;
     building->inventory_type = RES_NONE;
     building->production_timer = 0.0f;
+    building->processing_batch = 0;
     state->selected_building = state->building_count;
     state->building_count++;
     printf("Placed %s at (%d,%d)\n", building_name(building->type), x, y);
+}
+
+static ResourceType factory_output_for(ResourceType input) {
+    if (input == RES_IRON_ORE) return RES_IRON_PLATE;
+    if (input == RES_COPPER_ORE) return RES_COPPER_PLATE;
+    return RES_NONE;
 }
 
 static void assign_robot_route(GameState* state, int source_index,
@@ -208,6 +328,13 @@ static void assign_robot_route(GameState* state, int source_index,
         printf("Route failed: source has no transportable resource\n");
         return;
     }
+    if (target->type == BUILDING_FACTORY &&
+        factory_output_for(source->type == BUILDING_MINE ?
+                           source->resource_type : source->inventory_type) ==
+            RES_NONE) {
+        printf("Route failed: factories accept iron ore or copper ore\n");
+        return;
+    }
     robot = 0;
     for (i = 0; i < state->robot_count; i++) {
         if (state->robots[i].state == ROBOT_IDLE) {
@@ -229,6 +356,9 @@ static void assign_robot_route(GameState* state, int source_index,
     robot->target_building = target_index;
     robot->state = ROBOT_TO_SOURCE;
     robot->timer = 0.0f;
+    robot->path_status = ROBOT_PATH_QUEUED;
+    robot->path_length = 0;
+    robot->path_position = 0;
     printf("Robot route: %s (%d,%d) -> %s (%d,%d)\n",
            building_name(source->type), source->position.x, source->position.y,
            building_name(target->type), target->position.x, target->position.y);
@@ -281,6 +411,37 @@ static void update_mines(GameState* state, float delta_time) {
     }
 }
 
+static void update_factories(GameState* state, float delta_time) {
+    int i;
+    Building* building;
+    ResourceType output;
+
+    for (i = 0; i < state->building_count; i++) {
+        building = &state->buildings[i];
+        if (building->type != BUILDING_FACTORY) continue;
+        output = factory_output_for(building->inventory_type);
+        if (building->inventory_count <= 0 || output == RES_NONE) {
+            building->production_timer = 0.0f;
+            building->processing_batch = 0;
+            continue;
+        }
+        if (building->processing_batch <= 0) {
+            building->processing_batch = building->inventory_count;
+            building->production_timer = 0.0f;
+        }
+        building->production_timer += delta_time;
+        if (building->production_timer >=
+            (float)building->processing_batch) {
+            building->inventory_type = output;
+            building->production_timer = 0.0f;
+            building->processing_batch = 0;
+            printf("Factory at (%d,%d) produced %s x%d\n",
+                   building->position.x, building->position.y,
+                   resource_name(output), building->inventory_count);
+        }
+    }
+}
+
 static int robot_tile_blocked(GameState* state, Robot* robot, int x, int y,
                               int destination) {
     int building;
@@ -298,44 +459,133 @@ static int robot_tile_blocked(GameState* state, Robot* robot, int x, int y,
     return 0;
 }
 
-static int robot_next_direction(GameState* state, Robot* robot,
-                                int destination) {
-    int* queue;
-    unsigned char* visited;
+#define PATHFIND_NODES_PER_UPDATE 32
+
+static int robot_destination(Robot* robot) {
+    if (robot->state == ROBOT_TO_SOURCE) return robot->source_building;
+    return robot->target_building;
+}
+
+static void queue_robot_path(GameState* state, Robot* robot) {
+    robot->path_status = ROBOT_PATH_QUEUED;
+    robot->path_length = 0;
+    robot->path_position = 0;
+    robot->timer = 0.0f;
+    if (state->pathfinding_robot >= 0 &&
+        &state->robots[state->pathfinding_robot] == robot)
+        state->pathfinding_robot = -1;
+}
+
+static void finish_robot_path(GameState* state, int robot_index, int goal) {
+    Robot* robot;
+    int current;
+    int direction;
+    int previous;
+    int i;
+    unsigned char swap;
+
+    robot = &state->robots[robot_index];
+    current = goal;
+    robot->path_length = 0;
+    while (current != state->path_queue[0]) {
+        direction = state->path_parent_direction[current];
+        state->robot_paths[robot_index][robot->path_length++] =
+            (unsigned char)direction;
+        if (direction == 0) previous = current + 1;
+        else if (direction == 1) previous = current - 1;
+        else if (direction == 2) previous = current + state->map.width;
+        else previous = current - state->map.width;
+        current = previous;
+    }
+    for (i = 0; i < robot->path_length / 2; i++) {
+        swap = state->robot_paths[robot_index][i];
+        state->robot_paths[robot_index][i] =
+            state->robot_paths[robot_index][robot->path_length - i - 1];
+        state->robot_paths[robot_index][robot->path_length - i - 1] = swap;
+    }
+    robot->path_position = 0;
+    robot->path_status = ROBOT_PATH_READY;
+    robot->timer = 0.0f;
+}
+
+static void start_next_path_search(GameState* state) {
+    int i;
+    int destination;
     int start;
     int goal;
-    int head;
-    int tail;
-    int entry;
+    Robot* robot;
+
+    if (state->pathfinding_robot >= 0) return;
+    for (i = 0; i < state->robot_count; i++) {
+        robot = &state->robots[i];
+        if (robot->path_status != ROBOT_PATH_QUEUED) continue;
+        destination = robot_destination(robot);
+        if (destination < 0 || destination >= state->building_count) {
+            robot->path_status = ROBOT_PATH_FAILED;
+            continue;
+        }
+        start = robot->position.y * state->map.width + robot->position.x;
+        goal = state->buildings[destination].position.y *
+            state->map.width + state->buildings[destination].position.x;
+        if (start < 0 || start >= MAP_SIZE * MAP_SIZE ||
+            goal < 0 || goal >= MAP_SIZE * MAP_SIZE) {
+            robot->path_status = ROBOT_PATH_FAILED;
+            continue;
+        }
+        for (destination = 0;
+             destination < (MAP_SIZE * MAP_SIZE + 7) / 8;
+             destination++)
+            state->path_visited[destination] = 0;
+        state->path_queue_head = 0;
+        state->path_queue_tail = 1;
+        state->path_queue[0] = start;
+        state->path_visited[start >> 3] =
+            (unsigned char)(1 << (start & 7));
+        robot->path_status = ROBOT_PATH_SEARCHING;
+        state->pathfinding_robot = i;
+        return;
+    }
+}
+
+static void update_pathfinding(GameState* state) {
+    int budget;
+    int robot_index;
+    int destination;
+    int goal;
     int index;
-    int first;
     int x;
     int y;
     int next_x;
     int next_y;
     int next_index;
     int direction;
-    int first_direction;
     int byte_index;
     int bit;
-    int i;
+    Robot* robot;
 
-    queue = state->path_queue;
-    visited = state->path_visited;
-    if (destination < 0 || destination >= state->building_count) return -1;
-    start = robot->position.y * state->map.width + robot->position.x;
-    goal = state->buildings[destination].position.y * state->map.width +
-        state->buildings[destination].position.x;
-    if (start == goal) return -1;
-    for (i = 0; i < (MAP_SIZE * MAP_SIZE + 7) / 8; i++) visited[i] = 0;
-    head = 0;
-    tail = 0;
-    queue[tail++] = start | (4 << 12);
-    visited[start >> 3] = (unsigned char)(1 << (start & 7));
-    while (head < tail) {
-        entry = queue[head++];
-        index = entry & 4095;
-        first = entry >> 12;
+    start_next_path_search(state);
+    budget = PATHFIND_NODES_PER_UPDATE;
+    while (state->pathfinding_robot >= 0 && budget > 0) {
+        robot_index = state->pathfinding_robot;
+        robot = &state->robots[robot_index];
+        destination = robot_destination(robot);
+        goal = state->buildings[destination].position.y *
+            state->map.width + state->buildings[destination].position.x;
+        if (state->path_queue_head >= state->path_queue_tail) {
+            robot->path_status = ROBOT_PATH_FAILED;
+            robot->timer = 0.0f;
+            state->pathfinding_robot = -1;
+            start_next_path_search(state);
+            continue;
+        }
+        index = state->path_queue[state->path_queue_head++];
+        budget--;
+        if (index == goal) {
+            finish_robot_path(state, robot_index, goal);
+            state->pathfinding_robot = -1;
+            start_next_path_search(state);
+            continue;
+        }
         x = index % state->map.width;
         y = index / state->map.width;
         for (direction = 0; direction < 4; direction++) {
@@ -352,21 +602,22 @@ static int robot_next_direction(GameState* state, Robot* robot,
             next_index = next_y * state->map.width + next_x;
             byte_index = next_index >> 3;
             bit = 1 << (next_index & 7);
-            if (visited[byte_index] & bit) continue;
-            visited[byte_index] =
-                (unsigned char)(visited[byte_index] | bit);
-            first_direction = first == 4 ? direction : first;
-            if (next_index == goal) return first_direction;
-            queue[tail++] = next_index | (first_direction << 12);
+            if (state->path_visited[byte_index] & bit) continue;
+            state->path_visited[byte_index] =
+                (unsigned char)(state->path_visited[byte_index] | bit);
+            state->path_parent_direction[next_index] =
+                (unsigned char)direction;
+            state->path_queue[state->path_queue_tail++] = next_index;
         }
     }
-    return -1;
 }
 
 static void update_robots(GameState* state, float delta_time) {
     int i;
     int direction;
     int destination;
+    int next_x;
+    int next_y;
     Robot* robot;
     Building* source;
     Building* target;
@@ -376,9 +627,6 @@ static void update_robots(GameState* state, float delta_time) {
         if (robot->state == ROBOT_IDLE) continue;
         if (robot->state == ROBOT_TO_SOURCE ||
             robot->state == ROBOT_TO_TARGET) {
-            robot->timer += delta_time;
-            if (robot->timer < ROBOT_INTERVAL) continue;
-            robot->timer -= ROBOT_INTERVAL;
             if (robot->state == ROBOT_TO_SOURCE)
                 destination = robot->source_building;
             else destination = robot->target_building;
@@ -389,14 +637,41 @@ static void update_robots(GameState* state, float delta_time) {
                 robot->state = robot->state == ROBOT_TO_SOURCE ?
                     ROBOT_LOADING : ROBOT_UNLOADING;
                 robot->timer = 0.0f;
+                robot->path_status = ROBOT_PATH_NONE;
+                robot->path_length = 0;
+                robot->path_position = 0;
                 continue;
             }
-            direction = robot_next_direction(state, robot, destination);
-            if (direction == 0) robot->position.x--;
-            else if (direction == 1) robot->position.x++;
-            else if (direction == 2) robot->position.y--;
-            else if (direction == 3) robot->position.y++;
-            if (direction < 0) robot->timer = 0.0f;
+            if (robot->path_status == ROBOT_PATH_FAILED) {
+                robot->timer += delta_time;
+                if (robot->timer >= ROBOT_INTERVAL)
+                    queue_robot_path(state, robot);
+                continue;
+            }
+            if (robot->path_status != ROBOT_PATH_READY) continue;
+            robot->timer += delta_time;
+            if (robot->timer < ROBOT_INTERVAL) continue;
+            robot->timer -= ROBOT_INTERVAL;
+            if (robot->path_position >= robot->path_length) {
+                robot->path_status = ROBOT_PATH_FAILED;
+                robot->timer = 0.0f;
+                continue;
+            }
+            direction = state->robot_paths[i][robot->path_position];
+            next_x = robot->position.x;
+            next_y = robot->position.y;
+            if (direction == 0) next_x--;
+            else if (direction == 1) next_x++;
+            else if (direction == 2) next_y--;
+            else next_y++;
+            if (robot_tile_blocked(state, robot, next_x, next_y,
+                                   destination)) {
+                queue_robot_path(state, robot);
+                continue;
+            }
+            robot->position.x = next_x;
+            robot->position.y = next_y;
+            robot->path_position++;
             continue;
         }
 
@@ -406,7 +681,7 @@ static void update_robots(GameState* state, float delta_time) {
             if (source->inventory_count <= 0) {
                 if (robot->carrying_amount > 0) {
                     robot->state = ROBOT_TO_TARGET;
-                    robot->timer = 0.0f;
+                    queue_robot_path(state, robot);
                 }
                 continue;
             }
@@ -417,7 +692,7 @@ static void update_robots(GameState* state, float delta_time) {
                 robot->carrying_type = source->inventory_type;
             if (source->inventory_type != robot->carrying_type) {
                 robot->state = ROBOT_TO_TARGET;
-                robot->timer = 0.0f;
+                queue_robot_path(state, robot);
                 continue;
             }
             source->inventory_count--;
@@ -430,7 +705,9 @@ static void update_robots(GameState* state, float delta_time) {
                 robot->timer = 0.0f;
             }
         } else if (robot->state == ROBOT_UNLOADING) {
-            if ((target->inventory_type != RES_NONE &&
+            if ((target->type == BUILDING_FACTORY &&
+                 target->processing_batch > 0) ||
+                (target->inventory_type != RES_NONE &&
                  target->inventory_type != robot->carrying_type) ||
                 target->inventory_count >= BUILDING_BUFFER_CAP) continue;
             robot->timer += delta_time;
@@ -443,16 +720,15 @@ static void update_robots(GameState* state, float delta_time) {
                 robot->carrying_amount = 0;
                 robot->carrying_type = RES_NONE;
                 robot->state = ROBOT_TO_SOURCE;
-                robot->timer = 0.0f;
+                queue_robot_path(state, robot);
             }
         }
     }
 }
 
-static void draw_resource_total(int x, char* label, int total) {
+static void draw_resource_value(int x, int total) {
     char count[6];
     format_count(count, total);
-    gfx_text(x, 3, label, WHITE);
     gfx_text(x, 19, count, YELLOW);
 }
 
@@ -475,12 +751,6 @@ static void draw_minimap(GameState* state) {
         else color = WHITE;
         gfx_rect(MINIMAP_X + x, MINIMAP_Y + y, 2, 2, color);
     }
-    for (i = 0; i < state->robot_count; i++) {
-        if (state->robots[i].state == ROBOT_IDLE) continue;
-        x = state->robots[i].position.x * MINIMAP_SIZE / MAP_SIZE;
-        y = state->robots[i].position.y * MINIMAP_SIZE / MAP_SIZE;
-        gfx_rect(MINIMAP_X + x, MINIMAP_Y + y, 2, 2, YELLOW);
-    }
     size = tile_size(state);
     center_x = (state->camera_x + SCREEN_W / 2) / size *
         MINIMAP_SIZE / MAP_SIZE;
@@ -488,6 +758,76 @@ static void draw_minimap(GameState* state) {
         (MAP_VIEW_BOTTOM - MAP_VIEW_TOP) / 2) / size *
         MINIMAP_SIZE / MAP_SIZE;
     gfx_rect(MINIMAP_X + center_x, MINIMAP_Y + center_y, 2, 2, WHITE);
+}
+
+static void draw_static_hud(GameState* state) {
+    int i;
+    int button_x;
+    unsigned char color;
+    BuildingType button_tool;
+    char* button_label;
+
+    gfx_rect(0, 0, SCREEN_W, MAP_VIEW_TOP, BLACK);
+    gfx_rect(0, 0, SCREEN_W, 1, CYAN);
+    gfx_text(5, 3, "Coal", WHITE);
+    gfx_text(68, 3, "Iron", WHITE);
+    gfx_text(131, 3, "Copper", WHITE);
+    gfx_text(194, 3, "Fe plate", WHITE);
+    gfx_text(257, 3, "Cu plate", WHITE);
+    gfx_text(288, 29, "Z", CYAN);
+    draw_minimap(state);
+
+    gfx_rect(0, TOOLBAR_Y, SCREEN_W, SCREEN_H - TOOLBAR_Y, BLACK);
+    gfx_rect(0, TOOLBAR_Y, SCREEN_W, 1, CYAN);
+    gfx_text(145, TOOLBAR_Y + 5, "Bots", CYAN);
+    gfx_text(193, TOOLBAR_Y + 5, "/", WHITE);
+    if (state->build_tool == BUILDING_ROUTE) {
+        if (state->route_source < 0)
+            gfx_text(222, TOOLBAR_Y + 5, "Route: source", GRAY);
+        else
+            gfx_text(222, TOOLBAR_Y + 5, "Route: target", GRAY);
+    }
+    for (i = 0; i < TOOL_BUTTON_COUNT; i++) {
+        button_x = i * (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP) + 4;
+        button_tool = toolbar_button_tool(i);
+        button_label = building_name(button_tool);
+        color = state->build_tool == button_tool ? CYAN : GRAY;
+        if (state->toolbar_pressed == i && state->toolbar_hovered == i)
+            color = YELLOW;
+        else if (state->toolbar_hovered == i) color = WHITE;
+        gfx_rect(button_x, TOOLBAR_Y + 18, TOOL_BUTTON_WIDTH, 19,
+                 state->toolbar_pressed == i ? GRAY : DARK_GRAY);
+        gfx_rect(button_x, TOOLBAR_Y + 18, TOOL_BUTTON_WIDTH, 2, color);
+        gfx_text(button_x + 5, TOOLBAR_Y + 25, button_label, WHITE);
+    }
+}
+
+static void draw_minimap_robots(GameState* state) {
+    int i;
+    int x;
+    int y;
+
+    for (i = 0; i < state->robot_count; i++) {
+        if (state->robots[i].state == ROBOT_IDLE) continue;
+        x = state->robots[i].position.x * MINIMAP_SIZE / MAP_SIZE;
+        y = state->robots[i].position.y * MINIMAP_SIZE / MAP_SIZE;
+        gfx_rect(MINIMAP_X + x, MINIMAP_Y + y, 2, 2, YELLOW);
+    }
+}
+
+static void draw_robot_sprite(Robot* robot, int x, int y, int size) {
+    int unit;
+
+    unit = size / 8;
+    if (unit < 1) unit = 1;
+    gfx_rect(x + unit, y + 4 * unit, 6 * unit, 2 * unit, DARK_GRAY);
+    gfx_rect(x + 2 * unit, y + 2 * unit, 4 * unit, 3 * unit, WHITE);
+    gfx_rect(x + 3 * unit, y + unit, 2 * unit, 2 * unit, CYAN);
+    gfx_rect(x + unit, y + 6 * unit, 2 * unit, unit, YELLOW);
+    gfx_rect(x + 5 * unit, y + 6 * unit, 2 * unit, unit, YELLOW);
+    if (robot->carrying_type != RES_NONE)
+        gfx_rect(x + 5 * unit, y + 3 * unit, unit, unit,
+                 resource_color(robot->carrying_type));
 }
 
 void game_init(GameState* state) {
@@ -501,7 +841,12 @@ void game_init(GameState* state) {
     state->camera_x = BASE_X * size - SCREEN_W / 2;
     state->camera_y = BASE_Y * size -
         (MAP_VIEW_BOTTOM - MAP_VIEW_TOP) / 2;
+    state->map_layer_valid = 0;
     state->build_tool = BUILDING_MINE;
+    state->toolbar_pressed = -1;
+    state->toolbar_hovered = -1;
+    state->mouse_left_was_down = 0;
+    state->mouse_right_was_down = 0;
     state->selected_building = 0;
     state->pan_keys_was_down = 0;
     state->pan_repeat_timer = 0.0f;
@@ -511,6 +856,7 @@ void game_init(GameState* state) {
     state->right_dragging = 0;
     state->right_drag_moved = 0;
     state->route_source = -1;
+    state->pathfinding_robot = -1;
 
     base = &state->buildings[0];
     base->type = BUILDING_BASE;
@@ -520,6 +866,7 @@ void game_init(GameState* state) {
     base->inventory_type = RES_NONE;
     base->inventory_count = 0;
     base->production_timer = 0.0f;
+    base->processing_batch = 0;
     state->building_count = 1;
     robot = &state->robots[0];
     robot->position = base->position;
@@ -529,6 +876,9 @@ void game_init(GameState* state) {
     robot->target_building = -1;
     robot->state = ROBOT_IDLE;
     robot->timer = 0.0f;
+    robot->path_status = ROBOT_PATH_NONE;
+    robot->path_length = 0;
+    robot->path_position = 0;
     state->robot_count = 1;
     update_resource_totals(state);
 }
@@ -544,6 +894,8 @@ void game_update(GameState* state, float delta_time) {
     int tile_y;
     int wheel;
     int size;
+    int mouse_left_pressed;
+    int mouse_right_released;
     unsigned int pan_keys;
     unsigned int newly_pressed_pan_keys;
     unsigned int mouse_buttons;
@@ -596,29 +948,42 @@ void game_update(GameState* state, float delta_time) {
     mouse_events = gfx_mouse_events();
     mouse_x = gfx_mouse_x();
     mouse_y = gfx_mouse_y();
+    mouse_buttons = gfx_mouse_buttons();
+    mouse_left_pressed = (mouse_events & MOUSE_LEFT_DOWN) != 0 ||
+        ((mouse_buttons & MOUSE_LEFT) && !state->mouse_left_was_down);
+    mouse_right_released = (mouse_events & MOUSE_RIGHT_UP) != 0 ||
+        (state->mouse_right_was_down &&
+         !(mouse_buttons & MOUSE_RIGHT));
+    state->mouse_left_was_down = (mouse_buttons & MOUSE_LEFT) != 0;
+    state->mouse_right_was_down = (mouse_buttons & MOUSE_RIGHT) != 0;
+    state->toolbar_hovered = toolbar_button_at(mouse_x, mouse_y);
+    if (mouse_left_pressed) {
+        state->toolbar_pressed = state->toolbar_hovered;
+        if (state->toolbar_hovered >= 0)
+            select_toolbar_button(state, state->toolbar_hovered);
+    }
+    if ((mouse_events & MOUSE_LEFT_UP) || !state->mouse_left_was_down)
+        state->toolbar_pressed = -1;
     wheel = gfx_mouse_wheel();
     if (wheel != 0 && mouse_y >= MAP_VIEW_TOP && mouse_y < MAP_VIEW_BOTTOM) {
-        while (wheel > 0) {
+        if (wheel > 0)
             zoom_at_mouse(state, 1, mouse_x, mouse_y);
-            wheel--;
-        }
-        while (wheel < 0) {
+        else
             zoom_at_mouse(state, -1, mouse_x, mouse_y);
-            wheel++;
-        }
     }
-    mouse_buttons = gfx_mouse_buttons();
     if ((mouse_events & MOUSE_RIGHT_DOWN) &&
         mouse_y >= MAP_VIEW_TOP && mouse_y < MAP_VIEW_BOTTOM) {
         state->right_dragging = 1;
         state->right_drag_moved = 0;
         state->mouse_last_x = mouse_x;
         state->mouse_last_y = mouse_y;
-    } else if (mouse_events & MOUSE_RIGHT_DOWN) {
-        state->build_tool = BUILDING_NONE;
-        state->selected_building = -1;
-        state->route_source = -1;
-        printf("Build cancelled\n");
+    } else if ((mouse_buttons & MOUSE_RIGHT) &&
+               !state->mouse_right_was_down &&
+               mouse_y >= MAP_VIEW_TOP && mouse_y < MAP_VIEW_BOTTOM) {
+        state->right_dragging = 1;
+        state->right_drag_moved = 0;
+        state->mouse_last_x = mouse_x;
+        state->mouse_last_y = mouse_y;
     }
     if (mouse_buttons & MOUSE_RIGHT) {
         dx = mouse_x - state->mouse_last_x;
@@ -630,16 +995,18 @@ void game_update(GameState* state, float delta_time) {
             clamp_camera(state);
         }
     }
-    if (mouse_events & MOUSE_RIGHT_UP) {
+    if (mouse_right_released) {
         if (state->right_dragging && !state->right_drag_moved) {
-            state->build_tool = BUILDING_NONE;
-            state->selected_building = -1;
-            state->route_source = -1;
-            printf("Build cancelled\n");
+            size = tile_size(state);
+            world_x = mouse_x + state->camera_x;
+            world_y = mouse_y - MAP_VIEW_TOP + state->camera_y;
+            tile_x = world_x / size;
+            tile_y = world_y / size;
+            delete_building(state, building_at(state, tile_x, tile_y));
         }
         state->right_dragging = 0;
     }
-    if ((mouse_events & MOUSE_LEFT_DOWN) &&
+    if (mouse_left_pressed &&
         mouse_x >= MINIMAP_X && mouse_x < MINIMAP_X + MINIMAP_SIZE &&
         mouse_y >= MINIMAP_Y && mouse_y < MINIMAP_Y + MINIMAP_SIZE) {
         world_x = (mouse_x - MINIMAP_X) * state->map.width / MINIMAP_SIZE;
@@ -650,23 +1017,7 @@ void game_update(GameState* state, float delta_time) {
             (MAP_VIEW_BOTTOM - MAP_VIEW_TOP) / 2;
         clamp_camera(state);
     }
-    if ((mouse_events & MOUSE_LEFT_DOWN) &&
-        mouse_y >= TOOLBAR_Y && mouse_y < SCREEN_H) {
-        button = (mouse_x - 4) / (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP);
-        if (mouse_x >= 4 && button < TOOL_BUTTON_COUNT &&
-            (mouse_x - 4) % (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP) <
-                TOOL_BUTTON_WIDTH) {
-            if (button == 0) state->build_tool = BUILDING_MINE;
-            else if (button == 1) state->build_tool = BUILDING_FACTORY;
-            else if (button == 2) state->build_tool = BUILDING_STORAGE;
-            else if (button == 3) state->build_tool = BUILDING_NONE;
-            else state->build_tool = BUILDING_ROUTE;
-            state->selected_building = -1;
-            state->route_source = -1;
-            printf("Build tool: %s\n", building_name(state->build_tool));
-        }
-    }
-    if ((mouse_events & MOUSE_LEFT_DOWN) &&
+    if (mouse_left_pressed &&
         mouse_y >= MAP_VIEW_TOP && mouse_y < TOOLBAR_Y &&
         !(mouse_x >= MINIMAP_X && mouse_x < MINIMAP_X + MINIMAP_SIZE &&
           mouse_y >= MINIMAP_Y && mouse_y < MINIMAP_Y + MINIMAP_SIZE)) {
@@ -682,8 +1033,10 @@ void game_update(GameState* state, float delta_time) {
     state->mouse_last_x = mouse_x;
     state->mouse_last_y = mouse_y;
 
+    update_pathfinding(state);
     update_mines(state, delta_time);
     update_robots(state, delta_time);
+    update_factories(state, delta_time);
     update_resource_totals(state);
 }
 
@@ -701,55 +1054,61 @@ void game_draw(GameState* state) {
     ResourceType resource;
     char zoom_text[2];
 
-    gfx_clear(BLACK);
-
     size = tile_size(state);
-    map_draw(&state->map, state->camera_x, state->camera_y, size,
-             MAP_VIEW_TOP, MAP_VIEW_BOTTOM - MAP_VIEW_TOP);
-
-    for (i = 0; i < state->building_count; i++) {
-        Building* building;
-        building = &state->buildings[i];
-        screen_x = building->position.x * size - state->camera_x;
-        screen_y = MAP_VIEW_TOP + building->position.y * size - state->camera_y;
-        if (building->type == BUILDING_BASE) color = YELLOW;
-        else if (building->type == BUILDING_MINE) color = RED;
-        else if (building->type == BUILDING_FACTORY) color = BLUE;
-        else color = CYAN;
-        gfx_rect(screen_x + 1, screen_y + 1, size - 2, size - 2, color);
-        if (building->type == BUILDING_MINE && size >= 8)
-            gfx_rect(screen_x + size / 4, screen_y + size / 4, size / 2, size / 2,
-                     resource_color(building->resource_type));
-        if (i == state->selected_building) {
-            gfx_rect(screen_x, screen_y, size, 1, WHITE);
-            gfx_rect(screen_x, screen_y + size - 1, size, 1, WHITE);
-            gfx_rect(screen_x, screen_y, 1, size, WHITE);
-            gfx_rect(screen_x + size - 1, screen_y, 1, size, WHITE);
+    if (!state->map_layer_valid ||
+        state->map_layer_camera_x != state->camera_x ||
+        state->map_layer_camera_y != state->camera_y ||
+        state->map_layer_zoom != state->zoom ||
+        state->map_layer_building_count != state->building_count ||
+        state->map_layer_selected_building != state->selected_building ||
+        state->map_layer_build_tool != state->build_tool ||
+        state->map_layer_route_source != state->route_source ||
+        state->map_layer_toolbar_pressed != state->toolbar_pressed ||
+        state->map_layer_toolbar_hovered != state->toolbar_hovered) {
+        gfx_clear(BLACK);
+        map_draw(&state->map, state->camera_x, state->camera_y, size,
+                 MAP_VIEW_TOP, MAP_VIEW_BOTTOM - MAP_VIEW_TOP);
+        for (i = 0; i < state->building_count; i++) {
+            Building* building;
+            building = &state->buildings[i];
+            screen_x = building->position.x * size - state->camera_x;
+            screen_y = MAP_VIEW_TOP + building->position.y * size -
+                state->camera_y;
+            draw_building_sprite(building, screen_x, screen_y, size,
+                                 i == state->selected_building);
         }
+        draw_static_hud(state);
+        gfx_save();
+        state->map_layer_camera_x = state->camera_x;
+        state->map_layer_camera_y = state->camera_y;
+        state->map_layer_zoom = state->zoom;
+        state->map_layer_building_count = state->building_count;
+        state->map_layer_selected_building = state->selected_building;
+        state->map_layer_build_tool = state->build_tool;
+        state->map_layer_route_source = state->route_source;
+        state->map_layer_toolbar_pressed = state->toolbar_pressed;
+        state->map_layer_toolbar_hovered = state->toolbar_hovered;
+        state->map_layer_valid = 1;
+    } else {
+        gfx_restore();
     }
+
     for (i = 0; i < state->robot_count; i++) {
         Robot* robot;
         robot = &state->robots[i];
         if (robot->state == ROBOT_IDLE) continue;
         screen_x = robot->position.x * size - state->camera_x;
         screen_y = MAP_VIEW_TOP + robot->position.y * size - state->camera_y;
-        color = robot->carrying_type == RES_NONE ?
-            WHITE : resource_color(robot->carrying_type);
-        gfx_rect(screen_x + size / 3, screen_y + size / 3,
-                 size / 3, size / 3, color);
-        gfx_rect(screen_x + size / 2, screen_y + size / 2, 2, 2, YELLOW);
+        draw_robot_sprite(robot, screen_x, screen_y, size);
     }
 
-    draw_minimap(state);
+    draw_minimap_robots(state);
 
-    gfx_rect(0, 0, SCREEN_W, MAP_VIEW_TOP, BLACK);
-    gfx_rect(0, 0, SCREEN_W, 1, CYAN);
-    draw_resource_total(5, "Coal", state->total_resources[RES_COAL]);
-    draw_resource_total(68, "Iron", state->total_resources[RES_IRON_ORE]);
-    draw_resource_total(131, "Copper", state->total_resources[RES_COPPER_ORE]);
-    draw_resource_total(194, "Fe plate", state->total_resources[RES_IRON_PLATE]);
-    draw_resource_total(257, "Cu plate", state->total_resources[RES_COPPER_PLATE]);
-    gfx_text(288, 29, "Z", CYAN);
+    draw_resource_value(5, state->total_resources[RES_COAL]);
+    draw_resource_value(68, state->total_resources[RES_IRON_ORE]);
+    draw_resource_value(131, state->total_resources[RES_COPPER_ORE]);
+    draw_resource_value(194, state->total_resources[RES_IRON_PLATE]);
+    draw_resource_value(257, state->total_resources[RES_COPPER_PLATE]);
     zoom_text[0] = (char)('1' + state->zoom);
     zoom_text[1] = '\0';
     gfx_text(298, 29, zoom_text, WHITE);
@@ -775,18 +1134,10 @@ void game_draw(GameState* state) {
         active_robots = 0;
         for (i = 0; i < state->robot_count; i++)
             if (state->robots[i].state != ROBOT_IDLE) active_robots++;
-        gfx_text(145, TOOLBAR_Y + 5, "Bots", CYAN);
         format_count(robot_count, active_robots);
         gfx_text(178, TOOLBAR_Y + 5, robot_count, YELLOW);
-        gfx_text(193, TOOLBAR_Y + 5, "/", WHITE);
         format_count(robot_count, state->robot_count);
         gfx_text(201, TOOLBAR_Y + 5, robot_count, WHITE);
-        if (state->build_tool == BUILDING_ROUTE) {
-            if (state->route_source < 0)
-                gfx_text(222, TOOLBAR_Y + 5, "Route: source", GRAY);
-            else
-                gfx_text(222, TOOLBAR_Y + 5, "Route: target", GRAY);
-        }
     }
 
     mouse_screen_x = gfx_mouse_x();
@@ -810,23 +1161,6 @@ void game_draw(GameState* state) {
         gfx_rect(screen_x + size - 1, screen_y, 1, size, color);
     }
 
-    gfx_rect(0, TOOLBAR_Y, SCREEN_W, SCREEN_H - TOOLBAR_Y, BLACK);
-    gfx_rect(0, TOOLBAR_Y, SCREEN_W, 1, CYAN);
-    gfx_text(140, TOOLBAR_Y + 5, "BUILD MODE", GRAY);
-    for (i = 0; i < TOOL_BUTTON_COUNT; i++) {
-        int button_x;
-        BuildingType button_tool;
-        char* button_label;
-        button_x = i * (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP) + 4;
-        if (i == 0) button_tool = BUILDING_MINE;
-        else if (i == 1) button_tool = BUILDING_FACTORY;
-        else if (i == 2) button_tool = BUILDING_STORAGE;
-        else if (i == 3) button_tool = BUILDING_NONE;
-        else button_tool = BUILDING_ROUTE;
-        button_label = building_name(button_tool);
-        color = state->build_tool == button_tool ? CYAN : GRAY;
-        gfx_rect(button_x, TOOLBAR_Y + 18, TOOL_BUTTON_WIDTH, 19, DARK_GRAY);
-        gfx_rect(button_x, TOOLBAR_Y + 18, TOOL_BUTTON_WIDTH, 2, color);
-        gfx_text(button_x + 5, TOOLBAR_Y + 25, button_label, WHITE);
-    }
+    color = (gfx_ticks() & 0x20) ? GREEN : DARK_RED;
+    gfx_rect(309, TOOLBAR_Y + 5, 6, 8, color);
 }

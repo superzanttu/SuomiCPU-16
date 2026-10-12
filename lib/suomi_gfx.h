@@ -81,7 +81,7 @@ unsigned int gfx_irq_keys(void);
 #define KEY_START 32
 #define KEY_TAB 64
 
-/* Bits of gfx_mouse_buttons() (held) and gfx_mouse_events() (one frame only). */
+/* Bits of gfx_mouse_buttons() (held) and gfx_mouse_events() (latched until read). */
 #define MOUSE_LEFT 1
 #define MOUSE_RIGHT 2
 #define MOUSE_LEFT_DOWN 1

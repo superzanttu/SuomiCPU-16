@@ -7,8 +7,8 @@
 #define MAP_VIEW_TOP 36
 #define MAP_VIEW_BOTTOM 202
 
-#include "types.h"
 #include "map.h"
+#include "types.h"
 
 typedef struct {
     GameMap map;
@@ -22,9 +22,23 @@ typedef struct {
     int camera_x;
     int camera_y;
     int zoom;
+    int map_layer_camera_x;
+    int map_layer_camera_y;
+    int map_layer_zoom;
+    int map_layer_building_count;
+    int map_layer_selected_building;
+    BuildingType map_layer_build_tool;
+    int map_layer_route_source;
+    int map_layer_toolbar_pressed;
+    int map_layer_toolbar_hovered;
+    int map_layer_valid;
     unsigned int pan_keys_was_down;
     float pan_repeat_timer;
     BuildingType build_tool;
+    int toolbar_pressed;
+    int toolbar_hovered;
+    int mouse_left_was_down;
+    int mouse_right_was_down;
     int selected_building;
     int tab_was_down;
     int mouse_last_x;
@@ -34,6 +48,11 @@ typedef struct {
     int route_source;
     int path_queue[MAP_SIZE * MAP_SIZE];
     unsigned char path_visited[(MAP_SIZE * MAP_SIZE + 7) / 8];
+    unsigned char path_parent_direction[MAP_SIZE * MAP_SIZE];
+    unsigned char robot_paths[MAX_ROBOTS][MAP_SIZE * MAP_SIZE];
+    int pathfinding_robot;
+    int path_queue_head;
+    int path_queue_tail;
 } GameState;
 
 void game_init(GameState* state);

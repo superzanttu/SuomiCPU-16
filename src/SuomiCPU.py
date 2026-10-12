@@ -102,7 +102,7 @@ CONSOLE_CONTROL = 0x43202
 BIOS_BASE = 0x43040
 
 KEYS_ADDR   = 0x43004 # Mitkä näppäimet on painettuna
-MOUSE_ADDR  = 0x43008 # Mouse: +0 X word, +2 Y word, +4 held buttons, +5 click events (one frame)
+MOUSE_ADDR  = 0x43008 # Mouse: +0 X word, +2 Y word, +4 held buttons, +5 latched click events
 GPU_BASE    = 0x43020 # Grafiikkapiirin ohjausrekisterit
 BACK_START  = 0x44000 # "Takapuskuri" - piirretään tänne, sitten siirretään ruudulle
 FONT_ADDR   = 0x4400  # Fonttien paikka
@@ -265,6 +265,7 @@ def _load_jit():
                     CONSOLE_DATA,
                     CONSOLE_STATUS,
                     CONSOLE_CONTROL,
+                    MOUSE_ADDR + 5,
                 )
                 if sc16_jit.CONSTANTS == expected_constants:
                     _JIT = sc16_jit
@@ -345,6 +346,10 @@ class SuomiCompute16:
         addr &= MEM_SIZE - 1
         if addr == CONSOLE_DATA:
             return self._console_device().read_data()
+        if addr == MOUSE_ADDR + 5:
+            events = self.memory[addr]
+            self.memory[addr] = 0
+            return events
         if addr == CONSOLE_STATUS:
             status = self._console_device().status
             if not status & 0x01 and getattr(self, "running", False):
@@ -1321,8 +1326,8 @@ class SuomiCompute16:
                 remaining -= 1
 
     # Mouse button bits: held (MOUSE_ADDR+4) bit0 left, bit1 right.
-    # Events (MOUSE_ADDR+5), valid for one frame: bit0/1 left/right press, bit2/3 left/right double click,
-    # bit4/5 left/right release (drop). Drag = button held while the position changes.
+    # Events (MOUSE_ADDR+5): bit0/1 left/right press, bit2/3 left/right double click,
+    # bit4/5 left/right release. Events stay latched until the guest reads the register.
     def set_mouse_position(self, x, y):
         x = max(0, min(SCREEN_WIDTH - 1, x))
         y = max(0, min(SCREEN_HEIGHT - 1, y))
@@ -1366,7 +1371,6 @@ class SuomiCompute16:
             node.poll()
 
     def end_mouse_frame(self):
-        self.memory[MOUSE_ADDR + 5] = 0
         self.memory[MOUSE_ADDR + 6:MOUSE_ADDR + 8] = b"\0\0"
         self._mouse_wheel_delta = 0
 
