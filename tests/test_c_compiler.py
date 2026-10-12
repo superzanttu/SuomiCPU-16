@@ -1081,6 +1081,20 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 12), 1)
 
+    def test_c90_indexed_array_rows_decay_to_pointers_in_assignments(self):
+        image = compile_source(
+            "unsigned char matrix[2][8];\n"
+            "unsigned char *row;\n"
+            "int main(void) {\n"
+            "  row = matrix[1];\n"
+            "  row[3] = 42;\n"
+            "  return matrix[1][3] != 42;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.registers[0], 0)
+
     def test_c90_three_dimensional_array_extents_keep_declarator_order(self):
         image = compile_source(
             "int cube[2][3][4];\n"

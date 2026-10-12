@@ -3297,6 +3297,10 @@ class _CodeGenerator:
     def _is_array_lvalue(self, expression: Expr) -> bool:
         if expression.kind == "name":
             return bool(self._lookup(str(expression.value), expression.line).array_size)
+        if expression.kind == "index":
+            return re.fullmatch(
+                r".+\[\d+\]", self._expression_type(expression)
+            ) is not None
         if expression.kind == "member":
             operator, field_name = expression.value
             base_type = self._expression_type(expression.children[0])
@@ -4099,6 +4103,10 @@ class _CodeGenerator:
                 if operator != "="
                 else self._expression_type(expression.children[0])
             )
+            if operator == "=":
+                array_type = re.fullmatch(r"(.+)\[(\d+)\]", source_type)
+                if array_type is not None:
+                    source_type = array_type.group(1) + "*"
             self._store_lvalue(
                 target, "R0", source_type, expression.line, expression.children[0]
             )
@@ -4262,7 +4270,10 @@ class _CodeGenerator:
             self.stack_depth -= saved_size
             return
         if kind == "index":
-            self._load_lvalue(expression, expression.line)
+            if self._is_array_lvalue(expression):
+                self._lvalue_address(expression, expression.line)
+            else:
+                self._load_lvalue(expression, expression.line)
             return
         if kind == "binary":
             self._binary_expression(expression)

@@ -58,6 +58,8 @@ typedef struct {
     ResourceType resource_type; // Only used for Mines
     int inventory_count;
     ResourceType inventory_type;
+    int factory_iron_plate_input;
+    int factory_copper_plate_input;
     float production_timer;
     int processing_batch;
 } Building;

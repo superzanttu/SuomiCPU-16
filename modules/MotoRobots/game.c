@@ -112,7 +112,6 @@ static void select_toolbar_button(GameState* state, int button) {
     state->build_tool = toolbar_button_tool(button);
     state->selected_building = -1;
     state->route_source = -1;
-    state->pathfinding_robot = -1;
     printf("Build tool: %s\n", building_name(state->build_tool));
 }
 
@@ -292,6 +291,8 @@ static void place_building(GameState* state, int x, int y) {
         resource : RES_NONE;
     building->inventory_count = 0;
     building->inventory_type = RES_NONE;
+    building->factory_iron_plate_input = 0;
+    building->factory_copper_plate_input = 0;
     building->production_timer = 0.0f;
     building->processing_batch = 0;
     state->selected_building = state->building_count;
@@ -303,6 +304,11 @@ static ResourceType factory_output_for(ResourceType input) {
     if (input == RES_IRON_ORE) return RES_IRON_PLATE;
     if (input == RES_COPPER_ORE) return RES_COPPER_PLATE;
     return RES_NONE;
+}
+
+static int factory_accepts_resource(ResourceType input) {
+    return factory_output_for(input) != RES_NONE ||
+        input == RES_IRON_PLATE || input == RES_COPPER_PLATE;
 }
 
 static void assign_robot_route(GameState* state, int source_index,
@@ -329,10 +335,10 @@ static void assign_robot_route(GameState* state, int source_index,
         return;
     }
     if (target->type == BUILDING_FACTORY &&
-        factory_output_for(source->type == BUILDING_MINE ?
-                           source->resource_type : source->inventory_type) ==
-            RES_NONE) {
-        printf("Route failed: factories accept iron ore or copper ore\n");
+        !factory_accepts_resource(source->type == BUILDING_MINE ?
+                                  source->resource_type :
+                                  source->inventory_type)) {
+        printf("Route failed: factories accept iron or copper ore and plates\n");
         return;
     }
     robot = 0;
@@ -420,24 +426,41 @@ static void update_factories(GameState* state, float delta_time) {
         building = &state->buildings[i];
         if (building->type != BUILDING_FACTORY) continue;
         output = factory_output_for(building->inventory_type);
-        if (building->inventory_count <= 0 || output == RES_NONE) {
-            building->production_timer = 0.0f;
-            building->processing_batch = 0;
+        if (building->inventory_count > 0 && output != RES_NONE) {
+            if (building->processing_batch <= 0) {
+                building->processing_batch = building->inventory_count;
+                building->production_timer = 0.0f;
+            }
+            building->production_timer += delta_time;
+            if (building->production_timer >=
+                (float)building->processing_batch) {
+                building->inventory_type = output;
+                building->production_timer = 0.0f;
+                building->processing_batch = 0;
+                printf("Factory at (%d,%d) produced %s x%d\n",
+                       building->position.x, building->position.y,
+                       resource_name(output), building->inventory_count);
+            }
             continue;
         }
-        if (building->processing_batch <= 0) {
-            building->processing_batch = building->inventory_count;
+        building->processing_batch = 0;
+        if (building->factory_iron_plate_input <= 0 ||
+            building->factory_copper_plate_input < 2 ||
+            (building->inventory_count > 0 &&
+             building->inventory_type != RES_ROMBONENT) ||
+            building->inventory_count >= BUILDING_BUFFER_CAP) {
             building->production_timer = 0.0f;
+            continue;
         }
         building->production_timer += delta_time;
-        if (building->production_timer >=
-            (float)building->processing_batch) {
-            building->inventory_type = output;
-            building->production_timer = 0.0f;
-            building->processing_batch = 0;
-            printf("Factory at (%d,%d) produced %s x%d\n",
-                   building->position.x, building->position.y,
-                   resource_name(output), building->inventory_count);
+        if (building->production_timer >= 1.0f) {
+            building->production_timer -= 1.0f;
+            building->factory_iron_plate_input--;
+            building->factory_copper_plate_input -= 2;
+            building->inventory_type = RES_ROMBONENT;
+            building->inventory_count++;
+            printf("Factory at (%d,%d) produced Rombonent\n",
+                   building->position.x, building->position.y);
         }
     }
 }
@@ -703,18 +726,35 @@ static void update_robots(GameState* state, float delta_time) {
                 source->inventory_count == 0) {
                 robot->state = ROBOT_TO_TARGET;
                 robot->timer = 0.0f;
+                queue_robot_path(state, robot);
             }
         } else if (robot->state == ROBOT_UNLOADING) {
-            if ((target->type == BUILDING_FACTORY &&
-                 target->processing_batch > 0) ||
-                (target->inventory_type != RES_NONE &&
-                 target->inventory_type != robot->carrying_type) ||
-                target->inventory_count >= BUILDING_BUFFER_CAP) continue;
+            if (target->type == BUILDING_FACTORY &&
+                (target->processing_batch > 0 ||
+                 (robot->carrying_type == RES_IRON_PLATE &&
+                  target->factory_iron_plate_input >= BUILDING_BUFFER_CAP) ||
+                 (robot->carrying_type == RES_COPPER_PLATE &&
+                  target->factory_copper_plate_input >=
+                      BUILDING_BUFFER_CAP)))
+                continue;
+            if (target->type != BUILDING_FACTORY &&
+                ((target->inventory_type != RES_NONE &&
+                  target->inventory_type != robot->carrying_type) ||
+                 target->inventory_count >= BUILDING_BUFFER_CAP))
+                continue;
             robot->timer += delta_time;
             if (robot->timer < ROBOT_INTERVAL) continue;
             robot->timer -= ROBOT_INTERVAL;
-            target->inventory_type = robot->carrying_type;
-            target->inventory_count++;
+            if (target->type == BUILDING_FACTORY &&
+                robot->carrying_type == RES_IRON_PLATE)
+                target->factory_iron_plate_input++;
+            else if (target->type == BUILDING_FACTORY &&
+                     robot->carrying_type == RES_COPPER_PLATE)
+                target->factory_copper_plate_input++;
+            else {
+                target->inventory_type = robot->carrying_type;
+                target->inventory_count++;
+            }
             robot->carrying_amount--;
             if (robot->carrying_amount <= 0) {
                 robot->carrying_amount = 0;
@@ -865,6 +905,8 @@ void game_init(GameState* state) {
     base->resource_type = RES_NONE;
     base->inventory_type = RES_NONE;
     base->inventory_count = 0;
+    base->factory_iron_plate_input = 0;
+    base->factory_copper_plate_input = 0;
     base->production_timer = 0.0f;
     base->processing_batch = 0;
     state->building_count = 1;
