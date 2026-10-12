@@ -193,12 +193,12 @@ def select_boot_program(cpu, modules_dir=None, initial_disk=None):
         if getattr(cpu, "bios_reset_requested", False):
             cpu.module_name = None
             cpu.program_loaded = False
-            cpu.reset()
+            cpu.reset(preserve_console_history=True)
             cpu._prepared_for_run = False
             cpu.boot_time = time.monotonic()
             cpu._log_startup("System reset in BIOS")
         if getattr(cpu, "reboot_requested", False):
-            cpu.reset()
+            cpu.reset(preserve_console_history=True)
             cpu.boot_time = time.monotonic()
             cpu._log_startup("SC-16 system rebooted")
         console_window = getattr(cpu, "console_window", None)

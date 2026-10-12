@@ -103,12 +103,22 @@ class ConsoleDeviceTests(unittest.TestCase):
         console.write_text("C compilation complete; SC-16 image ready")
         console.receive(b"pending")
 
-        cpu.reset()
+        cpu.reset(preserve_console_history=True)
 
         text = "\n".join(console.scrollback_snapshot())
         self.assertIn("C compilation complete; SC-16 image ready", text)
         self.assertEqual(tuple(console.receive_buffer), ())
         self.assertEqual(console.control, 0x03)
+
+    def test_regular_cpu_reset_clears_console_history(self):
+        cpu = self.make_cpu()
+        cpu.entry_point = 0
+        console = cpu._console_device()
+        console.write_text("old console output")
+
+        cpu.reset()
+
+        self.assertNotIn("old console output", "\n".join(console.scrollback_snapshot()))
 
     def test_console_window_has_controls_and_fixed_80_by_25_text_area(self):
         tk = Mock()

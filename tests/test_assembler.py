@@ -70,6 +70,18 @@ class AssemblerTests(unittest.TestCase):
         self.assertEqual(image.segments[0].address, 0x30000)
         self.assertEqual(image.segments[0].data, b"\x19")
 
+    def test_lda_encodes_full_19_bit_address(self):
+        image = assemble("LDA R2, 0x51234\nHALT")
+
+        self.assertEqual(
+            image.segments[0].data,
+            b"\xfa\x1e\x70\x05\x12\x34\x00\x00",
+        )
+        self.assertEqual(
+            assemble("LDI19 R2, 0x51234\nHALT").segments[0].data,
+            image.segments[0].data,
+        )
+
     def test_data_directive_emits_hex_octal_binary_and_utf8_strings(self):
         image = assemble(
             '.data hex 0x41, 42\n'

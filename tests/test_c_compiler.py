@@ -24,6 +24,73 @@ def run_image(image, maximum_steps=100_000):
 
 
 class CCompilerTests(unittest.TestCase):
+    def test_c90_stdio_limits_meet_required_minimums(self):
+        image = compile_source(
+            "#include <stdio.h>\n"
+            "int main(void) {\n"
+            "  return BUFSIZ < 256 || FOPEN_MAX < 8 || TMP_MAX < 25;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertEqual(cpu.registers[0], 0)
+
+    def test_c90_setjmp_and_longjmp_restore_the_calling_context(self):
+        image = compile_source(
+            "#include <setjmp.h>\n"
+            "jmp_buf environment;\n"
+            "int main(void) {\n"
+            "    int result;\n"
+            "    result = setjmp(environment);\n"
+            "    if (result == 0) longjmp(environment, 7);\n"
+            "    return result != 7;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertEqual(cpu.registers[0], 0)
+
+    def test_c90_longjmp_converts_zero_to_one(self):
+        image = compile_source(
+            "#include <setjmp.h>\n"
+            "jmp_buf environment;\n"
+            "int main(void) {\n"
+            "    int result;\n"
+            "    result = setjmp(environment);\n"
+            "    if (result == 0) longjmp(environment, 0);\n"
+            "    return result != 1;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertEqual(cpu.registers[0], 0)
+
+    def test_c90_longjmp_unwinds_a_nested_call_with_a_local_buffer(self):
+        image = compile_source(
+            "#include <setjmp.h>\n"
+            "void transfer(unsigned char *environment) {\n"
+            "    longjmp(environment, 9);\n"
+            "}\n"
+            "int main(void) {\n"
+            "    jmp_buf environment;\n"
+            "    int result;\n"
+            "    result = setjmp(environment);\n"
+            "    if (result == 0) transfer(environment);\n"
+            "    return result != 9;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertEqual(cpu.registers[0], 0)
+
+    def test_c90_minimum_sized_global_object_is_addressable(self):
+        image = compile_source(
+            "unsigned char object[65535];\n"
+            "int main(void) {\n"
+            "    object[65534] = 42;\n"
+            "    return object[65534] != 42;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertEqual(cpu.registers[0], 0)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 65534], 42)
+
     def test_c90_stdio_printf_writes_to_the_console_device(self):
         image = compile_source(
             '#include <stdio.h>\n'
@@ -39,6 +106,63 @@ class CCompilerTests(unittest.TestCase):
             cpu.console_device.output.decode("ascii"),
             "N=-12 U=7 L=70000 H=002a S=ok %",
         )
+
+    def test_c90_stdio_scanf_reads_console_input(self):
+        image = compile_source(
+            "#include <stdio.h>\n"
+            "#include <string.h>\n"
+            "int result;\n"
+            "int main(void) {\n"
+            "  int value;\n"
+            "  char word[8];\n"
+            "  result = scanf(\"%d %7s\", &value, word);\n"
+            "  return result != 2 || value != 42 || strcmp(word, \"hi\") != 0;\n"
+            "}\n"
+        )
+        cpu = SuomiCompute16.__new__(SuomiCompute16)
+        cpu.memory = bytearray(MEM_SIZE)
+        cpu.registers = [0] * 8
+        cpu.flags = {"Z": 0, "C": 0}
+        cpu.running = True
+        cpu.sp = 0x2FFFF
+        cpu.load_program(image)
+        cpu.reset()
+        cpu.console_device.receive(b"42 hi\n")
+        steps = 0
+        while cpu.running and steps < 100_000:
+            cpu.step()
+            steps += 1
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 2)
+
+    def test_c90_stdio_gets_reads_until_newline_and_discards_it(self):
+        image = compile_source(
+            "#include <stdio.h>\n"
+            "#include <string.h>\n"
+            "char line[16];\n"
+            "int main(void) {\n"
+            "  if (gets(line) == NULL) return 1;\n"
+            "  return strcmp(line, \"hello\") != 0;\n"
+            "}\n"
+        )
+        cpu = SuomiCompute16.__new__(SuomiCompute16)
+        cpu.memory = bytearray(MEM_SIZE)
+        cpu.registers = [0] * 8
+        cpu.flags = {"Z": 0, "C": 0}
+        cpu.running = True
+        cpu.sp = 0x2FFFF
+        cpu.load_program(image)
+        cpu.reset()
+        cpu.console_device.receive(b"hello\n")
+
+        steps = 0
+        while cpu.running and steps < 100_000:
+            cpu.step()
+            steps += 1
+
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.registers[0], 0)
+        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE:GLOBAL_BASE + 6]), b"hello\0")
 
     def test_c90_getchar_poll_yields_to_the_emulator_event_loop(self):
         image = compile_source(
@@ -2133,6 +2257,102 @@ class CCompilerTests(unittest.TestCase):
             [12, 13, -123 & 0xFFFF, 321, 26220, 26220, 1],
         )
 
+    def test_c90_stdlib_heap_and_floating_conversion(self):
+        image = compile_source(
+            "#include <stdlib.h>\n"
+            "#include <errno.h>\n"
+            "int results[9];\n"
+            "int main(void) {\n"
+            "  char *memory;\n"
+            "  char *end;\n"
+            "  double number;\n"
+            "  memory = (char *)malloc(8UL);\n"
+            "  results[0] = memory != NULL;\n"
+            "  memory[0] = 'A'; memory[1] = 'B';\n"
+            "  memory = (char *)realloc(memory, 20UL);\n"
+            "  results[1] = memory != NULL && memory[0] == 'A' && "
+            "memory[1] == 'B';\n"
+            "  free(memory);\n"
+            "  memory = (char *)calloc(4UL, 2UL);\n"
+            "  results[2] = memory != NULL && memory[0] == 0 && "
+            "memory[7] == 0;\n"
+            "  free(memory);\n"
+            "  memory = (char *)malloc(600UL);\n"
+            "  results[3] = memory == NULL && errno == ENOMEM;\n"
+            "  number = strtod(\" -12.5e1tail\", &end);\n"
+            "  results[4] = number == -125.0;\n"
+            "  results[5] = *end == 't';\n"
+            "  number = strtod(\"invalid\", &end);\n"
+            "  results[6] = number == 0.0 && *end == 'i';\n"
+            "  results[7] = div(-17, 5).quot == -3 && "
+            "div(-17, 5).rem == -2;\n"
+            "  errno = 0;\n"
+            "  number = strtod(\"0.000030517578125e9\", &end);\n"
+            "  results[8] = number > 25000.0 && number < 40000.0 && "
+            "errno == 0 && *end == '\\0';\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(9)],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1],
+        )
+
+    def test_c90_math_library_core_functions(self):
+        image = compile_source(
+            "#include <math.h>\n"
+            "int results[8];\n"
+            "int main(void) {\n"
+            "  results[0] = (int)sqrt(9.0);\n"
+            "  results[1] = (int)fabs(-2.5);\n"
+            "  results[2] = (int)floor(-2.2);\n"
+            "  results[3] = (int)ceil(2.2);\n"
+            "  results[4] = (int)fmod(7.0, 4.0);\n"
+            "  results[5] = (int)pow(2.0, 3.0);\n"
+            "  results[6] = sin(0.0) == 0.0;\n"
+            "  results[7] = log(exp(1.0)) > 0.5 && log(exp(1.0)) < 1.5;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(8)],
+            [3, 2, -3 & 0xFFFF, 3, 3, 8, 1, 1],
+        )
+
+    def test_c90_math_range_and_angle_helpers(self):
+        image = compile_source(
+            "#include <math.h>\n"
+            "int results[13];\n"
+            "int main(void) {\n"
+            "  int exponent;\n"
+            "  double integral;\n"
+            "  results[0] = (int)acos(1.0);\n"
+            "  results[1] = (int)asin(0.0);\n"
+            "  results[2] = (int)atan(0.0);\n"
+            "  results[3] = (int)atan2(0.0, 1.0);\n"
+            "  results[4] = (int)cos(0.0);\n"
+            "  results[5] = (int)tan(0.0);\n"
+            "  results[6] = (int)cosh(0.0);\n"
+            "  results[7] = (int)sinh(0.0);\n"
+            "  results[8] = (int)tanh(0.0);\n"
+            "  results[9] = (int)(frexp(8.0, &exponent) * 10.0);\n"
+            "  results[10] = exponent;\n"
+            "  results[11] = (int)ldexp(0.5, 4);\n"
+            "  results[12] = (int)(modf(2.5, &integral) * 10.0) + (int)integral;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(13)],
+            [0, 0, 0, 0, 1, 0, 1, 0, 0, 5, 4, 8, 7],
+        )
+
     def test_c90_strto_integer_conversions(self):
         image = compile_source(
             "#include <stdlib.h>\n"
@@ -2176,6 +2396,34 @@ class CCompilerTests(unittest.TestCase):
                 -47 & 0xFFFF, 7, 0, 63, 3, 32768, 5, 0, 0, 1,
                 65535, 2, 0, 0, 0, 0,
             ],
+        )
+
+    def test_strto_functions_reject_unsupported_bases(self):
+        image = compile_source(
+            "#include <stdlib.h>\n"
+            "#include <errno.h>\n"
+            "int results[8];\n"
+            "int main(void) {\n"
+            "  char *end;\n"
+            "  char text[2];\n"
+            "  text[0] = '7';\n"
+            "  text[1] = '\\0';\n"
+            "  errno = 0;\n"
+            "  results[0] = strtol(text, &end, 1);\n"
+            "  results[1] = end == text;\n"
+            "  results[2] = errno;\n"
+            "  errno = 0;\n"
+            "  results[3] = strtoul(text, &end, 37);\n"
+            "  results[4] = end == text;\n"
+            "  results[5] = errno;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(6)],
+            [0, 1, 22, 0, 1, 22],
         )
 
     def test_strto_functions_cover_full_32_bit_long_ranges(self):
@@ -2367,6 +2615,40 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(
             [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(3)],
             [1, 1, 1],
+        )
+
+    def test_c90_time_calendar_conversion_and_formatting(self):
+        image = compile_source(
+            "#include <time.h>\n"
+            "#include <string.h>\n"
+            "int results[7];\n"
+            "char formatted[32];\n"
+            "int main(void) {\n"
+            "  time_t epoch;\n"
+            "  time_t round_trip;\n"
+            "  struct tm *calendar;\n"
+            "  struct tm input;\n"
+            "  epoch = 951782400L;\n"
+            "  calendar = gmtime(&epoch);\n"
+            "  results[0] = calendar->tm_year == 100;\n"
+            "  results[1] = calendar->tm_mon == 1 && calendar->tm_mday == 29;\n"
+            "  results[2] = calendar->tm_yday == 59 && calendar->tm_wday == 2;\n"
+            "  results[3] = strftime(formatted, sizeof(formatted), "
+            "\"%Y-%m-%d %a\", calendar) == 14;\n"
+            "  results[4] = strcmp(formatted, \"2000-02-29 Tue\") == 0;\n"
+            "  input = *calendar;\n"
+            "  round_trip = mktime(&input);\n"
+            "  results[5] = round_trip == epoch;\n"
+            "  results[6] = strcmp(asctime(calendar), "
+            "\"Tue Feb 29 00:00:00 2000\\n\") == 0;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image, maximum_steps=500_000)
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(7)],
+            [1, 1, 1, 1, 1, 1, 1],
         )
 
     def test_executes_recursive_factorial_example(self):

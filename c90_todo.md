@@ -29,6 +29,10 @@ an ABI choice as delivered.
   19-bit object pointers, aggregate assignment and by-value argument copies,
   caller-owned structure/union returns, and supported one-level `const`
   pointer-target qualification.
+- The compiler's 64 KiB global-data window is at `0x60000..0x6FFFF`; `LDI19`
+  now loads complete 19-bit addresses, and regression coverage exercises the
+  C90 minimum 65,535-byte object size. This does not provide a 1 GB address
+  space or establish all C90 translation limits.
 - `float`, `double`, and `long double` still use binary16; `double` therefore
   does not satisfy C90 minimum range and precision requirements.
 - Function pointers and indirect calls, bit-fields, full linkage/storage
@@ -52,7 +56,8 @@ or correct runtime helpers cannot meet the ABI requirements.
     argument offsets to match.
   - Encode direct far control and conditional branches in four bytes, and add
     register-pair indirect `JMPRP` / `CALLRP` for 19-bit function pointers.
-  - Verify assembler, emulator, JIT, ABI offsets, and high-address return paths.
+  - Add `LDI19`/`LDA` so assembler and compiler-generated addresses preserve all
+    19 bits; verify assembler, emulator, JIT, ABI offsets, and high addresses.
 
 ### A1. Define C90 floating-point representations
 
@@ -249,8 +254,17 @@ required before claiming full C90 compatibility.
 
 - [ ] **Implement all required C90 headers** (`c90-required-headers`)
   - Partial implementation now includes the console-only `<stdio.h>` interface
-    and a `printf` integer/text formatter; floating conversions and file-backed
-    streams remain outstanding.
+    and a `printf` integer/text formatter; C90 `gets` is present, but floating
+    conversions and file-backed streams remain outstanding. `<setjmp.h>` now
+    provides `jmp_buf`, `setjmp`, and `longjmp`; tests cover restored control
+    flow, zero-value conversion, and unwinding a nested call. `<signal.h>`
+    remains missing because signal-handler dispatch depends on function-pointer
+    support. The exposed `stdio.h` limits now meet the C90 minimum values for
+    `BUFSIZ`, `FOPEN_MAX`, and `TMP_MAX`; this does not imply file-backed stream
+    support, which remains outstanding.
+  - `<math.h>` now declares the C90 math interface and links software
+    approximations. These use the target's binary16 arithmetic and do not meet
+    C90 `double` range, precision, or exceptional-value requirements.
   - The emulator now supplies a text console, BIOS device descriptor and
     startup data-disk selection. This does not load programs from disk:
     programs selected by the BIOS still come from `modules/`.
@@ -275,8 +289,11 @@ required before claiming full C90 compatibility.
 
 - [ ] **Complete required C90 library functions** (`c90-library-functions`)
   - Implement required functions and macros from C90 headers, including
-    remaining math, stdio, setjmp, signal, stdlib, string, and time
+    remaining math, stdio, signal, stdlib, string, and time
     facilities.
+  - The current `<math.h>` implementation is only an approximate target
+    subset; validate all domains, ranges, errors, and accuracy after the
+    floating-point ABI is upgraded.
   - Specify boundary behavior, errors, `errno` effects, and hosted-resource
     limitations.
   - Keep SC-16 screen/graphics routines documented as extensions, not

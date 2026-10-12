@@ -133,7 +133,11 @@ class AssemblerEncodingTests(unittest.TestCase):
                     data = encode(f"LDA R{rd}, {address}")
                     self.assertEqual(
                         data,
-                        be(word(isa.OP_LDI, rd, imm=address & 0xFF), word(isa.OP_LDI_H, rd, imm=address >> 8)),
+                        be(
+                            (isa.OP_SHR << 11) | (rd << 8) | isa.MULDIV_PREFIX,
+                            (7 << 12) | (address >> 16),
+                            address & 0xFFFF,
+                        ),
                     )
 
     def test_two_register_forms(self):

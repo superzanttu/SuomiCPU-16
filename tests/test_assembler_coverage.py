@@ -110,7 +110,7 @@ class SyntaxTests(unittest.TestCase):
 
     def test_label_on_directive_line(self):
         image = assemble(".address 8\nx: .data hex 1\nLDA R0, x")
-        self.assertEqual(bytes(image.segments[0].data)[1:], b"\x08\x08\x80\x00")
+        self.assertEqual(bytes(image.segments[0].data)[1:], b"\xf8\x1e\x70\x00\x00\x08")
 
     def test_comments_and_whitespace(self):
         src = "  ; full\n# hash\nLDI R0, 1 ; c\n\tHALT # c\n"
@@ -158,8 +158,8 @@ class SyntaxTests(unittest.TestCase):
     def test_forward_label_far_and_lda(self):
         image = assemble("LDA R2, end\nJMPX end\n.address 0x12345\nend: HALT")
         self.assertEqual(image.entry_point, 0)
-        self.assertEqual(bytes(image.segments[0].data)[:2], b"\x0a\x45")
-        self.assertEqual(bytes(image.segments[0].data)[4:], b"\xf8\x7e\x23\x45")
+        self.assertEqual(bytes(image.segments[0].data)[:6], b"\xfa\x1e\x70\x01\x23\x45")
+        self.assertEqual(bytes(image.segments[0].data)[6:], b"\xf8\x7e\x23\x45")
 
 
 class IncludeTests(unittest.TestCase):

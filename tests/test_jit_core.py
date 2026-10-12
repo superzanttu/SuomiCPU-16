@@ -128,6 +128,39 @@ class JitEquivalenceTests(unittest.TestCase):
         fast._execute_jit(100)
         self.assertEqual(state(slow), state(fast))
 
+    def test_19_bit_immediate_load_falls_back_to_interpreter(self):
+        program = assemble("LDA R0, 0x51234\nHALT")
+        slow = make_cpu(program)
+        fast = make_cpu(program)
+        slow.use_jit = False
+        fast.use_jit = True
+        slow.gpu_log = []
+        fast.gpu_log = []
+        slow.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        fast.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        slow.step()
+        fast._execute_jit(1)
+
+        self.assertEqual(state(slow), state(fast))
+        self.assertEqual(fast.registers[0], 0x51234)
+
+    def test_stack_pointer_high_bits_instruction_matches_interpreter(self):
+        program = assemble("LDI R0, 5\nSETSPH R0\nHALT")
+        slow = make_cpu(program)
+        fast = make_cpu(program)
+        slow.use_jit = False
+        fast.use_jit = True
+        slow.gpu_log = []
+        fast.gpu_log = []
+        slow.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        fast.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+
+        reference_run(slow, 10)
+        fast._execute_jit(10)
+
+        self.assertEqual(state(slow), state(fast))
+        self.assertEqual(fast.sp, 0x5FFFF)
+
     def test_19_bit_return_addresses_match_for_calls_above_0xffff(self):
         program = assemble(
             ".address 0x20000\n"

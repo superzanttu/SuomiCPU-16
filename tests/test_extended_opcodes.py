@@ -75,6 +75,21 @@ class ExtendedOpcodeTests(unittest.TestCase):
         cpu = run("MOVSPH R0\nHALT")
         self.assertEqual(cpu.registers[0], 2)
 
+    def test_setsph_updates_only_the_high_stack_pointer_bits(self):
+        cpu = run(
+            "LDI R0, 5\n"
+            "SETSPH R0\n"
+            "MOVSP R1\n"
+            "MOVSPH R2\n"
+            "HALT"
+        )
+        self.assertEqual(cpu.sp, 0x5FFFF)
+        self.assertEqual((cpu.registers[1], cpu.registers[2]), (0x5FFFF, 5))
+
+    def test_lda_loads_a_full_19_bit_address(self):
+        cpu = run("LDA R0, 0x51234\nHALT")
+        self.assertEqual(cpu.registers[0], 0x51234)
+
     def test_32_bit_memory_access_is_big_endian_and_wraps(self):
         cpu = run(
             "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\n"

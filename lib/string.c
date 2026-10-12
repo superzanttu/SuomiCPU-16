@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <errno.h>
 
 char *strtok_state;
 
@@ -134,10 +135,34 @@ size_t strcspn(const char *s1, const char *s2)
 
 char *strerror(int errnum)
 {
-    if (errnum == 33)
+    if (errnum == EACCES)
+        return "permission denied";
+    if (errnum == EBADF)
+        return "bad file descriptor";
+    if (errnum == EDOM)
         return "domain error";
-    if (errnum == 34)
+    if (errnum == EEXIST)
+        return "file exists";
+    if (errnum == EINVAL)
+        return "invalid argument";
+    if (errnum == EIO)
+        return "I/O error";
+    if (errnum == ENOENT)
+        return "no such file";
+    if (errnum == ENOMEM)
+        return "out of memory";
+    if (errnum == ENOSPC)
+        return "no space left";
+    if (errnum == ENOSYS)
+        return "operation unavailable";
+    if (errnum == EPERM)
+        return "operation not permitted";
+    if (errnum == ERANGE)
         return "range error";
+    if (errnum == ESPIPE)
+        return "stream is not seekable";
+    if (errnum == EROFS)
+        return "read-only filesystem";
     return "unknown error";
 }
 

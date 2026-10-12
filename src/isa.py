@@ -82,6 +82,7 @@ WIDE_OPERATIONS = {
 #   word 1: 0xF800 | (Rd << 8) | 0x1E   (OP_SHR extension space, prefix 0x1E)
 #   word 2: (operation << 12) | (immediate flag << 11) | Rs
 #   word 3: 16-bit immediate, present only when the immediate flag is set
+# Operation 7 is reserved for the three-word LDI19 address-load encoding.
 MULDIV_PREFIX = 0x1E
 MULDIV_IMMEDIATE_FLAG = 0x0800
 MULDIV_OPERATIONS = {
@@ -92,6 +93,7 @@ MULDIV_OPERATIONS = {
     "DIVS": 4,   # Rd = Rd / Rs, signed (truncates toward zero)
     "MOD": 5,    # Rd = Rd % Rs, unsigned
     "MODS": 6,   # Rd = Rd % Rs, signed (sign follows the dividend)
+    "LDI19": 7,  # Rd = 19-bit immediate address; low three control bits are high bits
 }
 
 # Extended ALU group: shifts, rotates, add/subtract with carry, immediate ALU forms
@@ -141,6 +143,7 @@ MISC_OPERATIONS = {
     "MOVSPH": 10, # Rd = high three bits of SP
     "CALLRP": 11, # call the 19-bit address in Rd and the selected high register
     "JMPRP": 12,  # jump to the 19-bit address in Rd and the selected high register
+    "SETSPH": 13, # SP = (Rd[2:0] << 16) | SP[15:0]
 }
 
 # Far conditional branches: 4 bytes, 19-bit target.

@@ -21,7 +21,8 @@ INTEGER_TYPES = frozenset({
 })
 ARITHMETIC_TYPES = INTEGER_TYPES | {"float"}
 CODE_BASE = 0x4800
-GLOBAL_BASE = 0x2000
+GLOBAL_BASE = 0x60000
+GLOBAL_LIMIT = 0x70000
 STACK_OFFSET_LIMIT = 0xFF
 FRAME_SIZE_LIMIT = 126
 SCREEN_LIBRARY_FUNCTIONS = {
@@ -75,6 +76,8 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
 LIBRARY_FUNCTIONS = {**SCREEN_LIBRARY_FUNCTIONS, **GRAPHICS_LIBRARY_FUNCTIONS}
 LIBRARY_FUNCTIONS["abort"] = ("void", ())
 LIBRARY_FUNCTIONS["exit"] = ("void", ("int",))
+LIBRARY_FUNCTIONS["__sc16_setjmp"] = ("int", ("unsigned char*",))
+LIBRARY_FUNCTIONS["longjmp"] = ("void", ("unsigned char*", "int"))
 LIBRARY_FILES = {
     **{name: "lib_text.asm" for name in SCREEN_LIBRARY_FUNCTIONS},
     **{name: "lib_cgfx.asm" for name in GRAPHICS_LIBRARY_FUNCTIONS},
@@ -101,16 +104,37 @@ STANDARD_C_SOURCE = {
         name: "stdlib.c"
         for name in (
             "abs", "labs", "atoi", "atol", "strtol", "strtoul", "rand", "srand",
-            "getenv", "system",
+            "atof", "strtod", "div", "ldiv", "malloc", "calloc", "realloc",
+            "free", "getenv", "system",
         )
     },
     **{name: "locale.c" for name in ("setlocale", "localeconv")},
-    **{name: "time.c" for name in ("clock", "time")},
+    **{
+        name: "time.c"
+        for name in (
+            "clock", "time", "difftime", "mktime", "asctime", "ctime",
+            "gmtime", "localtime", "strftime",
+        )
+    },
+    **{
+        name: "math.c"
+        for name in (
+            "acos", "asin", "atan", "atan2", "cos", "sin", "tan",
+            "cosh", "sinh", "tanh", "exp", "frexp", "ldexp", "log",
+            "log10", "modf", "pow", "sqrt", "ceil", "fabs", "floor",
+            "fmod",
+        )
+    },
     **{
         name: "stdio.c"
         for name in (
-            "fgetc", "fputc", "fputs", "getchar", "putchar", "puts",
-            "printf", "fprintf", "vprintf", "vfprintf",
+            "fgetc", "fgets", "gets", "fputc", "fputs", "ungetc", "getchar",
+            "putchar", "puts", "printf", "fprintf", "vprintf", "vfprintf",
+            "scanf", "fscanf", "vscanf", "vfscanf", "fflush", "fopen",
+            "freopen", "fclose", "fread", "fwrite", "fseek", "ftell",
+            "rewind", "fgetpos", "fsetpos", "clearerr", "feof", "ferror",
+            "perror", "remove", "rename", "tmpfile", "tmpnam", "setbuf",
+            "setvbuf",
         )
     },
 }
@@ -1725,6 +1749,16 @@ class _CodeGenerator:
                 )
         self._allocate_globals()
         self._collect_string_literals()
+        static_data_end = GLOBAL_BASE + sum(
+            self._global_size(global_) for global_ in self.globals
+        )
+        if self.string_data:
+            static_data_end = (static_data_end + 1) & ~1
+            static_data_end += sum(len(data) for _, data in self.string_data)
+        if static_data_end > GLOBAL_LIMIT:
+            raise CCompilerError(
+                f"{self.filename}: static data exceeds the 64 KiB C data region"
+            )
         self.emit(".address 0")
         self.emit("__c_entry:")
         self.emit("    JMP __c_boot")
@@ -1778,8 +1812,10 @@ class _CodeGenerator:
             self.global_addresses[global_.name] = address
             self.global_variables[global_.name] = global_
             address += self._global_size(global_)
-        if address > 0x10000:
-            raise CCompilerError(f"{self.filename}: global variables exceed 16-bit addressable data")
+        if address > GLOBAL_LIMIT:
+            raise CCompilerError(
+                f"{self.filename}: global variables exceed the 64 KiB C data region"
+            )
 
     def _collect_string_literals(self) -> None:
         def visit(expression: Expr | None) -> None:
@@ -2290,6 +2326,11 @@ class _CodeGenerator:
             raise self.error(line, "temporary stack use exceeds stack-relative address range")
         return adjusted
 
+    def _emit_address(self, register: str, address: int) -> None:
+        if not 0 <= address < 0x80000:
+            raise CCompilerError("generated object address is outside 19-bit memory")
+        self.emit(f"    LDI19 {register}, {address}")
+
     def _emit_load_pointer(self, register: str) -> None:
         repeat = self.label("pointer_load")
         done = self.label("pointer_load_done")
@@ -2341,7 +2382,7 @@ class _CodeGenerator:
             return
         if variable.c_type.endswith("*"):
             if variable.global_address is not None:
-                self.emit(f"    LDI R7, {variable.global_address}")
+                self._emit_address("R7", variable.global_address)
             else:
                 offset = variable.local_offset
                 if offset is None:
@@ -2359,7 +2400,7 @@ class _CodeGenerator:
             self.emit(f"    LD32 {register}, R6")
             return
         if variable.global_address is not None:
-            self.emit(f"    LDI R7, {variable.global_address}")
+            self._emit_address("R7", variable.global_address)
             self.emit(
                 f"    {'LD' if _type_size(variable.c_type, self.records) == 1 else 'LDW'} "
                 f"{register}, R7"
@@ -2381,7 +2422,7 @@ class _CodeGenerator:
         self._convert_to_type(register, variable.c_type, source_type)
         if variable.c_type.endswith("*"):
             if variable.global_address is not None:
-                self.emit(f"    LDI R7, {variable.global_address}")
+                self._emit_address("R7", variable.global_address)
             else:
                 offset = variable.local_offset
                 if offset is None:
@@ -2399,7 +2440,7 @@ class _CodeGenerator:
             self.emit(f"    ST32 {register}, R6")
             return
         if variable.global_address is not None:
-            self.emit(f"    LDI R7, {variable.global_address}")
+            self._emit_address("R7", variable.global_address)
             self.emit(
                 f"    {'ST' if _type_size(variable.c_type, self.records) == 1 else 'STW'} "
                 f"R7, {register}"
@@ -2412,10 +2453,11 @@ class _CodeGenerator:
         self.emit(f"    STWS {register}, {self._stack_offset(offset, line)}")
 
     def _wide_variable_address(self, variable: _Variable, line: int) -> None:
-        self.emit("    LDI R6, 0")
         if variable.global_address is not None:
-            self.emit(f"    LDI R7, {variable.global_address}")
+            self.emit(f"    LDI R6, {variable.global_address >> 16}")
+            self.emit(f"    LDI R7, {variable.global_address & WORD_MASK}")
             return
+        self.emit("    LDI R6, 0")
         offset = variable.local_offset
         if offset is None:
             offset = variable.parameter_offset
@@ -2430,7 +2472,7 @@ class _CodeGenerator:
 
     def _array_address(self, variable: _Variable, register: str, line: int) -> None:
         if variable.global_address is not None:
-            self.emit(f"    LDI {register}, {variable.global_address}")
+            self._emit_address(register, variable.global_address)
             return
         offset = variable.local_offset
         if offset is None:
@@ -3448,7 +3490,7 @@ class _CodeGenerator:
             if variable.array_size:
                 self._array_address(variable, "R0", line)
             elif variable.global_address is not None:
-                self.emit(f"    LDI R0, {variable.global_address}")
+                self._emit_address("R0", variable.global_address)
             else:
                 offset = variable.local_offset
                 if offset is None:
@@ -3470,7 +3512,7 @@ class _CodeGenerator:
                 if array.array_size:
                     if index.kind == "constant" and array.global_address is not None:
                         element = array.global_address + int(index.value) * element_size
-                        self.emit(f"    LDI R0, {element & WORD_MASK}")
+                        self._emit_address("R0", element)
                         return element_type
                     self._emit_scaled_index(index, element_size)
                     self._array_address(array, "R1", line)
@@ -3920,7 +3962,55 @@ class _CodeGenerator:
                 self.emit("    MOVSP R7")
                 self._emit_store_pointer("R0")
                 argument_bytes += 3
-            if name in ("abort", "exit"):
+            if name == "__sc16_setjmp":
+                continuation = self.label("setjmp_return")
+                done = self.label("setjmp_done")
+                self.emit("    MOVSP R7")
+                self._emit_load_pointer("R2")
+                self.emit("    MOV R7, R2")
+                self.emit(f"    LDI19 R0, {continuation}")
+                self._emit_store_pointer("R0")
+                self.emit("    MOVSP R0")
+                self.emit("    MOV R7, R2")
+                self.emit("    LDI R6, 3")
+                self.emit("    ADD R7, R6")
+                self._emit_store_pointer("R0")
+                self.emit("    LDI R0, 0")
+                self.emit(f"    JMPX {done}")
+                self.emit(f"{continuation}:")
+                self.emit("    MOV R0, R1")
+                self.emit(f"{done}:")
+            elif name == "longjmp":
+                continuation = self.label("longjmp_continue")
+                self.emit("    LDWS R0, 3")
+                self.emit("    LDI R7, 0")
+                self.emit("    CMP R0, R7")
+                self.emit(f"    BNZX {continuation}")
+                self.emit("    LDI R0, 1")
+                self.emit(f"{continuation}:")
+                self.emit("    MOV R1, R0")
+                self.emit("    MOVSP R7")
+                self._emit_load_pointer("R2")
+                self.emit("    MOV R7, R2")
+                self.emit("    LDI R6, 3")
+                self.emit("    ADD R7, R6")
+                self._emit_load_pointer("R0")
+                self.emit("    MOV R3, R0")
+                self.emit("    SETSP R3")
+                self.emit("    SETSPH R3")
+                self.emit("    MOV R7, R2")
+                self.emit("    LDW R0, R7")
+                self.emit("    INC R7")
+                self.emit("    INC R7")
+                self.emit("    LD R3, R7")
+                self.emit("    LDI R6, 7")
+                self.emit("    AND R3, R6")
+                self.emit("    JMPRP R0, R3")
+                self.stack_depth -= argument_bytes
+                return
+            if name == "__sc16_setjmp":
+                pass
+            elif name in ("abort", "exit"):
                 self.emit("    HALT")
             elif name in LIBRARY_FUNCTIONS and name not in self.function_names:
                 self.emit(f"    CALLX {name}")
@@ -4576,22 +4666,47 @@ def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
     standard_calls = _called_functions(parser) - {
         function.name for function in functions
     }
-    runtime_sources = sorted(
-        {STANDARD_C_SOURCE[name] for name in standard_calls if name in STANDARD_C_SOURCE}
-    )
+    runtime_sources = {
+        STANDARD_C_SOURCE[name]
+        for name in standard_calls
+        if name in STANDARD_C_SOURCE
+    }
+    if runtime_sources & {"math.c", "stdio.c"}:
+        runtime_sources.add("stdlib.c")
     if runtime_sources:
         library_root = Path(__file__).resolve().parent.parent / "lib"
-        library_sources = []
-        for runtime_source in runtime_sources:
-            library_path = library_root / runtime_source
-            try:
-                library_sources.append(library_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError) as exc:
-                raise CCompilerError(
-                    f"{filename}: cannot read standard C library source {library_path}: {exc}"
-                ) from exc
-        parser = _Parser(source + "\n" + "\n".join(library_sources), filename)
-        globals_, functions = parser.parse()
+        library_contents: dict[str, str] = {}
+        while True:
+            for runtime_source in sorted(runtime_sources):
+                if runtime_source in library_contents:
+                    continue
+                library_path = library_root / runtime_source
+                try:
+                    library_contents[runtime_source] = library_path.read_text(
+                        encoding="utf-8"
+                    )
+                except (OSError, UnicodeError) as exc:
+                    raise CCompilerError(
+                        f"{filename}: cannot read standard C library source "
+                        f"{library_path}: {exc}"
+                    ) from exc
+            combined_source = source + "\n" + "\n".join(
+                library_contents[name] for name in sorted(library_contents)
+            )
+            parser = _Parser(combined_source, filename)
+            globals_, functions = parser.parse()
+            unresolved_calls = _called_functions(parser) - {
+                function.name for function in functions
+            }
+            discovered_sources = {
+                STANDARD_C_SOURCE[name]
+                for name in unresolved_calls
+                if name in STANDARD_C_SOURCE
+            }
+            discovered_sources -= runtime_sources
+            if not discovered_sources:
+                break
+            runtime_sources.update(discovered_sources)
     generator = _CodeGenerator(globals_, functions, filename, parser.records)
     generator.prototypes = parser.prototypes
     generator.enum_constants = parser.enum_constants

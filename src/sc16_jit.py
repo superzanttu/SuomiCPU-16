@@ -134,44 +134,48 @@ def run_block(mem, regs, st, budget):
         elif op == 31 and (instr & 0xF8FF) == 0xF81E:
             control = _rd16(mem, npc)
             npc += 2
-            if control & 0x0800:
-                right = _rd16(mem, npc)
+            if (control >> 12) == 7:
+                regs[rd] = (((control & 7) << 16) | _rd16(mem, npc))
                 npc += 2
             else:
-                right = regs[control & 7]
-            left = regs[rd] & 0xFFFF
-            right &= 0xFFFF
-            sl = left - 0x10000 if left & 0x8000 else left
-            sr = right - 0x10000 if right & 0x8000 else right
-            oper = control >> 12
-            carry = 0
-            result = 0
-            if oper == 0:
-                prod = left * right
-                result = prod & 0xFFFF
-                carry = 1 if prod > 0xFFFF else 0
-            elif oper == 1:
-                result = (left * right) >> 16
-            elif oper == 2:
-                result = ((sl * sr) >> 16) & 0xFFFF
-            elif right == 0:
-                result = left if (oper == 5 or oper == 6) else 0
-                carry = 1
-            elif oper == 3:
-                result = left // right
-            elif oper == 5:
-                result = left % right
-            else:
-                q = abs(sl) // abs(sr)
-                if (sl < 0) != (sr < 0):
-                    q = -q
-                if oper == 4:
-                    result = q & 0xFFFF
+                if control & 0x0800:
+                    right = _rd16(mem, npc)
+                    npc += 2
                 else:
-                    result = (sl - q * sr) & 0xFFFF
-            regs[rd] = result
-            z = 1 if result == 0 else 0
-            c = carry
+                    right = regs[control & 7]
+                left = regs[rd] & 0xFFFF
+                right &= 0xFFFF
+                sl = left - 0x10000 if left & 0x8000 else left
+                sr = right - 0x10000 if right & 0x8000 else right
+                oper = control >> 12
+                carry = 0
+                result = 0
+                if oper == 0:
+                    prod = left * right
+                    result = prod & 0xFFFF
+                    carry = 1 if prod > 0xFFFF else 0
+                elif oper == 1:
+                    result = (left * right) >> 16
+                elif oper == 2:
+                    result = ((sl * sr) >> 16) & 0xFFFF
+                elif right == 0:
+                    result = left if (oper == 5 or oper == 6) else 0
+                    carry = 1
+                elif oper == 3:
+                    result = left // right
+                elif oper == 5:
+                    result = left % right
+                else:
+                    q = abs(sl) // abs(sr)
+                    if (sl < 0) != (sr < 0):
+                        q = -q
+                    if oper == 4:
+                        result = q & 0xFFFF
+                    else:
+                        result = (sl - q * sr) & 0xFFFF
+                regs[rd] = result
+                z = 1 if result == 0 else 0
+                c = carry
         elif op == 31 and (instr & 0xF81F) == 0xF81A:
             bail = True
         elif op == 31 and (instr & 0xF8FF) == 0xF81F:
@@ -239,6 +243,8 @@ def run_block(mem, regs, st, budget):
                 elif sel == 12:
                     high_register = (control >> 9) & 7
                     npc = ((regs[high_register] & 7) << 16) | left
+                elif sel == 13:
+                    sp = (sp & 0xFFFF) | ((left & 7) << 16)
             elif oper <= 4:
                 if control & 0x0800:
                     cnt = control & 0xF

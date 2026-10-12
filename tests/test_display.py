@@ -99,7 +99,7 @@ class DisplayTests(unittest.TestCase):
         emulator.paused = False
         emulator.reboot_requested = False
         emulator.module_name = "test"
-        emulator.reset = lambda: setattr(emulator, "running", True)
+        emulator.reset = lambda **_kwargs: setattr(emulator, "running", True)
         emulator.execute_frame = lambda: setattr(emulator, "running", False)
         emulator.update_rtc = Mock()
         emulator.begin_mouse_frame = Mock()
@@ -128,7 +128,7 @@ class DisplayTests(unittest.TestCase):
         emulator.paused = False
         emulator.reboot_requested = False
         emulator.module_name = "test"
-        emulator.reset = lambda: setattr(emulator, "running", True)
+        emulator.reset = lambda **_kwargs: setattr(emulator, "running", True)
         emulator.execute_frame = lambda: setattr(emulator, "running", False)
         emulator.update_rtc = Mock()
         emulator.begin_mouse_frame = Mock()
@@ -153,7 +153,7 @@ class DisplayTests(unittest.TestCase):
         emulator.paused = False
         emulator.reboot_requested = False
         emulator.module_name = "test"
-        emulator.reset = lambda: setattr(emulator, "running", True)
+        emulator.reset = lambda **_kwargs: setattr(emulator, "running", True)
         emulator.execute_frame = lambda: setattr(emulator, "running", False)
         emulator.update_rtc = Mock()
         emulator.begin_mouse_frame = Mock()

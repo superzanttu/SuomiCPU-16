@@ -94,9 +94,13 @@ Selected modules are still loaded into memory by the emulator; virtual disks
 store program data only. The console currently supports a subset of standard
 text streams and formatted output. File-backed streams, floating-point format
 conversions, and several required C90 I/O facilities remain unimplemented.
-Device-mapped addresses retain their documented SC-16 behavior. Screen and
-graphics APIs remain implementation extensions and do not replace required
-C90 library interfaces.
+Device-mapped addresses retain their documented SC-16 behavior. Compiler
+global/static data is currently placed in `0x60000..0x6FFFF`, providing room
+for a single 65,535-byte object; generated addresses use the `LDI19`
+instruction so this region is not truncated to 16 bits. This allocation does
+not reserve additional runtime heap or imply that every C90 translation-limit
+requirement has been met. Screen and graphics APIs remain implementation
+extensions and do not replace required C90 library interfaces.
 
 ## Conformance gates
 

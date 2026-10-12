@@ -215,6 +215,7 @@ otherwise, instructions do not change the condition flags.
 | `HALT`      | `HALT`                | Stop execution.                                                                                                                                                    |
 | `LDI`       | `LDI Rd, value`       | Load an immediate value into `Rd`. Values from `0` to `255` use one word. Values from `256` to `65535` expand to `LDI` (low byte) followed by `LDI_H` (high byte). |
 | `LDI_H`     | `LDI_H Rd, high_byte` | Replace the high byte of `Rd`, preserving its low byte. `high_byte` must be `0` to `255`.                                                                          |
+| `LDI19`     | `LDI19 Rd, address`   | Load a full 19-bit address (`0` through `0x7FFFF`) into a register. `LDA` is an alias for this instruction.                                                       |
 
 For example:
 
@@ -315,7 +316,9 @@ These instructions use the extended `0x1A` selector in the `OP_SHR` space and
 are implemented by the Python emulator. The optional JIT hands this group back
 to the emulator. The `MOVSPH` miscellaneous instruction reads the high three
 bits of the 19-bit stack pointer; together with `MOVSP`, it lets compiler code
-form full stack addresses for 32-bit objects.
+form full stack addresses for 32-bit objects. `SETSPH` sets those upper bits
+without disturbing the low 16-bit offset, allowing code to restore a full
+19-bit stack position.
 
 Encoding: word 1 is `0xF800 | (high-register << 8) | 0x1A`; word 2 is
 `(operation << 12) | (immediate flag 0x0800) | source/count`. Operation codes
@@ -370,6 +373,7 @@ and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
 | `PUSHF` `POPF`                | `PUSHF`                    | Push/pop the flags (Z=1, C=2, N=4, V=8).                                                                                 |
 | `SETC` `CLC`                  | `SETC`                     | Set/clear the carry flag.                                                                                                |
 | `SETSP`                       | `SETSP Rd`                 | Load the stack pointer from `Rd`.                                                                                        |
+| `SETSPH`                      | `SETSPH Rd`                | Set the stack pointer's high three address bits from `Rd[2:0]`, preserving its low 16 bits.                              |
 | `NOP`                         | `NOP`                      | Do nothing (`MOV R0, R0`).                                                                                               |
 | `BNZX BNCX BNX BNNX BVX BNVX` | `BNZX label`               | Far branch if `Z`, `C`, `N`, `V` is clear (`BNZ`, `BNC`, `BNV`) or set (`BN`, `BV`); `BNNX` = `N` clear.                 |
 | `BLT BGE BGT BLE`             | `BLT label`                | Signed compare branches after `CMP` (use `N` and `V`).                                                                   |
@@ -708,46 +712,60 @@ preprocessor diagnostics. An optional filename remaps subsequent diagnostic
 filenames and the value of `__FILE__`; without a filename, the current mapped
 filename is retained.
 
-The library is incomplete. The repository provides `<stddef.h>`, `<limits.h>`,
-`<float.h>`, `<ctype.h>`, `<errno.h>`, `<assert.h>`, `<stdlib.h>`,
-`<string.h>`, `<stdarg.h>`, `<locale.h>`, and `<time.h>`. It also provides the
-C99 `<stdint.h>` header as a target-specific extension; this is not a C90
-standard header. It defines 8-, 16-, and 32-bit integer types, corresponding
-least/fast types, pointer-sized and maximum-width types, limits, and constant
-macros. The target has no 64-bit integer type, so 64-bit typedefs and macros
-are not provided. `<stddef.h>` includes `offsetof`,
-which supports nested struct/union member designators in constant initializers.
-The string/memory
-routines, C-locale character routines, and a subset of `<stdlib.h>` (`abs`,
-`labs`, `atoi`, `atol`, `strtol`, `strtoul`, `rand`, `srand`, `getenv`, and
-`system`) are compiled into a program when referenced. `exit(status)` and
-`abort()` halt the target; `EXIT_SUCCESS` is zero and `EXIT_FAILURE` is one,
-but the emulator has no host process exit-status channel and cannot perform
-`atexit` callbacks or stream cleanup. `strtol` and `strtoul` support base
-selection, end pointers, and `errno` range reporting using the target's 32-bit
-`long` limits; tests cover signed and unsigned boundary values and overflow.
-There is no target environment-variable store, so `getenv` returns `NULL`;
-there is no command processor, so `system(NULL)` returns zero and commands
-return -1. `<assert.h>` evaluates assertions unless `NDEBUG` is defined and
-stops the target on a failed assertion; enabled assertions expand to a `void`
-expression and evaluate their argument once. `RAND_MAX` is 32767; the sequence
-from `rand` is implementation-defined. `<locale.h>` exposes only the `"C"` locale;
-`setlocale` rejects other locale names, while `localeconv` reports the C locale
-numeric and monetary conventions. `<time.h>` defines `clock_t`, `time_t`, and
-`CLOCKS_PER_SEC`, and provides `clock` and `time`; since the target has no
-real-time clock or processor-time counter, both report `(time_t)-1`/
-`(clock_t)-1` (and `time` stores the sentinel when given a non-null pointer).
-Calendar conversion, formatting, and elapsed-time functions are not
-implemented. The limit and floating-point macros describe
-the target's actual types; they also make C90 minimum-range incompatibilities
-visible: `double` has the same binary16 precision and range as `float`, and
-`long double` maps to that same format as well. `size_t` is an unsigned 32-bit
-`long`, so it can represent the target's 19-bit address range; full 19-bit
-pointer arithmetic and object allocation remain unimplemented. These headers
-are partial: many required `<stdlib.h>` facilities and other C90 headers are
-not implemented. The project's screen and graphics routines are SC-16-specific
-extensions, not replacements for those standard facilities. Global
-initializers must be constant expressions supported by the compiler.
+The standard library remains incomplete and is not C90-conforming. Headers are
+available for `<stddef.h>`, `<limits.h>`, `<float.h>`, `<ctype.h>`, `<errno.h>`,
+`<assert.h>`, `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<stdarg.h>`,
+`<locale.h>`, `<time.h>`, `<math.h>`, and `<setjmp.h>`. The SC-16
+`setjmp`/`longjmp` implementation saves a 19-bit continuation and stack pointer;
+`longjmp` restores that context and converts a zero value to one. `<signal.h>`
+and signal-handler dispatch remain unimplemented. The C99 `<stdint.h>` header
+is an extension, not a C90 header.
+The target has no 64-bit integer type. `<stddef.h>` defines `size_t`,
+`ptrdiff_t`, `wchar_t`, `NULL`, and `offsetof`; `size_t` is a 32-bit unsigned
+`long` used for the target's 19-bit address range.
+
+The string and memory routines, C-locale character routines, and several
+`<stdlib.h>` services are linked when referenced. These include integer and
+decimal-string conversions, `div`/`ldiv`, random numbers, and a bounded
+512-byte heap for `malloc`, `calloc`, `realloc`, and `free`. Allocation failure
+returns `NULL` and reports `ENOMEM`; zero-size allocation returns `NULL`.
+`qsort` and `bsearch` are unavailable because callback function pointers are
+not supported. `exit(status)` and `abort()` halt the target; the emulator has
+no host process exit-status channel and cannot perform `atexit` callbacks or
+stream cleanup. There is no target environment-variable store, so `getenv`
+returns `NULL`; there is no command processor, so `system(NULL)` returns zero
+and commands return -1. `assert` evaluates its expression once and halts on a
+failed assertion unless `NDEBUG` is defined.
+
+`<stdio.h>` maps `stdin`, `stdout`, and `stderr` to the emulator's
+non-seekable console. Character/string I/O, integer/text `printf` formatting,
+and common `scanf` conversions are supported. Console input has no EOF
+condition, and `feof` therefore remains false. This runtime is unbuffered;
+`setvbuf` only accepts `_IONBF`. Hosted file operations (`fopen`, `remove`,
+`rename`, and temporary files) fail with `ENOSYS`; seek/position operations on
+console streams fail with `ESPIPE`. Floating-point `printf` conversions and
+`scanf` scansets are not implemented. `fscanf` can read the console stream but
+not files. The standard does not require a file system for freestanding
+implementations; this emulator's current data disks do not provide C streams.
+
+`<locale.h>` supports only the `"C"` locale. `<time.h>` provides calendar
+conversion, formatting, and elapsed-time conversion in UTC. `localtime` is
+currently UTC as well. No real-time clock or processor-time counter is
+available, so `time` and `clock` return their `-1` failure sentinels. The
+math interface contains software approximations only. All floating types map
+to binary16, which does not meet C90's minimum `double` range or precision;
+math results, `HUGE_VAL`, and exceptional-value handling are not C90-accurate.
+The project's screen and graphics routines are SC-16-specific extensions, not
+replacements for standard facilities. Global initializers must be constant
+expressions supported by the compiler.
+
+`<math.h>` is also available with the C90 function names and declarations.
+The current software routines provide basic approximations for the listed
+functions, but use the target's binary16 floating-point operations; they do
+not provide C90's required `double` range/precision or its full exceptional
+value behavior. In particular, `HUGE_VAL` is the largest finite target value,
+not an IEEE infinity. Do not use this math subset for numerically sensitive
+work or assume C90 numerical accuracy.
 
 ### Console, BIOS, and virtual disks
 
@@ -800,8 +818,10 @@ index is at `+10`, the RAM buffer offset at `+12`, and command results are at
 absent media, malformed images, and write-protected writes set the error
 status. Disk IDs are exactly eight ASCII letters, digits, `_`, or `-`.
 
-`<stdio.h>` currently provides console `getchar`, `putchar`, `puts`, `fgetc`,
-`fputc`, `fputs`, `printf`, `fprintf`, `vprintf`, and `vfprintf`. The formatter
+`<stdio.h>` currently provides console `getchar`, `putchar`, `puts`, `gets`,
+`fgetc`, `fgets`, `fputc`, `fputs`, `printf`, `fprintf`, `vprintf`, and `vfprintf`.
+`gets` follows C90 line-reading semantics and, like the standard function, does
+not bound writes to the supplied buffer. The formatter
 handles integer, character, string, and pointer conversions (`d`, `i`, `u`,
 `o`, `x`, `X`, `c`, `s`, `p`, `n`, and `%%`) with field width and precision.
 Unsupported conversions return `EOF`. File-backed streams and floating-point

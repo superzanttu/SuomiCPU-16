@@ -680,6 +680,8 @@ class SuomiCompute16:
 
     @staticmethod
     def _binary16_bits(value):
+        if math.isnan(value):
+            return 0x7E00
         try:
             return int.from_bytes(struct.pack(">e", value), "big")
         except OverflowError:
@@ -748,6 +750,11 @@ class SuomiCompute16:
         rd = (instr >> 8) & 0x7
         control = self.read_16(self.pc)
         self.pc += 2
+        operation = control >> 12
+        if operation == 7:
+            self.registers[rd] = (((control & 0x7) << 16) | self.read_16(self.pc))
+            self.pc += 2
+            return
         if control & 0x0800:
             right = self.read_16(self.pc)
             self.pc += 2
@@ -757,7 +764,6 @@ class SuomiCompute16:
         right &= 0xFFFF
         signed_left = left - 0x10000 if left & 0x8000 else left
         signed_right = right - 0x10000 if right & 0x8000 else right
-        operation = control >> 12
         carry = 0
         if operation == 0:
             product = left * right
@@ -1070,6 +1076,8 @@ class SuomiCompute16:
         elif selector == 12:
             high_register = (control >> 9) & 0x7
             self.pc = ((self.registers[high_register] & 0x7) << 16) | value
+        elif selector == 13:
+            self.sp = (self.sp & 0xFFFF) | ((value & 0x7) << 16)
 
     def _pack_flags(self):
         flags = self.flags
@@ -1359,13 +1367,15 @@ class SuomiCompute16:
         self.write(KEYS_ADDR, self.read(KEYS_ADDR) & ~(mask & 0xFF))
         self.write(KEYS_ADDR + 1, self.read(KEYS_ADDR + 1) & ~(mask >> 8))
 
-    def reset(self):
+    def reset(self, preserve_console_history=False):
         print("SC-16 starting...")
         self.registers = [0]*8
         self.sp = 0x2FFFF
         self.pc = self.entry_point
         self.running = True
-        self._console_device().reset(preserve_history=True)
+        self._console_device().reset(
+            preserve_history=preserve_console_history
+        )
         self.paused = False
         self.reboot_requested = False
         self.bios_reset_requested = False
@@ -1409,7 +1419,7 @@ class SuomiCompute16:
 
     def run(self):
         if not getattr(self, "_prepared_for_run", False):
-            self.reset()
+            self.reset(preserve_console_history=True)
             self.boot_time = time.monotonic()
             self._log_startup("SC-16 emulator started")
         self._prepared_for_run = False
@@ -1429,7 +1439,7 @@ class SuomiCompute16:
                     self.window_open = False
                     break
                 if self.reboot_requested:
-                    self.reset()
+                    self.reset(preserve_console_history=True)
                     self._prepared_for_run = False
                     self.boot_time = time.monotonic()
                     self._log_startup("SC-16 system rebooted")
@@ -1577,7 +1587,7 @@ def main():
 
             sc16.module_name = None
             sc16.program_loaded = False
-            sc16.reset()
+            sc16.reset(preserve_console_history=True)
             sc16._prepared_for_run = False
             sc16.boot_time = time.monotonic()
             sc16.console_log("System reset complete; BIOS ready")

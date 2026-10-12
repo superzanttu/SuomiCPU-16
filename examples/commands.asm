@@ -52,6 +52,7 @@ jump_target:
     BZ sample_routine
     BC sample_routine
     LDA R0, sample_routine ; Load a full memory address into a register
+    LDI19 R0, 0x51234      ; Load a 19-bit absolute address directly
     MOVSP R1                ; Copy the stack pointer into R1
     FADD R2, R3
     FSUB R2, R3
@@ -136,5 +137,6 @@ jump_target:
     MOD32 R0, R2
     MOD32S R0, R2
     MOVSPH R0
+    SETSPH R0               ; Set the stack pointer's high three address bits
 sample_routine:
     RET
