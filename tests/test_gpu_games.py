@@ -129,6 +129,7 @@ class CGraphicsTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 0x15)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 1)
 
+
     def test_signed_char_loads_are_sign_extended(self):
         source = ROOT / "tests" / "_sc.c"
         source.write_text(
@@ -171,6 +172,99 @@ class CGraphicsTests(unittest.TestCase):
     def test_library_names_are_reserved(self):
         with self.assertRaises(CCompilerError):
             compile_source("void gfx_clear(unsigned char c) {}\nint main(void) { return 0; }\n")
+
+
+class MotoRobotsTests(unittest.TestCase):
+    def test_initial_screen_presents_within_four_frame_budgets(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+            if any(vram(cpu)):
+                break
+        self.assertTrue(any(vram(cpu)))
+
+    def test_irregular_map_has_rock_water_and_mineable_deposits(self):
+        source = (
+            '#include "map.c"\n'
+            "int results[4];\n"
+            "GameMap test_map;\n"
+            "int main(void) {\n"
+            "  map_init(&test_map);\n"
+            "  results[0] = map_get_tile(&test_map, 10, 9);\n"
+            "  results[1] = map_get_tile(&test_map, test_map.river_x[12], 12);\n"
+            "  results[2] = map_get_resource(&test_map, 15, 19);\n"
+            "  results[3] = map_get_tile(&test_map, 24, 24);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "map_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(4)]
+        self.assertEqual(values, [1, 2, 1, 0])
+
+    def test_robot_transports_mine_inventory_to_factory(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[4];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  int step;\n"
+            "  Building* mine;\n"
+            "  Building* factory;\n"
+            "  game_init(&test_state);\n"
+            "  mine = &test_state.buildings[1];\n"
+            "  mine->type = BUILDING_MINE;\n"
+            "  mine->position.x = 15;\n"
+            "  mine->position.y = 19;\n"
+            "  mine->resource_type = RES_COAL;\n"
+            "  mine->inventory_type = RES_COAL;\n"
+            "  mine->inventory_count = 3;\n"
+            "  factory = &test_state.buildings[2];\n"
+            "  factory->type = BUILDING_FACTORY;\n"
+            "  factory->position.x = 16;\n"
+            "  factory->position.y = 19;\n"
+            "  factory->inventory_type = RES_NONE;\n"
+            "  factory->inventory_count = 0;\n"
+            "  test_state.building_count = 3;\n"
+            "  assign_robot_route(&test_state, 1, 2);\n"
+            "  test_state.robots[0].position.x = 15;\n"
+            "  test_state.robots[0].position.y = 19;\n"
+            "  for (step = 0; step < 9; step++)\n"
+            "    update_robots(&test_state, 0.5f);\n"
+            "  results[0] = mine->inventory_count;\n"
+            "  results[1] = factory->inventory_count;\n"
+            "  results[2] = test_state.robots[0].carrying_amount;\n"
+            "  results[3] = test_state.robots[0].state;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "robot_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(4)]
+        self.assertEqual(values[:3], [0, 3, 0])
+        self.assertEqual(values[3], 1)
+
+    def test_mouse_wheel_changes_map_zoom(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+            if any(vram(cpu)):
+                break
+        before = vram(cpu)
+        cpu.set_mouse_position(160, 120)
+        cpu.set_mouse_wheel(1)
+        for _ in range(4):
+            run_frame(cpu, limit=30000)
+            cpu.end_mouse_frame()
+            if cpu.frame_yield:
+                break
+        self.assertNotEqual(before, vram(cpu))
+        self.assertIn("Zoom level 3 of 3", cpu.console_device.output.decode("ascii"))
 
 
 class PreprocessorTests(unittest.TestCase):
@@ -463,6 +557,23 @@ class GameTests(unittest.TestCase):
         cpu.set_mouse_position(40, 30)
         run_frame(cpu)
         self.assertEqual(back(cpu, 40, 30), 6)
+
+    def test_mouse_wheel_builtin_reports_signed_frame_delta(self):
+        cpu = run_c(
+            "int main(void) {\n"
+            "  gfx_rect(0, 0, gfx_mouse_wheel() + 2, 1, WHITE);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n",
+            frames=0,
+        )
+        cpu.set_mouse_wheel(-1)
+        self.assertEqual(cpu.read_16(MOUSE_ADDR + 6), 0xFFFF)
+        run_frame(cpu)
+        self.assertEqual(back(cpu, 0, 0), 1)
+        self.assertEqual(back(cpu, 1, 0), 0)
+        cpu.end_mouse_frame()
+        self.assertEqual(cpu.read_16(MOUSE_ADDR + 6), 0)
 
     def test_paint_draws_with_mouse_drag_and_shapes(self):
         cpu = make_cpu(compile_file(ROOT / "modules" / "paint.c"))

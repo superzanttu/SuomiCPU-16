@@ -106,6 +106,7 @@ class CCompilerTests(unittest.TestCase):
             cpu.console_device.output.decode("ascii"),
             "N=-12 U=7 L=70000 H=002a S=ok %",
         )
+        self.assertFalse(getattr(cpu, "frame_yield", False))
 
     def test_c90_stdio_scanf_reads_console_input(self):
         image = compile_source(

@@ -24,7 +24,7 @@ The loop follows:
 Buildings are constructed for free, because this is first prototype game.
 
 ### 2.2 Logistics
-- **Transport Robot**: Transports items between mines, factories, and storage units. Uses a pathfinding algorithm to determine the optimal route. Robots are programmed by defining source and target locations for transport tasks.
+- **Transport Robot**: Transports items from mines or stocked buildings to another building. Select Route mode, click the source building, then click a non-mine destination.
 
 #### Robot Specifications
 - **Movement**: Robots are autonomous units that follow the instructions given by the player.
@@ -32,19 +32,20 @@ Buildings are constructed for free, because this is first prototype game.
 - **Capacity**: Robots can carry up to 5 items. (Limited to fit within register/memory constraints).
 - **Energy**: Robots don't consume energy.
 - **Speed**: Movement speed is 2 tiles per second. Load/unload speed is 0.5 seconds per item.
-- **Movement**: Robots can move forward and backward, turn left and right.
-- **Collision**: Robots avoid obstacles and other robots to prevent collisions.
+- **Collision**: Robots use breadth-first search to avoid rocks, water, other buildings, and other active robots. They retry their path on each movement step.
+- **Fleet**: Routes use an existing idle robot when possible and otherwise create a robot, up to a limit of eight.
+- **Buffers**: Mines hold up to 5 items; other buildings hold up to 20 items of one resource type. A robot waits if its destination is full or contains another resource type.
 
 ## 3. World & Map
 ### 3.1 Map Generation
-- **Map Type**: Procedurally generated tile map. To accommodate SuomiCPU-16 memory, the map uses a **chunk-based loading system** where only active areas are held in memory.
+- **Map Type**: A compact 48x48 tile map described by irregular terrain and resource features rather than a full tile array.
 
 #### Generation Rules
-- **Terrain**: Maps have lakes and rivers. Mountains are formed by clusters of rocks.
+- **Terrain**: The map includes irregular rock formations, a winding river, a pond, and clustered resource deposits. Feature edges and positions vary between runs to avoid square, repetitive layouts.
 - **Placement**: Buildings can exist on ground tiles only. Mines can only be placed on ground tiles that contain the corresponding resource.
 
 #### Biomes
-- **Distribution**: Resources are formed on clustered or resource-rich ground tiles.
+- **Distribution**: Coal, iron ore, and copper ore appear in distinct clusters.
 - **Availability**: Resources are infinite. Resource clusters are distributed evenly on map.
 
 ### 3.2 Tile Types
@@ -87,21 +88,19 @@ Buildings are constructed for free, because this is first prototype game.
 ### 5.1 Pathfinding
 
 #### Pathfinding Algorithm
-- **Algorithm**: Robots use a simplified A* or Dijkstra's algorithm. To save CPU cycles on SuomiCPU-16, pathfinding is computed incrementally or cached.
-- **Dynamic Obstacles**: If a robot hits a blocked tile, it recalculates the path to avoid the obstacle.
+- **Algorithm**: Robots run breadth-first search when selecting each next movement tile.
+- **Dynamic Obstacles**: The route is recalculated before each move so newly blocked paths are handled.
 
 ### 5.2 Save/Load System
-- **Persistence**: Game state is saved using the SuomiCPU-16 memory-mapped I/O or specific storage registers.
-- **Map Storage**: Map is stored as a series of chunks to minimize RAM usage.
-- **State Restoration**: State of robots and other entities is also saved and restored.
+- **Status**: Save/load is not implemented in the current prototype.
     
 ## 6. User Interface (GUI)
 ### 6.1 Map View
-- **View**: Zoomable map view.
+- **View**: Zoomable map view with three discrete zoom levels.
 
 #### Map Navigation
-- **Panning**: Right-click and drag or WASD keys.
-- **Zooming**: Mouse wheel scroll.
+- **Panning**: Right-click and drag or hold WASD keys.
+- **Zooming**: Mouse wheel scroll, anchored to the pointer over the map.
 
 ### 6.2 Interaction & Controls
 - **Input**: Full mouse support for navigation and interaction.
@@ -109,17 +108,16 @@ Buildings are constructed for free, because this is first prototype game.
 #### Control Scheme
 - **Left Click**: Select building / Place building.
 - **Right Click**: Cancel action / Pan map.
-- **Shift + Click**: Mass select similar buildings.
 
 ### 6.3 HUD & Feedback
 
 #### HUD Elements
 - **Resource Bar**: Top of screen showing totals of Coal, Iron Ore, Copper Ore, Iron Plate, and Copper Plate.
-- **Robot Status**: Bottom left showing number of active vs. idle robots.
-- **Mini-map**: Bottom right showing explored area and buildings.
+- **Robot Status**: Bottom toolbar showing active robots versus the total fleet.
+- **Mini-map**: Bottom right showing terrain landmarks, buildings, active robots, and the approximate map-view center.
 
-#### Notification System
-- **Alerts**: Simple toast notifications for events such as "Storage Full" or "Resource Depleted".
+#### Feedback
+- **Console**: Reports build-mode changes, selections, route assignments, and placement errors.
 
 ## 7. Progression & Goals
 ### 7.1 Milestones
@@ -139,11 +137,11 @@ Buildings are constructed for free, because this is first prototype game.
 ## 8. SuomiCPU-16 Specific Constraints
 ### 8.1 Memory Layout
 - **Global Storage**: Global variables start at `0xE800`.
-- **Memory Limit**: Total available memory is 512 KiB. Map chunks must be swapped to external storage to avoid exceeding this limit.
+- **Memory Limit**: Total available memory is 512 KiB. The current compact 48x48 feature map fits in RAM; larger worlds may need chunk streaming or external storage.
 - **Stack**: Local variables and function calls use the machine stack (starts at `0x2FFFF`).
 
 ### 8.2 Execution & Timing
-- **Frame Budget**: The emulator executes up to 30,000 instructions per frame (capped at 60 FPS). Pathfinding and map generation must be spread across multiple frames to avoid stuttering.
+- **Frame Budget**: The emulator executes up to 30,000 instructions per frame (capped at 60 FPS). Robot pathfinding runs synchronously before each movement step; longer routes may take multiple instruction windows to render.
 - **Precision**: Floating point values use IEEE-754 binary16 (half precision).
 
 ### 8.3 Graphics & I/O
@@ -153,21 +151,28 @@ Buildings are constructed for free, because this is first prototype game.
 
 ## 9. Current Prototype Status
 
-The current playable prototype implements procedural ground, rock, and water
-terrain; clustered coal, iron, and copper deposits; camera panning; free
-placement of mines, factories, and storage; and mine extraction at one unit per
-second. Mines hold up to five extracted units. The resource bar counts items
-currently held by buildings.
+The current prototype implements irregular rock formations, a winding river,
+a pond, and clustered coal, iron, and copper deposits. It has a three-level
+zoomable map, WASD and right-drag panning, a resource HUD, a landmark minimap,
+and a bottom toolbar with Mine, Factory, Storage, Select, and Route modes.
+Buildings can be placed for free. Mines extract one unit per second into a
+five-item buffer. Robots can be assigned mine-to-building routes, carry up to
+five items, and deliver them while avoiding terrain and active robots. The
+resource bar includes items carried by robots.
 
 Controls:
-- **WASD**: Pan the map one tile per press; holding a key repeats every 0.15
-  seconds.
-- **Bottom buttons**: Choose Mine, Factory, Storage, or Select mode.
-- **Tab**: Cycle between the same four modes.
+- **WASD**: Pan the map; holding a key repeats every 0.15 seconds.
+- **Right mouse drag**: Pan the map; right-click without dragging cancels the
+  current build tool.
+- **Mouse wheel**: Zoom in or out at the pointer across three levels.
+- **Bottom buttons**: Choose Mine, Factory, Storage, Select, or Route mode.
+- **Tab**: Cycle between all five modes.
 - **Left click**: Place the selected building, or select an existing building.
-- **Right click**: Cancel building placement.
+- **Route mode**: Click a mine or stocked building, then a different
+  non-mine building to assign an available robot.
+- **Minimap click**: Center the map view on that location.
 - **Console**: Displays build-mode changes, selections, placement results, and
   placement errors; no transient notification log is drawn over the map.
 
-Factory recipes, robot task assignment and transport, pathfinding, save/load,
-zoom, and the remaining progression systems are not implemented yet.
+Factory recipes, save/load, and the remaining progression systems are not
+implemented yet.

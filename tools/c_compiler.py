@@ -56,6 +56,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_mouse_y": ("int", ()),
     "gfx_mouse_buttons": ("unsigned int", ()),
     "gfx_mouse_events": ("unsigned int", ()),
+    "gfx_mouse_wheel": ("int", ()),
     "gfx_tilemap": ("void", ("unsigned char*", "int", "int", "int", "int")),
     "gfx_getchar": ("int", ()),
     "net_open": ("int", ("char*",)),

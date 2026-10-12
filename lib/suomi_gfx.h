@@ -21,6 +21,7 @@ int gfx_mouse_x(void);
 int gfx_mouse_y(void);
 unsigned int gfx_mouse_buttons(void);
 unsigned int gfx_mouse_events(void);
+int gfx_mouse_wheel(void);
 
 /* Tile map: one byte per tile = palette color (0 = black); draws 16x16 tiles over the
    whole back buffer with the camera at pixel (cam_x, cam_y). */

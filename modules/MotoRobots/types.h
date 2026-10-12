@@ -34,8 +34,17 @@ typedef enum {
     BUILDING_MINE,
     BUILDING_FACTORY,
     BUILDING_STORAGE,
-    BUILDING_BASE
+    BUILDING_BASE,
+    BUILDING_ROUTE
 } BuildingType;
+
+typedef enum {
+    ROBOT_IDLE,
+    ROBOT_TO_SOURCE,
+    ROBOT_LOADING,
+    ROBOT_TO_TARGET,
+    ROBOT_UNLOADING
+} RobotState;
 
 typedef struct {
     BuildingType type;
@@ -47,13 +56,13 @@ typedef struct {
 } Building;
 
 typedef struct {
-    int id;
-    Vec2f position;
+    Vec2i position;
     int carrying_amount;
     ResourceType carrying_type;
-    Vec2i source_pos;
-    Vec2i target_pos;
-    int is_active; // Using int instead of bool
+    int source_building;
+    int target_building;
+    RobotState state;
+    float timer;
 } Robot;
 
 #endif

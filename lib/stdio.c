@@ -83,8 +83,6 @@ int fputc(int character, FILE *stream)
         errno = EBADF;
         return EOF;
     }
-    while (!(CONSOLE_STATUS & 2))
-        ;
     CONSOLE_DATA = (unsigned char)character;
     return (unsigned char)character;
 }

@@ -1,109 +1,182 @@
 #include "map.h"
 #include "../../lib/suomi_gfx.h"
 
-#define RESOURCE_PATCHES 2
-#define TERRAIN_PATCHES 8
-#define MAP_BASE_X 24
-#define MAP_BASE_Y 24
-#define CELL_TILE_MASK 3
-#define CELL_RESOURCE_SHIFT 2
-#define CELL_RESOURCE_MASK 28
-
-static unsigned char cell_tile(unsigned char cell) {
-    return cell & CELL_TILE_MASK;
+static int absolute(int value) {
+    return value < 0 ? -value : value;
 }
 
-static unsigned char cell_resource(unsigned char cell) {
-    return (cell & CELL_RESOURCE_MASK) >> CELL_RESOURCE_SHIFT;
+static void add_feature(GameMap* map, int x, int y, int radius, int seed,
+                        TileType tile, ResourceType resource) {
+    MapFeature* feature;
+    if (map->feature_count >= MAP_MAX_FEATURES) return;
+    feature = &map->features[map->feature_count++];
+    feature->center_x = x;
+    feature->center_y = y;
+    feature->radius = radius;
+    feature->seed = seed;
+    feature->tile = tile;
+    feature->resource = resource;
 }
 
-static void set_cell(GameMap* map, int x, int y, TileType tile,
-                     ResourceType resource) {
-    map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-        .cells[x % CHUNK_SIZE][y % CHUNK_SIZE] =
-        (unsigned char)(tile | (resource << CELL_RESOURCE_SHIFT));
+static int feature_row(MapFeature* feature, int y, int* center, int* radius) {
+    int offset;
+    int row;
+    int spread;
+
+    offset = y - feature->center_y;
+    if (offset < -feature->radius || offset > feature->radius) return 0;
+    row = absolute(offset);
+    spread = feature->radius - (row * 2) / 3;
+    if (spread < 1) spread = 1;
+    *center = feature->center_x + ((offset + feature->seed) & 1) - 1;
+    *radius = spread;
+    return 1;
 }
 
-static void map_paint_patch(GameMap* map, int center_x, int center_y,
-                            int radius, TileType tile, ResourceType resource) {
-    int x;
-    int y;
-    int dx;
-    int dy;
-
-    for (x = center_x - radius; x <= center_x + radius; x++) {
-        for (y = center_y - radius; y <= center_y + radius; y++) {
-            dx = x - center_x;
-            dy = y - center_y;
-            if (dx * dx + dy * dy > radius * radius) continue;
-            if (x < 0 || x >= map->width || y < 0 || y >= map->height) continue;
-            if (tile != TILE_GROUND) {
-                set_cell(map, x, y, tile, RES_NONE);
-            } else if (map_get_tile(map, x, y) == TILE_GROUND) {
-                set_cell(map, x, y, TILE_GROUND, resource);
-            }
-        }
-    }
+static int in_feature(MapFeature* feature, int x, int y) {
+    int center;
+    int radius;
+    if (!feature_row(feature, y, &center, &radius)) return 0;
+    return x >= center - radius && x <= center + radius;
 }
 
 void map_init(GameMap* map) {
-    int cx;
-    int cy;
-    int x;
     int y;
-    int i;
-    int center_x;
-    int center_y;
-    int radius;
-    ResourceType resource;
+    int river_x;
+    int river_change_y;
+    int river_segment;
+    int variation;
 
-    map->width = MAP_CHUNKS * CHUNK_SIZE;
-    map->height = MAP_CHUNKS * CHUNK_SIZE;
+    map->width = MAP_SIZE;
+    map->height = MAP_SIZE;
+    map->feature_count = 0;
+    variation = (int)(gfx_random() & 1);
+    add_feature(map, 10 + variation, 9, 5, 1 + variation,
+                TILE_ROCK, RES_NONE);
+    add_feature(map, 37 - variation, 38, 5, 2 + variation,
+                TILE_ROCK, RES_NONE);
+    add_feature(map, 39, 10, 4, variation, TILE_WATER, RES_NONE);
+    add_feature(map, 15 + variation, 19, 3, variation,
+                TILE_GROUND, RES_COAL);
+    add_feature(map, 33 - variation, 17, 3, 1 + variation,
+                TILE_GROUND, RES_IRON_ORE);
+    add_feature(map, 28 + variation, 36, 3, 2 + variation,
+                TILE_GROUND, RES_COPPER_ORE);
 
-    for (cx = 0; cx < MAP_CHUNKS; cx++) {
-        for (cy = 0; cy < MAP_CHUNKS; cy++) {
-            for (x = 0; x < CHUNK_SIZE; x++) {
-                for (y = 0; y < CHUNK_SIZE; y++) {
-                    map->chunks[cx][cy].cells[x][y] = TILE_GROUND;
-                }
-            }
+    river_x = 5 + variation;
+    river_change_y = 11;
+    river_segment = 0;
+    for (y = 0; y < MAP_SIZE; y++) {
+        if (y == river_change_y) {
+            if ((river_segment & 2) == 0) river_x++;
+            else river_x--;
+            if (river_x < 4) river_x = 4;
+            if (river_x > 9) river_x = 9;
+            river_segment++;
+            river_change_y += 6;
         }
-    }
-
-    for (i = 0; i < TERRAIN_PATCHES; i++) {
-        center_x = gfx_random() % map->width;
-        center_y = gfx_random() % map->height;
-        radius = 2 + gfx_random() % 5;
-        map_paint_patch(map, center_x, center_y, radius,
-                        (gfx_random() & 1) ? TILE_ROCK : TILE_WATER, RES_NONE);
-    }
-
-    for (i = 0; i < RESOURCE_PATCHES * 3; i++) {
-        center_x = gfx_random() % map->width;
-        center_y = gfx_random() % map->height;
-        radius = 2 + gfx_random() % 3;
-        if (i < RESOURCE_PATCHES) resource = RES_COAL;
-        else if (i < RESOURCE_PATCHES * 2) resource = RES_IRON_ORE;
-        else resource = RES_COPPER_ORE;
-        map_paint_patch(map, center_x, center_y, radius, TILE_GROUND, resource);
-    }
-
-    for (x = MAP_BASE_X - 4; x <= MAP_BASE_X + 4; x++) {
-        for (y = MAP_BASE_Y - 4; y <= MAP_BASE_Y + 4; y++) {
-            map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-                .cells[x % CHUNK_SIZE][y % CHUNK_SIZE] = TILE_GROUND;
-        }
+        map->river_x[y] = (unsigned char)river_x;
     }
 }
 
 TileType map_get_tile(GameMap* map, int x, int y) {
-    if (x < 0 || x >= map->width || y < 0 || y >= map->height) return TILE_ROCK;
-    return (TileType)cell_tile(map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-        .cells[x % CHUNK_SIZE][y % CHUNK_SIZE]);
+    int i;
+    MapFeature* feature;
+
+    if (x < 0 || y < 0 || x >= map->width || y >= map->height)
+        return TILE_ROCK;
+    if (x >= 22 && x <= 26 && y >= 22 && y <= 26) return TILE_GROUND;
+    if (y >= 5 && y < 43) {
+        i = (int)map->river_x[y];
+        if (absolute(x - i) <= 1) return TILE_WATER;
+    }
+    for (i = 0; i < map->feature_count; i++) {
+        feature = &map->features[i];
+        if (feature->resource == RES_NONE &&
+            in_feature(feature, x, y)) return feature->tile;
+    }
+    return TILE_GROUND;
 }
 
 ResourceType map_get_resource(GameMap* map, int x, int y) {
-    if (x < 0 || x >= map->width || y < 0 || y >= map->height) return RES_NONE;
-    return (ResourceType)cell_resource(map->chunks[x / CHUNK_SIZE][y / CHUNK_SIZE]
-        .cells[x % CHUNK_SIZE][y % CHUNK_SIZE]);
+    int i;
+    MapFeature* feature;
+
+    if (map_get_tile(map, x, y) != TILE_GROUND) return RES_NONE;
+    for (i = 0; i < map->feature_count; i++) {
+        feature = &map->features[i];
+        if (feature->resource != RES_NONE &&
+            in_feature(feature, x, y)) return feature->resource;
+    }
+    return RES_NONE;
+}
+
+static unsigned char feature_color(MapFeature* feature) {
+    if (feature->resource == RES_COAL) return DARK_GRAY;
+    if (feature->resource == RES_IRON_ORE) return ORANGE;
+    if (feature->resource == RES_COPPER_ORE) return CYAN;
+    if (feature->tile == TILE_WATER) return BLUE;
+    return DARK_GRAY;
+}
+
+void map_draw(GameMap* map, int camera_x, int camera_y, int tile_size,
+              int view_y, int view_height) {
+    int first_y;
+    int last_y;
+    int map_y;
+    int river_y;
+    int river_start;
+    int river_end;
+    int screen_y;
+    int center;
+    int radius;
+    int i;
+    MapFeature* feature;
+
+    gfx_rect(0, view_y, SCREEN_W, view_height, GREEN);
+    first_y = camera_y / tile_size;
+    last_y = (camera_y + view_height) / tile_size + 1;
+    if (last_y > map->height) last_y = map->height;
+    for (river_y = 5; river_y < 43; river_y += 6) {
+        river_start = river_y;
+        river_end = river_y + 6;
+        if (river_start < first_y) river_start = first_y;
+        if (river_end > 43) river_end = 43;
+        if (river_end > last_y) river_end = last_y;
+        if (river_end <= river_start) continue;
+        center = (int)map->river_x[(river_start + river_end) / 2];
+        gfx_rect((center - 1) * tile_size - camera_x,
+                 view_y + river_start * tile_size - camera_y,
+                 3 * tile_size, (river_end - river_start) * tile_size, BLUE);
+    }
+    for (map_y = first_y; map_y < last_y; map_y++) {
+        screen_y = view_y + map_y * tile_size - camera_y;
+        for (i = 0; i < map->feature_count; i++) {
+            feature = &map->features[i];
+            if (feature_row(feature, map_y, &center, &radius)) {
+                gfx_rect((center - radius) * tile_size - camera_x,
+                         screen_y, (radius * 2 + 1) * tile_size,
+                         tile_size, feature_color(feature));
+            }
+        }
+    }
+}
+
+void map_draw_minimap(GameMap* map, int screen_x, int screen_y, int size) {
+    int map_y;
+    int map_x;
+    int river_map_x;
+    int i;
+    MapFeature* feature;
+
+    gfx_rect(screen_x, screen_y, size, size, GREEN);
+    river_map_x = (int)map->river_x[24] * size / MAP_SIZE;
+    gfx_rect(screen_x + river_map_x - 1, screen_y + 3, 3, size - 6, BLUE);
+    for (i = 0; i < map->feature_count; i++) {
+        feature = &map->features[i];
+        map_x = feature->center_x * size / MAP_SIZE;
+        map_y = feature->center_y * size / MAP_SIZE;
+        gfx_rect(screen_x + map_x - 2, screen_y + map_y - 2,
+                 5, 5, feature_color(feature));
+    }
 }

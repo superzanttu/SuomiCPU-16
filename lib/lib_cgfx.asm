@@ -223,6 +223,13 @@ gfx_mouse_events:
     LD R0, R7
     RET
 
+gfx_mouse_wheel:
+    CALLX CGFX_HIGH
+    LDI R6, 0x300E
+    ADD R7, R6
+    LDW R0, R7
+    RET
+
 gfx_random:
     LDI R5, 9
     CALLX CGFX_GO

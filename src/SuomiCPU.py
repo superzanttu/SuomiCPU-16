@@ -1328,6 +1328,15 @@ class SuomiCompute16:
         y = max(0, min(SCREEN_HEIGHT - 1, y))
         self.memory[MOUSE_ADDR:MOUSE_ADDR + 4] = bytes((x >> 8, x & 0xFF, y >> 8, y & 0xFF))
 
+    def set_mouse_wheel(self, delta):
+        if not hasattr(self, "_mouse_wheel_delta"):
+            self._mouse_wheel_delta = 0
+        self._mouse_wheel_delta = max(
+            -32768, min(32767, self._mouse_wheel_delta + delta)
+        )
+        self.write_16(MOUSE_ADDR + 6, self._mouse_wheel_delta & 0xFFFF)
+
+
     def mouse_button(self, button, down, x=0, y=0, now_ms=0):
         """Record a press or release of button 0 (left) or 1 (right); presses raise click events."""
         bit = 1 << button
@@ -1358,6 +1367,8 @@ class SuomiCompute16:
 
     def end_mouse_frame(self):
         self.memory[MOUSE_ADDR + 5] = 0
+        self.memory[MOUSE_ADDR + 6:MOUSE_ADDR + 8] = b"\0\0"
+        self._mouse_wheel_delta = 0
 
     def press_keys(self, mask):
         self.write(KEYS_ADDR, self.read(KEYS_ADDR) | (mask & 0xFF))
@@ -1459,6 +1470,12 @@ class SuomiCompute16:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         self.window_open = False
+                    if event.type == pygame.MOUSEWHEEL:
+                        self.set_mouse_wheel(event.y)
+                    elif (event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP)
+                          and event.button in (4, 5)
+                          and event.type == pygame.MOUSEBUTTONDOWN):
+                        self.set_mouse_wheel(1 if event.button == 4 else -1)
                     if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (1, 3):
                         mx, my = _screen_to_logical(event.pos, self.screen.get_size())
                         self.set_mouse_position(mx, my)
