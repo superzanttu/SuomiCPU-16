@@ -145,7 +145,10 @@ class JitEquivalenceTests(unittest.TestCase):
         self.assertEqual(fast.registers[0], 0x51234)
 
     def test_stack_pointer_high_bits_instruction_matches_interpreter(self):
-        program = assemble("LDI R0, 5\nSETSPH R0\nHALT")
+        program = assemble(
+            "LDI R1, 0x1234\nSETSP R1\nSETC\n"
+            "LDI R0, 0xFFFF\nSETSPH R0\nMOVSP R2\nMOVSPH R3\nHALT"
+        )
         slow = make_cpu(program)
         fast = make_cpu(program)
         slow.use_jit = False
@@ -159,7 +162,9 @@ class JitEquivalenceTests(unittest.TestCase):
         fast._execute_jit(10)
 
         self.assertEqual(state(slow), state(fast))
-        self.assertEqual(fast.sp, 0x5FFFF)
+        self.assertEqual(fast.sp, 0x71234)
+        self.assertEqual((fast.registers[2], fast.registers[3]), (0x71234, 7))
+        self.assertEqual(fast.flags["C"], 1)
 
     def test_19_bit_return_addresses_match_for_calls_above_0xffff(self):
         program = assemble(

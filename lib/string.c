@@ -135,12 +135,16 @@ size_t strcspn(const char *s1, const char *s2)
 
 char *strerror(int errnum)
 {
+    if (errnum == E2BIG)
+        return "argument list too long";
     if (errnum == EACCES)
         return "permission denied";
     if (errnum == EBADF)
         return "bad file descriptor";
     if (errnum == EDOM)
         return "domain error";
+    if (errnum == EILSEQ)
+        return "illegal byte sequence";
     if (errnum == EEXIST)
         return "file exists";
     if (errnum == EINVAL)

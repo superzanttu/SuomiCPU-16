@@ -2486,6 +2486,38 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
 
+    def test_c90_strerror_covers_all_defined_errno_values(self):
+        cases = (
+            ("E2BIG", "argument list too long"),
+            ("EACCES", "permission denied"),
+            ("EBADF", "bad file descriptor"),
+            ("EDOM", "domain error"),
+            ("EEXIST", "file exists"),
+            ("EILSEQ", "illegal byte sequence"),
+            ("EINVAL", "invalid argument"),
+            ("EIO", "I/O error"),
+            ("ENOENT", "no such file"),
+            ("ENOMEM", "out of memory"),
+            ("ENOSPC", "no space left"),
+            ("ENOSYS", "operation unavailable"),
+            ("EPERM", "operation not permitted"),
+            ("ERANGE", "range error"),
+            ("ESPIPE", "stream is not seekable"),
+            ("EROFS", "read-only filesystem"),
+            ("-1", "unknown error"),
+        )
+        for error_code, message in cases:
+            with self.subTest(error_code=error_code):
+                image = compile_source(
+                    "#include <errno.h>\n"
+                    "#include <string.h>\n"
+                    "int main(void) {\n"
+                    f'  return strcmp(strerror({error_code}), "{message}") != 0;\n'
+                    "}\n"
+                )
+                cpu, _ = run_image(image)
+                self.assertEqual(cpu.registers[0], 0)
+
     def test_c90_assert_macro_passes_and_aborts(self):
         success_image = compile_source(
             "#include <assert.h>\n"

@@ -290,7 +290,9 @@ required before claiming full C90 compatibility.
 - [ ] **Complete required C90 library functions** (`c90-library-functions`)
   - Implement required functions and macros from C90 headers, including
     remaining math, stdio, signal, stdlib, string, and time
-    facilities.
+    facilities. `strerror` now has a message for every errno macro defined by
+    this implementation, with runtime coverage for each mapping and the
+    unknown-error fallback.
   - The current `<math.h>` implementation is only an approximate target
     subset; validate all domains, ranges, errors, and accuracy after the
     floating-point ABI is upgraded.

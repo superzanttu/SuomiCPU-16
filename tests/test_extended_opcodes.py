@@ -77,14 +77,18 @@ class ExtendedOpcodeTests(unittest.TestCase):
 
     def test_setsph_updates_only_the_high_stack_pointer_bits(self):
         cpu = run(
-            "LDI R0, 5\n"
+            "LDI R1, 0x1234\n"
+            "SETSP R1\n"
+            "SETC\n"
+            "LDI R0, 0xFFFF\n"
             "SETSPH R0\n"
             "MOVSP R1\n"
             "MOVSPH R2\n"
             "HALT"
         )
-        self.assertEqual(cpu.sp, 0x5FFFF)
-        self.assertEqual((cpu.registers[1], cpu.registers[2]), (0x5FFFF, 5))
+        self.assertEqual(cpu.sp, 0x71234)
+        self.assertEqual((cpu.registers[1], cpu.registers[2]), (0x71234, 7))
+        self.assertEqual(cpu.flags["C"], 1)
 
     def test_lda_loads_a_full_19_bit_address(self):
         cpu = run("LDA R0, 0x51234\nHALT")
