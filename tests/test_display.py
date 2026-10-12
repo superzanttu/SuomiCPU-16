@@ -7,6 +7,8 @@ from assembler import assemble
 from src.SuomiCPU import (
     KEY_BITS,
     MEM_SIZE,
+    SPEED_ADDR,
+    VSYNC_ADDR,
     VRAM_START,
     SuomiCompute16,
     _screen_to_logical,
@@ -120,6 +122,71 @@ class DisplayTests(unittest.TestCase):
         emulator.update_display.assert_called_once_with()
         emulator.clock.tick.assert_called_once_with(30)
         console_window.return_value.close.assert_called_once_with()
+
+    def test_max_speed_keeps_display_updates_at_display_rate(self):
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
+        emulator.memory = bytearray(MEM_SIZE)
+        emulator.memory[SPEED_ADDR] = 1
+        emulator.clock = Mock()
+        emulator.paused = False
+        emulator.reboot_requested = False
+        emulator.bios_reset_requested = False
+        emulator.module_name = "test"
+        emulator.boot_time = 0.0
+        emulator._prepared_for_run = True
+        emulator.running = True
+        emulator.reset = Mock()
+        emulator.execute_frame = Mock()
+        emulator.update_rtc = Mock()
+        emulator.begin_mouse_frame = Mock()
+        emulator.end_mouse_frame = Mock()
+        emulator.update_display = Mock()
+        quit_event = pygame.event.Event(pygame.QUIT)
+        event_batches = [[] for _ in range(6)] + [[quit_event]]
+        monotonic_calls = 0
+
+        def monotonic():
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            return 10 + monotonic_calls * 0.017
+
+        with patch.object(pygame.event, "get", side_effect=event_batches):
+            with patch("src.SuomiCPU.time.monotonic", side_effect=monotonic):
+                with patch("src.SuomiCPU.ConsoleWindow"):
+                    emulator.run()
+
+        self.assertEqual(emulator.update_display.call_count, 6)
+        emulator.clock.tick.assert_not_called()
+
+    def test_vsync_throttles_max_speed_on_presented_frames(self):
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
+        emulator.memory = bytearray(MEM_SIZE)
+        emulator.memory[SPEED_ADDR] = 1
+        emulator.memory[VSYNC_ADDR] = 1
+        emulator.clock = Mock()
+        emulator.paused = False
+        emulator.reboot_requested = False
+        emulator.bios_reset_requested = False
+        emulator.module_name = "test"
+        emulator.boot_time = 0.0
+        emulator._prepared_for_run = True
+        emulator.running = True
+        emulator.reset = Mock()
+        emulator.execute_frame = lambda: setattr(emulator, "frame_yield", True)
+        emulator.update_rtc = Mock()
+        emulator.begin_mouse_frame = Mock()
+        emulator.end_mouse_frame = Mock()
+        emulator.update_display = Mock()
+        quit_event = pygame.event.Event(pygame.QUIT)
+
+        with patch.object(pygame.event, "get", side_effect=[[], [], [quit_event]]):
+            with patch("src.SuomiCPU.time.monotonic", return_value=10.0):
+                with patch("src.SuomiCPU.ConsoleWindow"):
+                    emulator.run()
+
+        self.assertEqual(emulator.update_display.call_count, 2)
+        self.assertEqual(emulator.clock.tick.call_count, 2)
+        emulator.clock.tick.assert_called_with(30)
 
     def test_f11_toggles_fullscreen_during_emulation(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)

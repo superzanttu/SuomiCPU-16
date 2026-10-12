@@ -72,3 +72,37 @@ python main.py asteroids.bin
 
 See the [user guide](user_guide.md) for setup details, controls, and the full
 example catalog.
+
+<!-- module-gif-gallery:start -->
+## Module gallery
+
+Each animation captures a module running in the SC-16 emulator.
+
+| Module | Animation |
+| --- | --- |
+| AnaClock | <img src="docs/module-gifs/anaclock.gif" alt="AnaClock running in SC-16" width="320"> |
+| Asteroids | <img src="docs/module-gifs/asteroids.gif" alt="Asteroids running in SC-16" width="320"> |
+| DiskEditor | <img src="docs/module-gifs/diskeditor.gif" alt="DiskEditor running in SC-16" width="320"> |
+| Elite | <img src="docs/module-gifs/elite.gif" alt="Elite running in SC-16" width="320"> |
+| Hulio | <img src="docs/module-gifs/hulio.gif" alt="Hulio running in SC-16" width="320"> |
+| Infinite CIty | <img src="docs/module-gifs/infinite-city.gif" alt="Infinite CIty running in SC-16" width="320"> |
+| Lunar Lander | <img src="docs/module-gifs/lunar-lander.gif" alt="Lunar Lander running in SC-16" width="320"> |
+| MotoRobots | <img src="docs/module-gifs/motorobots.gif" alt="MotoRobots running in SC-16" width="320"> |
+| Netgame Demo | <img src="docs/module-gifs/netgame-demo.gif" alt="Netgame Demo running in SC-16" width="320"> |
+| PacMan | <img src="docs/module-gifs/pacman.gif" alt="PacMan running in SC-16" width="320"> |
+| Paint | <img src="docs/module-gifs/paint.gif" alt="Paint running in SC-16" width="320"> |
+| SC-16 showcase | <img src="docs/module-gifs/sc-16-showcase.gif" alt="SC-16 showcase running in SC-16" width="320"> |
+| Space Invaders | <img src="docs/module-gifs/space-invaders.gif" alt="Space Invaders running in SC-16" width="320"> |
+| SpaceCave | <img src="docs/module-gifs/spacecave.gif" alt="SpaceCave running in SC-16" width="320"> |
+| Text Demo | <img src="docs/module-gifs/text-demo.gif" alt="Text Demo running in SC-16" width="320"> |
+<!-- module-gif-gallery:end -->
+
+Regenerate the animations for every module folder with a runnable C entry point:
+```console
+python tools/generate_module_gifs.py
+```
+Each generated GIF loops continuously with a 15-second cycle by default.
+The source module runs for 10 seconds during capture. Use
+`--run-seconds` to change the capture window and `--gif-seconds` to set the
+total GIF duration; `--fps` and `--capture-fps` adjust sampling. The script
+discovers modules from `modules/` each time it runs and updates this gallery.

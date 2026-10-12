@@ -1,3 +1,4 @@
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -59,6 +60,24 @@ class ConsoleDeviceTests(unittest.TestCase):
         self.assertEqual(len(snapshot), 25)
         self.assertTrue(all(len(line) == 80 for line in snapshot))
         self.assertEqual(snapshot[0][:22], "SC-16 emulator started")
+
+    def test_console_log_is_written_and_overwritten_on_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "console.log"
+            console = ConsoleDevice(log_path=path)
+            console.write_text("first session")
+            self.assertEqual(path.read_bytes(), b"first session\n")
+
+            console.reset(preserve_history=True)
+            self.assertEqual(path.read_bytes(), b"")
+            self.assertIn(
+                "first session",
+                "\n".join(console.scrollback_snapshot()),
+            )
+
+            console.write_text("second session")
+            console.close()
+            self.assertEqual(path.read_bytes(), b"second session\n")
 
     def test_console_scrollback_retains_the_latest_1000_rows(self):
         console = self.make_cpu()._console_device()

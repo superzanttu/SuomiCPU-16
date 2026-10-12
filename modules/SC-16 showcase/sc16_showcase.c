@@ -16,15 +16,15 @@
 // #....######....#
 // #..............#
 // ################
-// Left/Right (or A/D) change page.  On the benchmark page press Enter to run it.
-// Pages: 1 title, 2 CPU, 3 memory map, 4 graphics, 5 animation, 6 text/font,
-//        7 devices (RTC, keyboard, random numbers), 8 benchmark,
-//        9 speed comparison with other computers (press Enter to measure).
+// Left/Right (or A/D) change page.  Press Enter on the benchmark/comparison pages.
+// Pages: title, CPU, memory, graphics, animation, text/font, devices, benchmark,
+//        speed comparison, mouse/input, tile map/layers, LAN, 3D ship,
+//        maximum-speed sprite load test.
 // All timing uses the machine's own clocks: gfx_ticks() (emulated frames; 30/s
 // at fixed speed) and gfx_rtc() (the real-time clock registers).
 #include "suomi_gfx.h"
 
-#define PAGES 9
+#define PAGES 14
 #define NMACH 8
 #define SC16_ROW 4
 #define INSTR_PER_ITER 16
@@ -32,14 +32,22 @@
 #define NTEST 7
 #define DUR 30
 #define FONT_ROM 0x4400
+#define TILE_MAP_W 40
+#define TILE_MAP_H 20
+#define NETWORK_PAGE 11
+#define STRESS_PAGE 13
+#define STRESS_MAX_SPRITES 200
+#define SHIP_VERTICES 27
+#define SHIP_FACES 44
 
 char sintab[32] = {0, 20, 38, 56, 71, 83, 92, 98, 100, 98, 92, 83, 71, 56, 38, 20,
                    0, -20, -38, -56, -71, -83, -92, -98, -100, -98, -92, -83, -71, -56, -38, -20};
 unsigned char rainbow[7] = {RED, ORANGE, YELLOW, GREEN, CYAN, BLUE, MAGENTA};
-unsigned char logo[28] = {0x0E, 0x11, 0x10, 0x0E, 0x01, 0x11, 0x0E,
+unsigned char logo[35] = {0x0E, 0x11, 0x10, 0x0E, 0x01, 0x11, 0x0E,
                           0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E,
                           0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00,
-                          0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E};
+                          0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E,
+                          0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E};
 unsigned char bit5[5] = {16, 8, 4, 2, 1};
 unsigned char bit8[8] = {128, 64, 32, 16, 8, 4, 2, 1};
 unsigned char ball[8] = {0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C};
@@ -89,6 +97,52 @@ unsigned int bench_host_secs;
 unsigned int bench_sink;
 unsigned int bench_mark;
 unsigned char bench_mem[64];
+unsigned int cmp_kops;
+unsigned int cmp_mips_tenths;
+unsigned char bench_prev_speed;
+unsigned char tile_map[TILE_MAP_W * TILE_MAP_H];
+int tile_ready;
+int mouse_last_char;
+int network_attempted;
+int network_joined;
+int network_tx_ok;
+int network_x;
+int network_y;
+int network_px[NET_MAX_PLAYERS];
+int network_py[NET_MAX_PLAYERS];
+unsigned char network_message[NET_MAX_MSG];
+unsigned char network_colors[NET_MAX_PLAYERS] = {RED, GREEN, BLUE, YELLOW, CYAN, MAGENTA, ORANGE, WHITE};
+int ship_x[SHIP_VERTICES] = {
+    0, -13, -58, -28, -18, 0, 18, 28, 58, 13,
+    0, -13, -58, -28, -18, 0, 18, 28, 58, 13,
+    0, 0, -8, 8, 6, -6, 0};
+int ship_y[SHIP_VERTICES] = {
+    -52, -12, 16, 9, 38, 29, 38, 9, 16, -12,
+    -52, -12, 16, 9, 38, 29, 38, 9, 16, -12,
+    0, 0, -12, -12, 5, 5, -7};
+int ship_z[SHIP_VERTICES] = {
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    -8, -8, -8, -8, -8, -8, -8, -8, -8, -8,
+    8, -8, 8, 8, 8, 8, 22};
+int ship_rx[SHIP_VERTICES];
+int ship_ry[SHIP_VERTICES];
+int ship_rz[SHIP_VERTICES];
+int ship_px[SHIP_VERTICES];
+int ship_py[SHIP_VERTICES];
+unsigned char ship_fa[SHIP_FACES];
+unsigned char ship_fb[SHIP_FACES];
+unsigned char ship_fc[SHIP_FACES];
+unsigned char ship_edges[SHIP_VERTICES * SHIP_VERTICES];
+int ship_face_count;
+int stress_active;
+int stress_sprite_count;
+int stress_fps;
+int stress_done;
+unsigned int stress_last_ticks;
+unsigned int stress_last_second;
+unsigned char stress_previous_speed;
+
+unsigned int host_seconds(void);
 
 int page;
 int frame;
@@ -223,11 +277,11 @@ void chrome(char *title)
     {
         if (i == page)
         {
-            gfx_rect(236 + i * 9, 232, 7, 6, YELLOW);
+            gfx_rect(212 + i * 8, 232, 7, 6, YELLOW);
         }
         else
         {
-            gfx_rect(236 + i * 9, 232, 7, 6, DARK_GRAY);
+            gfx_rect(212 + i * 8, 232, 7, 6, DARK_GRAY);
         }
     }
 }
@@ -250,7 +304,7 @@ void page_title(void)
         gfx_rect(0, y, 320, 2, rainbow[(i + 7 - (frame / 6) % 7) % 7]);
     }
     gfx_rect(0, 40, 320, 100, BLACK);
-    for (g = 0; g < 4; g++)
+    for (g = 0; g < 5; g++)
     {
         for (r = 0; r < 7; r++)
         {
@@ -259,8 +313,8 @@ void page_title(void)
             {
                 if (b & bit5[c])
                 {
-                    x = 91 + g * 36 + c * 6;
-                    y = 48 + r * 6 + ((sinv(frame / 2 + g * 3 + c) * 2) / 100);
+                    x = 73 + g * 36 + c * 6;
+                    y = 48 + r * 6 + (sinv(frame / 2 + g * 3 + c) * 4) / 100;
                     gfx_rect(x, y, 5, 5, rainbow[(r + g + frame / 5) % 7]);
                 }
             }
@@ -300,7 +354,7 @@ void page_cpu(void)
     gfx_text(8, 42, "ADDRESS", GRAY);
     gfx_text(56, 42, "19-BIT = 512 KIB, BYTE ADDRESSED", WHITE);
     gfx_text(8, 52, "INSTR", GRAY);
-    gfx_text(56, 52, "FIXED 16-BIT WORD (FAR OPS 6 BYTES)", WHITE);
+    gfx_text(56, 52, "FIXED 16-BIT WORD (FAR MEM 6B, BRANCH 4B)", WHITE);
     gfx_text(8, 62, "STACK", GRAY);
     gfx_text(56, 62, "GROWS DOWN FROM 0x2FFFF", WHITE);
     gfx_text(8, 72, "FLAGS", GRAY);
@@ -348,7 +402,7 @@ void page_cpu(void)
 // ---------------------------------------------------------------- page 3
 void seg(int a, int b, unsigned char c)
 {
-    gfx_rect(32 + (a >> 7), 40, (b - a) >> 7, 22, c);
+    gfx_rect(32 + a, 40, b - a, 22, c);
 }
 
 void maprow(int y, unsigned char c, char *range, char *name, char *size)
@@ -362,12 +416,12 @@ void maprow(int y, unsigned char c, char *range, char *name, char *size)
 void page_memory(void)
 {
     gfx_text(8, 20, "MEMORY MAP - 512 KIB", YELLOW);
-    seg(0, 1024, GREEN);
-    seg(1024, 1536, ORANGE);
-    seg(1536, 2112, YELLOW);
-    seg(2112, 2176, MAGENTA);
-    seg(2176, 2784, CYAN);
-    gfx_rect(32 + 2784 / 128, 40, 2048 - 2784 / 128, 22, DARK_GRAY);
+    seg(0, 64, GREEN);
+    seg(64, 96, ORANGE);
+    seg(96, 134, YELLOW);
+    seg(134, 136, MAGENTA);
+    seg(136, 174, CYAN);
+    seg(174, 256, DARK_GRAY);
     panel(31, 39, 257, 23, WHITE);
     gfx_text(26, 66, "0", GRAY);
     gfx_text(266, 66, "7FFFF", GRAY);
@@ -381,7 +435,7 @@ void page_memory(void)
     gfx_text(8, 178, "0000 ENTRY STUB   0400 LIB_GFX   0700 LIB_TEXT", GRAY);
     gfx_text(8, 188, "1000 LIB_CGFX     4400 FONT 5X7  4800 CODE", GRAY);
     gfx_text(8, 198, "E800 GLOBALS      STACK 2FFFF DOWN", GRAY);
-    gfx_text(8, 212, "KEYS 43004   RTC 43010-12   GPU 43020-2E", CYAN);
+    gfx_text(8, 212, "SPEED 43003  KEYS 43004  MOUSE 43008  RTC 43010", CYAN);
     gfx_rect(32 + ((frame * 3) % 255), 36, 3, 3, WHITE);
 }
 
@@ -444,7 +498,7 @@ void page_graphics(void)
     gfx_text(220, 170, "6X8 CELLS", YELLOW);
     gfx_text(220, 180, "53 X 30 CHARS", GREEN);
     gfx_text(220, 190, "OEAAEA: öäå", MAGENTA);
-    gfx_text(220, 204, "12 GPU COMMANDS", GRAY);
+    gfx_text(220, 204, "21 GPU COMMANDS", GRAY);
 }
 
 // ---------------------------------------------------------------- page 5
@@ -669,6 +723,388 @@ void page_devices(void)
     pnum(56, 216, hist_total, WHITE);
 }
 
+// ---------------------------------------------------------------- page 10
+void page_mouse_input(void)
+{
+    int mx;
+    int my;
+    int buttons;
+    int events;
+    int wheel;
+    int ch;
+    mx = gfx_mouse_x();
+    my = gfx_mouse_y();
+    buttons = gfx_mouse_buttons();
+    events = gfx_mouse_events();
+    wheel = gfx_mouse_wheel();
+    ch = gfx_getchar();
+    if (ch > 0)
+    {
+        mouse_last_char = ch;
+    }
+
+    gfx_text(8, 20, "MOUSE, EXTENDED KEYS AND TEXT INPUT", YELLOW);
+    gfx_text(8, 38, "POSITION", GRAY);
+    gfx_text(76, 38, "X", CYAN);
+    pnum(88, 38, mx, WHITE);
+    gfx_text(130, 38, "Y", CYAN);
+    pnum(142, 38, my, WHITE);
+    gfx_text(8, 52, "BUTTONS", GRAY);
+    gfx_text(76, 52, "LEFT", buttons & MOUSE_LEFT ? GREEN : DARK_GRAY);
+    gfx_text(124, 52, "RIGHT", buttons & MOUSE_RIGHT ? GREEN : DARK_GRAY);
+    gfx_text(8, 66, "EVENTS", GRAY);
+    hex_text(76, 66, events, 2, WHITE);
+    gfx_text(104, 66, "DOWN / DOUBLE / UP", DARK_GRAY);
+    gfx_text(8, 80, "WHEEL", GRAY);
+    gfx_text(76, 80, wheel < 0 ? "-" : "+", CYAN);
+    pnum(88, 80, wheel < 0 ? -wheel : wheel, WHITE);
+    gfx_text(8, 104, "EXT KEYS (Q/E ROLL, X THRUST, Z REVERSE)", YELLOW);
+    hex_text(8, 118, gfx_keys_ext(), 2, WHITE);
+    gfx_text(32, 118, "BITS 0-3", GRAY);
+    gfx_text(8, 146, "TYPE A KEY - LAST INPUT BYTE:", YELLOW);
+    if (mouse_last_char > 0)
+    {
+        hex_text(190, 146, mouse_last_char, 2, GREEN);
+        if (mouse_last_char >= 32 && mouse_last_char <= 126)
+        {
+            nb[0] = mouse_last_char;
+            nb[1] = 0;
+            gfx_text(208, 146, nb, WHITE);
+        }
+        else if (mouse_last_char == 13)
+        {
+            gfx_text(208, 146, "ENTER", WHITE);
+        }
+        else if (mouse_last_char == 8)
+        {
+            gfx_text(208, 146, "BACKSPACE", WHITE);
+        }
+    }
+    else
+    {
+        gfx_text(190, 146, "--", DARK_GRAY);
+    }
+    gfx_text(8, 184, "LEFT/RIGHT CLICK, DOUBLE-CLICK AND WHEEL", GRAY);
+    gfx_text(8, 198, "MOUSE COORDINATES ARE SCREEN PIXELS", GRAY);
+    gfx_line(mx - 5, my, mx + 5, my, WHITE);
+    gfx_line(mx, my - 5, mx, my + 5, WHITE);
+}
+
+// ---------------------------------------------------------------- page 11
+void page_tiles(void)
+{
+    int x;
+    int y;
+    int tile;
+    if (!tile_ready)
+    {
+        for (y = 0; y < TILE_MAP_H; y++)
+        {
+            for (x = 0; x < TILE_MAP_W; x++)
+            {
+                if (y >= 16)
+                {
+                    tile = ((x + y) % 4 == 0) ? GREEN : DARK_GRAY;
+                }
+                else if ((x * 3 + y * 5) % 13 == 0)
+                {
+                    tile = CYAN;
+                }
+                else if ((x + y) % 3 == 0)
+                {
+                    tile = BLUE;
+                }
+                else
+                {
+                    tile = 25;
+                }
+                tile_map[y * TILE_MAP_W + x] = tile;
+            }
+        }
+        gfx_tilemap(tile_map, TILE_MAP_W, TILE_MAP_H, 64, 32);
+        gfx_save();
+        tile_ready = 1;
+    }
+    else
+    {
+        gfx_restore();
+    }
+    gfx_rect(0, 0, 320, 30, BLACK);
+    gfx_text(8, 6, "TILE MAP + SAVED STATIC LAYER", YELLOW);
+    gfx_text(8, 19, "16X16 TILES; MOVING SPRITE REDRAWN OVER RESTORED MAP", WHITE);
+    gfx_sprite(150 + sinv(frame / 2) / 4, 118 + cosv(frame / 3) / 4, 8, 8, smiley);
+    gfx_text(8, 214, "MAP 40X20 TILES - CAMERA (64,32)", CYAN);
+}
+
+// ---------------------------------------------------------------- page 12
+void network_receive(void)
+{
+    int n;
+    int sender;
+    n = net_recv(network_message);
+    while (n > 0)
+    {
+        sender = net_sender();
+        if (n == 3 && sender >= 0 && sender < NET_MAX_PLAYERS)
+        {
+            network_px[sender] = (network_message[0] << 8) | network_message[1];
+            network_py[sender] = network_message[2];
+        }
+        n = net_recv(network_message);
+    }
+}
+
+void page_network(void)
+{
+    int i;
+    int me;
+    int keys_now;
+    gfx_text(8, 20, "LOCAL NETWORK - UDP BROADCAST PEERS", YELLOW);
+    if (!network_joined)
+    {
+        gfx_text(8, 42, "COULD NOT JOIN NETWORK GROUP", RED);
+        gfx_text(8, 62, "OPEN THE SHOWCASE ON ANOTHER SC-16", GRAY);
+        return;
+    }
+    if (net_full())
+    {
+        gfx_text(8, 42, "GROUP FULL - NO PLAYER SLOT AVAILABLE", RED);
+        return;
+    }
+    me = net_slot();
+    gfx_text(8, 40, net_ready() ? "CONNECTED" : "ASSIGNING PLAYER SLOT...", net_ready() ? GREEN : ORANGE);
+    gfx_text(8, 54, "PLAYERS", GRAY);
+    pnum(68, 54, net_players(), WHITE);
+    gfx_text(104, 54, "MY SLOT", GRAY);
+    if (me >= 0)
+    {
+        pnum(158, 54, me, CYAN);
+    }
+    if (net_ready() && me >= 0)
+    {
+        keys_now = gfx_keys();
+        if (keys_now & KEY_LEFT) network_x = network_x - 2;
+        if (keys_now & KEY_RIGHT) network_x = network_x + 2;
+        if (keys_now & KEY_UP) network_y = network_y - 2;
+        if (keys_now & KEY_DOWN) network_y = network_y + 2;
+        if (network_x < 8) network_x = 8;
+        if (network_x > 304) network_x = 304;
+        if (network_y < 82) network_y = 82;
+        if (network_y > 210) network_y = 210;
+        network_message[0] = network_x >> 8;
+        network_message[1] = network_x & 255;
+        network_message[2] = network_y;
+        network_tx_ok = net_send(network_message, 3);
+        network_receive();
+        for (i = 0; i < NET_MAX_PLAYERS; i++)
+        {
+            if (net_active(i))
+            {
+                gfx_rect(204 + i * 13, 54, 9, 8, network_colors[i]);
+                if (i == me)
+                {
+                    gfx_rect(network_x, network_y, 8, 8, network_colors[i]);
+                }
+                else
+                {
+                    gfx_rect(network_px[i], network_py[i], 8, 8, network_colors[i]);
+                }
+            }
+            else
+            {
+                gfx_rect(204 + i * 13, 54, 9, 8, DARK_GRAY);
+            }
+        }
+        gfx_text(8, 70, "ARROWS MOVE YOUR SQUARE; OTHER INSTANCES ARE SHARED", GRAY);
+        gfx_text(8, 222, network_tx_ok ? "POSITION BROADCAST OK" : "WAITING TO BROADCAST", network_tx_ok ? GREEN : ORANGE);
+    }
+    else
+    {
+        for (i = 0; i < NET_MAX_PLAYERS; i++)
+        {
+            gfx_rect(204 + i * 13, 54, 9, 8, net_active(i) ? network_colors[i] : DARK_GRAY);
+        }
+        gfx_text(8, 70, "WAITING FOR NETWORK SLOT ASSIGNMENT", GRAY);
+    }
+}
+
+// ---------------------------------------------------------------- page 13
+void ship_add_face(int a, int b, int c)
+{
+    if (ship_face_count < SHIP_FACES)
+    {
+        ship_fa[ship_face_count] = a;
+        ship_fb[ship_face_count] = b;
+        ship_fc[ship_face_count] = c;
+        ship_face_count++;
+    }
+}
+
+void ship_init(void)
+{
+    int i;
+    int next;
+    ship_face_count = 0;
+    for (i = 0; i < 10; i++)
+    {
+        next = (i + 1) % 10;
+        ship_add_face(i, 20, next);
+        ship_add_face(i + 10, next + 10, 21);
+        ship_add_face(i, next, next + 10);
+        ship_add_face(i, next + 10, i + 10);
+    }
+    ship_add_face(22, 23, 26);
+    ship_add_face(23, 24, 26);
+    ship_add_face(24, 25, 26);
+    ship_add_face(25, 22, 26);
+}
+
+void page_ship(void)
+{
+    int i;
+    int j;
+    int a;
+    int b;
+    int c;
+    int ax;
+    int ay;
+    int az;
+    int x1;
+    int y1;
+    int z1;
+    int x2;
+    int y2;
+    int z2;
+    int nx;
+    int ny;
+    int nz;
+    int depth;
+    int px;
+    int py;
+    int ship_bob;
+    ax = frame / 3;
+    ay = frame / 4 + 5;
+    az = frame / 5;
+    ship_bob = (sinv(frame / 3) * 12) / 100;
+    for (i = 0; i < SHIP_VERTICES; i++)
+    {
+        x1 = (ship_x[i] * cosv(ay) - ship_z[i] * sinv(ay)) / 100;
+        z1 = (ship_x[i] * sinv(ay) + ship_z[i] * cosv(ay)) / 100;
+        y1 = (ship_y[i] * cosv(ax) - z1 * sinv(ax)) / 100;
+        z2 = (ship_y[i] * sinv(ax) + z1 * cosv(ax)) / 100;
+        ship_rx[i] = (x1 * cosv(az) - y1 * sinv(az)) / 100;
+        ship_ry[i] = (x1 * sinv(az) + y1 * cosv(az)) / 100;
+        ship_rz[i] = z2;
+        depth = 200 - ship_rz[i];
+        ship_px[i] = 160 + (ship_rx[i] * 200) / depth;
+        ship_py[i] = 112 + ship_bob + (ship_ry[i] * 200) / depth;
+    }
+    for (i = 0; i < SHIP_VERTICES * SHIP_VERTICES; i++)
+    {
+        ship_edges[i] = 0;
+    }
+    for (i = 0; i < ship_face_count; i++)
+    {
+        a = ship_fa[i];
+        b = ship_fb[i];
+        c = ship_fc[i];
+        nx = ship_rx[b] - ship_rx[a];
+        ny = ship_ry[b] - ship_ry[a];
+        x2 = ship_rx[c] - ship_rx[a];
+        y2 = ship_ry[c] - ship_ry[a];
+        nz = nx * y2 - ny * x2;
+        if (nz > 0)
+        {
+            ship_edges[a * SHIP_VERTICES + b] = 1;
+            ship_edges[b * SHIP_VERTICES + a] = 1;
+            ship_edges[b * SHIP_VERTICES + c] = 1;
+            ship_edges[c * SHIP_VERTICES + b] = 1;
+            ship_edges[c * SHIP_VERTICES + a] = 1;
+            ship_edges[a * SHIP_VERTICES + c] = 1;
+        }
+    }
+    for (i = 0; i < 56; i++)
+    {
+        px = (i * 47 + (frame & 255) * 3) % 320;
+        py = 24 + (i * 37) % 188;
+        gfx_pixel(px, py, (i % 4 == 0) ? WHITE : DARK_GRAY);
+    }
+    gfx_text(8, 20, "ROTATING 3D SHIP - HIDDEN EDGES CULLED", YELLOW);
+    for (i = 0; i < SHIP_VERTICES; i++)
+    {
+        for (j = i + 1; j < SHIP_VERTICES; j++)
+        {
+            if (ship_edges[i * SHIP_VERTICES + j])
+            {
+                gfx_line(ship_px[i], ship_py[i], ship_px[j], ship_py[j],
+                         (i >= 22 || j >= 22) ? ORANGE : CYAN);
+            }
+        }
+    }
+    gfx_text(8, 204, "VISIBLE TRIANGLE FACES ONLY - BACK EDGES OMITTED", WHITE);
+    gfx_text(8, 216, "INTEGER 3D ROTATION + PERSPECTIVE PROJECTION", GRAY);
+}
+
+// ---------------------------------------------------------------- page 14
+void page_sprite_load(void)
+{
+    int i;
+    int x;
+    int y;
+    unsigned int now;
+    unsigned int elapsed;
+    unsigned int ticks;
+    int seconds;
+
+    now = host_seconds();
+    elapsed = (now + 3600 - stress_last_second) % 3600;
+    if (elapsed > 0)
+    {
+        ticks = gfx_ticks() - stress_last_ticks;
+        stress_fps = ticks / elapsed;
+        if (stress_fps < 30)
+        {
+            stress_done = 1;
+        }
+        else if (!stress_done)
+        {
+            seconds = elapsed;
+            while (seconds > 0 && stress_sprite_count < STRESS_MAX_SPRITES)
+            {
+                stress_sprite_count++;
+                seconds--;
+            }
+            if (stress_sprite_count >= STRESS_MAX_SPRITES)
+            {
+                stress_done = 1;
+            }
+        }
+        stress_last_ticks = gfx_ticks();
+        stress_last_second = now;
+    }
+
+    gfx_text(8, 20, "MAX-SPEED SPRITE LOAD TEST", YELLOW);
+    gfx_text(8, 38, "SPRITES", GRAY);
+    pnum(68, 38, stress_sprite_count, WHITE);
+    gfx_text(142, 38, "FRAME RATE", GRAY);
+    pnum(244, 38, stress_fps, CYAN);
+    gfx_text(280, 38, "FPS", CYAN);
+    for (i = 0; i < stress_sprite_count; i++)
+    {
+        x = 8 + ((i * 8 + frame) % 304);
+        y = 120 + (sinv(frame / 2 + i * 2) * 75) / 100;
+        gfx_sprite(x, y, 8, 8, smiley);
+    }
+    if (stress_done)
+    {
+        gfx_text(8, 216, "UNDER 30 FPS - SPRITE COUNT HELD", RED);
+    }
+    else
+    {
+        gfx_text(8, 216, "ADDING ONE SPRITE PER SECOND WHILE FPS >= 30", GREEN);
+    }
+}
+
 // ---------------------------------------------------------------- page 8
 unsigned int fibo(int n)
 {
@@ -803,25 +1239,28 @@ void bench_max(void)
     unsigned int blocks;
     unsigned int acc;
     unsigned int k;
-    int s0;
-    int s;
+    unsigned int s0;
+    unsigned int s;
     int j;
     int ops;
     int secs;
     int last;
     unsigned int ksum;
+    unsigned int remainder;
     ops = bench_ops(0);
     blocks = 0;
     acc = 0;
     k = 0;
     ksum = 0;
+    remainder = 0;
     last = 0;
+    bench_prev_speed = *((unsigned char *)0x43003);
     gfx_speed(1);
-    s0 = gfx_rtc(0);
-    while (gfx_rtc(0) == s0)
+    s0 = host_seconds();
+    while (host_seconds() == s0)
     {
     }
-    s0 = gfx_rtc(0);
+    s0 = host_seconds();
     secs = 0;
     while (secs < CMP_SECS)
     {
@@ -836,23 +1275,30 @@ void bench_max(void)
                 k++;
             }
         }
-        s = gfx_rtc(0);
-        if (s < s0)
-        {
-            s = s + 60;
-        }
-        secs = s - s0;
+        s = host_seconds();
+        secs = (s + 3600 - s0) % 3600;
         if (secs != last)
         {
-            /* fold each finished second in separately so 16-bit counters cannot overflow */
             ksum = ksum + k / CMP_SECS;
+            remainder = remainder + k % CMP_SECS;
+            if (remainder >= CMP_SECS)
+            {
+                ksum = ksum + remainder / CMP_SECS;
+                remainder = remainder % CMP_SECS;
+            }
             k = 0;
             last = secs;
         }
     }
-    gfx_speed(0);
-    bench_kops[0] = ksum;
+    gfx_speed(bench_prev_speed);
+    cmp_kops = ksum;
 }
+
+unsigned int kops_to_mips_tenths(unsigned int kops)
+{
+    return (kops / 100) * INSTR_PER_ITER + ((kops % 100) * INSTR_PER_ITER) / 100;
+}
+
 char *bench_name(int test)
 {
     if (test == 0)
@@ -1047,9 +1493,9 @@ void page_compare(void)
     unsigned int sc;
     unsigned char c;
     sc = mach_tenths[SC16_ROW];
-    if (cmp_state == 2 || bench_state == 2)
+    if (cmp_state == 2)
     {
-        sc = (bench_kops[0] / 25) * 4 + ((bench_kops[0] % 25) * 4) / 25;
+        sc = cmp_mips_tenths;
     }
     gfx_text(8, 20, "SPEED IN MIPS (MILLION INSTRUCTIONS/S)", YELLOW);
     for (i = 0; i < NMACH; i++)
@@ -1074,21 +1520,33 @@ void page_compare(void)
     }
     gfx_line(8, 150, 311, 150, DARK_GRAY);
     gfx_text(8, 156, "CRAY-1 IS", GRAY);
-    pnum(116, 156, mach_tenths[6] / sc, GREEN);
-    gfx_text(116 + text_len(nb) * 6 + 6, 156, "X FASTER", GRAY);
     gfx_text(8, 166, "RASPBERRY PI A IS", GRAY);
-    pnum(116, 166, mach_tenths[7] / sc, GREEN);
-    gfx_text(116 + text_len(nb) * 6 + 6, 166, "X FASTER", GRAY);
     gfx_text(8, 176, "486DX2-66 IS", GRAY);
-    pnum(116, 176, mach_tenths[5] / sc, GREEN);
-    gfx_text(116 + text_len(nb) * 6 + 6, 176, "X FASTER", GRAY);
+    if (sc > 0)
+    {
+        pnum(116, 156, mach_tenths[6] / sc, GREEN);
+        gfx_text(116 + text_len(nb) * 6 + 6, 156, "X FASTER", GRAY);
+        pnum(116, 166, mach_tenths[7] / sc, GREEN);
+        gfx_text(116 + text_len(nb) * 6 + 6, 166, "X FASTER", GRAY);
+        pnum(116, 176, mach_tenths[5] / sc, GREEN);
+        gfx_text(116 + text_len(nb) * 6 + 6, 176, "X FASTER", GRAY);
+    }
+    else
+    {
+        gfx_text(116, 156, "--", GRAY);
+        gfx_text(116, 166, "--", GRAY);
+        gfx_text(116, 176, "--", GRAY);
+        gfx_text(134, 156, "NO RATE", DARK_GRAY);
+        gfx_text(134, 166, "NO RATE", DARK_GRAY);
+        gfx_text(134, 176, "NO RATE", DARK_GRAY);
+    }
     gfx_text(8, 188, "LOG-SCALE BARS. OTHERS: APPROX. PUBLISHED", DARK_GRAY);
-    gfx_text(8, 197, "SC-16: MEASURED AT MAX SPEED (SPEED REG)", DARK_GRAY);
+    gfx_text(8, 197, cmp_state == 2 ? "SC-16: MEASURED WITH 3-SECOND MAX-SPEED TEST" : "SC-16: APPROXIMATE UNTIL MEASURED", DARK_GRAY);
     if (cmp_state == 1)
     {
         ctext(210, "MEASURING AT MAX SPEED - 3 S", ORANGE);
     }
-    else if (cmp_state == 2 || bench_state == 2)
+    else if (cmp_state == 2)
     {
         ctext(210, "MEASURED - ENTER TO REPEAT", GREEN);
     }
@@ -1104,9 +1562,11 @@ void bench_step(void)
     if (cmp_state == 1)
     {
         bench_max();
+        cmp_mips_tenths = kops_to_mips_tenths(cmp_kops);
         cmp_state = 2;
         gfx_sound(2, 1320, 30, WAVE_TRIANGLE, 50);
-    }    if (bench_state == 1)
+    }
+    if (bench_state == 1)
     {
         if (bench_index == 0)
         {
@@ -1139,6 +1599,14 @@ int main(void)
         starx[i] = gfx_random() + (gfx_random() & 63);
         stary[i] = 18 + gfx_random() % 205;
     }
+    network_x = 160;
+    network_y = 120;
+    for (i = 0; i < NET_MAX_PLAYERS; i++)
+    {
+        network_px[i] = 20 + i * 24;
+        network_py[i] = 120;
+    }
+    ship_init();
     page = 0;
     while (1)
     {
@@ -1174,6 +1642,36 @@ int main(void)
                 cmp_state = 1;
                 gfx_sound(2, 880, 10, WAVE_SQUARE, 40);
             }
+        }
+        if (page == STRESS_PAGE && !stress_active)
+        {
+            stress_previous_speed = *((unsigned char *)0x43003);
+            gfx_speed(1);
+            stress_active = 1;
+            stress_sprite_count = 1;
+            stress_fps = 0;
+            stress_done = 0;
+            stress_last_ticks = gfx_ticks();
+            stress_last_second = host_seconds();
+        }
+        else if (page != STRESS_PAGE && stress_active)
+        {
+            gfx_speed(stress_previous_speed);
+            stress_active = 0;
+        }
+        if (page == NETWORK_PAGE && !network_attempted)
+        {
+            network_attempted = 1;
+            network_joined = net_open("sc16showcase");
+        }
+        else if (page != NETWORK_PAGE && network_attempted)
+        {
+            if (network_joined)
+            {
+                net_close();
+            }
+            network_attempted = 0;
+            network_joined = 0;
         }
         frame++;
         gfx_clear(BLACK);
@@ -1217,10 +1715,35 @@ int main(void)
             page_bench();
             chrome("BENCHMARK");
         }
-        else
+        else if (page == 8)
         {
             page_compare();
             chrome("SPEED COMPARISON");
+        }
+        else if (page == 9)
+        {
+            page_mouse_input();
+            chrome("MOUSE AND INPUT");
+        }
+        else if (page == 10)
+        {
+            page_tiles();
+            chrome("TILE MAP AND LAYERS");
+        }
+        else if (page == NETWORK_PAGE)
+        {
+            page_network();
+            chrome("LAN NETWORKING");
+        }
+        else if (page == 12)
+        {
+            page_ship();
+            chrome("ROTATING 3D SHIP");
+        }
+        else
+        {
+            page_sprite_load();
+            chrome("SPRITE LOAD TEST");
         }
         gfx_present();
         bench_step();

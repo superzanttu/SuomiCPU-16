@@ -48,6 +48,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_ticks": ("unsigned int", ()),
     "gfx_rtc": ("unsigned int", ("unsigned char",)),
     "gfx_speed": ("void", ("int",)),
+    "gfx_vsync": ("void", ("int",)),
     "gfx_irq_init": ("void", ()),
     "gfx_irq_ticks": ("unsigned int", ()),
     "gfx_irq_keys": ("unsigned int", ()),

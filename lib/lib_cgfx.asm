@@ -259,11 +259,20 @@ gfx_sound:
     CALLX CGFX_GO
     RET
 
-; gfx_speed(mode): writes the speed register at 0x43003. 0 = fixed 60 fps, nonzero = maximum speed.
+; gfx_speed(mode): writes the speed register at 0x43003. 0 = normal budget, nonzero = maximum budget.
 gfx_speed:
     LDWS R0, 3
     CALLX CGFX_HIGH
     LDI R6, 0x3003
+    ADD R7, R6
+    ST R7, R0
+    RET
+
+; gfx_vsync(enabled): synchronize presented frames to the emulator display rate.
+gfx_vsync:
+    LDWS R0, 3
+    CALLX CGFX_HIGH
+    LDI R6, 0x3004
     ADD R7, R6
     ST R7, R0
     RET

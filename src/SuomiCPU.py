@@ -25,6 +25,8 @@ from src.isa import (
     FAR_CONTROL_PREFIX,
 )
 
+CONSOLE_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "console.log"
+
 # =============================================================================
 # ISA (Instruction Set Architecture) - Prosessorin "kieli"
 # Tässä määritellään, mitä numeroita prosessori käyttää eri käskyille.
@@ -120,6 +122,7 @@ GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 
 # X/Y=camera pixel position. Draws 16x16 tiles over the whole back buffer.
 GPU_TILEMAP = 21
 SPEED_ADDR  = 0x43003 # Speed register: 0 = fixed (30 fps, 30000 instr/frame), 1 = maximum (unthrottled)
+VSYNC_ADDR  = 0x43004 # VSync register: nonzero synchronizes presented frames to the display rate
 TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
@@ -294,7 +297,7 @@ class SuomiCompute16:
         self.screen = _set_display_mode(self.fullscreen)
         pygame.display.set_caption("SuomiCPU-16 Emulator")
         self.clock = pygame.time.Clock()
-        self.console_device = ConsoleDevice()
+        self.console_device = ConsoleDevice(log_path=CONSOLE_LOG_PATH)
         self.module_name = None
         self.program_loaded = False
         self.program_image_bytes = 0
@@ -1279,6 +1282,10 @@ class SuomiCompute16:
         memory = getattr(self, 'memory', None)
         return bool(memory and memory[SPEED_ADDR])
 
+    def _vsync_enabled(self):
+        memory = getattr(self, 'memory', None)
+        return bool(memory and memory[VSYNC_ADDR])
+
     def execute_frame(self):
         self.frame_yield = False
         self.frames = (getattr(self, 'frames', 0) + 1) & 0xFFFF
@@ -1446,8 +1453,8 @@ class SuomiCompute16:
         self.console_log("Program execution started")
         pygame.key.start_text_input()
         deferred_release = 0
-        turbo_frames = 0
         last_console_update = 0.0
+        last_display_update = 0.0
         try:
             while self.window_open:
                 if getattr(self, "bios_reset_requested", False):
@@ -1521,17 +1528,22 @@ class SuomiCompute16:
                     break
                 self.begin_mouse_frame()
                 self.update_rtc()
-                was_turbo = self._max_speed()
                 if not self.paused:
                     self.execute_frame()
                 self.end_mouse_frame()
                 if deferred_release:
                     self.release_keys(deferred_release)
                     deferred_release = 0
-                turbo_frames += 1
-                if not (was_turbo and self._max_speed()) or turbo_frames % 32 == 0:
+                display_now = time.monotonic()
+                vsync_frame = (
+                    self._vsync_enabled() and
+                    getattr(self, "frame_yield", False)
+                )
+                if (vsync_frame or self.paused or not self._max_speed() or
+                        display_now - last_display_update >= 1 / DISPLAY_FPS):
                     self.update_display()
-                if self.paused or not self._max_speed():
+                    last_display_update = display_now
+                if self.paused or not self._max_speed() or vsync_frame:
                     self.clock.tick(DISPLAY_FPS)
         finally:
             pygame.key.stop_text_input()
@@ -1617,7 +1629,11 @@ def main():
             console_window.close()
         if sc16 is not None and getattr(sc16, 'net', None) is not None:
             sc16.net.close()
-        pygame.quit()
+        try:
+            if sc16 is not None:
+                sc16._console_device().close()
+        finally:
+            pygame.quit()
 
 if __name__ == "__main__":
     main()

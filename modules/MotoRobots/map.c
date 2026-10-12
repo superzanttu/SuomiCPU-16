@@ -112,7 +112,7 @@ ResourceType map_get_resource(GameMap* map, int x, int y) {
 }
 
 static unsigned char feature_color(MapFeature* feature) {
-    if (feature->resource == RES_COAL) return DARK_GRAY;
+    if (feature->resource == RES_COAL) return GRAY;
     if (feature->resource == RES_IRON_ORE) return ORANGE;
     if (feature->resource == RES_COPPER_ORE) return CYAN;
     if (feature->tile == TILE_WATER) return BLUE;

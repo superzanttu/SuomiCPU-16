@@ -51,8 +51,11 @@ typedef enum {
 #define ROBOT_PATH_SEARCHING 2
 #define ROBOT_PATH_READY 3
 #define ROBOT_PATH_FAILED 4
+#define FACTORY_STATUS_EMPTY 1
+#define FACTORY_STATUS_FULL 2
 
 typedef struct {
+    int id;
     BuildingType type;
     Vec2i position;
     ResourceType resource_type; // Only used for Mines
@@ -60,6 +63,8 @@ typedef struct {
     ResourceType inventory_type;
     int factory_iron_plate_input;
     int factory_copper_plate_input;
+    int factory_robot_rombonent_input;
+    int factory_status;
     float production_timer;
     int processing_batch;
 } Building;
@@ -75,6 +80,9 @@ typedef struct {
     int path_length;
     int path_position;
     int path_status;
+    int route_valid;
+    int route_direction;
+    float path_retry_timer;
 } Robot;
 
 #endif

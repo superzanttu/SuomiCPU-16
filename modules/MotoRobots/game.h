@@ -14,6 +14,7 @@ typedef struct {
     GameMap map;
     Building buildings[MAX_BUILDINGS];
     int building_count;
+    int next_building_id;
     Robot robots[MAX_ROBOTS];
     int robot_count;
 

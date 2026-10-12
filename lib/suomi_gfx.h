@@ -49,6 +49,7 @@ unsigned int gfx_random(void);
 unsigned int gfx_ticks(void);
 unsigned int gfx_rtc(unsigned char field);
 void gfx_speed(int mode);
+void gfx_vsync(int enabled);
 void gfx_irq_init(void);
 unsigned int gfx_irq_ticks(void);
 unsigned int gfx_irq_keys(void);

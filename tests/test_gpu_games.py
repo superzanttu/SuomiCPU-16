@@ -6,7 +6,7 @@ from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
 from src.SuomiCPU import (
     BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, MEM_SIZE,
-    MOUSE_ADDR, SCREEN_WIDTH, SuomiCompute16, _load_jit,
+    MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR, VSYNC_ADDR, SuomiCompute16, _load_jit,
 )
 
 HEADER = '#include "suomi_gfx.h"\n'
@@ -204,6 +204,182 @@ class CGraphicsTests(unittest.TestCase):
 
 
 class MotoRobotsTests(unittest.TestCase):
+    def test_game_uses_maximum_speed_register(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
+        run_frame(cpu, limit=400000)
+
+        self.assertEqual(cpu.memory[SPEED_ADDR], 1)
+        self.assertEqual(cpu.memory[VSYNC_ADDR], 1)
+
+    def test_pathfinding_discovered_tiles_are_drawn_on_map_only_while_searching(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  game_init(&test_state);\n"
+            "  test_state.camera_x = 0;\n"
+            "  test_state.camera_y = 0;\n"
+            "  test_state.pathfinding_robot = 0;\n"
+            "  test_state.robots[0].path_status = ROBOT_PATH_SEARCHING;\n"
+            "  test_state.path_queue[0] = 8 * 48 + 18;\n"
+            "  test_state.path_queue[1] = 8 * 48 + 19;\n"
+            "  test_state.path_queue_head = 1;\n"
+            "  test_state.path_queue_tail = 2;\n"
+            "  game_draw(&test_state);\n"
+            "  gfx_present();\n"
+            "  test_state.pathfinding_robot = -1;\n"
+            "  game_draw(&test_state);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "progress_test.c")))
+        run_frame(cpu)
+        explored_pixel = pixel(cpu, 18 * 16 + 4, 36 + 8 * 16 + 4)
+        frontier_pixel = pixel(cpu, 19 * 16 + 4, 36 + 8 * 16 + 4)
+        self.assertEqual(explored_pixel, 6)
+        self.assertEqual(frontier_pixel, 5)
+
+        run_frame(cpu)
+        self.assertNotEqual(
+            pixel(cpu, 18 * 16 + 4, 36 + 8 * 16 + 4),
+            6,
+        )
+        self.assertNotEqual(
+            pixel(cpu, 19 * 16 + 4, 36 + 8 * 16 + 4),
+            5,
+        )
+
+    def test_found_robot_route_is_drawn_ahead_of_robot(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Robot *robot;\n"
+            "  game_init(&test_state);\n"
+            "  test_state.camera_x = 0;\n"
+            "  test_state.camera_y = 0;\n"
+            "  robot = &test_state.robots[0];\n"
+            "  robot->state = ROBOT_TO_TARGET;\n"
+            "  robot->position.x = 17;\n"
+            "  robot->position.y = 8;\n"
+            "  robot->path_status = ROBOT_PATH_READY;\n"
+            "  robot->path_length = 2;\n"
+            "  robot->path_position = 0;\n"
+            "  test_state.robot_paths[0][0] = 1;\n"
+            "  test_state.robot_paths[0][1] = 3;\n"
+            "  game_draw(&test_state);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "found_route_test.c")))
+        run_frame(cpu)
+
+        self.assertEqual(pixel(cpu, 18 * 16 + 4, 36 + 8 * 16 + 4), 7)
+        self.assertEqual(pixel(cpu, 18 * 16 + 4, 36 + 9 * 16 + 4), 7)
+
+    def test_robots_can_share_a_destination_building_tile(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[2];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  game_init(&test_state);\n"
+            "  test_state.buildings[1].type = BUILDING_FACTORY;\n"
+            "  test_state.buildings[1].position.x = 25;\n"
+            "  test_state.buildings[1].position.y = 24;\n"
+            "  test_state.building_count = 2;\n"
+            "  test_state.robot_count = 2;\n"
+            "  test_state.robots[0].state = ROBOT_UNLOADING;\n"
+            "  test_state.robots[0].position.x = 25;\n"
+            "  test_state.robots[0].position.y = 24;\n"
+            "  test_state.robots[1].state = ROBOT_TO_TARGET;\n"
+            "  test_state.robots[1].position.x = 24;\n"
+            "  test_state.robots[1].position.y = 24;\n"
+            "  results[0] = robot_tile_blocked(&test_state,\n"
+            "      &test_state.robots[1], 25, 24, 1);\n"
+            "  test_state.robots[0].position.x = 24;\n"
+            "  test_state.robots[0].position.y = 23;\n"
+            "  results[1] = robot_tile_blocked(&test_state,\n"
+            "      &test_state.robots[1], 24, 23, 1);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "target_collision_test.c")))
+        while cpu.running:
+            cpu.step()
+
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(2)],
+            [0, 1],
+        )
+
+    def test_robots_cannot_move_onto_rock_and_rock_differs_from_coal(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[5];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  MapFeature *rock;\n"
+            "  MapFeature *coal;\n"
+            "  Robot *robot;\n"
+            "  int rock_tile_x;\n"
+            "  game_init(&test_state);\n"
+            "  rock = &test_state.map.features[0];\n"
+            "  coal = &test_state.map.features[3];\n"
+            "  rock_tile_x = rock->center_x + ((rock->seed & 1) - 1) +\n"
+            "      rock->radius;\n"
+            "  test_state.buildings[1].type = BUILDING_FACTORY;\n"
+            "  test_state.buildings[1].position.x = 30;\n"
+            "  test_state.buildings[1].position.y = 30;\n"
+            "  test_state.building_count = 2;\n"
+            "  test_state.robot_count = 1;\n"
+            "  robot = &test_state.robots[0];\n"
+            "  robot->state = ROBOT_TO_TARGET;\n"
+            "  robot->target_building = 1;\n"
+            "  robot->position.x = rock_tile_x + 1;\n"
+            "  robot->position.y = rock->center_y;\n"
+            "  robot->path_status = ROBOT_PATH_READY;\n"
+            "  robot->path_length = 1;\n"
+            "  test_state.robot_paths[0][0] = 0;\n"
+            "  results[0] = map_get_tile(&test_state.map,\n"
+            "      rock_tile_x, rock->center_y);\n"
+            "  results[1] = map_get_tile(&test_state.map,\n"
+            "      coal->center_x, coal->center_y);\n"
+            "  update_robots(&test_state, 30.0f);\n"
+            "  results[2] = robot->position.x;\n"
+            "  results[3] = robot->path_status;\n"
+            "  results[4] = rock_tile_x + 1;\n"
+            "  map_draw(&test_state.map, rock->center_x * 16,\n"
+            "      rock->center_y * 16, 16, MAP_VIEW_TOP, 192);\n"
+            "  map_draw(&test_state.map, coal->center_x * 16,\n"
+            "      coal->center_y * 16, 16, MAP_VIEW_TOP, 192);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "rock_collision_test.c")))
+        while cpu.running:
+            cpu.step()
+
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(5)][:4],
+            [1, 0, cpu.read_16(GLOBAL_BASE + 8), 4],
+        )
+        self.assertEqual(
+            cpu.read_16(GLOBAL_BASE + 4),
+            cpu.read_16(GLOBAL_BASE + 8),
+        )
+        self.assertEqual(back(cpu, 8, 55), 9)
+
     def test_toolbar_button_activates_on_press(self):
         cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
         for _ in range(4):
@@ -378,7 +554,7 @@ class MotoRobotsTests(unittest.TestCase):
         source = (
             '#include "game.c"\n'
             '#include "map.c"\n'
-            "int results[7];\n"
+            "int results[10];\n"
             "GameState test_state;\n"
             "int main(void) {\n"
             "  int step;\n"
@@ -399,7 +575,7 @@ class MotoRobotsTests(unittest.TestCase):
             "  results[0] = test_state.robots[0].position.x;\n"
             "  results[1] = test_state.robots[0].position.y;\n"
             "  results[2] = test_state.robots[0].path_status;\n"
-            "  results[6] = test_state.path_queue_head;\n"
+            "  results[9] = test_state.path_queue_head;\n"
             "  for (step = 0; step < 120 &&\n"
             "       test_state.robots[0].path_status != ROBOT_PATH_READY;\n"
             "       step++) update_pathfinding(&test_state);\n"
@@ -415,13 +591,18 @@ class MotoRobotsTests(unittest.TestCase):
             "  test_state.buildings[3].position.x = blocked_x;\n"
             "  test_state.buildings[3].position.y = blocked_y;\n"
             "  test_state.building_count = 4;\n"
-            "  update_robots(&test_state, 0.5f);\n"
+            "  update_robots(&test_state, 1.0f);\n"
             "  results[4] = test_state.robots[0].path_status;\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  results[5] = test_state.robots[0].path_status;\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  results[6] = test_state.robots[0].path_status;\n"
             "  for (step = 0; step < 120 &&\n"
             "       test_state.robots[0].path_status != ROBOT_PATH_READY;\n"
             "       step++) update_pathfinding(&test_state);\n"
-            "  update_robots(&test_state, 0.5f);\n"
-            "  results[5] = test_state.robots[0].position.x == blocked_x &&\n"
+            "  results[7] = test_state.path_queue_head;\n"
+            "  update_robots(&test_state, 1.0f);\n"
+            "  results[8] = test_state.robots[0].position.x == blocked_x &&\n"
             "       test_state.robots[0].position.y == blocked_y;\n"
             "  return 0;\n"
             "}\n"
@@ -430,12 +611,166 @@ class MotoRobotsTests(unittest.TestCase):
             source, str(ROOT / "modules" / "MotoRobots" / "path_test.c")))
         while cpu.running:
             cpu.step()
-        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(7)]
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(10)]
         self.assertEqual(values[:4], [
             24, 24, 2, 3,
         ])
-        self.assertEqual(values[4:6], [1, 0])
-        self.assertLessEqual(values[6], 32)
+        self.assertEqual(values[4:7], [4, 4, 1])
+        self.assertEqual(values[8], 0)
+        self.assertLessEqual(values[9], 32)
+
+    def test_robot_reverses_and_reuses_its_cached_route(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[6];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Robot* robot;\n"
+            "  game_init(&test_state);\n"
+            "  test_state.buildings[1].type = BUILDING_MINE;\n"
+            "  test_state.buildings[1].position.x = 10;\n"
+            "  test_state.buildings[1].position.y = 10;\n"
+            "  test_state.buildings[2].type = BUILDING_FACTORY;\n"
+            "  test_state.buildings[2].position.x = 11;\n"
+            "  test_state.buildings[2].position.y = 11;\n"
+            "  test_state.building_count = 3;\n"
+            "  robot = &test_state.robots[0];\n"
+            "  robot->source_building = 1;\n"
+            "  robot->target_building = 2;\n"
+            "  robot->route_valid = 1;\n"
+            "  robot->route_direction = 1;\n"
+            "  robot->path_length = 2;\n"
+            "  test_state.robot_paths[0][0] = 1;\n"
+            "  test_state.robot_paths[0][1] = 3;\n"
+            "  robot->position.x = 11;\n"
+            "  robot->position.y = 11;\n"
+            "  results[0] = use_cached_robot_route(&test_state, 0, -1);\n"
+            "  results[1] = test_state.robot_paths[0][0];\n"
+            "  results[2] = test_state.robot_paths[0][1];\n"
+            "  robot->position.x = 10;\n"
+            "  robot->position.y = 10;\n"
+            "  results[3] = use_cached_robot_route(&test_state, 0, 1);\n"
+            "  results[4] = test_state.robot_paths[0][0];\n"
+            "  results[5] = test_state.robot_paths[0][1];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "cached_route_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(6)]
+        self.assertEqual(values, [1, 2, 0, 1, 1, 3])
+
+    def test_robot_moves_one_block_per_second(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[2];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  int step;\n"
+            "  game_init(&test_state);\n"
+            "  test_state.buildings[1].id = 2;\n"
+            "  test_state.buildings[1].type = BUILDING_MINE;\n"
+            "  test_state.buildings[1].position.x = 25;\n"
+            "  test_state.buildings[1].position.y = 24;\n"
+            "  test_state.buildings[1].inventory_type = RES_IRON_ORE;\n"
+            "  test_state.buildings[1].inventory_count = 1;\n"
+            "  test_state.buildings[2].id = 3;\n"
+            "  test_state.buildings[2].type = BUILDING_FACTORY;\n"
+            "  test_state.buildings[2].position.x = 26;\n"
+            "  test_state.buildings[2].position.y = 24;\n"
+            "  test_state.building_count = 3;\n"
+            "  test_state.robots[0].state = ROBOT_TO_SOURCE;\n"
+            "  test_state.robots[0].source_building = 1;\n"
+            "  test_state.robots[0].target_building = 2;\n"
+            "  test_state.robots[0].path_status = ROBOT_PATH_READY;\n"
+            "  test_state.robots[0].path_length = 1;\n"
+            "  test_state.robot_paths[0][0] = 1;\n"
+            "  for (step = 0; step < 19; step++)\n"
+            "    update_robots(&test_state, 0.05f);\n"
+            "  results[0] = test_state.robots[0].position.x;\n"
+            "  update_robots(&test_state, 0.05f);\n"
+            "  results[1] = test_state.robots[0].position.x;\n"
+            "  update_robots(&test_state, 0.0f);\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  update_pathfinding(&test_state);\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  update_robots(&test_state, 0.0f);\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  update_robots(&test_state, 0.0f);\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "robot_speed_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(2)]
+        self.assertEqual(values, [24, 25])
+        console = cpu._console_device().output.decode("ascii")
+        self.assertIn(
+            "Robot arrived: Robot 1 at Mine(2) at (25,24)",
+            console,
+        )
+        self.assertIn(
+            "Robot departs: Robot 1 from Mine(2) at (25,24)",
+            console,
+        )
+        self.assertIn(
+            "Robot 1 route found: Mine(2) at (25,24) -> "
+            "Factory(3) at (26,24), 1 blocks",
+            console,
+        )
+        for event in (
+            "Robot load started: Robot 1 at Mine(2) at (25,24)",
+            "Robot load ended: Robot 1 at Mine(2) at (25,24)",
+            "Robot unload started: Robot 1 at Factory(3) at (26,24)",
+            "Robot unload ended: Robot 1 at Factory(3) at (26,24)",
+        ):
+            self.assertIn(event, console)
+
+    def test_factory_empty_and_full_events_are_logged_on_transitions(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Building* factory;\n"
+            "  game_init(&test_state);\n"
+            "  factory = &test_state.buildings[1];\n"
+            "  factory->id = 2;\n"
+            "  factory->type = BUILDING_FACTORY;\n"
+            "  factory->position.x = 12;\n"
+            "  factory->position.y = 13;\n"
+            "  factory->factory_status = 0;\n"
+            "  test_state.building_count = 2;\n"
+            "  update_factory_status(&test_state);\n"
+            "  update_factory_status(&test_state);\n"
+            "  factory->inventory_count = BUILDING_BUFFER_CAP;\n"
+            "  update_factory_status(&test_state);\n"
+            "  update_factory_status(&test_state);\n"
+            "  factory->inventory_count = 0;\n"
+            "  update_factory_status(&test_state);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "factory_status_test.c")))
+        while cpu.running:
+            cpu.step()
+        console = cpu._console_device().output.decode("ascii")
+        self.assertEqual(
+            console.count("Factory(2) at (12,13) is empty"),
+            2,
+        )
+        self.assertEqual(
+            console.count("Factory(2) at (12,13) is full"),
+            1,
+        )
 
     def test_factory_refines_iron_and_copper_ore_in_batches(self):
         source = (
@@ -494,6 +829,161 @@ class MotoRobotsTests(unittest.TestCase):
         self.assertEqual(values, [
             2, 3, 2, 1, 5, 4, 2, 1, 2,
         ])
+
+    def test_factory_assembles_rombonent_from_the_required_plate_ratio(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[7];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Building* factory;\n"
+            "  game_init(&test_state);\n"
+            "  factory = &test_state.buildings[1];\n"
+            "  factory->type = BUILDING_FACTORY;\n"
+            "  factory->factory_iron_plate_input = 2;\n"
+            "  factory->factory_copper_plate_input = 1;\n"
+            "  test_state.building_count = 2;\n"
+            "  update_factories(&test_state, 1.0f);\n"
+            "  results[0] = factory->inventory_count;\n"
+            "  results[1] = factory->factory_iron_plate_input;\n"
+            "  results[2] = factory->factory_copper_plate_input;\n"
+            "  factory->factory_copper_plate_input = 4;\n"
+            "  update_factories(&test_state, 0.5f);\n"
+            "  update_factories(&test_state, 0.5f);\n"
+            "  results[3] = factory->inventory_type;\n"
+            "  results[4] = factory->inventory_count;\n"
+            "  results[5] = factory->factory_copper_plate_input;\n"
+            "  update_resource_totals(&test_state);\n"
+            "  results[6] = test_state.total_resources[RES_ROMBONENT];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "rombonent_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(7)]
+        self.assertEqual(values, [0, 2, 1, 6, 1, 2, 1])
+
+    def test_factory_accepts_plate_deliveries_into_separate_recipe_buffers(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[5];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Building* factory;\n"
+            "  Robot* robot;\n"
+            "  game_init(&test_state);\n"
+            "  factory = &test_state.buildings[1];\n"
+            "  factory->type = BUILDING_FACTORY;\n"
+            "  factory->position.x = 20;\n"
+            "  factory->position.y = 20;\n"
+            "  test_state.building_count = 2;\n"
+            "  robot = &test_state.robots[1];\n"
+            "  robot->position = factory->position;\n"
+            "  robot->state = ROBOT_UNLOADING;\n"
+            "  robot->target_building = 1;\n"
+            "  robot->carrying_type = RES_IRON_PLATE;\n"
+            "  robot->carrying_amount = 1;\n"
+            "  test_state.robot_count = 2;\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  robot->state = ROBOT_UNLOADING;\n"
+            "  robot->carrying_type = RES_COPPER_PLATE;\n"
+            "  robot->carrying_amount = 1;\n"
+            "  update_robots(&test_state, 0.5f);\n"
+            "  update_resource_totals(&test_state);\n"
+            "  results[0] = factory->factory_iron_plate_input;\n"
+            "  results[1] = factory->factory_copper_plate_input;\n"
+            "  results[2] = factory->inventory_count;\n"
+            "  results[3] = test_state.total_resources[RES_IRON_PLATE];\n"
+            "  results[4] = test_state.total_resources[RES_COPPER_PLATE];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "factory_input_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(5)]
+        self.assertEqual(values, [1, 1, 0, 1, 1])
+
+    def test_factory_builds_a_robot_from_rombonent_and_iron_plate(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[9];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Building* factory;\n"
+            "  Building* storage;\n"
+            "  Robot* robot;\n"
+            "  game_init(&test_state);\n"
+            "  factory = &test_state.buildings[1];\n"
+            "  factory->type = BUILDING_FACTORY;\n"
+            "  factory->position.x = 20;\n"
+            "  factory->position.y = 20;\n"
+            "  factory->factory_robot_rombonent_input = 1;\n"
+            "  factory->factory_iron_plate_input = 1;\n"
+            "  storage = &test_state.buildings[2];\n"
+            "  storage->type = BUILDING_STORAGE;\n"
+            "  storage->position.x = 19;\n"
+            "  storage->position.y = 20;\n"
+            "  storage->inventory_type = RES_ROMBONENT;\n"
+            "  storage->inventory_count = 1;\n"
+            "  test_state.building_count = 3;\n"
+            "  assign_robot_route(&test_state, 2, 1);\n"
+            "  update_factories(&test_state, 1.0f);\n"
+            "  robot = &test_state.robots[1];\n"
+            "  results[0] = test_state.robot_count;\n"
+            "  results[1] = robot->state;\n"
+            "  results[2] = robot->position.x;\n"
+            "  results[3] = robot->position.y;\n"
+            "  results[4] = factory->factory_robot_rombonent_input;\n"
+            "  results[5] = factory->factory_iron_plate_input;\n"
+            "  update_resource_totals(&test_state);\n"
+            "  results[6] = test_state.total_resources[RES_ROMBONENT];\n"
+            "  results[7] = test_state.robots[0].path_status;\n"
+            "  results[8] = test_state.robots[0].state;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "robot_factory_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(9)]
+        self.assertEqual(values, [2, 0, 20, 20, 0, 0, 1, 1, 1])
+
+    def test_factory_preserves_robot_recipe_inputs_at_fleet_limit(self):
+        source = (
+            '#include "game.c"\n'
+            '#include "map.c"\n'
+            "int results[3];\n"
+            "GameState test_state;\n"
+            "int main(void) {\n"
+            "  Building* factory;\n"
+            "  game_init(&test_state);\n"
+            "  factory = &test_state.buildings[1];\n"
+            "  factory->type = BUILDING_FACTORY;\n"
+            "  factory->factory_robot_rombonent_input = 1;\n"
+            "  factory->factory_iron_plate_input = 1;\n"
+            "  test_state.building_count = 2;\n"
+            "  test_state.robot_count = MAX_ROBOTS;\n"
+            "  update_factories(&test_state, 2.0f);\n"
+            "  results[0] = test_state.robot_count;\n"
+            "  results[1] = factory->factory_robot_rombonent_input;\n"
+            "  results[2] = factory->factory_iron_plate_input;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source, str(ROOT / "modules" / "MotoRobots" / "robot_limit_test.c")))
+        while cpu.running:
+            cpu.step()
+        values = [cpu.read_16(GLOBAL_BASE + 2 * i) for i in range(3)]
+        self.assertEqual(values, [8, 1, 1])
 
     def test_right_click_deletes_building_but_preserves_base(self):
         source = (
@@ -703,7 +1193,10 @@ class PreprocessorTests(unittest.TestCase):
 
 class GameTests(unittest.TestCase):
     def play(self, name, keys, frames):
-        cpu = make_cpu(compile_file(ROOT / "modules" / name))
+        path = ROOT / "modules" / name
+        if name == "sc16_showcase.c":
+            path = ROOT / "modules" / "SC-16 showcase" / name
+        cpu = make_cpu(compile_file(path))
         for frame in range(frames):
             cpu.memory[KEYS_ADDR] = keys(frame)
             self.assertGreater(run_frame(cpu), 0)
@@ -781,7 +1274,7 @@ class GameTests(unittest.TestCase):
             run_frame(cpu, 5_000_000)
         self.assertNotEqual(first, bytes(vram(cpu)))
     def test_showcase_speed_benchmark_uses_speed_register(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "sc16_showcase.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
         run_frame(cpu, 400_000)
         for _ in range(8):
             cpu.memory[KEYS_ADDR] = 2
@@ -790,6 +1283,7 @@ class GameTests(unittest.TestCase):
             cpu.memory[0x43002] |= 2
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
+        estimate = vram(cpu)
         cpu.memory[KEYS_ADDR] = 32
         run_frame(cpu, 400_000)
         cpu.memory[KEYS_ADDR] = 0
@@ -800,11 +1294,39 @@ class GameTests(unittest.TestCase):
             cpu.memory[0x43010] = (cpu.memory[0x43010] + 1) % 60
             run_frame(cpu, 400_000)
         self.assertEqual(cpu.memory[0x43003], 0)
+        measured = vram(cpu)
+        estimate_chart = estimate[90 * SCREEN_WIDTH + 160:90 * SCREEN_WIDTH + 312]
+        measured_chart = measured[90 * SCREEN_WIDTH + 160:90 * SCREEN_WIDTH + 312]
+        self.assertNotEqual(estimate_chart, measured_chart)
+        self.assertNotEqual(estimate, measured)
+
+    def test_showcase_benchmark_reports_every_workload(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
+        run_frame(cpu, 400_000)
+        for _ in range(7):
+            cpu.memory[KEYS_ADDR] = 2
+            run_frame(cpu, 400_000)
+            cpu.memory[KEYS_ADDR] = 0
+            cpu.memory[0x43002] |= 2
+            run_frame(cpu, 400_000)
+            run_frame(cpu, 400_000)
+        cpu.memory[KEYS_ADDR] = 32
+        run_frame(cpu, 400_000)
+        cpu.memory[KEYS_ADDR] = 0
+        run_frame(cpu, 400_000)
+        for _ in range(32):
+            cpu.frames = (cpu.frames + 29) & 0xFFFF
+            run_frame(cpu, 400_000)
+        bar_colors = (2, 8, 5, 3, 6, 4, 7)
+        for i, color in enumerate(bar_colors):
+            self.assertEqual(pixel(cpu, 150, 36 + i * 20), color)
+
     def test_showcase_pages_and_interrupt_counters(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "sc16_showcase.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
+        self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
         run_frame(cpu, 400_000)
         seen = set()
-        for _ in range(9):
+        for page in range(14):
             cpu.memory[KEYS_ADDR] = 2
             run_frame(cpu, 400_000)
             cpu.memory[KEYS_ADDR] = 0
@@ -812,10 +1334,101 @@ class GameTests(unittest.TestCase):
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
             seen.add(bytes(vram(cpu)))
-        self.assertEqual(len(seen), 9)
+            if page == 1:
+                self.assertEqual(pixel(cpu, 64, 45), 3)
+                self.assertEqual(pixel(cpu, 112, 45), 8)
+                self.assertEqual(pixel(cpu, 136, 45), 5)
+                self.assertEqual(pixel(cpu, 167, 45), 7)
+                self.assertEqual(pixel(cpu, 176, 45), 6)
+                self.assertEqual(pixel(cpu, 224, 45), 10)
+        self.assertEqual(len(seen), 14)
         self.assertTrue(cpu.running)
         self.assertGreater(cpu.read_16(0x4340), 10)
         self.assertGreaterEqual(cpu.read_16(0x4342), 1)
+
+    def test_showcase_3d_ship_rotates(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
+        self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
+        run_frame(cpu, 400_000)
+        for _ in range(12):
+            cpu.memory[KEYS_ADDR] = 2
+            run_frame(cpu, 400_000)
+            cpu.memory[KEYS_ADDR] = 0
+            cpu.memory[0x43002] |= 2
+            run_frame(cpu, 400_000)
+            run_frame(cpu, 400_000)
+        first = vram(cpu)
+        for _ in range(4):
+            run_frame(cpu, 400_000)
+        last = vram(cpu)
+        ship_area = b"".join(last[y * SCREEN_WIDTH + 80:y * SCREEN_WIDTH + 240] for y in range(50, 180))
+        self.assertIn(6, ship_area)
+        self.assertNotEqual(first, last)
+        self.assertTrue(cpu.running)
+
+    def test_showcase_sprite_load_uses_max_speed_and_stops_below_30_fps(self):
+        cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
+        self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
+        run_frame(cpu, 400_000)
+        for _ in range(13):
+            cpu.memory[KEYS_ADDR] = 2
+            run_frame(cpu, 400_000)
+            cpu.memory[KEYS_ADDR] = 0
+            cpu.memory[0x43002] |= 2
+            run_frame(cpu, 400_000)
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.memory[0x43003], 1)
+        base_seconds = cpu.memory[0x43011] * 60 + cpu.memory[0x43010]
+        elapsed_seconds = [0]
+        frame_count = [0]
+        frames_per_second = [30]
+
+        def fake_update_rtc():
+            frame_count[0] += 1
+            if frame_count[0] % frames_per_second[0] == 0:
+                elapsed_seconds[0] += 1
+            total = (base_seconds + elapsed_seconds[0]) % 3600
+            cpu.memory[0x43010] = total % 60
+            cpu.memory[0x43011] = total // 60
+
+        cpu.update_rtc = fake_update_rtc
+        initial_count_display = b"".join(
+            vram(cpu)[y * SCREEN_WIDTH + 68:y * SCREEN_WIDTH + 92] for y in range(38, 46)
+        )
+        for _ in range(450):
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.memory[0x43003], 1)
+        green_status = any(pixel(cpu, x, y) == 3 for x in range(8, 312) for y in range(216, 224))
+        self.assertTrue(green_status)
+        image = vram(cpu)
+        snake_x = [
+            x for x in range(SCREEN_WIDTH)
+            if any(image[y * SCREEN_WIDTH + x] == 5 for y in range(45, 206))
+        ]
+        self.assertGreater(snake_x[-1] - snake_x[0], 100)
+        snake_gaps = [snake_x[i + 1] - snake_x[i] for i in range(len(snake_x) - 1)]
+        wrap_gap = max(snake_gaps)
+        snake_gaps.remove(wrap_gap)
+        self.assertLess(wrap_gap, 200)
+        self.assertLessEqual(max(snake_gaps), 3)
+        count_display = b"".join(
+            vram(cpu)[y * SCREEN_WIDTH + 68:y * SCREEN_WIDTH + 92] for y in range(38, 46)
+        )
+        self.assertNotEqual(initial_count_display, count_display)
+        frames_per_second[0] = 20
+        frame_count[0] = 0
+        for _ in range(20):
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.memory[0x43003], 1)
+        red_status = any(pixel(cpu, x, y) == 2 for x in range(8, 312) for y in range(216, 224))
+        self.assertTrue(red_status)
+        self.assertEqual(
+            count_display,
+            b"".join(vram(cpu)[y * SCREEN_WIDTH + 68:y * SCREEN_WIDTH + 92] for y in range(38, 46)),
+        )
+        cpu.memory[KEYS_ADDR] = 2
+        run_frame(cpu, 400_000)
+        self.assertEqual(cpu.memory[0x43003], 0)
 
     def test_lunar_lander_menu_flight_sound_and_crash(self):
         cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else 0, 8)

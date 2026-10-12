@@ -1,4 +1,5 @@
 from collections import deque
+from pathlib import Path
 import time
 
 
@@ -9,10 +10,16 @@ class ConsoleDevice:
     ROWS = 25
     SCROLLBACK_ROWS = 1000
 
-    def __init__(self):
+    def __init__(self, log_path=None):
+        self.log_path = Path(log_path) if log_path is not None else None
+        self._log_file = None
         self.reset()
 
     def reset(self, preserve_history=False):
+        self.close()
+        if self.log_path is not None:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = self.log_path.open("wb")
         self.receive_buffer = deque()
         if not preserve_history:
             self.output = bytearray()
@@ -54,6 +61,10 @@ class ConsoleDevice:
 
     def write_data(self, value):
         value &= 0xFF
+        if self._log_file is not None:
+            self._log_file.write(bytes((value,)))
+            if value == 10:
+                self._log_file.flush()
         self.output.append(value)
         if len(self.output) > self.OUTPUT_CAPACITY:
             del self.output[:self.OUTPUT_CAPACITY // 4]
@@ -91,6 +102,11 @@ class ConsoleDevice:
     def write_text(self, text):
         for value in text.encode("ascii", errors="replace") + b"\n":
             self.write_data(value)
+
+    def close(self):
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
 
     def render(self, surface, font, color, origin=(0, 0), line_height=16):
         x, y = origin
