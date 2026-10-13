@@ -32,7 +32,7 @@ def gpu(cpu, command, color=0, x=0, y=0, w=0, h=0, source=0):
         cpu.write_16(GPU_BASE + offset, value & 0xFFFF)
     cpu.write(GPU_BASE + 1, color)
     cpu.write_16(GPU_BASE + 10, source & 0xFFFF)
-    cpu.write(GPU_BASE + 12, source >> 16)
+    cpu.write_16(GPU_BASE + 12, (source >> 16) & 0x3FFF)
     cpu.write(GPU_BASE, command)
 
 
@@ -1194,9 +1194,17 @@ class PreprocessorTests(unittest.TestCase):
 
 class GameTests(unittest.TestCase):
     def play(self, name, keys, frames):
-        path = ROOT / "modules" / name
-        if name == "sc16_showcase.c":
-            path = ROOT / "modules" / "SC-16 showcase" / name
+        module_directories = {
+            "anaclock.c": "AnaClock",
+            "asteroids.c": "Asteroids",
+            "elitedemo.c": "Elite",
+            "lunarlander.c": "Lunar Lander",
+            "pacman.c": "PacMan",
+            "paint.c": "Paint",
+            "space_invaders.c": "Space Invaders",
+            "sc16_showcase.c": "SC-16 showcase",
+        }
+        path = ROOT / "modules" / module_directories.get(name, "") / name
         cpu = make_cpu(compile_file(path))
         for frame in range(frames):
             cpu.memory[KEYS_ADDR] = keys(frame)
@@ -1231,7 +1239,7 @@ class GameTests(unittest.TestCase):
         self.assertNotEqual(vram(idle), vram(moving))
 
     def test_anaclock_cycles_through_seven_distinct_faces(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "anaclock.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "AnaClock" / "anaclock.c"))
         faces = []
 
         cpu.memory[KEYS_ADDR] = 0
@@ -1248,7 +1256,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual(len(set(faces)), 7)
 
     def play_elite(self, keys, frames):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "elitedemo.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Elite" / "elitedemo.c"))
         for frame in range(frames):
             low, ext = keys(frame)
             cpu.memory[KEYS_ADDR] = low
@@ -1268,7 +1276,7 @@ class GameTests(unittest.TestCase):
         self.assertGreater(sum(1 for byte in vram(cpu) if byte), 100)
 
     def test_elitedemo_moons_orbit_and_scene_changes(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "elitedemo.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Elite" / "elitedemo.c"))
         run_frame(cpu, 5_000_000)
         first = bytes(vram(cpu))
         for _ in range(40):
@@ -1457,7 +1465,7 @@ class GameTests(unittest.TestCase):
                 self.assertIn(channel, used, name)
 
     def test_elitedemo_engine_and_laser_sounds(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "elitedemo.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Elite" / "elitedemo.c"))
         for frame in range(12):
             cpu.memory[KEYS_ADDR] = 16
             cpu.memory[KEYS_ADDR + 1] = 4
@@ -1506,7 +1514,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(MOUSE_ADDR + 6), 0)
 
     def test_paint_draws_with_mouse_drag_and_shapes(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "paint.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Paint" / "paint.c"))
         clock = [0]
 
         def step(x, y, down=None, up=None):

@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 
-from SuomiCPU import CONSOLE_CONTROL, CONSOLE_DATA, CONSOLE_STATUS, SuomiCompute16, create_memory  # noqa: E402
+from SuomiCPU import CONSOLE_CONTROL, CONSOLE_DATA, CONSOLE_STATUS, MEM_SIZE, SuomiCompute16, create_memory  # noqa: E402
 from src.console_device import ConsoleDevice, ConsoleWindow  # noqa: E402
 
 
