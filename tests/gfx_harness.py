@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from src.SuomiCPU import (
-    BACK_START, KEYS_ADDR, MEM_MASK, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START,
+    KEYS_ADDR, MEM_MASK, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START,
     SuomiCompute16, create_memory,
 )
 from c_compiler import compile_source
@@ -46,9 +46,15 @@ def run_frame(cpu, limit=400_000):
 def vram(cpu):
     return bytes(cpu.memory[VRAM_START:VRAM_START + SCREEN_WIDTH * SCREEN_HEIGHT])
 
+def layer_pixel(cpu, layer, x, y):
+    width, _ = cpu._screen_size()
+    if layer == 0:
+        return cpu._decode_framebuffer(VRAM_START)[y * width + x]
+    return cpu.gpu_layers[layer][y * width + x]
+
 
 def pixel(cpu, x, y):
-    return cpu.memory[VRAM_START + y * SCREEN_WIDTH + x]
+    return layer_pixel(cpu, 0, x, y)
 
 
 def save_png(cpu, path):

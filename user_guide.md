@@ -506,24 +506,25 @@ memory ranges:
 | ---------------------------------------- | ------------------: | -----------: |
 | Flash                                    | `0x00000`-`0x3FFFF` |      256 KiB |
 | Low RAM                                  | `0x40000`-`0x4FFFF` |       64 KiB |
-| VRAM                                     | `0x50000`-`0x62BFF` | 76,800 bytes |
+| VRAM                                     | `0x50000`-`0x757FF` | 153,600 bytes |
 | Keyboard                                 |           `0x43000` |       1 byte |
 | Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
 | Speed register (0 = fixed, 1 = maximum)  |           `0x43003` |       1 byte |
 | Held-key bitmask                         |           `0x43004` |       1 byte |
 | Disk storage device                      |           `0x43100` |     16 bytes |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
-| Graphics coprocessor registers           | `0x43020`-`0x4302F` |     16 bytes |
-| Back buffer (coprocessor drawing target) | `0x62C00`-`0x757FF` | 76,800 bytes |
+| Graphics coprocessor and layer registers| `0x43020`-`0x43036` |     23 bytes |
 
-The display is 320 by 240 pixels. Each VRAM byte indexes a 256-entry palette:
-entries 0-11 are named colors (0 black, 1 white, 2 red, 3 green, 4 blue,
-5 yellow, 6 cyan, 7 magenta, 8 orange, 9 gray, 10 dark gray, 11 dark red), 25 is
-pure blue, and the rest are grayscale. VRAM is a live view of CPU memory, so byte writes starting at
-`0x50000 + y * 320 + x` change the pixel at `(x, y)` and are shown at the next
-display refresh. The emulator renders the indexed framebuffer directly rather
-than converting every pixel in Python. It executes up to 30,000 instructions per
-display frame (capped at 60 frames per second), so long drawing routines can
+The display supports 320x240 indexed 8-bit mode and 640x480 packed 4-bit mode.
+VRAM reserves 153,600 bytes (`0x50000`-`0x757FF`), enough for the larger mode.
+At 320x240, each byte is a palette index; pixel `(x,y)` is at
+`0x50000 + y * 320 + x`. At 640x480, two pixels share a byte (left pixel in
+the high nibble, right pixel in the low nibble), using palette indices 0-15.
+The 256-entry palette names colors 0-11; index 25 is pure blue in 320x240 mode.
+Direct CPU writes update background layer 0, shown at the next display refresh.
+No CPU-visible back buffer is reserved: compositing and the other four layers
+are held in private GPU memory. The emulator executes up to 30,000 instructions
+per display frame (capped at 60 frames per second), so long drawing routines can
 finish without requiring a separate screen update for every CPU instruction.
 When the CPU halts, the window remains open with the final frame displayed;
 press any key to close it, or close the window using its title-bar control.
@@ -878,13 +879,17 @@ For shifts, `>>` is arithmetic for `int` and logical for unsigned types.
 (`RED`, `GREEN`, ...), key (`KEY_LEFT`, `KEY_FIRE`, ...) and screen-size
 constants. Using any `gfx_*` function makes the compiler link
 [`lib/lib_cgfx.asm`](lib/lib_cgfx.asm), which drives the graphics coprocessor, plus the
-font. All drawing goes to an off-screen back buffer; `gfx_present()` copies it
-to VRAM in one step and ends the current emulator frame (vsync), so there is
-no flicker.
+font. Five hardware layers are composited in ascending order, so higher-numbered
+layers cover lower ones: background/VRAM (0), tiles (1), sprites (2), 3D (3),
+and HUD (4). Zero is the default transparent color for layers 1-4. Layer
+visibility is selected with a five-bit mask. `gfx_present()` composites the
+enabled layers for display and ends the current emulator frame; it does not copy
+or overwrite VRAM. The GPU keeps layer, tile, and sprite storage outside the
+SC-16 CPU-visible address space.
 
 | Function                                                                                | Behavior                                                                                                                                                   |
 | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `void gfx_clear(unsigned char color)`                                                   | Fill the back buffer.                                                                                                                                      |
+| `void gfx_clear(unsigned char color)`                                                   | Fill the currently selected drawing layer.                                                                                                                |
 | `void gfx_pixel(int x, int y, unsigned char color)`                                     | Plot one pixel.                                                                                                                                            |
 | `void gfx_rect(int x, int y, int w, int h, unsigned char color)`                        | Filled rectangle.                                                                                                                                          |
 | `void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)`                    | Line (clipped).                                                                                                                                            |
@@ -892,7 +897,13 @@ no flicker.
 | `void gfx_sprite(int x, int y, int w, int h, unsigned char *data)`                      | Draw `w*h` palette bytes; 0 is transparent.                                                                                                                |
 | `void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char color)` | 1 bit per pixel, MSB first, `(w+7)/8` bytes per row.                                                                                                       |
 | `void gfx_text(int x, int y, char *text, unsigned char color)`                          | 6x8-cell text from the 5x7 font; UTF-8 `??????` and `\n` supported.                                                                                        |
-| `void gfx_present(void)`                                                                | Show the back buffer and wait for the next frame.                                                                                                          |
+| `void gfx_present(void)`                                                                | Composite visible layers and wait for the next frame.                                                                                                     |
+| `void gfx_layer_select(int layer)`                                                      | Select a drawing target 0-4 for ordinary drawing commands.                                                                                                |
+| `void gfx_layer_visibility(unsigned int mask)`                                          | Set the visible-layer bitmask (`LAYER_ALL` enables all five layers).                                                                                        |
+| `void gfx_layer_transparency(int layer, unsigned char color)`                           | Set one layer's transparent palette index.                                                                                                                 |
+| `void gfx_sprite_upload(int slot, int w, int h, unsigned char *data)`                   | Copy an indexed, zero-transparent image (up to 64x64) into one of 64 hardware sprite slots.                                                                |
+| `void gfx_sprite_move(int slot, int x, int y, int flags)`                               | Position/show a sprite; flags include `SPRITE_VISIBLE`, `SPRITE_FLIP_X`, and `SPRITE_FLIP_Y`.                                                              |
+| `void gfx_tile_upload(int tile, unsigned char *pixels)`                                 | Copy one 16x16 indexed tile into one of 256 hardware tile slots.                                                                                          |
 | `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                                                                                                          |
 | `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.                                                                                |
 | `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                                                                                                       |
@@ -901,10 +912,11 @@ no flicker.
 | `unsigned int gfx_mouse_events(void)`                                                   | One-frame events: press `MOUSE_LEFT_DOWN`/`RIGHT_DOWN` 1/2, double-click `MOUSE_LEFT_DOUBLE`/`RIGHT_DOUBLE` 4/8, release `MOUSE_LEFT_UP`/`RIGHT_UP` 16/32. |
 | `int gfx_mouse_wheel(void)`                                                            | Signed vertical wheel delta for the current frame; positive scrolls up, negative scrolls down.                                                            |
 | `void gfx_sound(int channel, int freq, int frames, int wave, int volume)`               | Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. `WAVE_SQUARE/NOISE/TRIANGLE`.                                                                 |
-| `void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y)`      | Fill the screen from a tile map (1 byte per tile = palette colour, 0 = black; 16x16 px tiles; camera in pixels; outside the map is black).                 |
-| `int gfx3d_draw(int *scene)`                                                           | Transform, project and draw a fixed-point 3D scene using GPU command 22; returns 0 on success.                                                        |
+| `void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y)`      | Copy a map of tile IDs (up to 128x128) to GPU memory and set its pixel camera; tiles are 16x16.                                                            |
+| `void gfx_tile_camera(int cam_x, int cam_y)`                                            | Move the GPU tile-map camera without re-uploading its map.                                                                                                 |
+| `int gfx3d_draw(int *scene)`                                                           | Transform, project and draw a fixed-point scene into layer 3 using GPU command 22; returns 0 on success.                                                   |
 | `int gfx_getchar(void)`                                                                 | Next typed ASCII character (8 backspace, 13 enter), 0 if none; consumes it.                                                                                |
-| `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store the back buffer as a static layer / redraw it in one call.                                                                                           |
+| `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store/restore the currently selected layer in private GPU memory.                                                                                          |
 
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
@@ -923,7 +935,14 @@ Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 2 pixel, 3 rect, 4 line (W,H are the end point), 5 sprite, 6 bitmap, 7 text
 (NUL-terminated string at SRC), 8 present, 9 random (to RESULT), 10 polygon
 (W is the point count), 13 sound (COLOR channel, X Hz, Y frames, W wave, H volume %),
-14 save back buffer, 15 restore it, 16-20 networking (below), 21 tile map (X,Y camera, W,H map size, SRC map). Assembly programs can use it directly.
+14 save selected layer, 15 restore it, 16-20 networking (below), 21 upload tile map
+(X/Y camera, W/H dimensions, SRC map), 22 3D scene, 23 sprite upload
+(COLOR slot, W/H size, SRC pixels), 24 sprite move (COLOR slot, X/Y, W flags),
+25 tile upload (COLOR tile ID, SRC 16x16 pixels), and 26 tile camera (X/Y).
+Memory-mapped layer controls follow at `0x43030`: select layer, visible-layer
+mask, then five per-layer transparent-color registers at `0x43032`-`0x43036`.
+Layer indices are background 0, tiles 1, sprites 2, 3D 3, HUD 4; bit N of the
+mask enables layer N. Assembly programs can use these registers directly.
 
 GPU command 22 draws a complete 3D scene from the 30-bit address in SRC. The
 scene is an array of signed 16-bit words, in big-endian memory order:

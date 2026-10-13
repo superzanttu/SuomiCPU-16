@@ -480,6 +480,94 @@ gfx_tilemap:
     CALLX CGFX_GO
     RET
 
+; gfx_tile_camera(cam_x, cam_y): update the tile engine camera registers.
+gfx_tile_camera:
+    LDWS R0, 4
+    LDWS R1, 6
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDI R5, 26
+    CALLX CGFX_GO
+    RET
+
+; gfx_tile_upload(tile, pixels): copy one 16x16 indexed tile into GPU tile RAM.
+gfx_tile_upload:
+    LDWS R0, 4
+    LDI R1, 0
+    LDI R2, 16
+    LDI R3, 16
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    CALLX CGFX_COLOR
+    LDWS R4, 6
+    MOVSP R7
+    LDI R6, 8
+    ADD R7, R6
+    LDW R5, R7
+    CALLX CGFX_SRC
+    LDI R5, 25
+    CALLX CGFX_GO
+    RET
+
+; gfx_sprite_upload(slot, w, h, pixels): copy a transparent indexed image to GPU RAM.
+gfx_sprite_upload:
+    LDWS R0, 4
+    LDI R1, 0
+    LDWS R2, 6
+    LDWS R3, 8
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    CALLX CGFX_COLOR
+    LDWS R4, 10
+    MOVSP R7
+    LDI R6, 12
+    ADD R7, R6
+    LDW R5, R7
+    CALLX CGFX_SRC
+    LDI R5, 23
+    CALLX CGFX_GO
+    RET
+
+; gfx_sprite_move(slot, x, y, flags): change one sprite descriptor.
+gfx_sprite_move:
+    LDWS R0, 6
+    LDWS R1, 8
+    LDWS R2, 10
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    CALLX CGFX_COLOR
+    LDI R5, 24
+    CALLX CGFX_GO
+    RET
+
+gfx_layer_select:
+    LDWS R0, 4
+    CALLX CGFX_BASE
+    LDI R6, 16
+    ADD R7, R6
+    ST R7, R0
+    RET
+
+gfx_layer_visibility:
+    LDWS R0, 4
+    CALLX CGFX_BASE
+    LDI R6, 17
+    ADD R7, R6
+    ST R7, R0
+    RET
+
+gfx_layer_transparency:
+    LDWS R0, 4
+    LDWS R1, 6
+    CALLX CGFX_BASE
+    LDI R6, 18
+    ADD R7, R6
+    ADD R7, R0
+    ST R7, R1
+    RET
+
 ; gfx3d_draw(scene): submit a fixed-point scene to GPU command 22.
 gfx3d_draw:
     LDWS R4, 4

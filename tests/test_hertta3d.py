@@ -2,7 +2,7 @@ import unittest
 
 from gfx_harness import ROOT, compile_file, make_cpu, run_frame
 from src.SuomiCPU import (
-    BACK_START, GPU_BASE, KEYS_ADDR, SCREEN_WIDTH, SPEED_ADDR, SPEED_MAX,
+    GPU_BASE, KEYS_ADDR, SCREEN_WIDTH, SPEED_ADDR, SPEED_MAX,
 )
 from c_compiler import compile_source
 
@@ -40,7 +40,7 @@ class Hertta3DTests(unittest.TestCase):
 
         self.assertFalse(cpu.running, "instrumented gameplay render did not finish")
         self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
-        pixels = cpu.memory[BACK_START:BACK_START + SCREEN_WIDTH * 240]
+        pixels = cpu.gpu_layers[3]
         self.assertEqual(pixels[30 * SCREEN_WIDTH + 160], 4)
         self.assertIn(pixels[120 * SCREEN_WIDTH + 140], (8, 9, 14))
         self.assertEqual(pixels[220 * SCREEN_WIDTH + 160], 10)

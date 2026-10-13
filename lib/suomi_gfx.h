@@ -1,5 +1,5 @@
-// 320x240 indexed or 640x480 packed graphics, double buffered.
-// All drawing goes to a back buffer; gfx_present() shows it and waits for the next frame.
+// Five composited hardware layers: background (VRAM), tiles, sprites, 3D, and HUD.
+// 320x240 uses 8-bit pixels; 640x480 uses packed 4-bit pixels.
 void gfx_clear(unsigned char color);
 void gfx_pixel(int x, int y, unsigned char color);
 void gfx_rect(int x, int y, int w, int h, unsigned char color);
@@ -10,9 +10,12 @@ void gfx_poly(int x, int y, int count, char *points, unsigned char color);
 void gfx_text(int x, int y, char *text, unsigned char color);
 void gfx_present(void);
 void gfx_mode(int mode);
-// Static layer: gfx_save() keeps the back buffer, gfx_restore() redraws it in one call.
+// Save/restore the currently selected graphics layer.
 void gfx_save(void);
 void gfx_restore(void);
+void gfx_layer_select(int layer);
+void gfx_layer_visibility(unsigned int mask);
+void gfx_layer_transparency(int layer, unsigned char color);
 // Sound: channel 0-3, freq in Hz (0 = silence channel), frames (0 = loop), wave, volume 1-100.
 void gfx_sound(int channel, int freq, int frames, int wave, int volume);
 unsigned int gfx_keys(void);
@@ -24,9 +27,13 @@ unsigned int gfx_mouse_buttons(void);
 unsigned int gfx_mouse_events(void);
 int gfx_mouse_wheel(void);
 
-/* Tile map: one byte per tile = palette color (0 = black); draws 16x16 tiles over the
-   whole back buffer with the camera at pixel (cam_x, cam_y). */
+/* Tile and sprite assets are uploaded into dedicated GPU memory. Zero pixels are
+   transparent. Tile maps contain tile IDs and are copied into GPU memory. */
+void gfx_sprite_upload(int slot, int w, int h, unsigned char *data);
+void gfx_sprite_move(int slot, int x, int y, int flags);
+void gfx_tile_upload(int tile, unsigned char *pixels);
 void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y);
+void gfx_tile_camera(int cam_x, int cam_y);
 /* GPU scene: 10-word header, 3 words per vertex, then 4 words per triangle. */
 int gfx3d_draw(int *scene);
 #define GPU3D_ONE 256
@@ -74,6 +81,15 @@ void gfx_vsync(int enabled);
 #define GFX_MODE_640_480 1
 #define SCREEN_W_640 640
 #define SCREEN_H_480 480
+#define LAYER_BACKGROUND 0
+#define LAYER_TILES 1
+#define LAYER_SPRITES 2
+#define LAYER_3D 3
+#define LAYER_HUD 4
+#define LAYER_ALL 0x1F
+#define SPRITE_VISIBLE 1
+#define SPRITE_FLIP_X 2
+#define SPRITE_FLIP_Y 4
 void gfx_irq_init(void);
 unsigned int gfx_irq_ticks(void);
 unsigned int gfx_irq_keys(void);

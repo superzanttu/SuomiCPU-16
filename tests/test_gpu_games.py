@@ -3,12 +3,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pygame
+
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
-from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
+from gfx_harness import ROOT, compile_file, layer_pixel, make_cpu, pixel, run_frame, vram
 from src.SuomiCPU import (
-    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_FAST, SPEED_MAX,
+    GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_FAST, SPEED_MAX,
     GFX_MODE_640_480, GFX_MODE_ADDR, MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR,
-    VRAM_START, VSYNC_ADDR, SuomiCompute16, _load_jit, create_memory,
+    VRAM_SIZE, VRAM_START, VSYNC_ADDR, SuomiCompute16, _load_jit, create_memory,
 )
 
 HEADER = '#include "suomi_gfx.h"\n'
@@ -37,11 +39,84 @@ def gpu(cpu, command, color=0, x=0, y=0, w=0, h=0, source=0):
     cpu.write(GPU_BASE, command)
 
 
-def back(cpu, x, y):
-    return cpu.memory[BACK_START + y * SCREEN_WIDTH + x]
+def back(cpu, x, y, layer=0):
+    return layer_pixel(cpu, layer, x, y)
 
 
 class GpuTests(unittest.TestCase):
+    def test_vram_reserves_only_640_by_480_four_bit_framebuffer(self):
+        self.assertEqual(VRAM_SIZE, 640 * 480 // 2)
+        self.assertEqual(VRAM_START + VRAM_SIZE, 0x75800)
+        self.assertFalse(hasattr(__import__("src.SuomiCPU", fromlist=[""]), "BACK_START"))
+
+    def test_hardware_layers_compose_in_priority_order_with_visibility_and_keys(self):
+        cpu = bare_cpu()
+        cpu._ensure_gpu_state()
+        cpu.palette = [pygame.Color(i, i, i) for i in range(256)]
+        cpu.palette[1] = (255, 255, 255)
+        cpu.palette[2] = (255, 0, 0)
+        cpu.palette[3] = (0, 255, 0)
+        cpu.palette[4] = (0, 0, 255)
+        cpu._create_vram_surface()
+        cpu.memory[VRAM_START] = 1
+        cpu.gpu_layers[1][0] = 2
+        cpu.gpu_layers[3][0] = 3
+        cpu.gpu_layers[4][0] = 4
+
+        cpu._composite_layers()
+        self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (0, 0, 255))
+
+        cpu.write(GPU_BASE + 22, 4)
+        cpu._composite_layers()
+        self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (0, 255, 0))
+
+        cpu.write(GPU_BASE + 17, 0b00011)
+        cpu._composite_layers()
+        self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (255, 0, 0))
+
+    def test_hardware_sprite_and_tile_memories_render_to_their_layers(self):
+        cpu = bare_cpu()
+        cpu.memory[0x1000:0x1004] = bytes((0, 5, 6, 0))
+        gpu(cpu, 23, color=0, w=2, h=2, source=0x1000)
+        gpu(cpu, 24, color=0, x=10, y=11, w=1)
+        self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
+
+        cpu.memory[0x1100:0x1100 + 256] = bytes([9]) * 256
+        gpu(cpu, 25, color=2, source=0x1100)
+        cpu.memory[0x1200] = 2
+        gpu(cpu, 21, x=0, y=0, w=1, h=1, source=0x1200)
+        cpu._composite_layers()
+
+        self.assertEqual(cpu.gpu_layers[2][11 * 320 + 11], 5)
+        self.assertEqual(cpu.gpu_layers[2][11 * 320 + 10], 0)
+        self.assertEqual(cpu.gpu_layers[1][0], 9)
+        self.assertEqual(cpu.gpu_layers[1][15 * 320 + 15], 9)
+
+    def test_c_layer_sprite_and_tile_apis_program_hardware_state(self):
+        cpu = run_c(
+            "unsigned char sprite[4] = {0,5,6,0};\n"
+            "unsigned char tile[256];\n"
+            "unsigned char map[1] = {2};\n"
+            "int main(void) {\n"
+            "  gfx_layer_select(LAYER_HUD);\n"
+            "  gfx_layer_visibility(LAYER_ALL);\n"
+            "  gfx_layer_transparency(LAYER_HUD, 0);\n"
+            "  gfx_sprite_upload(0, 2, 2, sprite);\n"
+            "  gfx_sprite_move(0, 7, 8, SPRITE_VISIBLE);\n"
+            "  gfx_tile_upload(2, tile);\n"
+            "  gfx_tilemap(map, 1, 1, 0, 0);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        self.assertEqual(cpu.memory[GPU_BASE + 16], 4)
+        self.assertEqual(cpu.memory[GPU_BASE + 17], 0x1F)
+        self.assertEqual(cpu.sprites[0], {"x": 7, "y": 8, "flags": 1})
+        self.assertEqual(cpu.sprite_memory[0], (2, 2, bytes((0, 5, 6, 0))))
+        self.assertEqual(cpu.tilemap_memory, b"\x02")
+        self.assertEqual(cpu.tilemap_width, 1)
+        self.assertEqual(cpu.tilemap_height, 1)
+
     def test_640x480_packed_clear_pixel_rect_and_present(self):
         cpu = bare_cpu()
         cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
@@ -50,16 +125,16 @@ class GpuTests(unittest.TestCase):
         gpu(cpu, 2, color=3, x=1, y=0)
         gpu(cpu, 3, color=1, x=2, y=0, w=3, h=2)
 
-        packed_size = 640 * 480 // 4
-        self.assertEqual(cpu.memory[BACK_START], 0xB5)
-        self.assertEqual(cpu.memory[BACK_START + 1], 0x6A)
-        self.assertEqual(cpu.memory[BACK_START + 640 // 4], 0xA5)
-        self.assertEqual(cpu.memory[BACK_START + packed_size - 1], 0xAA)
+        packed_size = 640 * 480 // 2
+        self.assertEqual(VRAM_SIZE, packed_size)
+        self.assertEqual(cpu.memory[VRAM_START], 0x23)
+        self.assertEqual(cpu.memory[VRAM_START + 1], 0x11)
+        self.assertEqual(cpu.memory[VRAM_START + 2], 0x12)
+        self.assertEqual(cpu.memory[VRAM_START + packed_size - 1], 0x22)
 
         gpu(cpu, 8)
 
         self.assertTrue(cpu.frame_yield)
-        self.assertEqual(cpu.memory[VRAM_START:VRAM_START + 2], b"\xB5\x6A")
         decoded = cpu._decode_framebuffer(VRAM_START)
         self.assertEqual(
             list(decoded[:8]),
@@ -69,7 +144,7 @@ class GpuTests(unittest.TestCase):
             list(decoded[640:648]),
             [2, 2, 1, 1, 1, 2, 2, 2],
         )
-        self.assertEqual(cpu.memory[VRAM_START + packed_size - 1], 0xAA)
+        self.assertEqual(cpu.memory[VRAM_START + packed_size - 1], 0x22)
 
     def test_640x480_mouse_coordinates_map_to_logical_pixels(self):
         cpu = bare_cpu()
@@ -130,7 +205,7 @@ class GpuTests(unittest.TestCase):
     def test_unknown_command_is_ignored(self):
         cpu = bare_cpu()
         gpu(cpu, 99)
-        self.assertEqual(cpu.memory[BACK_START], 0)
+        self.assertEqual(cpu.memory[VRAM_START], 0)
 
 
 class Gpu3DTests(unittest.TestCase):
@@ -157,8 +232,8 @@ class Gpu3DTests(unittest.TestCase):
         cpu = self.render_scene(scene)
 
         self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
-        self.assertEqual(back(cpu, 160, 120), 4)
-        self.assertEqual(back(cpu, 160, 105), 4)
+        self.assertEqual(back(cpu, 160, 120, 3), 4)
+        self.assertEqual(back(cpu, 160, 105, 3), 4)
 
     def test_scene_renders_to_the_packed_640_by_480_back_buffer(self):
         scene = [3, 1, 0, 0, 0, 0, 0, 80 * 256, 64 * 256, 1]
@@ -167,7 +242,7 @@ class Gpu3DTests(unittest.TestCase):
         scene.extend((0, 1, 2, 3))
 
         cpu = self.render_scene(scene, GFX_MODE_640_480)
-        decoded = cpu._decode_framebuffer(BACK_START)
+        decoded = cpu.gpu_layers[3]
 
         self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
         self.assertEqual(decoded[240 * 640 + 320], 3)
@@ -186,7 +261,7 @@ class Gpu3DTests(unittest.TestCase):
                 (x, y)
                 for y in range(240)
                 for x in range(320)
-                if back(cpu, x, y) == 3
+                if back(cpu, x, y, 3) == 3
             ]
             return (
                 min(x for x, _ in pixels), max(x for x, _ in pixels),
@@ -235,7 +310,7 @@ class Gpu3DTests(unittest.TestCase):
             steps += 1
         self.assertFalse(cpu.running, "3D showcase page did not finish")
         self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
-        self.assertIn(4, cpu.memory[BACK_START:BACK_START + 320 * 240])
+        self.assertIn(4, cpu.gpu_layers[3])
 
 
 def vram_pixel(cpu, x, y):

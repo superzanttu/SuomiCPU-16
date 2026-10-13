@@ -86,7 +86,7 @@ FLASH_START = 0x00000
 FLASH_SIZE  = 0x40000
 RAM_START   = FLASH_START + FLASH_SIZE
 VRAM_START  = 0x50000
-VRAM_SIZE   = 320 * 240
+VRAM_SIZE   = 640 * 480 // 2
 KBD_ADDR    = 0x43000 # Näppäimistön osoite
 ICR_ADDR    = 0x43002 # Keskeytysten ohjaus
 KEY_VECTOR_ADDR = 0x0002
@@ -112,8 +112,12 @@ BIOS_BASE = 0x43040
 KEYS_ADDR   = 0x43004 # Mitkä näppäimet on painettuna
 MOUSE_ADDR  = 0x43008 # Mouse: +0 X word, +2 Y word, +4 held buttons, +5 latched click events
 GPU_BASE    = 0x43020 # Grafiikkapiirin ohjausrekisterit
-BACK_START  = VRAM_START + VRAM_SIZE
 FONT_ADDR   = 0x4400  # Fonttien paikka
+GPU_LAYER_SELECT = GPU_BASE + 16
+GPU_LAYER_MASK = GPU_BASE + 17
+GPU_LAYER_TRANSPARENCY = GPU_BASE + 18
+GPU_LAYER_COUNT = 5
+GPU_LAYER_MASK_ALL = (1 << GPU_LAYER_COUNT) - 1
 
 # Grafiikkapiirin komennot
 GPU_CLEAR, GPU_PIXEL, GPU_RECT, GPU_LINE = 1, 2, 3, 4
@@ -121,13 +125,18 @@ GPU_SPRITE, GPU_BITMAP, GPU_TEXT, GPU_PRESENT, GPU_RANDOM, GPU_POLY = 5, 6, 7, 8
 GPU_TICKS = 11  # Laskee kuinka monta ruutua on kulunut
 GPU_RTC = 12    # Kello-tieto
 GPU_SOUND = 13  # Sound: COLOR=channel 0-3, X=frequency Hz (0=silence), Y=duration frames (0=loop), W=waveform, H=volume %
-GPU_SAVE, GPU_LOAD = 14, 15  # Save/restore the back buffer (static background layer)
+GPU_SAVE, GPU_LOAD = 14, 15  # Save/restore the selected hardware layer
 # LAN networking: SOURCE=buffer, X=length; results in bytes +14/+15 (word)
 GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 18, 19, 20
-# Tile map: SRC=map (1 byte per tile = palette color, 0 black), W/H=map size in tiles,
-# X/Y=camera pixel position. Draws 16x16 tiles over the whole back buffer.
+# Tile map: SRC=map (one tile index per cell), W/H=map size, X/Y=camera position.
 GPU_TILEMAP = 21
 GPU_3D = 22
+GPU_SPRITE_UPLOAD, GPU_SPRITE_MOVE = 23, 24
+GPU_TILE_UPLOAD, GPU_TILE_CAMERA = 25, 26
+GPU_SPRITE_SLOTS = 64
+GPU_SPRITE_MAX_SIZE = 64
+GPU_TILE_COUNT = 256
+GPU_TILEMAP_MAX_SIZE = 128
 GPU3D_FILL, GPU3D_WIREFRAME = 1, 2
 GPU3D_OK, GPU3D_ERROR_SCENE, GPU3D_ERROR_FACE = 0, 1, 2
 GPU3D_MAX_VERTICES = 128
@@ -157,7 +166,7 @@ DISPLAY_FPS = 30
 MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed register selects maximum speed
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
 SPEED_RATES = (10, 100, 1_000_000, 10_000_000, None)
-DISPLAY_MODES = ((320, 240, 8), (640, 480, 2))
+DISPLAY_MODES = ((320, 240, 8), (640, 480, 4))
 
 
 def create_memory():
@@ -341,6 +350,7 @@ class SuomiCompute16:
             self.palette[index] = color
         self.palette[25] = (0, 0, 255)
         self.frame_yield = False
+        self._ensure_gpu_state()
         self.vram_surface = self._create_vram_surface()
         self.disk = DiskDevice()
 
@@ -361,11 +371,16 @@ class SuomiCompute16:
     def _decode_framebuffer(self, address):
         width, height, bits_per_pixel = DISPLAY_MODES[self._graphics_mode()]
         if bits_per_pixel == 8:
-            return memoryview(self.memory)[address:address + VRAM_SIZE]
+            return memoryview(self.memory)[address:address + width * height]
         pixels = bytearray(width * height)
         packed_size = width * height * bits_per_pixel // 8
         packed = self.memory[address:address + packed_size]
-        if bits_per_pixel == 2:
+        if bits_per_pixel == 4:
+            for index, value in enumerate(packed):
+                offset = index * 2
+                pixels[offset] = value >> 4
+                pixels[offset + 1] = value & 0x0F
+        elif bits_per_pixel == 2:
             for index, value in enumerate(packed):
                 offset = index * 4
                 pixels[offset:offset + 4] = bytes(
@@ -373,16 +388,86 @@ class SuomiCompute16:
                 )
         return pixels
 
+    def _ensure_gpu_state(self):
+        if not hasattr(self, "gpu_layers"):
+            width, height = self._screen_size()
+            self.gpu_layers = [bytearray(width * height) for _ in range(GPU_LAYER_COUNT)]
+            self.sprite_memory = [None] * GPU_SPRITE_SLOTS
+            self.sprites = [
+                {"x": 0, "y": 0, "flags": 0} for _ in range(GPU_SPRITE_SLOTS)
+            ]
+            self.tile_memory = bytearray(GPU_TILE_COUNT * TILE_SIZE * TILE_SIZE)
+            for tile in range(1, GPU_TILE_COUNT):
+                start = tile * TILE_SIZE * TILE_SIZE
+                self.tile_memory[start:start + TILE_SIZE * TILE_SIZE] = bytes(
+                    [tile]
+                ) * (TILE_SIZE * TILE_SIZE)
+            self.tilemap_memory = bytearray()
+            self.tilemap_width = 0
+            self.tilemap_height = 0
+            self.tile_camera = (0, 0)
+            self.saved_layer = None
+            self._gpu_state_mode = self._graphics_mode()
+        if not getattr(self, "_gpu_control_initialized", False):
+            self.memory[GPU_LAYER_SELECT] = 0
+            self.memory[GPU_LAYER_MASK] = GPU_LAYER_MASK_ALL
+            for index in range(GPU_LAYER_COUNT):
+                self.memory[GPU_LAYER_TRANSPARENCY + index] = 0
+            self._gpu_control_initialized = True
+        if self._gpu_state_mode != self._graphics_mode():
+            width, height = self._screen_size()
+            self.gpu_layers = [
+                bytearray(width * height) for _ in range(GPU_LAYER_COUNT)
+            ]
+            self._gpu_state_mode = self._graphics_mode()
+
     def _create_vram_surface(self):
         width, height = self._screen_size()
         self._surface_mode = self._graphics_mode()
         self._expanded_vram = self._decode_framebuffer(VRAM_START)
-        surface = pygame.image.frombuffer(self._expanded_vram, (width, height), "P")
-        surface.set_palette(self.palette)
-        return surface
+        self._ensure_gpu_state()
+        self._layer_surfaces = [None]
+        for pixels in self.gpu_layers[1:]:
+            layer = pygame.image.frombuffer(pixels, (width, height), "P")
+            layer.set_palette(self.palette)
+            self._layer_surfaces.append(layer)
+        self.vram_surface = pygame.Surface((width, height), depth=8)
+        self.vram_surface.set_palette(self.palette)
+        self._composite_layers()
+        return self.vram_surface
+
+    def _composite_layers(self):
+        self._ensure_gpu_state()
+        width, height = self._screen_size()
+        mode = self._graphics_mode()
+        if mode != getattr(self, "_surface_mode", mode):
+            self._create_vram_surface()
+        self._render_tile_layer()
+        self._render_sprites()
+        base = pygame.image.frombuffer(
+            self._decode_framebuffer(VRAM_START), (width, height), "P"
+        )
+        base.set_palette(self.palette)
+        self.vram_surface.fill(0)
+        visible = self.memory[GPU_LAYER_MASK] & GPU_LAYER_MASK_ALL
+        if visible & 1:
+            base.set_colorkey(self.memory[GPU_LAYER_TRANSPARENCY])
+            self.vram_surface.blit(base, (0, 0))
+        for layer_index in range(1, GPU_LAYER_COUNT):
+            if not visible & (1 << layer_index):
+                continue
+            layer = self._layer_surfaces[layer_index]
+            layer.set_colorkey(
+                self.memory[GPU_LAYER_TRANSPARENCY + layer_index]
+            )
+            self.vram_surface.blit(layer, (0, 0))
+        return self.vram_surface
 
     def write(self, addr, val):
         addr &= MEM_SIZE - 1
+        if GPU_LAYER_SELECT <= addr < GPU_LAYER_TRANSPARENCY + GPU_LAYER_COUNT:
+            self._ensure_gpu_state()
+            self._gpu_control_initialized = True
         self.memory[addr] = val & 0xFF
         if addr == GPU_BASE:
             self.gpu_command(val & 0xFF)
@@ -437,43 +522,69 @@ class SuomiCompute16:
         return value - 0x10000 if signed and value & 0x8000 else value
 
     def _back_pixel(self, x, y, color):
+        self._ensure_gpu_state()
         width, height = self._screen_size()
         if not (0 <= x < width and 0 <= y < height):
             return
         mode = self._graphics_mode()
+        layer = min(
+            getattr(self, "_drawing_layer", self.memory[GPU_LAYER_SELECT]),
+            GPU_LAYER_COUNT - 1,
+        )
         if mode == GFX_MODE_320_240:
-            self.memory[BACK_START + y * width + x] = color
+            if layer == 0:
+                self.memory[VRAM_START + y * width + x] = color
+            else:
+                self.gpu_layers[layer][y * width + x] = color
         elif mode == GFX_MODE_640_480:
-            address = BACK_START + y * (width // 4) + x // 4
-            shift = (3 - x % 4) * 2
-            mask = 3 << shift
-            self.memory[address] = (self.memory[address] & ~mask) | ((color & 3) << shift)
+            if layer != 0:
+                self.gpu_layers[layer][y * width + x] = color & 0x0F
+                return
+            address = VRAM_START + y * (width // 2) + x // 2
+            shift = 4 if x % 2 == 0 else 0
+            mask = 0x0F << shift
+            self.memory[address] = (
+                (self.memory[address] & ~mask) | ((color & 0x0F) << shift)
+            )
 
     def _back_rect(self, x, y, width, height, color):
+        self._ensure_gpu_state()
         screen_width, screen_height = self._screen_size()
         left, right = max(x, 0), min(x + width, screen_width)
         top, bottom = max(y, 0), min(y + height, screen_height)
         if right <= left or bottom <= top:
             return
         mode = self._graphics_mode()
+        layer = min(
+            getattr(self, "_drawing_layer", self.memory[GPU_LAYER_SELECT]),
+            GPU_LAYER_COUNT - 1,
+        )
         if mode == GFX_MODE_320_240:
             row = bytes([color]) * (right - left)
             for row_y in range(top, bottom):
-                start = BACK_START + row_y * screen_width + left
-                self.memory[start:start + len(row)] = row
+                start = row_y * screen_width + left
+                if layer == 0:
+                    self.memory[VRAM_START + start:VRAM_START + start + len(row)] = row
+                else:
+                    self.gpu_layers[layer][start:start + len(row)] = row
             return
-        pixels_per_byte = 4
-        packed_color = (color & 3) * 0x55
+        if layer != 0:
+            row = bytes([color & 0x0F]) * (right - left)
+            for row_y in range(top, bottom):
+                start = row_y * screen_width + left
+                self.gpu_layers[layer][start:start + len(row)] = row
+            return
+        packed_color = ((color & 0x0F) << 4) | (color & 0x0F)
         for row_y in range(top, bottom):
             column = left
-            while column < right and column % pixels_per_byte:
+            while column < right and column % 2:
                 self._back_pixel(column, row_y, color)
                 column += 1
-            full_bytes = (right - column) // pixels_per_byte
+            full_bytes = (right - column) // 2
             if full_bytes:
-                start = BACK_START + row_y * (screen_width // pixels_per_byte) + column // pixels_per_byte
+                start = VRAM_START + row_y * (screen_width // 2) + column // 2
                 self.memory[start:start + full_bytes] = bytes([packed_color]) * full_bytes
-                column += full_bytes * pixels_per_byte
+                column += full_bytes * 2
             while column < right:
                 self._back_pixel(column, row_y, color)
                 column += 1
@@ -484,20 +595,20 @@ class SuomiCompute16:
         return ((high & 0x3FFF) << 16) | low
 
     def gpu_command(self, command):
-        """Run a graphics coprocessor command; drawing targets the back buffer."""
+        """Execute one graphics-device command against its selected hardware layer."""
+        self._ensure_gpu_state()
         color = self.memory[GPU_BASE + 1]
         x, y = self._gpu_word(2), self._gpu_word(4)
         w, h = self._gpu_word(6), self._gpu_word(8)
         width, height = self._screen_size()
         mode = self._graphics_mode()
+        layer = min(self.memory[GPU_LAYER_SELECT], GPU_LAYER_COUNT - 1)
         if command == GPU_CLEAR:
-            if mode == GFX_MODE_320_240:
-                fill = color
-            elif mode == GFX_MODE_640_480:
-                fill = (color & 3) * 0x55
+            if layer == 0 and mode == GFX_MODE_640_480:
+                fill = ((color & 0x0F) << 4) | (color & 0x0F)
+                self.memory[VRAM_START:VRAM_START + VRAM_SIZE] = bytes([fill]) * VRAM_SIZE
             else:
-                fill = 0xFF if color & 1 else 0
-            self.memory[BACK_START:BACK_START + VRAM_SIZE] = bytes([fill]) * VRAM_SIZE
+                self._back_rect(0, 0, width, height, color)
         elif command == GPU_PIXEL:
             self._back_pixel(x, y, color)
         elif command == GPU_RECT:
@@ -524,7 +635,7 @@ class SuomiCompute16:
         elif command == GPU_TEXT:
             self._gpu_text(x, y, color)
         elif command == GPU_PRESENT:
-            self.memory[VRAM_START:VRAM_START + VRAM_SIZE] = self.memory[BACK_START:BACK_START + VRAM_SIZE]
+            self._composite_layers()
             self.frame_yield = True
         elif command == GPU_TICKS:
             ticks = getattr(self, 'frames', 0)
@@ -537,11 +648,18 @@ class SuomiCompute16:
             self._gpu_sound(color, self._gpu_word(2, False), self._gpu_word(4, False),
                             self._gpu_word(6, False), self._gpu_word(8, False))
         elif command == GPU_SAVE:
-            self._saved_layer = bytes(self.memory[BACK_START:BACK_START + VRAM_SIZE])
+            self.saved_layer = bytes(
+                self.memory[VRAM_START:VRAM_START + VRAM_SIZE]
+                if layer == 0 else self.gpu_layers[layer]
+            )
         elif command == GPU_LOAD:
-            saved = getattr(self, '_saved_layer', None)
+            saved = self.saved_layer
             if saved is not None:
-                self.memory[BACK_START:BACK_START + VRAM_SIZE] = saved
+                if layer == 0:
+                    size = min(len(saved), VRAM_SIZE)
+                    self.memory[VRAM_START:VRAM_START + size] = saved[:size]
+                else:
+                    self.gpu_layers[layer][:] = saved[:len(self.gpu_layers[layer])]
         elif command == GPU_RANDOM:
             self.memory[GPU_BASE + 14] = random.randrange(256)
         elif GPU_NET_OPEN <= command <= GPU_NET_INFO:
@@ -549,7 +667,20 @@ class SuomiCompute16:
         elif command == GPU_TILEMAP:
             self._gpu_tilemap(x, y, w, h, self._gpu_source())
         elif command == GPU_3D:
-            self._gpu_3d(self._gpu_source())
+            self._drawing_layer = 3
+            try:
+                self._gpu_3d(self._gpu_source())
+            finally:
+                del self._drawing_layer
+        elif command == GPU_SPRITE_UPLOAD:
+            self._gpu_sprite_upload(color, w, h, self._gpu_source())
+        elif command == GPU_SPRITE_MOVE:
+            if color < GPU_SPRITE_SLOTS:
+                self.sprites[color] = {"x": x, "y": y, "flags": w & 7}
+        elif command == GPU_TILE_UPLOAD:
+            self._gpu_tile_upload(color, self._gpu_source())
+        elif command == GPU_TILE_CAMERA:
+            self.tile_camera = (x, y)
 
     @staticmethod
     def _gpu3d_sincos(angle):
@@ -602,6 +733,7 @@ class SuomiCompute16:
 
     def _gpu_3d(self, source):
         memory = self.memory
+        self.gpu_layers[3][:] = bytes(len(self.gpu_layers[3]))
         if source < 0 or source > MEM_SIZE - GPU3D_HEADER_WORDS * 2:
             self._gpu_result(GPU3D_ERROR_SCENE)
             return
@@ -670,32 +802,102 @@ class SuomiCompute16:
                 self._gpu_line(*points[2], *points[0], color)
         self._gpu_result(GPU3D_OK)
 
-    _TILE_ROWS = [bytes([c]) * TILE_SIZE for c in range(256)]
+    def _gpu_sprite_upload(self, slot, width, height, source):
+        if (slot >= GPU_SPRITE_SLOTS or not 1 <= width <= GPU_SPRITE_MAX_SIZE
+                or not 1 <= height <= GPU_SPRITE_MAX_SIZE):
+            self._gpu_result(1)
+            return
+        self.sprite_memory[slot] = (
+            width,
+            height,
+            bytes(self.read((source + index) & MEM_MASK)
+                  for index in range(width * height)),
+        )
+        self._gpu_result(0)
+
+    def _gpu_tile_upload(self, tile, source):
+        if tile >= GPU_TILE_COUNT:
+            self._gpu_result(1)
+            return
+        start = tile * TILE_SIZE * TILE_SIZE
+        self.tile_memory[start:start + TILE_SIZE * TILE_SIZE] = bytes(
+            self.read((source + index) & MEM_MASK)
+            for index in range(TILE_SIZE * TILE_SIZE)
+        )
+        self._gpu_result(0)
 
     def _gpu_tilemap(self, camx, camy, map_w, map_h, source):
+        if (not 1 <= map_w <= GPU_TILEMAP_MAX_SIZE
+                or not 1 <= map_h <= GPU_TILEMAP_MAX_SIZE):
+            self._gpu_result(1)
+            return
+        self.tilemap_width = map_w
+        self.tilemap_height = map_h
+        self.tilemap_memory = bytes(
+            self.read((source + index) & MEM_MASK)
+            for index in range(map_w * map_h)
+        )
+        self.tile_camera = (camx, camy)
+        self._gpu_result(0)
+
+    def _render_tile_layer(self):
         width, height = self._screen_size()
-        out = bytearray(width * height)
-        if map_w > 0 and map_h > 0:
-            first_col = camx // TILE_SIZE
-            last_col = (camx + width - 1) // TILE_SIZE
-            crop = camx - first_col * TILE_SIZE
-            for tile_y in range(camy // TILE_SIZE, (camy + height - 1) // TILE_SIZE + 1):
-                if not 0 <= tile_y < map_h:
+        target = self.gpu_layers[1]
+        target[:] = bytes(len(target))
+        if not self.tilemap_memory:
+            return
+        camx, camy = self.tile_camera
+        first_col = camx // TILE_SIZE
+        first_row = camy // TILE_SIZE
+        cols = (width + (camx - first_col * TILE_SIZE) + TILE_SIZE - 1) // TILE_SIZE
+        rows = (height + (camy - first_row * TILE_SIZE) + TILE_SIZE - 1) // TILE_SIZE
+        for row in range(max(first_row, 0), min(first_row + rows, self.tilemap_height)):
+            screen_y = row * TILE_SIZE - camy
+            for column in range(max(first_col, 0), min(first_col + cols, self.tilemap_width)):
+                map_index = row * self.tilemap_width + column
+                tile = self.tilemap_memory[map_index]
+                tile_start = tile * TILE_SIZE * TILE_SIZE
+                screen_x = column * TILE_SIZE - camx
+                left, right = max(screen_x, 0), min(screen_x + TILE_SIZE, width)
+                top, bottom = max(screen_y, 0), min(screen_y + TILE_SIZE, height)
+                if left >= right or top >= bottom:
                     continue
-                base = source + tile_y * map_w
-                cells = [self.memory[base + c] if 0 <= c < map_w else 0
-                         for c in range(first_col, last_col + 1)]
-                line = b"".join([self._TILE_ROWS[c] for c in cells])[crop:crop + width]
-                top = tile_y * TILE_SIZE - camy
-                for row in range(max(top, 0), min(top + TILE_SIZE, height)):
-                    out[row * width:(row + 1) * width] = line
-        if self._graphics_mode() == GFX_MODE_320_240:
-            self.memory[BACK_START:BACK_START + VRAM_SIZE] = out
-        else:
-            self.memory[BACK_START:BACK_START + VRAM_SIZE] = bytes(VRAM_SIZE)
-            for y in range(height):
-                for x in range(width):
-                    self._back_pixel(x, y, out[y * width + x])
+                source_x = left - screen_x
+                span = right - left
+                for dest_y in range(top, bottom):
+                    source_y = dest_y - screen_y
+                    src = tile_start + source_y * TILE_SIZE + source_x
+                    dst = dest_y * width + left
+                    row = self.tile_memory[src:src + span]
+                    if self._graphics_mode() == GFX_MODE_640_480:
+                        row = bytes(pixel & 0x0F for pixel in row)
+                    target[dst:dst + span] = row
+
+    def _render_sprites(self):
+        width, height = self._screen_size()
+        target = self.gpu_layers[2]
+        target[:] = bytes(len(target))
+        color_mask = 0x0F if self._graphics_mode() == GFX_MODE_640_480 else 0xFF
+        for slot, (sprite, descriptor) in enumerate(zip(self.sprite_memory, self.sprites)):
+            if sprite is None or not descriptor["flags"] & 1:
+                continue
+            sprite_width, sprite_height, pixels = sprite
+            x, y, flags = descriptor["x"], descriptor["y"], descriptor["flags"]
+            left, right = max(x, 0), min(x + sprite_width, width)
+            top, bottom = max(y, 0), min(y + sprite_height, height)
+            if left >= right or top >= bottom:
+                continue
+            for screen_y in range(top, bottom):
+                source_y = screen_y - y
+                if flags & 4:
+                    source_y = sprite_height - source_y - 1
+                for screen_x in range(left, right):
+                    source_x = screen_x - x
+                    if flags & 2:
+                        source_x = sprite_width - source_x - 1
+                    pixel = pixels[source_y * sprite_width + source_x]
+                    if pixel:
+                        target[screen_y * width + screen_x] = pixel & color_mask
 
     def _net_node(self):
         node = getattr(self, 'net', None)
@@ -1658,8 +1860,7 @@ class SuomiCompute16:
         mode = self._graphics_mode()
         if mode != getattr(self, "_surface_mode", mode):
             self.vram_surface = self._create_vram_surface()
-        elif mode != GFX_MODE_320_240:
-            self._expanded_vram[:] = self._decode_framebuffer(VRAM_START)
+        self._composite_layers()
         _present_scaled(self.vram_surface, self.screen)
 
     def _max_speed(self):

@@ -164,7 +164,7 @@ fleet. Production waits when the eight-robot fleet limit is reached.
 
 ### 8.3 Graphics & I/O
 - **Resolution**: 640x480 packed graphics mode. Maximum framerate is 30.
-- **Drawing**: All drawing is performed on a back buffer using `gfx_*` functions; `gfx_present()` is called once per frame to update the display.
+- **Drawing**: Drawing uses the SC-16 layered GPU; VRAM is background layer 0, and the tile, sprite, 3D, and HUD layers are GPU-managed. `gfx_present()` composites enabled layers once per frame.
 - **Input**: Keyboard and mouse are accessed via memory-mapped registers or `gfx_*` helpers.
 
 ## 9. Current Prototype Status

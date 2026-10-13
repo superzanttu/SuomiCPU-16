@@ -444,9 +444,9 @@ void page_memory(void)
     gfx_text(266, 66, "7FFFF", GRAY);
     maprow(86, GREEN, "00000-3FFFF", "FLASH / PROGRAM", "256 KIB");
     maprow(98, ORANGE, "40000-4FFFF", "LOW RAM", "64 KIB");
-    maprow(110, YELLOW, "50000-62BFF", "VRAM 320X240X8", "75 KIB");
-    maprow(122, MAGENTA, "43000-4302F", "KEYBOARD RTC GPU REGS", "I/O");
-    maprow(134, CYAN, "62C00-757FF", "GPU BACK BUFFER", "75 KIB");
+    maprow(110, YELLOW, "50000-757FF", "VRAM 640X480X4", "150 KIB");
+    maprow(122, MAGENTA, "43000-43036", "KEYS RTC GPU LAYERS", "I/O");
+    maprow(134, CYAN, "GPU INTERNAL", "TILES SPRITES 3D HUD", "PRIVATE");
     maprow(146, DARK_GRAY, "75800-7FFFF", "FREE", "42 KIB");
     gfx_text(8, 166, "C PROGRAM LAYOUT", YELLOW);
     gfx_text(8, 178, "0000 ENTRY STUB   0400 LIB_GFX   0700 LIB_TEXT", GRAY);
@@ -839,18 +839,21 @@ void page_tiles(void)
             }
         }
         gfx_tilemap(tile_map, TILE_MAP_W, TILE_MAP_H, 64, 32);
-        gfx_save();
+        gfx_sprite_upload(0, 8, 8, smiley);
         tile_ready = 1;
     }
     else
     {
-        gfx_restore();
+        gfx_tile_camera(64, 32);
     }
-    gfx_rect(0, 0, 320, 30, BLACK);
-    gfx_text(8, 6, "TILE MAP + SAVED STATIC LAYER", YELLOW);
-    gfx_text(8, 19, "16X16 TILES; MOVING SPRITE REDRAWN OVER RESTORED MAP", WHITE);
-    gfx_sprite(150 + sinv(frame / 2) / 4, 118 + cosv(frame / 3) / 4, 8, 8, smiley);
+    gfx_sprite_move(0, 150 + sinv(frame / 2) / 4,
+                    118 + cosv(frame / 3) / 4, SPRITE_VISIBLE);
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(BLACK);
+    gfx_text(8, 6, "TILE + SPRITE GPU ENGINES", YELLOW);
+    gfx_text(8, 19, "TILEMAP AND SPRITE DATA STAY IN GPU MEMORY", WHITE);
     gfx_text(8, 214, "MAP 40X20 TILES - CAMERA (64,32)", CYAN);
+    gfx_layer_select(LAYER_BACKGROUND);
 }
 
 // ---------------------------------------------------------------- page 12
@@ -1667,6 +1670,22 @@ int main(void)
             network_joined = 0;
         }
         frame++;
+        if (page == 10)
+        {
+            gfx_layer_visibility((1 << LAYER_BACKGROUND) |
+                                 (1 << LAYER_TILES) |
+                                 (1 << LAYER_SPRITES) |
+                                 (1 << LAYER_HUD));
+        }
+        else if (page == 12)
+        {
+            gfx_layer_visibility((1 << LAYER_BACKGROUND) | (1 << LAYER_3D));
+        }
+        else
+        {
+            gfx_layer_visibility(1 << LAYER_BACKGROUND);
+        }
+        gfx_layer_select(LAYER_BACKGROUND);
         gfx_clear(BLACK);
         if (page == 0)
         {

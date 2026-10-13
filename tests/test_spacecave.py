@@ -2,7 +2,7 @@ import unittest
 
 import c_compiler
 from c_compiler import GLOBAL_BASE
-from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame
+from gfx_harness import ROOT, compile_file, layer_pixel, make_cpu, pixel, run_frame
 from test_net import Clock, Hub
 from tools.sc16net import NetNode
 
@@ -430,12 +430,12 @@ class TileMapTests(unittest.TestCase):
         """
         cpu = make_cpu(c_compiler.compile_source(source, "tile.c"))
         run_frame(cpu)
-        self.assertEqual(pixel(cpu, 0, 0), 2)      # first tile, scrolled by 8 px
-        self.assertEqual(pixel(cpu, 7, 15), 2)
-        self.assertEqual(pixel(cpu, 8, 0), 3)
-        self.assertEqual(pixel(cpu, 0, 16), 4)
-        self.assertEqual(pixel(cpu, 8, 16), 5)
-        self.assertEqual(pixel(cpu, 40, 40), 0)    # outside the map
+        self.assertEqual(layer_pixel(cpu, 1, 0, 0), 2)      # first tile, scrolled by 8 px
+        self.assertEqual(layer_pixel(cpu, 1, 7, 15), 2)
+        self.assertEqual(layer_pixel(cpu, 1, 8, 0), 3)
+        self.assertEqual(layer_pixel(cpu, 1, 0, 16), 4)
+        self.assertEqual(layer_pixel(cpu, 1, 8, 16), 5)
+        self.assertEqual(layer_pixel(cpu, 1, 40, 40), 0)    # outside the map
 
     def test_gfx_getchar_returns_and_consumes_key(self):
         source = """

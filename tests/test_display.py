@@ -111,9 +111,11 @@ class DisplayTests(unittest.TestCase):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.vram_surface = object()
         emulator.screen = Mock()
+        emulator._composite_layers = Mock()
 
         with patch("src.SuomiCPU._present_scaled") as present:
             emulator.update_display()
+        emulator._composite_layers.assert_called_once_with()
         present.assert_called_once_with(emulator.vram_surface, emulator.screen)
 
     def test_halt_keeps_display_open_until_keypress(self):
