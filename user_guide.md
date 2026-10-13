@@ -449,21 +449,20 @@ bytes.
 
 The stack pointer starts at `0x3FFFFFFF`. `PUSH` decrements the pointer by two and
 stores a big-endian word; `POP` reads that word and advances the pointer by two.
-`CALL`/`RET` use the same stack. The `POP` instruction loads only the low byte
-into a general-purpose register, whereas `RET` and `RTI` use the full popped
-word. `LDW`/`STW` use big-endian byte order. `LDWS`/`STWS` address words from
-the current stack pointer; `ADJSP` reserves or releases a small stack region.
-Interrupt handling attempts to save the PC and `Z` flag, but not `C`.
-The interrupt vectors are two-byte absolute addresses stored at `0x0002`
-(keyboard) and `0x0004` (RTC).
+`CALL`/`RET` use the same stack and store/restore a four-byte big-endian PC.
+`POP` loads only the low byte into a general-purpose register. `LDW`/`STW` use
+big-endian byte order. `LDWS`/`STWS` address words from the current stack
+pointer; `ADJSP` reserves or releases a small stack region. Interrupt handling
+saves the full 30-bit PC and flags in a six-byte frame. Four-byte interrupt
+vectors are stored at `0x0002` (keyboard) and `0x0006` (RTC).
 
 Example vector setup:
 
 ```asm
 .address 0x0002
-.data hex 00, 70
-.address 0x0004
-.data hex 00, 70
+.data hex 00, 00, 00, 70
+.address 0x0006
+.data hex 00, 00, 00, 70
 .address 0x0070
 interrupt_handler:
     RTI
@@ -509,6 +508,7 @@ memory ranges:
 | Held-key bitmask                         |           `0x43004` |       1 byte |
 | Disk storage device                      |           `0x43100` |     16 bytes |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
+| Graphics mode                            |           `0x43014` |       1 byte |
 | Graphics coprocessor registers           | `0x43020`-`0x4302E` |     15 bytes |
 | Back buffer (coprocessor drawing target) | `0x62C00`-`0x757FF` | 76,800 bytes |
 | C global/static data                    | `0x80000`-`0xFFFFF` |      512 KiB |
@@ -518,9 +518,11 @@ entries 0-11 are named colors (0 black, 1 white, 2 red, 3 green, 4 blue,
 5 yellow, 6 cyan, 7 magenta, 8 orange, 9 gray, 10 dark gray, 11 dark red), 25 is
 pure blue, and the rest are grayscale. VRAM is a live view of CPU memory, so byte writes starting at
 `0x50000 + y * 320 + x` change the pixel at `(x, y)` in 320×240 mode and are
-shown at the next display refresh. In 640×480 mode, four 2-bit pixels are packed
-per byte. The emulator runs the CPU according to the speed register; the normal
-display loop is capped at 30 frames per second.
+shown at the next display refresh. In 640×480 mode, four 2-bit pixels (colors
+0-3, most-significant pixel first) are packed per byte. Select it by writing `1`
+to `0x43014` or calling `gfx_mode(GFX_MODE_640_480)`. The emulator runs the CPU
+according to the speed register; the normal display loop is capped at 30 frames
+per second.
 When the CPU halts, the window remains open with the final frame displayed;
 press any key to close it, or close the window using its title-bar control.
 Keyboard key presses write the character byte to the keyboard address and mark
@@ -850,9 +852,9 @@ do not use that region for application data while a screen routine is running.
 See [`examples/text_demo.c`](examples/text_demo.c) for a C example.
 
 Generated C code uses the far control instructions (`JMPX`, `CALLX`, `BZX`,
-`BCX`). Address 0 holds an entry stub; `0x0002`-`0x0005` hold interrupt
-vectors, and the boot routine at `0x0006` calls `main`. Compiled code starts at
-`0x4800`; global data starts at `0x80000`, so large code and data sections must
+`BCX`). Address 0 holds an entry stub; `0x0002`-`0x0009` hold four-byte
+interrupt vectors, and the boot routine at `0x000A` calls `main`. Compiled code starts at
+`0x4800`; global data starts at `0x80000` in a 512 KiB window, so large code and data sections must
 not overlap. Return addresses preserve the full 30-bit PC; code is no longer
 restricted to addresses below `0x10000` for call/return correctness. Libraries use fixed
 low-memory locations: `lib_gfx` at `0x400`, `lib_text` at `0x700`, and
@@ -879,6 +881,7 @@ no flicker.
 | Function                                                                                | Behavior                                                                                                                                                   |
 | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `void gfx_clear(unsigned char color)`                                                   | Fill the back buffer.                                                                                                                                      |
+| `void gfx_mode(int mode)`                                                               | Select 320×240 indexed mode (0) or 640×480 packed 2-bpp mode (1).                                                                                           |
 | `void gfx_pixel(int x, int y, unsigned char color)`                                     | Plot one pixel.                                                                                                                                            |
 | `void gfx_rect(int x, int y, int w, int h, unsigned char color)`                        | Filled rectangle.                                                                                                                                          |
 | `void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)`                    | Line (clipped).                                                                                                                                            |
@@ -890,7 +893,7 @@ no flicker.
 | `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                                                                                                          |
 | `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.                                                                                |
 | `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                                                                                                       |
-| `int gfx_mouse_x(void)` / `int gfx_mouse_y(void)`                                       | Mouse position in screen pixels (0-319, 0-239).                                                                                                            |
+| `int gfx_mouse_x(void)` / `int gfx_mouse_y(void)`                                       | Mouse position in screen pixels (320×240 or 640×480, depending on graphics mode).                                                                         |
 | `unsigned int gfx_mouse_buttons(void)`                                                  | Held buttons: `MOUSE_LEFT` 1, `MOUSE_RIGHT` 2 (use with position for dragging).                                                                            |
 | `unsigned int gfx_mouse_events(void)`                                                   | One-frame events: press `MOUSE_LEFT_DOWN`/`RIGHT_DOWN` 1/2, double-click `MOUSE_LEFT_DOUBLE`/`RIGHT_DOUBLE` 4/8, release `MOUSE_LEFT_UP`/`RIGHT_UP` 16/32. |
 | `int gfx_mouse_wheel(void)`                                                            | Signed vertical wheel delta for the current frame; positive scrolls up, negative scrolls down.                                                            |
@@ -1084,8 +1087,8 @@ Coordinates are pixels from the top-left. Drawing beyond the screen is not
 clipped. Pixel and sprite colors are palette indexes. A sprite is a sequence of
 `width * height` bytes; `.data hex` is suitable for small sprites. Text data
 consists of glyph IDs: printable ASCII uses its character code minus 31, IDs
-96-101 select `ÃƒÆ’Ã‚Â¶ÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¥ÃƒÆ’Ã¢â‚¬â€œÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Â¦`, and `0` terminates the text. `GFX_TEXT` accepts a full
-30-bit text pointer. Its x/y inputs are stored as bytes and therefore should be in the
+96-101 select `ÃƒÆ’Ã‚Â¶ÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¥ÃƒÆ’Ã¢â‚¬â€œÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Â¦`, and `0` terminates the text. `GFX_TEXT` accepts a 24-bit text pointer; the C graphics API supports full
+30-bit pointers. Its x/y inputs are stored as bytes and therefore should be in the
 range 0-255. Its scratch bytes at `0x4300`-`0x4306` are reserved while it runs.
 Include the glyph data so it is loaded at `0x4400`; the mask table is supplied
 by `lib_gfx.asm` at `0x4200`.
@@ -1109,9 +1112,9 @@ C builtins: `gfx_ticks()`, `gfx_rtc(field)`, `gfx_irq_init()` (executes EI),
 `gfx_irq_keys()` (key interrupt count, word at 0x4342).
 
 Interrupt handlers live in `lib_cgfx.asm` at fixed addresses: `irq_timer` at
-0x0010 (vector 0x0004) and `irq_key` at 0x0030 (vector 0x0002). The C entry stub
-is `JMP __c_boot` at 0 with the boot code at 6. `RTI` restores both Z and C flags.
-C globals start at 0x80000.
+0x0020 (vector 0x0006) and `irq_key` at 0x0040 (vector 0x0002). The C entry stub
+is `JMP __c_boot` at 0 with the boot code at 0x000A. `RTI` restores the flags
+and full 30-bit PC. C globals start at 0x80000.
 
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 
