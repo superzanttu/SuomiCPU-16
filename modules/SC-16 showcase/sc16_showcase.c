@@ -1255,7 +1255,7 @@ void bench_max(void)
     remainder = 0;
     last = 0;
     bench_prev_speed = *((unsigned char *)0x43003);
-    gfx_speed(1);
+    gfx_speed(SPEED_MAX);
     s0 = host_seconds();
     while (host_seconds() == s0)
     {
@@ -1593,6 +1593,8 @@ void bench_step(void)
 int main(void)
 {
     int i;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     gfx_irq_init();
     for (i = 0; i < 40; i++)
     {
@@ -1646,7 +1648,7 @@ int main(void)
         if (page == STRESS_PAGE && !stress_active)
         {
             stress_previous_speed = *((unsigned char *)0x43003);
-            gfx_speed(1);
+            gfx_speed(SPEED_MAX);
             stress_active = 1;
             stress_sprite_count = 1;
             stress_fps = 0;

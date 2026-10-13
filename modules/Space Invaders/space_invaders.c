@@ -453,6 +453,8 @@ void draw(void)
 int main(void)
 {
     unsigned int keys;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     new_game();
     while (1)
     {

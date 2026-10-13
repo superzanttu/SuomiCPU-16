@@ -22,7 +22,9 @@ GFX_PLOT_ROW_DONE:
     INC R7
     MOV R4, R7
     ADD R7, R4
-    ADD R7, R4              ; VRAM base = 0x30000
+    ADD R7, R4
+    ADD R7, R4
+    ADD R7, R4              ; VRAM base = 0x50000
     ADD R7, R6
     ADD R7, R0
     ST R7, R2
@@ -34,6 +36,8 @@ GFX_CLEAR:
     LDI R6, 0xFFFF
     INC R6
     MOV R7, R6
+    ADD R6, R7
+    ADD R6, R7
     ADD R6, R7
     ADD R6, R7
     LDI R0, 240

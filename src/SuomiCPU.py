@@ -449,7 +449,9 @@ class SuomiCompute16:
                 column += 1
 
     def _gpu_source(self):
-        return (self.memory[GPU_BASE + 12] << 16) | (self.memory[GPU_BASE + 10] << 8) | self.memory[GPU_BASE + 11]
+        high = (self.memory[GPU_BASE + 12] << 8) | self.memory[GPU_BASE + 13]
+        low = (self.memory[GPU_BASE + 10] << 8) | self.memory[GPU_BASE + 11]
+        return ((high & 0x3FFF) << 16) | low
 
     def gpu_command(self, command):
         """Run a graphics coprocessor command; drawing targets the back buffer."""
@@ -1496,6 +1498,9 @@ class SuomiCompute16:
         self.registers = [0]*8
         self.sp = MEM_MASK
         self.pc = self.entry_point
+        self.memory[SPEED_ADDR] = SPEED_NORMAL
+        self.memory[VSYNC_ADDR] = 0
+        self.memory[GFX_MODE_ADDR] = GFX_MODE_320_240
         self.running = True
         self._console_device().reset(
             preserve_history=preserve_console_history

@@ -29,6 +29,8 @@ int main(void)
 {
     char name[24];
 
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     SCREEN_CLEAR();
     SCREEN_PRINT("Kuka olet? ", 1);
     name_length = SCREEN_INPUT(name, 23, 1);

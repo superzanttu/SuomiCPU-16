@@ -1936,6 +1936,8 @@ int main(void)
     unsigned int keys;
     unsigned int kx;
 
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     new_game();
     while (1)
     {

@@ -103,6 +103,8 @@ void draw(void) {
 
 int main(void) {
     int keys;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     x = 150;
     y = 120;
     net_open("netdemo");
