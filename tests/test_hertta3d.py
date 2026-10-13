@@ -1,7 +1,7 @@
 import unittest
 
 from gfx_harness import ROOT, compile_file, make_cpu, run_frame
-from src.SuomiCPU import GPU_BASE, KEYS_ADDR
+from src.SuomiCPU import BACK_START, GPU_BASE, KEYS_ADDR, SCREEN_WIDTH
 from c_compiler import compile_source
 
 SOURCE = ROOT / "modules" / "Hertta-3D" / "hertta3d.c"
@@ -16,6 +16,30 @@ class Hertta3DTests(unittest.TestCase):
         cpu.memory[KEYS_ADDR] = 32
         run_frame(cpu)
         self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
+
+    def test_gameplay_frame_renders_maze_walls_with_the_gpu(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        source = source[:source.index("\nint main(void)\n")]
+        source += (
+            "\nint main(void) {\n"
+            "  level = 1;\n"
+            "  reset_level();\n"
+            "  render_game();\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(SOURCE)))
+        steps = 0
+        while cpu.running and steps < 300_000:
+            cpu.step()
+            steps += 1
+
+        self.assertFalse(cpu.running, "instrumented gameplay render did not finish")
+        self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
+        pixels = cpu.memory[BACK_START:BACK_START + SCREEN_WIDTH * 240]
+        self.assertGreater(sum(pixel == 8 for pixel in pixels), 1_000)
+        self.assertGreater(sum(pixel == 14 for pixel in pixels), 1_000)
 
     def test_throwing_a_treat_in_front_of_hertta_counts_a_snack(self):
         source = SOURCE.read_text(encoding="utf-8")

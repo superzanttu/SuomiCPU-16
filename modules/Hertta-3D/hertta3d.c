@@ -213,7 +213,7 @@ void scene_quad(int x0, int x1, int half_height, int depth, int color)
         return;
     left = (x0 * depth) / 120;
     right = (x1 * depth) / 120;
-    top = (half_height * depth) / 120;
+    top = half_height;
     bottom = -top;
     a = scene_vertex(left, top, depth);
     b = scene_vertex(right, top, depth);
@@ -282,9 +282,8 @@ void build_view(void)
             depth = 32;
         left = -160 + (ray * 320) / RAYS;
         right = -160 + ((ray + 1) * 320) / RAYS;
-        color = depth < 400 ? (ray & 1 ? 14 : 8) :
-                depth < 800 ? (ray & 1 ? 10 : 9) : (ray & 1 ? 60 : 9);
-        scene_quad(left, right, 70, depth, color);
+        color = depth < 512 ? 14 : depth < 1024 ? 8 : 9;
+        scene_quad(left, right, FIX, depth, color);
     }
 
     dx = dog_x - player_x;
@@ -314,8 +313,12 @@ void build_view(void)
 
     scene[0] = vertex_count;
     scene[1] = face_count;
-    scene[2] = scene[3] = scene[4] = 0;
-    scene[5] = scene[6] = scene[7] = 0;
+    scene[2] = 0;
+    scene[3] = 0;
+    scene[4] = 0;
+    scene[5] = 0;
+    scene[6] = 0;
+    scene[7] = 0;
     scene[8] = 120 * FIX;
     scene[9] = GPU3D_FILL;
     compact_faces();

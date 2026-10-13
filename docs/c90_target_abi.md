@@ -14,18 +14,62 @@ below.
 | `short`, `unsigned short` | 16 bits |
 | `int`, `unsigned int` | 16 bits |
 | `long`, `unsigned long` | 32 bits |
-| `float` | IEEE-754 binary32 |
-| `double` | IEEE-754 binary64 |
-| `long double` | IEEE-754 binary64 |
+| `float` | IEEE-754 binary32, 4 bytes |
+| `double` | IEEE-754 binary64, 8 bytes |
+| `long double` | IEEE-754 binary64, 8 bytes |
 | object pointer | 30-bit byte address, stored in 4 bytes |
 | function pointer | 30-bit byte address, stored in 4 bytes |
 
 Bytes are 8 bits. Multi-byte integer and floating representations are
 big-endian. Integer signedness and ranges follow the representations above;
 `long` therefore provides the minimum range required by C90. `float` and
-`double` are separate types even though current compiler code aliases them.
-The floating-point format decisions meet the C90 minimum precision and range
-requirements.
+`double` are separate types in this target model. `long double` has the same
+representation and precision as `double`. The floating-point format decisions
+meet the C90 minimum precision and range requirements.
+
+### Floating-point representations
+
+The target uses the IEEE-754 binary interchange formats. `float` is binary32:
+one sign bit, an 8-bit exponent with bias 127, and a 23-bit trailing significand
+field. `double` and `long double` are binary64: one sign bit, an 11-bit
+exponent with bias 1023, and a 52-bit trailing significand field. Floating
+objects use big-endian byte order. There is no additional alignment
+requirement; the existing aggregate layout places objects larger than one
+byte at even offsets.
+
+| Property | `float` | `double` / `long double` |
+| --- | ---: | ---: |
+| `*_MANT_DIG` | 24 | 53 |
+| `*_DIG` | 6 | 15 |
+| `*_MIN_EXP` | -125 | -1021 |
+| `*_MIN_10_EXP` | -37 | -307 |
+| `*_MAX_EXP` | 128 | 1024 |
+| `*_MAX_10_EXP` | 38 | 308 |
+| `*_EPSILON` | 2^-23 | 2^-52 |
+| `*_MIN` (minimum positive normalized value) | 2^-126 | 2^-1022 |
+| `*_MAX` | 2^128 - 2^104 | 2^1024 - 2^971 |
+| minimum positive subnormal | 2^-149 | 2^-1074 |
+
+Decimal floating constants without a suffix have type `double`; `f`/`F`
+suffixes select `float`, and `l`/`L` suffixes select `long double`. Conversion
+to the destination format and every arithmetic operation round to nearest,
+ties to even; consequently `FLT_ROUNDS` is 1. Subnormals are supported
+(gradual underflow), and signed zero is preserved. Overflow produces a signed
+infinity; finite nonzero division by zero produces a signed infinity; invalid
+arithmetic produces a quiet NaN.
+Newly generated NaNs use the canonical positive encodings
+`0x7FC00000` for binary32 and `0x7FF8000000000000` for binary64; NaN payload
+propagation is not part of the ABI. NaNs do not trap: ordered comparisons with
+a NaN are false, and NaN compares unequal to itself. Positive and negative
+zero compare equal. Floating exceptions do not trap and no floating status
+flags are exposed to C.
+
+These are the selected target rules, not the current compiler's behavior. The
+compiler currently represents all three floating types as binary16, emits
+binary16 operations in 2-byte objects, and reports binary16 characteristics
+from `float.h`. Those active sizes and limits must not be changed independently
+of the floating-point instruction and compiler-backend work; doing so would
+make object layout and generated accesses disagree.
 
 Pointer objects occupy four bytes. Their representation stores the low 16
 address bits first, followed by the high 14 address bits; each 16-bit word is
