@@ -4,9 +4,9 @@
 GameState state;
 
 int main() {
-    game_init(&state);
-    gfx_speed(1);
+    gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    game_init(&state);
     
     while (1) {
         float dt;

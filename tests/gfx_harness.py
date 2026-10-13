@@ -1,7 +1,10 @@
 """Headless helpers for running compiled SC-16 programs frame by frame."""
 from pathlib import Path
 
-from src.SuomiCPU import BACK_START, KEYS_ADDR, MEM_SIZE, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START, SuomiCompute16
+from src.SuomiCPU import (
+    BACK_START, KEYS_ADDR, MEM_MASK, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START,
+    SuomiCompute16, create_memory,
+)
 from c_compiler import compile_source
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -9,11 +12,11 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def make_cpu(image):
     cpu = SuomiCompute16.__new__(SuomiCompute16)
-    cpu.memory = bytearray(MEM_SIZE)
+    cpu.memory = create_memory()
     cpu.registers = [0] * 8
     cpu.flags = {"Z": 0, "C": 0}
     cpu.running = True
-    cpu.sp = 0x2FFFF
+    cpu.sp = MEM_MASK
     cpu.frame_yield = False
     cpu.audio_enabled = False
     cpu.sound_log = []

@@ -1605,6 +1605,8 @@ void play_frame(unsigned int keys) {
 
 int main(void) {
     unsigned int keys;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     rs = 4242;
     gen_cave(77);
     state = 0;

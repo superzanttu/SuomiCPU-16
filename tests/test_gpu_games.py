@@ -1,12 +1,14 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
 from src.SuomiCPU import (
-    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, MEM_SIZE,
-    MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR, VSYNC_ADDR, SuomiCompute16, _load_jit,
+    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_MAX,
+    GFX_MODE_640_480, GFX_MODE_ADDR, MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR,
+    VRAM_START, VSYNC_ADDR, SuomiCompute16, _load_jit, create_memory,
 )
 
 HEADER = '#include "suomi_gfx.h"\n'
@@ -21,7 +23,7 @@ def run_c(body, frames=1):
 
 def bare_cpu():
     cpu = SuomiCompute16.__new__(SuomiCompute16)
-    cpu.memory = bytearray(MEM_SIZE)
+    cpu.memory = create_memory()
     cpu.frame_yield = False
     return cpu
 
@@ -31,7 +33,7 @@ def gpu(cpu, command, color=0, x=0, y=0, w=0, h=0, source=0):
         cpu.write_16(GPU_BASE + offset, value & 0xFFFF)
     cpu.write(GPU_BASE + 1, color)
     cpu.write_16(GPU_BASE + 10, source & 0xFFFF)
-    cpu.write(GPU_BASE + 12, source >> 16)
+    cpu.write_16(GPU_BASE + 12, (source >> 16) & 0x3FFF)
     cpu.write(GPU_BASE, command)
 
 
@@ -40,6 +42,47 @@ def back(cpu, x, y):
 
 
 class GpuTests(unittest.TestCase):
+    def test_640x480_packed_clear_pixel_rect_and_present(self):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
+
+        gpu(cpu, 1, color=2)
+        gpu(cpu, 2, color=3, x=1, y=0)
+        gpu(cpu, 3, color=1, x=2, y=0, w=3, h=2)
+
+        packed_size = 640 * 480 // 4
+        self.assertEqual(cpu.memory[BACK_START], 0xB5)
+        self.assertEqual(cpu.memory[BACK_START + 1], 0x6A)
+        self.assertEqual(cpu.memory[BACK_START + 640 // 4], 0xA5)
+        self.assertEqual(cpu.memory[BACK_START + packed_size - 1], 0xAA)
+
+        gpu(cpu, 8)
+
+        self.assertTrue(cpu.frame_yield)
+        self.assertEqual(cpu.memory[VRAM_START:VRAM_START + 2], b"\xB5\x6A")
+        decoded = cpu._decode_framebuffer(VRAM_START)
+        self.assertEqual(
+            list(decoded[:8]),
+            [2, 3, 1, 1, 1, 2, 2, 2],
+        )
+        self.assertEqual(
+            list(decoded[640:648]),
+            [2, 2, 1, 1, 1, 2, 2, 2],
+        )
+        self.assertEqual(cpu.memory[VRAM_START + packed_size - 1], 0xAA)
+
+    def test_640x480_mouse_coordinates_map_to_logical_pixels(self):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
+        cpu.screen = Mock()
+        cpu.screen.get_size.return_value = (1920, 1440)
+
+        with patch("src.SuomiCPU.pygame.mouse.get_pos", return_value=(1917, 1437)):
+            cpu.begin_mouse_frame()
+
+        self.assertEqual(cpu.read_16(MOUSE_ADDR), 639)
+        self.assertEqual(cpu.read_16(MOUSE_ADDR + 2), 479)
+
     def test_clear_pixel_rect_and_clipping(self):
         cpu = bare_cpu()
         gpu(cpu, 1, color=4)
@@ -208,7 +251,7 @@ class MotoRobotsTests(unittest.TestCase):
         cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
         run_frame(cpu, limit=400000)
 
-        self.assertEqual(cpu.memory[SPEED_ADDR], 1)
+        self.assertEqual(cpu.memory[SPEED_ADDR], SPEED_MAX)
         self.assertEqual(cpu.memory[VSYNC_ADDR], 1)
 
     def test_pathfinding_discovered_tiles_are_drawn_on_map_only_while_searching(self):
@@ -1193,9 +1236,17 @@ class PreprocessorTests(unittest.TestCase):
 
 class GameTests(unittest.TestCase):
     def play(self, name, keys, frames):
-        path = ROOT / "modules" / name
-        if name == "sc16_showcase.c":
-            path = ROOT / "modules" / "SC-16 showcase" / name
+        module_directories = {
+            "anaclock.c": "AnaClock",
+            "asteroids.c": "Asteroids",
+            "elitedemo.c": "Elite",
+            "lunarlander.c": "Lunar Lander",
+            "pacman.c": "PacMan",
+            "paint.c": "Paint",
+            "space_invaders.c": "Space Invaders",
+            "sc16_showcase.c": "SC-16 showcase",
+        }
+        path = ROOT / "modules" / module_directories.get(name, "") / name
         cpu = make_cpu(compile_file(path))
         for frame in range(frames):
             cpu.memory[KEYS_ADDR] = keys(frame)
@@ -1230,7 +1281,7 @@ class GameTests(unittest.TestCase):
         self.assertNotEqual(vram(idle), vram(moving))
 
     def test_anaclock_cycles_through_seven_distinct_faces(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "anaclock.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "AnaClock" / "anaclock.c"))
         faces = []
 
         cpu.memory[KEYS_ADDR] = 0
@@ -1247,7 +1298,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual(len(set(faces)), 7)
 
     def play_elite(self, keys, frames):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "elitedemo.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Elite" / "elitedemo.c"))
         for frame in range(frames):
             low, ext = keys(frame)
             cpu.memory[KEYS_ADDR] = low
@@ -1267,7 +1318,7 @@ class GameTests(unittest.TestCase):
         self.assertGreater(sum(1 for byte in vram(cpu) if byte), 100)
 
     def test_elitedemo_moons_orbit_and_scene_changes(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "elitedemo.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Elite" / "elitedemo.c"))
         run_frame(cpu, 5_000_000)
         first = bytes(vram(cpu))
         for _ in range(40):
@@ -1289,11 +1340,11 @@ class GameTests(unittest.TestCase):
         cpu.memory[KEYS_ADDR] = 0
         run_frame(cpu, 400_000)
         run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         for _ in range(8):
             cpu.memory[0x43010] = (cpu.memory[0x43010] + 1) % 60
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 0)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         measured = vram(cpu)
         estimate_chart = estimate[90 * SCREEN_WIDTH + 160:90 * SCREEN_WIDTH + 312]
         measured_chart = measured[90 * SCREEN_WIDTH + 160:90 * SCREEN_WIDTH + 312]
@@ -1377,7 +1428,7 @@ class GameTests(unittest.TestCase):
             cpu.memory[0x43002] |= 2
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         base_seconds = cpu.memory[0x43011] * 60 + cpu.memory[0x43010]
         elapsed_seconds = [0]
         frame_count = [0]
@@ -1397,7 +1448,7 @@ class GameTests(unittest.TestCase):
         )
         for _ in range(450):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         green_status = any(pixel(cpu, x, y) == 3 for x in range(8, 312) for y in range(216, 224))
         self.assertTrue(green_status)
         image = vram(cpu)
@@ -1419,7 +1470,7 @@ class GameTests(unittest.TestCase):
         frame_count[0] = 0
         for _ in range(20):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         red_status = any(pixel(cpu, x, y) == 2 for x in range(8, 312) for y in range(216, 224))
         self.assertTrue(red_status)
         self.assertEqual(
@@ -1428,7 +1479,7 @@ class GameTests(unittest.TestCase):
         )
         cpu.memory[KEYS_ADDR] = 2
         run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 0)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
 
     def test_lunar_lander_menu_flight_sound_and_crash(self):
         cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else 0, 8)
@@ -1456,7 +1507,7 @@ class GameTests(unittest.TestCase):
                 self.assertIn(channel, used, name)
 
     def test_elitedemo_engine_and_laser_sounds(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "elitedemo.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Elite" / "elitedemo.c"))
         for frame in range(12):
             cpu.memory[KEYS_ADDR] = 16
             cpu.memory[KEYS_ADDR + 1] = 4
@@ -1505,7 +1556,7 @@ class GameTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(MOUSE_ADDR + 6), 0)
 
     def test_paint_draws_with_mouse_drag_and_shapes(self):
-        cpu = make_cpu(compile_file(ROOT / "modules" / "paint.c"))
+        cpu = make_cpu(compile_file(ROOT / "modules" / "Paint" / "paint.c"))
         clock = [0]
 
         def step(x, y, down=None, up=None):

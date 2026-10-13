@@ -2343,6 +2343,8 @@ int main(void)
     unsigned int keys;
     int i;
     int interval;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     for (i = 0; i < 8; i++)
     {
         hud_last[i] = -1;

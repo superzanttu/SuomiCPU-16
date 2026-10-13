@@ -452,6 +452,8 @@ void click(int mx, int my) {
 
 int main(void) {
     int c, mx, my, down, was_down, ev;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     was_down = 0;
     status = "PICK A DISK OR PRESS NEW";
     ram[0] = 0;

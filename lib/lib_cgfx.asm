@@ -1,5 +1,5 @@
 ; Graphics coprocessor services for the C compiler (gfx_* builtins).
-; Arguments are on the stack (pushed right to left); first argument starts at SP+3.
+; Arguments are on the stack; the first argument starts at SP+4 after the 4-byte return PC.
 ; Results are returned in R0.
 ; Coprocessor registers at 0x43020: +0 CMD, +1 COLOR, +2 X, +4 Y, +6 W, +8 H,
 ; +10 SRC word, +12 SRC high byte, +14 RESULT.
@@ -44,7 +44,7 @@ CGFX_SRC:
     STW R7, R4
     INC R7
     INC R7
-    ST R7, R5
+    STW R7, R5
     RET
 
 CGFX_GO:
@@ -53,111 +53,111 @@ CGFX_GO:
     RET
 
 gfx_clear:
-    LDWS R4, 3
+    LDWS R4, 4
     CALLX CGFX_COLOR
     LDI R5, 1
     CALLX CGFX_GO
     RET
 
 gfx_pixel:
-    LDWS R0, 3
-    LDWS R1, 5
+    LDWS R0, 4
+    LDWS R1, 6
     CALLX CGFX_FIELDS
-    LDWS R4, 7
+    LDWS R4, 8
     CALLX CGFX_COLOR
     LDI R5, 2
     CALLX CGFX_GO
     RET
 
 gfx_rect:
-    LDWS R0, 3
-    LDWS R1, 5
-    LDWS R2, 7
-    LDWS R3, 9
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
+    LDWS R3, 10
     CALLX CGFX_FIELDS
-    LDWS R4, 11
+    LDWS R4, 12
     CALLX CGFX_COLOR
     LDI R5, 3
     CALLX CGFX_GO
     RET
 
 gfx_line:
-    LDWS R0, 3
-    LDWS R1, 5
-    LDWS R2, 7
-    LDWS R3, 9
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
+    LDWS R3, 10
     CALLX CGFX_FIELDS
-    LDWS R4, 11
+    LDWS R4, 12
     CALLX CGFX_COLOR
     LDI R5, 4
     CALLX CGFX_GO
     RET
 
 gfx_sprite:
-    LDWS R0, 3
-    LDWS R1, 5
-    LDWS R2, 7
-    LDWS R3, 9
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
+    LDWS R3, 10
     CALLX CGFX_FIELDS
-    LDWS R4, 11
+    LDWS R4, 12
     MOVSP R7
-    LDI R6, 13
+    LDI R6, 14
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
     LDI R5, 5
     CALLX CGFX_GO
     RET
 
 gfx_bitmap:
-    LDWS R0, 3
-    LDWS R1, 5
-    LDWS R2, 7
-    LDWS R3, 9
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
+    LDWS R3, 10
     CALLX CGFX_FIELDS
-    LDWS R4, 11
+    LDWS R4, 12
     MOVSP R7
-    LDI R6, 13
+    LDI R6, 14
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
-    LDWS R4, 14
+    LDWS R4, 16
     CALLX CGFX_COLOR
     LDI R5, 6
     CALLX CGFX_GO
     RET
 
 gfx_poly:
-    LDWS R0, 3
-    LDWS R1, 5
-    LDWS R2, 7
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
     LDI R3, 0
     CALLX CGFX_FIELDS
-    LDWS R4, 9
+    LDWS R4, 10
     MOVSP R7
-    LDI R6, 11
+    LDI R6, 12
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
-    LDWS R4, 12
+    LDWS R4, 14
     CALLX CGFX_COLOR
     LDI R5, 10
     CALLX CGFX_GO
     RET
 
 gfx_text:
-    LDWS R0, 3
-    LDWS R1, 5
+    LDWS R0, 4
+    LDWS R1, 6
     LDI R2, 0
     LDI R3, 0
     CALLX CGFX_FIELDS
-    LDWS R4, 7
+    LDWS R4, 8
     MOVSP R7
-    LDI R6, 9
+    LDI R6, 10
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
-    LDWS R4, 10
+    LDWS R4, 12
     CALLX CGFX_COLOR
     LDI R5, 7
     CALLX CGFX_GO
@@ -166,6 +166,14 @@ gfx_text:
 gfx_present:
     LDI R5, 8
     CALLX CGFX_GO
+    RET
+
+gfx_mode:
+    LDWS R0, 4
+    CALLX CGFX_HIGH
+    LDI R6, 0x3014
+    ADD R7, R6
+    ST R7, R0
     RET
 
 ; gfx_save() stores the back buffer as a static layer; gfx_restore() copies it back.
@@ -248,20 +256,20 @@ gfx_ticks:
 
 ; gfx_sound(channel, freq, frames, wave, volume): COLOR=channel, X=freq, Y=frames, W=wave, H=volume.
 gfx_sound:
-    LDWS R0, 5
-    LDWS R1, 7
-    LDWS R2, 9
-    LDWS R3, 11
+    LDWS R0, 6
+    LDWS R1, 8
+    LDWS R2, 10
+    LDWS R3, 12
     CALLX CGFX_FIELDS
-    LDWS R4, 3
+    LDWS R4, 4
     CALLX CGFX_COLOR
     LDI R5, 13
     CALLX CGFX_GO
     RET
 
-; gfx_speed(mode): writes the speed register at 0x43003. 0 = normal budget, nonzero = maximum budget.
+; gfx_speed(mode): writes one of the five speed modes to 0x43003.
 gfx_speed:
-    LDWS R0, 3
+    LDWS R0, 4
     CALLX CGFX_HIGH
     LDI R6, 0x3003
     ADD R7, R6
@@ -270,15 +278,15 @@ gfx_speed:
 
 ; gfx_vsync(enabled): synchronize presented frames to the emulator display rate.
 gfx_vsync:
-    LDWS R0, 3
+    LDWS R0, 4
     CALLX CGFX_HIGH
-    LDI R6, 0x3004
+    LDI R6, 0x3013
     ADD R7, R6
     ST R7, R0
     RET
 
 gfx_rtc:
-    LDWS R4, 3
+    LDWS R4, 4
     CALLX CGFX_COLOR
     LDI R5, 12
     CALLX CGFX_GO
@@ -288,7 +296,7 @@ gfx_rtc:
     RET
 
 ; Interrupt support.  gfx_irq_init() just executes EI.  Handlers live at fixed
-; addresses 0x0010 (RTC, vector 0x0004, once per display frame) and 0x0030
+; addresses 0x0020 (RTC, vector 0x0006, once per display frame) and 0x0040
 ; (keyboard, vector 0x0002).  The handlers preserve R6/R7 and the flags, so they are
 ; invisible to the interrupted program.  Counters live at 0x4340 and 0x4342.
 gfx_irq_init:
@@ -306,10 +314,10 @@ gfx_irq_keys:
     RET
 
 .address 0x0002
-.data hex 00, 30
-.address 0x0004
-.data hex 00, 10
-.address 0x0010
+.data hex 00, 00, 00, 40
+.address 0x0006
+.data hex 00, 00, 00, 20
+.address 0x0020
 irq_timer:
     ADJSP -4
     STWS R6, 0
@@ -323,7 +331,7 @@ irq_timer:
     ADJSP 4
     EI
     RTI
-.address 0x0030
+.address 0x0040
 irq_key:
     ADJSP -4
     STWS R6, 0
@@ -346,11 +354,11 @@ net_open:
     LDI R2, 0
     LDI R3, 0
     CALLX CGFX_FIELDS
-    LDWS R4, 3
+    LDWS R4, 4
     MOVSP R7
-    LDI R6, 5
+    LDI R6, 6
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
     LDI R5, 16
     CALLX NET_RUN
@@ -363,16 +371,16 @@ net_close:
 
 ; net_send(data, len)
 net_send:
-    LDWS R0, 6
+    LDWS R0, 8
     LDI R1, 0
     LDI R2, 0
     LDI R3, 0
     CALLX CGFX_FIELDS
-    LDWS R4, 3
+    LDWS R4, 4
     MOVSP R7
-    LDI R6, 5
+    LDI R6, 6
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
     LDI R5, 18
     CALLX NET_RUN
@@ -384,11 +392,11 @@ net_recv:
     LDI R2, 0
     LDI R3, 0
     CALLX CGFX_FIELDS
-    LDWS R4, 3
+    LDWS R4, 4
     MOVSP R7
-    LDI R6, 5
+    LDI R6, 6
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
     LDI R5, 19
     CALLX NET_RUN
@@ -426,7 +434,7 @@ net_slot:
     RET
 
 net_active:
-    LDWS R0, 3
+    LDWS R0, 4
     LDI R4, 2
     CALLX NET_QUERY
     RET
@@ -457,16 +465,16 @@ net_is_open:
 
 ; gfx_tilemap(map, map_w, map_h, cam_x, cam_y): GPU command 21
 gfx_tilemap:
-    LDWS R0, 10
-    LDWS R1, 12
-    LDWS R2, 6
+    LDWS R0, 12
+    LDWS R1, 14
+    LDWS R2, 10
     LDWS R3, 8
     CALLX CGFX_FIELDS
-    LDWS R4, 3
+    LDWS R4, 4
     MOVSP R7
-    LDI R6, 5
+    LDI R6, 6
     ADD R7, R6
-    LD R5, R7
+    LDW R5, R7
     CALLX CGFX_SRC
     LDI R5, 21
     CALLX CGFX_GO

@@ -31,8 +31,7 @@ OP_ADJSP = 0x1D
 OP_BC = 0x1E
 OP_SHR = 0x1F
 # Far control instructions use the reserved 0x3E low-six-bit selector in the
-# OP_SHR space. The five intervening bits carry a 2-bit operation and the
-# high three bits of a 19-bit target; the following word carries its low bits.
+# OP_SHR space; the next two words carry the 30-bit target.
 FAR_CONTROL_MASK = 0xF83F
 FAR_CONTROL_PREFIX = 0xF83E
 FAR_CONTROL_OPERATIONS = {
@@ -82,7 +81,7 @@ WIDE_OPERATIONS = {
 #   word 1: 0xF800 | (Rd << 8) | 0x1E   (OP_SHR extension space, prefix 0x1E)
 #   word 2: (operation << 12) | (immediate flag << 11) | Rs
 #   word 3: 16-bit immediate, present only when the immediate flag is set
-# Operation 7 is reserved for the three-word LDI19 address-load encoding.
+# Operation 7 loads a 30-bit address from the next two words.
 MULDIV_PREFIX = 0x1E
 MULDIV_IMMEDIATE_FLAG = 0x0800
 MULDIV_OPERATIONS = {
@@ -93,7 +92,12 @@ MULDIV_OPERATIONS = {
     "DIVS": 4,   # Rd = Rd / Rs, signed (truncates toward zero)
     "MOD": 5,    # Rd = Rd % Rs, unsigned
     "MODS": 6,   # Rd = Rd % Rs, signed (sign follows the dividend)
-    "LDI19": 7,  # Rd = 19-bit immediate address; low three control bits are high bits
+    "LDI19": 7,
+    "LDI30": 7,
+    "LDP": 8,
+    "STP": 9,
+    "SPLIT30": 10,
+    "JOIN30": 11,
 }
 
 # Extended ALU group: shifts, rotates, add/subtract with carry, immediate ALU forms
@@ -141,14 +145,15 @@ MISC_OPERATIONS = {
     "SETSP": 8,   # SP = Rd (low 16 bits)
     "CLZ": 9,     # Rd = number of leading zero bits of Rd
     "MOVSPH": 10, # Rd = high three bits of SP
-    "CALLRP": 11, # call the 19-bit address in Rd and the selected high register
-    "JMPRP": 12,  # jump to the 19-bit address in Rd and the selected high register
-    "SETSPH": 13, # SP = (Rd[2:0] << 16) | SP[15:0]
+    "CALLRP": 11,
+    "JMPRP": 12,
+    "SETSPH": 13,
 }
 
-# Far conditional branches: 4 bytes, 19-bit target.
-#   word 1: 0xF80D | (condition << 7) | (target[18:16] << 4)
-#   word 2: target[15:0]
+# Far conditional branches: 6 bytes, 30-bit target.
+#   word 1: 0xF80D | (condition << 7)
+#   word 2: target[29:16]
+#   word 3: target[15:0]
 BRANCH_CONDITIONS = {
     "BNZX": 0,   # Z = 0
     "BNCX": 1,   # C = 0

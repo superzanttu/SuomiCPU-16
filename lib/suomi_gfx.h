@@ -1,4 +1,4 @@
-// SuomiCPU graphics library: 320x240, 8-bit palette, double buffered.
+// 320x240 indexed or 640x480 packed graphics, double buffered.
 // All drawing goes to a back buffer; gfx_present() shows it and waits for the next frame.
 void gfx_clear(unsigned char color);
 void gfx_pixel(int x, int y, unsigned char color);
@@ -9,6 +9,7 @@ void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char c
 void gfx_poly(int x, int y, int count, char *points, unsigned char color);
 void gfx_text(int x, int y, char *text, unsigned char color);
 void gfx_present(void);
+void gfx_mode(int mode);
 // Static layer: gfx_save() keeps the back buffer, gfx_restore() redraws it in one call.
 void gfx_save(void);
 void gfx_restore(void);
@@ -50,6 +51,15 @@ unsigned int gfx_ticks(void);
 unsigned int gfx_rtc(unsigned char field);
 void gfx_speed(int mode);
 void gfx_vsync(int enabled);
+#define SPEED_VERY_SLOW 0
+#define SPEED_SLOW 1
+#define SPEED_NORMAL 2
+#define SPEED_FAST 3
+#define SPEED_MAX 4
+#define GFX_MODE_320_240 0
+#define GFX_MODE_640_480 1
+#define SCREEN_W_640 640
+#define SCREEN_H_480 480
 void gfx_irq_init(void);
 unsigned int gfx_irq_ticks(void);
 unsigned int gfx_irq_keys(void);

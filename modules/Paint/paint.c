@@ -279,6 +279,8 @@ void new_picture(void) {
 int main(void) {
     int mx, my, cx, cy;
     unsigned int buttons, ev;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     new_picture();
     while (1) {
         mx = gfx_mouse_x();

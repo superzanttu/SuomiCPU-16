@@ -52,7 +52,12 @@ jump_target:
     BZ sample_routine
     BC sample_routine
     LDA R0, sample_routine ; Load a full memory address into a register
-    LDI19 R0, 0x51234      ; Load a 19-bit absolute address directly
+    LDI19 R0, 0x12345      ; Legacy spelling for the 30-bit immediate opcode
+    LDI30 R0, 0x3F51234    ; Load a 30-bit absolute address directly
+    LDP R0, R1             ; Load a 30-bit pointer from the address in R1
+    STP R0, R1             ; Store a 30-bit pointer through the address in R1
+    SPLIT30 R0, R1         ; Split R0 into high/low words R0:R1
+    JOIN30 R0, R1          ; Join high/low words R0:R1 as a 30-bit pointer
     MOVSP R1                ; Copy the stack pointer into R1
     FADD R2, R3
     FSUB R2, R3
@@ -91,9 +96,9 @@ jump_target:
     SETSP R2
     NOP
     JMPR R2
-    JMPRP R0, R1         ; 19-bit indirect jump through the pointer pair R0:R1
+    JMPRP R0, R1         ; 30-bit indirect jump through the pointer pair R0:R1
     CALLR R2
-    CALLRP R0, R1         ; Indirect call through the 19-bit pointer pair R0:R1
+    CALLRP R0, R1         ; Indirect call through the 30-bit pointer pair R0:R1
     BNZX sample_routine    ; Far conditional branches (flag/signed/unsigned)
     BNCX sample_routine
     BNX sample_routine

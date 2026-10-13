@@ -554,6 +554,8 @@ int main(void)
     int minute_angle;
     int second_angle;
 
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     face = 0;
     previous_keys = 0;
     reset_digits = 1;

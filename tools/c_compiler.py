@@ -21,10 +21,10 @@ INTEGER_TYPES = frozenset({
 })
 ARITHMETIC_TYPES = INTEGER_TYPES | {"float"}
 CODE_BASE = 0x4800
-GLOBAL_BASE = 0x60000
-GLOBAL_LIMIT = 0x70000
+GLOBAL_BASE = 0x80000
+GLOBAL_LIMIT = 0x100000
 STACK_OFFSET_LIMIT = 0xFF
-FRAME_SIZE_LIMIT = 126
+FRAME_SIZE_LIMIT = 0xFF
 SCREEN_LIBRARY_FUNCTIONS = {
     "SCREEN_CLEAR": ("void", ()),
     "SCREEN_SET_CURSOR": ("void", ("unsigned char", "unsigned char")),
@@ -43,6 +43,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_poly": ("void", ("int", "int", "int", "char*", "unsigned char")),
     "gfx_text": ("void", ("int", "int", "char*", "unsigned char")),
     "gfx_present": ("void", ()),
+    "gfx_mode": ("void", ("int",)),
     "gfx_keys": ("unsigned int", ()),
     "gfx_random": ("unsigned int", ()),
     "gfx_ticks": ("unsigned int", ()),
@@ -277,7 +278,7 @@ _ASSIGNMENTS = {
 
 def _type_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
     if c_type.endswith("*"):
-        return 3
+        return 4
     array_type = re.fullmatch(r"(.+)\[(\d+)\]", c_type)
     if array_type is not None:
         return int(array_type.group(2)) * _type_size(array_type.group(1), records)
@@ -290,7 +291,7 @@ def _type_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
 
 def _object_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
     if c_type.endswith("*"):
-        return 3
+        return 4
     if records is not None and c_type in records:
         return records[c_type].size
     if c_type in ("long", "unsigned long"):
@@ -1759,12 +1760,12 @@ class _CodeGenerator:
             static_data_end += sum(len(data) for _, data in self.string_data)
         if static_data_end > GLOBAL_LIMIT:
             raise CCompilerError(
-                f"{self.filename}: static data exceeds the 64 KiB C data region"
+                f"{self.filename}: static data exceeds the 512 KiB C data region"
             )
         self.emit(".address 0")
         self.emit("__c_entry:")
         self.emit("    JMP __c_boot")
-        self.emit(".address 6")
+        self.emit(".address 10")
         self.emit("__c_boot:")
         self.emit("    CALLX __c_function_main")
         self.emit("    HALT")
@@ -1816,7 +1817,7 @@ class _CodeGenerator:
             address += self._global_size(global_)
         if address > GLOBAL_LIMIT:
             raise CCompilerError(
-                f"{self.filename}: global variables exceed the 64 KiB C data region"
+                f"{self.filename}: global variables exceed the 512 KiB C data region"
             )
 
     def _collect_string_literals(self) -> None:
@@ -1930,7 +1931,7 @@ class _CodeGenerator:
             address_extension = (
                 initializer.kind == "wide_constant"
                 and self._is_integer_constant_expression(initializer)
-                and 0 <= self._constant(initializer) < (1 << 19)
+                and 0 <= self._constant(initializer) < (1 << 30)
             )
             is_null_pointer_constant = (
                 self._is_integer_constant_expression(initializer)
@@ -1943,10 +1944,10 @@ class _CodeGenerator:
                 )
         value = self._constant(initializer)
         size = _type_size(c_type, self.records)
-        if c_type.endswith("*") and not 0 <= value < (1 << 19):
-            raise self.error(line, "pointer initializer is outside the 19-bit address range")
+        if c_type.endswith("*") and not 0 <= value < (1 << 30):
+            raise self.error(line, "pointer initializer is outside the 30-bit address range")
         if c_type.endswith("*"):
-            return (value & WORD_MASK).to_bytes(2, "big") + bytes((value >> 16,))
+            return (value & WORD_MASK).to_bytes(2, "big") + ((value >> 16) & WORD_MASK).to_bytes(2, "big")
         return (value & ((1 << (size * 8)) - 1)).to_bytes(size, "big")
 
     def _constant(self, expression: Expr | None) -> int:
@@ -2267,17 +2268,17 @@ class _CodeGenerator:
         parameter_bytes = sum(
             _object_size(c_type, self.records) for c_type, _ in function.parameters
         )
-        hidden_return_bytes = 3 if function.return_type in self.records else 0
+        hidden_return_bytes = 4 if function.return_type in self.records else 0
         if (
-            self.frame_size + 3 + hidden_return_bytes + parameter_bytes
+            self.frame_size + 4 + hidden_return_bytes + parameter_bytes
             > STACK_OFFSET_LIMIT
         ):
             raise self.error(function.line, "parameters exceed stack-relative address range")
         self.stack_depth = 0
         self.scopes = [{}]
-        parameter_offset = self.frame_size + 3
+        parameter_offset = self.frame_size + 4
         if function.return_type in self.records:
-            parameter_offset += 3
+            parameter_offset += 4
         for c_type, name in function.parameters:
             if name is None:
                 parameter_offset += _object_size(c_type, self.records)
@@ -2294,7 +2295,7 @@ class _CodeGenerator:
             parameter_offset += _object_size(c_type, self.records)
         self.emit(f"__c_function_{function.name}:")
         if self.frame_size:
-            self.emit(f"    ADJSP -{self.frame_size}")
+            self._adjust_stack(-self.frame_size)
         for statement in function.body.children:
             self._statement(statement)
         self.emit("    LDI R0, 0")
@@ -2302,8 +2303,14 @@ class _CodeGenerator:
 
     def _emit_epilogue(self) -> None:
         if self.frame_size:
-            self.emit(f"    ADJSP {self.frame_size}")
+            self._adjust_stack(self.frame_size)
         self.emit("    RET")
+
+    def _adjust_stack(self, amount: int) -> None:
+        while amount:
+            adjustment = min(amount, 127) if amount > 0 else max(amount, -128)
+            self.emit(f"    ADJSP {adjustment}")
+            amount -= adjustment
 
     def _lookup(self, name: str, line: int) -> _Variable:
         for scope in reversed(self.scopes):
@@ -2329,51 +2336,15 @@ class _CodeGenerator:
         return adjusted
 
     def _emit_address(self, register: str, address: int) -> None:
-        if not 0 <= address < 0x80000:
-            raise CCompilerError("generated object address is outside 19-bit memory")
-        self.emit(f"    LDI19 {register}, {address}")
+        if not 0 <= address < (1 << 30):
+            raise CCompilerError("generated object address is outside 30-bit memory")
+        self.emit(f"    LDI30 {register}, {address}")
 
     def _emit_load_pointer(self, register: str) -> None:
-        repeat = self.label("pointer_load")
-        done = self.label("pointer_load_done")
-        self.emit(f"    LDW {register}, R7")
-        self.emit("    INC R7")
-        self.emit("    INC R7")
-        self.emit("    LD R5, R7")
-        self.emit("    LDI R4, 0")
-        self.emit("    LDI R6, 0xFFFF")
-        self.emit("    INC R6")
-        self.emit("    LDI R3, 0")
-        self.emit(f"{repeat}:")
-        self.emit("    CMP R5, R3")
-        self.emit(f"    BZX {done}")
-        self.emit("    ADD R4, R6")
-        self.emit("    DEC R5")
-        self.emit("    CMP R5, R3")
-        self.emit(f"    BZX {done}")
-        self.emit(f"    JMPX {repeat}")
-        self.emit(f"{done}:")
-        self.emit(f"    ADD {register}, R4")
+        self.emit(f"    LDP {register}, R7")
 
     def _emit_store_pointer(self, register: str) -> None:
-        repeat = self.label("pointer_store")
-        done = self.label("pointer_store_done")
-        self.emit(f"    STW R7, {register}")
-        self.emit("    INC R7")
-        self.emit("    INC R7")
-        self.emit(f"    MOV R5, {register}")
-        self.emit("    LDI R4, 0xFFFF")
-        self.emit("    INC R4")
-        self.emit("    LDI R6, 0")
-        self.emit("    LDI R3, 0")
-        self.emit(f"{repeat}:")
-        self.emit("    CMP R5, R4")
-        self.emit(f"    BCX {done}")
-        self.emit("    SUB R5, R4")
-        self.emit("    INC R6")
-        self.emit(f"    JMPX {repeat}")
-        self.emit(f"{done}:")
-        self.emit("    ST R7, R6")
+        self.emit(f"    STP {register}, R7")
 
     def _load_variable(self, variable: _Variable, register: str, line: int) -> None:
         if variable.constant_value is not None:
@@ -2534,48 +2505,14 @@ class _CodeGenerator:
             self.emit(f"    AND {register}, R7")
 
     def _convert_long_to_pointer(self, register: str) -> None:
-        """Pack the low 19 bits of the long result into the pointer register form."""
-        scratch = [f"R{index}" for index in range(2, 8) if f"R{index}" != register]
-        high, increment, mask, zero = scratch[:4]
-        repeat = self.label("long_to_pointer")
-        done = self.label("long_to_pointer_done")
-        self.emit(f"    MOV {high}, R0")
-        if register != "R1":
-            self.emit(f"    MOV {register}, R1")
-        self.emit(f"    LDI {mask}, 7")
-        self.emit(f"    AND {high}, {mask}")
-        self.emit(f"    LDI {increment}, 0xFFFF")
-        self.emit(f"    INC {increment}")
-        self.emit(f"    LDI {zero}, 0")
-        self.emit(f"{repeat}:")
-        self.emit(f"    CMP {high}, {zero}")
-        self.emit(f"    BZX {done}")
-        self.emit(f"    ADD {register}, {increment}")
-        self.emit(f"    DEC {high}")
-        self.emit(f"    CMP {high}, {zero}")
-        self.emit(f"    BZX {done}")
-        self.emit(f"    JMPX {repeat}")
-        self.emit(f"{done}:")
+        """Pack a 30-bit address from a long pair into the pointer register form."""
+        self.emit("    JOIN30 R0, R1")
+        if register != "R0":
+            self.emit(f"    MOV {register}, R0")
 
     def _convert_pointer_to_long(self, register: str) -> None:
-        """Split the compiler's expanded 19-bit pointer value into a long pair."""
-        scratch = [f"R{index}" for index in range(2, 8) if f"R{index}" != register]
-        remaining, low_word, word_size = scratch[:3]
-        repeat = self.label("pointer_to_long")
-        done = self.label("pointer_to_long_done")
-        self.emit(f"    MOV {remaining}, {register}")
-        self.emit(f"    LDI {low_word}, 0")
-        self.emit(f"    LDI {word_size}, 0xFFFF")
-        self.emit(f"    INC {word_size}")
-        self.emit(f"{repeat}:")
-        self.emit(f"    CMP {remaining}, {word_size}")
-        self.emit(f"    BCX {done}")
-        self.emit(f"    SUB {remaining}, {word_size}")
-        self.emit(f"    INC {low_word}")
-        self.emit(f"    JMPX {repeat}")
-        self.emit(f"{done}:")
-        self.emit(f"    MOV {register}, {low_word}")
-        self.emit(f"    MOV R1, {remaining}")
+        """Split the compiler's expanded 30-bit pointer value into a long pair."""
+        self.emit(f"    SPLIT30 {register}, R1")
 
     def _statement(self, statement: Stmt) -> None:
         kind = statement.kind
@@ -2689,12 +2626,12 @@ class _CodeGenerator:
                         )
                 self._expression(expression)
                 if self.current_function is not None and return_type in self.records:
-                    self.emit("    ADJSP -3")
-                    self.stack_depth += 3
+                    self.emit("    ADJSP -4")
+                    self.stack_depth += 4
                     self.emit("    MOVSP R7")
                     self._emit_store_pointer("R0")
                     self.emit("    MOVSP R7")
-                    destination_offset = self.frame_size + 3 + self.stack_depth
+                    destination_offset = self.frame_size + 4 + self.stack_depth
                     if destination_offset:
                         self.emit(f"    LDI R6, {destination_offset}")
                         self.emit("    ADD R7, R6")
@@ -2719,8 +2656,8 @@ class _CodeGenerator:
                     self.emit("    DEC R6")
                     self.emit(f"    JMPX {repeat}")
                     self.emit(f"{done}:")
-                    self.emit("    ADJSP 3")
-                    self.stack_depth -= 3
+                    self.emit("    ADJSP 4")
+                    self.stack_depth -= 4
                 elif self.current_function is not None:
                     self._convert_to_type("R0", return_type, source_type)
             self._emit_epilogue()
@@ -2902,7 +2839,7 @@ class _CodeGenerator:
         self.break_labels.pop()
         self.emit(f"{end_label}:")
         saved_size = 4 if wide_switch else 2
-        self.emit(f"    ADJSP {saved_size}")
+        self._adjust_stack(saved_size)
         self.stack_depth -= saved_size
 
     def _initialize_local_array(self, variable: _Variable, local: Local, line: int) -> None:
@@ -3443,25 +3380,21 @@ class _CodeGenerator:
         self, pointer: Expr, offset: Expr, stride: int, subtract: bool
     ) -> None:
         self._expression(pointer)
-        self.emit("    ADJSP -3")
+        self.emit("    ADJSP -4")
         self.emit("    MOVSP R7")
         self._emit_store_pointer("R0")
-        self.stack_depth += 3
+        self.stack_depth += 4
         self._emit_scaled_index(offset, stride)
         self.emit("    MOV R2, R0")
         self.emit("    MOVSP R7")
         self._emit_load_pointer("R1")
         self.emit(f"    {'SUB' if subtract else 'ADD'} R1, R2")
         self.emit("    MOV R0, R1")
-        self.emit("    ADJSP 3")
-        self.stack_depth -= 3
+        self.emit("    ADJSP 4")
+        self.stack_depth -= 4
 
     def _pointer_value_to_wide_pair(self) -> None:
-        self.emit("    MOV R1, R0")
-        self.emit("    LDI R7, 0xFFFF")
-        self.emit("    AND R1, R7")
-        self.emit("    LSR R0, 15")
-        self.emit("    LSR R0, 1")
+        self._convert_pointer_to_long("R0")
 
     def _pointer_difference_expression(
         self, left: Expr, right: Expr, stride: int
@@ -3529,18 +3462,18 @@ class _CodeGenerator:
                 self._lvalue_address(base, line)
             else:
                 self._expression(base)
-            self.emit("    ADJSP -3")
+            self.emit("    ADJSP -4")
             self.emit("    MOVSP R7")
             self._emit_store_pointer("R0")
-            self.stack_depth += 3
+            self.stack_depth += 4
             self._emit_scaled_index(index, element_size)
             self.emit("    MOV R2, R0")
             self.emit("    MOVSP R7")
             self._emit_load_pointer("R1")
             self.emit("    ADD R1, R2")
             self.emit("    MOV R0, R1")
-            self.emit("    ADJSP 3")
-            self.stack_depth -= 3
+            self.emit("    ADJSP 4")
+            self.stack_depth -= 4
             return element_type
         if expression.kind == "member":
             operator, field_name = expression.value
@@ -3666,25 +3599,25 @@ class _CodeGenerator:
             self.stack_depth -= 4
             return
         if c_type.endswith("*"):
-            self.emit("    ADJSP -3")
+            self.emit("    ADJSP -4")
             self.emit("    MOVSP R7")
             self._emit_store_pointer(register)
-            self.stack_depth += 3
+            self.stack_depth += 4
             self._lvalue_address(expression, line)
-            self.emit("    ADJSP -3")
+            self.emit("    ADJSP -4")
             self.emit("    MOVSP R7")
             self._emit_store_pointer("R0")
-            self.stack_depth += 3
+            self.stack_depth += 4
             self.emit("    MOVSP R7")
             self._emit_load_pointer("R1")
             self.emit("    MOVSP R7")
-            self.emit("    LDI R6, 3")
+            self.emit("    LDI R6, 4")
             self.emit("    ADD R7, R6")
             self._emit_load_pointer("R0")
             self.emit("    MOV R7, R1")
             self._emit_store_pointer("R0")
-            self.emit("    ADJSP 6")
-            self.stack_depth -= 6
+            self.emit("    ADJSP 8")
+            self.stack_depth -= 8
             return
         self.emit(f"    PUSH {register}")
         self.stack_depth += 2
@@ -3706,8 +3639,8 @@ class _CodeGenerator:
             )
         width = _type_size(c_type, self.records)
         self._expression(source)
-        self.emit("    ADJSP -3")
-        self.stack_depth += 3
+        self.emit("    ADJSP -4")
+        self.stack_depth += 4
         self.emit("    MOVSP R7")
         self._emit_store_pointer("R0")
         self._lvalue_address(target, line)
@@ -3729,8 +3662,8 @@ class _CodeGenerator:
         self.emit("    DEC R6")
         self.emit(f"    JMPX {repeat}")
         self.emit(f"{done}:")
-        self.emit("    ADJSP 3")
-        self.stack_depth -= 3
+        self.emit("    ADJSP 4")
+        self.stack_depth -= 4
         self.emit("    MOV R0, R3")
 
     def _expression(self, expression: Expr) -> None:
@@ -3929,7 +3862,7 @@ class _CodeGenerator:
                 width = _object_size(parameter_type, self.records)
                 if record_argument:
                     self.emit("    MOV R4, R0")
-                    self.emit(f"    ADJSP -{width}")
+                    self._adjust_stack(-width)
                     self.stack_depth += width
                     self.emit("    MOVSP R5")
                     for _ in range(width):
@@ -3939,8 +3872,8 @@ class _CodeGenerator:
                         self.emit("    INC R5")
                 else:
                     self._convert_to_type("R0", parameter_type, source_type)
-                    if width == 3:
-                        self.emit("    ADJSP -3")
+                    if parameter_type.endswith("*"):
+                        self.emit("    ADJSP -4")
                         self.emit("    MOVSP R7")
                         self._emit_store_pointer("R0")
                     elif width == 4:
@@ -3963,22 +3896,22 @@ class _CodeGenerator:
                 if result_offset:
                     self.emit(f"    LDI R7, {result_offset}")
                     self.emit("    ADD R0, R7")
-                self.emit("    ADJSP -3")
-                self.stack_depth += 3
+                self.emit("    ADJSP -4")
+                self.stack_depth += 4
                 self.emit("    MOVSP R7")
                 self._emit_store_pointer("R0")
-                argument_bytes += 3
+                argument_bytes += 4
             if name == "__sc16_setjmp":
                 continuation = self.label("setjmp_return")
                 done = self.label("setjmp_done")
                 self.emit("    MOVSP R7")
                 self._emit_load_pointer("R2")
                 self.emit("    MOV R7, R2")
-                self.emit(f"    LDI19 R0, {continuation}")
+                self.emit(f"    LDI30 R0, {continuation}")
                 self._emit_store_pointer("R0")
                 self.emit("    MOVSP R0")
                 self.emit("    MOV R7, R2")
-                self.emit("    LDI R6, 3")
+                self.emit("    LDI R6, 4")
                 self.emit("    ADD R7, R6")
                 self._emit_store_pointer("R0")
                 self.emit("    LDI R0, 0")
@@ -3988,7 +3921,7 @@ class _CodeGenerator:
                 self.emit(f"{done}:")
             elif name == "longjmp":
                 continuation = self.label("longjmp_continue")
-                self.emit("    LDWS R0, 3")
+                self.emit("    LDWS R0, 4")
                 self.emit("    LDI R7, 0")
                 self.emit("    CMP R0, R7")
                 self.emit(f"    BNZX {continuation}")
@@ -3998,18 +3931,18 @@ class _CodeGenerator:
                 self.emit("    MOVSP R7")
                 self._emit_load_pointer("R2")
                 self.emit("    MOV R7, R2")
-                self.emit("    LDI R6, 3")
+                self.emit("    LDI R6, 4")
                 self.emit("    ADD R7, R6")
                 self._emit_load_pointer("R0")
-                self.emit("    MOV R3, R0")
+                self.emit("    SPLIT30 R0, R3")
                 self.emit("    SETSP R3")
-                self.emit("    SETSPH R3")
+                self.emit("    SETSPH R0")
                 self.emit("    MOV R7, R2")
                 self.emit("    LDW R0, R7")
                 self.emit("    INC R7")
                 self.emit("    INC R7")
-                self.emit("    LD R3, R7")
-                self.emit("    LDI R6, 7")
+                self.emit("    LDW R3, R7")
+                self.emit("    LDI R6, 0x3FFF")
                 self.emit("    AND R3, R6")
                 self.emit("    JMPRP R0, R3")
                 self.stack_depth -= argument_bytes
@@ -4023,7 +3956,7 @@ class _CodeGenerator:
             else:
                 self.emit(f"    CALLX __c_function_{name}")
             if argument_bytes:
-                self.emit(f"    ADJSP {argument_bytes}")
+                self._adjust_stack(argument_bytes)
                 self.stack_depth -= argument_bytes
             if return_type in self.records:
                 self.emit("    MOVSP R0")
@@ -4191,7 +4124,7 @@ class _CodeGenerator:
                         self.emit("    LDWS R1, 2")
                     else:
                         self.emit("    LDWS R0, 0")
-                    self.emit(f"    ADJSP {saved_result_size}")
+                    self._adjust_stack(saved_result_size)
                     self.stack_depth -= saved_result_size
                 return
             self._expression(child)
@@ -4235,16 +4168,16 @@ class _CodeGenerator:
                 self.emit(f"    {'ADD32' if expression.value == '++' else 'SUB32'} R0, R2")
                 saved_size = 4
             elif c_type.endswith("*"):
-                self.emit("    ADJSP -3")
+                self.emit("    ADJSP -4")
                 self.emit("    MOVSP R7")
                 self._emit_store_pointer("R0")
-                self.stack_depth += 3
+                self.stack_depth += 4
                 self.emit(f"    LDI R7, {_type_size(c_type[:-1], self.records)}")
                 if expression.value == "++":
                     self.emit("    ADD R0, R7")
                 else:
                     self.emit("    SUB R0, R7")
-                saved_size = 3
+                saved_size = 4
             else:
                 self.emit("    PUSH R0")
                 self.stack_depth += 2
@@ -4259,15 +4192,15 @@ class _CodeGenerator:
                     self.emit("    AND R0, R7")
                 saved_size = 2
             self._store_lvalue(child, "R0", c_type, expression.line)
-            if saved_size == 4:
-                self.emit("    LDWS R0, 0")
-                self.emit("    LDWS R1, 2")
-            elif saved_size == 3:
+            if c_type.endswith("*"):
                 self.emit("    MOVSP R7")
                 self._emit_load_pointer("R0")
+            elif saved_size == 4:
+                self.emit("    LDWS R0, 0")
+                self.emit("    LDWS R1, 2")
             else:
                 self.emit("    LDWS R0, 0")
-            self.emit(f"    ADJSP {saved_size}")
+            self._adjust_stack(saved_size)
             self.stack_depth -= saved_size
             return
         if kind == "index":
@@ -4357,7 +4290,7 @@ class _CodeGenerator:
         self._expression(left)
         left_size = _object_size(left_type, self.records)
         if left_type.endswith("*"):
-            self.emit("    ADJSP -3")
+            self.emit("    ADJSP -4")
             self.emit("    MOVSP R7")
             self._emit_store_pointer("R0")
         else:
@@ -4380,7 +4313,7 @@ class _CodeGenerator:
             if pointer_type is not None:
                 stride = _type_size(pointer_type[:-1], self.records)
                 self._scale_index("R0", stride)
-        self.emit(f"    ADJSP {left_size}")
+        self._adjust_stack(left_size)
         self.stack_depth -= left_size
         result_type = self._expression_type(expression)
         if operator not in ("==", "!=", "<", "<=", ">", ">=") and result_type == "float":

@@ -6,23 +6,35 @@ import pygame
 from assembler import assemble
 from src.SuomiCPU import (
     KEY_BITS,
-    MEM_SIZE,
+    SPEED_MAX,
     SPEED_ADDR,
     VSYNC_ADDR,
     VRAM_START,
     SuomiCompute16,
+    create_memory,
     _screen_to_logical,
     _set_display_mode,
 )
 
 
 class DisplayTests(unittest.TestCase):
+    def test_resuming_pause_resets_instruction_budget_timestamp(self):
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
+        emulator.paused = True
+        emulator.console_log = Mock()
+
+        with patch("src.SuomiCPU.time.monotonic", return_value=123.0):
+            emulator.toggle_pause()
+
+        self.assertFalse(emulator.paused)
+        self.assertEqual(emulator._speed_time, 123.0)
+
     def test_tab_key_has_a_dedicated_held_key_bit(self):
         self.assertEqual(KEY_BITS[pygame.K_TAB], 64)
 
     def test_cpu_vram_writes_are_visible_in_palette_surface(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
-        emulator.memory = bytearray(MEM_SIZE)
+        emulator.memory = create_memory()
         emulator.registers = [0] * 8
         emulator.flags = {"Z": 0, "C": 0}
         emulator.running = True
@@ -38,6 +50,8 @@ class DisplayTests(unittest.TestCase):
                 "LDI R0, 0xFFFF\n"
                 "INC R0\n"
                 "MOV R1, R0\n"
+                "ADD R0, R1\n"
+                "ADD R0, R1\n"
                 "ADD R0, R1\n"
                 "ADD R0, R1\n"
                 "LDI R2, 25\n"
@@ -125,8 +139,8 @@ class DisplayTests(unittest.TestCase):
 
     def test_max_speed_keeps_display_updates_at_display_rate(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
-        emulator.memory = bytearray(MEM_SIZE)
-        emulator.memory[SPEED_ADDR] = 1
+        emulator.memory = create_memory()
+        emulator.memory[SPEED_ADDR] = SPEED_MAX
         emulator.clock = Mock()
         emulator.paused = False
         emulator.reboot_requested = False
@@ -160,8 +174,8 @@ class DisplayTests(unittest.TestCase):
 
     def test_vsync_throttles_max_speed_on_presented_frames(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
-        emulator.memory = bytearray(MEM_SIZE)
-        emulator.memory[SPEED_ADDR] = 1
+        emulator.memory = create_memory()
+        emulator.memory[SPEED_ADDR] = SPEED_MAX
         emulator.memory[VSYNC_ADDR] = 1
         emulator.clock = Mock()
         emulator.paused = False

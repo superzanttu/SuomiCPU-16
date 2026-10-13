@@ -336,6 +336,8 @@ void draw_scene()
 
 int main()
 {
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     init_game();
 
     while (1)

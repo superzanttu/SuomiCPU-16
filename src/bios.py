@@ -33,12 +33,12 @@ class BootModule:
 
 
 def initialize_bios(cpu):
-    descriptor = bytearray(16)
+    descriptor = bytearray(20)
     descriptor[0:4] = b"SC16"
-    descriptor[4:6] = bytes((1, 0))
-    descriptor[6:9] = MEM_SIZE.to_bytes(3, "big")
-    descriptor[9:12] = CONSOLE_DATA.to_bytes(3, "big")
-    descriptor[12:15] = DISK_BASE.to_bytes(3, "big")
+    descriptor[4:6] = bytes((2, 0))
+    descriptor[6:10] = MEM_SIZE.to_bytes(4, "big")
+    descriptor[10:13] = CONSOLE_DATA.to_bytes(3, "big")
+    descriptor[13:16] = DISK_BASE.to_bytes(3, "big")
     cpu.memory[BIOS_BASE:BIOS_BASE + len(descriptor)] = descriptor
 
 
@@ -52,11 +52,11 @@ def mount_data_disk(cpu, disk_id):
             raise DiskDeviceError(f"virtual data disk {disk_id!r} does not exist")
         cpu.disk.load_disk(disk_id)
     except DiskDeviceError as exc:
-        cpu.memory[BIOS_BASE + 15] = 1
+        cpu.memory[BIOS_BASE + 19] = 1
         if hasattr(cpu, "console_log"):
             cpu.console_log(f"ERROR: Cannot mount data disk: {exc}")
         raise BIOSError(str(exc)) from exc
-    cpu.memory[BIOS_BASE + 15] = 0
+    cpu.memory[BIOS_BASE + 19] = 0
     if hasattr(cpu, "console_log"):
         cpu.console_log(f"Data disk mounted: {disk_id}")
 

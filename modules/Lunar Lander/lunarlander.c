@@ -1176,6 +1176,8 @@ void update_result(unsigned int pressed)
 int main(void)
 {
     unsigned int keys, pressed;
+    gfx_speed(SPEED_MAX);
+    gfx_vsync(1);
     mode = M_CLASSIC;
     diff = 1;
     level = 1;
