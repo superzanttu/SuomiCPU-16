@@ -1544,6 +1544,14 @@ class GameTests(unittest.TestCase):
         frame_count[0] = 0
         for _ in range(30):
             run_frame(cpu, 400_000)
+        self.assertEqual(
+            count_display,
+            b"".join(vram(cpu)[y * SCREEN_WIDTH + 68:y * SCREEN_WIDTH + 92] for y in range(38, 46)),
+        )
+        frames_per_second[0] = 31
+        frame_count[0] = 0
+        for _ in range(31):
+            run_frame(cpu, 400_000)
         self.assertNotEqual(
             count_display,
             b"".join(vram(cpu)[y * SCREEN_WIDTH + 68:y * SCREEN_WIDTH + 92] for y in range(38, 46)),
@@ -1576,7 +1584,7 @@ class GameTests(unittest.TestCase):
         self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
         elapsed_seconds = [0]
         frame_count = [0]
-        frames_per_second = [30]
+        frames_per_second = [31]
 
         def fake_update_rtc():
             frame_count[0] += 1
@@ -1586,7 +1594,7 @@ class GameTests(unittest.TestCase):
             cpu.memory[0x43011] = elapsed_seconds[0] // 60
 
         cpu.update_rtc = fake_update_rtc
-        for _ in range(60):
+        for _ in range(62):
             run_frame(cpu, 400_000)
         self.assertEqual(cpu.read_16(0x10000000), 21)
         self.assertEqual(cpu.read_16(0x10000002), 0)
@@ -1601,6 +1609,12 @@ class GameTests(unittest.TestCase):
         frames_per_second[0] = 30
         frame_count[0] = 0
         for _ in range(30):
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.read_16(0x10000000), 21)
+
+        frames_per_second[0] = 31
+        frame_count[0] = 0
+        for _ in range(31):
             run_frame(cpu, 400_000)
         self.assertEqual(cpu.read_16(0x10000000), 22)
 

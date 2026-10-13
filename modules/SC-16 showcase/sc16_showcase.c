@@ -38,7 +38,6 @@
 #define TILE_MAP_H 20
 #define NETWORK_PAGE 11
 #define STRESS_PAGE 13
-#define STRESS_MAX_SPRITES 200
 #define SHIP_VERTICES 27
 #define SHIP_FACES 44
 
@@ -140,7 +139,6 @@ int ship_face_count;
 int stress_active;
 int stress_sprite_count;
 int stress_fps;
-int stress_done;
 int stress_slow_mode;
 unsigned int stress_last_ticks;
 unsigned int stress_last_second;
@@ -1101,15 +1099,10 @@ void page_sprite_load(void)
         {
             stress_slow_mode = 1;
         }
-        else
+        else if (!stress_slow_mode || stress_fps > 30)
         {
             seconds = elapsed * (stress_slow_mode ? 1 : 10);
             stress_sprite_count = stress_sprite_count + seconds;
-            if (stress_sprite_count >= STRESS_MAX_SPRITES)
-            {
-                stress_sprite_count = STRESS_MAX_SPRITES;
-                stress_done = 1;
-            }
         }
         stress_last_ticks = gfx_ticks();
         stress_last_second = now;
@@ -1127,11 +1120,7 @@ void page_sprite_load(void)
         y = 120 + (sinv(frame / 2 + i * 2) * 75) / 100;
         gfx_sprite(x, y, 8, 8, smiley);
     }
-    if (stress_done)
-    {
-        gfx_text(8, 216, "MAXIMUM SPRITE COUNT REACHED", RED);
-    }
-    else if (stress_slow_mode && stress_fps < 30)
+    if (stress_slow_mode && stress_fps <= 30)
     {
         gfx_text(8, 216, "LOW FPS - WAITING TO RECOVER", YELLOW);
     }
@@ -1703,7 +1692,6 @@ int main(void)
             stress_active = 1;
             stress_sprite_count = 1;
             stress_fps = 0;
-            stress_done = 0;
             stress_slow_mode = 0;
             stress_last_ticks = gfx_ticks();
             stress_last_second = host_seconds();

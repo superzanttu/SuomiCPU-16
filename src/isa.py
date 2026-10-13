@@ -144,7 +144,7 @@ MISC_OPERATIONS = {
     "CLC": 7,     # C = 0
     "SETSP": 8,   # SP = Rd (low 16 bits)
     "CLZ": 9,     # Rd = number of leading zero bits of Rd
-    "MOVSPH": 10, # Rd = high three bits of SP
+    "MOVSPH": 10, # Rd = high 14 bits of the 30-bit SP
     "CALLRP": 11,
     "JMPRP": 12,
     "SETSPH": 13,

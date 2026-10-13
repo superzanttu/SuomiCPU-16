@@ -153,9 +153,9 @@ fleet. Production waits when the eight-robot fleet limit is reached.
 
 ## 8. SuomiCPU-16 Specific Constraints
 ### 8.1 Memory Layout
-- **Global Storage**: Global variables start at `0xE800`.
-- **Memory Limit**: Total available memory is 512 KiB. The current compact 48x48 feature map fits in RAM; larger worlds may need chunk streaming or external storage.
-- **Stack**: Local variables and function calls use the machine stack (starts at `0x2FFFF`).
+- **Global Storage**: Compiler-managed global and static variables start at `0x80000`.
+- **Memory Limit**: The emulator provides 1 GiB of byte-addressable memory. The current compact 48x48 feature map fits in RAM; larger worlds may still need chunk streaming or external storage for game-design or performance reasons.
+- **Stack**: Local variables and function calls use the machine stack, which starts at `0x3FFFFFFF` and grows toward lower addresses.
 
 ### 8.2 Execution & Timing
 - **Frame Budget**: The emulator runs at up to 30 FPS with a 30,000-instruction frame budget. Static terrain, buildings, and HUD layers are cached until the camera, selection, or toolbar changes. Robot pathfinding is cooperative: it expands at most 32 map tiles per game update.

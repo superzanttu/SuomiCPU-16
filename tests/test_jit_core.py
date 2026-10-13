@@ -167,17 +167,17 @@ class JitEquivalenceTests(unittest.TestCase):
         self.assertEqual((fast.registers[2], fast.registers[3]), (0x3FFF1234, 0x3FFF))
         self.assertEqual(fast.flags["C"], 1)
 
-    def test_30_bit_return_addresses_match_for_calls_above_0xffff(self):
+    def test_30_bit_return_addresses_match_for_calls_near_memory_limit(self):
         program = assemble(
-            ".address 0x20000\n"
+            ".address 0x3F000000\n"
             "entry: CALLX far_routine\n"
-            "LDI R0, 0x400\n"
-            "LDI R1, 0\n"
+            "LDI R0, 0x4000\n"
+            "LDI R1, 0x2A23\n"
             "CALLRP R0, R1\n"
             "HALT\n"
-            ".address 0x30000\n"
+            ".address 0x3F123000\n"
             "far_routine: RET\n"
-            ".address 0x400\n"
+            ".address 0x2A234000\n"
             "indirect_routine: RET\n"
         )
         slow = make_cpu(program)
@@ -193,16 +193,16 @@ class JitEquivalenceTests(unittest.TestCase):
         fast._execute_jit(20)
 
         self.assertEqual(state(slow), state(fast))
-        self.assertEqual(slow.pc, 0x20012)
+        self.assertEqual(slow.pc, 0x3F000014)
         self.assertEqual(slow.sp, emulator.MEM_MASK)
 
     def test_30_bit_indirect_jump_matches_interpreter(self):
         program = assemble(
             ".address 0x20000\n"
-            "LDI R0, 0\n"
-            "LDI R1, 1\n"
+            "LDI R0, 0x3456\n"
+            "LDI R1, 0x3A12\n"
             "JMPRP R0, R1\n"
-            ".address 0x10000\n"
+            ".address 0x3A123456\n"
             "HALT\n"
         )
         slow = make_cpu(program)
@@ -218,7 +218,7 @@ class JitEquivalenceTests(unittest.TestCase):
         fast._execute_jit(10)
 
         self.assertEqual(state(slow), state(fast))
-        self.assertEqual(slow.pc, 0x10002)
+        self.assertEqual(slow.pc, 0x3A123458)
 
     def test_random_programs_match_step(self):
         compared = 0

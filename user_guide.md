@@ -129,7 +129,8 @@ labels are not accepted as `.address` arguments. Moving the address does not
 emit bytes. Sections need not be written in address order. The assembler returns
 separate memory segments for disjoint ranges and rejects overlapping output.
 
-Valid addresses are `0` through `0x7FFFF`, the emulator's 512 KiB memory range.
+Valid addresses are `0` through `0x3FFFFFFF`, the emulator's 1 GiB memory
+range.
 The entry point is the address of the first instruction encountered in source
 order. If there are no instructions, it is the first emitted data address; if
 the source emits nothing, it is the initial address `0`.
@@ -215,7 +216,7 @@ otherwise, instructions do not change the condition flags.
 | `HALT`      | `HALT`                | Stop execution.                                                                                                                                                    |
 | `LDI`       | `LDI Rd, value`       | Load an immediate value into `Rd`. Values from `0` to `255` use one word. Values from `256` to `65535` expand to `LDI` (low byte) followed by `LDI_H` (high byte). |
 | `LDI_H`     | `LDI_H Rd, high_byte` | Replace the high byte of `Rd`, preserving its low byte. `high_byte` must be `0` to `255`.                                                                          |
-| `LDI19`     | `LDI19 Rd, address`   | Load a full 19-bit address (`0` through `0x7FFFF`) into a register. `LDA` is an alias for this instruction.                                                       |
+| `LDI30`     | `LDI30 Rd, address`   | Load a full 30-bit address (`0` through `0x3FFFFFFF`) into a register. `LDI19` and `LDA` are compatibility aliases.                                                 |
 
 For example:
 
@@ -293,10 +294,10 @@ register is the high 16 bits and the following odd register is the low 16 bits:
 for example, `R0` names the `R0:R1` pair and `R2` names `R2:R3`. Binary
 arithmetic/logic operations and `MOV32` require even pair registers. Shift
 counts may be an immediate from 0 to 31 or the low five bits of a register.
-`LD32 Rd, Ra` loads four big-endian bytes at the 19-bit address in pair `Ra`
+`LD32 Rd, Ra` loads four big-endian bytes at the 30-bit address in pair `Ra`
 into pair `Rd`; `ST32 Rs, Ra` stores the value in pair `Rs` there. Both
 register-pair operands must start at an even register. Memory access wraps at
-the end of the 512 KiB address space and follows normal memory-mapped-device
+the end of the 1 GiB address space and follows normal memory-mapped-device
 read/write behavior.
 `MUL32` writes the low 32 product bits; it sets `C` for unsigned overflow and
 `V` for signed overflow. `DIV32`/`MOD32` are unsigned; the `S` forms are signed,
@@ -314,11 +315,11 @@ does not change flags.
 
 These instructions use the extended `0x1A` selector in the `OP_SHR` space and
 are implemented by the Python emulator. The optional JIT hands this group back
-to the emulator. The `MOVSPH` miscellaneous instruction reads the high three
-bits of the 19-bit stack pointer; together with `MOVSP`, it lets compiler code
+to the emulator. The `MOVSPH` miscellaneous instruction reads the high 14
+bits of the 30-bit stack pointer; together with `MOVSP`, it lets compiler code
 form full stack addresses for 32-bit objects. `SETSPH` sets those upper bits
 without disturbing the low 16-bit offset, allowing code to restore a full
-19-bit stack position.
+30-bit stack position.
 
 Encoding: word 1 is `0xF800 | (high-register << 8) | 0x1A`; word 2 is
 `(operation << 12) | (immediate flag 0x0800) | source/count`. Operation codes
@@ -369,26 +370,27 @@ and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
 | `ADD SUB AND OR XOR CMP`      | `ADD Rd, imm`              | Immediate forms (a non-register second operand selects them).                                                            |
 | `SWAP` `SEXT` `CLZ`           | `SWAP Rd`                  | Swap bytes; sign-extend the low byte; count leading zeros (all in place).                                                |
 | `JMPR` `CALLR`                | `JMPR Rd`                  | Jump/call to the 16-bit address held in `Rd`.                                                                            |
-| `JMPRP` `CALLRP`              | `JMPRP Rlow, Rhigh`        | Jump/call through a 19-bit pointer: low 16 bits in `Rlow`, high 3 bits in `Rhigh`.                                      |
+| `JMPRP` `CALLRP`              | `JMPRP Rlow, Rhigh`        | Jump/call through a 30-bit address: low 16 bits in `Rlow`, high 14 bits in `Rhigh`.                                     |
 | `PUSHF` `POPF`                | `PUSHF`                    | Push/pop the flags (Z=1, C=2, N=4, V=8).                                                                                 |
 | `SETC` `CLC`                  | `SETC`                     | Set/clear the carry flag.                                                                                                |
 | `SETSP`                       | `SETSP Rd`                 | Load the stack pointer from `Rd`.                                                                                        |
-| `SETSPH`                      | `SETSPH Rd`                | Set the stack pointer's high three address bits from `Rd[2:0]`, preserving its low 16 bits.                              |
+| `SETSPH`                      | `SETSPH Rd`                | Set the stack pointer's high 14 address bits from `Rd[13:0]`, preserving its low 16 bits.                                 |
 | `NOP`                         | `NOP`                      | Do nothing (`MOV R0, R0`).                                                                                               |
 | `BNZX BNCX BNX BNNX BVX BNVX` | `BNZX label`               | Far branch if `Z`, `C`, `N`, `V` is clear (`BNZ`, `BNC`, `BNV`) or set (`BN`, `BV`); `BNNX` = `N` clear.                 |
 | `BLT BGE BGT BLE`             | `BLT label`                | Signed compare branches after `CMP` (use `N` and `V`).                                                                   |
 | `BHI BLS`                     | `BHI label`                | Unsigned higher / lower-or-same after `CMP`.                                                                             |
 
 Every branch also has an `X` spelling (`BLTX`, ...); all conditional branches
-here are four-byte, full-address forms. `ADD`, `SUB` and `CMP` now also set the
+here are six-byte, full-address forms. `ADD`, `SUB` and `CMP` now also set the
 `N` (negative) and `V` (signed overflow) flags. `NOT` and `POP` now produce
 full 16-bit values. Encoding: opcode `0x1F` with low-byte prefix `0x1F`
 (ALU/misc group: `(op<<12) | 0x0800 immediate flag | operand`, ops `SHL`=0,
 `LSR`=1, `ASR`=2, `ROL`=3, `ROR`=4, `ADC`=5, `SBC`=6, `NEG`=7, `TEST`=8,
 `ADD`=9, `SUB`=10, `AND`=11, `OR`=12, `XOR`=13, `CMP`=14, misc=15).
-Compact far control uses prefix `0xF83E` and carries the operation plus the
-target's upper three bits in the prefix word. Far conditional branches use
-prefix `0xF80D`, with the condition and upper address bits in that word.
+Compact far control uses prefix `0xF83E` for the operation, followed by a word
+containing target bits 29-16 and a word containing bits 15-0. Far conditional
+branches use prefix `0xF80D` for the condition, followed by the same two target
+words.
 ### Branches
 
 | Instruction | Syntax                    | Operation                                               |
@@ -398,11 +400,11 @@ prefix `0xF80D`, with the condition and upper address bits in that word.
 | `BZ`        | `BZ address_or_label`     | Jump if the `Z` condition flag is set.                  |
 | `BC`        | `BC address_or_label`     | Jump if the `C` condition flag is set.                  |
 | `CALL`      | `CALL address_or_label`   | Push the return PC and call an absolute byte address.   |
-| `JMPX`      | `JMPX address_or_label`   | Unconditionally jump to a full 19-bit byte address.     |
-| `BZX`       | `BZX address_or_label`    | Jump to a full 19-bit address if `Z` is set.            |
-| `BCX`       | `BCX address_or_label`    | Jump to a full 19-bit address if `C` is set.            |
-| `CALLX`     | `CALLX address_or_label`  | Call a full 19-bit byte address.                        |
-| `CALLRP`    | `CALLRP Rlow, Rhigh`      | Call the 19-bit address in `Rlow` and the low 3 bits of `Rhigh`. |
+| `JMPX`      | `JMPX address_or_label`   | Unconditionally jump to a full 30-bit byte address.     |
+| `BZX`       | `BZX address_or_label`    | Jump to a full 30-bit address if `Z` is set.             |
+| `BCX`       | `BCX address_or_label`    | Jump to a full 30-bit address if `C` is set.             |
+| `CALLX`     | `CALLX address_or_label`  | Call a full 30-bit byte address.                         |
+| `CALLRP`    | `CALLRP Rlow, Rhigh`      | Call the 30-bit address in `Rlow` and `Rhigh[13:0]`.     |
 | `RET`       | `RET`                     | Pop the return PC from the stack.                       |
 
 Example:
@@ -422,19 +424,19 @@ encodes an 8-bit target (`0` to `0xFF`). These are absolute **byte** addresses,
 not instruction indexes or offsets. `JZ` tests the named register directly; it
 does not test the `Z` flag. `BZ` and `BC` test the `Z` and `C` flags,
 respectively, commonly after `SUB` or `CMP`.
-`JMPX`, `BZX`, `BCX`, and `CALLX` use four bytes and encode a full 19-bit address;
+`JMPX`, `BZX`, `BCX`, and `CALLX` use six bytes and encode a full 30-bit address;
 use them when code or routines are outside the short-address range.
 All `CALL`, `CALLX`, `CALLR`, and `CALLRP` instructions push the following
-19-bit PC as three big-endian bytes; `RET` restores all 19 bits. `CALLRP` uses
-the register-pair layout of C object pointers: low 16 address bits in `Rlow`
-and high three bits in `Rhigh`.
+30-bit PC as four big-endian bytes; `RET` restores all 30 bits. `CALLRP` uses
+the register-pair layout for machine addresses: low 16 address bits in `Rlow`
+and high 14 bits in `Rhigh`.
 
-The compact far-control prefix word uses bits 10-9 for the operation, bits 8-6
-for address bits 18-16, and fixed selector `0x3E` in bits 5-0. Its second word
-contains address bits 15-0. Far conditional branches use bits 10-7 for the
-condition code, bits 6-4 for address bits 18-16, and fixed selector `0xD` in
-bits 3-0; their second word also contains address bits 15-0. Both encodings
-therefore cover the full 512 KiB address space in four bytes.
+The compact far-control prefix word uses bits 10-9 for the operation and fixed
+selector `0x3E` in bits 5-0; its next two words contain address bits 29-16 and
+15-0. Far conditional branches use bits 10-7 for the condition code and fixed
+selector `0xD` in bits 3-0; their next two words contain the same address
+fields. Both encodings therefore cover the full 1 GiB address space in six
+bytes.
 
 ### Stack and interrupt instructions
 
@@ -444,10 +446,10 @@ therefore cover the full 512 KiB address space in four bytes.
 | `POP`       | `POP Rd`            | Pop a value from the stack into `Rd`; the register is masked to one byte. |
 | `EI`        | `EI`                | Set the interrupt-enable bit in the interrupt control register.           |
 | `DI`        | `DI`                | Clear the interrupt-enable bit.                                           |
-| `RTI`       | `RTI`               | Restore the flags and 19-bit PC from the five-byte interrupt frame.       |
+| `RTI`       | `RTI`               | Restore the flags and 30-bit PC from the six-byte interrupt frame.         |
 | `ADJSP`     | `ADJSP signed_byte` | Add a signed -128 to 127 byte adjustment to the stack pointer.            |
 
-The stack pointer starts at `0x2FFFF`. `PUSH` decrements the pointer by two and
+The stack pointer starts at `0x3FFFFFFF`. `PUSH` decrements the pointer by two and
 stores a big-endian word; `POP` reads that word and advances the pointer by two.
 `CALL`/`RET` use the same stack. The `POP` instruction loads only the low byte
 into a general-purpose register, whereas `RET` and `RTI` use the full popped
@@ -490,10 +492,12 @@ enabling interrupts.
 
 ## 7. Emulator memory and devices
 
-The backing memory is `2**19` bytes (`0x80000`, or 512 KiB). CPU read/write
-addresses are masked with `0x7FFFF`, so out-of-range accesses wrap into that
+The backing memory is `2**30` bytes (`0x40000000`, or 1 GiB). CPU read/write
+addresses are masked with `0x3FFFFFFF`, so out-of-range accesses wrap into that
 memory. Program-image loading is stricter and rejects segments that extend past
-the end of the backing memory.
+the end of the backing memory. The map below lists reserved low-memory and
+device ranges; other addresses are ordinary RAM. The process stack starts at
+the final valid address and grows downward.
 
 The emulator declares these addresses, which now map to distinct backing
 memory ranges:
@@ -501,7 +505,7 @@ memory ranges:
 | Name                                     |       Address range |         Size |
 | ---------------------------------------- | ------------------: | -----------: |
 | Flash                                    | `0x00000`-`0x1FFFF` |      128 KiB |
-| RAM and stack                            | `0x20000`-`0x2FFFF` |       64 KiB |
+| Low RAM                                  | `0x20000`-`0x2FFFF` |       64 KiB |
 | VRAM                                     | `0x30000`-`0x42BFF` | 76,800 bytes |
 | Keyboard                                 |           `0x43000` |       1 byte |
 | Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
@@ -660,28 +664,31 @@ minimum requirements:
   byte. `short` is 16-bit, and `long`/`unsigned long` are 32-bit with the
   minimum ranges required by C90. The compiler implements pair-based storage,
   scalar arithmetic, `switch`, and function argument/return handling for these
-  `long` types. The compiler supports indirect 32-bit lvalues and current
-  19-bit pointer address paths. Regression tests cover high-address byte, word,
+  `long` types. The compiler supports indirect 32-bit lvalues and 30-bit
+  pointer address paths. Regression tests cover high-address byte, word,
   and `long` accesses as well as indexed accesses across `0xFFFF`, but not every
   pointer conversion, arithmetic, alignment, or wraparound case. Integer
   literal types use the target's `int`, `unsigned int`, and 32-bit `long`
   candidate ranges. An explicit cast from a 32-bit integer to an object pointer
-  uses its low 19 bits as the address; this is the target's implementation-
+  uses its low 30 bits as the address; this is the target's implementation-
   defined conversion. For compatibility with existing programs, a file-scope
-  pointer initializer also accepts an integer constant in the SC-16 19-bit
+  pointer initializer also accepts an integer constant in the SC-16 30-bit
   address range as an implementation extension. Converting an object pointer
-  to a 32-bit integer preserves its 19-bit address value; conversion to 16-bit
+  to a 32-bit integer preserves its 30-bit address value; conversion to 16-bit
   `int` preserves the low 16 bits. These pointer/integer conversions are
   implementation-defined.
 - `float`, `double`, and `long double` use the SC-16 IEEE-754 binary16 format.
   In particular, `double` does not meet C90's required minimum range or
   precision.
-- Object pointers occupy three bytes for the machine's 19-bit address space.
+- Object pointers occupy four bytes for the machine's 30-bit address space.
+  Their in-memory representation stores the low 16 address bits first and the
+  high 14 bits second, with each word in big-endian byte order.
   `size_t` is unsigned 32-bit `long`, and `ptrdiff_t` is signed 32-bit `long`;
   compatible object-pointer subtraction produces a signed 32-bit element
   difference. Pointer arithmetic and dereferencing have not yet been
   exhaustively checked for all address, alignment, and overflow cases.
-  Function pointers and general function-pointer calls are not supported.
+  The ISA provides register-pair indirect control flow, but function-pointer
+  declarators and general C function-pointer calls are not supported.
 - `static`, `extern`, `auto`, `register`, and `volatile` specifiers do not have
   their full C linkage, storage-duration, or volatile-access semantics.
   The address-of constraint is enforced for local objects declared `register`,
@@ -697,10 +704,11 @@ minimum requirements:
   pointer-target qualifications. Const qualification through multiple pointer
   levels and const-qualified pointer objects are not supported; do not treat
   other accepted pointer qualifier combinations as strictly conforming.
-- Global storage begins at `0x2000` (`GLOBAL_BASE` in
+- Global/static storage begins at `0x80000` (`GLOBAL_BASE` in
   [`tools/c_compiler.py`](tools/c_compiler.py)); uninitialized globals are
-  zeroed. Local variables, arguments, return addresses, and temporaries use the
-  machine stack.
+  zeroed. The current compiler allocates static data through `0xFFFFF`.
+  Local variables, arguments, return addresses, and temporaries use the machine
+  stack.
 
 Important language gaps include multidimensional array function-parameter
 declarators beyond the supported forms, function pointers, and parts of C90's
@@ -716,13 +724,14 @@ The standard library remains incomplete and is not C90-conforming. Headers are
 available for `<stddef.h>`, `<limits.h>`, `<float.h>`, `<ctype.h>`, `<errno.h>`,
 `<assert.h>`, `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<stdarg.h>`,
 `<locale.h>`, `<time.h>`, `<math.h>`, and `<setjmp.h>`. The SC-16
-`setjmp`/`longjmp` implementation saves a 19-bit continuation and stack pointer;
-`longjmp` restores that context and converts a zero value to one. `<signal.h>`
+`setjmp`/`longjmp` implementation saves a 30-bit continuation and stack pointer
+in an 8-byte `jmp_buf`; `longjmp` restores that context and converts a zero
+value to one. `<signal.h>`
 and signal-handler dispatch remain unimplemented. The C99 `<stdint.h>` header
 is an extension, not a C90 header.
 The target has no 64-bit integer type. `<stddef.h>` defines `size_t`,
 `ptrdiff_t`, `wchar_t`, `NULL`, and `offsetof`; `size_t` is a 32-bit unsigned
-`long` used for the target's 19-bit address range.
+`long` used for the target's 30-bit address range.
 
 The string and memory routines, C-locale character routines, and several
 `<stdlib.h>` services are linked when referenced. These include integer and
@@ -849,15 +858,15 @@ See [`examples/text_demo.c`](examples/text_demo.c) for a C example.
 Generated C code uses the far control instructions (`JMPX`, `CALLX`, `BZX`,
 `BCX`). Address 0 holds an entry stub; `0x0002`-`0x0005` hold interrupt
 vectors, and the boot routine at `0x0006` calls `main`. Compiled code starts at
-`0x4800`; global data starts at `0x2000`, so large code and data sections must
-not overlap. Return addresses preserve the full 19-bit PC; code is no longer
+`0x4800`; global data starts at `0x80000`. Return addresses preserve the full
+30-bit PC; code is no longer
 restricted to addresses below `0x10000` for call/return correctness. Libraries use fixed
 low-memory locations: `lib_gfx` at `0x400`, `lib_text` at `0x700`, and
 `lib_cgfx` at `0x1000`. The compiler/assembler reports errors when emitted
 sections overlap or stack frames exceed supported limits. The command-line
 compiler writes a flat `.bin` image with address gaps zero-filled; the emulator
 loads it at address zero. In [`examples/factorial.c`](examples/factorial.c),
-the global `result` is stored at `0x2000` after execution.
+the global `result` is stored at `0x80000` after execution.
 
 The preprocessor implements the directives and extensions listed above, but is
 not certified against the full C90 translation limits or conformance suite.
@@ -1076,7 +1085,7 @@ clipped. Pixel and sprite colors are palette indexes. A sprite is a sequence of
 `width * height` bytes; `.data hex` is suitable for small sprites. Text data
 consists of glyph IDs: printable ASCII uses its character code minus 31, IDs
 96-101 select `ÃƒÆ’Ã‚Â¶ÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¥ÃƒÆ’Ã¢â‚¬â€œÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Â¦`, and `0` terminates the text. `GFX_TEXT` accepts a full
-19-bit text pointer. Its x/y inputs are stored as bytes and therefore should be in the
+30-bit text pointer. Its x/y inputs are stored as bytes and therefore should be in the
 range 0-255. Its scratch bytes at `0x4300`-`0x4306` are reserved while it runs.
 Include the glyph data so it is loaded at `0x4400`; the mask table is supplied
 by `lib_gfx.asm` at `0x4200`.
@@ -1102,7 +1111,7 @@ C builtins: `gfx_ticks()`, `gfx_rtc(field)`, `gfx_irq_init()` (executes EI),
 Interrupt handlers live in `lib_cgfx.asm` at fixed addresses: `irq_timer` at
 0x0010 (vector 0x0004) and `irq_key` at 0x0030 (vector 0x0002). The C entry stub
 is `JMP __c_boot` at 0 with the boot code at 6. `RTI` restores both Z and C flags.
-C globals start at 0x2000.
+C globals start at 0x80000.
 
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 

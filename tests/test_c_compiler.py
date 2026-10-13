@@ -1765,7 +1765,7 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 70000 & 0xFFFF)
 
-    def test_c90_target_abi_pointer_encoding_is_19_bit_big_endian(self):
+    def test_c90_target_abi_pointer_encoding_stores_low_word_before_high_word(self):
         image = compile_source(
             "int *pointer = 0x12345UL;\n"
             "int main(void) { return 0; }\n"

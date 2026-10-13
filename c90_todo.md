@@ -26,13 +26,15 @@ an ABI choice as delivered.
 - The compiler implements a substantial C90-oriented subset, but the user
   guide and ABI specification explicitly state that it is not yet conforming.
 - Existing implementation and regression coverage include 32-bit `long`,
-  19-bit object pointers, aggregate assignment and by-value argument copies,
-  caller-owned structure/union returns, and supported one-level `const`
-  pointer-target qualification.
-- The compiler's 64 KiB global-data window is at `0x60000..0x6FFFF`; `LDI19`
-  now loads complete 19-bit addresses, and regression coverage exercises the
-  C90 minimum 65,535-byte object size. This does not provide a 1 GB address
-  space or establish all C90 translation limits.
+  30-bit object-pointer accesses, aggregate assignment and by-value argument
+  copies, caller-owned structure/union returns, and supported one-level
+  `const` pointer-target qualification.
+- The emulator provides 1 GiB of byte-addressable memory, and far control flow,
+  return addresses, stack-pointer operations, and pointer accesses support
+  30-bit addresses. Compiler global/static data occupies
+  `0x80000..0xFFFFF`; `LDI30` loads full addresses. Regression coverage
+  exercises the C90 minimum 65,535-byte object size, but this does not establish
+  all C90 translation limits.
 - `float`, `double`, and `long double` still use binary16; `double` therefore
   does not satisfy C90 minimum range and precision requirements.
 - Function pointers and indirect calls, bit-fields, full linkage/storage
@@ -47,17 +49,18 @@ These tasks define and verify the target-specific representations and
 execution behavior. Add machine instructions only when existing instructions
 or correct runtime helpers cannot meet the ABI requirements.
 
-### A0. Implement the 19-bit control-flow ABI
+### A0. Implement the 30-bit control-flow ABI
 
 - [x] **Implement full-address calls, returns, and compact far control**
-  - Store return PCs as three big-endian bytes; `RET` and `RTI` restore all
-    19 address bits.
-  - Set the first function parameter at `SP + 3` and update assembly-library
+  - Store return PCs as four big-endian bytes; `RET` and `RTI` restore all
+    30 address bits.
+  - Set the first function parameter at `SP + 4` and update assembly-library
     argument offsets to match.
-  - Encode direct far control and conditional branches in four bytes, and add
-    register-pair indirect `JMPRP` / `CALLRP` for 19-bit function pointers.
-  - Add `LDI19`/`LDA` so assembler and compiler-generated addresses preserve all
-    19 bits; verify assembler, emulator, JIT, ABI offsets, and high addresses.
+  - Encode direct far control and conditional branches in six bytes, and add
+    register-pair indirect `JMPRP` / `CALLRP` for full 30-bit addresses.
+  - Add `LDI30` (with `LDI19`/`LDA` compatibility aliases) so assembler and
+    compiler-generated addresses preserve all 30 bits; verify assembler,
+    emulator, JIT, ABI offsets, and high addresses.
 
 ### A1. Define C90 floating-point representations
 

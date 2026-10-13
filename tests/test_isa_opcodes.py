@@ -519,13 +519,13 @@ class CpuExecutionTests(unittest.TestCase):
                         )
 
     def test_far_call_and_ret_preserve_all_pc_bits(self):
-        cpu = make_cpu(encode("CALLX 0x20000"))
+        cpu = make_cpu(encode("CALLX 0x3F123000"), pc=0x3F000000)
         cpu.step()
-        self.assertEqual(cpu.pc, 0x20000)
+        self.assertEqual(cpu.pc, 0x3F123000)
         self.assertEqual(cpu.sp, 0x2FFFB)
-        cpu.memory[0x20000:0x20002] = be(isa.OP_RET << 11)
+        cpu.memory[0x3F123000:0x3F123002] = be(isa.OP_RET << 11)
         cpu.step()
-        self.assertEqual((cpu.pc, cpu.sp), (CODE + 6, 0x2FFFF))
+        self.assertEqual((cpu.pc, cpu.sp), (0x3F000006, 0x2FFFF))
 
     def test_callr_and_ret_preserve_high_pc(self):
         cpu = make_cpu(be(0xFFFF), pc=0x20000)
