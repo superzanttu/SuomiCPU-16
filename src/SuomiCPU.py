@@ -126,6 +126,21 @@ GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 
 # Tile map: SRC=map (1 byte per tile = palette color, 0 black), W/H=map size in tiles,
 # X/Y=camera pixel position. Draws 16x16 tiles over the whole back buffer.
 GPU_TILEMAP = 21
+GPU_3D = 22
+GPU3D_FILL, GPU3D_WIREFRAME = 1, 2
+GPU3D_OK, GPU3D_ERROR_SCENE, GPU3D_ERROR_FACE = 0, 1, 2
+GPU3D_MAX_VERTICES = 128
+GPU3D_MAX_FACES = 128
+GPU3D_HEADER_WORDS = 10
+GPU3D_VERTEX_WORDS = 3
+GPU3D_FACE_WORDS = 4
+GPU3D_SIN_8_8 = (
+    0, 25, 50, 74, 98, 121, 142, 162, 181, 198, 213, 226, 237, 245, 251, 255,
+    256, 255, 251, 245, 237, 226, 213, 198, 181, 162, 142, 121, 98, 74, 50, 25,
+    0, -25, -50, -74, -98, -121, -142, -162, -181, -198, -213, -226, -237,
+    -245, -251, -255, -256, -255, -251, -245, -237, -226, -213, -198, -181,
+    -162, -142, -121, -98, -74, -50, -25,
+)
 SPEED_ADDR  = 0x43003
 VSYNC_ADDR  = 0x43013
 GFX_MODE_ADDR = 0x43014
@@ -532,6 +547,127 @@ class SuomiCompute16:
             self._gpu_net(command, color, x)
         elif command == GPU_TILEMAP:
             self._gpu_tilemap(x, y, w, h, self._gpu_source())
+        elif command == GPU_3D:
+            self._gpu_3d(self._gpu_source())
+
+    @staticmethod
+    def _gpu3d_sincos(angle):
+        index = ((angle & 0xFF) >> 2) & 63
+        return GPU3D_SIN_8_8[index], GPU3D_SIN_8_8[(index + 16) & 63]
+
+    @staticmethod
+    def _gpu3d_signed_word(memory, address):
+        value = (memory[address] << 8) | memory[address + 1]
+        return value - 0x10000 if value & 0x8000 else value
+
+    def _gpu3d_transform(self, vertex, angles, translation):
+        x, y, z = vertex
+        sin_x, cos_x = self._gpu3d_sincos(angles[0])
+        sin_y, cos_y = self._gpu3d_sincos(angles[1])
+        sin_z, cos_z = self._gpu3d_sincos(angles[2])
+
+        y, z = (y * cos_x - z * sin_x) >> 8, (y * sin_x + z * cos_x) >> 8
+        x, z = (x * cos_y + z * sin_y) >> 8, (-x * sin_y + z * cos_y) >> 8
+        x, y = (x * cos_z - y * sin_z) >> 8, (x * sin_z + y * cos_z) >> 8
+        return x + translation[0], y + translation[1], z + translation[2]
+
+    def _gpu3d_project(self, vertex, focal, width, height):
+        x, y, depth = vertex
+        return (
+            width // 2 + ((x * focal // depth) >> 8),
+            height // 2 - ((y * focal // depth) >> 8),
+        )
+
+    def _gpu3d_triangle(self, points, color):
+        (ax, ay), (bx, by), (cx, cy) = points
+
+        def edge(x0, y0, x1, y1, px, py):
+            return (px - x0) * (y1 - y0) - (py - y0) * (x1 - x0)
+
+        area = edge(ax, ay, bx, by, cx, cy)
+        if area == 0:
+            return
+        left, right = max(min(ax, bx, cx), 0), min(max(ax, bx, cx), self._screen_size()[0] - 1)
+        top, bottom = max(min(ay, by, cy), 0), min(max(ay, by, cy), self._screen_size()[1] - 1)
+        if left > right or top > bottom:
+            return
+        sign = 1 if area > 0 else -1
+        for y in range(top, bottom + 1):
+            for x in range(left, right + 1):
+                if (sign * edge(bx, by, cx, cy, x, y) >= 0
+                        and sign * edge(cx, cy, ax, ay, x, y) >= 0
+                        and sign * edge(ax, ay, bx, by, x, y) >= 0):
+                    self._back_pixel(x, y, color)
+
+    def _gpu_3d(self, source):
+        memory = self.memory
+        if source < 0 or source > MEM_SIZE - GPU3D_HEADER_WORDS * 2:
+            self._gpu_result(GPU3D_ERROR_SCENE)
+            return
+
+        header = [
+            self._gpu3d_signed_word(memory, source + offset * 2)
+            for offset in range(GPU3D_HEADER_WORDS)
+        ]
+        vertex_count, face_count = header[:2]
+        angles = tuple(value & 0xFF for value in header[2:5])
+        translation = tuple(header[5:8])
+        focal, flags = header[8:]
+        if (not 3 <= vertex_count <= GPU3D_MAX_VERTICES
+                or not 1 <= face_count <= GPU3D_MAX_FACES
+                or focal <= 0 or not flags
+                or flags & ~(GPU3D_FILL | GPU3D_WIREFRAME)):
+            self._gpu_result(GPU3D_ERROR_SCENE)
+            return
+
+        word_count = GPU3D_HEADER_WORDS + vertex_count * GPU3D_VERTEX_WORDS + face_count * GPU3D_FACE_WORDS
+        end = source + word_count * 2
+        if end > MEM_SIZE:
+            self._gpu_result(GPU3D_ERROR_SCENE)
+            return
+
+        vertex_offset = source + GPU3D_HEADER_WORDS * 2
+        vertices = []
+        for index in range(vertex_count):
+            offset = vertex_offset + index * GPU3D_VERTEX_WORDS * 2
+            vertex = tuple(self._gpu3d_signed_word(memory, offset + axis * 2) for axis in range(3))
+            vertices.append(self._gpu3d_transform(vertex, angles, translation))
+
+        face_offset = vertex_offset + vertex_count * GPU3D_VERTEX_WORDS * 2
+        faces = []
+        for index in range(face_count):
+            offset = face_offset + index * GPU3D_FACE_WORDS * 2
+            face = tuple(self._gpu3d_signed_word(memory, offset + field * 2) for field in range(4))
+            if any(vertex < 0 or vertex >= vertex_count for vertex in face[:3]):
+                self._gpu_result(GPU3D_ERROR_FACE)
+                return
+            faces.append(face)
+
+        width, height = self._screen_size()
+        projected = [None] * vertex_count
+        for index, (_, _, depth) in enumerate(vertices):
+            if depth > 0:
+                projected[index] = self._gpu3d_project(vertices[index], focal, width, height)
+
+        painter_order = sorted(
+            range(face_count),
+            key=lambda index: -sum(vertices[vertex][2] for vertex in faces[index][:3]),
+        )
+        for index in painter_order:
+            a, b, c, base_color = faces[index]
+            if projected[a] is None or projected[b] is None or projected[c] is None:
+                continue
+            points = (projected[a], projected[b], projected[c])
+            color = base_color & 0xFF
+            if flags & GPU3D_FILL:
+                self._gpu3d_triangle(points, color)
+            elif flags & GPU3D_WIREFRAME:
+                self._gpu3d_triangle(points, 0)
+            if flags & GPU3D_WIREFRAME:
+                self._gpu_line(*points[0], *points[1], color)
+                self._gpu_line(*points[1], *points[2], color)
+                self._gpu_line(*points[2], *points[0], color)
+        self._gpu_result(GPU3D_OK)
 
     _TILE_ROWS = [bytes([c]) * TILE_SIZE for c in range(256)]
 

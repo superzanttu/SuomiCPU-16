@@ -504,23 +504,23 @@ memory ranges:
 
 | Name                                     |       Address range |         Size |
 | ---------------------------------------- | ------------------: | -----------: |
-| Flash                                    | `0x00000`-`0x1FFFF` |      128 KiB |
-| Low RAM                                  | `0x20000`-`0x2FFFF` |       64 KiB |
-| VRAM                                     | `0x30000`-`0x42BFF` | 76,800 bytes |
+| Flash                                    | `0x00000`-`0x3FFFF` |      256 KiB |
+| Low RAM                                  | `0x40000`-`0x4FFFF` |       64 KiB |
+| VRAM                                     | `0x50000`-`0x62BFF` | 76,800 bytes |
 | Keyboard                                 |           `0x43000` |       1 byte |
 | Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
 | Speed register (0 = fixed, 1 = maximum)  |           `0x43003` |       1 byte |
 | Held-key bitmask                         |           `0x43004` |       1 byte |
 | Disk storage device                      |           `0x43100` |     16 bytes |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
-| Graphics coprocessor registers           | `0x43020`-`0x4302E` |     15 bytes |
-| Back buffer (coprocessor drawing target) | `0x44000`-`0x56BFF` | 76,800 bytes |
+| Graphics coprocessor registers           | `0x43020`-`0x4302F` |     16 bytes |
+| Back buffer (coprocessor drawing target) | `0x62C00`-`0x757FF` | 76,800 bytes |
 
 The display is 320 by 240 pixels. Each VRAM byte indexes a 256-entry palette:
 entries 0-11 are named colors (0 black, 1 white, 2 red, 3 green, 4 blue,
 5 yellow, 6 cyan, 7 magenta, 8 orange, 9 gray, 10 dark gray, 11 dark red), 25 is
 pure blue, and the rest are grayscale. VRAM is a live view of CPU memory, so byte writes starting at
-`0x30000 + y * 320 + x` change the pixel at `(x, y)` and are shown at the next
+`0x50000 + y * 320 + x` change the pixel at `(x, y)` and are shown at the next
 display refresh. The emulator renders the indexed framebuffer directly rather
 than converting every pixel in Python. It executes up to 30,000 instructions per
 display frame (capped at 60 frames per second), so long drawing routines can
@@ -902,6 +902,7 @@ no flicker.
 | `int gfx_mouse_wheel(void)`                                                            | Signed vertical wheel delta for the current frame; positive scrolls up, negative scrolls down.                                                            |
 | `void gfx_sound(int channel, int freq, int frames, int wave, int volume)`               | Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. `WAVE_SQUARE/NOISE/TRIANGLE`.                                                                 |
 | `void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y)`      | Fill the screen from a tile map (1 byte per tile = palette colour, 0 = black; 16x16 px tiles; camera in pixels; outside the map is black).                 |
+| `int gfx3d_draw(int *scene)`                                                           | Transform, project and draw a fixed-point 3D scene using GPU command 22; returns 0 on success.                                                        |
 | `int gfx_getchar(void)`                                                                 | Next typed ASCII character (8 backspace, 13 enter), 0 if none; consumes it.                                                                                |
 | `void gfx_save(void)` / `void gfx_restore(void)`                                        | Store the back buffer as a static layer / redraw it in one call.                                                                                           |
 
@@ -923,6 +924,31 @@ Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 (NUL-terminated string at SRC), 8 present, 9 random (to RESULT), 10 polygon
 (W is the point count), 13 sound (COLOR channel, X Hz, Y frames, W wave, H volume %),
 14 save back buffer, 15 restore it, 16-20 networking (below), 21 tile map (X,Y camera, W,H map size, SRC map). Assembly programs can use it directly.
+
+GPU command 22 draws a complete 3D scene from the 30-bit address in SRC. The
+scene is an array of signed 16-bit words, in big-endian memory order:
+
+| Word offset | Contents |
+| ----------- | -------- |
+| 0-1 | Vertex count (3-128), triangle count (1-128) |
+| 2-4 | Rotation around X, Y and Z; low byte is 0-255 units per full turn |
+| 5-7 | X, Y and Z translation in signed 8.8 fixed-point |
+| 8 | Positive focal length in 8.8 fixed-point |
+| 9 | Flags: `GPU3D_FILL` (1), `GPU3D_WIREFRAME` (2), or both |
+| 10 onward | Vertices: X, Y, Z; each signed 8.8 fixed-point |
+| After vertices | Triangles: three vertex indices and one palette color per face |
+
+`GPU3D_FIXED(n)` converts an integer coordinate to 8.8 format; `GPU3D_ONE` is
+256. These signed 16-bit values range from -128 through 127.996. Scene buffers
+may be byte-aligned at any address. The renderer performs integer X/Y/Z matrix
+rotations, perspective projection, and flat
+triangle filling. Faces are painted back-to-front by average vertex depth.
+Wireframe edges are drawn with each face, so later faces cover hidden edges.
+Triangles with a vertex at or behind the camera are skipped. `gfx3d_draw`
+returns `GPU3D_OK` (0) when accepted, `GPU3D_ERROR_SCENE` (1) for an invalid
+descriptor/count/flag/focal length, or `GPU3D_ERROR_FACE` (2) for a face
+referencing a nonexistent vertex. The renderer has no per-pixel depth buffer.
+See the SC-16 showcase's 3D flight page for an example.
 
 ### LAN games (`net_*`)
 

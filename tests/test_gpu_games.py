@@ -133,6 +133,111 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(cpu.memory[BACK_START], 0)
 
 
+class Gpu3DTests(unittest.TestCase):
+    def render_scene(self, scene, mode=0):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = mode
+        address = 0x1000
+        encoded = bytearray()
+        for word in scene:
+            encoded.extend(((word & 0xFFFF) >> 8, word & 0xFF))
+        cpu.memory[address:address + len(encoded)] = encoded
+        gpu(cpu, 22, source=address)
+        return cpu
+
+    def test_fixed_point_projection_fills_and_painter_order_hides_back_edges(self):
+        scene = [6, 2, 0, 0, 0, 0, 0, 80 * 256, 80 * 256, 3]
+        vertices = [
+            (-40, -30, 20), (40, -30, 20), (0, 40, 20),
+            (-40, -30, 0), (40, -30, 0), (0, 40, 0),
+        ]
+        scene.extend(value * 256 for vertex in vertices for value in vertex)
+        scene.extend((0, 1, 2, 2, 3, 4, 5, 4))
+
+        cpu = self.render_scene(scene)
+
+        self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
+        self.assertEqual(back(cpu, 160, 120), 4)
+        self.assertEqual(back(cpu, 160, 105), 4)
+
+    def test_scene_renders_to_the_packed_640_by_480_back_buffer(self):
+        scene = [3, 1, 0, 0, 0, 0, 0, 80 * 256, 64 * 256, 1]
+        scene.extend(value * 256 for vertex in [(-20, -20, 0), (20, -20, 0), (0, 20, 0)]
+                     for value in vertex)
+        scene.extend((0, 1, 2, 3))
+
+        cpu = self.render_scene(scene, GFX_MODE_640_480)
+        decoded = cpu._decode_framebuffer(BACK_START)
+
+        self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
+        self.assertEqual(decoded[240 * 640 + 320], 3)
+
+    def test_rotation_changes_projected_geometry_and_invalid_indices_report_error(self):
+        vertices = [(-40, -10, 0), (40, -10, 0), (0, 30, 0)]
+        scene = [3, 1, 0, 0, 0, 0, 0, 80 * 256, 64 * 256, 1]
+        scene.extend(value * 256 for vertex in vertices for value in vertex)
+        scene.extend((0, 1, 2, 3))
+        unrotated = self.render_scene(scene)
+        scene[4] = 64
+        rotated = self.render_scene(scene)
+
+        def bounds(cpu):
+            pixels = [
+                (x, y)
+                for y in range(240)
+                for x in range(320)
+                if back(cpu, x, y) == 3
+            ]
+            return (
+                min(x for x, _ in pixels), max(x for x, _ in pixels),
+                min(y for _, y in pixels), max(y for _, y in pixels),
+            )
+
+        self.assertNotEqual(bounds(unrotated), bounds(rotated))
+
+        scene[-4] = 9
+        invalid = self.render_scene(scene)
+        self.assertEqual(invalid.read_16(GPU_BASE + 14), 2)
+        self.assertEqual(back(invalid, 160, 120), 0)
+
+    def test_c_graphics_library_submits_scene_and_returns_gpu_status(self):
+        source = (
+            HEADER
+            + "int scene[23] = {3,1,0,0,0,0,0,24576,20480,1,"
+            "0xD800,0xE800,0,0x2800,0xE800,0,0,0x5000,0,"
+            "0,1,2,6};\n"
+            + "int result;\n"
+            + "int main(void) { result = gfx3d_draw(scene); gfx_present(); return 0; }\n"
+        )
+        cpu = run_c(source)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 46), 0)
+        self.assertEqual(pixel(cpu, 160, 120), 6)
+
+    def test_showcase_ship_page_uses_the_3d_gpu(self):
+        path = ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"
+        source = path.read_text(encoding="utf-8")
+        source = source[:source.index("\nint main(void)\n{")]
+        source += (
+            "\nint main(void) {\n"
+            "  gfx_clear(BLACK);\n"
+            "  ship_init();\n"
+            "  frame = 0;\n"
+            "  page_ship();\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(path)))
+        self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
+        steps = 0
+        while cpu.running and steps < 200_000:
+            cpu.step()
+            steps += 1
+        self.assertFalse(cpu.running, "3D showcase page did not finish")
+        self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
+        self.assertIn(4, cpu.memory[BACK_START:BACK_START + 320 * 240])
+
+
 def vram_pixel(cpu, x, y):
     from src.SuomiCPU import VRAM_START
     return cpu.memory[VRAM_START + y * SCREEN_WIDTH + x]
@@ -1479,6 +1584,62 @@ class GameTests(unittest.TestCase):
         self.assertEqual(cpu.memory[0x10000008], SPEED_FAST)
         self.assertEqual(cpu.memory[0x10000009], 1)
 
+    def test_showcase_sprite_load_animates_a_continuous_worm_in_both_axes(self):
+        path = ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"
+        source = path.read_text(encoding="utf-8")
+        source = source[:source.index("\nint main(void)\n{")]
+        draw_call = "        gfx_sprite(x, y, 8, 8, smiley);"
+        self.assertEqual(source.count(draw_call), 1)
+        source = source.replace(
+            draw_call,
+            "        *((int *)(0x10000000 + frame * 0x100 + i * 4)) = x;\n"
+            "        *((int *)(0x10000002 + frame * 0x100 + i * 4)) = y;",
+        )
+        source += (
+            "\nint main(void) {\n"
+            "  gfx_speed(SPEED_MAX);\n"
+            "  gfx_vsync(0);\n"
+            "  stress_sprite_count = 16;\n"
+            "  stress_last_ticks = gfx_ticks();\n"
+            "  stress_last_second = host_seconds();\n"
+            "  frame = 0;\n"
+            "  page_sprite_load();\n"
+            "  frame = 8;\n"
+            "  page_sprite_load();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(path)))
+        self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
+        steps = 0
+        while cpu.running and steps < 200_000:
+            cpu.step()
+            steps += 1
+        self.assertFalse(cpu.running, "instrumented sprite page did not finish")
+
+        frames = []
+        for frame in (0, 8):
+            positions = []
+            for index in range(16):
+                address = 0x10000000 + frame * 0x100 + index * 4
+                positions.append((cpu.read_16(address), cpu.read_16(address + 2)))
+            frames.append(positions)
+
+        first_frame, later_frame = frames
+        self.assertNotEqual(first_frame[0][0], later_frame[0][0])
+        self.assertNotEqual(first_frame[0][1], later_frame[0][1])
+        for positions in frames:
+            for index, (x, y) in enumerate(positions):
+                self.assertGreaterEqual(x, 8)
+                self.assertLessEqual(x, 312)
+                self.assertGreaterEqual(y, 50)
+                self.assertLessEqual(y, 190)
+                if index:
+                    previous_x, previous_y = positions[index - 1]
+                    self.assertGreaterEqual(x - previous_x, 5)
+                    self.assertLessEqual(x - previous_x, 11)
+                    self.assertLessEqual(abs(y - previous_y), 7)
+
     def test_showcase_sprite_load_slows_down_and_recovers_after_temporary_fps_drop(self):
         cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
         self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
@@ -1568,7 +1729,7 @@ class GameTests(unittest.TestCase):
             "\nint main(void) {\n"
             "  gfx_speed(SPEED_MAX);\n"
             "  gfx_vsync(0);\n"
-            "  stress_sprite_count = 1;\n"
+            "  stress_sprite_count = 199;\n"
             "  stress_slow_mode = 0;\n"
             "  stress_last_ticks = gfx_ticks() - 1;\n"
             "  stress_last_second = host_seconds();\n"
@@ -1596,27 +1757,27 @@ class GameTests(unittest.TestCase):
         cpu.update_rtc = fake_update_rtc
         for _ in range(62):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.read_16(0x10000000), 21)
+        self.assertEqual(cpu.read_16(0x10000000), 219)
         self.assertEqual(cpu.read_16(0x10000002), 0)
 
         frames_per_second[0] = 20
         frame_count[0] = 0
         for _ in range(40):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.read_16(0x10000000), 21)
+        self.assertEqual(cpu.read_16(0x10000000), 219)
         self.assertEqual(cpu.read_16(0x10000002), 1)
 
         frames_per_second[0] = 30
         frame_count[0] = 0
         for _ in range(30):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.read_16(0x10000000), 21)
+        self.assertEqual(cpu.read_16(0x10000000), 219)
 
         frames_per_second[0] = 31
         frame_count[0] = 0
         for _ in range(31):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.read_16(0x10000000), 22)
+        self.assertEqual(cpu.read_16(0x10000000), 220)
 
     def test_lunar_lander_menu_flight_sound_and_crash(self):
         cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else 0, 8)

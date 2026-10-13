@@ -126,15 +126,12 @@ int ship_z[SHIP_VERTICES] = {
     8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     -8, -8, -8, -8, -8, -8, -8, -8, -8, -8,
     8, -8, 8, 8, 8, 8, 22};
-int ship_rx[SHIP_VERTICES];
-int ship_ry[SHIP_VERTICES];
-int ship_rz[SHIP_VERTICES];
-int ship_px[SHIP_VERTICES];
-int ship_py[SHIP_VERTICES];
 unsigned char ship_fa[SHIP_FACES];
 unsigned char ship_fb[SHIP_FACES];
 unsigned char ship_fc[SHIP_FACES];
-unsigned char ship_edges[SHIP_VERTICES * SHIP_VERTICES];
+int ship_scene[GPU3D_HEADER_WORDS +
+               SHIP_VERTICES * GPU3D_VERTEX_WORDS +
+               SHIP_FACES * GPU3D_FACE_WORDS];
 int ship_face_count;
 int stress_active;
 int stress_sprite_count;
@@ -436,25 +433,25 @@ void maprow(int y, unsigned char c, char *range, char *name, char *size)
 void page_memory(void)
 {
     gfx_text(8, 20, "MEMORY MAP - 512 KIB", YELLOW);
-    seg(0, 64, GREEN);
-    seg(64, 96, ORANGE);
-    seg(96, 134, YELLOW);
+    seg(0, 128, GREEN);
+    seg(128, 160, ORANGE);
+    seg(160, 198, YELLOW);
     seg(134, 136, MAGENTA);
-    seg(136, 174, CYAN);
-    seg(174, 256, DARK_GRAY);
+    seg(198, 236, CYAN);
+    seg(236, 256, DARK_GRAY);
     panel(31, 39, 257, 23, WHITE);
     gfx_text(26, 66, "0", GRAY);
     gfx_text(266, 66, "7FFFF", GRAY);
-    maprow(86, GREEN, "00000-1FFFF", "FLASH / PROGRAM", "128 KIB");
-    maprow(98, ORANGE, "20000-2FFFF", "RAM AND STACK", "64 KIB");
-    maprow(110, YELLOW, "30000-42BFF", "VRAM 320X240X8", "75 KIB");
-    maprow(122, MAGENTA, "43000-4302E", "KEYBOARD RTC GPU REGS", "I/O");
-    maprow(134, CYAN, "44000-56BFF", "GPU BACK BUFFER", "75 KIB");
-    maprow(146, DARK_GRAY, "57000-7FFFF", "FREE", "164 KIB");
+    maprow(86, GREEN, "00000-3FFFF", "FLASH / PROGRAM", "256 KIB");
+    maprow(98, ORANGE, "40000-4FFFF", "LOW RAM", "64 KIB");
+    maprow(110, YELLOW, "50000-62BFF", "VRAM 320X240X8", "75 KIB");
+    maprow(122, MAGENTA, "43000-4302F", "KEYBOARD RTC GPU REGS", "I/O");
+    maprow(134, CYAN, "62C00-757FF", "GPU BACK BUFFER", "75 KIB");
+    maprow(146, DARK_GRAY, "75800-7FFFF", "FREE", "42 KIB");
     gfx_text(8, 166, "C PROGRAM LAYOUT", YELLOW);
     gfx_text(8, 178, "0000 ENTRY STUB   0400 LIB_GFX   0700 LIB_TEXT", GRAY);
     gfx_text(8, 188, "1000 LIB_CGFX     4400 FONT 5X7  4800 CODE", GRAY);
-    gfx_text(8, 198, "E800 GLOBALS      STACK 2FFFF DOWN", GRAY);
+    gfx_text(8, 198, "80000 GLOBALS    STACK 3FFFFFFF DOWN", GRAY);
     gfx_text(8, 212, "SPEED 43003  KEYS 43004  MOUSE 43008  RTC 43010", CYAN);
     gfx_rect(32 + ((frame * 3) % 255), 36, 3, 3, WHITE);
 }
@@ -518,7 +515,7 @@ void page_graphics(void)
     gfx_text(220, 170, "6X8 CELLS", YELLOW);
     gfx_text(220, 180, "53 X 30 CHARS", GREEN);
     gfx_text(220, 190, "OEAAEA: öäå", MAGENTA);
-    gfx_text(220, 204, "21 GPU COMMANDS", GRAY);
+    gfx_text(220, 204, "22 GPU COMMANDS", GRAY);
 }
 
 // ---------------------------------------------------------------- page 5
@@ -964,6 +961,7 @@ void ship_init(void)
 {
     int i;
     int next;
+    int offset;
     ship_face_count = 0;
     for (i = 0; i < 10; i++)
     {
@@ -977,30 +975,29 @@ void ship_init(void)
     ship_add_face(23, 24, 26);
     ship_add_face(24, 25, 26);
     ship_add_face(25, 22, 26);
+    ship_scene[0] = SHIP_VERTICES;
+    ship_scene[1] = ship_face_count;
+    ship_scene[8] = GPU3D_FIXED(100);
+    ship_scene[9] = GPU3D_FILL | GPU3D_WIREFRAME;
+    offset = GPU3D_HEADER_WORDS;
+    for (i = 0; i < SHIP_VERTICES; i++)
+    {
+        ship_scene[offset++] = GPU3D_FIXED(ship_x[i]);
+        ship_scene[offset++] = GPU3D_FIXED(ship_y[i]);
+        ship_scene[offset++] = GPU3D_FIXED(ship_z[i]);
+    }
+    for (i = 0; i < ship_face_count; i++)
+    {
+        ship_scene[offset++] = ship_fa[i];
+        ship_scene[offset++] = ship_fb[i];
+        ship_scene[offset++] = ship_fc[i];
+        ship_scene[offset++] = i >= 40 ? ORANGE : (i & 1 ? CYAN : BLUE);
+    }
 }
 
 void page_ship(void)
 {
     int i;
-    int j;
-    int a;
-    int b;
-    int c;
-    int ax;
-    int ay;
-    int az;
-    int x1;
-    int y1;
-    int z1;
-    int x2;
-    int y2;
-    int z2;
-    int nx;
-    int ny;
-    int nz;
-    int depth;
-    int px;
-    int py;
     int flight_phase;
     int flight_x;
     int flight_y;
@@ -1009,73 +1006,24 @@ void page_ship(void)
     flight_x = (ship_sinv(flight_phase) * 70) / 100;
     flight_y = (ship_sinv(flight_phase + 32) * 32) / 100;
     flight_depth = (ship_sinv(flight_phase + 16) * 28) / 100;
-    ax = ship_sinv(flight_phase + 16) / 12;
-    ay = ship_sinv(flight_phase) / 12;
-    az = 32 - flight_phase +
-         ship_sinv(flight_phase + 32) / 12;
-    for (i = 0; i < SHIP_VERTICES; i++)
-    {
-        x1 = (ship_x[i] * ship_cosv(ay) -
-              ship_z[i] * ship_sinv(ay)) / 100;
-        z1 = (ship_x[i] * ship_sinv(ay) +
-              ship_z[i] * ship_cosv(ay)) / 100;
-        y1 = (ship_y[i] * ship_cosv(ax) -
-              z1 * ship_sinv(ax)) / 100;
-        z2 = (ship_y[i] * ship_sinv(ax) +
-              z1 * ship_cosv(ax)) / 100;
-        ship_rx[i] = (x1 * ship_cosv(az) -
-                      y1 * ship_sinv(az)) / 100;
-        ship_ry[i] = (x1 * ship_sinv(az) +
-                      y1 * ship_cosv(az)) / 100;
-        ship_rz[i] = z2;
-        depth = 200 + flight_depth - ship_rz[i];
-        ship_px[i] = 160 + flight_x + (ship_rx[i] * 200) / depth;
-        ship_py[i] = 112 + flight_y + (ship_ry[i] * 200) / depth;
-    }
-    for (i = 0; i < SHIP_VERTICES * SHIP_VERTICES; i++)
-    {
-        ship_edges[i] = 0;
-    }
-    for (i = 0; i < ship_face_count; i++)
-    {
-        a = ship_fa[i];
-        b = ship_fb[i];
-        c = ship_fc[i];
-        nx = ship_rx[b] - ship_rx[a];
-        ny = ship_ry[b] - ship_ry[a];
-        x2 = ship_rx[c] - ship_rx[a];
-        y2 = ship_ry[c] - ship_ry[a];
-        nz = nx * y2 - ny * x2;
-        if (nz > 0)
-        {
-            ship_edges[a * SHIP_VERTICES + b] = 1;
-            ship_edges[b * SHIP_VERTICES + a] = 1;
-            ship_edges[b * SHIP_VERTICES + c] = 1;
-            ship_edges[c * SHIP_VERTICES + b] = 1;
-            ship_edges[c * SHIP_VERTICES + a] = 1;
-            ship_edges[a * SHIP_VERTICES + c] = 1;
-        }
-    }
+    ship_scene[2] = (flight_phase * 8 + 12) & 255;
+    ship_scene[3] = (flight_phase * 8 + 32) & 255;
+    ship_scene[4] = (256 - flight_phase * 3) & 255;
+    ship_scene[5] = GPU3D_FIXED(flight_x);
+    ship_scene[6] = GPU3D_FIXED(flight_y);
+    ship_scene[7] = GPU3D_FIXED(96 + flight_depth / 2);
     for (i = 0; i < 56; i++)
     {
+        int px;
+        int py;
         px = (i * 47 + (frame & 255) * 3) % 320;
         py = 24 + (i * 37) % 188;
         gfx_pixel(px, py, (i % 4 == 0) ? WHITE : DARK_GRAY);
     }
-    gfx_text(8, 20, "3D FLIGHT - HEADING TRACKS MOTION", YELLOW);
-    for (i = 0; i < SHIP_VERTICES; i++)
-    {
-        for (j = i + 1; j < SHIP_VERTICES; j++)
-        {
-            if (ship_edges[i * SHIP_VERTICES + j])
-            {
-                gfx_line(ship_px[i], ship_py[i], ship_px[j], ship_py[j],
-                         (i >= 22 || j >= 22) ? ORANGE : CYAN);
-            }
-        }
-    }
-    gfx_text(8, 204, "VISIBLE TRIANGLE FACES ONLY - BACK EDGES OMITTED", WHITE);
-    gfx_text(8, 216, "INTEGER 3D ROTATION + PERSPECTIVE PROJECTION", GRAY);
+    gfx3d_draw(ship_scene);
+    gfx_text(8, 20, "GPU 3D FLIGHT - PAINTER-SORTED TRIANGLES", YELLOW);
+    gfx_text(8, 204, "FIXED 8.8 TRANSFORMS + HIDDEN-LINE REMOVAL", WHITE);
+    gfx_text(8, 216, "ROTATION, PERSPECTIVE AND FLAT SHADING IN GPU", GRAY);
 }
 
 // ---------------------------------------------------------------- page 14
@@ -1116,8 +1064,10 @@ void page_sprite_load(void)
     gfx_text(280, 38, "FPS", CYAN);
     for (i = 0; i < stress_sprite_count; i++)
     {
-        x = 8 + ((i * 8 + frame) % 304);
-        y = 120 + (sinv(frame / 2 + i * 2) * 75) / 100;
+        int phase;
+        phase = frame + i * 2;
+        x = 8 + ((i * 8 + frame + (ship_cosv(phase) * 12) / 100 + 304) % 304);
+        y = 120 + (ship_sinv(phase) * 58) / 100;
         gfx_sprite(x, y, 8, 8, smiley);
     }
     if (stress_slow_mode && stress_fps <= 30)

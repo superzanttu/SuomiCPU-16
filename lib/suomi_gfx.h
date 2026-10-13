@@ -27,6 +27,20 @@ int gfx_mouse_wheel(void);
 /* Tile map: one byte per tile = palette color (0 = black); draws 16x16 tiles over the
    whole back buffer with the camera at pixel (cam_x, cam_y). */
 void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y);
+/* GPU scene: 10-word header, 3 words per vertex, then 4 words per triangle. */
+int gfx3d_draw(int *scene);
+#define GPU3D_ONE 256
+#define GPU3D_FILL 1
+#define GPU3D_WIREFRAME 2
+#define GPU3D_OK 0
+#define GPU3D_ERROR_SCENE 1
+#define GPU3D_ERROR_FACE 2
+#define GPU3D_HEADER_WORDS 10
+#define GPU3D_VERTEX_WORDS 3
+#define GPU3D_FACE_WORDS 4
+#define GPU3D_MAX_VERTICES 128
+#define GPU3D_MAX_FACES 128
+#define GPU3D_FIXED(value) ((value) * GPU3D_ONE)
 /* Next typed character (ASCII, 8 = backspace, 13 = enter) or 0 when none. */
 int gfx_getchar(void);
 

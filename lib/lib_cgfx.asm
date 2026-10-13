@@ -480,6 +480,21 @@ gfx_tilemap:
     CALLX CGFX_GO
     RET
 
+; gfx3d_draw(scene): submit a fixed-point scene to GPU command 22.
+gfx3d_draw:
+    LDWS R4, 4
+    MOVSP R7
+    LDI R6, 6
+    ADD R7, R6
+    LDW R5, R7
+    CALLX CGFX_SRC
+    LDI R5, 22
+    CALLX CGFX_GO
+    LDI R6, 14
+    ADD R7, R6
+    LDW R0, R7
+    RET
+
 ; gfx_getchar(): next typed ASCII character from the keyboard register (0 = none)
 gfx_getchar:
     CALLX CGFX_HIGH
