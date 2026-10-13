@@ -18,6 +18,8 @@ from numba import njit
 # Must match the constants in SuomiCPU.py (checked by SuomiCPU before enabling the core).
 MEM_MASK = 2**30 - 1
 GPU_BASE = 0x43020
+GPU_LAYER_CONTROL_START = GPU_BASE + 16
+GPU_LAYER_CONTROL_END = GPU_BASE + 28
 ICR_ADDR = 0x43002
 DISK_BASE = 0x43100
 CONSOLE_DATA = 0x43200
@@ -37,6 +39,8 @@ CONSTANTS = (
     CONSOLE_STATUS,
     CONSOLE_CONTROL,
     MOUSE_EVENTS_ADDR,
+    GPU_LAYER_CONTROL_START,
+    GPU_LAYER_CONTROL_END,
 )
 
 
@@ -106,6 +110,9 @@ def _rd_pc(mem, a):
 def _hits_mmio(a, width=2):
     for offset in range(width):
         address = (a + offset) & MEM_MASK
+        # Layer-register writes initialize GPU state through the Python MMIO path.
+        if GPU_LAYER_CONTROL_START <= address < GPU_LAYER_CONTROL_END:
+            return True
         if address in (
             GPU_BASE,
             DISK_BASE,

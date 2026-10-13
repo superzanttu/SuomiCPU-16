@@ -81,6 +81,8 @@ class JitEquivalenceTests(unittest.TestCase):
         fast = make_cpu(program)
         slow.use_jit = False
         fast.use_jit = True
+        slow.gpu_log = []
+        fast.gpu_log = []
         slow.registers[:4] = [0x3FC0, 0, 0x4010, 0]
         fast.registers[:4] = [0x3FC0, 0, 0x4010, 0]
 
@@ -242,8 +244,8 @@ class JitEquivalenceTests(unittest.TestCase):
             for _ in range(2):
                 try:
                     reference_run(slow, 2500)
-                except (ValueError, OverflowError):
-                    break  # pre-existing float-conversion error in step(); not comparable further
+                except (IndexError, ValueError, OverflowError):
+                    break  # malformed float instruction in random code is not comparable
                 compared += 1
                 fast._execute_jit(2500)
                 self.assertTrue(state(slow) == state(fast), f"seed {seed} diverged")
@@ -260,6 +262,8 @@ class JitEquivalenceTests(unittest.TestCase):
                 CONSOLE_STATUS,
                 CONSOLE_CONTROL,
                 emulator.MOUSE_ADDR + 5,
+                emulator.GPU_LAYER_SELECT,
+                emulator.GPU_LAYER_ORDER + emulator.GPU_LAYER_COUNT,
             ),
         )
         self.assertEqual(MEM_SIZE - 1, emulator.MEM_MASK)

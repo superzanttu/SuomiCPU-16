@@ -14,7 +14,7 @@ def make_cpu(image):
     cpu = SuomiCompute16.__new__(SuomiCompute16)
     cpu.memory = create_memory()
     cpu.registers = [0] * 8
-    cpu.flags = {"Z": 0, "C": 0}
+    cpu.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
     cpu.running = True
     cpu.sp = MEM_MASK
     cpu.frame_yield = False

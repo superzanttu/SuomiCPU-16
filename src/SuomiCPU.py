@@ -309,6 +309,8 @@ def _load_jit():
                     CONSOLE_STATUS,
                     CONSOLE_CONTROL,
                     MOUSE_ADDR + 5,
+                    GPU_LAYER_SELECT,
+                    GPU_LAYER_ORDER + GPU_LAYER_COUNT,
                 )
                 if sc16_jit.CONSTANTS == expected_constants:
                     _JIT = sc16_jit

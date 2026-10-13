@@ -75,11 +75,11 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (255, 0, 0))
 
         cpu.write(GPU_BASE + 17, 0x1F)
-        cpu.write(GPU_LAYER_ORDER, 5)
-        cpu.write(GPU_LAYER_ORDER + 3, 10)
-        cpu.write(GPU_LAYER_ORDER + 4, 1)
+        cpu.write(GPU_LAYER_ORDER, 10)
+        cpu.write(GPU_LAYER_ORDER + 3, 1)
+        cpu.write(GPU_LAYER_ORDER + 4, 0)
         cpu._composite_layers()
-        self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (0, 255, 0))
+        self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (255, 0, 0))
 
     def test_hardware_sprite_and_tile_memories_render_to_their_layers(self):
         cpu = bare_cpu()

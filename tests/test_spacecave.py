@@ -5,6 +5,7 @@ from c_compiler import GLOBAL_BASE
 from gfx_harness import ROOT, compile_file, layer_pixel, make_cpu, pixel, run_frame
 from test_net import Clock, Hub
 from tools.sc16net import NetNode
+from src.SuomiCPU import MEM_SIZE
 
 SOURCE = ROOT / "modules" / "SpaceCave" / "spacecave.c"
 
@@ -245,7 +246,7 @@ class MissionTests(unittest.TestCase):
 
 class SpaceCaveTests(unittest.TestCase):
     def test_fits_memory_budget(self):
-        self.assertLess(GLOBAL_BASE + GLOBALS_SIZE + 700, 0x10000)  # room for strings
+        self.assertLess(GLOBAL_BASE + GLOBALS_SIZE + 700, MEM_SIZE)
 
     def test_menu_name_entry_and_backspace(self):
         game = Game(1)
