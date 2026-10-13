@@ -368,7 +368,7 @@ and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
 | `TEST`                        | `TEST Rd, Rs` / `imm`      | `Rd AND source`; sets flags only.                                                                                        |
 | `ADD SUB AND OR XOR CMP`      | `ADD Rd, imm`              | Immediate forms (a non-register second operand selects them).                                                            |
 | `SWAP` `SEXT` `CLZ`           | `SWAP Rd`                  | Swap bytes; sign-extend the low byte; count leading zeros (all in place).                                                |
-| `JMPR` `CALLR`                | `JMPR Rd`                  | Jump/call to the 16-bit address held in `Rd`.                                                                            |
+| `JMPR` `CALLR`                | `JMPR Rd`                  | Jump/call to the 30-bit address held in `Rd`.                                                                            |
 | `JMPRP` `CALLRP`              | `JMPRP Rlow, Rhigh`        | Jump/call through a 30-bit pointer: low 16 bits in `Rlow`, high 14 bits in `Rhigh`.                                     |
 | `PUSHF` `POPF`                | `PUSHF`                    | Push/pop the flags (Z=1, C=2, N=4, V=8).                                                                                 |
 | `SETC` `CLC`                  | `SETC`                     | Set/clear the carry flag.                                                                                                |
@@ -501,15 +501,18 @@ memory ranges:
 | ---------------------------------------- | ------------------: | -----------: |
 | Flash                                    | `0x00000`-`0x3FFFF` |      256 KiB |
 | RAM                                      | `0x40000`-`0x4FFFF` |       64 KiB |
-| VRAM                                     | `0x50000`-`0x62BFF` | 76,800 bytes |
 | Keyboard                                 |           `0x43000` |       1 byte |
 | Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
 | Speed register (modes 0-4; see below)    |           `0x43003` |       1 byte |
 | Held-key bitmask                         |           `0x43004` |       1 byte |
-| Disk storage device                      |           `0x43100` |     16 bytes |
-| RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
-| Graphics mode                            |           `0x43014` |       1 byte |
-| Graphics coprocessor registers           | `0x43020`-`0x4302E` |     15 bytes |
+| Mouse registers                          | `0x43008`-`0x4300F` |       8 bytes |
+| RTC seconds/minutes/hours                | `0x43010`-`0x43012` |       3 bytes |
+| VSync and graphics mode                  | `0x43013`-`0x43014` |       2 bytes |
+| Graphics coprocessor registers           | `0x43020`-`0x4302F` |      16 bytes |
+| BIOS descriptor                          | `0x43040`-`0x43053` |      20 bytes |
+| Disk storage device                      | `0x43100`-`0x43110` |      17 bytes |
+| Console                                  | `0x43200`-`0x43202` |       3 bytes |
+| VRAM                                     | `0x50000`-`0x62BFF` | 76,800 bytes |
 | Back buffer (coprocessor drawing target) | `0x62C00`-`0x757FF` | 76,800 bytes |
 | C global/static data                    | `0x80000`-`0xFFFFF` |      512 KiB |
 
@@ -862,7 +865,7 @@ low-memory locations: `lib_gfx` at `0x400`, `lib_text` at `0x700`, and
 sections overlap or stack frames exceed supported limits. The command-line
 compiler writes a flat `.bin` image with address gaps zero-filled; the emulator
 loads it at address zero. In [`examples/factorial.c`](examples/factorial.c),
-The global `result` is stored at `0x80000` after execution.
+the global `result` is stored at `0x80000` after execution.
 
 The preprocessor implements the directives and extensions listed above, but is
 not certified against the full C90 translation limits or conformance suite.
