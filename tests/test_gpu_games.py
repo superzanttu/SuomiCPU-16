@@ -1,13 +1,14 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
 from src.SuomiCPU import (
     BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_MAX,
-    MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR, VSYNC_ADDR, SuomiCompute16, _load_jit,
-    create_memory,
+    GFX_MODE_640_480, GFX_MODE_ADDR, MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR,
+    VRAM_START, VSYNC_ADDR, SuomiCompute16, _load_jit, create_memory,
 )
 
 HEADER = '#include "suomi_gfx.h"\n'
@@ -41,6 +42,47 @@ def back(cpu, x, y):
 
 
 class GpuTests(unittest.TestCase):
+    def test_640x480_packed_clear_pixel_rect_and_present(self):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
+
+        gpu(cpu, 1, color=2)
+        gpu(cpu, 2, color=3, x=1, y=0)
+        gpu(cpu, 3, color=1, x=2, y=0, w=3, h=2)
+
+        packed_size = 640 * 480 // 4
+        self.assertEqual(cpu.memory[BACK_START], 0xB5)
+        self.assertEqual(cpu.memory[BACK_START + 1], 0x6A)
+        self.assertEqual(cpu.memory[BACK_START + 640 // 4], 0xA5)
+        self.assertEqual(cpu.memory[BACK_START + packed_size - 1], 0xAA)
+
+        gpu(cpu, 8)
+
+        self.assertTrue(cpu.frame_yield)
+        self.assertEqual(cpu.memory[VRAM_START:VRAM_START + 2], b"\xB5\x6A")
+        decoded = cpu._decode_framebuffer(VRAM_START)
+        self.assertEqual(
+            list(decoded[:8]),
+            [2, 3, 1, 1, 1, 2, 2, 2],
+        )
+        self.assertEqual(
+            list(decoded[640:648]),
+            [2, 2, 1, 1, 1, 2, 2, 2],
+        )
+        self.assertEqual(cpu.memory[VRAM_START + packed_size - 1], 0xAA)
+
+    def test_640x480_mouse_coordinates_map_to_logical_pixels(self):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
+        cpu.screen = Mock()
+        cpu.screen.get_size.return_value = (1920, 1440)
+
+        with patch("src.SuomiCPU.pygame.mouse.get_pos", return_value=(1917, 1437)):
+            cpu.begin_mouse_frame()
+
+        self.assertEqual(cpu.read_16(MOUSE_ADDR), 639)
+        self.assertEqual(cpu.read_16(MOUSE_ADDR + 2), 479)
+
     def test_clear_pixel_rect_and_clipping(self):
         cpu = bare_cpu()
         gpu(cpu, 1, color=4)
