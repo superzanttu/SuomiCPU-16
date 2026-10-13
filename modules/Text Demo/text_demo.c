@@ -1,43 +1,20 @@
-// SC-16 text-mode demonstration.
-// ICON
-// ################
-// #..............#
-// #..#############
-// #..#...........#
-// #..#..########.#
-// #..#..#......#.#
-// #..#..########.#
-// #..#...........#
-// #..#############
-// #..............#
-// #..##..##..##..#
-// #..##..##..##..#
-// #..............#
-// #....########..#
-// #..............#
-// ################
-void SCREEN_CLEAR(void);
-void SCREEN_SET_CURSOR(unsigned char column, unsigned char row);
-int SCREEN_GET_CURSOR(void);
-void SCREEN_PRINT(char *text, unsigned char color);
-unsigned int SCREEN_INPUT(char *buffer, unsigned int capacity, unsigned char color);
-
-unsigned int name_length;
-int cursor_position;
+#include <stdio.h>
 
 int main(void)
 {
     char name[24];
+    int i;
 
-    gfx_speed(SPEED_MAX);
-    gfx_vsync(1);
-    SCREEN_CLEAR();
-    SCREEN_PRINT("Kuka olet? ", 1);
-    name_length = SCREEN_INPUT(name, 23, 1);
-
-    SCREEN_SET_CURSOR(0, 2);
-    SCREEN_PRINT("Huomenta! Kohta kouluun, ", 1);
-    SCREEN_PRINT(name, 1);
-    cursor_position = SCREEN_GET_CURSOR();
+    printf("Kuka olet? ");
+    if (fgets(name, sizeof(name), stdin) == 0)
+    {
+        puts("Nimen lukeminen epaonnistui.");
+        return 1;
+    }
+    for (i = 0; name[i] != 0 && name[i] != '\n'; i++)
+    {
+    }
+    name[i] = 0;
+    printf("Huomenta! Kohta kouluun, %s!\n", name);
     return 0;
 }

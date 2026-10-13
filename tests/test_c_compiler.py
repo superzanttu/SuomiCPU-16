@@ -10,7 +10,7 @@ from src.SuomiCPU import (
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source, main as compiler_main
 
 
-def run_image(image, maximum_steps=100_000):
+def run_image(image, maximum_steps=100_000, console_input=b""):
     cpu = SuomiCompute16.__new__(SuomiCompute16)
     cpu.memory = create_memory()
     cpu.registers = [0] * 8
@@ -19,6 +19,8 @@ def run_image(image, maximum_steps=100_000):
     cpu.sp = MEM_MASK
     cpu.load_program(image)
     cpu.reset()
+    if console_input:
+        cpu._console_device().receive(console_input)
     steps = 0
     while cpu.running and steps < maximum_steps:
         cpu.step()
@@ -27,6 +29,21 @@ def run_image(image, maximum_steps=100_000):
 
 
 class CCompilerTests(unittest.TestCase):
+    def test_text_demo_uses_standard_console_input_and_output(self):
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "modules"
+            / "Text Demo"
+            / "text_demo.c"
+        )
+        image = compile_source(path.read_text(encoding="utf-8"), str(path))
+        cpu, _ = run_image(image, console_input=b"Kaika Korhonen\n")
+        self.assertEqual(
+            cpu.console_device.output.decode("ascii"),
+            "Kuka olet? Kaika Korhonen\n"
+            "Huomenta! Kohta kouluun, Kaika Korhonen!\n",
+        )
+
     def test_c90_stdio_limits_meet_required_minimums(self):
         image = compile_source(
             "#include <stdio.h>\n"
@@ -886,7 +903,7 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 7)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 7)
 
     def test_c90_assignment_rejects_incompatible_pointer_scalar_values(self):
         sources = (
@@ -1865,7 +1882,7 @@ class CCompilerTests(unittest.TestCase):
         image = compile_source(
             "#include <string.h>\n"
             "char text[12];\n"
-            "int results[7];\n"
+            "int results[10];\n"
             "int main(void) {\n"
             "  char *token;\n"
             "  strcpy(text, \"a,,b,c\");\n"
@@ -2214,42 +2231,100 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 0)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 4)
 
-    def test_c90_float_header_matches_binary16_target(self):
+    def test_c90_float_header_matches_ieee_target(self):
         image = compile_source(
             "#include <float.h>\n"
-            "#if FLT_RADIX != 2 || FLT_MANT_DIG != 11 || FLT_DIG != 3\n"
+            "#if FLT_RADIX != 2 || FLT_MANT_DIG != 24 || FLT_DIG != 6\n"
             "#error incorrect float characteristics\n"
             "#endif\n"
-            "#if DBL_MANT_DIG != 11 || DBL_DIG != 3\n"
+            "#if DBL_MANT_DIG != 53 || DBL_DIG != 15\n"
             "#error incorrect double characteristics\n"
             "#endif\n"
-            "#if LDBL_MANT_DIG != 11 || LDBL_DIG != 3\n"
+            "#if LDBL_MANT_DIG != 53 || LDBL_DIG != 15\n"
             "#error incorrect long double characteristics\n"
             "#endif\n"
-            "#if FLT_MIN_EXP != -13 || FLT_MAX_EXP != 16\n"
+            "#if FLT_MIN_EXP != -125 || FLT_MAX_EXP != 128\n"
             "#error incorrect float exponent range\n"
             "#endif\n"
-            "#if LDBL_MIN_EXP != -13 || LDBL_MAX_EXP != 16\n"
+            "#if DBL_MIN_EXP != -1021 || DBL_MAX_EXP != 1024\n"
+            "#error incorrect double exponent range\n"
+            "#endif\n"
+            "#if LDBL_MIN_EXP != -1021 || LDBL_MAX_EXP != 1024\n"
             "#error incorrect long double exponent range\n"
             "#endif\n"
-            "int results[6];\n"
+            "int results[7];\n"
             "int main(void) {\n"
-            "  results[0] = FLT_MAX == 65504.0;\n"
-            "  results[1] = FLT_EPSILON == 0.0009765625;\n"
-            "  results[2] = FLT_MIN == 0.00006103515625;\n"
-            "  results[3] = DBL_MAX == FLT_MAX;\n"
-            "  results[4] = DBL_EPSILON == FLT_EPSILON;\n"
-            "  results[5] = DBL_MIN == FLT_MIN;\n"
-            "  results[6] = LDBL_MAX == FLT_MAX;\n"
+            "  results[0] = sizeof(float) == 4;\n"
+            "  results[1] = sizeof(double) == 8;\n"
+            "  results[2] = sizeof(long double) == 8;\n"
+            "  results[3] = FLT_MAX > 3.0e38;\n"
+            "  results[4] = FLT_EPSILON == 1.1920928955078125e-7;\n"
+            "  results[5] = DBL_EPSILON == 2.2204460492503131e-16;\n"
+            "  results[6] = LDBL_MAX == DBL_MAX;\n"
+            "  results[7] = FLT_MIN > 1.1e-38 && FLT_MIN < 1.2e-38;\n"
+            "  results[8] = DBL_MAX > 1.7e308;\n"
+            "  results[9] = DBL_MIN > 2.2e-308 && DBL_MIN < 2.3e-308;\n"
             "  return 0;\n"
             "}\n"
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(
-            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(7)],
-            [1, 1, 1, 1, 1, 1, 1],
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(10)],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
         )
+
+    def test_c90_ieee_float_layout_literals_and_execution(self):
+        image = compile_source(
+            "#include <stddef.h>\n"
+            "float stored_float = 1.0f;\n"
+            "double stored_double = 1.0;\n"
+            "long double stored_long_double = 1.0L;\n"
+            "float smallest_subnormal = 1.401298464324817e-45f;\n"
+            "float negative_zero = -0.0f;\n"
+            "struct Layout { char tag; float value; double wide; };\n"
+            "struct Layout layout = { 'x', 2.0f, 3.0 };\n"
+            "float rounded_float_constant = 16777216.0f + 1.0f;\n"
+            "double rounded_double_constant = 9007199254740992.0 + 1.0;\n"
+            "int converted_static_float = (int)2.75;\n"
+            "float bump_float(float value) { return value + 1.0f; }\n"
+            "double bump_double(double value) { return value + 0.5; }\n"
+            "int main(void) {\n"
+            "  float f;\n"
+            "  double d;\n"
+            "  long double ld;\n"
+            "  f = bump_float(2.0f);\n"
+            "  d = bump_double(2.0);\n"
+            "  ld = 3.0L;\n"
+            "  layout.value += 1.0f;\n"
+            "  return sizeof(struct Layout) != 14\n"
+            "      || offsetof(struct Layout, value) != 2\n"
+            "      || offsetof(struct Layout, wide) != 6\n"
+            "      || f != 3.0f || d != 2.5 || ld != 3.0L\n"
+            "      || layout.value != 3.0f\n"
+            "      || rounded_float_constant != 16777216.0f\n"
+            "      || rounded_double_constant != 9007199254740992.0\n"
+            "      || converted_static_float != 2\n"
+            "      || (9007199254740992.0 + 1.0) != 9007199254740992.0;\n"
+            "}\n"
+        )
+        cpu, _ = run_image(image)
+        self.assertFalse(cpu.running)
+        self.assertEqual(cpu.registers[0], 0)
+        self.assertEqual(
+            bytes(cpu.memory[GLOBAL_BASE:GLOBAL_BASE + 28]),
+            bytes.fromhex(
+                "3f800000"
+                "3ff0000000000000"
+                "3ff0000000000000"
+                "00000001"
+                "80000000"
+            ),
+        )
+        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE + 30:GLOBAL_BASE + 34]), bytes.fromhex("40400000"))
+        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE + 34:GLOBAL_BASE + 42]), bytes.fromhex("4008000000000000"))
+        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE + 42:GLOBAL_BASE + 46]), bytes.fromhex("4b800000"))
+        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE + 46:GLOBAL_BASE + 54]), bytes.fromhex("4340000000000000"))
 
     def test_c90_basic_stdlib_functions(self):
         image = compile_source(
@@ -2814,8 +2889,9 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x0C), 3)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x0E), 42)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x12), 32767)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x14), 0x4200)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x16), 1)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x14), 0x4040)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x16), 0)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x18), 1)
         self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_text_library_prints_and_tracks_cursor(self):

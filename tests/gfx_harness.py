@@ -1,8 +1,10 @@
 """Headless helpers for running compiled SC-16 programs frame by frame."""
 from pathlib import Path
 
+import pygame
+
 from src.SuomiCPU import (
-    KEYS_ADDR, MEM_MASK, SCREEN_HEIGHT, SCREEN_WIDTH, VRAM_START,
+    KEYS_ADDR, MEM_MASK, SCREEN_HEIGHT, SCREEN_WIDTH,
     SuomiCompute16, create_memory,
 )
 from c_compiler import compile_source
@@ -44,7 +46,7 @@ def run_frame(cpu, limit=400_000):
 
 
 def vram(cpu):
-    return bytes(cpu.memory[VRAM_START:VRAM_START + SCREEN_WIDTH * SCREEN_HEIGHT])
+    return pygame.image.tostring(cpu._composite_layers(), "P")
 
 def layer_pixel(cpu, layer, x, y):
     width, _ = cpu._screen_size()
@@ -54,10 +56,8 @@ def layer_pixel(cpu, layer, x, y):
 
 
 def pixel(cpu, x, y):
-    surface = getattr(cpu, "vram_surface", None)
-    if surface is not None:
-        return surface.map_rgb(surface.get_at((x, y))) & 0xFF
-    return layer_pixel(cpu, 0, x, y)
+    surface = cpu._composite_layers()
+    return surface.map_rgb(surface.get_at((x, y))) & 0xFF
 
 
 def save_png(cpu, path):

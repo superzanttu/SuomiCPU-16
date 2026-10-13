@@ -1,10 +1,11 @@
 # SC-16 C90 Target ABI
 
 This document records the target ABI decisions for completing hosted ANSI C90
-support. It is a specification target, not a claim that the current compiler
-implements every item. The compiler remains nonconforming until the
-implementation and independent conformance tests meet the acceptance criteria
-below.
+support. Floating-point object representation, literal conversion, scalar
+conversions, and generated arithmetic follow the rules below. The document is
+not a claim that the compiler implements every C90 requirement; the compiler
+remains nonconforming until the implementation and independent conformance
+tests meet the acceptance criteria below.
 
 ## Data model
 
@@ -77,12 +78,13 @@ instruction returns zero for non-finite input and the low destination bits for
 finite values outside the destination range; C code must not rely on this
 extension where C90 leaves the conversion result undefined.
 
-These are the selected target rules, not the current compiler's behavior. The
-compiler currently represents all three floating types as binary16, emits
-binary16 operations in 2-byte objects, and reports binary16 characteristics
-from `float.h`. Those active sizes and limits must not be changed independently
-of the floating-point instruction and compiler-backend work; doing so would
-make object layout and generated accesses disagree.
+The compiler converts decimal floating constants directly to the selected
+binary format using round-to-nearest, ties-to-even. Unsuffixed constants have
+type `double`, `f`/`F` constants have type `float`, and `l`/`L` constants have
+type `long double`. In non-prototype calls, `float` arguments are promoted to
+`double`, as required by the default argument promotions. `float.h` describes
+the formats implemented here; its maximum, epsilon, and minimum constants
+round to the corresponding binary32/binary64 values.
 
 Pointer objects occupy four bytes. Their representation stores the low 16
 address bits first, followed by the high 14 address bits; each 16-bit word is
@@ -164,9 +166,9 @@ extensions and do not replace required C90 library interfaces.
 
 ## Conformance gates
 
-The current code does not yet satisfy this target. In particular, binary16 is
-still used for all floating types, C function-pointer declarators and calls are
-incomplete, and the hosted library is partial. Aggregate assignment, fixed-
+The current code does not yet satisfy this target. In particular, C
+function-pointer declarators and calls are incomplete, and the hosted library
+is partial. Aggregate assignment, fixed-
 parameter copies, and caller-owned record returns are implemented, but other
 declarator and ABI requirements remain incomplete. Regression tests cover
 30-bit pointer accesses and 30-bit return PCs, explicit

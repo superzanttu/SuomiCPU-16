@@ -71,13 +71,12 @@ or correct runtime helpers cannot meet the ABI requirements.
     `long double`, their sizes, byte order, alignment, literal conversion,
     rounding, subnormals, signed zero, infinities, NaNs, and exception policy
     in `docs/c90_target_abi.md`.
-  - [ ] Implement this model consistently in compiler types, object layout,
+  - [x] Implement this model consistently in compiler types, object layout,
     literal conversion, and the execution backend.
-  - [ ] Update `float.h` limits and type sizes only with the implementation
-    that makes those limits true. Until then, the existing header continues to
-    report the measured binary16 behavior rather than advertising the future
-    ABI.
-  - [ ] Add compile-time and runtime boundary tests; claim C90 minimum range
+  - [x] Update `float.h` limits and type sizes only with the implementation
+    that makes those limits true; the header now reports the implemented
+    binary32/binary64 limits.
+  - [x] Add compile-time and runtime boundary tests; claim C90 minimum range
     and precision only when verified.
 
 ### A2. Provide required floating-point machine operations

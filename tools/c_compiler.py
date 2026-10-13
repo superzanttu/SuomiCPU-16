@@ -4,6 +4,7 @@ import argparse
 import ast
 import decimal
 import datetime
+import math
 import os
 import re
 import struct
@@ -19,7 +20,8 @@ DWORD_MASK = 0xFFFFFFFF
 INTEGER_TYPES = frozenset({
     "char", "unsigned char", "int", "unsigned int", "long", "unsigned long",
 })
-ARITHMETIC_TYPES = INTEGER_TYPES | {"float"}
+FLOAT_TYPES = frozenset({"float", "double", "long double"})
+ARITHMETIC_TYPES = INTEGER_TYPES | FLOAT_TYPES
 CODE_BASE = 0x4800
 GLOBAL_BASE = 0x80000
 GLOBAL_LIMIT = 0x100000
@@ -296,6 +298,10 @@ def _type_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
         return records[c_type].size
     if c_type in ("long", "unsigned long"):
         return 4
+    if c_type == "float":
+        return 4
+    if c_type in ("double", "long double"):
+        return 8
     return 1 if c_type in ("char", "unsigned char") else 2
 
 
@@ -306,7 +312,84 @@ def _object_size(c_type: str, records: dict[str, _Record] | None = None) -> int:
         return records[c_type].size
     if c_type in ("long", "unsigned long"):
         return 4
+    if c_type == "float":
+        return 4
+    if c_type in ("double", "long double"):
+        return 8
     return 2
+
+
+def _float_precision(c_type: str) -> int:
+    return 32 if c_type == "float" else 64
+
+
+def _round_ratio_to_even(numerator: int, denominator: int) -> int:
+    quotient, remainder = divmod(numerator, denominator)
+    doubled = remainder * 2
+    if doubled > denominator or (doubled == denominator and quotient & 1):
+        quotient += 1
+    return quotient
+
+
+def _encode_ieee754(value: decimal.Decimal, precision: int) -> int:
+    """Encode an exact Decimal as an IEEE-754 binary32 or binary64 bit pattern."""
+    fraction_bits, exponent_bits = (23, 8) if precision == 32 else (52, 11)
+    bias = (1 << (exponent_bits - 1)) - 1
+    sign = int(value.is_signed())
+    sign_bit = sign << (fraction_bits + exponent_bits)
+    exponent_mask = (1 << exponent_bits) - 1
+    if value.is_nan():
+        return sign_bit | (exponent_mask << fraction_bits) | (1 << (fraction_bits - 1))
+    if value.is_infinite():
+        return sign_bit | (exponent_mask << fraction_bits)
+    if value.is_zero():
+        return sign_bit
+    if value.adjusted() > (50 if precision == 32 else 400):
+        return sign_bit | (exponent_mask << fraction_bits)
+    if value.adjusted() < (-60 if precision == 32 else -400):
+        return sign_bit
+
+    numerator, denominator = abs(value).as_integer_ratio()
+    exponent = numerator.bit_length() - denominator.bit_length()
+    if exponent >= 0:
+        if numerator < denominator << exponent:
+            exponent -= 1
+    elif numerator << -exponent < denominator:
+        exponent -= 1
+
+    minimum_exponent = 1 - bias
+    maximum_exponent = bias
+    precision_bits = fraction_bits + 1
+    if exponent > maximum_exponent:
+        return sign_bit | (exponent_mask << fraction_bits)
+    if exponent >= minimum_exponent:
+        shift = precision_bits - 1 - exponent
+        scaled_numerator = numerator << shift if shift >= 0 else numerator
+        scaled_denominator = denominator if shift >= 0 else denominator << -shift
+        significand = _round_ratio_to_even(scaled_numerator, scaled_denominator)
+        if significand == 1 << precision_bits:
+            significand >>= 1
+            exponent += 1
+            if exponent > maximum_exponent:
+                return sign_bit | (exponent_mask << fraction_bits)
+        encoded_exponent = exponent + bias
+        return (
+            sign_bit
+            | (encoded_exponent << fraction_bits)
+            | (significand - (1 << fraction_bits))
+        )
+
+    shift = precision_bits - 1 - minimum_exponent
+    subnormal = _round_ratio_to_even(numerator << shift, denominator)
+    if subnormal >= 1 << fraction_bits:
+        return sign_bit | (1 << fraction_bits)
+    return sign_bit | subnormal
+
+
+def _decode_ieee754(bits: int, c_type: str) -> float:
+    width = _type_size(c_type)
+    format_code = ">f" if width == 4 else ">d"
+    return struct.unpack(format_code, bits.to_bytes(width, "big"))[0]
 
 
 def _cast_integer_constant(value: int, c_type: str) -> int:
@@ -685,7 +768,9 @@ class _Parser:
         if base in ("float", "double"):
             if unsigned or signed or short or (long and base != "double"):
                 raise self.fail("invalid combination of floating type specifiers")
-            return "float"
+            if base == "float":
+                return "float"
+            return "long double" if long else "double"
         if base == "char" and (short or long):
             raise self.fail("char cannot be combined with short or long")
         if base == "char":
@@ -1112,6 +1197,8 @@ class _Parser:
     def _default_argument_promotion(c_type: str) -> str:
         if c_type in ("char", "unsigned char"):
             return "int"
+        if c_type == "float":
+            return "double"
         return c_type
 
     def parse_old_style_parameter_declarations(
@@ -1623,14 +1710,20 @@ class _Parser:
             )
             if float_match is not None:
                 numeric = token.value.rstrip("fFlL")
+                suffix = token.value[-1].lower() if token.value[-1].lower() in "fl" else ""
+                c_type = {"f": "float", "l": "long double"}.get(suffix, "double")
                 try:
                     value = decimal.Decimal(numeric)
-                    bits = struct.pack(">e", float(value))
+                    bits = _encode_ieee754(value, _float_precision(c_type))
                 except (decimal.InvalidOperation, OverflowError) as exc:
                     raise CCompilerError(
                         f"{self.filename}:{token.line}: floating constant is out of range"
                     ) from exc
-                return Expr("float_constant", int.from_bytes(bits, "big"), line=token.line)
+                return Expr(
+                    "float_constant",
+                    (bits, c_type),
+                    line=token.line,
+                )
             match = re.fullmatch(
                 r"(0[xX][0-9a-fA-F]+|[0-9]+)(?:[uU]?[lL]?|[lL][uU]?)",
                 token.value,
@@ -1875,6 +1968,76 @@ class _CodeGenerator:
         )
         self._emit_bytes(data)
 
+    def _constant_float_value(self, expression: Expr) -> float:
+        if expression.kind == "init_list":
+            if len(expression.children) != 1:
+                raise self.error(
+                    expression.line,
+                    "scalar initializer braces must contain exactly one value",
+                )
+            return self._constant_float_value(expression.children[0])
+        if expression.kind == "float_constant":
+            bits, source_type = expression.value
+            return _decode_ieee754(bits, source_type)
+        if expression.kind in ("constant", "wide_constant"):
+            source_type = self._expression_type(expression)
+            value = self._constant(expression)
+            width = 32 if source_type in ("long", "unsigned long") else 16
+            if source_type not in ("unsigned char", "unsigned int", "unsigned long"):
+                sign_bit = 1 << (width - 1)
+                if value & sign_bit:
+                    value -= 1 << width
+            return float(value)
+        if expression.kind == "cast":
+            target_type = str(expression.value)
+            source_value = self._constant_float_value(expression.children[0])
+            if target_type in FLOAT_TYPES:
+                return _decode_ieee754(
+                    _encode_ieee754(
+                        decimal.Decimal.from_float(source_value),
+                        _float_precision(target_type),
+                    ),
+                    target_type,
+                )
+            if target_type in INTEGER_TYPES:
+                return float(_cast_integer_constant(math.trunc(source_value), target_type))
+            return source_value
+        if expression.kind == "unary":
+            value = self._constant_float_value(expression.children[0])
+            if expression.value == "-":
+                return -value
+            if expression.value == "+":
+                return value
+        if expression.kind == "binary":
+            left = self._constant_float_value(expression.children[0])
+            right = self._constant_float_value(expression.children[1])
+            operator = str(expression.value)
+            if operator == "+":
+                result = left + right
+            elif operator == "-":
+                result = left - right
+            elif operator == "*":
+                result = left * right
+            elif operator == "/":
+                if right == 0.0:
+                    raise self.error(expression.line, "division by zero in floating constant")
+                result = left / right
+            else:
+                raise self.error(expression.line, "invalid floating constant expression")
+            result_type = self._expression_type(expression)
+            return _decode_ieee754(
+                _encode_ieee754(
+                    decimal.Decimal.from_float(result),
+                    _float_precision(result_type),
+                ),
+                result_type,
+            )
+        if expression.kind == "conditional":
+            condition = self._constant_float_value(expression.children[0])
+            selected = expression.children[1] if condition else expression.children[2]
+            return self._constant_float_value(selected)
+        raise self.error(expression.line, "initializer is not a floating constant expression")
+
     def _serialize_initializer(
         self,
         c_type: str,
@@ -1937,6 +2100,31 @@ class _CodeGenerator:
             initializer = initializer.children[0]
         if initializer.kind == "string":
             raise self.error(line, "a string literal cannot initialize a scalar")
+        if c_type in FLOAT_TYPES:
+            value = self._constant_float_value(initializer)
+            bits = _encode_ieee754(
+                decimal.Decimal.from_float(value), _float_precision(c_type)
+            )
+            return bits.to_bytes(_type_size(c_type, self.records), "big")
+        if c_type in INTEGER_TYPES and self._expression_type(initializer) in FLOAT_TYPES:
+            value = self._constant_float_value(initializer)
+            if not math.isfinite(value):
+                raise self.error(line, "floating initializer is not representable as an integer")
+            integer = math.trunc(value)
+            limits = {
+                "char": (-0x80, 0x7F),
+                "unsigned char": (0, 0xFF),
+                "int": (-0x8000, 0x7FFF),
+                "unsigned int": (0, 0xFFFF),
+                "long": (-0x80000000, 0x7FFFFFFF),
+                "unsigned long": (0, 0xFFFFFFFF),
+            }
+            minimum, maximum = limits[c_type]
+            if not minimum <= integer <= maximum:
+                raise self.error(line, "floating initializer is outside the integer type range")
+            integer = _cast_integer_constant(integer, c_type)
+            size = _type_size(c_type, self.records)
+            return (integer & ((1 << (size * 8)) - 1)).to_bytes(size, "big")
         if c_type.endswith("*"):
             address_extension = (
                 initializer.kind == "wide_constant"
@@ -1984,6 +2172,14 @@ class _CodeGenerator:
             condition = self._constant(expression.children[0])
             return self._constant(expression.children[1] if condition else expression.children[2])
         if expression.kind == "cast" and expression.value in INTEGER_TYPES:
+            if self._expression_type(expression.children[0]) in FLOAT_TYPES:
+                value = self._constant_float_value(expression.children[0])
+                if not math.isfinite(value):
+                    raise self.error(
+                        expression.line,
+                        "floating constant is not representable as an integer",
+                    )
+                return _cast_integer_constant(math.trunc(value), str(expression.value))
             return _cast_integer_constant(
                 self._constant(expression.children[0]), str(expression.value)
             )
@@ -1996,7 +2192,7 @@ class _CodeGenerator:
         if expression.kind == "address_constant":
             return int(expression.value)
         if expression.kind == "float_constant":
-            return int(expression.value) & WORD_MASK
+            return int(expression.value[0]) & WORD_MASK
         if expression.kind == "unary":
             if expression.value == "&" and expression.children[0].kind == "member":
                 return self._constant_member_offset(
@@ -2363,6 +2559,26 @@ class _CodeGenerator:
         if variable.array_size:
             self._array_address(variable, register, line)
             return
+        if variable.c_type in FLOAT_TYPES:
+            words = _type_size(variable.c_type, self.records) // 2
+            if variable.global_address is not None:
+                self._emit_address("R7", variable.global_address)
+                for index in range(words):
+                    self.emit(f"    LDW R{index}, R7")
+                    if index + 1 < words:
+                        self.emit("    INC R7")
+                        self.emit("    INC R7")
+            else:
+                offset = variable.local_offset
+                if offset is None:
+                    offset = variable.parameter_offset
+                assert offset is not None
+                for index in range(words):
+                    self.emit(
+                        f"    LDWS R{index}, "
+                        f"{self._stack_offset(offset + index * 2, line)}"
+                    )
+            return
         if variable.c_type.endswith("*"):
             if variable.global_address is not None:
                 self._emit_address("R7", variable.global_address)
@@ -2403,6 +2619,26 @@ class _CodeGenerator:
         if variable.constant_value is not None:
             raise self.error(line, "cannot assign to an enumerator")
         self._convert_to_type(register, variable.c_type, source_type)
+        if variable.c_type in FLOAT_TYPES:
+            words = _type_size(variable.c_type, self.records) // 2
+            if variable.global_address is not None:
+                self._emit_address("R7", variable.global_address)
+                for index in range(words):
+                    self.emit(f"    STW R7, R{index}")
+                    if index + 1 < words:
+                        self.emit("    INC R7")
+                        self.emit("    INC R7")
+            else:
+                offset = variable.local_offset
+                if offset is None:
+                    offset = variable.parameter_offset
+                assert offset is not None
+                for index in range(words):
+                    self.emit(
+                        f"    STWS R{index}, "
+                        f"{self._stack_offset(offset + index * 2, line)}"
+                    )
+            return
         if variable.c_type.endswith("*"):
             if variable.global_address is not None:
                 self._emit_address("R7", variable.global_address)
@@ -2478,6 +2714,38 @@ class _CodeGenerator:
             self.emit(f"    SUB {register}, R7")
 
     def _convert_to_type(self, register: str, c_type: str, source_type: str) -> None:
+        if c_type in FLOAT_TYPES:
+            destination_precision = _float_precision(c_type)
+            if source_type in FLOAT_TYPES:
+                source_precision = _float_precision(source_type)
+                if source_precision != destination_precision:
+                    self.emit(
+                        f"    F{source_precision}TOF{destination_precision} {register}, {register}"
+                    )
+                return
+            if source_type in ("long", "unsigned long"):
+                width = 32
+                unsigned = source_type == "unsigned long"
+            else:
+                width = 16
+                unsigned = source_type in ("unsigned char", "unsigned int")
+                if source_type in ("char", "unsigned char"):
+                    self._convert_loaded(register, source_type)
+            sign = "U" if unsigned else "I"
+            self.emit(
+                f"    {sign}{width}TOF{destination_precision} {register}, {register}"
+            )
+            return
+        if source_type in FLOAT_TYPES:
+            precision = _float_precision(source_type)
+            width = 32 if c_type in ("long", "unsigned long") else 16
+            unsigned = c_type in ("unsigned char", "unsigned int", "unsigned long")
+            sign = "U" if unsigned else "I"
+            self.emit(f"    F{precision}TO{sign}{width} {register}, {register}")
+            if c_type in ("char", "unsigned char"):
+                self.emit("    LDI R7, 0x00FF")
+                self.emit(f"    AND {register}, R7")
+            return
         if c_type.endswith("*") and source_type in ("long", "unsigned long"):
             self._convert_long_to_pointer(register)
             return
@@ -2497,11 +2765,7 @@ class _CodeGenerator:
                     self.emit("    ASR R6, 15")
                     self.emit(f"    MOV {register}, R6")
                 return
-        if c_type == "float" and source_type != "float":
-            self.emit(f"    ITOF {register}")
-        elif c_type != "float" and source_type == "float":
-            self.emit(f"    FTOI {register}")
-        elif c_type in ("int", "unsigned int") and source_type.endswith("*"):
+        if c_type in ("int", "unsigned int") and source_type.endswith("*"):
             mask = "R6" if register == "R7" else "R7"
             self.emit(f"    LDI {mask}, 0xFFFF")
             self.emit(f"    AND {register}, {mask}")
@@ -2739,14 +3003,23 @@ class _CodeGenerator:
                     self.emit(f"{done}:")
                 return
             if (operator in ("==", "!=", "<", "<=", ">", ">=")
-                    and "float" not in (self._expression_type(left), self._expression_type(right))):
+                    and not any(
+                        type_ in FLOAT_TYPES
+                        for type_ in (
+                            self._expression_type(left),
+                            self._expression_type(right),
+                        )
+                    )):
                 self._jump_false = target
                 self._expression(condition)
                 return
         self._expression(condition)
-        if condition_type == "float":
-            self.emit("    LDI R1, 0")
-            self.emit("    FCMP R0, R1")
+        if condition_type in FLOAT_TYPES:
+            precision = _float_precision(condition_type)
+            zero_register = "R2" if precision == 32 else "R4"
+            for index in range(precision // 16):
+                self.emit(f"    LDI R{int(zero_register[1:]) + index}, 0")
+            self.emit(f"    F{precision}CMP R0, {zero_register}")
         else:
             self.emit("    CMP R0, 0")
         self.emit(f"    BZX {target}")
@@ -2876,7 +3149,7 @@ class _CodeGenerator:
         if expression.kind == "wide_constant":
             return str(expression.value[1])
         if expression.kind == "float_constant":
-            return "float"
+            return str(expression.value[1])
         if expression.kind == "string":
             return "char*"
         if expression.kind in ("sizeof_type", "sizeof_expr"):
@@ -3095,16 +3368,10 @@ class _CodeGenerator:
                         expression.line,
                         f"operator {operator} requires arithmetic operands",
                     )
-                if left_type == "float" or right_type == "float":
-                    return "float"
                 return self._usual_arithmetic_type(left_type, right_type)
             if operator == "+":
                 if left_arithmetic and right_arithmetic:
-                    return (
-                        "float"
-                        if left_type == "float" or right_type == "float"
-                        else self._usual_arithmetic_type(left_type, right_type)
-                    )
+                    return self._usual_arithmetic_type(left_type, right_type)
                 if left_pointer and right_integer:
                     self._require_pointer_arithmetic_type(left_type, expression.line)
                     return left_type
@@ -3117,11 +3384,7 @@ class _CodeGenerator:
                 )
             if operator == "-":
                 if left_arithmetic and right_arithmetic:
-                    return (
-                        "float"
-                        if left_type == "float" or right_type == "float"
-                        else self._usual_arithmetic_type(left_type, right_type)
-                    )
+                    return self._usual_arithmetic_type(left_type, right_type)
                 if left_pointer and right_integer:
                     self._require_pointer_arithmetic_type(left_type, expression.line)
                     return left_type
@@ -3137,8 +3400,8 @@ class _CodeGenerator:
                     "operator - requires arithmetic operands, a pointer and integer, "
                     "or compatible pointers",
                 )
-            if left_type == "float" or right_type == "float":
-                return "float"
+            if left_type in FLOAT_TYPES or right_type in FLOAT_TYPES:
+                return self._usual_arithmetic_type(left_type, right_type)
             raise self.error(expression.line, f"unsupported binary operator {operator}")
         raise self.error(expression.line, "could not determine expression type")
 
@@ -3315,8 +3578,11 @@ class _CodeGenerator:
 
     @staticmethod
     def _usual_arithmetic_type(left_type: str, right_type: str) -> str:
-        if left_type == "float" or right_type == "float":
-            return "float"
+        if left_type in FLOAT_TYPES or right_type in FLOAT_TYPES:
+            floating_types = [
+                type_ for type_ in (left_type, right_type) if type_ in FLOAT_TYPES
+            ]
+            return max(floating_types, key=("float", "double", "long double").index)
         if left_type.endswith("*") and right_type.endswith("*"):
             return left_type if left_type == right_type else "int"
         if left_type.endswith("*"):
@@ -3522,7 +3788,15 @@ class _CodeGenerator:
         c_type = self._lvalue_address(expression, line)
         if c_type in self.records:
             return
-        if c_type.endswith("*"):
+        if c_type in FLOAT_TYPES:
+            words = _type_size(c_type, self.records) // 2
+            self.emit("    MOV R7, R0")
+            for index in range(words):
+                self.emit(f"    LDW R{index}, R7")
+                if index + 1 < words:
+                    self.emit("    INC R7")
+                    self.emit("    INC R7")
+        elif c_type.endswith("*"):
             self.emit("    MOV R7, R0")
             self._emit_load_pointer("R0")
         elif c_type in ("long", "unsigned long"):
@@ -3592,6 +3866,29 @@ class _CodeGenerator:
             if variable.array_size:
                 raise self.error(line, "cannot assign to an array")
             self._store_variable(variable, register, line, c_type)
+            return
+        if c_type in FLOAT_TYPES:
+            words = _type_size(c_type, self.records) // 2
+            for index in reversed(range(words)):
+                self.emit(f"    PUSH R{index}")
+            self.stack_depth += words * 2
+            self._lvalue_address(expression, line)
+            self.emit("    ADJSP -4")
+            self.stack_depth += 4
+            self.emit("    MOVSP R7")
+            self._emit_store_pointer("R0")
+            self.emit("    MOVSP R7")
+            self._emit_load_pointer("R6")
+            for index in range(words):
+                self.emit(f"    LDWS R{index}, {4 + index * 2}")
+                self.emit(f"    STW R6, R{index}")
+                if index + 1 < words:
+                    self.emit("    INC R6")
+                    self.emit("    INC R6")
+            for index in range(words):
+                self.emit(f"    LDWS R{index}, {4 + index * 2}")
+            self._adjust_stack(words * 2 + 4)
+            self.stack_depth -= words * 2 + 4
             return
         if c_type in ("long", "unsigned long"):
             self.emit("    PUSH R1")
@@ -3711,7 +4008,13 @@ class _CodeGenerator:
             self.emit(f"    LDA R0, 0x{int(expression.value):05X}")
             return
         if kind == "float_constant":
-            self.emit(f"    LDI R0, 0x{int(expression.value) & WORD_MASK:04X}")
+            bits, c_type = expression.value
+            words = _type_size(c_type, self.records) // 2
+            for index in range(words):
+                shift = (words - index - 1) * 16
+                self.emit(
+                    f"    LDI R{index}, 0x{(bits >> shift) & WORD_MASK:04X}"
+                )
             return
         if kind == "string":
             self.emit(f"    LDA R0, {expression.value}")
@@ -3807,6 +4110,8 @@ class _CodeGenerator:
                     parameter_type = source_type
                     if source_type in ("char", "unsigned char"):
                         parameter_type = "int"
+                    elif source_type == "float":
+                        parameter_type = "double"
                 const_pointer_parameter = (
                     index < expected
                     and index
@@ -3886,11 +4191,9 @@ class _CodeGenerator:
                         self.emit("    ADJSP -4")
                         self.emit("    MOVSP R7")
                         self._emit_store_pointer("R0")
-                    elif width == 4:
-                        self.emit("    PUSH R1")
-                        self.emit("    PUSH R0")
                     else:
-                        self.emit("    PUSH R0")
+                        for word in reversed(range(width // 2)):
+                            self.emit(f"    PUSH R{word}")
                     self.stack_depth += width
                 argument_bytes += width
             return_type = self._expression_type(expression)
@@ -4002,8 +4305,11 @@ class _CodeGenerator:
                     expression.line,
                 )
                 result_type = self._expression_type(operation)
-                if target_type in ("long", "unsigned long") or result_type in (
-                    "long", "unsigned long"
+                if (
+                    target_type in ("long", "unsigned long")
+                    or result_type in ("long", "unsigned long")
+                    or target_type in FLOAT_TYPES
+                    or result_type in FLOAT_TYPES
                 ):
                     self._expression(operation)
                 else:
@@ -4111,15 +4417,29 @@ class _CodeGenerator:
                     self.emit("    LDI R2, 0")
                     self.emit("    LDI R3, 1")
                     self.emit(f"    {'ADD32' if operator == '++' else 'SUB32'} R0, R2")
-                elif c_type == "float":
-                    self.emit("    LDI R7, 0x3C00")
-                    self.emit(f"    {'FADD' if operator == '++' else 'FSUB'} R0, R7")
+                elif c_type in FLOAT_TYPES:
+                    precision = _float_precision(c_type)
+                    one_bits = (
+                        0x3F800000
+                        if precision == 32
+                        else 0x3FF0000000000000
+                    )
+                    for index in range(precision // 16):
+                        shift = (precision // 16 - index - 1) * 16
+                        self.emit(
+                            f"    LDI R{(2 if precision == 32 else 4) + index}, "
+                            f"0x{(one_bits >> shift) & WORD_MASK:04X}"
+                        )
+                    self.emit(
+                        f"    F{precision}{'ADD' if operator == '++' else 'SUB'} "
+                        f"R0, R{2 if precision == 32 else 4}"
+                    )
                 else:
                     self.emit(f"    {'INC' if operator == '++' else 'DEC'} R0")
                     if not discarded:
                         self._mask_result()
                 saved_result_size = 0
-                if child.kind != "name":
+                if child.kind != "name" and c_type not in FLOAT_TYPES:
                     if c_type in ("long", "unsigned long"):
                         self.emit("    PUSH R1")
                         self.stack_depth += 2
@@ -4139,9 +4459,9 @@ class _CodeGenerator:
                 return
             self._expression(child)
             if operator == "-":
-                if child_type == "float":
-                    self.emit("    LDI R7, 0x8000")
-                    self.emit("    XOR R0, R7")
+                if child_type in FLOAT_TYPES:
+                    precision = _float_precision(child_type)
+                    self.emit(f"    F{precision}NEG R0")
                 elif child_type in ("long", "unsigned long"):
                     self.emit("    NEG32 R0")
                 else:
@@ -4185,26 +4505,46 @@ class _CodeGenerator:
                 self.emit(f"    LDI R7, {_type_size(c_type[:-1], self.records)}")
                 if expression.value == "++":
                     self.emit("    ADD R0, R7")
+                elif c_type in FLOAT_TYPES:
+                    precision = _float_precision(c_type)
+                    width = precision // 8
+                    for index in reversed(range(width // 2)):
+                        self.emit(f"    PUSH R{index}")
+                    self.stack_depth += width
+                    one_bits = (
+                        0x3F800000
+                        if precision == 32
+                        else 0x3FF0000000000000
+                    )
+                    right_register = 2 if precision == 32 else 4
+                    for index in range(width // 2):
+                        shift = (width // 2 - index - 1) * 16
+                        self.emit(
+                            f"    LDI R{right_register + index}, "
+                            f"0x{(one_bits >> shift) & WORD_MASK:04X}"
+                        )
+                    self.emit(
+                        f"    F{precision}{'ADD' if expression.value == '++' else 'SUB'} "
+                        f"R0, R{right_register}"
+                    )
+                    saved_size = width
                 else:
                     self.emit("    SUB R0, R7")
                 saved_size = 4
             else:
                 self.emit("    PUSH R0")
                 self.stack_depth += 2
-                if c_type == "float":
-                    self.emit("    LDI R7, 0x3C00")
-                    self.emit(
-                        f"    {'FADD' if expression.value == '++' else 'FSUB'} R0, R7"
-                    )
-                else:
-                    self.emit(f"    {'INC' if expression.value == '++' else 'DEC'} R0")
-                    self.emit("    LDI R7, 0xFFFF")
-                    self.emit("    AND R0, R7")
+                self.emit(f"    {'INC' if expression.value == '++' else 'DEC'} R0")
+                self.emit("    LDI R7, 0xFFFF")
+                self.emit("    AND R0, R7")
                 saved_size = 2
             self._store_lvalue(child, "R0", c_type, expression.line)
             if c_type.endswith("*"):
                 self.emit("    MOVSP R7")
                 self._emit_load_pointer("R0")
+            elif c_type in FLOAT_TYPES:
+                for index in range(saved_size // 2):
+                    self.emit(f"    LDWS R{index}, {index * 2}")
             elif saved_size == 4:
                 self.emit("    LDWS R0, 0")
                 self.emit("    LDWS R1, 2")
@@ -4295,6 +4635,12 @@ class _CodeGenerator:
                 jump_false,
             )
             return
+        if wide_type in FLOAT_TYPES:
+            self._floating_binary_expression(
+                expression, left, right, left_type, right_type, wide_type,
+                jump_false,
+            )
+            return
         if right.kind == "constant" and self._constant_binary(expression, operator, left, left_type, jump_false):
             return
         self._expression(left)
@@ -4326,13 +4672,8 @@ class _CodeGenerator:
         self._adjust_stack(left_size)
         self.stack_depth -= left_size
         result_type = self._expression_type(expression)
-        if operator not in ("==", "!=", "<", "<=", ">", ">=") and result_type == "float":
-            if left_type != "float":
-                self.emit("    ITOF R0")
-            if right_type != "float":
-                self.emit("    ITOF R1")
         if operator in ("<<", ">>"):
-            if left_type == "float" or right_type == "float" or left_type.endswith("*"):
+            if left_type in FLOAT_TYPES or right_type in FLOAT_TYPES or left_type.endswith("*"):
                 raise self.error(expression.line, f"operator {operator} requires integers")
             if operator == "<<":
                 helper = "__runtime_shl"
@@ -4354,18 +4695,88 @@ class _CodeGenerator:
                     self.emit(f"    LDI R7, {stride}")
                     self.emit("    DIVS R0, R7")
         else:
-            compare_type = "float" if left_type == "float" or right_type == "float" else (
+            compare_type = "float" if left_type in FLOAT_TYPES or right_type in FLOAT_TYPES else (
                 "unsigned int" if promoted_left_type.startswith("unsigned")
                 or promoted_right_type.startswith("unsigned")
                 or left_type.endswith("*") or right_type.endswith("*")
                 else "int"
             )
-            if compare_type == "float":
-                if left_type != "float":
-                    self.emit("    ITOF R0")
-                if right_type != "float":
-                    self.emit("    ITOF R1")
             self._comparison(operator, expression.line, compare_type, jump_false=jump_false)
+
+    def _floating_binary_expression(
+        self,
+        expression: Expr,
+        left: Expr,
+        right: Expr,
+        left_type: str,
+        right_type: str,
+        result_type: str,
+        jump_false: str | None,
+    ) -> None:
+        operator = str(expression.value)
+        precision = _float_precision(result_type)
+        words = precision // 16
+        right_register = 2 if precision == 32 else 4
+        self._expression(left)
+        self._convert_to_type("R0", result_type, left_type)
+        for index in reversed(range(words)):
+            self.emit(f"    PUSH R{index}")
+        self.stack_depth += precision // 8
+
+        self._expression(right)
+        self._convert_to_type("R0", result_type, right_type)
+        for index in range(words):
+            self.emit(f"    MOV R{right_register + index}, R{index}")
+        for index in range(words):
+            self.emit(f"    LDWS R{index}, {index * 2}")
+        self._adjust_stack(precision // 8)
+        self.stack_depth -= precision // 8
+
+        operation = {"+": "ADD", "-": "SUB", "*": "MUL", "/": "DIV"}
+        if operator in operation:
+            self.emit(
+                f"    F{precision}{operation[operator]} R0, R{right_register}"
+            )
+            return
+        if operator not in ("==", "!=", "<", "<=", ">", ">="):
+            raise self.error(expression.line, f"operator {operator} is invalid for floating operands")
+
+        reverse = operator in (">", ">=")
+        if reverse:
+            self.emit(f"    F{precision}CMP R{right_register}, R0")
+        else:
+            self.emit(f"    F{precision}CMP R0, R{right_register}")
+        if jump_false is not None:
+            false_branch = {
+                "==": "BNZX",
+                "!=": "BZX",
+                "<": "BNCX",
+                "<=": "BHIX",
+                ">": "BNCX",
+                ">=": "BHIX",
+            }[operator]
+            self.emit(f"    {false_branch} {jump_false}")
+            return
+
+        true_label = self.label("float_cmp_true")
+        false_label = self.label("float_cmp_false")
+        end_label = self.label("float_cmp_end")
+        if operator == "==":
+            self.emit(f"    BZX {true_label}")
+        elif operator == "!=":
+            self.emit(f"    BNZX {true_label}")
+        elif operator in ("<", ">"):
+            self.emit(f"    BCX {true_label}")
+        else:
+            self.emit(f"    BCX {true_label}")
+            self.emit(f"    BZX {true_label}")
+        self.emit(f"    JMPX {false_label}")
+        self.emit(f"{true_label}:")
+        self.emit("    LDI R0, 1")
+        self.emit(f"    JMPX {end_label}")
+        self.emit(f"{false_label}:")
+        self.emit("    LDI R0, 0")
+        self.emit(f"{end_label}:")
 
     def _wide_binary_expression(
         self,
@@ -4436,7 +4847,7 @@ class _CodeGenerator:
                          jump_false: str | None = None) -> bool:
         """Emit `left <op> constant` without the operand stack; False if not applicable."""
         value = int(expression.children[1].value) & WORD_MASK
-        if left_type == "float" or left_type.endswith("*"):
+        if left_type in FLOAT_TYPES or left_type.endswith("*"):
             return False
         shifts = ("<<", ">>")
         compares = ("==", "!=", "<", "<=", ">", ">=")
@@ -4570,9 +4981,12 @@ class _CodeGenerator:
     def _boolean_not(self, c_type: str) -> None:
         false_label = self.label("not_false")
         end_label = self.label("not_end")
-        if c_type == "float":
-            self.emit("    LDI R1, 0")
-            self.emit("    FCMP R0, R1")
+        if c_type in FLOAT_TYPES:
+            precision = _float_precision(c_type)
+            zero_register = 2 if precision == 32 else 4
+            for index in range(precision // 16):
+                self.emit(f"    LDI R{zero_register + index}, 0")
+            self.emit(f"    F{precision}CMP R0, R{zero_register}")
         elif c_type in ("long", "unsigned long"):
             self.emit("    LDI R2, 0")
             self.emit("    LDI R3, 0")
