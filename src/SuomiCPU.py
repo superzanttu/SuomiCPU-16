@@ -128,7 +128,7 @@ SPEED_ADDR  = 0x43003
 VSYNC_ADDR  = 0x43013
 GFX_MODE_ADDR = 0x43014
 SPEED_VERY_SLOW, SPEED_SLOW, SPEED_NORMAL, SPEED_FAST, SPEED_MAX = range(5)
-GFX_MODE_320_240, GFX_MODE_640_480, GFX_MODE_800_600 = range(3)
+GFX_MODE_320_240, GFX_MODE_640_480 = range(2)
 TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
@@ -139,7 +139,11 @@ DISPLAY_FPS = 30
 MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed register selects maximum speed
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
 SPEED_RATES = (10, 100, 1_000_000, 10_000_000, None)
-DISPLAY_MODES = ((320, 240, 8), (640, 480, 2), (800, 600, 1))
+DISPLAY_MODES = ((320, 240, 8), (640, 480, 2))
+
+
+def create_memory():
+    return mmap.mmap(-1, MEM_SIZE)
 
 
 def _display_viewport(screen_size, virtual_size=(SCREEN_WIDTH, SCREEN_HEIGHT)):
@@ -288,7 +292,7 @@ class SuomiCompute16:
     """Tämä on itse tietokoneen sydän (emulaattori)."""
     def __init__(self, fullscreen: bool = False):
         # Muisti on kuin pitkä jono numeroita
-        self.memory = mmap.mmap(-1, MEM_SIZE)
+        self.memory = create_memory()
         self._last_click = [(-10**9, 0, 0), (-10**9, 0, 0)]
         # Rekisterit ovat koneen "lyhytkestoisia muistipaikkoja"
         self.registers = [0] * 8
@@ -348,12 +352,6 @@ class SuomiCompute16:
                 offset = index * 4
                 pixels[offset:offset + 4] = bytes(
                     ((value >> 6) & 3, (value >> 4) & 3, (value >> 2) & 3, value & 3)
-                )
-        else:
-            for index, value in enumerate(packed):
-                offset = index * 8
-                pixels[offset:offset + 8] = bytes(
-                    (value >> shift) & 1 for shift in range(7, -1, -1)
                 )
         return pixels
 
@@ -420,13 +418,6 @@ class SuomiCompute16:
             shift = (3 - x % 4) * 2
             mask = 3 << shift
             self.memory[address] = (self.memory[address] & ~mask) | ((color & 3) << shift)
-        else:
-            address = BACK_START + y * (width // 8) + x // 8
-            mask = 1 << (7 - x % 8)
-            self.memory[address] = (
-                self.memory[address] | mask if color & 1
-                else self.memory[address] & ~mask
-            )
 
     def _back_rect(self, x, y, width, height, color):
         screen_width, screen_height = self._screen_size()
@@ -441,9 +432,8 @@ class SuomiCompute16:
                 start = BACK_START + row_y * screen_width + left
                 self.memory[start:start + len(row)] = row
             return
-        bits_per_pixel = DISPLAY_MODES[mode][2]
-        pixels_per_byte = 8 // bits_per_pixel
-        packed_color = ((color & ((1 << bits_per_pixel) - 1)) * 0x55) if bits_per_pixel == 2 else (0xFF if color & 1 else 0)
+        pixels_per_byte = 4
+        packed_color = (color & 3) * 0x55
         for row_y in range(top, bottom):
             column = left
             while column < right and column % pixels_per_byte:

@@ -26,7 +26,7 @@ from src.isa import (
     WIDE_PREFIX,
 )
 
-MEMORY_SIZE = 1 << 19
+MEMORY_SIZE = 1 << 30
 
 
 class AssemblyError(ValueError):
@@ -265,7 +265,7 @@ def _extended_size(mnemonic: str, operands: list[str], line_number: int) -> int 
     if mnemonic in BRANCH_CONDITIONS or mnemonic in BRANCH_ALIASES:
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")
-        return 4
+        return 6
     if mnemonic == "NOP":
         return 2
     if mnemonic in MISC_OPERATIONS:
@@ -327,8 +327,8 @@ def _assemble_extended(
             target = _parse_number(operands[0], line_number)
         if not 0 <= target < MEMORY_SIZE:
             raise _error(line_number, f"{mnemonic} target is outside available memory")
-        first = FAR_BRANCH_PREFIX | (condition << 7) | (((target >> 16) & 0x7) << 4)
-        return [first, target & 0xFFFF]
+        first = FAR_BRANCH_PREFIX | (condition << 7)
+        return [first, (target >> 16) & 0x3FFF, target & 0xFFFF]
     if mnemonic in MISC_OPERATIONS:
         if mnemonic in ("CALLRP", "JMPRP"):
             if len(operands) != 2:
@@ -382,15 +382,15 @@ def _instruction_size(text: str, line_number: int) -> int:
     if mnemonic in ("JMPX", "CALLX", "BZX", "BCX"):
         if len(operands) != 1:
             raise _error(line_number, f"{mnemonic} expects one address or label")
-        return 4
+        return 6
     if mnemonic in MULDIV_OPERATIONS:
         if len(operands) != 2:
             raise _error(line_number, f"{mnemonic} expects a register and a register or immediate")
         return 6 if not re.fullmatch(r"R[0-7]", operands[1].strip(), re.IGNORECASE) else 4
-    if mnemonic in ("LDA", "LDI19"):
+    if mnemonic in ("LDA", "LDI19", "LDI30"):
         if len(operands) != 2:
             raise _error(line_number, f"{mnemonic} expects a register and an address or label")
-        return 6
+        return 8
     if mnemonic == "LDI":
         if len(operands) != 2:
             raise _error(line_number, "LDI expects a register and an immediate")
@@ -434,18 +434,17 @@ def _assemble_instruction(
         if not 0 <= target < MEMORY_SIZE:
             raise _error(line_number, f"{mnemonic} target is outside available memory")
         first = FAR_CONTROL_PREFIX | (FAR_CONTROL_OPERATIONS[mnemonic] << 9)
-        first |= ((target >> 16) & 0x7) << 6
-        return [first, target & 0xFFFF]
+        return [first, (target >> 16) & 0x3FFF, target & 0xFFFF]
 
-    if mnemonic in ("LDA", "LDI19"):
+    if mnemonic in ("LDA", "LDI19", "LDI30"):
         require_count(2)
         destination = _parse_register(operands[0], line_number)
         value = target_address(operands[1])
         if not 0 <= value < MEMORY_SIZE:
             raise _error(line_number, f"{mnemonic} address is outside available memory")
         first = (OPCODES["SHR"] << 11) | (destination << 8) | MULDIV_PREFIX
-        control = (7 << 12) | ((value >> 16) & 0x7)
-        return [first, control, value & 0xFFFF]
+        control = 7 << 12
+        return [first, control, (value >> 16) & 0x3FFF, value & 0xFFFF]
 
     if mnemonic in MULDIV_OPERATIONS:
         require_count(2)
@@ -497,7 +496,7 @@ def _assemble_instruction(
             words.append((OP_LDI_H << 11) | (destination << 8) | (value >> 8))
         return words
     if mnemonic == "LDA":
-        raise AssertionError("LDA must be encoded by the 19-bit immediate handler")
+        raise AssertionError("LDA must be encoded by the 30-bit immediate handler")
     if mnemonic == "LDI_H":
         require_count(2)
         destination = _parse_register(operands[0], line_number)

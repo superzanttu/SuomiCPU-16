@@ -16,7 +16,7 @@ import numpy as np
 from numba import njit
 
 # Must match the constants in SuomiCPU.py (checked by SuomiCPU before enabling the core).
-MEM_MASK = 2**19 - 1
+MEM_MASK = 2**30 - 1
 GPU_BASE = 0x43020
 ICR_ADDR = 0x43002
 DISK_BASE = 0x43100
@@ -53,17 +53,19 @@ def _wr16(mem, a, v):
 
 @njit(cache=True)
 def _wr_pc(mem, a, pc):
-    mem[a & MEM_MASK] = (pc >> 16) & 0x7
-    mem[(a + 1) & MEM_MASK] = (pc >> 8) & 0xFF
-    mem[(a + 2) & MEM_MASK] = pc & 0xFF
+    mem[a & MEM_MASK] = (pc >> 24) & 0xFF
+    mem[(a + 1) & MEM_MASK] = (pc >> 16) & 0xFF
+    mem[(a + 2) & MEM_MASK] = (pc >> 8) & 0xFF
+    mem[(a + 3) & MEM_MASK] = pc & 0xFF
 
 
 @njit(cache=True)
 def _rd_pc(mem, a):
     return (
-        (np.int64(mem[a & MEM_MASK]) << 16)
-        | (np.int64(mem[(a + 1) & MEM_MASK]) << 8)
-        | np.int64(mem[(a + 2) & MEM_MASK])
+        (np.int64(mem[a & MEM_MASK]) << 24)
+        | (np.int64(mem[(a + 1) & MEM_MASK]) << 16)
+        | (np.int64(mem[(a + 2) & MEM_MASK]) << 8)
+        | np.int64(mem[(a + 3) & MEM_MASK])
     ) & MEM_MASK
 
 
@@ -138,8 +140,9 @@ def run_block(mem, regs, st, budget):
             control = _rd16(mem, npc)
             npc += 2
             if (control >> 12) == 7:
-                regs[rd] = (((control & 7) << 16) | _rd16(mem, npc))
-                npc += 2
+                high = _rd16(mem, npc) & 0x3FFF
+                regs[rd] = ((high << 16) | _rd16(mem, npc + 2)) & MEM_MASK
+                npc += 4
             else:
                 if control & 0x0800:
                     right = _rd16(mem, npc)
@@ -199,10 +202,10 @@ def run_block(mem, regs, st, budget):
                 elif sel == 2:
                     npc = left
                 elif sel == 3:
-                    if _hits_mmio(sp - 3, 3):
+                    if _hits_mmio(sp - 4, 4):
                         bail = True
                     else:
-                        sp -= 3
+                        sp -= 4
                         _wr_pc(mem, sp, npc)
                         npc = left
                 elif sel == 4:
@@ -236,21 +239,21 @@ def run_block(mem, regs, st, budget):
                     regs[rd] = 16 - bits
                     z = 1 if left == 0 else 0
                 elif sel == 10:
-                    regs[rd] = (sp >> 16) & 7
+                    regs[rd] = (sp >> 16) & 0x3FFF
                 elif sel == 11:
-                    if _hits_mmio(sp - 3, 3):
+                    if _hits_mmio(sp - 4, 4):
                         bail = True
                     else:
                         high_register = (control >> 9) & 7
-                        target = ((regs[high_register] & 7) << 16) | left
-                        sp -= 3
+                        target = ((regs[high_register] & 0x3FFF) << 16) | left
+                        sp -= 4
                         _wr_pc(mem, sp, npc)
                         npc = target
                 elif sel == 12:
                     high_register = (control >> 9) & 7
-                    npc = ((regs[high_register] & 7) << 16) | left
+                    npc = ((regs[high_register] & 0x3FFF) << 16) | left
                 elif sel == 13:
-                    sp = (sp & 0xFFFF) | ((left & 7) << 16)
+                    sp = (sp & 0xFFFF) | ((left & 0x3FFF) << 16)
             elif oper <= 4:
                 if control & 0x0800:
                     cnt = control & 0xF
@@ -318,14 +321,13 @@ def run_block(mem, regs, st, budget):
                     regs[rd] = result
         elif op == 31 and (instr & FAR_CONTROL_MASK) == FAR_CONTROL_PREFIX:
             operation = (instr >> 9) & 3
-            high_address = (instr >> 6) & 7
-            target = (high_address << 16) | _rd16(mem, npc)
-            npc += 2
+            target = ((_rd16(mem, npc) & 0x3FFF) << 16) | _rd16(mem, npc + 2)
+            npc += 4
             if operation == 1:
-                if _hits_mmio(sp - 3, 3):
+                if _hits_mmio(sp - 4, 4):
                     bail = True
                 else:
-                    sp -= 3
+                    sp -= 4
                     _wr_pc(mem, sp, npc)
                     npc = target
             elif operation == 0:
@@ -336,8 +338,8 @@ def run_block(mem, regs, st, budget):
                 npc = target
         elif op == 31 and (instr & FAR_BRANCH_MASK) == FAR_BRANCH_PREFIX:
             cond = (instr >> 7) & 0xF
-            target = _rd16(mem, npc) | (((instr >> 4) & 0x7) << 16)
-            npc += 2
+            target = ((_rd16(mem, npc) & 0x3FFF) << 16) | _rd16(mem, npc + 2)
+            npc += 4
             if _condition(cond, z, c, n, v):
                 npc = target
         elif op == 31:
@@ -388,11 +390,11 @@ def run_block(mem, regs, st, budget):
             n = r16 >> 15
             v = 1 if ((a ^ b) & (a ^ r16) & 0x8000) else 0
         elif op == 23:
-            if _hits_mmio(sp, 3):
+            if _hits_mmio(sp, 4):
                 bail = True
             else:
                 npc = _rd_pc(mem, sp)
-                sp += 3
+                sp += 4
         elif op == 7:
             regs[rd] = regs[rs1] & regs[rs2]
         elif op == 25:
@@ -455,8 +457,8 @@ def run_block(mem, regs, st, budget):
             if regs[rd] == 0:
                 npc = imm
         elif op == 22:
-            nsp = sp - 3
-            if _hits_mmio(nsp, 3):
+            nsp = sp - 4
+            if _hits_mmio(nsp, 4):
                 bail = True
             else:
                 sp = nsp
@@ -471,7 +473,7 @@ def run_block(mem, regs, st, budget):
         elif op == 10:
             regs[rd] = (~regs[rs1]) & 0xFFFF
         elif op == 19:
-            if _hits_mmio(sp, 5):
+            if _hits_mmio(sp, 6):
                 bail = True
             else:
                 saved = _rd16(mem, sp)
@@ -481,7 +483,7 @@ def run_block(mem, regs, st, budget):
                 n = (saved >> 2) & 1
                 v = (saved >> 3) & 1
                 npc = _rd_pc(mem, sp)
-                sp += 3
+                sp += 4
         elif op == 17:
             mem[ICR_ADDR] = mem[ICR_ADDR] | 1
         elif op == 18:
