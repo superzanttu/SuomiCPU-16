@@ -8,6 +8,7 @@ import struct
 import random
 import os
 import time
+import mmap
 from collections.abc import Callable
 from src.console_device import ConsoleDevice, ConsoleWindow
 from pathlib import Path
@@ -78,11 +79,13 @@ OP_FTOI = OP_SHR
 # KONFIGURAATIO JA MUISTIKARTTA
 # Tässä päätetään, mihin muistiin mitäkin laitetaan.
 # =============================================================================
-MEM_SIZE = 2**19       # Muistin kokonaiskoko (512 KB)
+MEM_SIZE = 2**30       # 1 GiB byte-addressed memory
 MEM_MASK = MEM_SIZE - 1
-FLASH_START = 0x00000 # Ohjelman alkuosa
-RAM_START   = 0x20000 # Työmuistin alku
-VRAM_START  = 0x30000 # Videomuistin alku (tänne piirretään ruutu)
+FLASH_START = 0x00000
+FLASH_SIZE  = 0x40000
+RAM_START   = FLASH_START + FLASH_SIZE
+VRAM_START  = 0x50000
+VRAM_SIZE   = 320 * 240
 KBD_ADDR    = 0x43000 # Näppäimistön osoite
 ICR_ADDR    = 0x43002 # Keskeytysten ohjaus
 DISK_BASE   = 0x43100 # Levylaitteen ohjaus (Disk storage)
@@ -106,7 +109,7 @@ BIOS_BASE = 0x43040
 KEYS_ADDR   = 0x43004 # Mitkä näppäimet on painettuna
 MOUSE_ADDR  = 0x43008 # Mouse: +0 X word, +2 Y word, +4 held buttons, +5 latched click events
 GPU_BASE    = 0x43020 # Grafiikkapiirin ohjausrekisterit
-BACK_START  = 0x44000 # "Takapuskuri" - piirretään tänne, sitten siirretään ruudulle
+BACK_START  = VRAM_START + VRAM_SIZE
 FONT_ADDR   = 0x4400  # Fonttien paikka
 
 # Grafiikkapiirin komennot
@@ -121,8 +124,11 @@ GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 
 # Tile map: SRC=map (1 byte per tile = palette color, 0 black), W/H=map size in tiles,
 # X/Y=camera pixel position. Draws 16x16 tiles over the whole back buffer.
 GPU_TILEMAP = 21
-SPEED_ADDR  = 0x43003 # Speed register: 0 = fixed (30 fps, 30000 instr/frame), 1 = maximum (unthrottled)
-VSYNC_ADDR  = 0x43004 # VSync register: nonzero synchronizes presented frames to the display rate
+SPEED_ADDR  = 0x43003
+VSYNC_ADDR  = 0x43013
+GFX_MODE_ADDR = 0x43014
+SPEED_VERY_SLOW, SPEED_SLOW, SPEED_NORMAL, SPEED_FAST, SPEED_MAX = range(5)
+GFX_MODE_320_240, GFX_MODE_640_480, GFX_MODE_800_600 = range(3)
 TILE_SIZE = 16
 
 SCREEN_WIDTH = 320
@@ -132,6 +138,8 @@ WINDOW_SCALE = 3
 DISPLAY_FPS = 30
 MAX_SPEED_INSTRUCTIONS = 300000 # Instructions per loop pass when the speed register selects maximum speed
 INSTRUCTIONS_PER_FRAME = 30000 # Kuinka monta käskyä suoritetaan yhden kuvan välillä
+SPEED_RATES = (10, 100, 1_000_000, 10_000_000, None)
+DISPLAY_MODES = ((320, 240, 8), (640, 480, 2), (800, 600, 1))
 
 
 def _display_viewport(screen_size, virtual_size=(SCREEN_WIDTH, SCREEN_HEIGHT)):
@@ -280,7 +288,7 @@ class SuomiCompute16:
     """Tämä on itse tietokoneen sydän (emulaattori)."""
     def __init__(self, fullscreen: bool = False):
         # Muisti on kuin pitkä jono numeroita
-        self.memory = bytearray(MEM_SIZE)
+        self.memory = mmap.mmap(-1, MEM_SIZE)
         self._last_click = [(-10**9, 0, 0), (-10**9, 0, 0)]
         # Rekisterit ovat koneen "lyhytkestoisia muistipaikkoja"
         self.registers = [0] * 8
@@ -288,7 +296,7 @@ class SuomiCompute16:
         self.pc = 0
         self.entry_point = 0
         # Pino (Stack) on paikka, jonne tallennetaan tietoa funktioiden ajaksi
-        self.sp = 0x2FFFF
+        self.sp = MEM_MASK
         self.flags = {'Z': 0, 'C': 0, 'N': 0, 'V': 0} # Z = nolla, C = kanto (käytetään vertailuissa)
         self.running = True
         
@@ -319,10 +327,41 @@ class SuomiCompute16:
         self.screen = _set_display_mode(self.fullscreen)
         pygame.display.set_caption("SuomiCPU-16 Emulator")
 
+    def _graphics_mode(self):
+        memory = getattr(self, "memory", None)
+        mode = memory[GFX_MODE_ADDR] if memory is not None else 0
+        return mode if mode in range(len(DISPLAY_MODES)) else GFX_MODE_320_240
+
+    def _screen_size(self):
+        width, height, _ = DISPLAY_MODES[self._graphics_mode()]
+        return width, height
+
+    def _decode_framebuffer(self, address):
+        width, height, bits_per_pixel = DISPLAY_MODES[self._graphics_mode()]
+        if bits_per_pixel == 8:
+            return memoryview(self.memory)[address:address + VRAM_SIZE]
+        pixels = bytearray(width * height)
+        packed_size = width * height * bits_per_pixel // 8
+        packed = self.memory[address:address + packed_size]
+        if bits_per_pixel == 2:
+            for index, value in enumerate(packed):
+                offset = index * 4
+                pixels[offset:offset + 4] = bytes(
+                    ((value >> 6) & 3, (value >> 4) & 3, (value >> 2) & 3, value & 3)
+                )
+        else:
+            for index, value in enumerate(packed):
+                offset = index * 8
+                pixels[offset:offset + 8] = bytes(
+                    (value >> shift) & 1 for shift in range(7, -1, -1)
+                )
+        return pixels
+
     def _create_vram_surface(self):
-        vram_size = SCREEN_WIDTH * SCREEN_HEIGHT
-        framebuffer = memoryview(self.memory)[VRAM_START:VRAM_START + vram_size]
-        surface = pygame.image.frombuffer(framebuffer, (SCREEN_WIDTH, SCREEN_HEIGHT), "P")
+        width, height = self._screen_size()
+        self._surface_mode = self._graphics_mode()
+        self._expanded_vram = self._decode_framebuffer(VRAM_START)
+        surface = pygame.image.frombuffer(self._expanded_vram, (width, height), "P")
         surface.set_palette(self.palette)
         return surface
 
@@ -370,8 +409,54 @@ class SuomiCompute16:
         return value - 0x10000 if signed and value & 0x8000 else value
 
     def _back_pixel(self, x, y, color):
-        if 0 <= x < SCREEN_WIDTH and 0 <= y < SCREEN_HEIGHT:
-            self.memory[BACK_START + y * SCREEN_WIDTH + x] = color
+        width, height = self._screen_size()
+        if not (0 <= x < width and 0 <= y < height):
+            return
+        mode = self._graphics_mode()
+        if mode == GFX_MODE_320_240:
+            self.memory[BACK_START + y * width + x] = color
+        elif mode == GFX_MODE_640_480:
+            address = BACK_START + y * (width // 4) + x // 4
+            shift = (3 - x % 4) * 2
+            mask = 3 << shift
+            self.memory[address] = (self.memory[address] & ~mask) | ((color & 3) << shift)
+        else:
+            address = BACK_START + y * (width // 8) + x // 8
+            mask = 1 << (7 - x % 8)
+            self.memory[address] = (
+                self.memory[address] | mask if color & 1
+                else self.memory[address] & ~mask
+            )
+
+    def _back_rect(self, x, y, width, height, color):
+        screen_width, screen_height = self._screen_size()
+        left, right = max(x, 0), min(x + width, screen_width)
+        top, bottom = max(y, 0), min(y + height, screen_height)
+        if right <= left or bottom <= top:
+            return
+        mode = self._graphics_mode()
+        if mode == GFX_MODE_320_240:
+            row = bytes([color]) * (right - left)
+            for row_y in range(top, bottom):
+                start = BACK_START + row_y * screen_width + left
+                self.memory[start:start + len(row)] = row
+            return
+        bits_per_pixel = DISPLAY_MODES[mode][2]
+        pixels_per_byte = 8 // bits_per_pixel
+        packed_color = ((color & ((1 << bits_per_pixel) - 1)) * 0x55) if bits_per_pixel == 2 else (0xFF if color & 1 else 0)
+        for row_y in range(top, bottom):
+            column = left
+            while column < right and column % pixels_per_byte:
+                self._back_pixel(column, row_y, color)
+                column += 1
+            full_bytes = (right - column) // pixels_per_byte
+            if full_bytes:
+                start = BACK_START + row_y * (screen_width // pixels_per_byte) + column // pixels_per_byte
+                self.memory[start:start + full_bytes] = bytes([packed_color]) * full_bytes
+                column += full_bytes * pixels_per_byte
+            while column < right:
+                self._back_pixel(column, row_y, color)
+                column += 1
 
     def _gpu_source(self):
         return (self.memory[GPU_BASE + 12] << 16) | (self.memory[GPU_BASE + 10] << 8) | self.memory[GPU_BASE + 11]
@@ -381,18 +466,20 @@ class SuomiCompute16:
         color = self.memory[GPU_BASE + 1]
         x, y = self._gpu_word(2), self._gpu_word(4)
         w, h = self._gpu_word(6), self._gpu_word(8)
+        width, height = self._screen_size()
+        mode = self._graphics_mode()
         if command == GPU_CLEAR:
-            size = SCREEN_WIDTH * SCREEN_HEIGHT
-            self.memory[BACK_START:BACK_START + size] = bytes([color]) * size
+            if mode == GFX_MODE_320_240:
+                fill = color
+            elif mode == GFX_MODE_640_480:
+                fill = (color & 3) * 0x55
+            else:
+                fill = 0xFF if color & 1 else 0
+            self.memory[BACK_START:BACK_START + VRAM_SIZE] = bytes([fill]) * VRAM_SIZE
         elif command == GPU_PIXEL:
             self._back_pixel(x, y, color)
         elif command == GPU_RECT:
-            left, right = max(x, 0), min(x + w, SCREEN_WIDTH)
-            if right > left:
-                row = bytes([color]) * (right - left)
-                for row_y in range(max(y, 0), min(y + h, SCREEN_HEIGHT)):
-                    start = BACK_START + row_y * SCREEN_WIDTH + left
-                    self.memory[start:start + len(row)] = row
+            self._back_rect(x, y, w, h, color)
         elif command == GPU_LINE:
             self._gpu_line(x, y, w, h, color)
         elif command == GPU_POLY:
@@ -415,8 +502,7 @@ class SuomiCompute16:
         elif command == GPU_TEXT:
             self._gpu_text(x, y, color)
         elif command == GPU_PRESENT:
-            size = SCREEN_WIDTH * SCREEN_HEIGHT
-            self.memory[VRAM_START:VRAM_START + size] = self.memory[BACK_START:BACK_START + size]
+            self.memory[VRAM_START:VRAM_START + VRAM_SIZE] = self.memory[BACK_START:BACK_START + VRAM_SIZE]
             self.frame_yield = True
         elif command == GPU_TICKS:
             ticks = getattr(self, 'frames', 0)
@@ -429,13 +515,11 @@ class SuomiCompute16:
             self._gpu_sound(color, self._gpu_word(2, False), self._gpu_word(4, False),
                             self._gpu_word(6, False), self._gpu_word(8, False))
         elif command == GPU_SAVE:
-            size = SCREEN_WIDTH * SCREEN_HEIGHT
-            self._saved_layer = bytes(self.memory[BACK_START:BACK_START + size])
+            self._saved_layer = bytes(self.memory[BACK_START:BACK_START + VRAM_SIZE])
         elif command == GPU_LOAD:
-            size = SCREEN_WIDTH * SCREEN_HEIGHT
             saved = getattr(self, '_saved_layer', None)
             if saved is not None:
-                self.memory[BACK_START:BACK_START + size] = saved
+                self.memory[BACK_START:BACK_START + VRAM_SIZE] = saved
         elif command == GPU_RANDOM:
             self.memory[GPU_BASE + 14] = random.randrange(256)
         elif GPU_NET_OPEN <= command <= GPU_NET_INFO:
@@ -446,22 +530,29 @@ class SuomiCompute16:
     _TILE_ROWS = [bytes([c]) * TILE_SIZE for c in range(256)]
 
     def _gpu_tilemap(self, camx, camy, map_w, map_h, source):
-        out = bytearray(SCREEN_WIDTH * SCREEN_HEIGHT)
+        width, height = self._screen_size()
+        out = bytearray(width * height)
         if map_w > 0 and map_h > 0:
             first_col = camx // TILE_SIZE
-            last_col = (camx + SCREEN_WIDTH - 1) // TILE_SIZE
+            last_col = (camx + width - 1) // TILE_SIZE
             crop = camx - first_col * TILE_SIZE
-            for tile_y in range(camy // TILE_SIZE, (camy + SCREEN_HEIGHT - 1) // TILE_SIZE + 1):
+            for tile_y in range(camy // TILE_SIZE, (camy + height - 1) // TILE_SIZE + 1):
                 if not 0 <= tile_y < map_h:
                     continue
                 base = source + tile_y * map_w
                 cells = [self.memory[base + c] if 0 <= c < map_w else 0
                          for c in range(first_col, last_col + 1)]
-                line = b"".join([self._TILE_ROWS[c] for c in cells])[crop:crop + SCREEN_WIDTH]
+                line = b"".join([self._TILE_ROWS[c] for c in cells])[crop:crop + width]
                 top = tile_y * TILE_SIZE - camy
-                for row in range(max(top, 0), min(top + TILE_SIZE, SCREEN_HEIGHT)):
-                    out[row * SCREEN_WIDTH:(row + 1) * SCREEN_WIDTH] = line
-        self.memory[BACK_START:BACK_START + len(out)] = out
+                for row in range(max(top, 0), min(top + TILE_SIZE, height)):
+                    out[row * width:(row + 1) * width] = line
+        if self._graphics_mode() == GFX_MODE_320_240:
+            self.memory[BACK_START:BACK_START + VRAM_SIZE] = out
+        else:
+            self.memory[BACK_START:BACK_START + VRAM_SIZE] = bytes(VRAM_SIZE)
+            for y in range(height):
+                for x in range(width):
+                    self._back_pixel(x, y, out[y * width + x])
 
     def _net_node(self):
         node = getattr(self, 'net', None)
@@ -739,18 +830,18 @@ class SuomiCompute16:
 
     def push_pc(self, value):
         value &= MEM_MASK
-        self.sp -= 3
-        self.write(self.sp, value >> 16)
-        self.write(self.sp + 1, value >> 8)
-        self.write(self.sp + 2, value)
+        self.sp -= 4
+        for offset in range(4):
+            self.write(self.sp + offset, value >> (24 - offset * 8))
 
     def pop_pc(self):
         value = (
-            (self.read(self.sp) << 16)
-            | (self.read(self.sp + 1) << 8)
-            | self.read(self.sp + 2)
+            (self.read(self.sp) << 24)
+            | (self.read(self.sp + 1) << 16)
+            | (self.read(self.sp + 2) << 8)
+            | self.read(self.sp + 3)
         )
-        self.sp += 3
+        self.sp += 4
         return value & MEM_MASK
 
     def _execute_muldiv(self, instr):
@@ -760,8 +851,9 @@ class SuomiCompute16:
         self.pc += 2
         operation = control >> 12
         if operation == 7:
-            self.registers[rd] = (((control & 0x7) << 16) | self.read_16(self.pc))
-            self.pc += 2
+            high = self.read_16(self.pc) & 0x3FFF
+            self.registers[rd] = ((high << 16) | self.read_16(self.pc + 2)) & MEM_MASK
+            self.pc += 4
             return
         if control & 0x0800:
             right = self.read_16(self.pc)
@@ -1075,17 +1167,17 @@ class SuomiCompute16:
             self.registers[rd] = 16 - value.bit_length()
             self.flags['Z'] = int(value == 0)
         elif selector == 10:
-            self.registers[rd] = (self.sp >> 16) & 0x7
+            self.registers[rd] = (self.sp >> 16) & 0x3FFF
         elif selector == 11:
             high_register = (control >> 9) & 0x7
-            target = ((self.registers[high_register] & 0x7) << 16) | value
+            target = ((self.registers[high_register] & 0x3FFF) << 16) | value
             self.push_pc(self.pc)
             self.pc = target
         elif selector == 12:
             high_register = (control >> 9) & 0x7
-            self.pc = ((self.registers[high_register] & 0x7) << 16) | value
+            self.pc = ((self.registers[high_register] & 0x3FFF) << 16) | value
         elif selector == 13:
-            self.sp = (self.sp & 0xFFFF) | ((value & 0x7) << 16)
+            self.sp = (self.sp & 0xFFFF) | ((value & 0x3FFF) << 16)
 
     def _pack_flags(self):
         flags = self.flags
@@ -1121,15 +1213,16 @@ class SuomiCompute16:
             self._execute_alu(instr)
         elif opcode == OP_SHR and (instr & FAR_BRANCH_MASK) == FAR_BRANCH_PREFIX:
             condition = (instr >> 7) & 0xF
-            target = self.read_16(self.pc) | (((instr >> 4) & 0x7) << 16)
-            self.pc += 2
+            target = (((self.read_16(self.pc) & 0x3FFF) << 16)
+                      | self.read_16(self.pc + 2)) & MEM_MASK
+            self.pc += 4
             if self._flag_condition(condition):
                 self.pc = target
         elif opcode == OP_SHR and (instr & FAR_CONTROL_MASK) == FAR_CONTROL_PREFIX:
             operation = (instr >> 9) & 0x3
-            high_address = (instr >> 6) & 0x7
-            target = self.read_16(self.pc) | (high_address << 16)
-            self.pc += 2
+            target = (((self.read_16(self.pc) & 0x3FFF) << 16)
+                      | self.read_16(self.pc + 2)) & MEM_MASK
+            self.pc += 4
             if operation == FAR_CONTROL_OPERATIONS["CALLX"]:
                 self.push_pc(self.pc)
                 self.pc = target
@@ -1276,11 +1369,16 @@ class SuomiCompute16:
         if now.second % 1 == 0: self.write(ICR_ADDR, self.read(ICR_ADDR) | 0x08)
 
     def update_display(self):
+        mode = self._graphics_mode()
+        if mode != self._surface_mode:
+            self.vram_surface = self._create_vram_surface()
+        elif mode != GFX_MODE_320_240:
+            self._expanded_vram[:] = self._decode_framebuffer(VRAM_START)
         _present_scaled(self.vram_surface, self.screen)
 
     def _max_speed(self):
         memory = getattr(self, 'memory', None)
-        return bool(memory and memory[SPEED_ADDR])
+        return bool(memory and memory[SPEED_ADDR] == SPEED_MAX)
 
     def _vsync_enabled(self):
         memory = getattr(self, 'memory', None)
@@ -1289,7 +1387,19 @@ class SuomiCompute16:
     def execute_frame(self):
         self.frame_yield = False
         self.frames = (getattr(self, 'frames', 0) + 1) & 0xFFFF
-        budget = MAX_SPEED_INSTRUCTIONS if self.memory[SPEED_ADDR] else INSTRUCTIONS_PER_FRAME
+        mode = self.memory[SPEED_ADDR]
+        mode = mode if mode in range(len(SPEED_RATES)) else SPEED_NORMAL
+        now = time.monotonic()
+        previous = getattr(self, "_speed_time", now - 1 / DISPLAY_FPS)
+        self._speed_time = now
+        rate = SPEED_RATES[mode]
+        if rate is None:
+            budget = MAX_SPEED_INSTRUCTIONS
+        else:
+            fraction = getattr(self, "_speed_budget_fraction", 0.0)
+            exact_budget = rate * max(now - previous, 0.0) + fraction
+            budget = int(exact_budget)
+            self._speed_budget_fraction = exact_budget - budget
         if getattr(self, 'use_jit', True) and _load_jit() is not None:
             self._execute_jit(budget)
             return
@@ -1336,8 +1446,9 @@ class SuomiCompute16:
     # Events (MOUSE_ADDR+5): bit0/1 left/right press, bit2/3 left/right double click,
     # bit4/5 left/right release. Events stay latched until the guest reads the register.
     def set_mouse_position(self, x, y):
-        x = max(0, min(SCREEN_WIDTH - 1, x))
-        y = max(0, min(SCREEN_HEIGHT - 1, y))
+        width, height = self._screen_size()
+        x = max(0, min(width - 1, x))
+        y = max(0, min(height - 1, y))
         self.memory[MOUSE_ADDR:MOUSE_ADDR + 4] = bytes((x >> 8, x & 0xFF, y >> 8, y & 0xFF))
 
     def set_mouse_wheel(self, delta):
@@ -1371,6 +1482,7 @@ class SuomiCompute16:
             *_screen_to_logical(
                 (px, py),
                 self.screen.get_size(),
+                self._screen_size(),
             )
         )
         node = getattr(self, 'net', None)
@@ -1392,7 +1504,7 @@ class SuomiCompute16:
     def reset(self, preserve_console_history=False):
         print("SC-16 starting...")
         self.registers = [0]*8
-        self.sp = 0x2FFFF
+        self.sp = MEM_MASK
         self.pc = self.entry_point
         self.running = True
         self._console_device().reset(
@@ -1488,7 +1600,9 @@ class SuomiCompute16:
                           and event.type == pygame.MOUSEBUTTONDOWN):
                         self.set_mouse_wheel(1 if event.button == 4 else -1)
                     if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (1, 3):
-                        mx, my = _screen_to_logical(event.pos, self.screen.get_size())
+                        mx, my = _screen_to_logical(
+                            event.pos, self.screen.get_size(), self._screen_size()
+                        )
                         self.set_mouse_position(mx, my)
                         self.mouse_button(0 if event.button == 1 else 1, event.type == pygame.MOUSEBUTTONDOWN,
                                           mx, my, pygame.time.get_ticks())
