@@ -1740,7 +1740,6 @@ void draw_scene(void)
 {
     int i;
 
-    gfx_clear(BLACK);
     draw_dust();
     draw_world();
     for (i = 0; i < NEXP; i++)
@@ -1938,6 +1937,10 @@ int main(void)
 
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_3D) |
+                    (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_3D, 255);
+    gfx_layer_transparency(LAYER_HUD, 255);
     new_game();
     while (1)
     {
@@ -1964,8 +1967,15 @@ int main(void)
             update_collisions();
             update_effects();
         }
+        gfx_layer_select(LAYER_BACKGROUND);
+        gfx_clear(BLACK);
+        gfx_layer_select(LAYER_3D);
+        gfx_clear(255);
         draw_scene();
+        gfx_layer_select(LAYER_HUD);
+        gfx_clear(255);
         draw_hud();
+        gfx_layer_select(LAYER_BACKGROUND);
         gfx_present();
         frame++;
     }

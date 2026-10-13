@@ -7,6 +7,7 @@ int main() {
     gfx_mode(GFX_MODE_640_480);
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset(1 << LAYER_BACKGROUND);
     game_init(&state);
     
     while (1) {

@@ -35,8 +35,10 @@ an ABI choice as delivered.
   `0x80000..0xFFFFF`; `LDI30` loads full addresses. Regression coverage
   exercises the C90 minimum 65,535-byte object size, but this does not establish
   all C90 translation limits.
-- `float`, `double`, and `long double` still use binary16; `double` therefore
-  does not satisfy C90 minimum range and precision requirements.
+- The assembler and emulator now provide binary32/binary64 floating-point
+  instructions with JIT interpreter fallback and focused opcode regressions.
+  The C compiler, C object layout, literals, and `float.h` still use binary16;
+  `double` therefore does not satisfy C90 minimum range and precision.
 - Function pointers and indirect calls, bit-fields, full linkage/storage
   semantics, complete hosted standard-library facilities, and independent
   conformance validation remain incomplete.
@@ -80,7 +82,7 @@ or correct runtime helpers cannot meet the ABI requirements.
 
 ### A2. Provide required floating-point machine operations
 
-- [ ] **Provide required floating-point machine operations** (`c90-float-isa`)
+- [x] **Provide required floating-point machine operations** (`c90-float-isa`)
   - [x] Add assembler-encoded binary32/binary64 arithmetic, ordered compare,
     integer and format conversions, negation, and square root.
   - [x] Implement IEEE binary32/binary64 register encoding, rounding,

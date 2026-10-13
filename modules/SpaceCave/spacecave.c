@@ -1242,7 +1242,7 @@ void draw_world(void) {
     int i, k, t, sx, sy;
     gfx_tilemap(cave, MW, MH, camx, camy);
     gfx_layer_select(LAYER_SPRITES);
-    gfx_clear(BLACK);
+    gfx_clear(255);
     for (k = 0; k < nt; k++) {
         sx = tx[k] - camx; sy = ty[k] - camy;
         if (sx > -12 && sx < 332 && sy > -12 && sy < 252) draw_turret(k, sx, sy);
@@ -1483,6 +1483,8 @@ void draw_menu(void) {
         tname[name_len] = ch; name_len++;
     }
     gfx_tilemap(cave, MW, MH, 100 + ((frame >> 1) % 500), 200);
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(255);
     gfx_rect(50, 20, 220, 200, BLACK);
     gfx_rect(50, 20, 220, 1, GRAY);
     gfx_rect(50, 219, 220, 1, GRAY);
@@ -1498,6 +1500,7 @@ void draw_menu(void) {
         gfx_text(70, 162, "MISSION: REACH THE TARGET,", YELLOW);
         gfx_text(70, 172, "SHOOT THE ROAMING DRONES.", YELLOW);
         gfx_text(70, 200, "TAB: BACK", GREEN);
+        gfx_layer_select(LAYER_BACKGROUND);
         return;
     }
     gfx_text(70, 80, "NICKNAME:", WHITE);
@@ -1512,6 +1515,7 @@ void draw_menu(void) {
     gfx_text(70, 154, "TAB:   CONTROLS", WHITE);
     gfx_text(70, 168, "LEFT/RIGHT: CHANGE MODE", WHITE);
     if (name_len == 0) gfx_text(70, 190, "TYPE A NAME FIRST", GRAY);
+    gfx_layer_select(LAYER_BACKGROUND);
 }
 
 void join_game(void) {
@@ -1539,8 +1543,10 @@ void play_frame(unsigned int keys) {
     int n, t;
     if ((frame % 6) == 0 || hnet < 0) refresh_net();
     if (!nready) {
-        gfx_clear(BLACK);
+        gfx_layer_select(LAYER_HUD);
+        gfx_clear(255);
         gfx_text(110, 110, "CONNECTING...", YELLOW);
+        gfx_layer_select(LAYER_BACKGROUND);
         return;
     }
     if (i_am_host && !cave_ok) {
@@ -1554,8 +1560,10 @@ void play_frame(unsigned int keys) {
     was_host = i_am_host;
     while ((n = net_recv(ibuf)) > 0) handle_message(n);
     if (!cave_ok) {
-        gfx_clear(BLACK);
+        gfx_layer_select(LAYER_HUD);
+        gfx_clear(255);
         gfx_text(100, 110, "WAITING FOR HOST...", YELLOW);
+        gfx_layer_select(LAYER_BACKGROUND);
         return;
     }
     find_me();
@@ -1593,7 +1601,7 @@ void play_frame(unsigned int keys) {
     gfx_clear(BLACK);
     draw_world();
     gfx_layer_select(LAYER_HUD);
-    gfx_clear(BLACK);
+    gfx_clear(255);
     sort_players();
     draw_hud();
     if (gmode) draw_mission_hud();
@@ -1614,6 +1622,10 @@ int main(void) {
     unsigned int keys;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_TILES) |
+                    (1 << LAYER_SPRITES) | (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_SPRITES, 255);
+    gfx_layer_transparency(LAYER_HUD, 255);
     rs = 4242;
     gen_cave(77);
     state = 0;

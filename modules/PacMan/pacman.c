@@ -803,6 +803,9 @@ int main(void)
     unsigned int keys;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_SPRITES) |
+                    (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_HUD, 255);
     new_game();
     while (1)
     {
@@ -813,12 +816,14 @@ int main(void)
         {
             erase_all();
         }
-        if (hud_dirty)
-        {
-            draw_hud();
-        }
+        gfx_layer_select(LAYER_HUD);
+        gfx_clear(255);
+        draw_hud();
+        gfx_layer_select(LAYER_SPRITES);
+        gfx_clear(0);
         if (mode == 3)
         {
+            gfx_layer_select(LAYER_HUD);
             gfx_text(OX + 44, OY + 80, "GAME OVER", RED);
             gfx_text(OX + 12, OY + 96, "PRESS ENTER", WHITE);
         }
@@ -827,9 +832,11 @@ int main(void)
             draw_entities();
             if (mode == 0)
             {
+                gfx_layer_select(LAYER_HUD);
                 gfx_text(OX + 58, OY + 80, "READY!", YELLOW);
             }
         }
+        gfx_layer_select(LAYER_BACKGROUND);
         gfx_present();
     }
     return 0;

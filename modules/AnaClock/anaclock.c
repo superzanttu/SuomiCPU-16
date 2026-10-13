@@ -556,6 +556,7 @@ int main(void)
 
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset(1 << LAYER_BACKGROUND);
     face = 0;
     previous_keys = 0;
     reset_digits = 1;

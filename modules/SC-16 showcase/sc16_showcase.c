@@ -849,7 +849,7 @@ void page_tiles(void)
     gfx_sprite_move(0, 150 + sinv(frame / 2) / 4,
                     118 + cosv(frame / 3) / 4, SPRITE_VISIBLE);
     gfx_layer_select(LAYER_HUD);
-    gfx_clear(BLACK);
+    gfx_clear(255);
     gfx_text(8, 6, "TILE + SPRITE GPU ENGINES", YELLOW);
     gfx_text(8, 19, "TILEMAP AND SPRITE DATA STAY IN GPU MEMORY", WHITE);
     gfx_text(8, 214, "MAP 40X20 TILES - CAMERA (64,32)", CYAN);
@@ -1587,6 +1587,7 @@ int main(void)
     int i;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset(1 << LAYER_BACKGROUND);
     gfx_irq_init();
     for (i = 0; i < 40; i++)
     {
@@ -1677,13 +1678,16 @@ int main(void)
                                  (1 << LAYER_TILES) |
                                  (1 << LAYER_SPRITES) |
                                  (1 << LAYER_HUD));
+            gfx_layer_select(LAYER_HUD);
+            gfx_layer_transparency(LAYER_HUD, 255);
         }
         else if (page == 12)
         {
             gfx_layer_visibility((1 << LAYER_BACKGROUND) | (1 << LAYER_3D) |
                                  (1 << LAYER_HUD));
+            gfx_layer_transparency(LAYER_HUD, 255);
             gfx_layer_select(LAYER_HUD);
-            gfx_clear(BLACK);
+            gfx_clear(255);
         }
         else
         {
@@ -1744,7 +1748,9 @@ int main(void)
         else if (page == 10)
         {
             page_tiles();
+            gfx_layer_select(LAYER_HUD);
             chrome("TILE MAP AND LAYERS");
+            gfx_layer_select(LAYER_BACKGROUND);
         }
         else if (page == NETWORK_PAGE)
         {

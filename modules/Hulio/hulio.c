@@ -338,6 +338,7 @@ int main()
 {
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset(1 << LAYER_BACKGROUND);
     init_game();
 
     while (1)

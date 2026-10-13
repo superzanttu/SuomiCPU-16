@@ -1016,6 +1016,7 @@ void draw_result(void)
 /* Draws the sky, planet, ground and everything that moves */
 void draw_scene(void)
 {
+    gfx_layer_select(LAYER_BACKGROUND);
     if (bg_dirty)
     {
         gfx_clear(BLACK);
@@ -1030,6 +1031,8 @@ void draw_scene(void)
         gfx_restore();
     }
     twinkle();
+    gfx_layer_select(LAYER_SPRITES);
+    gfx_clear(0);
     draw_particles();
     if (state == ST_PLAY || state == ST_LANDED)
     {
@@ -1178,6 +1181,9 @@ int main(void)
     unsigned int keys, pressed;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_SPRITES) |
+                    (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_HUD, 255);
     mode = M_CLASSIC;
     diff = 1;
     level = 1;
@@ -1204,7 +1210,10 @@ int main(void)
         else
             update_result(pressed);
         sfx_update();
+        gfx_layer_select(LAYER_BACKGROUND);
         draw_scene();
+        gfx_layer_select(LAYER_HUD);
+        gfx_clear(255);
         if (state == ST_MENU)
             draw_menu();
         else
@@ -1213,6 +1222,7 @@ int main(void)
             if (state != ST_PLAY)
                 draw_result();
         }
+        gfx_layer_select(LAYER_BACKGROUND);
         gfx_present();
         frame++;
     }

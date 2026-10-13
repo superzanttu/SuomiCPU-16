@@ -578,6 +578,50 @@ gfx_layer_order:
     ST R7, R1
     RET
 
+; Restore the standard composition state for a new module.
+gfx_layer_reset:
+    LDWS R0, 4
+    CALLX CGFX_BASE
+    LDI R6, 17
+    ADD R7, R6
+    ST R7, R0
+
+    LDI R0, 0
+    CALLX CGFX_BASE
+    LDI R6, 16
+    ADD R7, R6
+    ST R7, R0
+
+    LDI R6, 18
+    ADD R7, R6
+    ST R7, R0
+    INC R7
+    ST R7, R0
+    INC R7
+    ST R7, R0
+    INC R7
+    ST R7, R0
+    INC R7
+    ST R7, R0
+
+    CALLX CGFX_BASE
+    LDI R6, 23
+    ADD R7, R6
+    ST R7, R0
+    INC R0
+    INC R7
+    ST R7, R0
+    INC R0
+    INC R7
+    ST R7, R0
+    INC R0
+    INC R7
+    ST R7, R0
+    INC R0
+    INC R7
+    ST R7, R0
+    RET
+
 ; gfx3d_draw(scene): submit a fixed-point scene to GPU command 22.
 gfx3d_draw:
     LDWS R4, 4

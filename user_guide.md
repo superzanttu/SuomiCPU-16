@@ -27,7 +27,7 @@ On Windows, run the PowerShell launcher with a source or binary path:
 
 ```powershell
 .\run.ps1 .\examples\factorial.c
-.\run.ps1 .\examples\asteroids.c
+.\run.ps1 ".\modules\Asteroids\asteroids.c"
 ```
 
 `run.ps1` changes to the repository directory and starts the emulator through
@@ -357,6 +357,36 @@ word is `0xF800 | (Rd << 8) | 0x1E`; the second word is
 immediate, a third word holds the 16-bit value. The register form is four
 bytes and the immediate form six bytes. The C compiler emits `MUL`, `DIV`/`DIVS`
 and `MOD`/`MODS` directly for `*`, `/` and `%`; there are no software routines.
+
+### IEEE-754 floating-point instructions
+
+The `F32` and `F64` instruction families operate on IEEE-754 binary32 and
+binary64 values. Binary32 values use an even register pair (`R0:R1`, `R2:R3`,
+`R4:R5`, or `R6:R7`), with the most-significant word first. Binary64 values
+use `R0:R1:R2:R3` or `R4:R5:R6:R7`, also most-significant word first.
+Arithmetic instructions replace the destination value with the result:
+
+| Instruction family | Examples | Operation |
+| --- | --- | --- |
+| Arithmetic | `F32ADD`, `F32SUB`, `F32MUL`, `F32DIV`; corresponding `F64` forms | Add, subtract, multiply, divide |
+| Compare | `F32CMP`, `F64CMP` | Set `Z` for ordered equality and `C` for ordered less-than; unordered comparisons clear both |
+| Integer conversion | `I16TOF32`, `U16TOF32`, `I32TOF64`, `F64TOU32` | Convert between signed/unsigned 16/32-bit integers and the indicated floating format |
+| Format conversion | `F32TOF64`, `F64TOF32` | Convert between binary32 and binary64 |
+| Unary | `F32NEG`, `F64NEG`, `F32SQRT`, `F64SQRT` | Negate or calculate square root |
+
+Conversions from floating point to integers truncate toward zero. For non-finite
+values the conversion instructions produce zero; finite values outside the
+destination range produce the low destination bits. C programs must not depend
+on those results for out-of-range conversions, whose result is undefined by
+C90. Operations round to nearest, ties to even; subnormals and signed zero are
+supported. Overflow produces infinity and invalid operations produce a
+canonical quiet NaN.
+
+These are assembler/emulator instructions; the C compiler has not yet been
+updated to emit them. In compiled C, `float`, `double`, and `long double`
+currently remain binary16 values stored in two bytes. See
+[`docs/c90_target_abi.md`](docs/c90_target_abi.md) for the selected future C ABI
+and the remaining compiler/backend work.
 
 ### Extended ALU, miscellaneous and conditional-branch instructions
 
@@ -854,7 +884,7 @@ grid of 6x8 cells:
 Screen text input accepts printable ASCII and Latin-1 keys, echoes the entered
 glyphs, and uses Enter as the line terminator. The library reserves scratch bytes near `0x4300`;
 do not use that region for application data while a screen routine is running.
-See [`examples/text_demo.c`](examples/text_demo.c) for a C example.
+See [`modules/Text Demo/text_demo.c`](<modules/Text Demo/text_demo.c>) for a C example.
 
 Generated C code uses the far control instructions (`JMPX`, `CALLX`, `BZX`,
 `BCX`). Address 0 holds an entry stub; `0x0002`-`0x0005` hold interrupt
@@ -904,6 +934,7 @@ space.
 | `void gfx_layer_visibility(unsigned int mask)`                                          | Set the visible-layer bitmask (`LAYER_ALL` enables all five layers).                                                                                        |
 | `void gfx_layer_transparency(int layer, unsigned char color)`                           | Set one layer's transparent palette index.                                                                                                                 |
 | `void gfx_layer_order(int layer, int priority)`                                         | Set a layer's 8-bit composition priority; larger values are drawn on top (defaults to layer index).                                                        |
+| `void gfx_layer_reset(unsigned int visible_layers)`                                     | Reset layer selection, visibility, transparency keys, and composition priorities for a new module.                                                         |
 | `void gfx_sprite_upload(int slot, int w, int h, unsigned char *data)`                   | Copy an indexed, zero-transparent image (up to 64x64) into one of 64 hardware sprite slots.                                                                |
 | `void gfx_sprite_move(int slot, int x, int y, int flags)`                               | Position/show a sprite; flags include `SPRITE_VISIBLE`, `SPRITE_FLIP_X`, and `SPRITE_FLIP_Y`.                                                              |
 | `void gfx_tile_upload(int tile, unsigned char *pixels)`                                 | Copy one 16x16 indexed tile into one of 256 hardware tile slots.                                                                                          |
@@ -997,25 +1028,28 @@ so send state continuously rather than relying on single events.
 | `int net_ready(void)` / `int net_full(void)` / `int net_is_open(void)` | Slot settled / group had no free slot / joined.                         |
 
 Windows may need to allow Python through the firewall for private networks.
-[`examples/net_game_demo.c`](examples/net_game_demo.c) shows the pattern.
+[`modules/Netgame Demo/net_game_demo.c`](<modules/Netgame Demo/net_game_demo.c>)
+shows the pattern.
 
 ### Games
 
-[`examples/asteroids.c`](examples/asteroids.c) and
-[`examples/space_invaders.c`](examples/space_invaders.c) are complete playable
-games with score, lives, and restart. [`examples/pacman.c`](examples/pacman.c)
-is a 19x21-tile maze game with four ghosts, power pellets, a wrap-around tunnel,
-lives, and levels. Build and run any of them from the repository root:
+[`modules/Asteroids/asteroids.c`](<modules/Asteroids/asteroids.c>) and
+[`modules/Space Invaders/space_invaders.c`](<modules/Space Invaders/space_invaders.c>)
+are complete playable games with score, lives, and restart.
+[`modules/PacMan/pacman.c`](modules/PacMan/pacman.c) is a 19x21-tile maze game
+with four ghosts, power pellets, a wrap-around tunnel, lives, and levels. Build
+and run one from the repository root:
 
 ```
-python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
+python tools/c_compiler.py "modules/Asteroids/asteroids.c" -o asteroids.bin
 python main.py asteroids.bin
 ```
 
 [`examples/factorial.c`](examples/factorial.c) and
-[`examples/text_demo.c`](examples/text_demo.c) demonstrate C recursion and text
-input/output. [`examples/sc16_showcase.c`](examples/sc16_showcase.c) is an
-eight-page tour of the SC-16's CPU, memory, graphics, text, devices, and
+[`modules/Text Demo/text_demo.c`](<modules/Text Demo/text_demo.c>) demonstrate C
+recursion and text input/output.
+[`modules/SC-16 showcase/sc16_showcase.c`](<modules/SC-16 showcase/sc16_showcase.c>)
+is an eight-page tour of the SC-16's CPU, memory, graphics, text, devices, and
 benchmark features.
 
 [`modules/Hertta-3D/hertta3d.c`](modules/Hertta-3D/hertta3d.c) is a first-person
@@ -1050,21 +1084,21 @@ instructions per frame.
   rectangle, sprite, and text routines.
 - [`examples/factorial.c`](examples/factorial.c) demonstrates the C compiler,
   recursive calls, local variables, arithmetic, and a `for` loop.
-- [`examples/anaclock.c`](examples/anaclock.c) displays the emulator RTC as a
+- [`modules/AnaClock/anaclock.c`](modules/AnaClock/anaclock.c) displays the emulator RTC as a
   live clock with five classic analog faces, a Nixie-tube simulation, and a
   split-flap flip clock. Each analog face has its own hand design, Nixie digits
   dim and re-ignite when they change, and flip cards animate each change.
   Press Tab to cycle through the seven faces. Run it with
-  `python main.py examples/anaclock.c`.
-- [`examples/elitedemo.c`](examples/elitedemo.c) is a first-person Elite-style
+  `python main.py modules/AnaClock/anaclock.c`.
+- [`modules/Elite/elitedemo.c`](modules/Elite/elitedemo.c) is a first-person Elite-style
   space-combat prototype around a planet with two orbiting moons, drifting
   asteroids and patrolling enemy fighters that dogfight and shoot back. Flight is
   Newtonian-inspired: the ship keeps its velocity when it turns. Arrows pitch/yaw
   (Up = nose up), Q/E roll, X or Shift thrust, Z or Ctrl reverse, Space fires a
   heat-limited laser. It has regenerating shields, a hull, collisions with every
   body, a 3D radar and a HUD. It needs roughly 100,000 instructions per frame.
-  Run it with `python main.py examples/elitedemo.c`.
-- [`examples/lunarlander.c`](examples/lunarlander.c) is a Lunar Lander game with
+  Run it with `python main.py modules/Elite/elitedemo.c`.
+- [`modules/Lunar Lander/lunarlander.c`](<modules/Lunar Lander/lunarlander.c>) is a Lunar Lander game with
   gravity, inertia, limited fuel, procedural terrain with x2/x3/x5 landing pads,
   exhaust, dust and explosion particles, a starfield with the Earth, a HUD with
   altitude, velocity and fuel, and synthesized sound (engine, RCS, ambient drone,
@@ -1072,18 +1106,21 @@ instructions per frame.
   (rough terrain, stronger gravity), each with three difficulty levels. Space fires
   the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
   Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
-  accuracy bonus) x pad multiplier. Run it with `python main.py examples/lunarlander.c`.
-- [`examples/paint.c`](examples/paint.c) is an MS Paint style drawing program driven by the
+  accuracy bonus) x pad multiplier. Run it with
+  `python main.py "modules/Lunar Lander/lunarlander.c"`.
+- [`modules/Paint/paint.c`](modules/Paint/paint.c) is an MS Paint style drawing program driven by the
   mouse: pen, eraser, spray, line, rectangle and filled rectangle with live shape previews,
   four brush sizes and a 16-color palette. Left button draws with the foreground color, right
   button with the background color; double-click a palette color to fill the canvas and
-  double-click CLR to clear it. Images cannot be saved. Run it with `python main.py examples/paint.c`.
-- [`examples/net_game_demo.c`](examples/net_game_demo.c) is a LAN demo: start it in up to 8
+  double-click CLR to clear it. Images cannot be saved. Run it with
+  `python main.py modules/Paint/paint.c`.
+- [`modules/Netgame Demo/net_game_demo.c`](<modules/Netgame Demo/net_game_demo.c>) is a LAN demo: start it in up to 8
   emulator instances on one network; each player moves a coloured square (arrows) and Space
-  broadcasts a ping ring to all others. Run it with `python main.py examples/net_game_demo.c`.
-- [`examples/spacecave.c`](examples/spacecave.c) (SpaceCave) is an Asteroids-style LAN dogfight
+  broadcasts a ping ring to all others. Run it with
+  `python main.py "modules/Netgame Demo/net_game_demo.c"`.
+- [`modules/SpaceCave/spacecave.c`](modules/SpaceCave/spacecave.c) (SpaceCave) is an Asteroids-style LAN dogfight
   for up to 8 pilots inside a procedurally generated cave with auto-repairing defence turrets.
-  Start it in one emulator per player (`python main.py examples/spacecave.c`), type a nickname and
+  Start it in one emulator per player (`python main.py modules/SpaceCave/spacecave.c`), type a nickname and
   press Enter. Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard. The
   lowest network slot acts as the authoritative host: clients only send their keys, the host simulates
   and broadcasts ships, bullets, turrets and scores, and the cave is rebuilt from a broadcast seed.
@@ -1094,13 +1131,14 @@ instructions per frame.
   a *beacon* (fly into it, +150), a *reactor* (shoot it down, +300, rebuilt elsewhere) or six
   *crystals* (+40 each, +140 for the last), plus four roaming drones (+25 when shot; they chase
   pilots in line of sight and damage them on contact). An edge marker points to the nearest target.
-- [`examples/text_demo.c`](examples/text_demo.c) demonstrates C text output,
+- [`modules/Text Demo/text_demo.c`](<modules/Text Demo/text_demo.c>) demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
-- [`examples/asteroids.c`](examples/asteroids.c) and
-  [`examples/space_invaders.c`](examples/space_invaders.c) are playable C games.
-- [`examples/pacman.c`](examples/pacman.c) is a tile-based maze game with ghost
+- [`modules/Asteroids/asteroids.c`](<modules/Asteroids/asteroids.c>) and
+  [`modules/Space Invaders/space_invaders.c`](<modules/Space Invaders/space_invaders.c>)
+  are playable C games.
+- [`modules/PacMan/pacman.c`](modules/PacMan/pacman.c) is a tile-based maze game with ghost
   AI, power pellets, and tunnel wrapping.
-- [`examples/sc16_showcase.c`](examples/sc16_showcase.c) presents an interactive
+- [`modules/SC-16 showcase/sc16_showcase.c`](<modules/SC-16 showcase/sc16_showcase.c>) presents an interactive
   eight-page SC-16 feature tour and benchmark. The playable games are written in C
   and use the graphics API; their controls are described in the Games section.
 
@@ -1173,7 +1211,7 @@ C globals start at 0x80000.
 
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 
-    python tools/c_compiler.py examples/sc16_showcase.c -o showcase.bin
+    python tools/c_compiler.py "modules/SC-16 showcase/sc16_showcase.c" -o showcase.bin
     python main.py showcase.bin
 
 ## Optional JIT acceleration

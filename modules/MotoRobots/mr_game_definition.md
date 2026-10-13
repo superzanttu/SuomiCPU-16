@@ -67,14 +67,14 @@ Buildings are constructed for free, because this is first prototype game.
 ### 4.2 Production & Recipes
 
 #### Resource Rates
-| Resource     | Production Rate |
-| ------------ | --------------- |
-| Coal         | 1 unit/sec      |
-| Iron Ore     | 1 unit/sec      |
-| Copper Ore   | 1 unit/sec      |
-| Iron Plate   | 1 unit/sec      |
-| Copper Plate | 1 unit/sec      |
-| Rombonent    | 1 unit/sec      |
+| Resource     | Production Rate                       |
+| ------------ | ------------------------------------- |
+| Coal         | 1 unit/sec                            |
+| Iron Ore     | 1 unit/sec                            |
+| Copper Ore   | 1 unit/sec                            |
+| Iron Plate   | 1 unit/sec                            |
+| Copper Plate | 1 unit/sec                            |
+| Rombonent    | 1 unit/sec                            |
 | Robot        | 1 unit/sec when fleet capacity allows |
 
 #### Recipe List
@@ -158,7 +158,7 @@ fleet. Production waits when the eight-robot fleet limit is reached.
 - **Stack**: Local variables and function calls use the machine stack, which starts at `0x3FFFFFFF` and grows toward lower addresses.
 
 ### 8.2 Execution & Timing
-- **Frame Budget**: The emulator runs at up to 30 FPS with a 30,000-instruction frame budget. Static terrain, buildings, and HUD layers are cached until the camera, selection, or toolbar changes. Robot pathfinding is cooperative: it expands at most 32 map tiles per game update.
+- **Frame Budget**: The emulator runs at up to 30 FPS wit. Static terrain, buildings, and HUD layers are cached until the camera, selection, or toolbar changes. Robot pathfinding is cooperative: it expands at most 32 map tiles per game update.
 - **Game Speed**: MotoRobots selects the emulator maximum-speed register to accelerate pathfinding and enables VSync so each presented game frame is paced at the display rate. This keeps robot movement at one tile per real-time second and loading/unloading at 0.5 seconds per item. While a search is active, discovered tiles are highlighted directly on the map: cyan for expanded tiles and yellow for the frontier. A found route is highlighted in magenta ahead of its moving robot.
 - **Precision**: Floating point values use IEEE-754 binary16 (half precision).
 

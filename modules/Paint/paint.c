@@ -241,6 +241,8 @@ void draw_tool_button(int i) {
 
 void draw_toolbar(void) {
     int i, x, y, c;
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(255);
     gfx_rect(0, 0, TB_W, 240, TOOLBAR_BG);
     for (i = 0; i <= T_CLEAR; i++) draw_tool_button(i);
     /* Brush sizes */
@@ -264,6 +266,7 @@ void draw_toolbar(void) {
         if (pal[i] == fg) gfx_rect(x, y, 3, 3, WHITE);
         if (pal[i] == bg) gfx_rect(x + 18, y + 9, 3, 3, GRAY);
     }
+    gfx_layer_select(LAYER_BACKGROUND);
 }
 
 /* --- 6. Main loop --- */
@@ -281,6 +284,8 @@ int main(void) {
     unsigned int buttons, ev;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_HUD, 255);
     new_picture();
     while (1) {
         mx = gfx_mouse_x();

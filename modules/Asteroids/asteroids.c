@@ -391,7 +391,10 @@ void draw_hud(void)
 void draw(void)
 {
     int i;
+    gfx_layer_select(LAYER_BACKGROUND);
     gfx_clear(BLACK);
+    gfx_layer_select(LAYER_SPRITES);
+    gfx_clear(0);
     for (i = 0; i < MAXA; i++)
         if (asz[i] != 0)
             draw_asteroid(i);
@@ -400,12 +403,15 @@ void draw(void)
             gfx_rect(bx[i] >> 4, by[i] >> 4, 2, 2, YELLOW);
     if (over == 0 && (invuln & 4) == 0)
         draw_ship();
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(255);
     draw_hud();
     if (over)
     {
         gfx_text(124, 108, "GAME OVER", RED);
         gfx_text(100, 124, "PRESS ENTER TO RESTART", WHITE);
     }
+    gfx_layer_select(LAYER_BACKGROUND);
 }
 
 int main(void)
@@ -413,6 +419,9 @@ int main(void)
     unsigned int keys;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_SPRITES) |
+                    (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_HUD, 255);
     new_game();
     while (1)
     {

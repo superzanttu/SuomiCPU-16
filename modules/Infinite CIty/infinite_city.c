@@ -2345,6 +2345,10 @@ int main(void)
     int interval;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_SPRITES) |
+                    (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_SPRITES, 255);
+    gfx_layer_transparency(LAYER_HUD, 255);
     for (i = 0; i < 8; i++)
     {
         hud_last[i] = -1;
@@ -2446,7 +2450,10 @@ int main(void)
                 reset_game();
             }
         }
+        gfx_layer_select(LAYER_BACKGROUND);
         draw_city();    // piirretaan taustasta eteenpain: kauimmainen ensin
+        gfx_layer_select(LAYER_SPRITES);
+        gfx_clear(255);
         draw_residents();
         draw_pickups();
         for (i = 0; i < ENEMY_MAX; i++)
@@ -2461,6 +2468,8 @@ int main(void)
         }
         draw_player(player.x - camera_x, player.y);
         draw_booms();
+        gfx_layer_select(LAYER_HUD);
+        gfx_clear(255);
         draw_crosshair();
         draw_hud();
         draw_terrain_hud();
@@ -2468,6 +2477,7 @@ int main(void)
         {
             end_game_screen();
         }
+        gfx_layer_select(LAYER_BACKGROUND);
         gfx_present();    // nayttaa valmiin kuvan ruudulla
         frame_count++;
     }

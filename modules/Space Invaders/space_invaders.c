@@ -411,7 +411,10 @@ void draw(void)
     char buffer[8];
     int s;
     int i;
+    gfx_layer_select(LAYER_BACKGROUND);
     gfx_clear(BLACK);
+    gfx_layer_select(LAYER_SPRITES);
+    gfx_clear(0);
     draw_invaders();
     if (boom_timer > 0)
     {
@@ -433,6 +436,8 @@ void draw(void)
         }
     }
     gfx_line(0, 226, 319, 226, GREEN);
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(255);
     number_text(score, buffer);
     gfx_text(4, 4, "SCORE", GRAY);
     gfx_text(40, 4, buffer, WHITE);
@@ -448,6 +453,7 @@ void draw(void)
         gfx_text(124, 108, "GAME OVER", RED);
         gfx_text(100, 124, "PRESS ENTER TO RESTART", WHITE);
     }
+    gfx_layer_select(LAYER_BACKGROUND);
 }
 
 int main(void)
@@ -455,6 +461,9 @@ int main(void)
     unsigned int keys;
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_SPRITES) |
+                    (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_HUD, 255);
     new_game();
     while (1)
     {

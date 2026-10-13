@@ -777,7 +777,7 @@ void render_game(void)
     build_view();
     status = gfx3d_draw(scene);
     gfx_layer_select(LAYER_HUD);
-    gfx_clear(BLACK);
+    gfx_clear(255);
     draw_wall_edges();
     if (status != GPU3D_OK)
     {
@@ -795,6 +795,9 @@ void render_game(void)
 int main(void)
 {
     gfx_speed(SPEED_MAX);
+    gfx_layer_reset((1 << LAYER_BACKGROUND) | (1 << LAYER_3D) |
+                    (1 << LAYER_HUD));
+    gfx_layer_transparency(LAYER_HUD, 255);
     level = 1;
     state = ST_MENU;
     for (;;)

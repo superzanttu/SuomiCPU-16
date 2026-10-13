@@ -105,6 +105,7 @@ class GpuTests(unittest.TestCase):
             "unsigned char tile[256];\n"
             "unsigned char map[2] = {2,3};\n"
             "int main(void) {\n"
+            "  gfx_layer_reset(1 << LAYER_HUD);\n"
             "  gfx_layer_select(LAYER_HUD);\n"
             "  gfx_layer_visibility(LAYER_ALL);\n"
             "  gfx_layer_transparency(LAYER_HUD, 0);\n"
@@ -121,6 +122,10 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(cpu.memory[GPU_BASE + 16], 4)
         self.assertEqual(cpu.memory[GPU_BASE + 17], 0x1F)
         self.assertEqual(cpu.memory[GPU_LAYER_ORDER + 4], 9)
+        self.assertEqual(
+            list(cpu.memory[GPU_LAYER_ORDER:GPU_LAYER_ORDER + 5]),
+            [0, 1, 2, 3, 9],
+        )
         self.assertEqual(cpu.sprites[0], {"x": 7, "y": 8, "flags": 1})
         self.assertEqual(cpu.sprite_memory[0], (2, 2, bytes((0, 5, 6, 0))))
         self.assertEqual(cpu.tilemap_memory, b"\x02\x03")
