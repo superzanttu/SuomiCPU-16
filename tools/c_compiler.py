@@ -1760,7 +1760,7 @@ class _CodeGenerator:
             static_data_end += sum(len(data) for _, data in self.string_data)
         if static_data_end > GLOBAL_LIMIT:
             raise CCompilerError(
-                f"{self.filename}: static data exceeds the 64 KiB C data region"
+                f"{self.filename}: static data exceeds the 512 KiB C data region"
             )
         self.emit(".address 0")
         self.emit("__c_entry:")
@@ -1817,7 +1817,7 @@ class _CodeGenerator:
             address += self._global_size(global_)
         if address > GLOBAL_LIMIT:
             raise CCompilerError(
-                f"{self.filename}: global variables exceed the 64 KiB C data region"
+                f"{self.filename}: global variables exceed the 512 KiB C data region"
             )
 
     def _collect_string_literals(self) -> None:
