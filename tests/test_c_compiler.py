@@ -3,17 +3,20 @@ import unittest
 from pathlib import Path
 
 from assembler import assemble_file
-from src.SuomiCPU import KBD_ADDR, MEM_SIZE, SCREEN_WIDTH, VRAM_START, SuomiCompute16, load_program_file
+from src.SuomiCPU import (
+    KBD_ADDR, MEM_MASK, MEM_SIZE, SCREEN_WIDTH, VRAM_START, SuomiCompute16,
+    create_memory, load_program_file,
+)
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source, main as compiler_main
 
 
 def run_image(image, maximum_steps=100_000):
     cpu = SuomiCompute16.__new__(SuomiCompute16)
-    cpu.memory = bytearray(MEM_SIZE)
+    cpu.memory = create_memory()
     cpu.registers = [0] * 8
     cpu.flags = {"Z": 0, "C": 0}
     cpu.running = True
-    cpu.sp = 0x2FFFF
+    cpu.sp = MEM_MASK
     cpu.load_program(image)
     cpu.reset()
     steps = 0
@@ -121,7 +124,7 @@ class CCompilerTests(unittest.TestCase):
             "}\n"
         )
         cpu = SuomiCompute16.__new__(SuomiCompute16)
-        cpu.memory = bytearray(MEM_SIZE)
+        cpu.memory = create_memory()
         cpu.registers = [0] * 8
         cpu.flags = {"Z": 0, "C": 0}
         cpu.running = True
@@ -147,7 +150,7 @@ class CCompilerTests(unittest.TestCase):
             "}\n"
         )
         cpu = SuomiCompute16.__new__(SuomiCompute16)
-        cpu.memory = bytearray(MEM_SIZE)
+        cpu.memory = create_memory()
         cpu.registers = [0] * 8
         cpu.flags = {"Z": 0, "C": 0}
         cpu.running = True
@@ -171,7 +174,7 @@ class CCompilerTests(unittest.TestCase):
             "int main(void) { return getchar(); }\n"
         )
         cpu = SuomiCompute16.__new__(SuomiCompute16)
-        cpu.memory = bytearray(MEM_SIZE)
+        cpu.memory = create_memory()
         cpu.registers = [0] * 8
         cpu.flags = {"Z": 0, "C": 0}
         cpu.running = True
@@ -341,7 +344,7 @@ class CCompilerTests(unittest.TestCase):
         image = compile_source(
             "struct Incomplete;\n"
             "int main(void) { struct Incomplete *pointer; "
-            "return sizeof(pointer) != 3; }\n"
+            "return sizeof(pointer) != 4; }\n"
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
@@ -700,7 +703,7 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 5), 14)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 14)
 
     def test_c90_scalar_brace_initializer_requires_one_element(self):
         invalid_sources = (
@@ -760,7 +763,7 @@ class CCompilerTests(unittest.TestCase):
 
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 12)
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_c90_function_arguments_convert_to_parameter_types(self):
         image = compile_source(
@@ -970,7 +973,7 @@ class CCompilerTests(unittest.TestCase):
             actual,
             [42, 0xFFFE, 0xFFFF, 0xFFD6, 0xFFD6, 1, 1, 1, 1, 0xFFFE, 1, 2, 0xFFFF, 1],
         )
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_compiles_for_do_while_break_and_continue(self):
         image = compile_source(
@@ -992,7 +995,7 @@ class CCompilerTests(unittest.TestCase):
 
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 20)
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_logical_operators_short_circuit(self):
         image = compile_source(
@@ -1010,7 +1013,7 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 0)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x02), 0)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x04), 1)
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_typedef_and_enum_declarations(self):
         image = compile_source(
@@ -1303,9 +1306,9 @@ class CCompilerTests(unittest.TestCase):
             )
 
     def test_c90_record_return_temporaries_count_toward_frame_limit(self):
-        with self.assertRaisesRegex(CCompilerError, "function frame exceeds"):
+        with self.assertRaisesRegex(CCompilerError, "exceed"):
             compile_source(
-                "struct Block { char bytes[64]; };\n"
+                "struct Block { char bytes[128]; };\n"
                 "struct Block make_block(void) {\n"
                 "  struct Block value;\n"
                 "  return value;\n"
@@ -1395,7 +1398,7 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE), 24)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 25)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 7)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 8)
 
@@ -1769,13 +1772,13 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
-        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE:GLOBAL_BASE + 3]), b"\x23\x45\x01")
+        self.assertEqual(bytes(cpu.memory[GLOBAL_BASE:GLOBAL_BASE + 4]), b"\x23\x45\x00\x01")
 
-    def test_c90_pointer_accesses_read_and_write_across_19_bit_address_space(self):
+    def test_c90_pointer_accesses_read_and_write_across_30_bit_address_space(self):
         image = compile_source(
-            "int *word = 0x0FFFFUL;\n"
-            "unsigned char *bytes = 0x12345UL;\n"
-            "long *wide = 0x12347UL;\n"
+            "int *word = 0x10FFFFUL;\n"
+            "unsigned char *bytes = 0x212345UL;\n"
+            "long *wide = 0x312347UL;\n"
             "int observed;\n"
             "unsigned char observed_byte;\n"
             "long observed_long;\n"
@@ -1792,14 +1795,14 @@ class CCompilerTests(unittest.TestCase):
         )
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 9), 0x68AC)
-        self.assertEqual(cpu.memory[GLOBAL_BASE + 11], 0xAB)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 12), 0x1234)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 14), 0x5678)
-        self.assertEqual(cpu.read_16(0xFFFF), 0x1234)
-        self.assertEqual(cpu.read_16(0x10001), 0x5678)
-        self.assertEqual(cpu.memory[0x12345], 0xAB)
-        self.assertEqual(bytes(cpu.memory[0x12347:0x1234B]), b"\x12\x34\x56\x78")
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 12), 0x68AC)
+        self.assertEqual(cpu.memory[GLOBAL_BASE + 14], 0xAB)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 15), 0x1234)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 17), 0x5678)
+        self.assertEqual(cpu.read_16(0x10FFFF), 0x1234)
+        self.assertEqual(cpu.read_16(0x110001), 0x5678)
+        self.assertEqual(cpu.memory[0x212345], 0xAB)
+        self.assertEqual(bytes(cpu.memory[0x312347:0x31234B]), b"\x12\x34\x56\x78")
 
     def test_c90_pointer_integer_casts_preserve_defined_address_bits(self):
         image = compile_source(
@@ -1821,11 +1824,11 @@ class CCompilerTests(unittest.TestCase):
         cpu, _ = run_image(image)
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 0x0001)
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 2), 0x0081)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 4), 0x2345)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 6), 0x2345)
-        self.assertEqual(cpu.memory[0x12345], 0xAB)
-        self.assertEqual(bytes(cpu.memory[0x12347:0x1234B]), b"\x12\x34\x56\x78")
+        self.assertEqual(cpu.memory[0x812345], 0xAB)
+        self.assertEqual(bytes(cpu.memory[0x812347:0x81234B]), b"\x12\x34\x56\x78")
 
     def test_c90_string_search_and_bounded_operations(self):
         image = compile_source(
@@ -2046,7 +2049,7 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         holder_address = GLOBAL_BASE
         values_address = holder_address + 4
-        result_address = values_address + 8 + 3
+        result_address = values_address + 8 + 4
         self.assertEqual(
             (cpu.read_16(holder_address) << 16) | cpu.read_16(holder_address + 2),
             0x12345678,
@@ -2712,7 +2715,7 @@ class CCompilerTests(unittest.TestCase):
 
         self.assertFalse(cpu.running)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 120)
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_loads_c_file_and_initializes_constant_globals(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2813,7 +2816,7 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x12), 32767)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x14), 0x4200)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x16), 1)
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_text_library_prints_and_tracks_cursor(self):
         image = compile_source(
@@ -2837,11 +2840,11 @@ class CCompilerTests(unittest.TestCase):
         self.assertFalse(cpu.running)
         self.assertLess(steps, 500_000)
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 0x0103)
-        self.assertEqual(cpu.read(0x30000 + 8 * 320 + 13), 1)
-        self.assertEqual(cpu.read(0x30000 + 8 * 320 + 14), 1)
-        self.assertEqual(cpu.read(0x30000 + 8 * 320 + 15), 1)
-        self.assertEqual(cpu.read(0x30000 + 8 * 320 + 12), 0)
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.read(VRAM_START + 8 * 320 + 13), 1)
+        self.assertEqual(cpu.read(VRAM_START + 8 * 320 + 14), 1)
+        self.assertEqual(cpu.read(VRAM_START + 8 * 320 + 15), 1)
+        self.assertEqual(cpu.read(VRAM_START + 8 * 320 + 12), 0)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_text_library_prints_ascii_punctuation_and_finnish_letters(self):
         image = compile_source(
@@ -2875,7 +2878,7 @@ class CCompilerTests(unittest.TestCase):
                         expected,
                         f"glyph {cell} pixel ({x}, {y})",
                     )
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
     def test_text_input_reads_and_terminates_a_buffer(self):
         image = compile_source(
@@ -2891,7 +2894,7 @@ class CCompilerTests(unittest.TestCase):
             "}\n"
         )
         cpu = SuomiCompute16.__new__(SuomiCompute16)
-        cpu.memory = bytearray(MEM_SIZE)
+        cpu.memory = create_memory()
         cpu.registers = [0] * 8
         cpu.flags = {"Z": 0, "C": 0}
         cpu.running = True
@@ -2928,7 +2931,7 @@ class CCompilerTests(unittest.TestCase):
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 3)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x02), ord("b"))
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 0x04), 0)
-        self.assertEqual(cpu.sp, 0x2FFFF)
+        self.assertEqual(cpu.sp, MEM_MASK)
 
 
 if __name__ == "__main__":

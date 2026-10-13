@@ -19,11 +19,13 @@ if str(ROOT) not in sys.path:
 
 from src.SuomiCPU import (  # noqa: E402
     MEM_SIZE,
+    MEM_MASK,
     PALETTE_COLORS,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
     VRAM_START,
     SuomiCompute16,
+    create_memory,
 )
 from tools.c_compiler import compile_source  # noqa: E402
 
@@ -181,11 +183,11 @@ def write_gif(
 def _make_cpu(source: Path, module_name: str):
     image = compile_source(source.read_text(encoding="utf-8"), str(source))
     cpu = SuomiCompute16.__new__(SuomiCompute16)
-    cpu.memory = bytearray(MEM_SIZE)
+    cpu.memory = create_memory()
     cpu.registers = [0] * 8
     cpu.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
     cpu.running = True
-    cpu.sp = 0x2FFFF
+    cpu.sp = MEM_MASK
     cpu.frame_yield = False
     cpu.audio_enabled = False
     cpu.sound_log = []

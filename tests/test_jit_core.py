@@ -55,13 +55,14 @@ def random_cpu(seed, use_jit):
     cpu.sp = rng.choice((0x2FFFF, 0x2F000, 0x43020, 0x4301E))
     cpu.memory[0x20000:0x20400] = bytes(rng.randrange(256) for _ in range(0x400))
     cpu.memory[ICR_ADDR] = rng.choice((0, 1, 1 | 2, 1 | 8))
-    cpu.memory[0x0002:0x0006] = bytes((0x01, 0x00, 0x01, 0x80))
+    cpu.memory[0x0002:0x0006] = bytes((0, 0, 3, 0))
+    cpu.memory[0x0006:0x000A] = bytes((0, 0, 4, 0))
     cpu.frame_yield = False
     return cpu
 
 
 def state(cpu):
-    return (bytes(cpu.memory), list(cpu.registers), dict(cpu.flags), cpu.pc, cpu.sp, cpu.running,
+    return (bytes(cpu.memory[:0x80000]), list(cpu.registers), dict(cpu.flags), cpu.pc, cpu.sp, cpu.running,
             list(cpu.gpu_log))
 
 
@@ -162,11 +163,11 @@ class JitEquivalenceTests(unittest.TestCase):
         fast._execute_jit(10)
 
         self.assertEqual(state(slow), state(fast))
-        self.assertEqual(fast.sp, 0x71234)
-        self.assertEqual((fast.registers[2], fast.registers[3]), (0x71234, 7))
+        self.assertEqual(fast.sp, 0x3FFF1234)
+        self.assertEqual((fast.registers[2], fast.registers[3]), (0x3FFF1234, 0x3FFF))
         self.assertEqual(fast.flags["C"], 1)
 
-    def test_19_bit_return_addresses_match_for_calls_above_0xffff(self):
+    def test_30_bit_return_addresses_match_for_calls_above_0xffff(self):
         program = assemble(
             ".address 0x20000\n"
             "entry: CALLX far_routine\n"
@@ -192,10 +193,10 @@ class JitEquivalenceTests(unittest.TestCase):
         fast._execute_jit(20)
 
         self.assertEqual(state(slow), state(fast))
-        self.assertEqual(slow.pc, 0x20010)
-        self.assertEqual(slow.sp, 0x2FFFF)
+        self.assertEqual(slow.pc, 0x20012)
+        self.assertEqual(slow.sp, emulator.MEM_MASK)
 
-    def test_19_bit_indirect_jump_matches_interpreter(self):
+    def test_30_bit_indirect_jump_matches_interpreter(self):
         program = assemble(
             ".address 0x20000\n"
             "LDI R0, 0\n"
@@ -244,6 +245,7 @@ class JitEquivalenceTests(unittest.TestCase):
                 CONSOLE_DATA,
                 CONSOLE_STATUS,
                 CONSOLE_CONTROL,
+                emulator.MOUSE_ADDR + 5,
             ),
         )
         self.assertEqual(MEM_SIZE - 1, emulator.MEM_MASK)

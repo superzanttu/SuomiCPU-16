@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 
-from SuomiCPU import BIOS_BASE, DISK_BASE, MEM_SIZE, SuomiCompute16  # noqa: E402
+from SuomiCPU import BIOS_BASE, DISK_BASE, SuomiCompute16, create_memory  # noqa: E402
 from src.bios import BIOSError, initialize_bios, mount_data_disk  # noqa: E402
 from src.lib_disk import DiskDevice, DiskDeviceError  # noqa: E402
 
@@ -36,7 +36,7 @@ class StorageBIOSIntegrationTests(unittest.TestCase):
             disk.write_block(0, "application save")
 
             cpu = SuomiCompute16.__new__(SuomiCompute16)
-            cpu.memory = bytearray(MEM_SIZE)
+            cpu.memory = create_memory()
             cpu.disk = DiskDevice(directory)
             cpu.entry_point = 0x1234
             initialize_bios(cpu)
@@ -50,7 +50,7 @@ class StorageBIOSIntegrationTests(unittest.TestCase):
     def test_disk_command_errors_are_reported_in_status_register(self):
         with tempfile.TemporaryDirectory() as directory:
             cpu = SuomiCompute16.__new__(SuomiCompute16)
-            cpu.memory = bytearray(MEM_SIZE)
+            cpu.memory = create_memory()
             cpu.disk = DiskDevice(directory)
             cpu.write(DISK_BASE, 0x04)
             self.assertEqual(cpu.read(DISK_BASE + 16), 1)
@@ -65,7 +65,7 @@ class StorageBIOSIntegrationTests(unittest.TestCase):
     def test_bios_reports_missing_data_disk(self):
         with tempfile.TemporaryDirectory() as directory:
             cpu = SuomiCompute16.__new__(SuomiCompute16)
-            cpu.memory = bytearray(MEM_SIZE)
+            cpu.memory = create_memory()
             cpu.disk = DiskDevice(directory)
             with self.assertRaises(BIOSError):
                 mount_data_disk(cpu, "bad/id!!")

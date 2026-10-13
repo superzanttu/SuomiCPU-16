@@ -2,6 +2,7 @@
 import unittest
 
 from assembler import assemble
+from src.SuomiCPU import MEM_MASK
 from tests.gfx_harness import make_cpu
 
 
@@ -73,7 +74,7 @@ class ExtendedOpcodeTests(unittest.TestCase):
 
     def test_movsph_reads_high_bits_of_stack_pointer(self):
         cpu = run("MOVSPH R0\nHALT")
-        self.assertEqual(cpu.registers[0], 2)
+        self.assertEqual(cpu.registers[0], MEM_MASK >> 16)
 
     def test_setsph_updates_only_the_high_stack_pointer_bits(self):
         cpu = run(
@@ -86,8 +87,8 @@ class ExtendedOpcodeTests(unittest.TestCase):
             "MOVSPH R2\n"
             "HALT"
         )
-        self.assertEqual(cpu.sp, 0x71234)
-        self.assertEqual((cpu.registers[1], cpu.registers[2]), (0x71234, 7))
+        self.assertEqual(cpu.sp, 0x3FFF1234)
+        self.assertEqual((cpu.registers[1], cpu.registers[2]), (0x3FFF1234, 0x3FFF))
         self.assertEqual(cpu.flags["C"], 1)
 
     def test_lda_loads_a_full_19_bit_address(self):
@@ -102,7 +103,19 @@ class ExtendedOpcodeTests(unittest.TestCase):
         )
         self.assertEqual((cpu.registers[4], cpu.registers[5]), (0x1234, 0x5678))
         self.assertEqual(bytes(cpu.memory[:3]), b"\x34\x56\x78")
-        self.assertEqual(cpu.memory[0x7FFFF], 0x12)
+        self.assertEqual(cpu.memory[MEM_MASK], 0x12)
+
+    def test_30_bit_pointer_load_and_store_wrap_at_memory_end(self):
+        cpu = run(
+            "LDI30 R0, 0x12345678\n"
+            "LDI30 R1, 0x3FFFFFFD\n"
+            "STP R0, R1\n"
+            "LDP R2, R1\n"
+            "HALT"
+        )
+        self.assertEqual(cpu.registers[2], 0x12345678)
+        self.assertEqual(bytes(cpu.memory[MEM_MASK - 1:MEM_MASK + 1]), b"\x78\x12")
+        self.assertEqual(bytes(cpu.memory[:1]), b"\x34")
 
     def test_32_bit_multiply_divide_and_remainder(self):
         cpu = run(

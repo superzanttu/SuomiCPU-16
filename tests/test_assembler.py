@@ -70,15 +70,15 @@ class AssemblerTests(unittest.TestCase):
         self.assertEqual(image.segments[0].address, 0x30000)
         self.assertEqual(image.segments[0].data, b"\x19")
 
-    def test_lda_encodes_full_19_bit_address(self):
-        image = assemble("LDA R2, 0x51234\nHALT")
+    def test_lda_encodes_full_30_bit_address(self):
+        image = assemble("LDA R2, 0x3F51234\nHALT")
 
         self.assertEqual(
             image.segments[0].data,
-            b"\xfa\x1e\x70\x05\x12\x34\x00\x00",
+            b"\xfa\x1e\x70\x00\x03\xf5\x12\x34\x00\x00",
         )
         self.assertEqual(
-            assemble("LDI19 R2, 0x51234\nHALT").segments[0].data,
+            assemble("LDI30 R2, 0x3F51234\nHALT").segments[0].data,
             image.segments[0].data,
         )
 
@@ -151,18 +151,18 @@ class AssemblerTests(unittest.TestCase):
 
         self.assertEqual(
             image.segments[0].data,
-            b"\xF8\x7E\x23\x45"
-            b"\xFA\x7E\x23\x45"
-            b"\xFC\x7E\x23\x45"
-            b"\xFE\x7E\x23\x45",
+            b"\xF8\x3E\x00\x01\x23\x45"
+            b"\xFA\x3E\x00\x01\x23\x45"
+            b"\xFC\x3E\x00\x01\x23\x45"
+            b"\xFE\x3E\x00\x01\x23\x45",
         )
 
     def test_encodes_far_conditional_branches_in_four_bytes(self):
         image = assemble("BNZX 0x12345\nBLTX 0x23456\n")
         self.assertEqual(
             image.segments[0].data,
-            b"\xF8\x1D\x23\x45"
-            b"\xFB\x2D\x34\x56",
+            b"\xF8\x0D\x00\x01\x23\x45"
+            b"\xFB\x0D\x00\x02\x34\x56",
         )
 
     def test_encodes_register_pair_far_call(self):

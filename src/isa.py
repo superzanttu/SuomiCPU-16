@@ -94,6 +94,10 @@ MULDIV_OPERATIONS = {
     "MODS": 6,   # Rd = Rd % Rs, signed (sign follows the dividend)
     "LDI19": 7,
     "LDI30": 7,
+    "LDP": 8,
+    "STP": 9,
+    "SPLIT30": 10,
+    "JOIN30": 11,
 }
 
 # Extended ALU group: shifts, rotates, add/subtract with carry, immediate ALU forms

@@ -139,7 +139,9 @@ def run_block(mem, regs, st, budget):
         elif op == 31 and (instr & 0xF8FF) == 0xF81E:
             control = _rd16(mem, npc)
             npc += 2
-            if (control >> 12) == 7:
+            if (control >> 12) in (8, 9, 10, 11):
+                bail = True
+            elif (control >> 12) == 7:
                 high = _rd16(mem, npc) & 0x3FFF
                 regs[rd] = ((high << 16) | _rd16(mem, npc + 2)) & MEM_MASK
                 npc += 4

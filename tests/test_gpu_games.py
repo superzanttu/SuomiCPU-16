@@ -5,8 +5,9 @@ from pathlib import Path
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
 from src.SuomiCPU import (
-    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, MEM_SIZE,
+    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_MAX,
     MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR, VSYNC_ADDR, SuomiCompute16, _load_jit,
+    create_memory,
 )
 
 HEADER = '#include "suomi_gfx.h"\n'
@@ -21,7 +22,7 @@ def run_c(body, frames=1):
 
 def bare_cpu():
     cpu = SuomiCompute16.__new__(SuomiCompute16)
-    cpu.memory = bytearray(MEM_SIZE)
+    cpu.memory = create_memory()
     cpu.frame_yield = False
     return cpu
 
@@ -208,7 +209,7 @@ class MotoRobotsTests(unittest.TestCase):
         cpu = make_cpu(compile_file(ROOT / "modules" / "MotoRobots" / "main.c"))
         run_frame(cpu, limit=400000)
 
-        self.assertEqual(cpu.memory[SPEED_ADDR], 1)
+        self.assertEqual(cpu.memory[SPEED_ADDR], SPEED_MAX)
         self.assertEqual(cpu.memory[VSYNC_ADDR], 1)
 
     def test_pathfinding_discovered_tiles_are_drawn_on_map_only_while_searching(self):
@@ -1289,11 +1290,11 @@ class GameTests(unittest.TestCase):
         cpu.memory[KEYS_ADDR] = 0
         run_frame(cpu, 400_000)
         run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         for _ in range(8):
             cpu.memory[0x43010] = (cpu.memory[0x43010] + 1) % 60
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 0)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         measured = vram(cpu)
         estimate_chart = estimate[90 * SCREEN_WIDTH + 160:90 * SCREEN_WIDTH + 312]
         measured_chart = measured[90 * SCREEN_WIDTH + 160:90 * SCREEN_WIDTH + 312]
@@ -1377,7 +1378,7 @@ class GameTests(unittest.TestCase):
             cpu.memory[0x43002] |= 2
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         base_seconds = cpu.memory[0x43011] * 60 + cpu.memory[0x43010]
         elapsed_seconds = [0]
         frame_count = [0]
@@ -1397,7 +1398,7 @@ class GameTests(unittest.TestCase):
         )
         for _ in range(450):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         green_status = any(pixel(cpu, x, y) == 3 for x in range(8, 312) for y in range(216, 224))
         self.assertTrue(green_status)
         image = vram(cpu)
@@ -1419,7 +1420,7 @@ class GameTests(unittest.TestCase):
         frame_count[0] = 0
         for _ in range(20):
             run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 1)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         red_status = any(pixel(cpu, x, y) == 2 for x in range(8, 312) for y in range(216, 224))
         self.assertTrue(red_status)
         self.assertEqual(
@@ -1428,7 +1429,7 @@ class GameTests(unittest.TestCase):
         )
         cpu.memory[KEYS_ADDR] = 2
         run_frame(cpu, 400_000)
-        self.assertEqual(cpu.memory[0x43003], 0)
+        self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
 
     def test_lunar_lander_menu_flight_sound_and_crash(self):
         cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else 0, 8)

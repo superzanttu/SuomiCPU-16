@@ -11,7 +11,7 @@ import unittest
 
 import isa
 from assembler import AssemblyError, assemble
-from src.SuomiCPU import ICR_ADDR, MEM_SIZE, SuomiCompute16
+from src.SuomiCPU import ICR_ADDR, MEM_MASK, SuomiCompute16, create_memory
 
 REGS = range(8)
 CODE = 0x100
@@ -37,7 +37,7 @@ def encode(text):
 
 def make_cpu(program=b"", registers=None, pc=CODE, sp=0x2FFFF, flags=None):
     cpu = SuomiCompute16.__new__(SuomiCompute16)
-    cpu.memory = bytearray(MEM_SIZE)
+    cpu.memory = create_memory()
     cpu.memory[pc:pc + len(program)] = program
     cpu.registers = list(registers) if registers else [0] * 8
     cpu.flags = {"Z": 0, "C": 0}
@@ -128,14 +128,15 @@ class AssemblerEncodingTests(unittest.TestCase):
 
     def test_lda_every_register(self):
         for rd in REGS:
-            for address in (0, 0xFF, 0x100, 0x2FFFF, MEM_SIZE - 1):
+            for address in (0, 0xFF, 0x100, 0x2FFFF, MEM_MASK):
                 with self.subTest(rd=rd, address=address):
                     data = encode(f"LDA R{rd}, {address}")
                     self.assertEqual(
                         data,
                         be(
                             (isa.OP_SHR << 11) | (rd << 8) | isa.MULDIV_PREFIX,
-                            (7 << 12) | (address >> 16),
+                            7 << 12,
+                            (address >> 16) & 0x3FFF,
                             address & 0xFFFF,
                         ),
                     )
@@ -190,16 +191,15 @@ class AssemblerEncodingTests(unittest.TestCase):
 
     def test_far_control_boundary_targets(self):
         for name, operation in isa.FAR_CONTROL_OPERATIONS.items():
-            for target in (0, 1, 0xFFFF, 0x10000, 0x12345, MEM_SIZE - 1):
+            for target in (0, 1, 0xFFFF, 0x10000, 0x12345, MEM_MASK):
                 with self.subTest(name=name, target=target):
                     first = (
                         isa.FAR_CONTROL_PREFIX
                         | (operation << 9)
-                        | (((target >> 16) & 0x7) << 6)
                     )
                     self.assertEqual(
                         encode(f"{name} {target}"),
-                        be(first, target & 0xFFFF),
+                        be(first, (target >> 16) & 0x3FFF, target & 0xFFFF),
                     )
 
     def test_labels_resolve_for_every_branch(self):
@@ -218,8 +218,8 @@ class AssemblerEncodingTests(unittest.TestCase):
             "LDI R0, 65536", "LDI R0, -1", "LDI_H R0, 256", "LDWS R0, 256",
             "STWS R0, -1", "ADJSP 128", "ADJSP -129", "ADJSP x",
             "JMP 0x800", "CALL 0x800", "BZ 0x800", "BC 0x800", "JMP -1",
-            "JZ R0, 256", "JZ R8, 0", "JMPX 0x80000", "CALLX -1", "BZX 0x80000",
-            "BCX 0x80000", "LDA R0, 0x80000", "FOO R0", "HALT R0", "MOV R0",
+            "JZ R0, 256", "JZ R8, 0", "JMPX 0x40000000", "CALLX -1", "BZX 0x40000000",
+            "BCX 0x40000000", "LDA R0, 0x40000000", "FOO R0", "HALT R0", "MOV R0",
             "ADD R0", "JMP", "RET R0", "PUSH", "FADD R0", "ITOF", "MOVSP",
         ]
         for text in bad:
@@ -421,8 +421,8 @@ class CpuExecutionTests(unittest.TestCase):
 
     def test_adjsp_wraps_within_memory(self):
         cpu = self.run_one(word(isa.OP_ADJSP, imm=0xFF), sp=0)
-        self.assertEqual(cpu.sp, MEM_SIZE - 1)
-        cpu = self.run_one(word(isa.OP_ADJSP, imm=0x01), sp=MEM_SIZE - 1)
+        self.assertEqual(cpu.sp, MEM_MASK)
+        cpu = self.run_one(word(isa.OP_ADJSP, imm=0x01), sp=MEM_MASK)
         self.assertEqual(cpu.sp, 0)
 
     def test_push_pop_every_register(self):
@@ -473,10 +473,10 @@ class CpuExecutionTests(unittest.TestCase):
             with self.subTest(target=target):
                 cpu = self.run_one((isa.OP_CALL << 11) | target)
                 self.assertEqual(cpu.pc, target)
-                self.assertEqual(cpu.sp, 0x2FFFC)
+                self.assertEqual(cpu.sp, 0x2FFFB)
                 self.assertEqual(
-                    cpu.memory[cpu.sp:cpu.sp + 3],
-                    bytes((0, (CODE + 2) >> 8, (CODE + 2) & 0xFF)),
+                    cpu.memory[cpu.sp:cpu.sp + 4],
+                    bytes((0, 0, (CODE + 2) >> 8, (CODE + 2) & 0xFF)),
                 )
                 cpu.memory[target:target + 2] = be(isa.OP_RET << 11)
                 cpu.step()
@@ -485,57 +485,47 @@ class CpuExecutionTests(unittest.TestCase):
     def test_far_control_taken_and_not_taken(self):
         for name, operation in isa.FAR_CONTROL_OPERATIONS.items():
             for z, c in itertools.product((0, 1), repeat=2):
-                for target in (0, 0x12345, MEM_SIZE - 1):
+                for target in (0, 0x12345, MEM_MASK):
                     with self.subTest(name=name, z=z, c=c, target=target):
-                        first = (
-                            isa.FAR_CONTROL_PREFIX
-                            | (operation << 9)
-                            | (((target >> 16) & 0x7) << 6)
-                        )
-                        program = be(first, target & 0xFFFF)
+                        program = encode(f"{name} {target}")
                         cpu = make_cpu(program, flags={"Z": z, "C": c})
                         cpu.step()
                         taken = {"JMPX": True, "CALLX": True, "BZX": z, "BCX": c}[name]
-                        self.assertEqual(cpu.pc, target if taken else CODE + 4)
+                        self.assertEqual(cpu.pc, target if taken else CODE + 6)
                         if name == "CALLX":
-                            self.assertEqual(cpu.sp, 0x2FFFC)
+                            self.assertEqual(cpu.sp, 0x2FFFB)
                             self.assertEqual(
-                                cpu.memory[cpu.sp:cpu.sp + 3],
-                                bytes((0, (CODE + 4) >> 8, (CODE + 4) & 0xFF)),
+                                cpu.memory[cpu.sp:cpu.sp + 4],
+                                bytes((0, 0, (CODE + 6) >> 8, (CODE + 6) & 0xFF)),
                             )
                         else:
                             self.assertEqual(cpu.sp, 0x2FFFF)
 
-    def test_far_conditional_branches_cover_19_bit_targets(self):
+    def test_far_conditional_branches_cover_30_bit_targets(self):
         for name, condition in isa.BRANCH_CONDITIONS.items():
-            for target in (0, 0x12345, MEM_SIZE - 1):
+            for target in (0, 0x12345, MEM_MASK):
                 for taken in (False, True):
                     with self.subTest(name=name, target=target, taken=taken):
                         flags = {
                             "Z": int(taken), "C": int(taken),
                             "N": int(taken), "V": 0,
                         }
-                        encoded = (
-                            isa.FAR_BRANCH_PREFIX
-                            | (condition << 7)
-                            | (((target >> 16) & 7) << 4)
-                        )
-                        cpu = make_cpu(be(encoded, target & 0xFFFF), flags=flags)
+                        cpu = make_cpu(encode(f"{name} {target}"), flags=flags)
                         expected_taken = cpu._flag_condition(condition)
                         cpu.step()
                         self.assertEqual(
                             cpu.pc,
-                            target if expected_taken else CODE + 4,
+                            target if expected_taken else CODE + 6,
                         )
 
     def test_far_call_and_ret_preserve_all_pc_bits(self):
         cpu = make_cpu(encode("CALLX 0x20000"))
         cpu.step()
         self.assertEqual(cpu.pc, 0x20000)
-        self.assertEqual(cpu.sp, 0x2FFFC)
+        self.assertEqual(cpu.sp, 0x2FFFB)
         cpu.memory[0x20000:0x20002] = be(isa.OP_RET << 11)
         cpu.step()
-        self.assertEqual((cpu.pc, cpu.sp), (CODE + 4, 0x2FFFF))
+        self.assertEqual((cpu.pc, cpu.sp), (CODE + 6, 0x2FFFF))
 
     def test_callr_and_ret_preserve_high_pc(self):
         cpu = make_cpu(be(0xFFFF), pc=0x20000)
@@ -548,7 +538,7 @@ class CpuExecutionTests(unittest.TestCase):
         cpu.step()
         self.assertEqual((cpu.pc, cpu.sp), (0x20004, 0x2FFFF))
 
-    def test_jmprp_jumps_to_19_bit_register_pair_address(self):
+    def test_jmprp_jumps_to_30_bit_register_pair_address(self):
         cpu = make_cpu(be(0xFFFF), pc=0x20000)
         cpu.registers[2] = 0x3456
         cpu.registers[3] = 2
@@ -556,16 +546,16 @@ class CpuExecutionTests(unittest.TestCase):
         cpu.step()
         self.assertEqual((cpu.pc, cpu.sp), (0x23456, 0x2FFFF))
 
-    def test_interrupt_return_restores_a_19_bit_pc(self):
+    def test_interrupt_return_restores_a_30_bit_pc(self):
         cpu = make_cpu(be(0xFFFF), pc=0x20000)
-        cpu.memory[0x0002:0x0004] = be(0x300)
-        cpu.memory[0x300:0x302] = be(isa.OP_RTI << 11)
+        cpu.memory[0x0002:0x0006] = bytes((0, 1, 0x23, 0))
+        cpu.memory[0x12300:0x12302] = be(isa.OP_RTI << 11)
         cpu.flags = {"Z": 1, "C": 0, "N": 1, "V": 0}
 
         cpu.handle_interrupt(0x0002)
 
-        self.assertEqual(cpu.pc, 0x300)
-        self.assertEqual(cpu.sp, 0x2FFFA)
+        self.assertEqual(cpu.pc, 0x12300)
+        self.assertEqual(cpu.sp, 0x2FFF9)
         cpu.step()
         self.assertEqual((cpu.pc, cpu.sp), (0x20000, 0x2FFFF))
         self.assertEqual(cpu.flags, {"Z": 1, "C": 0, "N": 1, "V": 0})
@@ -581,19 +571,19 @@ class CpuExecutionTests(unittest.TestCase):
                 self.assertEqual(cpu.memory[ICR_ADDR], (initial & ~0x0A) & ~0x01 & 0xFF)
 
     def test_interrupt_entry_and_rti_for_both_sources(self):
-        for pending, vector in ((0x02, 0x0002), (0x08, 0x0004)):
+        for pending, vector in ((0x02, 0x0002), (0x08, 0x0006)):
             for z in (0, 1):
                 with self.subTest(pending=pending, z=z):
                     cpu = make_cpu(be(isa.OP_EI << 11), flags={"Z": z})
-                    cpu.memory[vector:vector + 2] = (0x300).to_bytes(2, "big")
+                    cpu.memory[vector:vector + 4] = bytes((0, 0, 3, 0))
                     cpu.memory[0x300:0x302] = be(isa.OP_RTI << 11)
                     cpu.memory[ICR_ADDR] = pending
                     cpu.step()
                     self.assertEqual(cpu.pc, 0x300)
-                    self.assertEqual(cpu.sp, 0x2FFFF - 5)
+                    self.assertEqual(cpu.sp, 0x2FFFF - 6)
                     self.assertEqual(cpu.read_16(cpu.sp), z)
                     self.assertEqual(cpu.read(cpu.sp + 2), 0)
-                    self.assertEqual(cpu.read_16(cpu.sp + 3), CODE + 2)
+                    self.assertEqual(cpu.read_32(cpu.sp + 2), CODE + 2)
                     self.assertEqual(cpu.memory[ICR_ADDR] & 0x0B, 0)
                     cpu.flags["Z"] = 1 - z
                     cpu.step()
@@ -608,8 +598,8 @@ class CpuExecutionTests(unittest.TestCase):
 
     def test_keyboard_interrupt_has_priority_over_rtc(self):
         cpu = make_cpu(be(isa.OP_EI << 11))
-        cpu.memory[0x0002:0x0004] = (0x300).to_bytes(2, "big")
-        cpu.memory[0x0004:0x0006] = (0x400).to_bytes(2, "big")
+        cpu.memory[0x0002:0x0006] = bytes((0, 0, 3, 0))
+        cpu.memory[0x0006:0x000A] = bytes((0, 0, 4, 0))
         cpu.memory[ICR_ADDR] = 0x0A
         cpu.step()
         self.assertEqual(cpu.pc, 0x300)

@@ -296,7 +296,7 @@ gfx_rtc:
     RET
 
 ; Interrupt support.  gfx_irq_init() just executes EI.  Handlers live at fixed
-; addresses 0x0010 (RTC, vector 0x0004, once per display frame) and 0x0030
+; addresses 0x0020 (RTC, vector 0x0006, once per display frame) and 0x0040
 ; (keyboard, vector 0x0002).  The handlers preserve R6/R7 and the flags, so they are
 ; invisible to the interrupted program.  Counters live at 0x4340 and 0x4342.
 gfx_irq_init:
@@ -314,10 +314,10 @@ gfx_irq_keys:
     RET
 
 .address 0x0002
-.data hex 00, 30
-.address 0x0004
-.data hex 00, 10
-.address 0x0010
+.data hex 00, 00, 00, 40
+.address 0x0006
+.data hex 00, 00, 00, 20
+.address 0x0020
 irq_timer:
     ADJSP -4
     STWS R6, 0
@@ -331,7 +331,7 @@ irq_timer:
     ADJSP 4
     EI
     RTI
-.address 0x0030
+.address 0x0040
 irq_key:
     ADJSP -4
     STWS R6, 0

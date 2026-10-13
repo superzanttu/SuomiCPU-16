@@ -88,6 +88,8 @@ VRAM_START  = 0x50000
 VRAM_SIZE   = 320 * 240
 KBD_ADDR    = 0x43000 # Näppäimistön osoite
 ICR_ADDR    = 0x43002 # Keskeytysten ohjaus
+KEY_VECTOR_ADDR = 0x0002
+RTC_VECTOR_ADDR = 0x0006
 DISK_BASE   = 0x43100 # Levylaitteen ohjaus (Disk storage)
 DISK_STATUS = DISK_BASE + 16
 # DISK_BASE:
@@ -401,6 +403,18 @@ class SuomiCompute16:
 
     def read_16(self, addr):
         return (self.read(addr) << 8) | self.read(addr + 1)
+
+    def read_32(self, addr):
+        return (
+            (self.read(addr) << 24)
+            | (self.read(addr + 1) << 16)
+            | (self.read(addr + 2) << 8)
+            | self.read(addr + 3)
+        )
+
+    def write_32(self, addr, value):
+        for offset in range(4):
+            self.write(addr + offset, value >> (24 - offset * 8))
 
     def _gpu_word(self, offset, signed=True):
         value = (self.memory[GPU_BASE + offset] << 8) | self.memory[GPU_BASE + offset + 1]
@@ -846,6 +860,28 @@ class SuomiCompute16:
             high = self.read_16(self.pc) & 0x3FFF
             self.registers[rd] = ((high << 16) | self.read_16(self.pc + 2)) & MEM_MASK
             self.pc += 4
+            return
+        if operation == 8:
+            address = self.registers[control & 0x7]
+            low = self.read_16(address)
+            high = self.read_16(address + 2) & 0x3FFF
+            self.registers[rd] = (high << 16) | low
+            return
+        if operation == 9:
+            address = self.registers[control & 0x7]
+            value = self.registers[rd] & MEM_MASK
+            self.write_16(address, value)
+            self.write_16(address + 2, value >> 16)
+            return
+        if operation == 10:
+            value = self.registers[rd] & MEM_MASK
+            self.registers[rd] = value >> 16
+            self.registers[control & 0x7] = value & 0xFFFF
+            return
+        if operation == 11:
+            high = self.registers[rd] & 0x3FFF
+            low = self.registers[control & 0x7] & 0xFFFF
+            self.registers[rd] = (high << 16) | low
             return
         if control & 0x0800:
             right = self.read_16(self.pc)
@@ -1343,15 +1379,15 @@ class SuomiCompute16:
 
     def check_interrupts(self):
         icr = self.read(ICR_ADDR)
-        if (icr & 0x01) and (icr & 0x02): self.handle_interrupt(0x0002)
-        elif (icr & 0x01) and (icr & 0x08): self.handle_interrupt(0x0004)
+        if (icr & 0x01) and (icr & 0x02): self.handle_interrupt(KEY_VECTOR_ADDR)
+        elif (icr & 0x01) and (icr & 0x08): self.handle_interrupt(RTC_VECTOR_ADDR)
 
     def handle_interrupt(self, vector_addr):
         self.push_pc(self.pc)
         self.push(self._pack_flags())
         self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x01)
         self.write(ICR_ADDR, self.read(ICR_ADDR) & ~0x02 & ~0x08)
-        self.pc = self.read_16(vector_addr)
+        self.pc = self.read_32(vector_addr) & MEM_MASK
 
     def update_rtc(self):
         now = datetime.datetime.now()
@@ -1362,7 +1398,7 @@ class SuomiCompute16:
 
     def update_display(self):
         mode = self._graphics_mode()
-        if mode != self._surface_mode:
+        if mode != getattr(self, "_surface_mode", mode):
             self.vram_surface = self._create_vram_surface()
         elif mode != GFX_MODE_320_240:
             self._expanded_vram[:] = self._decode_framebuffer(VRAM_START)
