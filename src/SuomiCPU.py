@@ -1574,6 +1574,8 @@ class SuomiCompute16:
 
     def toggle_pause(self):
         self.paused = not self.paused
+        if not self.paused:
+            self._speed_time = time.monotonic()
         self.console_log("Emulation paused" if self.paused else "Emulation continued")
 
     def _log_startup(self, message):

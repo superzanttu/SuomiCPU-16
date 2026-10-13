@@ -18,6 +18,17 @@ from src.SuomiCPU import (
 
 
 class DisplayTests(unittest.TestCase):
+    def test_resuming_pause_resets_instruction_budget_timestamp(self):
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
+        emulator.paused = True
+        emulator.console_log = Mock()
+
+        with patch("src.SuomiCPU.time.monotonic", return_value=123.0):
+            emulator.toggle_pause()
+
+        self.assertFalse(emulator.paused)
+        self.assertEqual(emulator._speed_time, 123.0)
+
     def test_tab_key_has_a_dedicated_held_key_bit(self):
         self.assertEqual(KEY_BITS[pygame.K_TAB], 64)
 
