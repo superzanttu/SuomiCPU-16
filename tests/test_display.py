@@ -32,6 +32,13 @@ class DisplayTests(unittest.TestCase):
     def test_tab_key_has_a_dedicated_held_key_bit(self):
         self.assertEqual(KEY_BITS[pygame.K_TAB], 64)
 
+    def test_wasd_keys_map_to_directional_controls(self):
+        self.assertEqual(
+            [KEY_BITS[pygame.K_a], KEY_BITS[pygame.K_d],
+             KEY_BITS[pygame.K_w], KEY_BITS[pygame.K_s]],
+            [1, 2, 4, 8],
+        )
+
     def test_cpu_vram_writes_are_visible_in_palette_surface(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.memory = create_memory()

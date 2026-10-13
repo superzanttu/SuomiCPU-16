@@ -75,6 +75,20 @@ def reference_run(cpu, count):
 
 @unittest.skipUnless(HAVE_JIT, "numba is not installed")
 class JitEquivalenceTests(unittest.TestCase):
+    def test_binary32_instruction_falls_back_to_interpreter(self):
+        program = assemble("F32ADD R0, R2\nHALT")
+        slow = make_cpu(program)
+        fast = make_cpu(program)
+        slow.use_jit = False
+        fast.use_jit = True
+        slow.registers[:4] = [0x3FC0, 0, 0x4010, 0]
+        fast.registers[:4] = [0x3FC0, 0, 0x4010, 0]
+
+        reference_run(slow, 1)
+        fast._execute_jit(1)
+
+        self.assertEqual(state(fast), state(slow))
+
     def test_console_mmio_reads_and_writes_fall_back_to_interpreter(self):
         input_program = assemble("LD R0, R1\nHALT")
         slow = make_cpu(input_program)

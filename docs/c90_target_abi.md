@@ -64,6 +64,19 @@ a NaN are false, and NaN compares unequal to itself. Positive and negative
 zero compare equal. Floating exceptions do not trap and no floating status
 flags are exposed to C.
 
+The ISA implements binary32 and binary64 add, subtract, multiply, divide,
+ordered comparison, integer conversions, format conversion, negation, and
+square root. A float value occupies an even pair of registers; a double or
+long-double value occupies R0-R3 or R4-R7, most-significant word first.
+Assembler mnemonics use the `F32`/`F64` prefixes (`F32ADD`, `F64CMP`,
+`I32TOF64`, `F64TOI32`, etc.) and reject register groups that cross these
+boundaries. The Numba JIT hands these instructions to the same emulator
+implementation, so both execution paths share the IEEE conversion and
+rounding behavior. Float-to-integer conversion truncates toward zero. The
+instruction returns zero for non-finite input and the low destination bits for
+finite values outside the destination range; C code must not rely on this
+extension where C90 leaves the conversion result undefined.
+
 These are the selected target rules, not the current compiler's behavior. The
 compiler currently represents all three floating types as binary16, emits
 binary16 operations in 2-byte objects, and reports binary16 characteristics

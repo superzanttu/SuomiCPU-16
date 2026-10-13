@@ -100,6 +100,46 @@ MULDIV_OPERATIONS = {
     "JOIN30": 11,
 }
 
+# IEEE-754 operations use a two-word instruction in the OP_SHR extension
+# space. Word one's low five bits identify the prefix; word two stores the
+# operation in bits 15:11 and the source register in bits 2:0. Binary32 values
+# occupy an even register pair and binary64 values occupy R0:R3 or R4:R7.
+FLOAT_PREFIX = 0x1B
+FLOAT_OPERATIONS = {
+    "F32ADD": 0,
+    "F32SUB": 1,
+    "F32MUL": 2,
+    "F32DIV": 3,
+    "F32CMP": 4,
+    "F64ADD": 5,
+    "F64SUB": 6,
+    "F64MUL": 7,
+    "F64DIV": 8,
+    "F64CMP": 9,
+    "I16TOF32": 10,
+    "U16TOF32": 11,
+    "I32TOF32": 12,
+    "U32TOF32": 13,
+    "I16TOF64": 14,
+    "U16TOF64": 15,
+    "I32TOF64": 16,
+    "U32TOF64": 17,
+    "F32TOF64": 18,
+    "F64TOF32": 19,
+    "F32NEG": 20,
+    "F64NEG": 21,
+    "F32SQRT": 22,
+    "F64SQRT": 23,
+    "F32TOI16": 24,
+    "F32TOU16": 25,
+    "F32TOI32": 26,
+    "F32TOU32": 27,
+    "F64TOI16": 28,
+    "F64TOU16": 29,
+    "F64TOI32": 30,
+    "F64TOU32": 31,
+}
+
 # Extended ALU group: shifts, rotates, add/subtract with carry, immediate ALU forms
 # and miscellaneous register operations. Every instruction is 4 bytes, or 6 bytes when
 # a 16-bit immediate follows.
@@ -217,6 +257,7 @@ OPCODES = {
     "BCX": OP_SHR,
 }
 OPCODES.update({name: OP_SHR for name in MULDIV_OPERATIONS})
+OPCODES.update({name: OP_SHR for name in FLOAT_OPERATIONS})
 OPCODES.update({name: OP_SHR for name in WIDE_OPERATIONS})
 OPCODES.update({name: OP_SHR for name in MISC_OPERATIONS})
 OPCODES.update({name: OP_SHR for name in BRANCH_CONDITIONS})

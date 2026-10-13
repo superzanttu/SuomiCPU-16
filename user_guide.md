@@ -999,7 +999,10 @@ benchmark features.
 maze game rendered with the SC-GPU. Move with W/S, turn with A/D, and throw
 treats with Space. Hertta wanders through the maze; feed her enough treats and
 she will come to you to finish the level. Later levels add maze walls and make
-Hertta faster.
+Hertta faster. The connected maze is generated with a route between you and
+Hertta; she wanders through its passages and finds a path to you after the treats.
+Visible wall cells are drawn as outlined surfaces, and the minimap uses solid
+wall tiles with separate markers for you and Hertta.
 
 All games and the showcase play sound effects through `gfx_sound` (lasers, explosions,
 engine rumble, pellet and ghost sounds, page and benchmark beeps); sound is

@@ -24,6 +24,7 @@ from src.isa import (
     FAR_CONTROL_MASK,
     FAR_CONTROL_OPERATIONS,
     FAR_CONTROL_PREFIX,
+    FLOAT_PREFIX,
 )
 
 CONSOLE_LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "console.log"
@@ -928,6 +929,123 @@ class SuomiCompute16:
         except OverflowError:
             return 0xFC00 if value < 0 else 0x7C00
 
+    def _read_float_register(self, register, precision):
+        words = 2 if precision == 32 else 4
+        bits = 0
+        for offset in range(words):
+            bits = (bits << 16) | (self.registers[register + offset] & 0xFFFF)
+        format_code = ">f" if precision == 32 else ">d"
+        return struct.unpack(format_code, bits.to_bytes(words * 2, "big"))[0]
+
+    def _write_float_register(self, register, precision, value):
+        if math.isnan(value):
+            bits = 0x7FC00000 if precision == 32 else 0x7FF8000000000000
+            width = 2 if precision == 32 else 4
+        else:
+            format_code = ">f" if precision == 32 else ">d"
+            try:
+                packed = struct.pack(format_code, value)
+            except OverflowError:
+                packed = struct.pack(format_code, math.copysign(math.inf, value))
+            bits = int.from_bytes(packed, "big")
+            width = len(packed) // 2
+        for offset in range(width):
+            shift = (width - offset - 1) * 16
+            self.registers[register + offset] = (bits >> shift) & 0xFFFF
+
+    def _read_integer_register(self, register, width, unsigned):
+        if width == 16:
+            value = self.registers[register] & 0xFFFF
+        else:
+            value = (
+                ((self.registers[register] & 0xFFFF) << 16)
+                | (self.registers[register + 1] & 0xFFFF)
+            )
+        if not unsigned and value & (1 << (width - 1)):
+            value -= 1 << width
+        return value
+
+    def _write_integer_register(self, register, width, value):
+        value &= (1 << width) - 1
+        if width == 16:
+            self.registers[register] = value
+        else:
+            self.registers[register] = (value >> 16) & 0xFFFF
+            self.registers[register + 1] = value & 0xFFFF
+
+    def _execute_float(self, action, destination, source):
+        if action <= 9:
+            precision = 32 if action < 5 else 64
+            left = self._read_float_register(destination, precision)
+            right = self._read_float_register(source, precision)
+            operation = action % 5
+            if operation == 4:
+                unordered = math.isnan(left) or math.isnan(right)
+                self.flags["Z"] = int(not unordered and left == right)
+                self.flags["C"] = int(not unordered and left < right)
+                self.flags["N"] = 0
+                self.flags["V"] = 0
+                return
+            if operation == 0:
+                result = left + right
+            elif operation == 1:
+                result = left - right
+            elif operation == 2:
+                result = left * right
+            elif right == 0.0:
+                if left == 0.0 or math.isnan(left):
+                    result = math.nan
+                else:
+                    result = math.copysign(
+                        math.inf,
+                        math.copysign(1.0, left) * math.copysign(1.0, right),
+                    )
+            else:
+                result = left / right
+            self._write_float_register(destination, precision, result)
+            return
+
+        if 10 <= action <= 17:
+            format_index = (action - 10) % 4
+            integer_width = 16 if format_index < 2 else 32
+            unsigned = format_index in (1, 3)
+            precision = 32 if action < 14 else 64
+            value = self._read_integer_register(source, integer_width, unsigned)
+            self._write_float_register(destination, precision, float(value))
+            return
+
+        if action in (18, 19):
+            source_precision, destination_precision = (
+                (32, 64) if action == 18 else (64, 32)
+            )
+            value = self._read_float_register(source, source_precision)
+            self._write_float_register(destination, destination_precision, value)
+            return
+
+        if action in (20, 21, 22, 23):
+            precision = 32 if action in (20, 22) else 64
+            value = self._read_float_register(source, precision)
+            if action in (20, 21):
+                result = -value
+            else:
+                try:
+                    result = math.sqrt(value)
+                except ValueError:
+                    result = math.nan
+            self._write_float_register(destination, precision, result)
+            return
+
+        precision = 32 if action < 28 else 64
+        conversion = (action - 24) % 4
+        integer_width = 16 if conversion < 2 else 32
+        unsigned = conversion in (1, 3)
+        value = self._read_float_register(source, precision)
+        if not math.isfinite(value):
+            converted = 0
+        else:
+            converted = math.trunc(value)
+        self._write_integer_register(destination, integer_width, converted)
+
     def load_program(self, image):
         for segment in image.segments:
             end = segment.address + len(segment.data)
@@ -1369,6 +1487,10 @@ class SuomiCompute16:
         imm = instr & 0xFF
 
         if opcode == OP_LDI: registers[rd] = imm
+        elif opcode == OP_SHR and (instr & 0xF81F) == (0xF800 | FLOAT_PREFIX):
+            control = self.read_16(self.pc)
+            self.pc += 2
+            self._execute_float((control >> 11) & 0x1F, rd, control & 0x7)
         elif opcode == OP_SHR and (instr & 0xF8FF) == 0xF81E:
             self._execute_muldiv(instr)
         elif opcode == OP_SHR and (instr & 0xF81F) == 0xF81A:

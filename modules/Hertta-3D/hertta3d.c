@@ -14,6 +14,9 @@
 #define ST_HAPPY 2
 #define ST_DONE 3
 #define FIX 256
+#define MAP_X 252
+#define MAP_Y 25
+#define MAP_CELL 6
 
 int sintab[64] = {
     0, 25, 50, 74, 98, 121, 142, 162, 181, 198, 213, 226, 237, 245, 251, 255,
@@ -24,6 +27,12 @@ int sintab[64] = {
 
 unsigned char maze[MW * MH];
 int scene[SCENE_WORDS];
+int ray_depths[RAYS];
+int ray_cells[RAYS];
+int move_dx[4] = {0, 1, 0, -1};
+int move_dy[4] = {-1, 0, 1, 0};
+int path_queue[MW * MH];
+int path_toward[MW * MH];
 int vertex_count;
 int face_count;
 int state;
@@ -52,6 +61,29 @@ int sine(int angle)
 int cosine(int angle)
 {
     return sine(angle + 64);
+}
+
+int fixed_mul(int value, int factor)
+{
+    int whole;
+    int fraction;
+    int half_fraction;
+    int odd_fraction;
+    whole = value >> 8;
+    fraction = value - whole * FIX;
+    half_fraction = fraction >> 1;
+    odd_fraction = fraction & 1;
+    return whole * factor + ((half_fraction * factor) >> 7) +
+           ((odd_fraction * factor) >> 8);
+}
+
+int screen_offset(int pixels, int depth)
+{
+    int whole;
+    int remainder;
+    whole = depth / 120;
+    remainder = depth % 120;
+    return pixels * whole + (pixels * remainder) / 120;
 }
 
 int absval(int value)
@@ -90,54 +122,65 @@ int wall_at(int x, int y)
 
 void make_maze(void)
 {
+    int stack_x[16];
+    int stack_y[16];
+    int choices_x[4];
+    int choices_y[4];
+    int stack_count;
+    int choice_count;
     int x;
     int y;
-    int gate_a;
-    int gate_b;
-    int gate_c;
-    int gate_d;
+    int next_x;
+    int next_y;
+    int i;
+    int choice;
     for (y = 0; y < MH; y++)
     {
         for (x = 0; x < MW; x++)
         {
-            maze[y * MW + x] = (x == 0 || y == 0 || x == MW - 1 || y == MH - 1) ? 1 : 0;
+            maze[y * MW + x] = 1;
         }
     }
-    gate_a = 2 + (level % 5);
-    gate_b = 2 + ((level + 2) % 5);
-    gate_c = 1 + ((level + 1) % 7);
-    gate_d = 1 + ((level + 4) % 7);
-    for (y = 1; y < MH - 1; y++)
+    stack_count = 1;
+    stack_x[0] = 1;
+    stack_y[0] = 1;
+    maze[MW + 1] = 0;
+    while (stack_count > 0)
     {
-        if (y != gate_a)
-            maze[y * MW + 3] = 1;
-        if (y != gate_b)
-            maze[y * MW + 6] = 1;
+        x = stack_x[stack_count - 1];
+        y = stack_y[stack_count - 1];
+        choice_count = 0;
+        for (i = 0; i < 4; i++)
+        {
+            if (i == 0) { next_x = x; next_y = y - 2; }
+            else if (i == 1) { next_x = x + 2; next_y = y; }
+            else if (i == 2) { next_x = x; next_y = y + 2; }
+            else { next_x = x - 2; next_y = y; }
+            if (next_x > 0 && next_x < MW - 1 &&
+                next_y > 0 && next_y < MH - 1 &&
+                maze[next_y * MW + next_x])
+            {
+                choices_x[choice_count] = next_x;
+                choices_y[choice_count] = next_y;
+                choice_count++;
+            }
+        }
+        if (choice_count == 0)
+        {
+            stack_count--;
+        }
+        else
+        {
+            choice = gfx_random() % choice_count;
+            next_x = choices_x[choice];
+            next_y = choices_y[choice];
+            maze[((y + next_y) / 2) * MW + ((x + next_x) / 2)] = 0;
+            maze[next_y * MW + next_x] = 0;
+            stack_x[stack_count] = next_x;
+            stack_y[stack_count] = next_y;
+            stack_count++;
+        }
     }
-    for (x = 1; x < MW - 1; x++)
-    {
-        if (x != gate_c)
-            maze[4 * MW + x] = 1;
-        if (x != gate_d)
-            maze[7 * MW + x] = 1;
-    }
-    if (level > 1)
-    {
-        x = 1 + (level % 2);
-        y = 2 + (level % 4);
-        if (x != 1 || y != 1)
-            maze[y * MW + x] = 1;
-        x = 7 + (level % 2);
-        y = 5 + (level % 2);
-        maze[y * MW + x] = 1;
-    }
-    if (level > 3)
-    {
-        maze[2 * MW + 8] = 1;
-        maze[6 * MW + 2] = 1;
-    }
-    maze[1 * MW + 1] = 0;
-    maze[8 * MW + 8] = 0;
 }
 
 void reset_level(void)
@@ -146,10 +189,20 @@ void reset_level(void)
     make_maze();
     player_x = FIX + FIX / 2;
     player_y = FIX + FIX / 2;
-    player_angle = 32;
-    dog_x = 8 * FIX + FIX / 2;
-    dog_y = 8 * FIX + FIX / 2;
-    dog_angle = 160;
+    player_angle = 0;
+    if (wall_at(player_x, player_y - FIX))
+    {
+        player_angle = 64;
+        if (wall_at(player_x + FIX, player_y))
+        {
+            player_angle = 128;
+            if (wall_at(player_x, player_y + FIX))
+                player_angle = 192;
+        }
+    }
+    dog_x = 7 * FIX + FIX / 2;
+    dog_y = 7 * FIX + FIX / 2;
+    dog_angle = 0;
     dog_turn = 0;
     treats_eaten = 0;
     treats_needed = level + 2;
@@ -211,8 +264,8 @@ void scene_quad(int x0, int x1, int half_height, int depth, int color)
     int d;
     if (depth < 32 || vertex_count + 4 > MAX_VERTICES || face_count + 2 > MAX_FACES)
         return;
-    left = (x0 * depth) / 120;
-    right = (x1 * depth) / 120;
+    left = screen_offset(x0, depth);
+    right = screen_offset(x1, depth);
     top = half_height;
     bottom = -top;
     a = scene_vertex(left, top, depth);
@@ -248,8 +301,6 @@ void build_view(void)
     int wx;
     int wy;
     int depth;
-    int local_x;
-    int local_z;
     int dx;
     int dy;
     int dog_local_x;
@@ -259,6 +310,11 @@ void build_view(void)
     int color;
     int left;
     int right;
+    int hit_x;
+    int hit_y;
+    int group_start;
+    int depth_sum;
+    int group_count;
     int i;
     vertex_count = 0;
     face_count = 0;
@@ -269,27 +325,53 @@ void build_view(void)
         dist = 24;
         while (dist <= 1536)
         {
-            wx = player_x + (sine(angle) * dist >> 8);
-            wy = player_y - (cosine(angle) * dist >> 8);
+            wx = player_x + fixed_mul(dist, sine(angle));
+            wy = player_y - fixed_mul(dist, cosine(angle));
             if (wall_at(wx, wy))
                 break;
             dist += 24;
         }
         if (dist > 1536)
             dist = 1536;
-        depth = (dist * cosine(relative)) >> 8;
+        hit_x = wx >> 8;
+        hit_y = wy >> 8;
+        if (hit_x < 0) hit_x = 0;
+        if (hit_x >= MW) hit_x = MW - 1;
+        if (hit_y < 0) hit_y = 0;
+        if (hit_y >= MH) hit_y = MH - 1;
+        depth = fixed_mul(dist, cosine(relative));
         if (depth < 32)
             depth = 32;
-        left = -160 + (ray * 320) / RAYS;
+        ray_depths[ray] = depth;
+        ray_cells[ray] = hit_y * MW + hit_x;
+    }
+
+    ray = 0;
+    while (ray < RAYS)
+    {
+        group_start = ray;
+        depth_sum = ray_depths[ray];
+        group_count = 1;
+        while (ray + 1 < RAYS && ray_cells[ray + 1] == ray_cells[group_start])
+        {
+            ray++;
+            depth_sum += ray_depths[ray];
+            group_count++;
+        }
+        depth = depth_sum / group_count;
+        left = -160 + (group_start * 320) / RAYS;
         right = -160 + ((ray + 1) * 320) / RAYS;
-        color = depth < 512 ? 14 : depth < 1024 ? 8 : 9;
+        color = depth < 192 ? 14 : depth < 320 ? 8 : 9;
         scene_quad(left, right, FIX, depth, color);
+        ray++;
     }
 
     dx = dog_x - player_x;
     dy = dog_y - player_y;
-    dog_local_x = (dx * cosine(player_angle) + dy * sine(player_angle)) >> 8;
-    dog_depth = (dx * sine(player_angle) - dy * cosine(player_angle)) >> 8;
+    dog_local_x = fixed_mul(dx, cosine(player_angle)) +
+                  fixed_mul(dy, sine(player_angle));
+    dog_depth = fixed_mul(dx, sine(player_angle)) -
+                fixed_mul(dy, cosine(player_angle));
     if (dog_depth > 0)
     {
         add_billboard(dog_local_x, FIX / 8, dog_depth, FIX / 4, FIX / 3, ORANGE);
@@ -304,8 +386,10 @@ void build_view(void)
         {
             dx = treat_x[i] - player_x;
             dy = treat_y[i] - player_y;
-            treat_local_x = (dx * cosine(player_angle) + dy * sine(player_angle)) >> 8;
-            treat_depth = (dx * sine(player_angle) - dy * cosine(player_angle)) >> 8;
+            treat_local_x = fixed_mul(dx, cosine(player_angle)) +
+                            fixed_mul(dy, sine(player_angle));
+            treat_depth = fixed_mul(dx, sine(player_angle)) -
+                          fixed_mul(dy, cosine(player_angle));
             if (treat_depth > 0)
                 add_billboard(treat_local_x, -FIX / 3, treat_depth, FIX / 12, FIX / 12, WHITE);
         }
@@ -322,6 +406,89 @@ void build_view(void)
     scene[8] = 120 * FIX;
     scene[9] = GPU3D_FILL;
     compact_faces();
+}
+
+void draw_wall_edges(void)
+{
+    int ray;
+    int left;
+    int right;
+    int group_start;
+    int depth_sum;
+    int group_count;
+    int depth;
+    int half_height;
+    int top;
+    int bottom;
+    ray = 0;
+    while (ray < RAYS)
+    {
+        group_start = ray;
+        depth_sum = ray_depths[ray];
+        group_count = 1;
+        while (ray + 1 < RAYS && ray_cells[ray + 1] == ray_cells[group_start])
+        {
+            ray++;
+            depth_sum += ray_depths[ray];
+            group_count++;
+        }
+        left = (group_start * 320) / RAYS;
+        right = ((ray + 1) * 320) / RAYS;
+        depth = depth_sum / group_count;
+        half_height = (120 * FIX) / depth;
+        top = 120 - half_height;
+        bottom = 120 + half_height;
+        gfx_line(left, top, right, top, DARK_GRAY);
+        gfx_line(left, bottom, right, bottom, DARK_GRAY);
+        gfx_line(left, top, left, bottom, DARK_GRAY);
+        ray++;
+    }
+    gfx_line(right, top, right, bottom, DARK_GRAY);
+}
+
+void draw_minimap(void)
+{
+    int x;
+    int y;
+    int px;
+    int py;
+    int player_cell_x;
+    int player_cell_y;
+    int dog_cell_x;
+    int dog_cell_y;
+    gfx_rect(MAP_X - 4, MAP_Y - 4, MW * MAP_CELL + 8,
+             MH * MAP_CELL + 8, GRAY);
+    gfx_rect(MAP_X - 2, MAP_Y - 2, MW * MAP_CELL + 4,
+             MH * MAP_CELL + 4, BLACK);
+    for (y = 0; y < MH; y++)
+    {
+        for (x = 0; x < MW; x++)
+        {
+            px = MAP_X + x * MAP_CELL;
+            py = MAP_Y + y * MAP_CELL;
+            gfx_rect(px, py, MAP_CELL, MAP_CELL,
+                     maze[y * MW + x] ? GRAY : BLACK);
+            if (maze[y * MW + x])
+            {
+                if (y == 0 || !maze[(y - 1) * MW + x])
+                    gfx_line(px, py, px + MAP_CELL - 1, py, DARK_GRAY);
+                if (x == 0 || !maze[y * MW + x - 1])
+                    gfx_line(px, py, px, py + MAP_CELL - 1, DARK_GRAY);
+                if (y == MH - 1 || !maze[(y + 1) * MW + x])
+                    gfx_line(px, py + MAP_CELL - 1,
+                             px + MAP_CELL - 1, py + MAP_CELL - 1, DARK_GRAY);
+                if (x == MW - 1 || !maze[y * MW + x + 1])
+                    gfx_line(px + MAP_CELL - 1, py,
+                             px + MAP_CELL - 1, py + MAP_CELL - 1, DARK_GRAY);
+            }
+        }
+    }
+    player_cell_x = (player_x >> 8) * MAP_CELL + MAP_X + 1;
+    player_cell_y = (player_y >> 8) * MAP_CELL + MAP_Y + 1;
+    dog_cell_x = (dog_x >> 8) * MAP_CELL + MAP_X + 1;
+    dog_cell_y = (dog_y >> 8) * MAP_CELL + MAP_Y + 1;
+    gfx_rect(player_cell_x, player_cell_y, MAP_CELL - 2, MAP_CELL - 2, GREEN);
+    gfx_rect(dog_cell_x, dog_cell_y, MAP_CELL - 2, MAP_CELL - 2, ORANGE);
 }
 
 void throw_treat(void)
@@ -378,6 +545,49 @@ void update_treats(void)
     }
 }
 
+int path_direction(int from_x, int from_y, int to_x, int to_y)
+{
+    int first;
+    int last;
+    int current;
+    int next;
+    int x;
+    int y;
+    int direction;
+    int i;
+    first = 0;
+    last = 0;
+    for (i = 0; i < MW * MH; i++)
+        path_toward[i] = -1;
+    current = (to_y >> 8) * MW + (to_x >> 8);
+    next = (from_y >> 8) * MW + (from_x >> 8);
+    if (current == next)
+        return -1;
+    path_queue[last++] = current;
+    path_toward[current] = -2;
+    while (first < last)
+    {
+        current = path_queue[first++];
+        if (current == next)
+            return path_toward[current];
+        for (direction = 0; direction < 4; direction++)
+        {
+            x = current % MW + move_dx[direction];
+            y = current / MW + move_dy[direction];
+            if (x >= 0 && x < MW && y >= 0 && y < MH)
+            {
+                i = y * MW + x;
+                if (!maze[i] && path_toward[i] == -1)
+                {
+                    path_toward[i] = (direction + 2) & 3;
+                    path_queue[last++] = i;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
 void update_dog(void)
 {
     int speed;
@@ -386,9 +596,11 @@ void update_dog(void)
     int dx;
     int dy;
     int direction;
-    int candidate_distance;
-    int best_distance;
-    int best_direction;
+    int candidate_count;
+    int candidates[4];
+    int reverse;
+    int player_cell;
+    int dog_cell;
     int i;
     if (state == ST_HAPPY)
     {
@@ -399,56 +611,67 @@ void update_dog(void)
             state = ST_DONE;
             return;
         }
-        best_distance = absval(dx) + absval(dy);
-        best_direction = -1;
-        for (i = 0; i < 4; i++)
+        player_cell = (player_y >> 8) * MW + (player_x >> 8);
+        dog_cell = (dog_y >> 8) * MW + (dog_x >> 8);
+        if (player_cell == dog_cell)
         {
-            direction = (dog_turn + i) & 3;
-            nx = dog_x + sine(direction * 64) * 5 / 256;
-            ny = dog_y - cosine(direction * 64) * 5 / 256;
+            if (absval(dx) > absval(dy))
+                direction = dx > 0 ? 1 : 3;
+            else
+                direction = dy > 0 ? 2 : 0;
+        }
+        else
+            direction = path_direction(dog_x, dog_y, player_x, player_y);
+        speed = 16 + level;
+        if (speed > 28)
+            speed = 28;
+        if (direction >= 0)
+        {
+            dog_angle = direction * 64;
+            nx = dog_x + (sine(dog_angle) * speed >> 8);
+            ny = dog_y - (cosine(dog_angle) * speed >> 8);
             if (!wall_at(nx, ny))
             {
-                candidate_distance = absval(player_x - nx) + absval(player_y - ny);
-                if (candidate_distance < best_distance)
-                {
-                    best_distance = candidate_distance;
-                    best_direction = direction;
-                }
+                dog_x = nx;
+                dog_y = ny;
             }
         }
-        if (best_direction < 0)
+        return;
+    }
+
+    if (dog_turn > 0)
+        dog_turn--;
+    if (dog_turn == 0)
+    {
+        candidate_count = 0;
+        reverse = ((dog_angle + 128) & 255) >> 6;
+        for (i = 0; i < 4; i++)
         {
-            for (i = 0; i < 4; i++)
+            nx = dog_x + move_dx[i] * FIX;
+            ny = dog_y + move_dy[i] * FIX;
+            if (!wall_at(nx, ny))
+                candidates[candidate_count++] = i;
+        }
+        if (candidate_count > 1)
+        {
+            for (i = 0; i < candidate_count; i++)
             {
-                direction = (dog_turn + i) & 3;
-                nx = dog_x + sine(direction * 64) * 5 / 256;
-                ny = dog_y - cosine(direction * 64) * 5 / 256;
-                if (!wall_at(nx, ny))
+                if (candidates[i] == reverse)
                 {
-                    best_direction = direction;
+                    candidates[i] = candidates[candidate_count - 1];
+                    candidate_count--;
                     break;
                 }
             }
         }
-        if (best_direction >= 0)
-        {
-            dog_angle = best_direction * 64;
-            dog_x += sine(dog_angle) * 5 / 256;
-            dog_y -= cosine(dog_angle) * 5 / 256;
-        }
-        dog_turn++;
-        return;
+        if (candidate_count == 0)
+            return;
+        dog_angle = candidates[gfx_random() % candidate_count] * 64;
+        dog_turn = 8 + (gfx_random() & 15);
     }
-
-    dog_turn++;
-    if (dog_turn > 30 + (gfx_random() & 15))
-    {
-        dog_angle = (gfx_random() & 3) * 64;
-        dog_turn = 0;
-    }
-    speed = 3 + level;
-    if (speed > 10)
-        speed = 10;
+    speed = 12 + level;
+    if (speed > 24)
+        speed = 24;
     nx = dog_x + (sine(dog_angle) * speed >> 8);
     ny = dog_y - (cosine(dog_angle) * speed >> 8);
     if (wall_at(nx, ny))
@@ -552,6 +775,7 @@ void render_game(void)
     gfx_rect(0, 108, SCREEN_W, 132, 10);
     build_view();
     status = gfx3d_draw(scene);
+    draw_wall_edges();
     if (status != GPU3D_OK)
     {
         gfx_text(8, 210, "SC-GPU SCENE ERROR", RED);
@@ -559,12 +783,14 @@ void render_game(void)
     gfx_rect(158, 119, 5, 1, WHITE);
     gfx_rect(160, 117, 1, 5, WHITE);
     draw_hud();
+    draw_minimap();
     draw_status();
     gfx_present();
 }
 
 int main(void)
 {
+    gfx_speed(SPEED_MAX);
     level = 1;
     state = ST_MENU;
     for (;;)

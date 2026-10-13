@@ -15,6 +15,8 @@ from src.isa import (
     FAR_CONTROL_OPERATIONS,
     FAR_CONTROL_PREFIX,
     FAR_BRANCH_PREFIX,
+    FLOAT_OPERATIONS,
+    FLOAT_PREFIX,
     MISC_OPERATIONS,
     MULDIV_IMMEDIATE_FLAG,
     MULDIV_OPERATIONS,
@@ -390,6 +392,8 @@ def _instruction_size(text: str, line_number: int) -> int:
         if mnemonic in ("LDP", "STP", "SPLIT30", "JOIN30") and not register_operand:
             raise _error(line_number, f"{mnemonic} expects two registers")
         return 4 if register_operand else 6
+    if mnemonic in FLOAT_OPERATIONS:
+        return 4
     if mnemonic in ("LDA", "LDI19", "LDI30"):
         if len(operands) != 2:
             raise _error(line_number, f"{mnemonic} expects a register and an address or label")
@@ -460,6 +464,42 @@ def _assemble_instruction(
         if not -0x8000 <= value <= 0xFFFF:
             raise _error(line_number, f"{mnemonic} immediate must fit in 16 bits")
         return [first, control | MULDIV_IMMEDIATE_FLAG, value & 0xFFFF]
+
+    if mnemonic in FLOAT_OPERATIONS:
+        action = FLOAT_OPERATIONS[mnemonic]
+        unary = action in (20, 21, 22, 23)
+        require_count(1 if unary else 2)
+        destination = _parse_register(operands[0], line_number)
+        source = destination if unary else _parse_register(operands[1], line_number)
+
+        def require_pair(register: int, *, binary64: bool = False) -> None:
+            if register & 1 or (binary64 and register not in (0, 4)):
+                requirement = "R0 or R4" if binary64 else "an even register"
+                raise _error(line_number, f"{mnemonic} register must be {requirement}")
+
+        if action <= 9 or action in (20, 21, 22, 23):
+            binary64 = action >= 5 and action <= 9 or action in (21, 23)
+            require_pair(destination, binary64=binary64)
+            require_pair(source, binary64=binary64)
+        elif 10 <= action <= 17:
+            binary64 = action >= 14
+            require_pair(destination, binary64=binary64)
+            if action in (12, 13, 16, 17):
+                require_pair(source)
+        elif action == 18:
+            require_pair(destination, binary64=True)
+            require_pair(source)
+        elif action == 19:
+            require_pair(destination)
+            require_pair(source, binary64=True)
+        else:
+            binary64 = action >= 28
+            require_pair(source, binary64=binary64)
+            if action in (26, 27, 30, 31):
+                require_pair(destination)
+
+        first = (opcode << 11) | (destination << 8) | FLOAT_PREFIX
+        return [first, (action << 11) | source]
 
     extended = {
         "MOVSP": 0,

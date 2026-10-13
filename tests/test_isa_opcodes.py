@@ -167,6 +167,48 @@ class AssemblerEncodingTests(unittest.TestCase):
                 self.assertEqual(encode(f"ITOF R{rd}"), be(word(isa.OP_SHR, rd, 6)))
                 self.assertEqual(encode(f"FTOI R{rd}"), be(word(isa.OP_SHR, rd, 7)))
 
+    def test_ieee_float_instruction_encodings(self):
+        for mnemonic, action in isa.FLOAT_OPERATIONS.items():
+            with self.subTest(mnemonic=mnemonic):
+                if mnemonic in ("F32NEG", "F64NEG", "F32SQRT", "F64SQRT"):
+                    destination = 4 if "64" in mnemonic else 2
+                    source = destination
+                    text = f"{mnemonic} R{destination}"
+                elif mnemonic in ("F32TOF64", "F64TOF32"):
+                    destination, source = (0, 2) if mnemonic == "F32TOF64" else (2, 0)
+                    text = f"{mnemonic} R{destination}, R{source}"
+                elif mnemonic.startswith(("I16", "U16")):
+                    destination, source = (0, 3) if "F32" in mnemonic else (4, 3)
+                    text = f"{mnemonic} R{destination}, R{source}"
+                elif mnemonic.startswith(("I32", "U32")):
+                    destination, source = (0, 2) if "F32" in mnemonic else (4, 2)
+                    text = f"{mnemonic} R{destination}, R{source}"
+                elif "TOI16" in mnemonic or "TOU16" in mnemonic:
+                    destination, source = (3, 0) if "F32" in mnemonic else (3, 4)
+                    text = f"{mnemonic} R{destination}, R{source}"
+                elif "TOI32" in mnemonic or "TOU32" in mnemonic:
+                    destination, source = (2, 0) if "F32" in mnemonic else (2, 4)
+                    text = f"{mnemonic} R{destination}, R{source}"
+                else:
+                    destination, source = (0, 4) if "F64" in mnemonic else (0, 2)
+                    text = f"{mnemonic} R{destination}, R{source}"
+                self.assertEqual(
+                    encode(text),
+                    be((isa.OP_SHR << 11) | (destination << 8) | isa.FLOAT_PREFIX,
+                       (action << 11) | source),
+                )
+
+    def test_ieee_float_register_constraints(self):
+        for source in ("R1", "R3", "R5", "R7"):
+            with self.subTest(source=source):
+                with self.assertRaises(AssemblyError):
+                    assemble(f"F32ADD R0, {source}")
+        for text in ("F64ADD R0, R2", "F64ADD R2, R4",
+                     "I32TOF32 R0, R3", "F32TOI32 R3, R0"):
+            with self.subTest(text=text):
+                with self.assertRaises(AssemblyError):
+                    assemble(text)
+
     def test_stack_relative_offsets(self):
         for name in ("LDWS", "STWS"):
             for rd, offset in itertools.product(REGS, EDGE_BYTES):
@@ -681,6 +723,117 @@ class FloatExecutionTests(unittest.TestCase):
                 regs[rd] = bits(value)
                 cpu = self.run_one(word(isa.OP_SHR, rd, 7), regs)
                 self.assertEqual(cpu.registers[rd], int(half(regs[rd])) & 0xFFFF)
+
+
+class IeeeFloatExecutionTests(unittest.TestCase):
+    @staticmethod
+    def set_float(registers, base, value, precision):
+        packed = struct.pack(">f" if precision == 32 else ">d", value)
+        bits_value = int.from_bytes(packed, "big")
+        word_count = len(packed) // 2
+        for offset in range(word_count):
+            shift = (word_count - offset - 1) * 16
+            registers[base + offset] = (bits_value >> shift) & 0xFFFF
+
+    @staticmethod
+    def get_float(registers, base, precision):
+        word_count = 2 if precision == 32 else 4
+        bits_value = 0
+        for word_value in registers[base:base + word_count]:
+            bits_value = (bits_value << 16) | word_value
+        return struct.unpack(
+            ">f" if precision == 32 else ">d",
+            bits_value.to_bytes(word_count * 2, "big"),
+        )[0]
+
+    def execute(self, mnemonic, destination, source=None, registers=None):
+        operands = f"R{destination}" if source is None else f"R{destination}, R{source}"
+        cpu = make_cpu(encode(f"{mnemonic} {operands}"), registers or [0] * 8)
+        cpu.step()
+        return cpu
+
+    def test_binary32_and_binary64_arithmetic_rounding_and_subnormals(self):
+        regs = [0] * 8
+        self.set_float(regs, 0, 1.0, 32)
+        self.set_float(regs, 2, 2.0**-24, 32)
+        cpu = self.execute("F32ADD", 0, 2, regs)
+        self.assertEqual(self.get_float(cpu.registers, 0, 32), 1.0)
+
+        regs = [0] * 8
+        regs[0:2] = [0, 1]
+        regs[2:4] = [0x0000, 0x0001]
+        cpu = self.execute("F32ADD", 0, 2, regs)
+        self.assertEqual(cpu.registers[:2], [0, 2])
+
+        regs = [0] * 8
+        self.set_float(regs, 0, 1.5, 64)
+        self.set_float(regs, 4, 2.25, 64)
+        cpu = self.execute("F64MUL", 0, 4, regs)
+        self.assertEqual(self.get_float(cpu.registers, 0, 64), 3.375)
+
+        regs = [0] * 8
+        regs[0:4] = [0, 0, 0, 1]
+        regs[4:8] = [0, 0, 0, 1]
+        cpu = self.execute("F64ADD", 0, 4, regs)
+        self.assertEqual(cpu.registers[:4], [0, 0, 0, 2])
+
+    def test_overflow_division_by_zero_and_canonical_nan(self):
+        regs = [0] * 8
+        regs[0:2] = [0x7F7F, 0xFFFF]
+        self.set_float(regs, 2, 2.0, 32)
+        cpu = self.execute("F32MUL", 0, 2, regs)
+        self.assertEqual(cpu.registers[:2], [0x7F80, 0])
+
+        regs = [0] * 8
+        self.set_float(regs, 0, 1.0, 32)
+        regs[2:4] = [0x8000, 0]
+        cpu = self.execute("F32DIV", 0, 2, regs)
+        self.assertEqual(cpu.registers[:2], [0xFF80, 0])
+
+        regs = [0] * 8
+        cpu = self.execute("F32DIV", 0, 2, regs)
+        self.assertEqual(cpu.registers[:2], [0x7FC0, 0])
+
+    def test_ordered_comparisons_with_nan_and_signed_zero(self):
+        regs = [0] * 8
+        regs[0:2] = [0x7FC0, 0]
+        self.set_float(regs, 2, 1.0, 32)
+        cpu = self.execute("F32CMP", 0, 2, regs)
+        self.assertEqual(cpu.flags["Z"], 0)
+        self.assertEqual(cpu.flags["C"], 0)
+
+        regs = [0] * 8
+        regs[0:2] = [0x8000, 0]
+        self.set_float(regs, 2, 0.0, 32)
+        cpu = self.execute("F32CMP", 0, 2, regs)
+        self.assertEqual(cpu.flags["Z"], 1)
+        self.assertEqual(cpu.flags["C"], 0)
+
+    def test_integer_and_precision_conversions_and_sqrt(self):
+        regs = [0] * 8
+        regs[2:4] = [0xFFFF, 0xFFFE]
+        cpu = self.execute("I32TOF64", 0, 2, regs)
+        self.assertEqual(self.get_float(cpu.registers, 0, 64), -2.0)
+
+        regs = [0] * 8
+        self.set_float(regs, 0, 12.875, 32)
+        cpu = self.execute("F32TOI16", 3, 0, regs)
+        self.assertEqual(cpu.registers[3], 12)
+
+        regs = [0] * 8
+        self.set_float(regs, 0, 2.0**32 - 1.0, 64)
+        cpu = self.execute("F64TOU32", 2, 0, regs)
+        self.assertEqual(cpu.registers[2:4], [0xFFFF, 0xFFFF])
+
+        regs = [0] * 8
+        self.set_float(regs, 2, 1.25, 32)
+        cpu = self.execute("F32TOF64", 0, 2, regs)
+        self.assertEqual(self.get_float(cpu.registers, 0, 64), 1.25)
+
+        regs = [0] * 8
+        self.set_float(regs, 4, 9.0, 64)
+        cpu = self.execute("F64SQRT", 4, None, regs)
+        self.assertEqual(self.get_float(cpu.registers, 4, 64), 3.0)
 
 
 class AssembledProgramTests(unittest.TestCase):

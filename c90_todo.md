@@ -81,13 +81,13 @@ or correct runtime helpers cannot meet the ABI requirements.
 ### A2. Provide required floating-point machine operations
 
 - [ ] **Provide required floating-point machine operations** (`c90-float-isa`)
-  - Compare binary32/binary64 needs with the existing ISA, runtime helpers,
-    emulator, JIT, and assembler.
-  - Reuse instructions or helpers where they correctly implement the
-    semantics; add opcodes only when necessary.
-  - Cover arithmetic, comparison, conversion, rounding, and required
-    status/exception behavior.
-  - Keep encoding, assembler output, emulator, and JIT behavior consistent.
+  - [x] Add assembler-encoded binary32/binary64 arithmetic, ordered compare,
+    integer and format conversions, negation, and square root.
+  - [x] Implement IEEE binary32/binary64 register encoding, rounding,
+    subnormal arithmetic, signed zero, infinities, NaNs, and comparison flags
+    in the emulator.
+  - [x] Route the new instructions through the JIT's interpreter fallback and
+    add assembler, validation, and JIT-equivalence regressions.
   - **Depends on:** A1 (`c90-float-model`).
 
 ### A3. Validate floating-point execution and ABI
