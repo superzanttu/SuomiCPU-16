@@ -465,8 +465,8 @@ net_is_open:
 
 ; gfx_tilemap(map, map_w, map_h, cam_x, cam_y): GPU command 21
 gfx_tilemap:
-    LDWS R0, 14
-    LDWS R1, 12
+    LDWS R0, 12
+    LDWS R1, 14
     LDWS R2, 10
     LDWS R3, 8
     CALLX CGFX_FIELDS
