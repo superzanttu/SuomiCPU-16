@@ -10,7 +10,8 @@ from gfx_harness import ROOT, compile_file, layer_pixel, make_cpu, pixel, run_fr
 from src.SuomiCPU import (
     GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_FAST, SPEED_MAX,
     GFX_MODE_640_480, GFX_MODE_ADDR, MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR,
-    VRAM_SIZE, VRAM_START, VSYNC_ADDR, SuomiCompute16, _load_jit, create_memory,
+    GPU_LAYER_ORDER, VRAM_SIZE, VRAM_START, VSYNC_ADDR, SuomiCompute16,
+    _load_jit, create_memory,
 )
 
 HEADER = '#include "suomi_gfx.h"\n'
@@ -58,8 +59,7 @@ class GpuTests(unittest.TestCase):
         cpu.palette[3] = (0, 255, 0)
         cpu.palette[4] = (0, 0, 255)
         cpu._create_vram_surface()
-        cpu.memory[VRAM_START] = 1
-        cpu.gpu_layers[1][0] = 2
+        cpu.memory[VRAM_START] = 2
         cpu.gpu_layers[3][0] = 3
         cpu.gpu_layers[4][0] = 4
 
@@ -70,9 +70,16 @@ class GpuTests(unittest.TestCase):
         cpu._composite_layers()
         self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (0, 255, 0))
 
-        cpu.write(GPU_BASE + 17, 0b00011)
+        cpu.write(GPU_BASE + 17, 0b00001)
         cpu._composite_layers()
         self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (255, 0, 0))
+
+        cpu.write(GPU_BASE + 17, 0x1F)
+        cpu.write(GPU_LAYER_ORDER, 5)
+        cpu.write(GPU_LAYER_ORDER + 3, 10)
+        cpu.write(GPU_LAYER_ORDER + 4, 1)
+        cpu._composite_layers()
+        self.assertEqual(tuple(cpu.vram_surface.get_at((0, 0)))[:3], (0, 255, 0))
 
     def test_hardware_sprite_and_tile_memories_render_to_their_layers(self):
         cpu = bare_cpu()
@@ -96,26 +103,30 @@ class GpuTests(unittest.TestCase):
         cpu = run_c(
             "unsigned char sprite[4] = {0,5,6,0};\n"
             "unsigned char tile[256];\n"
-            "unsigned char map[1] = {2};\n"
+            "unsigned char map[2] = {2,3};\n"
             "int main(void) {\n"
             "  gfx_layer_select(LAYER_HUD);\n"
             "  gfx_layer_visibility(LAYER_ALL);\n"
             "  gfx_layer_transparency(LAYER_HUD, 0);\n"
+            "  gfx_layer_order(LAYER_HUD, 9);\n"
             "  gfx_sprite_upload(0, 2, 2, sprite);\n"
             "  gfx_sprite_move(0, 7, 8, SPRITE_VISIBLE);\n"
             "  gfx_tile_upload(2, tile);\n"
-            "  gfx_tilemap(map, 1, 1, 0, 0);\n"
+            "  gfx_tilemap(map, 2, 1, 0, 0);\n"
+            "  gfx_tile_camera(16, 32);\n"
             "  gfx_present();\n"
             "  return 0;\n"
             "}\n"
         )
         self.assertEqual(cpu.memory[GPU_BASE + 16], 4)
         self.assertEqual(cpu.memory[GPU_BASE + 17], 0x1F)
+        self.assertEqual(cpu.memory[GPU_LAYER_ORDER + 4], 9)
         self.assertEqual(cpu.sprites[0], {"x": 7, "y": 8, "flags": 1})
         self.assertEqual(cpu.sprite_memory[0], (2, 2, bytes((0, 5, 6, 0))))
-        self.assertEqual(cpu.tilemap_memory, b"\x02")
-        self.assertEqual(cpu.tilemap_width, 1)
+        self.assertEqual(cpu.tilemap_memory, b"\x02\x03")
+        self.assertEqual(cpu.tilemap_width, 2)
         self.assertEqual(cpu.tilemap_height, 1)
+        self.assertEqual(cpu.tile_camera, (16, 32))
 
     def test_640x480_packed_clear_pixel_rect_and_present(self):
         cpu = bare_cpu()
@@ -209,6 +220,23 @@ class GpuTests(unittest.TestCase):
 
 
 class Gpu3DTests(unittest.TestCase):
+    def test_numba_triangle_rasterizer_matches_python_fallback(self):
+        jit = _load_jit()
+        if jit is None:
+            self.skipTest("Numba JIT is unavailable")
+
+        cpu = bare_cpu()
+        cpu._ensure_gpu_state()
+        cpu._drawing_layer = 3
+        points = ((-12, 8), (71, 19), (23, 91))
+        with patch("src.SuomiCPU._load_jit", return_value=None):
+            cpu._gpu3d_triangle(points, 13)
+        expected = bytes(cpu.gpu_layers[3])
+        cpu.gpu_layers[3][:] = bytes(len(cpu.gpu_layers[3]))
+        cpu._gpu3d_triangle(points, 13)
+
+        self.assertEqual(bytes(cpu.gpu_layers[3]), expected)
+
     def render_scene(self, scene, mode=0):
         cpu = bare_cpu()
         cpu.memory[GFX_MODE_ADDR] = mode
@@ -286,7 +314,7 @@ class Gpu3DTests(unittest.TestCase):
         )
         cpu = run_c(source)
         self.assertEqual(cpu.read_16(GLOBAL_BASE + 46), 0)
-        self.assertEqual(pixel(cpu, 160, 120), 6)
+        self.assertEqual(layer_pixel(cpu, 3, 160, 120), 6)
 
     def test_showcase_ship_page_uses_the_3d_gpu(self):
         path = ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"
@@ -1584,10 +1612,10 @@ class GameTests(unittest.TestCase):
             cpu.memory[0x43002] |= 2
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
-        first = vram(cpu)
+        first = pygame.image.tobytes(cpu.vram_surface, "P")
         for _ in range(32):
             run_frame(cpu, 400_000)
-        last = vram(cpu)
+        last = pygame.image.tobytes(cpu.vram_surface, "P")
         ship_area = b"".join(last[y * SCREEN_WIDTH + 80:y * SCREEN_WIDTH + 240] for y in range(50, 180))
         self.assertIn(6, ship_area)
         self.assertNotEqual(first, last)

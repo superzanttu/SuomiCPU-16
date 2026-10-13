@@ -67,6 +67,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_layer_select": ("void", ("int",)),
     "gfx_layer_visibility": ("void", ("unsigned int",)),
     "gfx_layer_transparency": ("void", ("int", "unsigned char")),
+    "gfx_layer_order": ("void", ("int", "int")),
     "gfx3d_draw": ("int", ("int*",)),
     "gfx_getchar": ("int", ()),
     "net_open": ("int", ("char*",)),

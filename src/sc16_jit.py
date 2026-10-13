@@ -41,6 +41,39 @@ CONSTANTS = (
 
 
 @njit(cache=True)
+def _edge(x0, y0, x1, y1, px, py):
+    return (px - x0) * (y1 - y0) - (py - y0) * (x1 - x0)
+
+
+@njit(cache=True)
+def _fill_triangle(pixels, width, height, ax, ay, bx, by, cx, cy, color):
+    area = _edge(ax, ay, bx, by, cx, cy)
+    if area == 0:
+        return
+    left = max(min(ax, bx, cx), 0)
+    right = min(max(ax, bx, cx), width - 1)
+    top = max(min(ay, by, cy), 0)
+    bottom = min(max(ay, by, cy), height - 1)
+    if left > right or top > bottom:
+        return
+    sign = 1 if area > 0 else -1
+    for y in range(top, bottom + 1):
+        for x in range(left, right + 1):
+            if (_edge(bx, by, cx, cy, x, y) * sign >= 0
+                    and _edge(cx, cy, ax, ay, x, y) * sign >= 0
+                    and _edge(ax, ay, bx, by, x, y) * sign >= 0):
+                pixels[y * width + x] = color
+
+
+def fill_triangle(buffer, width, height, ax, ay, bx, by, cx, cy, color):
+    """Fill an indexed framebuffer in native code without copying its bytearray."""
+    _fill_triangle(
+        np.frombuffer(buffer, dtype=np.uint8), width, height,
+        ax, ay, bx, by, cx, cy, color,
+    )
+
+
+@njit(cache=True)
 def _rd16(mem, a):
     return (np.int64(mem[a & MEM_MASK]) << 8) | np.int64(mem[(a + 1) & MEM_MASK])
 

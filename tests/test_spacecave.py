@@ -6,7 +6,7 @@ from gfx_harness import ROOT, compile_file, layer_pixel, make_cpu, pixel, run_fr
 from test_net import Clock, Hub
 from tools.sc16net import NetNode
 
-SOURCE = ROOT / "modules" / "spacecave.c"
+SOURCE = ROOT / "modules" / "SpaceCave" / "spacecave.c"
 
 
 def global_offsets():

@@ -25,7 +25,7 @@
 // - Double-click a palette color to fill the whole canvas with it
 // - Double-click the CLR button to clear the canvas to the background color
 //
-// The canvas is simply the back buffer: strokes are drawn into it and stay there.
+// The canvas lives on background layer 0; strokes remain in VRAM between frames.
 // Shape previews use gfx_save()/gfx_restore() to roll back to the picture before the drag.
 #include "suomi_gfx.h"
 

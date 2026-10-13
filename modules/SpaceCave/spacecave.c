@@ -1241,6 +1241,8 @@ void draw_drone(int sx, int sy) {
 void draw_world(void) {
     int i, k, t, sx, sy;
     gfx_tilemap(cave, MW, MH, camx, camy);
+    gfx_layer_select(LAYER_SPRITES);
+    gfx_clear(BLACK);
     for (k = 0; k < nt; k++) {
         sx = tx[k] - camx; sy = ty[k] - camy;
         if (sx > -12 && sx < 332 && sy > -12 && sy < 252) draw_turret(k, sx, sy);
@@ -1587,7 +1589,11 @@ void play_frame(unsigned int keys) {
     if (camy < 0) camy = 0;
     if (camx > WORLD_W - 320) camx = WORLD_W - 320;
     if (camy > WORLD_H - 240) camy = WORLD_H - 240;
+    gfx_layer_select(LAYER_BACKGROUND);
+    gfx_clear(BLACK);
     draw_world();
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(BLACK);
     sort_players();
     draw_hud();
     if (gmode) draw_mission_hud();
@@ -1601,6 +1607,7 @@ void play_frame(unsigned int keys) {
         gfx_sound(0, 0, 0, 0, 0);
         thr_snd = 0;
     }
+    gfx_layer_select(LAYER_BACKGROUND);
 }
 
 int main(void) {

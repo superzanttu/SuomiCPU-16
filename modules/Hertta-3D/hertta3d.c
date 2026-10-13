@@ -770,11 +770,14 @@ void draw_status(void)
 void render_game(void)
 {
     int status;
+    gfx_layer_select(LAYER_BACKGROUND);
     gfx_clear(BLACK);
     gfx_rect(0, 18, SCREEN_W, 90, BLUE);
     gfx_rect(0, 108, SCREEN_W, 132, 10);
     build_view();
     status = gfx3d_draw(scene);
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(BLACK);
     draw_wall_edges();
     if (status != GPU3D_OK)
     {
@@ -785,6 +788,7 @@ void render_game(void)
     draw_hud();
     draw_minimap();
     draw_status();
+    gfx_layer_select(LAYER_BACKGROUND);
     gfx_present();
 }
 

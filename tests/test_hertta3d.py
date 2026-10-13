@@ -2,7 +2,7 @@ import unittest
 
 from gfx_harness import ROOT, compile_file, make_cpu, run_frame
 from src.SuomiCPU import (
-    GPU_BASE, KEYS_ADDR, SCREEN_WIDTH, SPEED_ADDR, SPEED_MAX,
+    GPU_BASE, KEYS_ADDR, SPEED_ADDR, SPEED_MAX,
 )
 from c_compiler import compile_source
 
@@ -40,17 +40,27 @@ class Hertta3DTests(unittest.TestCase):
 
         self.assertFalse(cpu.running, "instrumented gameplay render did not finish")
         self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
-        pixels = cpu.gpu_layers[3]
-        self.assertEqual(pixels[30 * SCREEN_WIDTH + 160], 4)
-        self.assertIn(pixels[120 * SCREEN_WIDTH + 140], (8, 9, 14))
-        self.assertEqual(pixels[220 * SCREEN_WIDTH + 160], 10)
-        self.assertGreater(sum(pixel == 8 for pixel in pixels), 1_000)
-        self.assertGreater(sum(pixel == 9 for pixel in pixels), 1_000)
-        self.assertEqual(pixels[28 * SCREEN_WIDTH + 255], 9)
-        self.assertEqual(pixels[33 * SCREEN_WIDTH + 260], 3)
-        self.assertEqual(pixels[69 * SCREEN_WIDTH + 296], 8)
+        surface = cpu.vram_surface
+
+        def color_at(x, y):
+            return surface.map_rgb(surface.get_at((x, y))) & 0xFF
+
+        self.assertEqual(color_at(160, 30), 4)
+        self.assertIn(color_at(140, 120), (8, 9, 14))
+        self.assertEqual(color_at(160, 220), 10)
+        self.assertGreater(
+            sum(color_at(x, y) == 8 for y in range(240) for x in range(320)),
+            1_000,
+        )
+        self.assertGreater(
+            sum(color_at(x, y) == 9 for y in range(240) for x in range(320)),
+            1_000,
+        )
+        self.assertEqual(color_at(255, 28), 9)
+        self.assertEqual(color_at(260, 33), 3)
+        self.assertEqual(color_at(296, 69), 8)
         edge_area = [
-            pixels[y * SCREEN_WIDTH + x]
+            color_at(x, y)
             for y in range(18, 108)
             for x in range(250)
         ]

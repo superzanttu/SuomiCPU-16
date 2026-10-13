@@ -176,7 +176,7 @@ gfx_mode:
     ST R7, R0
     RET
 
-; gfx_save() stores the back buffer as a static layer; gfx_restore() copies it back.
+; gfx_save()/gfx_restore() snapshot the currently selected GPU layer.
 gfx_save:
     LDI R5, 14
     CALLX CGFX_GO
@@ -467,8 +467,8 @@ net_is_open:
 gfx_tilemap:
     LDWS R0, 12
     LDWS R1, 14
-    LDWS R2, 10
-    LDWS R3, 8
+    LDWS R2, 8
+    LDWS R3, 10
     CALLX CGFX_FIELDS
     LDWS R4, 4
     MOVSP R7
@@ -563,6 +563,16 @@ gfx_layer_transparency:
     LDWS R1, 6
     CALLX CGFX_BASE
     LDI R6, 18
+    ADD R7, R6
+    ADD R7, R0
+    ST R7, R1
+    RET
+
+gfx_layer_order:
+    LDWS R0, 4
+    LDWS R1, 6
+    CALLX CGFX_BASE
+    LDI R6, 23
     ADD R7, R6
     ADD R7, R0
     ST R7, R1

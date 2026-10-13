@@ -54,6 +54,9 @@ def layer_pixel(cpu, layer, x, y):
 
 
 def pixel(cpu, x, y):
+    surface = getattr(cpu, "vram_surface", None)
+    if surface is not None:
+        return surface.map_rgb(surface.get_at((x, y))) & 0xFF
     return layer_pixel(cpu, 0, x, y)
 
 

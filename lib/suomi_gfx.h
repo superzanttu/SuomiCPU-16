@@ -16,6 +16,7 @@ void gfx_restore(void);
 void gfx_layer_select(int layer);
 void gfx_layer_visibility(unsigned int mask);
 void gfx_layer_transparency(int layer, unsigned char color);
+void gfx_layer_order(int layer, int priority);
 // Sound: channel 0-3, freq in Hz (0 = silence channel), frames (0 = loop), wave, volume 1-100.
 void gfx_sound(int channel, int freq, int frames, int wave, int volume);
 unsigned int gfx_keys(void);

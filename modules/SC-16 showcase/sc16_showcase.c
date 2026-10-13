@@ -1024,6 +1024,7 @@ void page_ship(void)
         gfx_pixel(px, py, (i % 4 == 0) ? WHITE : DARK_GRAY);
     }
     gfx3d_draw(ship_scene);
+    gfx_layer_select(LAYER_HUD);
     gfx_text(8, 20, "GPU 3D FLIGHT - PAINTER-SORTED TRIANGLES", YELLOW);
     gfx_text(8, 204, "FIXED 8.8 TRANSFORMS + HIDDEN-LINE REMOVAL", WHITE);
     gfx_text(8, 216, "ROTATION, PERSPECTIVE AND FLAT SHADING IN GPU", GRAY);
@@ -1679,7 +1680,10 @@ int main(void)
         }
         else if (page == 12)
         {
-            gfx_layer_visibility((1 << LAYER_BACKGROUND) | (1 << LAYER_3D));
+            gfx_layer_visibility((1 << LAYER_BACKGROUND) | (1 << LAYER_3D) |
+                                 (1 << LAYER_HUD));
+            gfx_layer_select(LAYER_HUD);
+            gfx_clear(BLACK);
         }
         else
         {
@@ -1757,6 +1761,8 @@ int main(void)
             page_sprite_load();
             chrome("SPRITE LOAD TEST");
         }
+        if (page == 12)
+            gfx_layer_select(LAYER_BACKGROUND);
         gfx_present();
         bench_step();
     }

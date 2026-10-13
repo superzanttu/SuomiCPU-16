@@ -513,7 +513,7 @@ memory ranges:
 | Held-key bitmask                         |           `0x43004` |       1 byte |
 | Disk storage device                      |           `0x43100` |     16 bytes |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
-| Graphics coprocessor and layer registers| `0x43020`-`0x43036` |     23 bytes |
+| Graphics coprocessor and layer registers| `0x43020`-`0x4303B` |     28 bytes |
 
 The display supports 320x240 indexed 8-bit mode and 640x480 packed 4-bit mode.
 VRAM reserves 153,600 bytes (`0x50000`-`0x757FF`), enough for the larger mode.
@@ -879,13 +879,15 @@ For shifts, `>>` is arithmetic for `int` and logical for unsigned types.
 (`RED`, `GREEN`, ...), key (`KEY_LEFT`, `KEY_FIRE`, ...) and screen-size
 constants. Using any `gfx_*` function makes the compiler link
 [`lib/lib_cgfx.asm`](lib/lib_cgfx.asm), which drives the graphics coprocessor, plus the
-font. Five hardware layers are composited in ascending order, so higher-numbered
-layers cover lower ones: background/VRAM (0), tiles (1), sprites (2), 3D (3),
-and HUD (4). Zero is the default transparent color for layers 1-4. Layer
-visibility is selected with a five-bit mask. `gfx_present()` composites the
-enabled layers for display and ends the current emulator frame; it does not copy
-or overwrite VRAM. The GPU keeps layer, tile, and sprite storage outside the
-SC-16 CPU-visible address space.
+font. Five hardware layers are composited from lowest to highest priority:
+background/VRAM (0), tiles (1), sprites (2), 3D (3), and HUD (4) by default.
+Higher priorities cover lower ones; equal priorities are ordered by layer
+number. `gfx_layer_order()` changes a layer's 8-bit priority. Zero is the
+default transparent color for each layer. Layer visibility is selected with a
+five-bit mask. `gfx_present()` composites the enabled layers for display and
+ends the current emulator frame; it does not copy or overwrite VRAM. The GPU
+keeps layer, tile, and sprite storage outside the SC-16 CPU-visible address
+space.
 
 | Function                                                                                | Behavior                                                                                                                                                   |
 | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -901,6 +903,7 @@ SC-16 CPU-visible address space.
 | `void gfx_layer_select(int layer)`                                                      | Select a drawing target 0-4 for ordinary drawing commands.                                                                                                |
 | `void gfx_layer_visibility(unsigned int mask)`                                          | Set the visible-layer bitmask (`LAYER_ALL` enables all five layers).                                                                                        |
 | `void gfx_layer_transparency(int layer, unsigned char color)`                           | Set one layer's transparent palette index.                                                                                                                 |
+| `void gfx_layer_order(int layer, int priority)`                                         | Set a layer's 8-bit composition priority; larger values are drawn on top (defaults to layer index).                                                        |
 | `void gfx_sprite_upload(int slot, int w, int h, unsigned char *data)`                   | Copy an indexed, zero-transparent image (up to 64x64) into one of 64 hardware sprite slots.                                                                |
 | `void gfx_sprite_move(int slot, int x, int y, int flags)`                               | Position/show a sprite; flags include `SPRITE_VISIBLE`, `SPRITE_FLIP_X`, and `SPRITE_FLIP_Y`.                                                              |
 | `void gfx_tile_upload(int tile, unsigned char *pixels)`                                 | Copy one 16x16 indexed tile into one of 256 hardware tile slots.                                                                                          |
@@ -940,7 +943,8 @@ Coprocessor registers (base `0x43020`, 16-bit values big-endian and signed):
 (COLOR slot, W/H size, SRC pixels), 24 sprite move (COLOR slot, X/Y, W flags),
 25 tile upload (COLOR tile ID, SRC 16x16 pixels), and 26 tile camera (X/Y).
 Memory-mapped layer controls follow at `0x43030`: select layer, visible-layer
-mask, then five per-layer transparent-color registers at `0x43032`-`0x43036`.
+mask, five per-layer transparent-color registers at `0x43032`-`0x43036`, then
+five composition-priority registers at `0x43037`-`0x4303B` (one byte per layer).
 Layer indices are background 0, tiles 1, sprites 2, 3D 3, HUD 4; bit N of the
 mask enables layer N. Assembly programs can use these registers directly.
 
@@ -1174,4 +1178,4 @@ Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchma
 
 ## Optional JIT acceleration
 
-If [Numba](https://numba.pivot.org) is installed (`pip install numba`), the emulator runs the CPU core as compiled machine code, typically 5-15x faster than the pure-Python interpreter (the first start compiles and caches it, taking a few seconds). Without Numba the emulator falls back automatically to the pure-Python core. Set `SC16_NOJIT=1` to force the Python core. Both cores are verified identical by `tests/test_jit_core.py`.
+If [Numba](https://numba.readthedocs.io/) is installed (`pip install numba`), the emulator runs the CPU core as compiled machine code, typically 5-15x faster than the pure-Python interpreter, and uses compiled triangle rasterization for the 3D layer. The first use compiles kernels and can take a few seconds; Numba caches compiled code. Without Numba the emulator falls back automatically to the pure-Python CPU and rasterizer. Set `SC16_NOJIT=1` to force the Python paths. CPU instruction equivalence is tested in `tests/test_jit_core.py`; the GPU triangle kernel is tested against the Python fallback.

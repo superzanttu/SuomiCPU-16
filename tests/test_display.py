@@ -72,12 +72,14 @@ class DisplayTests(unittest.TestCase):
 
         pixel_address = VRAM_START
         self.assertEqual(emulator.read(pixel_address), 25)
+        emulator._composite_layers()
         self.assertEqual(
             tuple(emulator.vram_surface.get_at((0, 0)))[:3],
             (0, 0, 255),
         )
 
         emulator.write(pixel_address, 1)
+        emulator._composite_layers()
         self.assertEqual(
             tuple(emulator.vram_surface.get_at((0, 0)))[:3],
             (255, 255, 255),

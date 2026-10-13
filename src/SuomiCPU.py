@@ -116,6 +116,7 @@ FONT_ADDR   = 0x4400  # Fonttien paikka
 GPU_LAYER_SELECT = GPU_BASE + 16
 GPU_LAYER_MASK = GPU_BASE + 17
 GPU_LAYER_TRANSPARENCY = GPU_BASE + 18
+GPU_LAYER_ORDER = GPU_BASE + 23
 GPU_LAYER_COUNT = 5
 GPU_LAYER_MASK_ALL = (1 << GPU_LAYER_COUNT) - 1
 
@@ -389,6 +390,11 @@ class SuomiCompute16:
         return pixels
 
     def _ensure_gpu_state(self):
+        if not hasattr(self, "palette"):
+            self.palette = [pygame.Color(i, i, i) for i in range(256)]
+            for index, value in enumerate(PALETTE_COLORS):
+                self.palette[index] = value
+            self.palette[25] = (0, 0, 255)
         if not hasattr(self, "gpu_layers"):
             width, height = self._screen_size()
             self.gpu_layers = [bytearray(width * height) for _ in range(GPU_LAYER_COUNT)]
@@ -407,12 +413,15 @@ class SuomiCompute16:
             self.tilemap_height = 0
             self.tile_camera = (0, 0)
             self.saved_layer = None
+            self._tile_layer_dirty = True
+            self._sprite_layer_dirty = True
             self._gpu_state_mode = self._graphics_mode()
         if not getattr(self, "_gpu_control_initialized", False):
             self.memory[GPU_LAYER_SELECT] = 0
             self.memory[GPU_LAYER_MASK] = GPU_LAYER_MASK_ALL
             for index in range(GPU_LAYER_COUNT):
                 self.memory[GPU_LAYER_TRANSPARENCY + index] = 0
+                self.memory[GPU_LAYER_ORDER + index] = index
             self._gpu_control_initialized = True
         if self._gpu_state_mode != self._graphics_mode():
             width, height = self._screen_size()
@@ -420,6 +429,8 @@ class SuomiCompute16:
                 bytearray(width * height) for _ in range(GPU_LAYER_COUNT)
             ]
             self._gpu_state_mode = self._graphics_mode()
+            self._tile_layer_dirty = True
+            self._sprite_layer_dirty = True
 
     def _create_vram_surface(self):
         width, height = self._screen_size()
@@ -433,30 +444,35 @@ class SuomiCompute16:
             self._layer_surfaces.append(layer)
         self.vram_surface = pygame.Surface((width, height), depth=8)
         self.vram_surface.set_palette(self.palette)
-        self._composite_layers()
         return self.vram_surface
 
     def _composite_layers(self):
         self._ensure_gpu_state()
         width, height = self._screen_size()
         mode = self._graphics_mode()
-        if mode != getattr(self, "_surface_mode", mode):
+        if (mode != getattr(self, "_surface_mode", None)
+                or not hasattr(self, "vram_surface")):
             self._create_vram_surface()
-        self._render_tile_layer()
-        self._render_sprites()
+        if self._tile_layer_dirty:
+            self._render_tile_layer()
+            self._tile_layer_dirty = False
+        if self._sprite_layer_dirty:
+            self._render_sprites()
+            self._sprite_layer_dirty = False
         base = pygame.image.frombuffer(
             self._decode_framebuffer(VRAM_START), (width, height), "P"
         )
         base.set_palette(self.palette)
         self.vram_surface.fill(0)
         visible = self.memory[GPU_LAYER_MASK] & GPU_LAYER_MASK_ALL
-        if visible & 1:
-            base.set_colorkey(self.memory[GPU_LAYER_TRANSPARENCY])
-            self.vram_surface.blit(base, (0, 0))
-        for layer_index in range(1, GPU_LAYER_COUNT):
+        order = sorted(
+            range(GPU_LAYER_COUNT),
+            key=lambda index: (self.memory[GPU_LAYER_ORDER + index], index),
+        )
+        for layer_index in order:
             if not visible & (1 << layer_index):
                 continue
-            layer = self._layer_surfaces[layer_index]
+            layer = base if layer_index == 0 else self._layer_surfaces[layer_index]
             layer.set_colorkey(
                 self.memory[GPU_LAYER_TRANSPARENCY + layer_index]
             )
@@ -465,7 +481,8 @@ class SuomiCompute16:
 
     def write(self, addr, val):
         addr &= MEM_SIZE - 1
-        if GPU_LAYER_SELECT <= addr < GPU_LAYER_TRANSPARENCY + GPU_LAYER_COUNT:
+        if (GPU_LAYER_SELECT <= addr < GPU_LAYER_TRANSPARENCY + GPU_LAYER_COUNT
+                or GPU_LAYER_ORDER <= addr < GPU_LAYER_ORDER + GPU_LAYER_COUNT):
             self._ensure_gpu_state()
             self._gpu_control_initialized = True
         self.memory[addr] = val & 0xFF
@@ -677,10 +694,13 @@ class SuomiCompute16:
         elif command == GPU_SPRITE_MOVE:
             if color < GPU_SPRITE_SLOTS:
                 self.sprites[color] = {"x": x, "y": y, "flags": w & 7}
+                self._sprite_layer_dirty = True
         elif command == GPU_TILE_UPLOAD:
             self._gpu_tile_upload(color, self._gpu_source())
+            self._tile_layer_dirty = True
         elif command == GPU_TILE_CAMERA:
             self.tile_camera = (x, y)
+            self._tile_layer_dirty = True
 
     @staticmethod
     def _gpu3d_sincos(angle):
@@ -712,6 +732,19 @@ class SuomiCompute16:
 
     def _gpu3d_triangle(self, points, color):
         (ax, ay), (bx, by), (cx, cy) = points
+        width, height = self._screen_size()
+        layer = min(
+            getattr(self, "_drawing_layer", self.memory[GPU_LAYER_SELECT]),
+            GPU_LAYER_COUNT - 1,
+        )
+        jit = _load_jit()
+        if jit is not None and layer != 0:
+            jit.fill_triangle(
+                self.gpu_layers[layer], width, height,
+                ax, ay, bx, by, cx, cy,
+                color & (0x0F if self._graphics_mode() == GFX_MODE_640_480 else 0xFF),
+            )
+            return
 
         def edge(x0, y0, x1, y1, px, py):
             return (px - x0) * (y1 - y0) - (py - y0) * (x1 - x0)
@@ -719,8 +752,8 @@ class SuomiCompute16:
         area = edge(ax, ay, bx, by, cx, cy)
         if area == 0:
             return
-        left, right = max(min(ax, bx, cx), 0), min(max(ax, bx, cx), self._screen_size()[0] - 1)
-        top, bottom = max(min(ay, by, cy), 0), min(max(ay, by, cy), self._screen_size()[1] - 1)
+        left, right = max(min(ax, bx, cx), 0), min(max(ax, bx, cx), width - 1)
+        top, bottom = max(min(ay, by, cy), 0), min(max(ay, by, cy), height - 1)
         if left > right or top > bottom:
             return
         sign = 1 if area > 0 else -1
@@ -733,7 +766,6 @@ class SuomiCompute16:
 
     def _gpu_3d(self, source):
         memory = self.memory
-        self.gpu_layers[3][:] = bytes(len(self.gpu_layers[3]))
         if source < 0 or source > MEM_SIZE - GPU3D_HEADER_WORDS * 2:
             self._gpu_result(GPU3D_ERROR_SCENE)
             return
@@ -786,6 +818,7 @@ class SuomiCompute16:
             range(face_count),
             key=lambda index: -sum(vertices[vertex][2] for vertex in faces[index][:3]),
         )
+        self.gpu_layers[3][:] = bytes(len(self.gpu_layers[3]))
         for index in painter_order:
             a, b, c, base_color = faces[index]
             if projected[a] is None or projected[b] is None or projected[c] is None:
@@ -813,6 +846,7 @@ class SuomiCompute16:
             bytes(self.read((source + index) & MEM_MASK)
                   for index in range(width * height)),
         )
+        self._sprite_layer_dirty = True
         self._gpu_result(0)
 
     def _gpu_tile_upload(self, tile, source):
@@ -824,6 +858,7 @@ class SuomiCompute16:
             self.read((source + index) & MEM_MASK)
             for index in range(TILE_SIZE * TILE_SIZE)
         )
+        self._tile_layer_dirty = True
         self._gpu_result(0)
 
     def _gpu_tilemap(self, camx, camy, map_w, map_h, source):
@@ -838,6 +873,7 @@ class SuomiCompute16:
             for index in range(map_w * map_h)
         )
         self.tile_camera = (camx, camy)
+        self._tile_layer_dirty = True
         self._gpu_result(0)
 
     def _render_tile_layer(self):
@@ -868,10 +904,10 @@ class SuomiCompute16:
                     source_y = dest_y - screen_y
                     src = tile_start + source_y * TILE_SIZE + source_x
                     dst = dest_y * width + left
-                    row = self.tile_memory[src:src + span]
+                    tile_row = self.tile_memory[src:src + span]
                     if self._graphics_mode() == GFX_MODE_640_480:
-                        row = bytes(pixel & 0x0F for pixel in row)
-                    target[dst:dst + span] = row
+                        tile_row = bytes(pixel & 0x0F for pixel in tile_row)
+                    target[dst:dst + span] = tile_row
 
     def _render_sprites(self):
         width, height = self._screen_size()
