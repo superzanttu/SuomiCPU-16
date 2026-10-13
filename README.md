@@ -54,6 +54,11 @@ Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
 Space. The ship accelerates and drifts with inertia; shields regenerate and the
 laser needs time to cool.
 
+Select **Hertta-3D** in the BIOS for a first-person maze game rendered with the
+SC-GPU. Use W/S to move, A/D to turn, and Space to throw treats toward Hertta;
+feed her enough treats and wait for her to reach you to advance to a harder
+maze. Its source is [`modules/Hertta-3D/hertta3d.c`](modules/Hertta-3D/hertta3d.c).
+
 On Windows, the PowerShell launcher can run the same programs:
 ```powershell
 .\run.ps1 .\examples\factorial.c

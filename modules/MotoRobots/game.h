@@ -3,9 +3,9 @@
 
 #define MAX_BUILDINGS 100
 #define MAX_ROBOTS 8
-#define TILE_PIXELS 16
-#define MAP_VIEW_TOP 36
-#define MAP_VIEW_BOTTOM 202
+#define TILE_PIXELS 32
+#define MAP_VIEW_TOP 72
+#define MAP_VIEW_BOTTOM 404
 
 #include "map.h"
 #include "types.h"

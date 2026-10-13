@@ -12,19 +12,19 @@
 #define ROBOT_PATH_RETRY_DELAY 1.0f
 #define TOOLBAR_Y MAP_VIEW_BOTTOM
 #define TOOL_BUTTON_COUNT 5
-#define TOOL_BUTTON_WIDTH 59
-#define TOOL_BUTTON_GAP 3
-#define MINIMAP_X 284
-#define MINIMAP_Y 166
-#define MINIMAP_SIZE 32
+#define TOOL_BUTTON_WIDTH 118
+#define TOOL_BUTTON_GAP 6
+#define MINIMAP_X 568
+#define MINIMAP_Y 332
+#define MINIMAP_SIZE 64
 #define PAN_REPEAT_DELAY 0.15f
 
 static int tile_size(GameState *state)
 {
     if (state->zoom == 0)
-        return 8;
+        return 16;
     if (state->zoom == 2)
-        return 24;
+        return 48;
     return TILE_PIXELS;
 }
 
@@ -35,7 +35,7 @@ static void clamp_camera(GameState *state)
     int size;
 
     size = tile_size(state);
-    max_camera_x = state->map.width * size - SCREEN_W;
+    max_camera_x = state->map.width * size - SCREEN_W_640;
     max_camera_y = state->map.height * size -
                    (MAP_VIEW_BOTTOM - MAP_VIEW_TOP);
     if (max_camera_x < 0)
@@ -123,9 +123,9 @@ static int toolbar_button_at(int x, int y)
     int button;
     int button_offset;
 
-    if (y < TOOLBAR_Y + 18 || y >= TOOLBAR_Y + 37 || x < 4)
+    if (y < TOOLBAR_Y + 36 || y >= TOOLBAR_Y + 74 || x < 8)
         return -1;
-    button_offset = x - 4;
+    button_offset = x - 8;
     button = button_offset / (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP);
     if (button >= TOOL_BUTTON_COUNT ||
         button_offset % (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP) >=
@@ -1229,7 +1229,7 @@ static void draw_resource_value(int x, int total)
 {
     char count[6];
     format_count(count, total);
-    gfx_text(x, 19, count, YELLOW);
+    gfx_text(x, 38, count, YELLOW);
 }
 
 static void draw_minimap(GameState *state)
@@ -1242,8 +1242,8 @@ static void draw_minimap(GameState *state)
     int i;
     unsigned char color;
 
-    gfx_rect(MINIMAP_X - 2, MINIMAP_Y - 2, MINIMAP_SIZE + 4,
-             MINIMAP_SIZE + 4, GREEN);
+    gfx_rect(MINIMAP_X - 4, MINIMAP_Y - 4, MINIMAP_SIZE + 8,
+             MINIMAP_SIZE + 8, GREEN);
     map_draw_minimap(&state->map, MINIMAP_X, MINIMAP_Y, MINIMAP_SIZE);
     for (i = 0; i < state->building_count; i++)
     {
@@ -1253,16 +1253,16 @@ static void draw_minimap(GameState *state)
             color = YELLOW;
         else
             color = WHITE;
-        gfx_rect(MINIMAP_X + x, MINIMAP_Y + y, 2, 2, color);
+        gfx_rect(MINIMAP_X + x, MINIMAP_Y + y, 4, 4, color);
     }
     size = tile_size(state);
-    center_x = (state->camera_x + SCREEN_W / 2) / size *
+    center_x = (state->camera_x + SCREEN_W_640 / 2) / size *
                MINIMAP_SIZE / MAP_SIZE;
     center_y = (state->camera_y +
                 (MAP_VIEW_BOTTOM - MAP_VIEW_TOP) / 2) /
                size *
                MINIMAP_SIZE / MAP_SIZE;
-    gfx_rect(MINIMAP_X + center_x, MINIMAP_Y + center_y, 2, 2, WHITE);
+    gfx_rect(MINIMAP_X + center_x, MINIMAP_Y + center_y, 4, 4, WHITE);
 }
 
 static void draw_static_hud(GameState *state)
@@ -1273,31 +1273,31 @@ static void draw_static_hud(GameState *state)
     BuildingType button_tool;
     char *button_label;
 
-    gfx_rect(0, 0, SCREEN_W, MAP_VIEW_TOP, BLACK);
-    gfx_rect(0, 0, SCREEN_W, 1, CYAN);
-    gfx_text(4, 3, "Coal", WHITE);
-    gfx_text(55, 3, "Fe Ore", WHITE);
-    gfx_text(106, 3, "Cu Ore", WHITE);
-    gfx_text(157, 3, "Fe Plate", WHITE);
-    gfx_text(208, 3, "Cu Plate", WHITE);
-    gfx_text(259, 3, "Romb", WHITE);
-    gfx_text(288, 29, "Z", CYAN);
+    gfx_rect(0, 0, SCREEN_W_640, MAP_VIEW_TOP, BLACK);
+    gfx_rect(0, 0, SCREEN_W_640, 2, CYAN);
+    gfx_text(8, 6, "Coal", WHITE);
+    gfx_text(110, 6, "Fe Ore", WHITE);
+    gfx_text(212, 6, "Cu Ore", WHITE);
+    gfx_text(314, 6, "Fe Plate", WHITE);
+    gfx_text(416, 6, "Cu Plate", WHITE);
+    gfx_text(518, 6, "Romb", WHITE);
+    gfx_text(576, 58, "Z", CYAN);
     draw_minimap(state);
 
-    gfx_rect(0, TOOLBAR_Y, SCREEN_W, SCREEN_H - TOOLBAR_Y, BLACK);
-    gfx_rect(0, TOOLBAR_Y, SCREEN_W, 1, CYAN);
-    gfx_text(145, TOOLBAR_Y + 5, "Bots", CYAN);
-    gfx_text(193, TOOLBAR_Y + 5, "/", WHITE);
+    gfx_rect(0, TOOLBAR_Y, SCREEN_W_640, SCREEN_H_480 - TOOLBAR_Y, BLACK);
+    gfx_rect(0, TOOLBAR_Y, SCREEN_W_640, 2, CYAN);
+    gfx_text(290, TOOLBAR_Y + 10, "Bots", CYAN);
+    gfx_text(386, TOOLBAR_Y + 10, "/", WHITE);
     if (state->build_tool == BUILDING_ROUTE)
     {
         if (state->route_source < 0)
-            gfx_text(222, TOOLBAR_Y + 5, "Route: source", GRAY);
+            gfx_text(444, TOOLBAR_Y + 10, "Route: source", GRAY);
         else
-            gfx_text(222, TOOLBAR_Y + 5, "Route: target", GRAY);
+            gfx_text(444, TOOLBAR_Y + 10, "Route: target", GRAY);
     }
     for (i = 0; i < TOOL_BUTTON_COUNT; i++)
     {
-        button_x = i * (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP) + 4;
+        button_x = i * (TOOL_BUTTON_WIDTH + TOOL_BUTTON_GAP) + 8;
         button_tool = toolbar_button_tool(i);
         button_label = building_name(button_tool);
         color = state->build_tool == button_tool ? CYAN : GRAY;
@@ -1305,10 +1305,10 @@ static void draw_static_hud(GameState *state)
             color = YELLOW;
         else if (state->toolbar_hovered == i)
             color = WHITE;
-        gfx_rect(button_x, TOOLBAR_Y + 18, TOOL_BUTTON_WIDTH, 19,
+        gfx_rect(button_x, TOOLBAR_Y + 36, TOOL_BUTTON_WIDTH, 38,
                  state->toolbar_pressed == i ? GRAY : DARK_GRAY);
-        gfx_rect(button_x, TOOLBAR_Y + 18, TOOL_BUTTON_WIDTH, 2, color);
-        gfx_text(button_x + 5, TOOLBAR_Y + 25, button_label, WHITE);
+        gfx_rect(button_x, TOOLBAR_Y + 36, TOOL_BUTTON_WIDTH, 4, color);
+        gfx_text(button_x + 10, TOOLBAR_Y + 50, button_label, WHITE);
     }
 }
 
@@ -1356,7 +1356,7 @@ static void draw_found_robot_routes(GameState *state)
                 y++;
             screen_x = x * size - state->camera_x;
             screen_y = MAP_VIEW_TOP + y * size - state->camera_y;
-            if (screen_x + size <= 0 || screen_x >= SCREEN_W ||
+            if (screen_x + size <= 0 || screen_x >= SCREEN_W_640 ||
                 screen_y + size <= MAP_VIEW_TOP || screen_y >= TOOLBAR_Y)
                 continue;
             draw_map_rect(screen_x + inset, screen_y + inset,
@@ -1377,7 +1377,7 @@ static void draw_minimap_robots(GameState *state)
             continue;
         x = state->robots[i].position.x * MINIMAP_SIZE / MAP_SIZE;
         y = state->robots[i].position.y * MINIMAP_SIZE / MAP_SIZE;
-        gfx_rect(MINIMAP_X + x, MINIMAP_Y + y, 2, 2, YELLOW);
+        gfx_rect(MINIMAP_X + x, MINIMAP_Y + y, 4, 4, YELLOW);
     }
 }
 
@@ -1421,7 +1421,7 @@ void game_init(GameState *state)
     map_init(&state->map);
     state->zoom = 1;
     size = tile_size(state);
-    state->camera_x = BASE_X * size - SCREEN_W / 2;
+    state->camera_x = BASE_X * size - SCREEN_W_640 / 2;
     state->camera_y = BASE_Y * size -
                       (MAP_VIEW_BOTTOM - MAP_VIEW_TOP) / 2;
     state->map_layer_valid = 0;
@@ -1633,7 +1633,7 @@ void game_update(GameState *state, float delta_time)
         world_x = (mouse_x - MINIMAP_X) * state->map.width / MINIMAP_SIZE;
         world_y = (mouse_y - MINIMAP_Y) * state->map.height / MINIMAP_SIZE;
         size = tile_size(state);
-        state->camera_x = world_x * size - SCREEN_W / 2;
+        state->camera_x = world_x * size - SCREEN_W_640 / 2;
         state->camera_y = world_y * size -
                           (MAP_VIEW_BOTTOM - MAP_VIEW_TOP) / 2;
         clamp_camera(state);
@@ -1737,15 +1737,15 @@ void game_draw(GameState *state)
 
     draw_minimap_robots(state);
 
-    draw_resource_value(4, state->total_resources[RES_COAL]);
-    draw_resource_value(55, state->total_resources[RES_IRON_ORE]);
-    draw_resource_value(106, state->total_resources[RES_COPPER_ORE]);
-    draw_resource_value(157, state->total_resources[RES_IRON_PLATE]);
-    draw_resource_value(208, state->total_resources[RES_COPPER_PLATE]);
-    draw_resource_value(259, state->total_resources[RES_ROMBONENT]);
+    draw_resource_value(8, state->total_resources[RES_COAL]);
+    draw_resource_value(110, state->total_resources[RES_IRON_ORE]);
+    draw_resource_value(212, state->total_resources[RES_COPPER_ORE]);
+    draw_resource_value(314, state->total_resources[RES_IRON_PLATE]);
+    draw_resource_value(416, state->total_resources[RES_COPPER_PLATE]);
+    draw_resource_value(518, state->total_resources[RES_ROMBONENT]);
     zoom_text[0] = (char)('1' + state->zoom);
     zoom_text[1] = '\0';
-    gfx_text(298, 29, zoom_text, WHITE);
+    gfx_text(596, 58, zoom_text, WHITE);
     if (state->selected_building >= 0 &&
         state->selected_building < state->building_count)
     {
@@ -1755,14 +1755,14 @@ void game_draw(GameState *state)
         format_count(count, selected_building->inventory_count);
         if (selected_building->type == BUILDING_MINE)
         {
-            gfx_text(8, TOOLBAR_Y + 5,
+            gfx_text(16, TOOLBAR_Y + 10,
                      resource_name(selected_building->resource_type), WHITE);
-            gfx_text(80, TOOLBAR_Y + 5, count, YELLOW);
-            gfx_text(98, TOOLBAR_Y + 5, "/5", WHITE);
+            gfx_text(160, TOOLBAR_Y + 10, count, YELLOW);
+            gfx_text(196, TOOLBAR_Y + 10, "/5", WHITE);
         }
         else
         {
-            gfx_text(8, TOOLBAR_Y + 5,
+            gfx_text(16, TOOLBAR_Y + 10,
                      building_name(selected_building->type), WHITE);
         }
     }
@@ -1774,9 +1774,9 @@ void game_draw(GameState *state)
             if (state->robots[i].state != ROBOT_IDLE)
                 active_robots++;
         format_count(robot_count, active_robots);
-        gfx_text(178, TOOLBAR_Y + 5, robot_count, YELLOW);
+        gfx_text(356, TOOLBAR_Y + 10, robot_count, YELLOW);
         format_count(robot_count, state->robot_count);
-        gfx_text(201, TOOLBAR_Y + 5, robot_count, WHITE);
+        gfx_text(402, TOOLBAR_Y + 10, robot_count, WHITE);
     }
 
     mouse_screen_x = gfx_mouse_x();
@@ -1802,5 +1802,5 @@ void game_draw(GameState *state)
     }
 
     color = (gfx_ticks() & 0x20) ? GREEN : DARK_RED;
-    gfx_rect(309, TOOLBAR_Y + 5, 6, 8, color);
+    gfx_rect(618, TOOLBAR_Y + 10, 12, 16, color);
 }

@@ -4,6 +4,7 @@
 GameState state;
 
 int main() {
+    gfx_mode(GFX_MODE_640_480);
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
     game_init(&state);

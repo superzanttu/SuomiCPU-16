@@ -163,7 +163,7 @@ fleet. Production waits when the eight-robot fleet limit is reached.
 - **Precision**: Floating point values use IEEE-754 binary16 (half precision).
 
 ### 8.3 Graphics & I/O
-- **Resolution**: 320x240 pixels, 8-bit palette. Maximum framerate is 30.
+- **Resolution**: 640x480 packed graphics mode. Maximum framerate is 30.
 - **Drawing**: All drawing is performed on a back buffer using `gfx_*` functions; `gfx_present()` is called once per frame to update the display.
 - **Input**: Keyboard and mouse are accessed via memory-mapped registers or `gfx_*` helpers.
 
@@ -184,7 +184,9 @@ and two copper plates per second when those ingredients and output space are
 available. Factories use one Rombonent and one iron plate to manufacture a
 new idle transport robot per second, up to the eight-robot fleet limit.
 The renderer caches the static world and HUD layers between changes so normal
-frames redraw only moving robots and changing status values.
+frames redraw only moving robots and changing status values. The game runs in
+640x480 graphics mode, with its map tiles and interface layout scaled for the
+higher-resolution display.
 
 Controls:
 - **WASD**: Pan the map; holding a key repeats every 0.15 seconds.

@@ -995,6 +995,12 @@ input/output. [`examples/sc16_showcase.c`](examples/sc16_showcase.c) is an
 eight-page tour of the SC-16's CPU, memory, graphics, text, devices, and
 benchmark features.
 
+[`modules/Hertta-3D/hertta3d.c`](modules/Hertta-3D/hertta3d.c) is a first-person
+maze game rendered with the SC-GPU. Move with W/S, turn with A/D, and throw
+treats with Space. Hertta wanders through the maze; feed her enough treats and
+she will come to you to finish the level. Later levels add maze walls and make
+Hertta faster.
+
 All games and the showcase play sound effects through `gfx_sound` (lasers, explosions,
 engine rumble, pellet and ghost sounds, page and benchmark beeps); sound is
 synthesized by the emulator and needs a working pygame audio device.

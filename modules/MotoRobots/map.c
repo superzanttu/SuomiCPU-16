@@ -133,7 +133,7 @@ void map_draw(GameMap* map, int camera_x, int camera_y, int tile_size,
     int i;
     MapFeature* feature;
 
-    gfx_rect(0, view_y, SCREEN_W, view_height, GREEN);
+    gfx_rect(0, view_y, SCREEN_W_640, view_height, GREEN);
     first_y = camera_y / tile_size;
     last_y = (camera_y + view_height) / tile_size + 1;
     if (last_y > map->height) last_y = map->height;
@@ -171,12 +171,12 @@ void map_draw_minimap(GameMap* map, int screen_x, int screen_y, int size) {
 
     gfx_rect(screen_x, screen_y, size, size, GREEN);
     river_map_x = (int)map->river_x[24] * size / MAP_SIZE;
-    gfx_rect(screen_x + river_map_x - 1, screen_y + 3, 3, size - 6, BLUE);
+    gfx_rect(screen_x + river_map_x - 2, screen_y + 6, 6, size - 12, BLUE);
     for (i = 0; i < map->feature_count; i++) {
         feature = &map->features[i];
         map_x = feature->center_x * size / MAP_SIZE;
         map_y = feature->center_y * size / MAP_SIZE;
-        gfx_rect(screen_x + map_x - 2, screen_y + map_y - 2,
-                 5, 5, feature_color(feature));
+        gfx_rect(screen_x + map_x - 4, screen_y + map_y - 4,
+                 10, 10, feature_color(feature));
     }
 }
