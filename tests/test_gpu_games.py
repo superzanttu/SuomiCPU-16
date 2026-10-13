@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 from c_compiler import GLOBAL_BASE, CCompilerError, compile_source
 from gfx_harness import ROOT, compile_file, make_cpu, pixel, run_frame, vram
 from src.SuomiCPU import (
-    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_MAX,
+    BACK_START, GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_FAST, SPEED_MAX,
     GFX_MODE_640_480, GFX_MODE_ADDR, MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR,
     VRAM_START, VSYNC_ADDR, SuomiCompute16, _load_jit, create_memory,
 )
@@ -254,7 +254,7 @@ class MotoRobotsTests(unittest.TestCase):
         self.assertEqual(cpu.memory[SPEED_ADDR], SPEED_MAX)
         self.assertEqual(cpu.memory[VSYNC_ADDR], 1)
 
-    def test_pathfinding_discovered_tiles_are_drawn_on_map_only_while_searching(self):
+    def test_pathfinding_search_does_not_draw_progress_on_map(self):
         source = (
             '#include "game.c"\n'
             '#include "map.c"\n'
@@ -263,15 +263,14 @@ class MotoRobotsTests(unittest.TestCase):
             "  game_init(&test_state);\n"
             "  test_state.camera_x = 0;\n"
             "  test_state.camera_y = 0;\n"
+            "  game_draw(&test_state);\n"
+            "  gfx_present();\n"
             "  test_state.pathfinding_robot = 0;\n"
             "  test_state.robots[0].path_status = ROBOT_PATH_SEARCHING;\n"
             "  test_state.path_queue[0] = 8 * 48 + 18;\n"
             "  test_state.path_queue[1] = 8 * 48 + 19;\n"
             "  test_state.path_queue_head = 1;\n"
             "  test_state.path_queue_tail = 2;\n"
-            "  game_draw(&test_state);\n"
-            "  gfx_present();\n"
-            "  test_state.pathfinding_robot = -1;\n"
             "  game_draw(&test_state);\n"
             "  gfx_present();\n"
             "  return 0;\n"
@@ -282,17 +281,14 @@ class MotoRobotsTests(unittest.TestCase):
         run_frame(cpu)
         explored_pixel = pixel(cpu, 18 * 16 + 4, 36 + 8 * 16 + 4)
         frontier_pixel = pixel(cpu, 19 * 16 + 4, 36 + 8 * 16 + 4)
-        self.assertEqual(explored_pixel, 6)
-        self.assertEqual(frontier_pixel, 5)
-
         run_frame(cpu)
-        self.assertNotEqual(
+        self.assertEqual(
             pixel(cpu, 18 * 16 + 4, 36 + 8 * 16 + 4),
-            6,
+            explored_pixel,
         )
-        self.assertNotEqual(
+        self.assertEqual(
             pixel(cpu, 19 * 16 + 4, 36 + 8 * 16 + 4),
-            5,
+            frontier_pixel,
         )
 
     def test_found_robot_route_is_drawn_ahead_of_robot(self):
@@ -1397,7 +1393,7 @@ class GameTests(unittest.TestCase):
         self.assertGreater(cpu.read_16(0x4340), 10)
         self.assertGreaterEqual(cpu.read_16(0x4342), 1)
 
-    def test_showcase_3d_ship_rotates(self):
+    def test_showcase_3d_ship_flies_and_changes_orientation(self):
         cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
         self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
         run_frame(cpu, 400_000)
@@ -1409,15 +1405,81 @@ class GameTests(unittest.TestCase):
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
         first = vram(cpu)
-        for _ in range(4):
+        for _ in range(32):
             run_frame(cpu, 400_000)
         last = vram(cpu)
         ship_area = b"".join(last[y * SCREEN_WIDTH + 80:y * SCREEN_WIDTH + 240] for y in range(50, 180))
         self.assertIn(6, ship_area)
         self.assertNotEqual(first, last)
+        first_cyan = [
+            (x, y)
+            for y in range(50, 180)
+            for x in range(50, 270)
+            if first[y * SCREEN_WIDTH + x] == 6
+        ]
+        last_cyan = [
+            (x, y)
+            for y in range(50, 180)
+            for x in range(50, 270)
+            if last[y * SCREEN_WIDTH + x] == 6
+        ]
+        first_center_x = sum(point[0] for point in first_cyan) // len(first_cyan)
+        last_center_x = sum(point[0] for point in last_cyan) // len(last_cyan)
+        self.assertGreater(abs(last_center_x - first_center_x), 8)
         self.assertTrue(cpu.running)
 
-    def test_showcase_sprite_load_uses_max_speed_and_stops_below_30_fps(self):
+    def test_showcase_speed_comparison_measures_the_max_speed_loop(self):
+        path = ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"
+        source = path.read_text(encoding="utf-8")
+        source = source[:source.index("\nint main(void)\n{")] + (
+            "\nint main(void) {\n"
+            "  gfx_speed(SPEED_FAST);\n"
+            "  gfx_vsync(1);\n"
+            "  bench_max();\n"
+            "  cmp_mips_tenths = kops_to_mips_tenths(cmp_kops);\n"
+            "  *((unsigned int *)0x10000000) = cmp_kops;\n"
+            "  *((unsigned int *)0x10000004) = cmp_mips_tenths;\n"
+            "  *((unsigned char *)0x10000008) = *((unsigned char *)0x43003);\n"
+            "  *((unsigned char *)0x10000009) = *((unsigned char *)0x43013);\n"
+            "  *((unsigned long *)0x10000010) = 0x5343554D;\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(path)))
+        self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
+        rtc_modes = []
+        original_gpu_command = cpu.gpu_command
+
+        def observe_rtc_mode(command):
+            if command == 12:
+                rtc_modes.append(
+                    (cpu.memory[SPEED_ADDR], cpu.memory[VSYNC_ADDR])
+                )
+            original_gpu_command(command)
+
+        cpu.gpu_command = observe_rtc_mode
+        for _ in range(200):
+            run_frame(cpu, limit=400_000)
+            if cpu.read_32(0x10000010) == 0x5343554D:
+                break
+        self.assertEqual(
+            cpu.read_32(0x10000010),
+            0x5343554D,
+            f"RTC calls={len(rtc_modes)}, RTC={list(cpu.memory[0x43010:0x43013])}, "
+            f"speed={cpu.memory[SPEED_ADDR]}, vsync={cpu.memory[VSYNC_ADDR]}, "
+            f"pc={cpu.pc:#x}, running={cpu.running}",
+        )
+        self.assertTrue(rtc_modes)
+        self.assertTrue(all(mode == (SPEED_MAX, 0) for mode in rtc_modes))
+        self.assertGreater(cpu.read_16(0x10000000), 0)
+        kops = cpu.read_16(0x10000000)
+        expected_mips_tenths = (kops * 533 + 1600) // 3200
+        self.assertEqual(cpu.read_16(0x10000004), expected_mips_tenths)
+        self.assertEqual(cpu.memory[0x10000008], SPEED_FAST)
+        self.assertEqual(cpu.memory[0x10000009], 1)
+
+    def test_showcase_sprite_load_slows_down_and_recovers_after_temporary_fps_drop(self):
         cpu = make_cpu(compile_file(ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"))
         self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
         run_frame(cpu, 400_000)
@@ -1429,6 +1491,7 @@ class GameTests(unittest.TestCase):
             run_frame(cpu, 400_000)
             run_frame(cpu, 400_000)
         self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
+        self.assertEqual(cpu.memory[VSYNC_ADDR], 0)
         base_seconds = cpu.memory[0x43011] * 60 + cpu.memory[0x43010]
         elapsed_seconds = [0]
         frame_count = [0]
@@ -1472,14 +1535,74 @@ class GameTests(unittest.TestCase):
             run_frame(cpu, 400_000)
         self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
         red_status = any(pixel(cpu, x, y) == 2 for x in range(8, 312) for y in range(216, 224))
-        self.assertTrue(red_status)
+        self.assertFalse(red_status)
         self.assertEqual(
+            count_display,
+            b"".join(vram(cpu)[y * SCREEN_WIDTH + 68:y * SCREEN_WIDTH + 92] for y in range(38, 46)),
+        )
+        frames_per_second[0] = 30
+        frame_count[0] = 0
+        for _ in range(30):
+            run_frame(cpu, 400_000)
+        self.assertNotEqual(
             count_display,
             b"".join(vram(cpu)[y * SCREEN_WIDTH + 68:y * SCREEN_WIDTH + 92] for y in range(38, 46)),
         )
         cpu.memory[KEYS_ADDR] = 2
         run_frame(cpu, 400_000)
         self.assertEqual(cpu.memory[0x43003], SPEED_MAX)
+        self.assertEqual(cpu.memory[VSYNC_ADDR], 1)
+
+    def test_showcase_sprite_load_uses_ten_then_one_sprite_per_second(self):
+        path = ROOT / "modules" / "SC-16 showcase" / "sc16_showcase.c"
+        source = path.read_text(encoding="utf-8")
+        source = source[:source.index("\nint main(void)\n{")] + (
+            "\nint main(void) {\n"
+            "  gfx_speed(SPEED_MAX);\n"
+            "  gfx_vsync(0);\n"
+            "  stress_sprite_count = 1;\n"
+            "  stress_slow_mode = 0;\n"
+            "  stress_last_ticks = gfx_ticks() - 1;\n"
+            "  stress_last_second = host_seconds();\n"
+            "  while (1) {\n"
+            "    page_sprite_load();\n"
+            "    *((unsigned int *)0x10000000) = stress_sprite_count;\n"
+            "    *((unsigned int *)0x10000002) = stress_slow_mode;\n"
+            "    gfx_present();\n"
+            "  }\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(path)))
+        self.addCleanup(lambda: cpu.net.transport.close() if getattr(cpu, "net", None) else None)
+        elapsed_seconds = [0]
+        frame_count = [0]
+        frames_per_second = [30]
+
+        def fake_update_rtc():
+            frame_count[0] += 1
+            if frame_count[0] % frames_per_second[0] == 0:
+                elapsed_seconds[0] += 1
+            cpu.memory[0x43010] = elapsed_seconds[0] % 60
+            cpu.memory[0x43011] = elapsed_seconds[0] // 60
+
+        cpu.update_rtc = fake_update_rtc
+        for _ in range(60):
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.read_16(0x10000000), 21)
+        self.assertEqual(cpu.read_16(0x10000002), 0)
+
+        frames_per_second[0] = 20
+        frame_count[0] = 0
+        for _ in range(40):
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.read_16(0x10000000), 21)
+        self.assertEqual(cpu.read_16(0x10000002), 1)
+
+        frames_per_second[0] = 30
+        frame_count[0] = 0
+        for _ in range(30):
+            run_frame(cpu, 400_000)
+        self.assertEqual(cpu.read_16(0x10000000), 22)
 
     def test_lunar_lander_menu_flight_sound_and_crash(self):
         cpu = self.play("lunarlander.c", lambda f: 32 if f == 3 else 0, 8)

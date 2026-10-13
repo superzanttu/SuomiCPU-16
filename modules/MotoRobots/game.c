@@ -1365,46 +1365,6 @@ static void draw_found_robot_routes(GameState *state)
     }
 }
 
-static void draw_pathfinding_map(GameState *state)
-{
-    int robot_index;
-    int i;
-    int tile_index;
-    int tile_x;
-    int tile_y;
-    int screen_x;
-    int screen_y;
-    int inset;
-    int marker_size;
-    int size;
-    unsigned char color;
-
-    robot_index = state->pathfinding_robot;
-    if (robot_index < 0 || robot_index >= state->robot_count ||
-        state->robots[robot_index].path_status != ROBOT_PATH_SEARCHING)
-        return;
-
-    size = tile_size(state);
-    inset = size / 4;
-    if (inset < 1)
-        inset = 1;
-    marker_size = size - inset * 2;
-    for (i = 0; i < state->path_queue_tail; i++)
-    {
-        tile_index = state->path_queue[i];
-        tile_x = tile_index % state->map.width;
-        tile_y = tile_index / state->map.width;
-        screen_x = tile_x * size - state->camera_x;
-        screen_y = MAP_VIEW_TOP + tile_y * size - state->camera_y;
-        if (screen_x + size <= 0 || screen_x >= SCREEN_W ||
-            screen_y + size <= MAP_VIEW_TOP || screen_y >= TOOLBAR_Y)
-            continue;
-        color = i < state->path_queue_head ? CYAN : YELLOW;
-        draw_map_rect(screen_x + inset, screen_y + inset,
-                      marker_size, marker_size, color);
-    }
-}
-
 static void draw_minimap_robots(GameState *state)
 {
     int i;
@@ -1763,7 +1723,6 @@ void game_draw(GameState *state)
     }
 
     draw_found_robot_routes(state);
-    draw_pathfinding_map(state);
 
     for (i = 0; i < state->robot_count; i++)
     {

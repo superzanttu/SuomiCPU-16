@@ -94,7 +94,7 @@ int HULLPTS[8] = {0, 1, 2, 3, 4, 5, 16, 17};
 int GEARPTS[6] = {8, 9, 10, 11, 12, 13};
 
 /* Difficulty settings: Easy, Normal, Hard */
-int GRAV[3] = {6, 8, 10};       // Gravity (1/256 px per frame squared)
+int GRAV[3] = {6, 6, 10};       // Gravity (1/256 px per frame squared)
 int FUEL[3] = {1200, 900, 650}; // Starting fuel
 int VLIM[3] = {260, 200, 150};  // Safe landing speed
 int TLIM[3] = {160, 114, 80};   // Safe tilt (4096 units = full turn)

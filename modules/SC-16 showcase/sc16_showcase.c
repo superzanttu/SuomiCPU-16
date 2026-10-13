@@ -27,10 +27,12 @@
 #define PAGES 14
 #define NMACH 8
 #define SC16_ROW 4
-#define INSTR_PER_ITER 16
 #define CMP_SECS 3
 #define NTEST 7
 #define DUR 30
+#define BENCH_ADDS_PER_BLOCK 32
+/* Compiled bench_block(0) executes 533 SC-16 instructions for 32 additions. */
+#define BENCH_INSTRUCTIONS_PER_BLOCK 533
 #define FONT_ROM 0x4400
 #define TILE_MAP_W 40
 #define TILE_MAP_H 20
@@ -100,6 +102,7 @@ unsigned char bench_mem[64];
 unsigned int cmp_kops;
 unsigned int cmp_mips_tenths;
 unsigned char bench_prev_speed;
+unsigned char bench_prev_vsync;
 unsigned char tile_map[TILE_MAP_W * TILE_MAP_H];
 int tile_ready;
 int mouse_last_char;
@@ -138,9 +141,11 @@ int stress_active;
 int stress_sprite_count;
 int stress_fps;
 int stress_done;
+int stress_slow_mode;
 unsigned int stress_last_ticks;
 unsigned int stress_last_second;
 unsigned char stress_previous_speed;
+unsigned char stress_previous_vsync;
 
 unsigned int host_seconds(void);
 
@@ -159,6 +164,23 @@ int sinv(int a)
 int cosv(int a)
 {
     return sintab[(a + 8) & 31];
+}
+
+int ship_sinv(int phase)
+{
+    int index;
+    int fraction;
+    int next;
+    index = (phase >> 2) & 31;
+    fraction = phase & 3;
+    next = (index + 1) & 31;
+    return (sintab[index] * (4 - fraction) +
+            sintab[next] * fraction) / 4;
+}
+
+int ship_cosv(int phase)
+{
+    return ship_sinv(phase + 32);
 }
 
 int pick(int cond, int a, int b)
@@ -981,23 +1003,36 @@ void page_ship(void)
     int depth;
     int px;
     int py;
-    int ship_bob;
-    ax = frame / 3;
-    ay = frame / 4 + 5;
-    az = frame / 5;
-    ship_bob = (sinv(frame / 3) * 12) / 100;
+    int flight_phase;
+    int flight_x;
+    int flight_y;
+    int flight_depth;
+    flight_phase = frame / 2;
+    flight_x = (ship_sinv(flight_phase) * 70) / 100;
+    flight_y = (ship_sinv(flight_phase + 32) * 32) / 100;
+    flight_depth = (ship_sinv(flight_phase + 16) * 28) / 100;
+    ax = ship_sinv(flight_phase + 16) / 12;
+    ay = ship_sinv(flight_phase) / 12;
+    az = 32 - flight_phase +
+         ship_sinv(flight_phase + 32) / 12;
     for (i = 0; i < SHIP_VERTICES; i++)
     {
-        x1 = (ship_x[i] * cosv(ay) - ship_z[i] * sinv(ay)) / 100;
-        z1 = (ship_x[i] * sinv(ay) + ship_z[i] * cosv(ay)) / 100;
-        y1 = (ship_y[i] * cosv(ax) - z1 * sinv(ax)) / 100;
-        z2 = (ship_y[i] * sinv(ax) + z1 * cosv(ax)) / 100;
-        ship_rx[i] = (x1 * cosv(az) - y1 * sinv(az)) / 100;
-        ship_ry[i] = (x1 * sinv(az) + y1 * cosv(az)) / 100;
+        x1 = (ship_x[i] * ship_cosv(ay) -
+              ship_z[i] * ship_sinv(ay)) / 100;
+        z1 = (ship_x[i] * ship_sinv(ay) +
+              ship_z[i] * ship_cosv(ay)) / 100;
+        y1 = (ship_y[i] * ship_cosv(ax) -
+              z1 * ship_sinv(ax)) / 100;
+        z2 = (ship_y[i] * ship_sinv(ax) +
+              z1 * ship_cosv(ax)) / 100;
+        ship_rx[i] = (x1 * ship_cosv(az) -
+                      y1 * ship_sinv(az)) / 100;
+        ship_ry[i] = (x1 * ship_sinv(az) +
+                      y1 * ship_cosv(az)) / 100;
         ship_rz[i] = z2;
-        depth = 200 - ship_rz[i];
-        ship_px[i] = 160 + (ship_rx[i] * 200) / depth;
-        ship_py[i] = 112 + ship_bob + (ship_ry[i] * 200) / depth;
+        depth = 200 + flight_depth - ship_rz[i];
+        ship_px[i] = 160 + flight_x + (ship_rx[i] * 200) / depth;
+        ship_py[i] = 112 + flight_y + (ship_ry[i] * 200) / depth;
     }
     for (i = 0; i < SHIP_VERTICES * SHIP_VERTICES; i++)
     {
@@ -1029,7 +1064,7 @@ void page_ship(void)
         py = 24 + (i * 37) % 188;
         gfx_pixel(px, py, (i % 4 == 0) ? WHITE : DARK_GRAY);
     }
-    gfx_text(8, 20, "ROTATING 3D SHIP - HIDDEN EDGES CULLED", YELLOW);
+    gfx_text(8, 20, "3D FLIGHT - HEADING TRACKS MOTION", YELLOW);
     for (i = 0; i < SHIP_VERTICES; i++)
     {
         for (j = i + 1; j < SHIP_VERTICES; j++)
@@ -1064,18 +1099,15 @@ void page_sprite_load(void)
         stress_fps = ticks / elapsed;
         if (stress_fps < 30)
         {
-            stress_done = 1;
+            stress_slow_mode = 1;
         }
-        else if (!stress_done)
+        else
         {
-            seconds = elapsed;
-            while (seconds > 0 && stress_sprite_count < STRESS_MAX_SPRITES)
-            {
-                stress_sprite_count++;
-                seconds--;
-            }
+            seconds = elapsed * (stress_slow_mode ? 1 : 10);
+            stress_sprite_count = stress_sprite_count + seconds;
             if (stress_sprite_count >= STRESS_MAX_SPRITES)
             {
+                stress_sprite_count = STRESS_MAX_SPRITES;
                 stress_done = 1;
             }
         }
@@ -1083,7 +1115,7 @@ void page_sprite_load(void)
         stress_last_second = now;
     }
 
-    gfx_text(8, 20, "MAX-SPEED SPRITE LOAD TEST", YELLOW);
+    gfx_text(8, 20, "30 FPS SPRITE LOAD TEST", YELLOW);
     gfx_text(8, 38, "SPRITES", GRAY);
     pnum(68, 38, stress_sprite_count, WHITE);
     gfx_text(142, 38, "FRAME RATE", GRAY);
@@ -1097,11 +1129,19 @@ void page_sprite_load(void)
     }
     if (stress_done)
     {
-        gfx_text(8, 216, "UNDER 30 FPS - SPRITE COUNT HELD", RED);
+        gfx_text(8, 216, "MAXIMUM SPRITE COUNT REACHED", RED);
+    }
+    else if (stress_slow_mode && stress_fps < 30)
+    {
+        gfx_text(8, 216, "LOW FPS - WAITING TO RECOVER", YELLOW);
+    }
+    else if (stress_slow_mode)
+    {
+        gfx_text(8, 216, "ADDING ONE SPRITE PER SECOND", GREEN);
     }
     else
     {
-        gfx_text(8, 216, "ADDING ONE SPRITE PER SECOND WHILE FPS >= 30", GREEN);
+        gfx_text(8, 216, "ADDING 10 SPRITES PER SECOND", GREEN);
     }
 }
 
@@ -1255,7 +1295,9 @@ void bench_max(void)
     remainder = 0;
     last = 0;
     bench_prev_speed = *((unsigned char *)0x43003);
+    bench_prev_vsync = *((unsigned char *)0x43013);
     gfx_speed(SPEED_MAX);
+    gfx_vsync(0);
     s0 = host_seconds();
     while (host_seconds() == s0)
     {
@@ -1291,12 +1333,19 @@ void bench_max(void)
         }
     }
     gfx_speed(bench_prev_speed);
+    gfx_vsync(bench_prev_vsync);
     cmp_kops = ksum;
 }
 
 unsigned int kops_to_mips_tenths(unsigned int kops)
 {
-    return (kops / 100) * INSTR_PER_ITER + ((kops % 100) * INSTR_PER_ITER) / 100;
+    unsigned int scale;
+    unsigned int whole;
+    unsigned int remainder;
+    scale = BENCH_ADDS_PER_BLOCK * 100;
+    whole = (kops / scale) * BENCH_INSTRUCTIONS_PER_BLOCK;
+    remainder = (kops % scale) * BENCH_INSTRUCTIONS_PER_BLOCK;
+    return whole + (remainder + scale / 2) / scale;
 }
 
 char *bench_name(int test)
@@ -1541,7 +1590,7 @@ void page_compare(void)
         gfx_text(134, 176, "NO RATE", DARK_GRAY);
     }
     gfx_text(8, 188, "LOG-SCALE BARS. OTHERS: APPROX. PUBLISHED", DARK_GRAY);
-    gfx_text(8, 197, cmp_state == 2 ? "SC-16: MEASURED WITH 3-SECOND MAX-SPEED TEST" : "SC-16: APPROXIMATE UNTIL MEASURED", DARK_GRAY);
+    gfx_text(8, 197, cmp_state == 2 ? "SC-16: 32-ADD LOOP MEASURED AT MAX SPEED" : "SC-16: APPROXIMATE UNTIL MEASURED", DARK_GRAY);
     if (cmp_state == 1)
     {
         ctext(210, "MEASURING AT MAX SPEED - 3 S", ORANGE);
@@ -1648,17 +1697,21 @@ int main(void)
         if (page == STRESS_PAGE && !stress_active)
         {
             stress_previous_speed = *((unsigned char *)0x43003);
+            stress_previous_vsync = *((unsigned char *)0x43013);
             gfx_speed(SPEED_MAX);
+            gfx_vsync(0);
             stress_active = 1;
             stress_sprite_count = 1;
             stress_fps = 0;
             stress_done = 0;
+            stress_slow_mode = 0;
             stress_last_ticks = gfx_ticks();
             stress_last_second = host_seconds();
         }
         else if (page != STRESS_PAGE && stress_active)
         {
             gfx_speed(stress_previous_speed);
+            gfx_vsync(stress_previous_vsync);
             stress_active = 0;
         }
         if (page == NETWORK_PAGE && !network_attempted)
@@ -1740,7 +1793,7 @@ int main(void)
         else if (page == 12)
         {
             page_ship();
-            chrome("ROTATING 3D SHIP");
+            chrome("3D SHIP FLIGHT");
         }
         else
         {
