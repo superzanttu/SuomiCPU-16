@@ -386,7 +386,10 @@ def _instruction_size(text: str, line_number: int) -> int:
     if mnemonic in MULDIV_OPERATIONS and mnemonic not in ("LDI19", "LDI30"):
         if len(operands) != 2:
             raise _error(line_number, f"{mnemonic} expects a register and a register or immediate")
-        return 6 if not re.fullmatch(r"R[0-7]", operands[1].strip(), re.IGNORECASE) else 4
+        register_operand = re.fullmatch(r"R[0-7]", operands[1].strip(), re.IGNORECASE) is not None
+        if mnemonic in ("LDP", "STP", "SPLIT30", "JOIN30") and not register_operand:
+            raise _error(line_number, f"{mnemonic} expects two registers")
+        return 4 if register_operand else 6
     if mnemonic in ("LDA", "LDI19", "LDI30"):
         if len(operands) != 2:
             raise _error(line_number, f"{mnemonic} expects a register and an address or label")
