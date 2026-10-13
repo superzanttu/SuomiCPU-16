@@ -17,8 +17,8 @@ below.
 | `float` | IEEE-754 binary32 |
 | `double` | IEEE-754 binary64 |
 | `long double` | IEEE-754 binary64 |
-| object pointer | 19-bit byte address, stored in 3 bytes |
-| function pointer | 19-bit byte address, stored in 3 bytes |
+| object pointer | 30-bit byte address, stored in 4 bytes |
+| function pointer | 30-bit byte address, stored in 4 bytes |
 
 Bytes are 8 bits. Multi-byte integer and floating representations are
 big-endian. Integer signedness and ranges follow the representations above;
@@ -27,14 +27,14 @@ big-endian. Integer signedness and ranges follow the representations above;
 The floating-point format decisions meet the C90 minimum precision and range
 requirements.
 
-Pointer representations use the low 16 address bits in the first two bytes and
-the remaining three address bits in the third byte. Pointer arithmetic is
-defined over the flat byte-addressed machine space but must still obey C90's
-same-array object rules. The compiler must not silently truncate addresses or
-offsets. Explicit pointer-to-integer conversions preserve the complete address
-in a 32-bit `long` and the low 16 bits in a 16-bit `int`. Explicit integer-to-
-pointer conversions use the low 19 bits. These conversion choices are
-implementation-defined.
+Pointer objects store the low 16 address bits in the first two bytes, followed
+by the high 14 bits in the next two bytes; each word is big-endian. LDP/STP
+access this representation. Pointer arithmetic is defined over the flat
+byte-addressed machine space but must still obey C90's same-array object rules.
+The compiler must not silently truncate addresses or offsets. Explicit
+pointer-to-integer conversions preserve the complete address in a 32-bit `long`
+and the low 16 bits in a 16-bit `int`. Explicit integer-to-pointer conversions
+use the low 30 bits. These conversion choices are implementation-defined.
 
 ## Alignment and aggregates
 
@@ -59,20 +59,19 @@ order, unit size, and boundary behavior as implementation-defined choices.
 
 Arguments are evaluated and pushed right-to-left. The stack grows toward
 lower addresses. The caller removes arguments after return. The return address
-occupies three bytes and stores the 19-bit PC in big-endian order (the high
-byte uses only its low three bits). At function entry, the first named
-parameter begins at `SP + 3`, followed by subsequent parameters in declaration
-order; locals are
-allocated below the entry stack position.
+occupies four bytes and stores the 30-bit PC in big-endian order. At function
+entry, the first named parameter begins at `SP + 4`, followed by subsequent
+parameters in declaration order; locals are allocated below the entry stack
+position.
 
 16-bit integer results use `R0`; 32-bit integer results use `R0:R1`, with the
-high word in the even register. Pointer results use `R0` for the low 16 address
-bits and the low three bits of `R1` for the high address bits. Indirect
-function-pointer calls and jumps use `CALLRP R0, R1` and `JMPRP R0, R1` with
-this same representation. Once implemented,
+high word in the even register. Pointer results use `R0` as a numeric 30-bit
+address. Indirect function-pointer calls and jumps split this address between
+`CALLRP Rlow, Rhigh` and `JMPRP Rlow, Rhigh`: the low 16 bits are in `Rlow` and
+the high 14 bits in `Rhigh`. Once implemented,
 32-bit floating results use `R0:R1` and 64-bit floating results use
 `R0:R1:R2:R3`, from most- to least-significant word. Arguments use their
-in-memory object representations on the stack, including the 3-byte pointer
+in-memory object representations on the stack, including the 4-byte pointer
 representation.
 
 Structure and union parameters are passed as copies of their complete object
@@ -87,7 +86,7 @@ and recursive returns.
 
 ## Hosted execution environment
 
-The hosted implementation uses the emulator's byte-addressable 512 KiB
+The hosted implementation uses the emulator's byte-addressable 1 GiB
 address space. Startup firmware exposes a descriptor at `0x43040`, an
 interactive data-disk selector, and a memory-mapped console at `0x43200`.
 Selected modules are still loaded into memory by the emulator; virtual disks
@@ -95,10 +94,12 @@ store program data only. The console currently supports a subset of standard
 text streams and formatted output. File-backed streams, floating-point format
 conversions, and several required C90 I/O facilities remain unimplemented.
 Device-mapped addresses retain their documented SC-16 behavior. Compiler
-global/static data is currently placed in `0x60000..0x6FFFF`, providing room
-for a single 65,535-byte object; generated addresses use the `LDI19`
-instruction so this region is not truncated to 16 bits. This allocation does
-not reserve additional runtime heap or imply that every C90 translation-limit
+global/static data is currently placed in `0x80000..0xFFFFF`, providing 512 KiB
+of storage; generated addresses use `LDI30` so this region is not truncated to
+16 bits. The BIOS descriptor at `0x43040` is 20 bytes: it stores the memory
+size in bytes `6..9`, the console data address in `10..12`, the disk-control
+address in `13..15`, and startup status at byte `19`. This allocation does not
+reserve additional runtime heap or imply that every C90 translation-limit
 requirement has been met. Screen and graphics APIs remain implementation
 extensions and do not replace required C90 library interfaces.
 
@@ -108,10 +109,11 @@ The current code does not yet satisfy this target. In particular, binary16 is
 still used for all floating types, function pointers and indirect calls are
 incomplete, and the hosted library is partial. Aggregate assignment, fixed-
 parameter copies, and caller-owned record returns are implemented, but other
-declarator and ABI requirements remain incomplete. Regression tests now cover 19-bit pointer encodings, explicit
-32-bit-integer-to-pointer casts, high-address byte/word/long accesses, and
-indexed accesses crossing `0xFFFF`; these cases do not establish every pointer
-conversion, arithmetic, alignment, or wraparound behavior.
+declarator and ABI requirements remain incomplete. Regression tests now cover
+30-bit pointer encodings, explicit 32-bit-integer-to-pointer casts, high-address
+byte/word/long accesses, and indexed accesses crossing `0xFFFF`; these cases do
+not establish every pointer conversion, arithmetic, alignment, or wraparound
+behavior.
 
 Do not remove the compiler's nonconformance disclaimer until all of the
 following pass:
@@ -121,8 +123,8 @@ following pass:
    calling conventions.
 2. Emulator, JIT, and assembler execute identical tests for every C-visible
    memory, control-flow, and floating-point opcode. Calls and returns,
-   including indirect calls, preserve all 19 PC bits; interrupt frames contain
-   the three-byte PC and two-byte flags value.
+   including indirect calls, preserve all 30 PC bits; interrupt frames contain
+   the four-byte PC and two-byte flags value.
 3. An independent C90 conformance suite passes, with each remaining failure
    categorized as a documented implementation-defined/unspecified behavior
    or fixed as a defect.
