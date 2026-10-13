@@ -157,7 +157,7 @@ class AssemblerTests(unittest.TestCase):
             b"\xFE\x3E\x00\x01\x23\x45",
         )
 
-    def test_encodes_far_conditional_branches_in_four_bytes(self):
+    def test_encodes_far_conditional_branches_in_six_bytes(self):
         image = assemble("BNZX 0x12345\nBLTX 0x23456\n")
         self.assertEqual(
             image.segments[0].data,
@@ -171,6 +171,12 @@ class AssemblerTests(unittest.TestCase):
             image.segments[0].data,
             b"\xF8\x1F\xF2\x0B\xFA\x1F\xF6\x0C",
         )
+
+    def test_pointer_only_instructions_reject_immediate_operands(self):
+        for instruction in ("LDP R0, 1", "STP R0, 1", "SPLIT30 R0, 1", "JOIN30 R0, 1"):
+            with self.subTest(instruction=instruction):
+                with self.assertRaisesRegex(AssemblyError, "expects two registers"):
+                    assemble(instruction)
 
     def test_encodes_word_stack_and_carry_instructions(self):
         image = assemble(
