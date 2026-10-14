@@ -6,6 +6,7 @@ import pygame
 from assembler import assemble
 from src.SuomiCPU import (
     KEY_BITS,
+    KEYS_ADDR,
     SPEED_MAX,
     SPEED_ADDR,
     VSYNC_ADDR,
@@ -90,6 +91,25 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(KEY_BITS[pygame.K_e], 0x200)
         self.assertEqual(KEY_BITS[pygame.K_x], 0x400)
         self.assertEqual(KEY_BITS[pygame.K_z], 0x800)
+
+    def test_tank_controls_use_a_third_held_key_byte(self):
+        emulator = SuomiCompute16.__new__(SuomiCompute16)
+        emulator.memory = create_memory()
+        controls = (
+            pygame.K_c, pygame.K_j, pygame.K_l,
+            pygame.K_i, pygame.K_k, pygame.K_PERIOD,
+        )
+        masks = [KEY_BITS[key] for key in controls]
+        self.assertEqual(masks, [
+            0x10000, 0x20000, 0x40000,
+            0x80000, 0x100000, 0x200000,
+        ])
+
+        for mask in masks:
+            emulator.press_keys(mask)
+        self.assertEqual(emulator.read(KEYS_ADDR + 2), 0x3F)
+        emulator.release_keys(masks[1] | masks[4])
+        self.assertEqual(emulator.read(KEYS_ADDR + 2), 0x2D)
 
     def test_fullscreen_viewport_preserves_aspect_ratio_for_mouse(self):
         self.assertEqual(_screen_to_logical((240, 0), (1920, 1080)), (0, 0))

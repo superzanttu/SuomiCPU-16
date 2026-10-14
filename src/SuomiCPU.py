@@ -230,6 +230,11 @@ KEY_BITS = {
     pygame.K_q: 0x100, pygame.K_e: 0x200,
     pygame.K_LSHIFT: 0x400, pygame.K_RSHIFT: 0x400, pygame.K_x: 0x400,
     pygame.K_LCTRL: 0x800, pygame.K_RCTRL: 0x800, pygame.K_z: 0x800,
+    # A third byte is reserved for game-specific controls.
+    pygame.K_c: 0x10000,
+    pygame.K_j: 0x20000, pygame.K_l: 0x40000,
+    pygame.K_i: 0x80000, pygame.K_k: 0x100000,
+    pygame.K_PERIOD: 0x200000,
 }
 
 def load_program_file(
@@ -2021,10 +2026,12 @@ class SuomiCompute16:
     def press_keys(self, mask):
         self.write(KEYS_ADDR, self.read(KEYS_ADDR) | (mask & 0xFF))
         self.write(KEYS_ADDR + 1, self.read(KEYS_ADDR + 1) | (mask >> 8))
+        self.write(KEYS_ADDR + 2, self.read(KEYS_ADDR + 2) | ((mask >> 16) & 0xFF))
 
     def release_keys(self, mask):
         self.write(KEYS_ADDR, self.read(KEYS_ADDR) & ~(mask & 0xFF))
-        self.write(KEYS_ADDR + 1, self.read(KEYS_ADDR + 1) & ~(mask >> 8))
+        self.write(KEYS_ADDR + 1, self.read(KEYS_ADDR + 1) & ~((mask >> 8) & 0xFF))
+        self.write(KEYS_ADDR + 2, self.read(KEYS_ADDR + 2) & ~((mask >> 16) & 0xFF))
 
     def reset(self, preserve_console_history=False):
         print("SC-16 starting...")

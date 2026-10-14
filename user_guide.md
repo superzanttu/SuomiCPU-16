@@ -940,6 +940,7 @@ space.
 | `void gfx_tile_upload(int tile, unsigned char *pixels)`                                 | Copy one 16x16 indexed tile into one of 256 hardware tile slots.                                                                                          |
 | `unsigned int gfx_keys(void)`                                                           | Held-key bitmask.                                                                                                                                          |
 | `unsigned int gfx_keys_ext(void)`                                                       | Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.                                                                                |
+| `unsigned int gfx_keys_ext2(void)`                                                      | Third held-key byte for application-specific controls. Tank-16 uses C, J, L, I, K, and period.                                                             |
 | `unsigned int gfx_random(void)`                                                         | Random byte (0-255).                                                                                                                                       |
 | `int gfx_mouse_x(void)` / `int gfx_mouse_y(void)`                                       | Mouse position in screen pixels (0-319, 0-239).                                                                                                            |
 | `unsigned int gfx_mouse_buttons(void)`                                                  | Held buttons: `MOUSE_LEFT` 1, `MOUSE_RIGHT` 2 (use with position for dragging).                                                                            |
@@ -955,6 +956,9 @@ space.
 Everything is clipped to the screen. Held keys (bitmask at `0x43004`): bit 0
 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
 (`0x43005`, `gfx_keys_ext()`, constants `KEYX_*`) holds bit 0 Q, 1 E, 2 X/Shift, 3 Z/Ctrl.
+The third byte (`0x43006`, `gfx_keys_ext2()`) uses `KEYX2_*` constants; Tank-16
+assigns bit 0 C, 1 J, 2 L, 3 I, 4 K, and 5 period. The mouse register block
+starts at `0x43008`.
 
 Speed register (`0x43003`): 0 = fixed speed (30 frames/s, 30000 instructions per frame), nonzero = maximum speed: the emulator drops the frame cap, skips most display refreshes and runs up to 300000 instructions per pass. Use it from C with `gfx_speed(1)` / `gfx_speed(0)`; time maximum-speed runs with the real-time clock (`gfx_rtc`), since frame ticks no longer match wall time. Page 9 of the showcase uses it to measure the SC-16 for 3 seconds.
 

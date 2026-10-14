@@ -22,6 +22,8 @@ void gfx_layer_reset(unsigned int visible_layers);
 void gfx_sound(int channel, int freq, int frames, int wave, int volume);
 unsigned int gfx_keys(void);
 unsigned int gfx_keys_ext(void);
+/* Additional held-key bank at keyboard-register offset +2. */
+unsigned int gfx_keys_ext2(void);
 // Mouse: position in screen pixels, held buttons and one-frame events (see MOUSE_* bits).
 int gfx_mouse_x(void);
 int gfx_mouse_y(void);
@@ -139,3 +141,10 @@ unsigned int gfx_irq_keys(void);
 #define KEYX_ROLL_RIGHT 2
 #define KEYX_THRUST 4
 #define KEYX_REVERSE 8
+
+#define KEYX2_P1_FIRE 1
+#define KEYX2_P2_LEFT 2
+#define KEYX2_P2_RIGHT 4
+#define KEYX2_P2_FORWARD 8
+#define KEYX2_P2_BACKWARD 16
+#define KEYX2_P2_FIRE 32

@@ -202,6 +202,14 @@ gfx_keys_ext:
     LD R0, R7
     RET
 
+; Third held-key byte for game-specific controls.
+gfx_keys_ext2:
+    CALLX CGFX_HIGH
+    LDI R6, 0x3006
+    ADD R7, R6
+    LD R0, R7
+    RET
+
 ; Mouse registers at 0x43008: X word, Y word, held buttons byte, event byte.
 gfx_mouse_x:
     CALLX CGFX_HIGH

@@ -56,6 +56,7 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_irq_ticks": ("unsigned int", ()),
     "gfx_irq_keys": ("unsigned int", ()),
     "gfx_keys_ext": ("unsigned int", ()),
+    "gfx_keys_ext2": ("unsigned int", ()),
     "gfx_mouse_x": ("int", ()),
     "gfx_mouse_y": ("int", ()),
     "gfx_mouse_buttons": ("unsigned int", ()),
