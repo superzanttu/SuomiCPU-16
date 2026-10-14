@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import unittest
 
 from c_compiler import GLOBAL_BASE, compile_source
@@ -43,6 +44,134 @@ class Tank16Tests(unittest.TestCase):
         self.assertNotEqual(cpu.sprite_memory[0][2], cpu.sprite_memory[8][2])
         self.assertNotEqual(cpu.sprite_memory[0][2], cpu.sprite_memory[16][2])
         self.assertNotEqual(cpu.sprite_memory[0][2], cpu.sprite_memory[24][2])
+        cpu.memory[KEYS_ADDR] = 1
+        cpu.memory[KEYS_ADDR + 2] = 2
+        for _ in range(4):
+            run_frame(cpu)
+        visible_slots = [
+            slot for slot, sprite in enumerate(cpu.sprites)
+            if sprite["flags"] & 1
+        ]
+        self.assertEqual(visible_slots, [20, 36])
+        self.assertEqual(cpu.sprites[20]["x"], 548)
+        self.assertEqual(cpu.sprites[20]["y"], 244)
+        self.assertEqual(cpu.sprites[36]["x"], 60)
+        self.assertEqual(cpu.sprites[36]["y"], 244)
+
+    def test_tank_speed_and_sprite_heading_match_all_directions(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = source_path.read_text(encoding="utf-8").replace(
+            "int main(void)", "int tank16_game_entry(void)", 1)
+        test_source = (
+            "int main(void) {\n"
+            "  int direction;\n"
+            "  int frame;\n"
+            "  setup_map();\n"
+            "  tank_sprite_slots[0] = -1;\n"
+            "  for (direction = 0; direction < 32; direction++) {\n"
+            "    start_round();\n"
+            "    tanks[0].x = 100; tanks[0].y = 260;\n"
+            "    tanks[0].direction = direction;\n"
+            "    tanks[1].x = 560; tanks[1].y = 440;\n"
+            "    for (frame = 0; frame < 16; frame++)\n"
+            "      update_tank(0, 4, 0);\n"
+            "    movement_results[direction * 3] = tanks[0].x - 100;\n"
+            "    movement_results[direction * 3 + 1] = tanks[0].y - 260;\n"
+            "    draw_tank(0);\n"
+            "    movement_results[direction * 3 + 2] = tank_sprite_slots[0];\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        filename = ROOT / "modules" / "Tank-16" / "movement_test.c"
+        cpu = make_cpu(compile_source(
+            "int movement_results[96];\nint main(void);\n" +
+            game_source + test_source,
+            str(filename),
+        ))
+        while cpu.running:
+            cpu.step()
+
+        def signed_word(value):
+            return value - 0x10000 if value & 0x8000 else value
+
+        results = [
+            signed_word(cpu.read_16(GLOBAL_BASE + index * 2))
+            for index in range(96)
+        ]
+        for direction in range(32):
+            dx, dy, sprite_slot = results[direction * 3:direction * 3 + 3]
+            self.assertGreaterEqual(dx * dx + dy * dy, 900)
+            self.assertLessEqual(dx * dx + dy * dy, 1156)
+            actual_angle = math.atan2(dx, -dy) % (math.pi * 2)
+            expected_angle = direction * math.pi / 16
+            angle_error = abs(actual_angle - expected_angle)
+            angle_error = min(angle_error, math.pi * 2 - angle_error)
+            self.assertLessEqual(angle_error, 0.05)
+            self.assertEqual(sprite_slot, direction + 32)
+
+    def test_shot_speed_and_aim_match_all_tank_directions(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = source_path.read_text(encoding="utf-8").replace(
+            "int main(void)", "int tank16_game_entry(void)", 1)
+        test_source = (
+            "int main(void) {\n"
+            "  int direction;\n"
+            "  int frame;\n"
+            "  int i;\n"
+            "  setup_map();\n"
+            "  for (i = 0; i < 7; i++) obstacles[i].x = 1000;\n"
+            "  for (direction = 0; direction < 32; direction++) {\n"
+            "    start_round();\n"
+            "    tanks[0].x = 320; tanks[0].y = 240;\n"
+            "    tanks[0].direction = direction;\n"
+            "    tanks[1].x = 600; tanks[1].y = 440;\n"
+            "    fire_shot(0);\n"
+            "    shot_results[direction * 4] = shots[0].x;\n"
+            "    shot_results[direction * 4 + 1] = shots[0].y;\n"
+            "    shot_results[direction * 4 + 2] = shots[0].direction;\n"
+            "    for (frame = 0; frame < 10; frame++) update_shots();\n"
+            "    shot_results[direction * 4 + 3] = shots[0].life;\n"
+            "    shot_results[128 + direction * 2] = shots[0].x;\n"
+            "    shot_results[129 + direction * 2] = shots[0].y;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        filename = ROOT / "modules" / "Tank-16" / "shot_direction_test.c"
+        cpu = make_cpu(compile_source(
+            "int shot_results[192];\nint main(void);\n" +
+            game_source + test_source,
+            str(filename),
+        ))
+        while cpu.running:
+            cpu.step()
+
+        def signed_word(value):
+            return value - 0x10000 if value & 0x8000 else value
+
+        results = [
+            signed_word(cpu.read_16(GLOBAL_BASE + index * 2))
+            for index in range(192)
+        ]
+        for direction in range(32):
+            start_x, start_y, shot_direction, life = results[
+                direction * 4:direction * 4 + 4
+            ]
+            end_x, end_y = results[128 + direction * 2:
+                                   130 + direction * 2]
+            dx = end_x - start_x
+            dy = end_y - start_y
+            distance_squared = dx * dx + dy * dy
+            self.assertEqual(shot_direction, direction)
+            self.assertEqual(life, 110)
+            self.assertGreaterEqual(distance_squared, 2304)
+            self.assertLessEqual(distance_squared, 2704)
+            actual_angle = math.atan2(dx, -dy) % (math.pi * 2)
+            expected_angle = direction * math.pi / 16
+            angle_error = abs(actual_angle - expected_angle)
+            angle_error = min(angle_error, math.pi * 2 - angle_error)
+            self.assertLessEqual(angle_error, 0.05)
 
     def test_c_program_can_read_third_held_key_byte(self):
         source = (

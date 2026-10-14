@@ -8,6 +8,7 @@
 #define MAX_SHOTS 12
 #define ROUND_FRAMES 9000
 #define ROUND_DELAY 90
+#define DIRECTION_SCALE 1000
 
 typedef struct {
     int x;
@@ -16,16 +17,18 @@ typedef struct {
     int health;
     int cooldown;
     int collision_cooldown;
+    int movement_remainder_x;
+    int movement_remainder_y;
 } Tank;
 
 typedef struct {
     int x;
     int y;
-    int vx;
-    int vy;
     int owner;
     int direction;
     int life;
+    int movement_remainder_x;
+    int movement_remainder_y;
 } Shot;
 
 typedef struct {
@@ -47,12 +50,13 @@ int round_delay;
 int round_over;
 int round_winner;
 int previous_keys;
+int tank_sprite_slots[2];
 int directions_x[32] = {
-    0, 2, 4, 6, 7, 8, 9, 10, 10, 10, 9, 8, 7, 6, 4, 2,
-    0, -2, -4, -6, -7, -8, -9, -10, -10, -10, -9, -8, -7, -6, -4, -2};
+    0, 195, 383, 556, 707, 831, 924, 981, 1000, 981, 924, 831, 707, 556, 383, 195,
+    0, -195, -383, -556, -707, -831, -924, -981, -1000, -981, -924, -831, -707, -556, -383, -195};
 int directions_y[32] = {
-    -10, -10, -9, -8, -7, -6, -4, -2, 0, 2, 4, 6, 7, 8, 9, 10,
-    10, 10, 9, 8, 7, 6, 4, 2, 0, -2, -4, -6, -7, -8, -9, -10};
+    -1000, -981, -924, -831, -707, -556, -383, -195, 0, 195, 383, 556, 707, 831, 924, 981,
+    1000, 981, 924, 831, 707, 556, 383, 195, 0, -195, -383, -556, -707, -831, -924, -981};
 
 void number_text(unsigned int value, char *out)
 {
@@ -77,6 +81,19 @@ void number_text(unsigned int value, char *out)
 int absolute_value(int value)
 {
     return value < 0 ? -value : value;
+}
+
+int direction_offset(int component, int distance)
+{
+    int offset;
+
+    offset = component * distance;
+    if (offset >= 0) {
+        offset += DIRECTION_SCALE / 2;
+    } else {
+        offset -= DIRECTION_SCALE / 2;
+    }
+    return offset / DIRECTION_SCALE;
 }
 
 int overlaps(int x, int y, int radius, Obstacle *obstacle)
@@ -122,6 +139,8 @@ void start_round(void)
         tanks[i].health = 100;
         tanks[i].cooldown = 0;
         tanks[i].collision_cooldown = 0;
+        tanks[i].movement_remainder_x = 0;
+        tanks[i].movement_remainder_y = 0;
     }
     for (i = 0; i < MAX_SHOTS; i++) {
         shots[i].life = 0;
@@ -219,14 +238,14 @@ void fire_shot(int player)
             direction = tanks[player].direction & 31;
             shot = &shots[i];
             shot->x = tanks[player].x +
-                      directions_x[direction] * 12 / 10;
+                      direction_offset(directions_x[direction], 12);
             shot->y = tanks[player].y +
-                      directions_y[direction] * 12 / 10;
-            shot->vx = directions_x[direction] * 5 / 10;
-            shot->vy = directions_y[direction] * 5 / 10;
+                      direction_offset(directions_y[direction], 12);
             shot->owner = player;
             shot->direction = direction;
             shot->life = 120;
+            shot->movement_remainder_x = 0;
+            shot->movement_remainder_y = 0;
             tanks[player].cooldown = 18;
             return;
         }
@@ -241,6 +260,8 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     int move;
     int next_x;
     int next_y;
+    int movement_numerator_x;
+    int movement_numerator_y;
     int forward_key;
     int backward_key;
 
@@ -263,8 +284,12 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     if (backward_key) {
         move = -2;
     }
-    next_x = old_x + directions_x[direction] * move / 10;
-    next_y = old_y + directions_y[direction] * move / 10;
+    movement_numerator_x = tanks[player].movement_remainder_x +
+                           directions_x[direction] * move;
+    movement_numerator_y = tanks[player].movement_remainder_y +
+                           directions_y[direction] * move;
+    next_x = old_x + movement_numerator_x / DIRECTION_SCALE;
+    next_y = old_y + movement_numerator_y / DIRECTION_SCALE;
     if (absolute_value(next_x - tanks[1 - player].x) < 20 &&
         absolute_value(next_y - tanks[1 - player].y) < 20) {
         if (tanks[player].collision_cooldown == 0) {
@@ -284,6 +309,12 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     } else if (!blocked(next_x, next_y, player)) {
         tanks[player].x = next_x;
         tanks[player].y = next_y;
+        tanks[player].movement_remainder_x =
+            movement_numerator_x -
+            (next_x - old_x) * DIRECTION_SCALE;
+        tanks[player].movement_remainder_y =
+            movement_numerator_y -
+            (next_y - old_y) * DIRECTION_SCALE;
     }
     if ((extra & (player == 0 ? KEYX2_P1_FIRE : KEYX2_P2_FIRE)) != 0) {
         fire_shot(player);
@@ -346,6 +377,10 @@ void update_shots(void)
     int i;
     int player;
     int blocked_shot;
+    int movement_numerator_x;
+    int movement_numerator_y;
+    int next_x;
+    int next_y;
     Shot *shot;
 
     for (i = 0; i < MAX_SHOTS; i++) {
@@ -353,8 +388,18 @@ void update_shots(void)
         if (shot->life == 0) {
             continue;
         }
-        shot->x += shot->vx;
-        shot->y += shot->vy;
+        movement_numerator_x = shot->movement_remainder_x +
+                               directions_x[shot->direction] * 5;
+        movement_numerator_y = shot->movement_remainder_y +
+                               directions_y[shot->direction] * 5;
+        next_x = shot->x + movement_numerator_x / DIRECTION_SCALE;
+        next_y = shot->y + movement_numerator_y / DIRECTION_SCALE;
+        shot->movement_remainder_x =
+            movement_numerator_x - (next_x - shot->x) * DIRECTION_SCALE;
+        shot->movement_remainder_y =
+            movement_numerator_y - (next_y - shot->y) * DIRECTION_SCALE;
+        shot->x = next_x;
+        shot->y = next_y;
         shot->life--;
         blocked_shot = shot->x < 8 || shot->x > 632 ||
                        shot->y < 32 || shot->y > 472;
@@ -414,6 +459,12 @@ void draw_tank(int player)
     if (player == 0) {
         slot += 32;
     }
+    if (tank_sprite_slots[player] != slot) {
+        if (tank_sprite_slots[player] >= 0) {
+            gfx_sprite_move(tank_sprite_slots[player], 0, 0, 0);
+        }
+        tank_sprite_slots[player] = slot;
+    }
     gfx_sprite_move(slot, tanks[player].x - 16,
                     tanks[player].y - 16, SPRITE_VISIBLE);
 }
@@ -451,10 +502,14 @@ void draw_hud(void)
     for (i = 0; i < MAX_SHOTS; i++) {
         if (shots[i].life > 0) {
             gfx_line(
-                shots[i].x - directions_x[shots[i].direction] * 4 / 10,
-                shots[i].y - directions_y[shots[i].direction] * 4 / 10,
-                shots[i].x + directions_x[shots[i].direction] * 4 / 10,
-                shots[i].y + directions_y[shots[i].direction] * 4 / 10,
+                shots[i].x -
+                    direction_offset(directions_x[shots[i].direction], 4),
+                shots[i].y -
+                    direction_offset(directions_y[shots[i].direction], 4),
+                shots[i].x +
+                    direction_offset(directions_x[shots[i].direction], 4),
+                shots[i].y +
+                    direction_offset(directions_y[shots[i].direction], 4),
                 YELLOW);
         }
     }
@@ -531,6 +586,8 @@ int main(void)
     wins[0] = 0;
     wins[1] = 0;
     previous_keys = 0;
+    tank_sprite_slots[0] = -1;
+    tank_sprite_slots[1] = -1;
     start_round();
     while (1) {
         keys = gfx_keys();
