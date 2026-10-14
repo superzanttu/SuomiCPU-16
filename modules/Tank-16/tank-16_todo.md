@@ -1,33 +1,28 @@
-# Tank-16 TODO
+# Tank-16 TODO List
 
-## Core game
-- [ ] Use `main.c` as the game's main file. Game is programmed in SC-16's C-language.
-- [ ] Build a two-player, top-down 2D tank battle for a 640x480 screen.
-- [ ] Keep both tanks inside the screen boundaries.
-- [ ] Implement Player 1 controls: A/D to turn, W/S to move forward/backward, and C to fire.
-- [ ] Implement Player 2 controls: J/L to turn, I/K to move forward/backward, and . (period) to fire.
-- [ ] Start Player 1 on the left side of the map and Player 2 on the right.
-- [ ] Let players drive, avoid obstacles, and hit the opposing tank with projectiles.
-- [ ] Give each player one life and 100 health points; update health when they take damage.
-- [ ] Reduce health by 10 points for an ammunition hit, 25 points for a mine, and 5 points for a tank collision.
-- [ ] End a round when a player's health reaches zero.
+## Completed
+### Gameplay
+- [x] Implement the game in SC-16 C in `main.c` for a 640×480 display.
+- [x] Support two players in a top-down tank battle; start Player 1 on the left and Player 2 on the right.
+- [x] Keep tanks within screen bounds and let players drive, avoid obstacles, and fire projectiles.
+- [x] Map controls: Player 1 uses A/D to turn, W/S to move, and C to fire; Player 2 uses J/L to turn, I/K to move, and period to fire.
+- [x] Give each player one life and 100 health; apply 10 damage for an ammunition hit, 25 for a mine, and 5 for a tank collision.
+- [x] End a round when a player's health reaches zero.
+- [x] Build the screen-sized map with 16×16 terrain tiles generated from `gfx/tiles_terrain.png`.
+- [x] Inspect `gfx/tiles_objects.png` and use the tank sprite at atlas coordinates (124, 68), source size 48×56.
+- [x] Provide `sprite_viewer.py` to inspect sprite IDs, atlas coordinates, and selected-region dimensions.
+- [x] Precalculate 32 tank sprite rotations and projectile directions.
+- [x] Show both players' health and the game timer and win count in the HUD.
+- [x] Limit each round to five minutes; decide the winner by remaining health and declare a draw on equal health.
+- [x] Start a new round automatically after each round and retain wins; reset the win count when the game restarts.
 
-## Graphics and map
-- [ ] Use `/Tank-16/gfx/tiles_terrain.png` for the terrain, scaling its 64x64 source tiles to 16x16 pixels.
-- [ ] Inspect `/Tank-16/gfx/tiles_objects.png` and document the available sprites, their dimensions, and positions in the image.
-- [ ] Create an external `sprite_viewer.py` tool to inspect available sprites and show their IDs, if IDs are used, and coordinates for hard-coding selected sprites into the game.
-- [ ] Create a screen-sized map using terrain tiles and place suitable objects from the object graphics.
-- [ ] Precalculate tank and projectile rotations to keep turning and firing animations smooth.
+## Remaining tasks
+- [ ] Use `sprite_viewer.py` to choose mine and obstacle sprites from the object atlas.
+- [ ] Define the chosen sprite coordinates in the game code and use those sprites instead of the current simple mine and obstacle drawings.
+- [ ] Add destructible and indestructible obstacles.
+- [ ] Add timed power-ups, such as increased speed, stronger shots, and health restoration.
+- [ ] Add sound effects for shooting, tank movement, and explosions.
 
-## HUD and match flow
-- [ ] Show Player 1's health at the top left and Player 2's health at the top right; update both in real time.
-- [ ] Show the game timer at the top center, with the players' win count (for example, `1-2`) next to it.
-- [ ] Limit each match to five minutes. When time expires, determine the winner from the remaining health.
-- [ ] Treat equal health when time expires as a draw.
-- [ ] Automatically start a new round after each round ends and preserve the win count between rounds.
-- [ ] Reset the win count when the game is restarted.
-
-## Optional enhancements
-- [ ] Later enhancement: add destructible and indestructible obstacles.
-- [ ] Later enhancement: add timed power-ups, such as increased speed, stronger shots, and health restoration.
-- [ ] Later enhancement: add sound effects for shooting, tank movement, and explosions.
+## Questions for the user
+Q: Which object-atlas sprites should be used for mines and obstacles?
+A: No sprite choices have been specified yet. Choose them with `sprite_viewer.py`; then record their atlas coordinates in the game code.

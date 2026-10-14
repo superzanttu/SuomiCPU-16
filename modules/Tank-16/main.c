@@ -1,5 +1,6 @@
 #include "suomi_gfx.h"
 #include "terrain_tiles.h"
+#include "tank_sprite_rotations.h"
 
 #define MAP_COLUMNS 40
 #define MAP_ROWS 30
@@ -23,6 +24,7 @@ typedef struct {
     int vx;
     int vy;
     int owner;
+    int direction;
     int life;
 } Shot;
 
@@ -36,6 +38,7 @@ typedef struct {
 Tank tanks[2];
 Shot shots[MAX_SHOTS];
 unsigned char map_data[MAP_CELLS];
+unsigned char sprite_work[32 * 32];
 unsigned char mine_active[3];
 Obstacle obstacles[7];
 int wins[2];
@@ -89,11 +92,11 @@ int blocked(int x, int y, int tank_index)
     int i;
     int other;
 
-    if (x < 16 || x > 624 || y < 46 || y > 465) {
+    if (x < 16 || x > 624 || y < 46 || y > 464) {
         return 1;
     }
     for (i = 0; i < 7; i++) {
-        if (overlaps(x, y, 12, &obstacles[i])) {
+        if (overlaps(x, y, 16, &obstacles[i])) {
             return 1;
         }
     }
@@ -130,6 +133,27 @@ void start_round(void)
     round_delay = 0;
     round_over = 0;
     round_winner = -1;
+}
+
+void load_tank_sprites(void)
+{
+    int angle;
+    int pixel;
+    unsigned char color;
+
+    for (angle = 0; angle < 32; angle++) {
+        gfx_sprite_upload(angle, 32, 32, tank_sprite_rotations[angle]);
+        for (pixel = 0; pixel < 32 * 32; pixel++) {
+            color = tank_sprite_rotations[angle][pixel];
+            if (color == RED) {
+                color = GREEN;
+            } else if (color == DARK_RED) {
+                color = DARK_GRAY;
+            }
+            sprite_work[pixel] = color;
+        }
+        gfx_sprite_upload(angle + 32, 32, 32, sprite_work);
+    }
 }
 
 void setup_map(void)
@@ -201,6 +225,7 @@ void fire_shot(int player)
             shot->vx = directions_x[direction] * 5 / 10;
             shot->vy = directions_y[direction] * 5 / 10;
             shot->owner = player;
+            shot->direction = direction;
             shot->life = 120;
             tanks[player].cooldown = 18;
             return;
@@ -383,46 +408,14 @@ void update_game(unsigned int keys, unsigned int extra)
 
 void draw_tank(int player)
 {
-    int direction;
-    int side;
-    int x;
-    int y;
-    int fx;
-    int fy;
-    int sx;
-    int sy;
-    int front_x;
-    int front_y;
-    int rear_x;
-    int rear_y;
-    int color;
+    int slot;
 
-    direction = tanks[player].direction;
-    side = (direction + 8) & 31;
-    x = tanks[player].x;
-    y = tanks[player].y;
-    fx = directions_x[direction] * 9 / 10;
-    fy = directions_y[direction] * 9 / 10;
-    sx = directions_x[side] * 6 / 10;
-    sy = directions_y[side] * 6 / 10;
-    front_x = x + fx;
-    front_y = y + fy;
-    rear_x = x - fx;
-    rear_y = y - fy;
-    color = player == 0 ? GREEN : RED;
-    gfx_line(front_x + sx, front_y + sy,
-             front_x - sx, front_y - sy, color);
-    gfx_line(front_x + sx, front_y + sy,
-             rear_x + sx, rear_y + sy, color);
-    gfx_line(rear_x + sx, rear_y + sy,
-             rear_x - sx, rear_y - sy, color);
-    gfx_line(rear_x - sx, rear_y - sy,
-             front_x - sx, front_y - sy, color);
-    gfx_line(x, y, x + directions_x[direction] * 15 / 10,
-             y + directions_y[direction] * 15 / 10, WHITE);
-    gfx_rect(x - 3, y - 3, 7, 7, color);
-    gfx_line(x - 3, y - 7, x + 3, y - 7, color);
-    gfx_line(x - 3, y + 7, x + 3, y + 7, color);
+    slot = tanks[player].direction & 31;
+    if (player == 0) {
+        slot += 32;
+    }
+    gfx_sprite_move(slot, tanks[player].x - 16,
+                    tanks[player].y - 16, SPRITE_VISIBLE);
 }
 
 void draw_hud(void)
@@ -432,50 +425,11 @@ void draw_hud(void)
     char timer[16];
     unsigned int seconds;
     int i;
-
-    gfx_layer_select(LAYER_HUD);
-    gfx_clear(255);
-    gfx_rect(0, 0, 640, 30, DARK_GRAY);
-    gfx_text(8, 5, "P1", WHITE);
-    number_text((unsigned int)tanks[0].health, health);
-    gfx_text(28, 5, health, WHITE);
-    gfx_rect(68, 7, 100, 10, DARK_RED);
-    gfx_rect(68, 7, tanks[0].health, 10, GREEN);
-    gfx_text(204, 5, "P2", WHITE);
-    number_text((unsigned int)tanks[1].health, health);
-    gfx_text(224, 5, health, WHITE);
-    gfx_rect(264, 7, 100, 10, DARK_RED);
-    gfx_rect(264, 7, tanks[1].health, 10, RED);
-    seconds = (unsigned int)(round_frames > 0 ? round_frames / 30 : 0);
-    timer[0] = 'T';
-    timer[1] = 'I';
-    timer[2] = 'M';
-    timer[3] = 'E';
-    timer[4] = ' ';
-    timer[5] = (char)('0' + seconds / 60);
-    timer[6] = ':';
-    timer[7] = (char)('0' + (seconds % 60) / 10);
-    timer[8] = (char)('0' + seconds % 10);
-    timer[9] = 0;
-    gfx_text(398, 5, timer, YELLOW);
-    number_text((unsigned int)wins[0], score);
-    i = 0;
-    while (score[i] != 0 && i < 5) {
-        i++;
-    }
-    score[i++] = '-';
-    number_text((unsigned int)wins[1], score + i);
-    gfx_text(500, 5, score, WHITE);
-}
-
-void draw_game(void)
-{
-    int i;
     int mine_x[3];
     int mine_y[3];
 
-    gfx_layer_select(LAYER_SPRITES);
-    gfx_clear(0);
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(15);
     for (i = 0; i < 7; i++) {
         gfx_rect(obstacles[i].x, obstacles[i].y,
                  obstacles[i].width, obstacles[i].height, DARK_GRAY);
@@ -496,12 +450,54 @@ void draw_game(void)
     }
     for (i = 0; i < MAX_SHOTS; i++) {
         if (shots[i].life > 0) {
-            gfx_rect(shots[i].x - 2, shots[i].y - 2,
-                     5, 5, YELLOW);
+            gfx_line(
+                shots[i].x - directions_x[shots[i].direction] * 4 / 10,
+                shots[i].y - directions_y[shots[i].direction] * 4 / 10,
+                shots[i].x + directions_x[shots[i].direction] * 4 / 10,
+                shots[i].y + directions_y[shots[i].direction] * 4 / 10,
+                YELLOW);
         }
     }
+    gfx_rect(0, 0, 640, 30, DARK_GRAY);
+    gfx_text(8, 5, "P1", WHITE);
+    number_text((unsigned int)tanks[0].health, health);
+    gfx_text(28, 5, health, WHITE);
+    gfx_rect(68, 7, 100, 10, DARK_RED);
+    gfx_rect(68, 7, tanks[0].health, 10, GREEN);
+    gfx_text(472, 5, "P2", WHITE);
+    number_text((unsigned int)tanks[1].health, health);
+    gfx_text(492, 5, health, WHITE);
+    gfx_rect(528, 7, 100, 10, DARK_RED);
+    gfx_rect(528, 7, tanks[1].health, 10, RED);
+    seconds = (unsigned int)(round_frames > 0 ?
+                             (round_frames + 29) / 30 : 0);
+    timer[0] = 'T';
+    timer[1] = 'I';
+    timer[2] = 'M';
+    timer[3] = 'E';
+    timer[4] = ' ';
+    timer[5] = (char)('0' + seconds / 60);
+    timer[6] = ':';
+    timer[7] = (char)('0' + (seconds % 60) / 10);
+    timer[8] = (char)('0' + seconds % 10);
+    timer[9] = 0;
+    gfx_text(274, 5, timer, YELLOW);
+    number_text((unsigned int)wins[0], score);
+    i = 0;
+    while (score[i] != 0 && i < 5) {
+        i++;
+    }
+    score[i++] = '-';
+    number_text((unsigned int)wins[1], score + i);
+    gfx_text(338, 5, score, WHITE);
+}
+
+void draw_game(void)
+{
+    gfx_layer_select(LAYER_SPRITES);
     draw_tank(0);
     draw_tank(1);
+    draw_hud();
     if (round_over) {
         if (round_winner < 0) {
             gfx_text(285, 220, "DRAW", YELLOW);
@@ -511,7 +507,6 @@ void draw_game(void)
             gfx_text(270, 220, "PLAYER 2 WINS", RED);
         }
     }
-    draw_hud();
 }
 
 int main(void)
@@ -525,7 +520,8 @@ int main(void)
     gfx_vsync(1);
     gfx_layer_reset((1 << LAYER_TILES) | (1 << LAYER_SPRITES) |
                     (1 << LAYER_HUD));
-    gfx_layer_transparency(LAYER_HUD, 255);
+    gfx_layer_transparency(LAYER_HUD, 15);
+    load_tank_sprites();
     for (i = 0; i < 4; i++) {
         gfx_tile_upload(i, terrain_tiles[i]);
     }

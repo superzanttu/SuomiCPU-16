@@ -10,13 +10,39 @@ class Tank16Tests(unittest.TestCase):
     def test_main_game_compiles_and_renders_a_frame(self):
         source = ROOT / "modules" / "Tank-16" / "main.c"
         cpu = make_cpu(compile_file(source))
-        run_frame(cpu)
-        run_frame(cpu)
+        for _ in range(8):
+            run_frame(cpu)
+            if cpu.frame_yield:
+                break
 
+        self.assertTrue(cpu.frame_yield)
         self.assertEqual(cpu.tilemap_width, 40)
         self.assertEqual(cpu.tilemap_height, 30)
-        self.assertEqual(layer_pixel(cpu, 2, 76, 260), 3)
-        self.assertEqual(layer_pixel(cpu, 2, 564, 260), 2)
+        player_one = [
+            layer_pixel(cpu, 2, x, y)
+            for y in range(244, 276)
+            for x in range(60, 92)
+        ]
+        player_two = [
+            layer_pixel(cpu, 2, x, y)
+            for y in range(244, 276)
+            for x in range(548, 580)
+        ]
+        self.assertGreater(sum(value != 0 for value in player_one), 100)
+        self.assertGreater(sum(value != 0 for value in player_two), 100)
+        self.assertIn(3, player_one)
+        self.assertIn(2, player_two)
+        for slot in range(64):
+            width, height, pixels = cpu.sprite_memory[slot]
+            self.assertEqual((width, height), (32, 32))
+            for position in range(32):
+                self.assertEqual(pixels[position], 0)
+                self.assertEqual(pixels[31 * 32 + position], 0)
+                self.assertEqual(pixels[position * 32], 0)
+                self.assertEqual(pixels[position * 32 + 31], 0)
+        self.assertNotEqual(cpu.sprite_memory[0][2], cpu.sprite_memory[8][2])
+        self.assertNotEqual(cpu.sprite_memory[0][2], cpu.sprite_memory[16][2])
+        self.assertNotEqual(cpu.sprite_memory[0][2], cpu.sprite_memory[24][2])
 
     def test_c_program_can_read_third_held_key_byte(self):
         source = (
