@@ -10,7 +10,7 @@ from gfx_harness import ROOT, compile_file, layer_pixel, make_cpu, pixel, run_fr
 from src.SuomiCPU import (
     GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_FAST, SPEED_MAX,
     GFX_MODE_640_480, GFX_MODE_ADDR, MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR,
-    GPU_LAYER_ORDER, VRAM_SIZE, VRAM_START, VSYNC_ADDR, SuomiCompute16,
+    GPU_LAYER_ORDER, GPU_LAYER_SELECT, VRAM_SIZE, VRAM_START, VSYNC_ADDR, SuomiCompute16,
     _load_jit, create_memory,
 )
 
@@ -45,6 +45,67 @@ def back(cpu, x, y, layer=0):
 
 
 class GpuTests(unittest.TestCase):
+    def test_world_effect_wrappers_clip_to_map_and_preserve_both_camera_views(self):
+        cpu = run_c(
+            "typedef struct { int x; int y; int life; int mask; } Emitter;\n"
+            "Emitter sites[2];\n"
+            "unsigned char tile[1024]; unsigned char map[1];\n"
+            "int main(void) {\n"
+            "  gfx_mode(GFX_MODE_640_480); gfx_tile_size(32);\n"
+            "  gfx_tile_upload(0, tile); gfx_tilemap(map, 1, 1, 0, 0);\n"
+            "  gfx_split_camera(0, 0, 0, 0); gfx_layer_select(LAYER_3D);\n"
+            "  gfx_world_rect(-2, -2, 6, 6, 42);\n"
+            "  gfx_world_particle(30, 30, 4, 8, 16);\n"
+            "  sites[0].x = 16; sites[0].y = 24; sites[0].life = 11; sites[0].mask = -1;\n"
+            "  sites[1].x = 28; sites[1].y = 10; sites[1].life = 0; sites[1].mask = -1;\n"
+            "  gfx_world_emitters(sites, 2, 12);\n"
+            "  gfx_present(); return 0;\n"
+            "}\n"
+        )
+        for offset in (0, 320):
+            self.assertEqual(back(cpu, offset + 0, 0, 3), 42)
+            self.assertEqual(back(cpu, offset + 3, 3, 3), 42)
+            self.assertEqual(back(cpu, offset + 4, 4, 3), 0)
+            self.assertEqual(back(cpu, offset + 30, 30, 3), 8)
+            self.assertEqual(back(cpu, offset + 32, 30, 3), 0)
+            self.assertEqual(back(cpu, offset + 30, 32, 3), 0)
+            self.assertIn(back(cpu, offset + 16, 24, 3), (1, 5, 8, 11))
+        self.assertEqual(cpu.gpu_layers[3][:320], cpu.gpu_layers[3][320:640])
+
+    def test_emitter_animation_is_repeatable_and_wrecks_use_opaque_sprite_pixels(self):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
+        cpu._ensure_gpu_state()
+        cpu.split_cameras = ((0, 0), (0, 0))
+        cpu.memory[GPU_LAYER_SELECT] = 2
+        cpu.sprite_memory[0] = (32, 32, bytes(
+            2 if x == 2 and y == 28 else 0
+            for y in range(32) for x in range(32)))
+        address = 0x12000
+        for offset, value in ((0, 100), (2, 120), (4, 11), (6, 0)):
+            cpu.write_16(address + offset, value)
+        gpu(cpu, 34, x=1, y=0, source=address)
+        first = bytes(cpu.gpu_layers[2])
+        self.assertEqual(back(cpu, 86, 132, 2), 12)
+        self.assertEqual(back(cpu, 85, 132, 2), 0)
+        cpu.gpu_layers[2][:] = bytes(len(cpu.gpu_layers[2]))
+        gpu(cpu, 34, x=1, y=0, source=address)
+        self.assertEqual(bytes(cpu.gpu_layers[2]), first)
+        cpu.gpu_layers[2][:] = bytes(len(cpu.gpu_layers[2]))
+        gpu(cpu, 34, x=1, y=12, source=address)
+        self.assertNotEqual(bytes(cpu.gpu_layers[2]), first)
+        self.assertTrue(any(pixel in (9, 10) for pixel in cpu.gpu_layers[2]))
+        cpu.write_16(address + 4, 0)
+        cpu.gpu_layers[2][:] = bytes(len(cpu.gpu_layers[2]))
+        gpu(cpu, 34, x=1, y=12, source=address)
+        self.assertFalse(any(cpu.gpu_layers[2]))
+        with self.assertRaises(ValueError):
+            gpu(cpu, 35, w=33, h=16)
+        with self.assertRaises(ValueError):
+            gpu(cpu, 35, w=2, h=17)
+        with self.assertRaises(ValueError):
+            gpu(cpu, 34, x=-1, source=address)
+
     def test_pixel_masks_use_opaque_pixels_at_every_supported_tile_scale(self):
         cpu = bare_cpu()
         cpu._ensure_gpu_state()

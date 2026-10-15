@@ -45,6 +45,9 @@ void gfx_world_tile(int tile, int x, int y);
 int gfx_mask_overlap(int first, int first_x, int first_y,
                      int second, int second_x, int second_y);
 void gfx_world_ammo(int x, int y);
+void gfx_world_rect(int x, int y, int width, int height, int color);
+void gfx_world_particle(int x, int y, int radius, int color, int opacity);
+void gfx_world_emitters(void *sites, int count, int tick);
 #define GFX_MASK_TILE_BASE 64
 #define GFX_MASK_AMMO 320
 /* Set one indexed color-map entry (index and RGB channels are 0..255). */

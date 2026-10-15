@@ -138,6 +138,7 @@ GPU_PALETTE = 27
 GPU_TILE_SIZE = 28
 GPU_WORLD_TILE = 30
 GPU_MASK_OVERLAP, GPU_WORLD_AMMO = 31, 32
+GPU_WORLD_RECT, GPU_WORLD_EMITTERS, GPU_WORLD_PARTICLE = 33, 34, 35
 GPU_SPRITE_SLOTS = 64
 GPU_SPRITE_MAX_SIZE = 64
 GPU_TILE_COUNT = 256
@@ -783,6 +784,119 @@ class SuomiCompute16:
             self._gpu_result(self._gpu_masks_overlap(first, x, y, second, w, h))
         elif command == GPU_WORLD_AMMO:
             self._gpu_world_ammo(x, y, layer)
+        elif command == GPU_WORLD_RECT:
+            self._gpu_world_rect(x, y, w, h, color, layer)
+        elif command == GPU_WORLD_PARTICLE:
+            if not 0 <= w <= 32 or not 0 <= h <= 16:
+                raise ValueError("World particle radius/opacity outside supported range")
+            self._gpu_world_disc(x, y, w, color, h, layer)
+        elif command == GPU_WORLD_EMITTERS:
+            self._gpu_world_emitters(self._gpu_source(), x, y, layer)
+
+    def _gpu_world_views(self, x, y, width, height, layer):
+        if layer == 0:
+            raise ValueError("World effects require an unpacked graphics layer")
+        screen_width, screen_height = self._screen_size()
+        cameras = self.split_cameras
+        views = ((self.tile_camera, 0, screen_width),) if cameras is None else (
+            (cameras[0], 0, screen_width // 2),
+            (cameras[1], screen_width // 2, screen_width))
+        map_width = self.tilemap_width * self.tile_pixel_size
+        map_height = self.tilemap_height * self.tile_pixel_size
+        for (camera_x, camera_y), clip_left, clip_right in views:
+            left = max(x, camera_x)
+            right = min(x + width, camera_x + clip_right - clip_left)
+            top = max(y, camera_y)
+            bottom = min(y + height, camera_y + screen_height)
+            if self.tilemap_width and self.tilemap_height:
+                left, right = max(left, 0), min(right, map_width)
+                top, bottom = max(top, 0), min(bottom, map_height)
+            if left < right and top < bottom:
+                yield (left, top, right, bottom,
+                       clip_left - camera_x, -camera_y, screen_width)
+
+    def _gpu_world_rect(self, x, y, width, height, color, layer):
+        target = self.gpu_layers[layer]
+        for left, top, right, bottom, dx, dy, stride in self._gpu_world_views(
+                x, y, width, height, layer):
+            pixels = bytes((color,)) * (right - left)
+            for row in range(top, bottom):
+                start = (row + dy) * stride + left + dx
+                target[start:start + len(pixels)] = pixels
+
+    def _gpu_world_disc(self, x, y, radius, color, opacity, layer):
+        target = self.gpu_layers[layer]
+        dither = (0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5)
+        for left, top, right, bottom, dx, dy, stride in self._gpu_world_views(
+                x - radius, y - radius, radius * 2 + 1, radius * 2 + 1, layer):
+            for row in range(top, bottom):
+                for column in range(left, right):
+                    distance = (row - y) ** 2 + (column - x) ** 2
+                    if distance > radius * radius:
+                        continue
+                    coverage = opacity
+                    if radius > 2 and distance > (radius - 1) ** 2:
+                        coverage = opacity // 2
+                    if dither[(row & 3) * 4 + (column & 3)] < coverage:
+                        target[(row + dy) * stride + column + dx] = color
+
+    def _gpu_world_emitters(self, source, count, tick, layer):
+        if count < 0 or source + count * 8 > len(self.memory):
+            raise ValueError("World emitter buffer outside guest memory")
+        if layer == 0:
+            raise ValueError("World emitters require an unpacked graphics layer")
+        target = self.gpu_layers[layer]
+        drawn_sites = set()
+        smoke_cells = set()
+        for index in range(count):
+            address = source + index * 8
+            x, y, life, mask = (
+                self._gpu3d_signed_word(self.memory, address + offset)
+                for offset in (0, 2, 4, 6))
+            if life <= 0:
+                continue
+            if not any(self._gpu_world_views(x - 24, y - 56, 48, 80, layer)):
+                continue
+            if (x, y, mask) in drawn_sites:
+                continue
+            drawn_sites.add((x, y, mask))
+            if mask >= 0:
+                image = self._gpu_collision_mask(mask)
+                if image is None:
+                    raise ValueError("Wreck mask has not been uploaded")
+                width, height, pixels = image
+                for left, top, right, bottom, dx, dy, stride in self._gpu_world_views(
+                        x - width // 2, y - height // 2, width, height, layer):
+                    for row in range(top, bottom):
+                        for column in range(left, right):
+                            pixel = pixels[(row - y + height // 2) * width +
+                                           column - x + width // 2]
+                            if pixel:
+                                target[(row + dy) * stride + column + dx] = (
+                                    10 if pixel in (1, 10, 11) else 12)
+            self._gpu_world_disc(x, y + 2, 10 if mask >= 0 else 4, 10, 12, layer)
+            self._gpu_world_disc(x, y, 3 if mask >= 0 else 1,
+                                 8 if (tick + index) % 6 < 3 else 5, 16, layer)
+            cell = (x // 16, y // 16)
+            if cell in smoke_cells:
+                continue
+            smoke_cells.add(cell)
+            for particle in range(8 if mask >= 0 else 4):
+                seed = (index * 137 + particle * 71 + x * 13 + y * 7) & 0xFFFF
+                age = (tick + seed) % 36
+                drift = (seed % 7) - 3
+                px = x + (seed % 9 - 4) + drift * age // 24
+                py = y - age * (2 if mask >= 0 else 1) // 3
+                if age < 16:
+                    radius = max(1, (5 if mask >= 0 else 3) - age // 5)
+                    self._gpu_world_disc(px, py, radius,
+                                         5 if age < 5 else 8 if age < 11 else 11,
+                                         16, layer)
+                    if age < 5:
+                        self._gpu_world_disc(px, py, 1, 1, 12, layer)
+                else:
+                    self._gpu_world_disc(px, py, 2 + age // 8, 10 if age < 26 else 9,
+                                         max(1, (36 - age) // 2), layer)
 
     def _gpu_collision_mask(self, mask):
         if 0 <= mask < GPU_SPRITE_SLOTS:

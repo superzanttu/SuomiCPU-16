@@ -14,7 +14,7 @@
 #define TANK_SPRITE_PIXEL_COUNT (TANK_SPRITE_WIDTH * TANK_SPRITE_HEIGHT)
 #define TANK_SPRITE_PLAYER_2_BASE 0
 #define TANK_SPRITE_PLAYER_1_BASE TANK_ROTATION_COUNT
-#define MAX_TRACK_MARKS 96
+#define MAX_TRACK_MARKS 288
 #define TRACK_SPACING 4
 #define TRACK_COLOR 12
 #define EXPLOSION_FRAMES 18
@@ -23,9 +23,20 @@
 #define HIT_FLASH_FRAMES 8
 #define MAX_IMPACTS 12
 #define IMPACT_FRAMES 10
-#define MAX_PARTICLES 48
-#define PARTICLE_FRAMES 24
-#define FIRE_EMISSION_INTERVAL 3
+#define MAX_PARTICLES 80
+#define PARTICLE_FRAMES 36
+#define BURN_ROUNDS 10
+#define MAX_BURN_SITES ((ROUND_FRAMES / SHOT_COOLDOWN * 2 + 2) * (BURN_ROUNDS + 1))
+#define SPEED_SCALE 16
+#define MAX_FORWARD_SPEED 32
+#define MAX_REVERSE_SPEED 16
+#define MOVING_TURN_FRAMES 4
+#define STATIONARY_TURN_FRAMES 2
+#define HANDBRAKE_DECELERATION 1
+#define PARTICLE_SPARK 0
+#define PARTICLE_SMOKE 1
+#define PARTICLE_FLAME 2
+#define PARTICLE_DEBRIS 3
 
 typedef struct
 {
@@ -37,6 +48,13 @@ typedef struct
     int collision_cooldown;
     int movement_remainder_x;
     int movement_remainder_y;
+    int throttle;
+    int speed;
+    int turn_tick;
+    int impulse_x;
+    int impulse_y;
+    int shake;
+    int handbrake;
 } Tank;
 
 typedef struct
@@ -58,14 +76,31 @@ typedef struct
     int velocity_y;
     int life;
     int smoke;
+    int age;
+    int size;
+    int remainder_x;
+    int remainder_y;
 } Particle;
+
+typedef struct
+{
+    int x;
+    int y;
+    int rounds;
+    int mask;
+} BurnSite;
 
 Tank tanks[2];
 Shot shots[MAX_SHOTS];
 Particle particles[MAX_PARTICLES];
+BurnSite burn_sites[MAX_BURN_SITES];
+BurnSite *next_burn_site;
+int next_burn_index;
+int burn_count;
+int burn_capacity_error;
+int effect_tick;
+unsigned int effect_random = 12345;
 int next_particle;
-int particle_sequence;
-int fire_tick;
 unsigned char sprite_work[TANK_SPRITE_PIXEL_COUNT];
 unsigned char object_active[MAP_OBJECT_CAPACITY];
 unsigned char object_contacts[MAP_OBJECT_CAPACITY];
@@ -73,6 +108,8 @@ unsigned char object_explosion[MAP_OBJECT_CAPACITY];
 int track_x[MAX_TRACK_MARKS];
 int track_y[MAX_TRACK_MARKS];
 int track_direction[MAX_TRACK_MARKS];
+int track_offset_x[MAX_TRACK_MARKS];
+int track_offset_y[MAX_TRACK_MARKS];
 int track_count;
 int next_track;
 int last_track_x[2];
@@ -145,6 +182,136 @@ int direction_offset(int component, int distance)
     return offset / DIRECTION_SCALE;
 }
 
+int effect_noise(int range)
+{
+    effect_random = effect_random * 25173 + 13849;
+    return (int)((effect_random >> 1) % (unsigned int)range);
+}
+
+void add_burn_site(int x, int y, int mask)
+{
+    int i;
+    int index;
+    BurnSite *site;
+
+    index = next_burn_index;
+    site = next_burn_site;
+    if (site == 0)
+        site = burn_sites;
+    for (i = 0; i < MAX_BURN_SITES; i++)
+    {
+        if (site->rounds == 0)
+        {
+            site->x = x < 0 ? 0 : x;
+            site->y = y < 0 ? 0 : y;
+            if (site->x >= MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
+                site->x = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 1;
+            if (site->y >= MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+                site->y = MAP_ROWS * MAP_TILE_PIXEL_SIZE - 1;
+            site->rounds = BURN_ROUNDS + 1;
+            site->mask = mask;
+            if (index == burn_count)
+                burn_count++;
+            site++;
+            index++;
+            if (index == MAX_BURN_SITES)
+            {
+                site = burn_sites;
+                index = 0;
+            }
+            next_burn_site = site;
+            next_burn_index = index;
+            return;
+        }
+        site++;
+        index++;
+        if (index == MAX_BURN_SITES)
+        {
+            site = burn_sites;
+            index = 0;
+        }
+    }
+    burn_capacity_error = 1;
+}
+
+void age_burn_sites(void)
+{
+    int i;
+    BurnSite *site;
+
+    site = burn_sites;
+    for (i = 0; i < burn_count; i++)
+    {
+        if (site->rounds > 0)
+            site->rounds--;
+        site++;
+    }
+}
+
+void reset_battlefield(void)
+{
+    int i;
+    BurnSite *site;
+
+    site = burn_sites;
+    for (i = 0; i < burn_count; i++)
+    {
+        site->rounds = 0;
+        site++;
+    }
+    burn_count = 0;
+    next_burn_site = burn_sites;
+    next_burn_index = 0;
+    burn_capacity_error = 0;
+}
+
+void tank_impulse(int player, int x, int y, int strength)
+{
+    tanks[player].impulse_x += x;
+    tanks[player].impulse_y += y;
+    if (tanks[player].impulse_x > 48)
+        tanks[player].impulse_x = 48;
+    if (tanks[player].impulse_x < -48)
+        tanks[player].impulse_x = -48;
+    if (tanks[player].impulse_y > 48)
+        tanks[player].impulse_y = 48;
+    if (tanks[player].impulse_y < -48)
+        tanks[player].impulse_y = -48;
+    if (strength > tanks[player].shake)
+        tanks[player].shake = strength;
+}
+
+void blast_reaction(int x, int y, int strength)
+{
+    int player;
+    int dx;
+    int dy;
+    int distance;
+    int force;
+
+    for (player = 0; player < 2; player++)
+    {
+        if (tanks[player].health <= 0)
+            continue;
+        dx = tanks[player].x - x;
+        dy = tanks[player].y - y;
+        distance = absolute_value(dx) + absolute_value(dy);
+        if (distance < 64)
+        {
+            force = strength * (64 - distance) / 64;
+            if (distance == 0)
+            {
+                dx = directions_x[tanks[player].direction] / 100;
+                dy = directions_y[tanks[player].direction] / 100;
+                distance = 10;
+            }
+            tank_impulse(player, dx * force / distance,
+                         dy * force / distance, force / 4 + 2);
+            tanks[player].speed /= 2;
+        }
+    }
+}
+
 void emit_particle(int x, int y, int velocity_x, int velocity_y, int smoke)
 {
     Particle *particle;
@@ -152,10 +319,15 @@ void emit_particle(int x, int y, int velocity_x, int velocity_y, int smoke)
     particle = &particles[next_particle];
     particle->x = x;
     particle->y = y;
-    particle->velocity_x = velocity_x;
-    particle->velocity_y = velocity_y;
-    particle->life = PARTICLE_FRAMES;
+    particle->velocity_x = velocity_x * 4;
+    particle->velocity_y = velocity_y * 4;
+    particle->life = smoke == PARTICLE_SMOKE ? 36 + effect_noise(25) : smoke == PARTICLE_FLAME ? 12 + effect_noise(13)
+                                                                                               : 18 + effect_noise(PARTICLE_FRAMES - 17);
     particle->smoke = smoke;
+    particle->age = 0;
+    particle->size = smoke == PARTICLE_SMOKE ? 3 + effect_noise(3) : 1 + effect_noise(2);
+    particle->remainder_x = 0;
+    particle->remainder_y = 0;
     next_particle = (next_particle + 1) % MAX_PARTICLES;
 }
 
@@ -163,14 +335,20 @@ void emit_explosion(int x, int y, int speed)
 {
     int direction;
 
-    for (direction = 0; direction < TANK_ROTATION_COUNT; direction += 4)
+    for (direction = 0; direction < TANK_ROTATION_COUNT; direction += 2)
     {
-        emit_particle(x, y,
-                      direction_offset(directions_x[direction], speed),
-                      direction_offset(directions_y[direction], speed), 0);
+        emit_particle(x + effect_noise(5) - 2, y + effect_noise(5) - 2,
+                      direction_offset(directions_x[direction], speed) + effect_noise(3) - 1,
+                      direction_offset(directions_y[direction], speed) - effect_noise(2),
+                      direction % 4 == 0 ? PARTICLE_SPARK : PARTICLE_DEBRIS);
     }
-    emit_particle(x - 2, y, -1, -1, 1);
-    emit_particle(x + 2, y, 1, -1, 1);
+    for (direction = 0; direction < 4; direction++)
+    {
+        emit_particle(x + effect_noise(9) - 4, y + effect_noise(5) - 2,
+                      effect_noise(3) - 1, -1, PARTICLE_SMOKE);
+        emit_particle(x + effect_noise(7) - 3, y,
+                      effect_noise(3) - 1, -1, PARTICLE_FLAME);
+    }
 }
 
 void explode_object(int index)
@@ -181,6 +359,8 @@ void explode_object(int index)
                    map_object_y[index] * MAP_TILE_PIXEL_SIZE +
                        MAP_TILE_PIXEL_SIZE / 2,
                    2);
+    blast_reaction(map_object_x[index] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2,
+                   map_object_y[index] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2, 40);
     gfx_sound(0, 90, 8, WAVE_NOISE, 35);
 }
 
@@ -213,6 +393,11 @@ void change_health(int player, int amount)
         hit_flash[player] = HIT_FLASH_FRAMES;
         if (tanks[player].health == 0)
         {
+            add_burn_site(tanks[player].x, tanks[player].y,
+                          tanks[player].direction & TANK_DIRECTION_MASK);
+            tanks[player].speed = 0;
+            tanks[player].throttle = 0;
+            blast_reaction(tanks[player].x, tanks[player].y, 48);
             add_impact(tanks[player].x, tanks[player].y, 28);
             gfx_sound(2, 65, 16, WAVE_NOISE, 45);
         }
@@ -254,6 +439,8 @@ int tank_collision(int x, int y, int player)
     int other;
 
     other = 1 - player;
+    if (tanks[other].health <= 0)
+        return 0;
     if (absolute_value(x - tanks[other].x) >= 32 ||
         absolute_value(y - tanks[other].y) >= 32)
         return 0;
@@ -328,9 +515,21 @@ int blocked(int x, int y, int tank_index)
 
 int movement_blocked(int old_x, int old_y, int x, int y, int player)
 {
-    return blocked(old_x + (x - old_x) / 2,
-                   old_y + (y - old_y) / 2, player) ||
-           blocked(x, y, player);
+    int step;
+    int steps;
+    int dy;
+
+    steps = absolute_value(x - old_x);
+    dy = absolute_value(y - old_y);
+    if (dy > steps)
+        steps = dy;
+    for (step = 1; step <= steps; step++)
+    {
+        if (blocked(old_x + (x - old_x) * step / steps,
+                    old_y + (y - old_y) * step / steps, player))
+            return 1;
+    }
+    return 0;
 }
 
 void start_round(void)
@@ -349,6 +548,8 @@ void start_round(void)
     int score;
     int found;
 
+    if (round_over)
+        age_burn_sites();
     prepare_collision_assets();
     tanks[0].direction = 8;
     tanks[1].direction = 24;
@@ -405,6 +606,13 @@ void start_round(void)
         tanks[i].collision_cooldown = 0;
         tanks[i].movement_remainder_x = 0;
         tanks[i].movement_remainder_y = 0;
+        tanks[i].throttle = 0;
+        tanks[i].speed = 0;
+        tanks[i].turn_tick = 0;
+        tanks[i].impulse_x = 0;
+        tanks[i].impulse_y = 0;
+        tanks[i].shake = 0;
+        tanks[i].handbrake = 0;
         hit_flash[i] = 0;
         muzzle_flash[i] = 0;
     }
@@ -422,8 +630,6 @@ void start_round(void)
         particles[i].life = 0;
     }
     next_particle = 0;
-    particle_sequence = 0;
-    fire_tick = 0;
     for (i = 0; i < MAP_OBJECT_COUNT; i++)
     {
         object_active[i] = 1;
@@ -503,6 +709,11 @@ void fire_shot(int player)
             muzzle_y[player] = tanks[player].y +
                                direction_offset(directions_y[direction], 18);
             muzzle_flash[player] = MUZZLE_FLASH_FRAMES;
+            tank_impulse(player, -direction_offset(directions_x[direction], 12),
+                         -direction_offset(directions_y[direction], 12), 3);
+            emit_particle(muzzle_x[player], muzzle_y[player],
+                          direction_offset(directions_x[direction], 2),
+                          direction_offset(directions_y[direction], 2), PARTICLE_SMOKE);
             gfx_sound(player, 230, 3, WAVE_NOISE, 22);
             return;
         }
@@ -514,7 +725,6 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     int old_x;
     int old_y;
     int direction;
-    int move;
     int next_x;
     int next_y;
     int movement_numerator_x;
@@ -524,39 +734,76 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     int forward_key;
     int backward_key;
     int old_direction;
+    int turn;
+    int turn_frames;
+    int left_key;
+    int right_key;
+
+    if (tanks[player].health <= 0)
+        return;
 
     old_direction = tanks[player].direction;
     forward_key = player == 0 ? (int)(keys & 4) : (int)(extra & KEYX2_P2_FORWARD);
     backward_key = player == 0 ? (int)(keys & 8) : (int)(extra & KEYX2_P2_BACKWARD);
-    if ((player == 0 && (keys & 1)) ||
-        (player == 1 && (extra & KEYX2_P2_LEFT)))
+    left_key = player == 0 ? (int)(keys & 1) : (int)(extra & KEYX2_P2_LEFT);
+    right_key = player == 0 ? (int)(keys & 2) : (int)(extra & KEYX2_P2_RIGHT);
+    tanks[player].handbrake = left_key && right_key;
+    if (tanks[player].handbrake)
     {
-        tanks[player].direction =
-            (tanks[player].direction - 1) & TANK_DIRECTION_MASK;
+        tanks[player].throttle = 0;
+        if (tanks[player].speed > HANDBRAKE_DECELERATION)
+            tanks[player].speed -= HANDBRAKE_DECELERATION;
+        else if (tanks[player].speed < -HANDBRAKE_DECELERATION)
+            tanks[player].speed += HANDBRAKE_DECELERATION;
+        else
+            tanks[player].speed = 0;
+        tanks[player].impulse_x = 0;
+        tanks[player].impulse_y = 0;
+        tanks[player].movement_remainder_x = 0;
+        tanks[player].movement_remainder_y = 0;
     }
-    if ((player == 0 && (keys & 2)) ||
-        (player == 1 && (extra & KEYX2_P2_RIGHT)))
+    else
     {
-        tanks[player].direction =
-            (tanks[player].direction + 1) & TANK_DIRECTION_MASK;
+        if (forward_key && !backward_key && tanks[player].throttle < MAX_FORWARD_SPEED)
+            tanks[player].throttle++;
+        if (backward_key && !forward_key && tanks[player].throttle > -MAX_REVERSE_SPEED)
+            tanks[player].throttle--;
+        if (tanks[player].speed < tanks[player].throttle)
+            tanks[player].speed++;
+        if (tanks[player].speed > tanks[player].throttle)
+            tanks[player].speed--;
     }
-    if (blocked(tanks[player].x, tanks[player].y, player))
-        tanks[player].direction = old_direction;
+    turn = (right_key != 0) - (left_key != 0);
+    if (turn != 0)
+    {
+        turn_frames = STATIONARY_TURN_FRAMES +
+                      absolute_value(tanks[player].speed) *
+                          (MOVING_TURN_FRAMES - STATIONARY_TURN_FRAMES) / MAX_FORWARD_SPEED;
+        tanks[player].turn_tick++;
+        if (tanks[player].turn_tick >= turn_frames)
+        {
+            tanks[player].turn_tick = 0;
+            tanks[player].direction = (old_direction + turn) & TANK_DIRECTION_MASK;
+            if (blocked(tanks[player].x, tanks[player].y, player))
+                tanks[player].direction = old_direction;
+        }
+    }
+    else
+        tanks[player].turn_tick = 0;
     old_x = tanks[player].x;
     old_y = tanks[player].y;
     direction = tanks[player].direction;
-    move = forward_key ? 2 : 0;
-    if (backward_key)
-    {
-        move = -2;
-    }
     movement_numerator_x = tanks[player].movement_remainder_x +
-                           directions_x[direction] * move;
+                           directions_x[direction] * tanks[player].speed / DIRECTION_SCALE +
+                           tanks[player].impulse_x;
     movement_numerator_y = tanks[player].movement_remainder_y +
-                           directions_y[direction] * move;
-    next_x = old_x + movement_numerator_x / DIRECTION_SCALE;
-    next_y = old_y + movement_numerator_y / DIRECTION_SCALE;
-    if (tank_collision(next_x, next_y, player))
+                           directions_y[direction] * tanks[player].speed / DIRECTION_SCALE +
+                           tanks[player].impulse_y;
+    next_x = old_x + movement_numerator_x / SPEED_SCALE;
+    next_y = old_y + movement_numerator_y / SPEED_SCALE;
+    tanks[player].impulse_x = tanks[player].impulse_x * 3 / 4;
+    tanks[player].impulse_y = tanks[player].impulse_y * 3 / 4;
+    if ((next_x != old_x || next_y != old_y) && tank_collision(next_x, next_y, player))
     {
         if (tanks[player].collision_cooldown == 0)
         {
@@ -568,15 +815,21 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
             change_health(1 - player, -5);
             tanks[1 - player].collision_cooldown = 30;
         }
+        tank_impulse(player, (old_x - next_x) * 8, (old_y - next_y) * 8, 4);
+        tank_impulse(1 - player, (next_x - old_x) * 8, (next_y - old_y) * 8, 4);
+        tanks[player].speed = 0;
+        tanks[player].throttle = 0;
+        tanks[player].movement_remainder_x = 0;
+        tanks[player].movement_remainder_y = 0;
     }
     else if (!movement_blocked(old_x, old_y, next_x, next_y, player))
     {
         tanks[player].x = next_x;
         tanks[player].y = next_y;
         tanks[player].movement_remainder_x =
-            movement_numerator_x - (next_x - old_x) * DIRECTION_SCALE;
+            movement_numerator_x - (next_x - old_x) * SPEED_SCALE;
         tanks[player].movement_remainder_y =
-            movement_numerator_y - (next_y - old_y) * DIRECTION_SCALE;
+            movement_numerator_y - (next_y - old_y) * SPEED_SCALE;
     }
     else
     {
@@ -591,14 +844,18 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
         {
             tanks[player].x = next_x;
             tanks[player].movement_remainder_x =
-                movement_numerator_x - (next_x - old_x) * DIRECTION_SCALE;
+                movement_numerator_x - (next_x - old_x) * SPEED_SCALE;
         }
         else if (can_move_y)
         {
             tanks[player].y = next_y;
             tanks[player].movement_remainder_y =
-                movement_numerator_y - (next_y - old_y) * DIRECTION_SCALE;
+                movement_numerator_y - (next_y - old_y) * SPEED_SCALE;
         }
+        tanks[player].speed /= 2;
+        tanks[player].throttle = tanks[player].speed;
+        tanks[player].impulse_x = 0;
+        tanks[player].impulse_y = 0;
     }
     if ((tanks[player].x != old_x || tanks[player].y != old_y) &&
         absolute_value(tanks[player].x - last_track_x[player]) +
@@ -608,6 +865,8 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
         track_x[next_track] = old_x;
         track_y[next_track] = old_y;
         track_direction[next_track] = direction;
+        track_offset_x[next_track] = direction_offset(directions_y[direction], 10);
+        track_offset_y[next_track] = -direction_offset(directions_x[direction], 10);
         next_track = (next_track + 1) % MAX_TRACK_MARKS;
         if (track_count < MAX_TRACK_MARKS)
         {
@@ -677,6 +936,9 @@ void update_objects(void)
                 contacts |= mask;
                 if (!(object_contacts[i] & mask))
                 {
+                    if (map_object_hp[i] < 0 && map_object_removal[i] != OBJECT_EXPLOSION)
+                        blast_reaction(map_object_x[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2,
+                                       map_object_y[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2, 24);
                     change_health(player, map_object_hp[i]);
                     if (map_object_removal[i] != OBJECT_FIXED)
                     {
@@ -717,6 +979,8 @@ void update_combat_effects(void)
             hit_flash[i]--;
         if (muzzle_flash[i] > 0)
             muzzle_flash[i]--;
+        if (tanks[i].shake > 0)
+            tanks[i].shake--;
     }
     for (i = 0; i < MAX_IMPACTS; i++)
     {
@@ -728,7 +992,7 @@ void update_combat_effects(void)
 void update_particles(void)
 {
     int i;
-    int drift;
+    int move;
     Particle *particle;
 
     for (i = 0; i < MAX_PARTICLES; i++)
@@ -739,45 +1003,38 @@ void update_particles(void)
         particle->life--;
         if (particle->life == 0)
             continue;
-        if (particle->smoke)
+        particle->age++;
+        if (particle->smoke == PARTICLE_SMOKE || particle->smoke == PARTICLE_FLAME)
         {
-            particle->y--;
-            if (particle->life % 4 == 0)
-                particle->x += particle->velocity_x;
+            if (particle->age % 4 == 0)
+            {
+                particle->velocity_x += effect_noise(3) - 1;
+                if (particle->velocity_y > -8)
+                    particle->velocity_y--;
+            }
         }
         else
         {
-            particle->x += particle->velocity_x;
-            particle->y += particle->velocity_y;
-            if (particle->life % 4 == 0)
+            if (particle->age % 3 == 0)
             {
-                particle->velocity_x /= 2;
-                particle->velocity_y /= 2;
+                particle->velocity_x = particle->velocity_x * 3 / 4;
+                particle->velocity_y++;
             }
-            if (particle->life < PARTICLE_FRAMES / 2)
-                particle->y--;
         }
+        particle->remainder_x += particle->velocity_x;
+        move = particle->remainder_x / 4;
+        particle->x += move;
+        particle->remainder_x -= move * 4;
+        particle->remainder_y += particle->velocity_y;
+        move = particle->remainder_y / 4;
+        particle->y += move;
+        particle->remainder_y -= move * 4;
         if (particle->x < 0 || particle->y < 0 ||
             particle->x >= MAP_COLUMNS * MAP_TILE_PIXEL_SIZE ||
             particle->y >= MAP_ROWS * MAP_TILE_PIXEL_SIZE)
             particle->life = 0;
     }
-    fire_tick = (fire_tick + 1) % FIRE_EMISSION_INTERVAL;
-    if (fire_tick == 0)
-    {
-        for (i = 0; i < 2; i++)
-        {
-            if (tanks[i].health == 0)
-            {
-                drift = particle_sequence % 3 - 1;
-                particle_sequence++;
-                emit_particle(tanks[i].x + drift * 3, tanks[i].y,
-                              drift, -1, 0);
-                emit_particle(tanks[i].x - drift * 2, tanks[i].y - 4,
-                              -drift, -1, 1);
-            }
-        }
-    }
+    effect_tick = (effect_tick + 1) % 4320;
 }
 
 int shot_collision(int index)
@@ -798,6 +1055,8 @@ int shot_collision(int index)
                          tank_mask(player), tanks[player].x - 16,
                          tanks[player].y - 16))
     {
+        tank_impulse(player, direction_offset(directions_x[shot->direction], 24),
+                     direction_offset(directions_y[shot->direction], 24), 8);
         change_health(player, -10);
         return 1;
     }
@@ -828,6 +1087,7 @@ int shot_collision(int index)
             gfx_mask_overlap(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
                              GFX_MASK_AMMO, shots[i].x - 3, shots[i].y - 3))
         {
+            add_burn_site(shots[i].x, shots[i].y, -1);
             shots[i].life = 0;
             return 1;
         }
@@ -874,6 +1134,7 @@ void update_shots(void)
             if (shot_collision(i))
             {
                 add_impact(shot->x, shot->y, 12);
+                add_burn_site(shot->x, shot->y, -1);
                 shot->life = 0;
                 break;
             }
@@ -889,6 +1150,8 @@ void update_game(unsigned int keys, unsigned int extra)
     {
         wins[0] = 0;
         wins[1] = 0;
+        reset_battlefield();
+        round_over = 0;
         start_round();
     }
     previous_keys = (int)keys;
@@ -965,47 +1228,16 @@ int camera_origin(int position, int viewport_size, int map_size)
     return camera;
 }
 
-void draw_world_rect_view(
-    int x, int y, int rect_width, int rect_height, int color,
-    int camera_x, int camera_y, int viewport_x)
+int tank_camera_x(int player)
 {
-    int map_width;
-    int map_height;
-    int left;
-    int right;
-    int top;
-    int bottom;
+    return camera_origin(tanks[player].x, 320, MAP_COLUMNS * MAP_TILE_PIXEL_SIZE) +
+           (effect_tick % 2 == 0 ? tanks[player].shake / 3 : -tanks[player].shake / 3);
+}
 
-    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
-    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
-    left = x > 0 ? x : 0;
-    right = x + rect_width < map_width ? x + rect_width : map_width;
-    top = y > 0 ? y : 0;
-    bottom = y + rect_height < map_height ? y + rect_height : map_height;
-    left = left - camera_x + viewport_x;
-    right = right - camera_x + viewport_x;
-    top -= camera_y;
-    bottom -= camera_y;
-    if (left < viewport_x)
-    {
-        left = viewport_x;
-    }
-    if (right > viewport_x + 320)
-    {
-        right = viewport_x + 320;
-    }
-    if (top < 0)
-    {
-        top = 0;
-    }
-    if (bottom > 480)
-    {
-        bottom = 480;
-    }
-    if (left < right && top < bottom)
-    {
-        gfx_rect(left, top, right - left, bottom - top, color);
-    }
+int tank_camera_y(int player)
+{
+    return camera_origin(tanks[player].y, 480, MAP_ROWS * MAP_TILE_PIXEL_SIZE) +
+           (effect_tick % 3 == 0 ? tanks[player].shake / 4 : -tanks[player].shake / 4);
 }
 
 void draw_map_obstacles(int camera_x, int camera_y)
@@ -1055,30 +1287,19 @@ void draw_ground(void)
 
     gfx_layer_select(LAYER_3D);
     gfx_clear(0);
-    for (viewport = 0; viewport < 2; viewport++)
+    for (i = 0; i < track_count; i++)
     {
-        camera_x = camera_origin(tanks[viewport].x, 320,
-                                 MAP_COLUMNS * MAP_TILE_PIXEL_SIZE);
-        camera_y = camera_origin(tanks[viewport].y, 480,
-                                 MAP_ROWS * MAP_TILE_PIXEL_SIZE);
-        for (i = 0; i < track_count; i++)
-        {
-            offset_x = direction_offset(directions_y[track_direction[i]], 10);
-            offset_y = -direction_offset(directions_x[track_direction[i]], 10);
-            draw_world_rect_view(
-                track_x[i] + offset_x - 1, track_y[i] + offset_y - 1, 3, 3,
-                TRACK_COLOR, camera_x, camera_y, viewport * 320);
-            draw_world_rect_view(
-                track_x[i] - offset_x - 1, track_y[i] - offset_y - 1, 3, 3,
-                TRACK_COLOR, camera_x, camera_y, viewport * 320);
-        }
+        offset_x = track_offset_x[i];
+        offset_y = track_offset_y[i];
+        gfx_world_rect(track_x[i] + offset_x - 1, track_y[i] + offset_y - 1,
+                       3, 3, TRACK_COLOR);
+        gfx_world_rect(track_x[i] - offset_x - 1, track_y[i] - offset_y - 1,
+                       3, 3, TRACK_COLOR);
     }
     for (viewport = 0; viewport < 2; viewport++)
     {
-        camera_x = camera_origin(tanks[viewport].x, 320,
-                                 MAP_COLUMNS * MAP_TILE_PIXEL_SIZE);
-        camera_y = camera_origin(tanks[viewport].y, 480,
-                                 MAP_ROWS * MAP_TILE_PIXEL_SIZE);
+        camera_x = tank_camera_x(viewport);
+        camera_y = tank_camera_y(viewport);
         draw_map_obstacles(camera_x, camera_y);
     }
     for (i = 0; i < MAP_OBJECT_COUNT; i++)
@@ -1090,25 +1311,10 @@ void draw_ground(void)
                            map_object_y[i] * MAP_TILE_PIXEL_SIZE);
         }
     }
+    gfx_world_emitters(burn_sites, burn_count, effect_tick);
 }
 
-void draw_burst(int x, int y, int radius, int color,
-                int camera_x, int camera_y, int viewport_x)
-{
-    int direction;
-    int outer_x;
-    int outer_y;
-
-    for (direction = 0; direction < TANK_ROTATION_COUNT; direction += 4)
-    {
-        outer_x = x + direction_offset(directions_x[direction], radius);
-        outer_y = y + direction_offset(directions_y[direction], radius);
-        draw_world_rect_view(outer_x - 1, outer_y - 1, 3, 3,
-                             color, camera_x, camera_y, viewport_x);
-    }
-}
-
-void draw_combat_feedback(int camera_x, int camera_y, int viewport_x)
+void draw_combat_feedback(void)
 {
     int i;
     int radius;
@@ -1118,24 +1324,22 @@ void draw_combat_feedback(int camera_x, int camera_y, int viewport_x)
     {
         if (impact_life[i] > 0)
         {
-            radius = 2 + (IMPACT_FRAMES - impact_life[i]) * impact_size[i] /
-                             IMPACT_FRAMES;
+            radius = 2 + impact_life[i] * impact_size[i] / (IMPACT_FRAMES * 2);
             color = impact_life[i] > IMPACT_FRAMES / 2 ? YELLOW : ORANGE;
-            draw_burst(impact_x[i], impact_y[i], radius, color,
-                       camera_x, camera_y, viewport_x);
+            gfx_world_particle(impact_x[i], impact_y[i], radius, color,
+                               impact_life[i] > 7 ? 12 : 4);
         }
     }
     for (i = 0; i < 2; i++)
     {
         if (muzzle_flash[i] > 0)
         {
-            draw_burst(muzzle_x[i], muzzle_y[i], 5, WHITE,
-                       camera_x, camera_y, viewport_x);
+            gfx_world_particle(muzzle_x[i], muzzle_y[i], 5, ORANGE, 8);
+            gfx_world_particle(muzzle_x[i], muzzle_y[i], 2, WHITE, 16);
         }
         if (hit_flash[i] > 0 && tanks[i].health > 0)
         {
-            draw_burst(tanks[i].x, tanks[i].y, 20, RED,
-                       camera_x, camera_y, viewport_x);
+            gfx_world_particle(tanks[i].x, tanks[i].y, 16, RED, 2);
         }
     }
 }
@@ -1147,65 +1351,48 @@ void draw_hud(void)
     char timer[16];
     unsigned int seconds;
     int i;
-    int viewport;
-    int camera_x;
-    int camera_y;
-    int map_width;
-    int map_height;
     int explosion_x;
     int explosion_y;
     int radius;
     int particle_size;
     int particle_color;
+    int opacity;
     Particle *particle;
 
     gfx_layer_select(LAYER_HUD);
     gfx_clear(15);
-    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
-    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
-    for (viewport = 0; viewport < 2; viewport++)
+    for (i = 0; i < MAX_PARTICLES; i++)
     {
-        camera_x = camera_origin(tanks[viewport].x, 320, map_width);
-        camera_y = camera_origin(tanks[viewport].y, 480, map_height);
-        for (i = 0; i < MAX_PARTICLES; i++)
+        particle = &particles[i];
+        if (particle->life > 0)
         {
-            particle = &particles[i];
-            if (particle->life > 0)
+            opacity = particle->life < 8 ? particle->life * 2 : 16;
+            if (particle->smoke == PARTICLE_SMOKE)
             {
-                if (particle->smoke)
-                {
-                    particle_size = 3 + (PARTICLE_FRAMES - particle->life) / 6;
-                    particle_color = particle->life > PARTICLE_FRAMES / 2 ? DARK_GRAY : GRAY;
-                }
-                else
-                {
-                    particle_size = particle->life > PARTICLE_FRAMES / 2 ? 3 : 2;
-                    particle_color = particle->life > 18 ? YELLOW : particle->life > 8 ? ORANGE
-                                                                                       : DARK_RED;
-                }
-                draw_world_rect_view(
-                    particle->x - particle_size / 2,
-                    particle->y - particle_size / 2,
-                    particle_size, particle_size, particle_color,
-                    camera_x, camera_y, viewport * 320);
+                particle_size = particle->size + particle->age / 8;
+                particle_color = particle->age < 18 ? DARK_GRAY : GRAY;
+                opacity = particle->life < 16 ? particle->life / 2 : 8;
             }
+            else
+            {
+                particle_size = particle->smoke == PARTICLE_FLAME ? 2 + particle->life / 8 : particle->size;
+                particle_color = particle->smoke == PARTICLE_DEBRIS ? TRACK_COLOR : particle->age < 3 ? WHITE
+                                                                                : particle->age < 9   ? YELLOW
+                                                                                : particle->age < 17  ? ORANGE
+                                                                                                      : DARK_RED;
+            }
+            gfx_world_particle(particle->x, particle->y, particle_size, particle_color, opacity);
         }
-        draw_combat_feedback(camera_x, camera_y, viewport * 320);
-        for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    }
+    draw_combat_feedback();
+    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    {
+        if (object_explosion[i] > EXPLOSION_FRAMES - 4)
         {
-            if (object_explosion[i] > 0)
-            {
-                explosion_x = map_object_x[i] * MAP_TILE_PIXEL_SIZE +
-                              MAP_TILE_PIXEL_SIZE / 2;
-                explosion_y = map_object_y[i] * MAP_TILE_PIXEL_SIZE +
-                              MAP_TILE_PIXEL_SIZE / 2;
-                radius = (EXPLOSION_FRAMES - object_explosion[i] + 4) *
-                             MAP_TILE_PIXEL_SIZE / 32 +
-                         2;
-                draw_burst(explosion_x, explosion_y, radius,
-                           object_explosion[i] > EXPLOSION_FRAMES / 2 ? YELLOW : ORANGE,
-                           camera_x, camera_y, viewport * 320);
-            }
+            explosion_x = map_object_x[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2;
+            explosion_y = map_object_y[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2;
+            radius = 4 + object_explosion[i] / 2;
+            gfx_world_particle(explosion_x, explosion_y, radius, ORANGE, 8);
         }
     }
     for (i = 0; i < MAX_SHOTS; i++)
@@ -1256,12 +1443,22 @@ void draw_hud(void)
     score[i++] = '-';
     number_text((unsigned int)wins[1], score + i);
     gfx_text(338, 5, score, WHITE);
+    gfx_text(180, 5, tanks[0].handbrake ? "BRAKE" : tanks[0].speed < 0 ? "REV"
+                                                                       : "GAS",
+             WHITE);
+    gfx_rect(180, 19, 64, 4, BLACK);
+    gfx_rect(180, 19, absolute_value(tanks[0].throttle) * 2, 4, YELLOW);
+    gfx_text(398, 5, tanks[1].handbrake ? "BRAKE" : tanks[1].speed < 0 ? "REV"
+                                                                       : "GAS",
+             WHITE);
+    gfx_rect(398, 19, 64, 4, BLACK);
+    gfx_rect(398, 19, absolute_value(tanks[1].throttle) * 2, 4, YELLOW);
+    if (burn_capacity_error)
+        gfx_text(240, 34, "FIRE CAPACITY REACHED", RED);
 }
 
 void draw_game(void)
 {
-    int map_width;
-    int map_height;
     int camera1_x;
     int camera1_y;
     int camera2_x;
@@ -1269,12 +1466,10 @@ void draw_game(void)
     int viewport;
     char countdown[6];
 
-    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
-    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
-    camera1_x = camera_origin(tanks[0].x, 320, map_width);
-    camera1_y = camera_origin(tanks[0].y, 480, map_height);
-    camera2_x = camera_origin(tanks[1].x, 320, map_width);
-    camera2_y = camera_origin(tanks[1].y, 480, map_height);
+    camera1_x = tank_camera_x(0);
+    camera1_y = tank_camera_y(0);
+    camera2_x = tank_camera_x(1);
+    camera2_y = tank_camera_y(1);
     gfx_split_camera(camera1_x, camera1_y, camera2_x, camera2_y);
     draw_ground();
     gfx_layer_select(LAYER_SPRITES);

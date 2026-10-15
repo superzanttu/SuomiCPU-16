@@ -23,7 +23,141 @@ class Tank16Tests(unittest.TestCase):
                       f"#define MAP_TILE_PIXEL_SIZE {tile_size}", source).replace(
                           "int main(void)", "int tank16_game_entry(void)", 1)
 
-    def test_particles_move_expire_wrap_reset_and_burn_during_round_end(self):
+    def scenario_results(self, body, count, tile_size=64):
+        path = ROOT / "modules" / "Tank-16" / "main.c"
+        source = (f"int results[{count}];\n" + self.game_source(path, tile_size) +
+                  "int main(void) {\n" + body + "\nreturn 0;\n}\n")
+        cpu = make_cpu(compile_source(source, str(path)))
+        for _ in range(100):
+            run_frame(cpu)
+            if not cpu.running:
+                break
+        self.assertFalse(cpu.running, "Scenario exceeded 40 million instructions")
+        values = [cpu.read_16(GLOBAL_BASE + i * 2) for i in range(count)]
+        return [value - 65536 if value >= 32768 else value for value in values]
+
+    def test_throttle_coasts_brakes_reverses_and_stationary_turning_is_doubled(self):
+        results = self.scenario_results(
+            "int i;\n"
+            "start_round();\n"
+            "tanks[0].x = 100; tanks[0].y = 100; tanks[0].direction = 8;\n"
+            "tanks[1].x = 500; tanks[1].y = 400;\n"
+            "update_tank(0, 4, 0);\n"
+            "results[0] = tanks[0].speed; results[1] = tanks[0].x;\n"
+            "for (i = 1; i < 32; i++) update_tank(0, 4, 0);\n"
+            "results[2] = tanks[0].speed; results[3] = tanks[0].x;\n"
+            "for (i = 0; i < 8; i++) update_tank(0, 0, 0);\n"
+            "results[4] = tanks[0].speed; results[5] = tanks[0].x;\n"
+            "for (i = 0; i < 32; i++) update_tank(0, 8, 0);\n"
+            "results[6] = tanks[0].speed;\n"
+            "for (i = 0; i < 16; i++) update_tank(0, 8, 0);\n"
+            "results[7] = tanks[0].speed; results[8] = tanks[0].x;\n"
+            "tanks[0].speed = 0; tanks[0].throttle = 0; tanks[0].direction = 8;\n"
+            "for (i = 0; i < 8; i++) update_tank(0, 2, 0);\n"
+            "results[9] = tanks[0].direction;\n"
+            "tanks[0].speed = 32; tanks[0].throttle = 32; tanks[0].direction = 8;\n"
+            "for (i = 0; i < 8; i++) update_tank(0, 2, 0);\n"
+            "results[10] = tanks[0].direction;\n"
+            "for (i = 0; i < 64; i++) update_tank(1, 0, KEYX2_P2_FORWARD);\n"
+            "results[11] = tanks[1].speed;\n"
+            "for (i = 0; i < 64; i++) update_tank(1, 0, KEYX2_P2_BACKWARD);\n"
+            "results[12] = tanks[1].speed;\n", 13)
+        self.assertEqual(results[:3], [1, 100, 32])
+        self.assertEqual(results[3:7], [133, 32, 149, 0])
+        self.assertEqual(results[7], -16)
+        self.assertLess(results[8], 180)
+        self.assertEqual(results[9:], [12, 10, 32, -16])
+
+    def test_handbrake_overrides_throttle_stops_both_players_and_turning_tracks_speed(self):
+        results = self.scenario_results(
+            "int i; int speed;\n"
+            "start_round();\n"
+            "tanks[0].x = 100; tanks[0].y = 100; tanks[0].direction = 8;\n"
+            "tanks[1].x = 500; tanks[1].y = 400;\n"
+            "tanks[0].speed = 32; tanks[0].throttle = 32;\n"
+            "update_tank(0, 7, 0); results[0] = tanks[0].speed;\n"
+            "for (i = 0; i < 3; i++) update_tank(0, 7, 0);\n"
+            "results[1] = tanks[0].speed; results[2] = tanks[0].throttle;\n"
+            "results[3] = tanks[0].direction; results[4] = tanks[0].x;\n"
+            "update_tank(0, 0, 0); results[5] = tanks[0].speed;\n"
+            "results[6] = tanks[0].handbrake;\n"
+            "tanks[1].speed = -16; tanks[1].throttle = -16;\n"
+            "for (i = 0; i < 2; i++) update_tank(1, 0, KEYX2_P2_LEFT | KEYX2_P2_RIGHT | KEYX2_P2_BACKWARD);\n"
+            "results[7] = tanks[1].speed; results[8] = tanks[1].throttle;\n"
+            "results[9] = tanks[1].direction; results[10] = tanks[1].handbrake;\n"
+            "for (speed = 0; speed < 3; speed++) {\n"
+            "  tanks[0].x = 100; tanks[0].y = 100; tanks[0].direction = 8;\n"
+            "  tanks[0].speed = speed * 16; tanks[0].throttle = speed * 16;\n"
+            "  tanks[0].turn_tick = 0;\n"
+            "  for (i = 0; i < 12; i++) update_tank(0, 2, 0);\n"
+            "  results[11 + speed] = tanks[0].direction;\n"
+            "}\n", 14)
+        self.assertEqual(results, [24, 0, 0, 8, 102, 0, 0, 0, 0, 24, 1, 14, 12, 11])
+
+    def test_wreck_and_impact_fires_survive_ten_future_rounds_and_restart_clears(self):
+        results = self.scenario_results(
+            "int i;\n"
+            "start_round();\n"
+            "tanks[0].x = 100; tanks[0].y = 100;\n"
+            "tanks[1].x = 140; tanks[1].y = 100;\n"
+            "shots[0].x = 132; shots[0].y = 100; shots[0].direction = 8;\n"
+            "shots[0].life = 120; update_shots();\n"
+            "change_health(1, -100);\n"
+            "results[0] = burn_count; results[1] = burn_sites[0].mask;\n"
+            "results[2] = burn_sites[1].mask;\n"
+            "results[3] = burn_sites[1].x; results[4] = burn_sites[1].y;\n"
+            "change_health(1, -100); results[5] = burn_count;\n"
+            "for (i = 0; i < 10; i++) { finish_round(); start_round(); }\n"
+            "results[6] = burn_sites[0].rounds; results[7] = burn_sites[1].rounds;\n"
+            "finish_round(); start_round();\n"
+            "results[8] = burn_sites[0].rounds; results[9] = burn_sites[1].rounds;\n"
+            "add_burn_site(100, 100, -1); update_game(32, 0);\n"
+            "results[10] = burn_count; results[11] = burn_sites[0].rounds;\n", 12)
+        self.assertEqual(results, [2, -1, 24, 140, 100, 2, 1, 1, 0, 0, 0, 0])
+
+    def test_burn_capacity_keeps_sites_until_expiry_and_crosses_64k_address_boundary(self):
+        results = self.scenario_results(
+            "int i;\n"
+            "BurnSite *site;\n"
+            "for (i = 0; i < MAX_BURN_SITES; i++) add_burn_site(50, 100, -1);\n"
+            "results[0] = burn_count;\n"
+            "results[1] = next_burn_site == burn_sites;\n"
+            "site = burn_sites;\n"
+            "for (i = 0; i < 9000; i++) site++;\n"
+            "results[2] = site->rounds;\n"
+            "add_burn_site(200, 100, -1);\n"
+            "results[3] = burn_capacity_error; results[4] = burn_sites[0].x;\n"
+            "for (i = 0; i < BURN_ROUNDS + 1; i++) age_burn_sites();\n"
+            "add_burn_site(200, 100, -1);\n"
+            "results[5] = burn_sites[0].x; results[6] = burn_sites[0].rounds;\n", 7)
+        self.assertEqual(results, [11022, 1, 11, 1, 50, 200, 11])
+
+    def test_recoil_hit_and_blast_impulses_respect_obstacles_and_decay(self):
+        results = self.scenario_results(
+            "int i;\n"
+            "start_round();\n"
+            "tanks[0].x = 100; tanks[0].y = 100; tanks[0].direction = 8;\n"
+            "tanks[1].x = 140; tanks[1].y = 100;\n"
+            "fire_shot(0); results[0] = tanks[0].impulse_x;\n"
+            "results[1] = tanks[0].shake;\n"
+            "for (i = 0; i < 5; i++) update_shots();\n"
+            "results[2] = tanks[1].impulse_x;\n"
+            "results[3] = tanks[1].health;\n"
+            "for (i = 0; i < 12; i++) update_tank(0, 0, 0);\n"
+            "results[4] = tanks[0].impulse_x; results[5] = tanks[0].x;\n"
+            "tanks[0].speed = 32; tanks[0].throttle = 32;\n"
+            "blast_reaction(tanks[0].x - 8, 100, 40);\n"
+            "results[6] = tanks[0].impulse_x; results[7] = tanks[0].speed;\n"
+            "tanks[0].x = 16; tanks[0].speed = 0; tanks[0].throttle = 0;\n"
+            "tank_impulse(0, -48, 0, 8);\n"
+            "for (i = 0; i < 16; i++) update_tank(0, 0, 0);\n"
+            "results[8] = tanks[0].x;\n", 9)
+        self.assertEqual(results[:5], [-12, 3, 24, 90, 0])
+        self.assertLess(results[5], 100)
+        self.assertGreater(results[6], 0)
+        self.assertEqual(results[7:], [16, 16])
+
+    def test_particles_move_expire_wrap_and_reset(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
         scenario = (
             "int main(void) {\n"
@@ -31,17 +165,18 @@ class Tank16Tests(unittest.TestCase):
             "  gfx_mode(GFX_MODE_640_480); start_round();\n"
             "  tanks[0].x = 100; tanks[0].y = 100;\n"
             "  tanks[1].x = 140; tanks[1].y = 100;\n"
-            "  emit_explosion(150, 160, 3);\n"
+            "  emit_particle(150, 160, 2, -3, PARTICLE_SPARK);\n"
+            "  emit_particle(148, 160, -1, -1, PARTICLE_SMOKE);\n"
             "  results[0] = next_particle;\n"
             "  update_particles();\n"
             "  results[1] = particles[0].y;\n"
-            "  results[2] = particles[8].y;\n"
+            "  results[2] = particles[1].y;\n"
             "  results[3] = particles[0].life;\n"
             "  gfx_split_camera(0, 0, 0, 0); draw_hud(); gfx_present();\n"
-            "  for (i = 0; i < PARTICLE_FRAMES; i++) update_particles();\n"
+            "  for (i = 0; i < 64; i++) update_particles();\n"
             "  for (i = 0; i < MAX_PARTICLES; i++) results[4] += particles[i].life;\n"
             "  emit_particle(0, 0, -1, -1, 0); update_particles();\n"
-            "  results[5] = particles[10].life;\n"
+            "  results[5] = particles[2].life;\n"
             "  start_round();\n"
             "  for (i = 0; i < MAX_PARTICLES + 3; i++) emit_particle(i, 100, 1, 0, 0);\n"
             "  results[6] = next_particle;\n"
@@ -49,11 +184,12 @@ class Tank16Tests(unittest.TestCase):
             "  start_round();\n"
             "  results[8] = next_particle;\n"
             "  for (i = 0; i < MAX_PARTICLES; i++) results[9] += particles[i].life;\n"
-            "  tanks[1].health = 0; round_over = 1; round_delay = 60;\n"
-            "  for (i = 0; i < FIRE_EMISSION_INTERVAL; i++) update_game(0, 0);\n"
-            "  results[10] = next_particle;\n"
-            "  results[11] = particles[0].smoke;\n"
-            "  results[12] = particles[1].smoke;\n"
+            "  tanks[1].x = 140; tanks[1].y = 100;\n"
+            "  change_health(1, -100); round_over = 1; round_delay = 60;\n"
+            "  for (i = 0; i < 3; i++) update_game(0, 0);\n"
+            "  results[10] = burn_count;\n"
+            "  results[11] = burn_sites[0].rounds;\n"
+            "  results[12] = burn_sites[0].mask;\n"
             "  results[13] = round_delay;\n"
             "  return 0;\n"
             "}\n"
@@ -64,12 +200,16 @@ class Tank16Tests(unittest.TestCase):
         self.assertLess(run_frame(cpu), 400_000)
         self.assertTrue(cpu.frame_yield)
         for offset in (0, 320):
-            self.assertEqual(layer_pixel(cpu, 4, offset + 150, 157), 5)
-            self.assertEqual(layer_pixel(cpu, 4, offset + 148, 159), 10)
+            self.assertEqual(layer_pixel(cpu, 4, offset + 152, 157), 1)
+            self.assertTrue(any(layer_pixel(cpu, 4, offset + x, y) == 10
+                                for x in range(143, 152) for y in range(156, 163)))
         while cpu.running:
             cpu.step()
-        self.assertEqual([cpu.read_16(GLOBAL_BASE + i * 2) for i in range(14)],
-                         [10, 157, 159, 23, 0, 0, 3, 48, 0, 0, 2, 0, 1, 57])
+        results = [cpu.read_16(GLOBAL_BASE + i * 2) for i in range(14)]
+        self.assertEqual(results[:3], [2, 157, 159])
+        self.assertGreaterEqual(results[3], 17)
+        self.assertLessEqual(results[3], 35)
+        self.assertEqual(results[4:], [0, 0, 3, 80, 0, 0, 1, 11, 24, 57])
 
     def test_pixel_collisions_rotation_thin_obstacles_and_crossing_ammo(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
@@ -92,7 +232,7 @@ class Tank16Tests(unittest.TestCase):
             "  tanks[0].health = 100; tanks[1].health = 100;\n"
             "  results[0] = blocked(111, 80, 0);\n"
             "  results[1] = blocked(112, 80, 0);\n"
-            "  update_tank(0, 2, 0); results[2] = tanks[0].direction;\n"
+            "  update_tank(0, 2, 0); update_tank(0, 2, 0); results[2] = tanks[0].direction;\n"
             "  results[3] = tank_collision(199, 100, 0);\n"
             "  results[4] = tank_collision(200, 100, 0);\n"
             "  shots[0].x = 106; shots[0].y = 80; shots[0].life = 120;\n"
@@ -160,7 +300,7 @@ class Tank16Tests(unittest.TestCase):
         while cpu.running:
             cpu.step()
         self.assertEqual([cpu.read_16(GLOBAL_BASE + i * 2) for i in range(9)],
-                         [100, 75, 0, 18, 20, 1, 0, 0, 0])
+                         [100, 75, 0, 18, 48, 1, 0, 0, 0])
 
     def test_full_tracks_and_impact_pool_render_within_frame_budget(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
@@ -174,8 +314,9 @@ class Tank16Tests(unittest.TestCase):
             "  tanks[1].x = 480; tanks[1].y = 240; tanks[1].health = 20;\n"
             "  tank_sprite_slots[0] = -1; tank_sprite_slots[1] = -1;\n"
             "  for (i = 0; i < MAX_TRACK_MARKS; i++) {\n"
-            "    track_x[i] = 40 + i * 5; track_y[i] = 210 + i;\n"
+            "    track_x[i] = 40 + (i % 96) * 5; track_y[i] = 210 + i / 96 * 4;\n"
             "    track_direction[i] = 8;\n"
+            "    track_offset_y[i] = -10;\n"
             "  }\n"
             "  track_count = MAX_TRACK_MARKS;\n"
             "  for (i = 0; i < MAX_IMPACTS; i++) {\n"
@@ -184,6 +325,7 @@ class Tank16Tests(unittest.TestCase):
             "  }\n"
             "  fire_shot(0); fire_shot(1);\n"
             "  hit_flash[1] = HIT_FLASH_FRAMES;\n"
+            "  for (i = 0; i < 100; i++) add_burn_site(40 + i * 5, 250, -1);\n"
             "  for (i = 0; i < MAX_SHOTS; i++) {\n"
             "    shots[i].life = 120; shots[i].x = 40 + i * 40;\n"
             "    shots[i].y = 160; shots[i].direction = 0;\n"
@@ -253,8 +395,8 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(layer_pixel(cpu, 4, 528, 7), 1)
         self.assertEqual(layer_pixel(cpu, 4, 319, 100), 10)
         self.assertEqual(layer_pixel(cpu, 4, 320, 100), 10)
-        self.assertEqual(layer_pixel(cpu, 4, 118, 95), 1)
-        self.assertEqual(layer_pixel(cpu, 4, 438, 95), 1)
+        self.assertEqual(layer_pixel(cpu, 4, 118, 100), 1)
+        self.assertEqual(layer_pixel(cpu, 4, 438, 100), 1)
         self.assertLess(run_frame(cpu), 400_000)
         self.assertTrue(cpu.frame_yield)
         self.assertEqual(cpu.sprites[24]["flags"], 0)
@@ -370,6 +512,8 @@ class Tank16Tests(unittest.TestCase):
             "  fire_shot(0); update_shots();\n"
             "  results[15] = shots[0].life;\n"
             "  tanks[0].x = 100; tanks[0].y = 260;\n"
+            "  tanks[0].speed = MAX_FORWARD_SPEED; tanks[0].throttle = MAX_FORWARD_SPEED;\n"
+            "  tanks[0].impulse_x = 0; tanks[0].impulse_y = 0;\n"
             "  last_track_x[0] = 100; last_track_y[0] = 260;\n"
             "  for (i = 0; i < 10; i++) update_tank(0, 4, 0);\n"
             "  results[16] = track_count;\n"
@@ -379,11 +523,13 @@ class Tank16Tests(unittest.TestCase):
             "  gfx_tile_size(MAP_TILE_PIXEL_SIZE);\n"
             "  upload_terrain_tiles();\n"
             "  gfx_split_camera(0, 0, 320, 0);\n"
+            "  reset_battlefield();\n"
             "  draw_ground();\n"
             "  start_round();\n"
             "  results[18] = track_count;\n"
             "  tanks[0].x = 100; tanks[0].y = 260;\n"
             "  tanks[0].direction = 8;\n"
+            "  tanks[0].speed = MAX_FORWARD_SPEED; tanks[0].throttle = MAX_FORWARD_SPEED;\n"
             "  tanks[1].x = 600; tanks[1].y = 440;\n"
             "  last_track_x[0] = 100; last_track_y[0] = 260;\n"
             "  for (i = 0; i < 200; i++) update_tank(0, 4, 0);\n"
@@ -405,7 +551,7 @@ class Tank16Tests(unittest.TestCase):
         results = [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(22)]
         self.assertEqual(results, [
             75, 0, 18, 75, 100, 0, 0, 90, 1, 80, 0,
-            1, 0, 1, 0, 0, 5, 5, 0, 96, 4, 0,
+            1, 0, 1, 0, 0, 5, 5, 0, 100, 100, 0,
         ])
         obstacle_tile = tiles[40]
         for y in range(64):
@@ -464,8 +610,10 @@ class Tank16Tests(unittest.TestCase):
             "  for (i = 0; i < 4096; i++) terrain_tiles[1][i] = 1;\n"
             "  gfx_tile_upload(1, terrain_tiles[1]);\n"
             "  map_obstacles[2 * MAP_COLUMNS + 3] = 1;\n"
-            "  tanks[0].x = 177; tanks[0].y = 150;\n"
+            "  tanks[0].x = 177; tanks[0].y = 140;\n"
             "  tanks[0].direction = 12;\n"
+            "  tanks[0].health = 100;\n"
+            "  tanks[0].speed = MAX_FORWARD_SPEED; tanks[0].throttle = MAX_FORWARD_SPEED;\n"
             "  tanks[1].x = 560; tanks[1].y = 440;\n"
             "  update_tank(0, 4, 0);\n"
             "  slide_results[0] = tanks[0].x;\n"
@@ -486,7 +634,7 @@ class Tank16Tests(unittest.TestCase):
             cpu.read_16(GLOBAL_BASE + index * 2)
             for index in range(2)
         ]
-        self.assertEqual(results, [177, 151])
+        self.assertEqual(results, [177, 141])
 
     def test_main_game_compiles_and_renders_a_frame(self):
         source = ROOT / "modules" / "Tank-16" / "main.c"
@@ -556,13 +704,13 @@ class Tank16Tests(unittest.TestCase):
             slot for slot, sprite in enumerate(cpu.sprites)
             if sprite["flags"] & 1
         ]
-        self.assertEqual(visible_slots, [20, 36])
+        self.assertEqual(visible_slots, [22, 38])
         map_width = cpu.tilemap_width * cpu.tile_pixel_size
         map_height = cpu.tilemap_height * cpu.tile_pixel_size
-        player_two_x = cpu.sprites[20]["x"] + 16
-        player_two_y = cpu.sprites[20]["y"] + 16
-        player_one_x = cpu.sprites[36]["x"] + 16
-        player_one_y = cpu.sprites[36]["y"] + 16
+        player_two_x = cpu.sprites[22]["x"] + 16
+        player_two_y = cpu.sprites[22]["y"] + 16
+        player_one_x = cpu.sprites[38]["x"] + 16
+        player_one_y = cpu.sprites[38]["y"] + 16
         self.assertLess(player_one_x, map_width // 2)
         self.assertGreaterEqual(player_two_x, map_width // 2)
         self.assertLess(player_two_x, map_width)
@@ -632,6 +780,7 @@ class Tank16Tests(unittest.TestCase):
             "    start_round();\n"
             "    tanks[0].x = 100; tanks[0].y = 260;\n"
             "    tanks[0].direction = direction;\n"
+            "    tanks[0].speed = MAX_FORWARD_SPEED; tanks[0].throttle = MAX_FORWARD_SPEED;\n"
             "    tanks[1].x = 560; tanks[1].y = 440;\n"
             "    for (frame = 0; frame < 16; frame++)\n"
             "      update_tank(0, 4, 0);\n"
@@ -770,6 +919,7 @@ class Tank16Tests(unittest.TestCase):
             "  tanks[0].x = 100; tanks[0].y = 100;\n"
             "  tanks[0].direction = 8;\n"
             "  tanks[1].x = 120; tanks[1].y = 100;\n"
+            "  tanks[0].speed = MAX_FORWARD_SPEED; tanks[0].throttle = MAX_FORWARD_SPEED;\n"
             "  update_tank(0, 4, 0);\n"
             "  results[2] = tanks[0].health;\n"
             "  results[3] = tanks[1].health;\n"
@@ -800,7 +950,7 @@ class Tank16Tests(unittest.TestCase):
             cpu.step()
 
         results = [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(12)]
-        self.assertEqual(results, [90, 100, 95, 95, 1, 0, 100, 1, 0, 0, 100, 23])
+        self.assertEqual(results, [90, 100, 95, 95, 1, 0, 100, 1, 0, 0, 100, 24])
 
 
 if __name__ == "__main__":

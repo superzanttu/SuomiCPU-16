@@ -6,7 +6,7 @@
 - [x] Support two players in a top-down tank battle; start Player 1 on the left and Player 2 on the right.
 - [x] Keep tanks within screen bounds and let players drive, avoid obstacles, and fire projectiles.
 - [x] Allow tanks to slide along obstacle edges when a diagonal movement is blocked.
-- [x] Map controls: Player 1 uses A/D to turn, W/S to move, and C to fire; Player 2 uses J/L to turn, I/K to move, and period to fire.
+- [x] Map controls: Player 1 uses A/D to turn, W/S to adjust throttle, and C to fire; Player 2 uses J/L to turn, I/K to adjust throttle, and period to fire.
 - [x] Give each player one life and 100 health; apply 10 damage for an ammunition hit, 25 for a mine, and 5 for a tank collision.
 - [x] End a round when a player's health reaches zero.
 - [x] Build the screen-sized map from 16×16 runtime terrain tiles.
@@ -26,6 +26,36 @@
 - [x] Use opaque-pixel collision masks for rotated tanks, obstacles, map objects, and ammunition; sweep moving shots to detect thin obstacles.
 - [x] Draw larger 7x7 ammunition with a white core and yellow outline, using the same shape for collision detection.
 - [x] Emit moving sparks and rising smoke from explosions and impacts, and flames/smoke from destroyed tanks during the round countdown.
+- [x] Keep burning wrecks and ammunition impact fires throughout ten subsequent rounds.
+- [x] Add inertial throttle, reverse, slower moving turns, recoil, blast knockback, and per-player camera shake.
+- [x] Retain three times as many track marks and show forward/reverse throttle in the HUD.
+
+## Driving and battle reactions
+
+Hold W to increase signed throttle; hold S to decrease it. Releasing both retains
+the setting, so the tank cruises instead of stopping immediately. S brakes a
+forward-moving tank through zero into reverse; W brakes reverse travel back into
+forward. Player 2 uses I/K identically. Both throttle keys together leave the
+setting unchanged. Speed approaches the setting gradually. Forward speed is
+capped at 2 pixels/update; reverse at 1 pixel/update. Values use `SPEED_SCALE`
+subpixel units. The HUD shows throttle and REV when reversing.
+
+One 32-direction steering step varies with absolute speed: 2 updates at rest,
+3 at half forward speed, and `MOVING_TURN_FRAMES` (4) at full forward speed.
+`STATIONARY_TURN_FRAMES` (2) makes stationary pivoting twice as fast as full-speed
+turning. A+D (J+L for Player 2) is a handbrake: it overrides throttle input,
+resets gas to zero, prevents turning, and sheds `HANDBRAKE_DECELERATION` (8)
+speed units per update. A full-speed tank stops within four updates and stays
+stopped after release until throttle is applied again. The HUD displays BRAKE.
+Collision checks use the new orientation
+and sweep every pixel of translation, including recoil and blast displacement.
+Blocked motion loses speed rather than storing up acceleration against a wall.
+
+Firing produces backwards recoil and muzzle smoke. Shell hits push in the shot's
+direction. Mines and destruction blasts push nearby surviving tanks away with
+distance falloff and reduce their speed; existing HP amounts remain unchanged.
+Impulses decay, stop at solid obstacles/map bounds, and briefly shake only the
+affected player's camera. Fresh rounds clear throttle, impulses, and camera shake.
 
 ## Collision and particle effects
 
@@ -40,14 +70,32 @@ ammunition. Shooting an object consumes the shot; fixed objects remain, explosio
 objects are removed with an explosion, and disappear objects are removed without
 an object explosion. Object HP changes still apply only on tank contact.
 
-The particle system uses a fixed pool of `MAX_PARTICLES` (48) entries. New emissions
-replace the oldest entries when full. Sparks slow and fade through yellow, orange,
-and dark red; smoke rises, drifts, and expands. Particles expire after
-`PARTICLE_FRAMES` (24) updates or on leaving the map. Wrecks emit fire and smoke every
-`FIRE_EMISSION_INTERVAL` (3) updates, including during round-end countdowns.
-Starting a round clears all particles. Both camera views clip effects to their
-viewport and the map boundaries. Round-result banners sit near the bottom of
-each viewport so they do not cover the centered wreck fires.
+Transient particles use a fixed pool of `MAX_PARTICLES` (80) entries. New emissions
+replace the oldest transient particles when full. Explosions eject randomized
+sparks, gravity-affected debris, hot flame, and expanding smoke. Sparks cool from
+white through yellow/orange to dark red. Smoke and flames rise with turbulence;
+soft dithered circular particles fade instead of drawing solid squares. Spark
+lifetimes vary up to `PARTICLE_FRAMES` (36) updates; smoke lasts up to 60.
+
+Persistent fires are separate from that transient pool. Every ammunition collision
+leaves a small fire and scorch at its world impact point. Destroyed tanks leave a
+charred silhouette at their final position/orientation with larger fire plumes.
+These emitters animate through countdowns and new rounds. `BURN_ROUNDS` (10) means
+ten complete *subsequent matches*, not seconds or frames; an emitter is retired at
+the start of the eleventh subsequent match. Burn sites are cosmetic, do not spread,
+and do not add collision damage or block spawn locations. Map JSON is not modified.
+R starts a fresh battle, clearing both accumulated burns and the win count.
+
+The burn-site capacity covers the maximum possible shell impacts and two destroyed
+tanks per match over the entire eleven-match retention window. Live sites are never
+evicted for new effects; an unexpected overflow is reported in the HUD. GPU rendering
+culls off-screen emitters, merges coincident drawing, and shares dense smoke plumes
+without discarding individual impact fires. Starting a round clears only transient
+particles. Both camera views clip effects to the viewport and map boundaries.
+Round-result banners stay near the bottom so centered wreck fires remain visible.
+
+`MAX_TRACK_MARKS` is 288 (previously 96), at the same spacing: visible trail history
+is three times longer. Track marks clear between rounds as before.
 
 The graphics API exposes `gfx_mask_overlap(first, first_x, first_y, second,
 second_x, second_y)` with top-left world coordinates. Sprite mask IDs are 0-63;
@@ -55,6 +103,15 @@ tile masks are `GFX_MASK_TILE_BASE + tile_id`; `GFX_MASK_AMMO` selects the 7x7
 projectile diamond. The result is 1 only for overlapping nonzero pixels.
 `gfx_world_ammo(x, y)` draws the same diamond centered at world coordinates on the
 selected non-background layer through both cameras.
+
+`gfx_world_rect(x, y, width, height, color)` draws clipped world rectangles.
+`gfx_world_particle(x, y, radius, color, opacity)` draws a soft circular particle
+with radius 0-32 and dither opacity 0-16. `gfx_world_emitters(sites, count, tick)`
+renders an array of four-word records: signed world x/y, positive remaining round
+count (zero means inactive), and sprite mask ID (`-1` for a small fire without a
+wreck). These commands require a non-background layer. The game owns persistence;
+the GPU uses the animation tick and stable seeds to reconstruct rising flame and
+smoke particles without allocating one guest particle pool per old fire.
 
 ## Remaining tasks
 - [ ] Add timed power-ups, such as increased speed, stronger shots, and health restoration.

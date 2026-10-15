@@ -571,6 +571,43 @@ gfx_world_ammo:
     CALLX CGFX_GO
     RET
 
+gfx_world_rect:
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
+    LDWS R3, 10
+    CALLX CGFX_FIELDS
+    LDWS R4, 12
+    CALLX CGFX_COLOR
+    LDI R5, 33
+    CALLX CGFX_GO
+    RET
+
+gfx_world_particle:
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
+    LDWS R3, 12
+    CALLX CGFX_FIELDS
+    LDWS R4, 10
+    CALLX CGFX_COLOR
+    LDI R5, 35
+    CALLX CGFX_GO
+    RET
+
+gfx_world_emitters:
+    LDWS R0, 8
+    LDWS R1, 10
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    LDWS R5, 6
+    CALLX CGFX_SRC
+    LDI R5, 34
+    CALLX CGFX_GO
+    RET
+
 ; gfx_tile_upload(tile, pixels): copy one configured indexed tile into GPU tile RAM.
 gfx_tile_upload:
     LDWS R0, 4
