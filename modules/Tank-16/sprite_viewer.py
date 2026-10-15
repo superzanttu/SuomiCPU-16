@@ -8,57 +8,80 @@ ATLAS_FILES = (
     ROOT / "gfx" / "tiles_objects.png",
     ROOT / "gfx" / "tiles_terrain.png",
 )
-SCALE = 2
+SPRITE_SIZE = 64
+SCALE = 1
 HEADER_HEIGHT = 54
 FOOTER_HEIGHT = 54
-GRID = 16
 
 
-def find_sprite_squares(image, alpha_threshold=250, minimum_size=8):
-    """Find square bounds around separate visible components in an alpha atlas."""
+def padded_atlas(image: pygame.Surface) -> pygame.Surface:
+    """Return an atlas padded to whole 64x64 cells."""
     width, height = image.get_size()
-    if not any(
-            image.get_at((x, y)).a < alpha_threshold
-            for y in range(height)
-            for x in range(width)):
-        return []
+    padded_size = (
+        ((width + SPRITE_SIZE - 1) // SPRITE_SIZE) * SPRITE_SIZE,
+        ((height + SPRITE_SIZE - 1) // SPRITE_SIZE) * SPRITE_SIZE,
+    )
+    if image.get_size() == padded_size:
+        return image
 
-    mask = pygame.mask.from_surface(image, alpha_threshold)
-    squares = []
-
-    for component in mask.connected_components():
-        bounds = component.to_surface(
-            setcolor=(255, 255, 255, 255),
-            unsetcolor=(0, 0, 0, 0),
-        ).get_bounding_rect(min_alpha=1)
-        side = max(bounds.width, bounds.height)
-        if side < minimum_size or side > min(width, height):
-            continue
-
-        left = (bounds.left + bounds.right - side) // 2
-        top = (bounds.top + bounds.bottom - side) // 2
-        left = max(0, min(width - side, left))
-        top = max(0, min(height - side, top))
-        squares.append(pygame.Rect(left, top, side, side))
-
-    return sorted(squares, key=lambda square: (square.top, square.left))
+    padded = pygame.Surface(padded_size, pygame.SRCALPHA, 32)
+    padded.blit(image, (0, 0))
+    return padded
 
 
-def main():
+def load_atlas(path: Path) -> pygame.Surface:
+    return padded_atlas(pygame.image.load(str(path)))
+
+
+def _grid_size(image: pygame.Surface) -> tuple[int, int]:
+    width, height = image.get_size()
+    columns = (width + SPRITE_SIZE - 1) // SPRITE_SIZE
+    rows = (height + SPRITE_SIZE - 1) // SPRITE_SIZE
+    return columns, rows
+
+
+def sprite_id_at(image: pygame.Surface, x: int, y: int) -> int:
+    """Return the row-major ID of the 64x64 cell containing (x, y)."""
+    width, height = image.get_size()
+    if not 0 <= x < width or not 0 <= y < height:
+        raise ValueError("Coordinates are outside the atlas")
+
+    columns, _ = _grid_size(image)
+    return (y // SPRITE_SIZE) * columns + x // SPRITE_SIZE
+
+
+def sprite_bounds(image: pygame.Surface, sprite_id: int) -> pygame.Rect:
+    """Return the 64x64 rectangle for a row-major atlas sprite ID."""
+    columns, rows = _grid_size(image)
+    if not 0 <= sprite_id < columns * rows:
+        raise ValueError("Sprite ID is outside the atlas")
+
+    return pygame.Rect(
+        (sprite_id % columns) * SPRITE_SIZE,
+        (sprite_id // columns) * SPRITE_SIZE,
+        SPRITE_SIZE,
+        SPRITE_SIZE,
+    )
+
+
+def extract_sprite(image: pygame.Surface, sprite_id: int) -> pygame.Surface:
+    """Copy one 64x64 sprite from an atlas, padding an incomplete edge cell."""
+    bounds = sprite_bounds(image, sprite_id)
+    normalized = padded_atlas(image)
+    return normalized.subsurface(bounds).copy()
+
+
+def main() -> int:
     global SCALE
 
     pygame.init()
-    atlases = [pygame.image.load(str(path)) for path in ATLAS_FILES]
-    sprite_squares = [find_sprite_squares(image) for image in atlases]
+    atlases = [load_atlas(path) for path in ATLAS_FILES]
     atlas_index = 0
-    show_sprite_squares = True
+    selected_sprite = None
     window = pygame.display.set_mode((1400, 920), pygame.RESIZABLE)
     pygame.display.set_caption("Tank-16 Sprite Viewer")
     font = pygame.font.Font(None, 18)
-    small_font = pygame.font.Font(None, 13)
-    dragging = False
-    selection_start = None
-    selection = None
+    small_font = pygame.font.Font(None, 16)
     clock = pygame.time.Clock()
     running = True
 
@@ -72,10 +95,11 @@ def main():
         mouse_x, mouse_y = pygame.mouse.get_pos()
         source_x = (mouse_x - image_x) // SCALE
         source_y = (mouse_y - image_y) // SCALE
-        cell_x = source_x // GRID * GRID
-        cell_y = source_y // GRID * GRID
         inside = (image_x <= mouse_x < image_x + image_width and
                   image_y <= mouse_y < image_y + image_height)
+        hovered_sprite = (
+            sprite_id_at(image, source_x, source_y) if inside else None)
+        columns, rows = _grid_size(image)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -87,100 +111,72 @@ def main():
                     running = False
                 elif event.key == pygame.K_TAB:
                     atlas_index = 1 - atlas_index
-                    selection = None
-                elif event.key == pygame.K_a:
-                    show_sprite_squares = not show_sprite_squares
+                    selected_sprite = None
                 elif event.key in (pygame.K_EQUALS, pygame.K_PLUS):
                     SCALE = min(4, SCALE + 1)
                 elif event.key == pygame.K_MINUS:
                     SCALE = max(1, SCALE - 1)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if inside:
-                    dragging = True
-                    selection_start = (source_x // GRID * GRID,
-                                       source_y // GRID * GRID)
-            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                if dragging and selection_start is not None:
-                    end_x = max(0, min(image.get_width(), source_x + 1))
-                    end_y = max(0, min(image.get_height(), source_y + 1))
-                    start_x, start_y = selection_start
-                    left = min(start_x, end_x // GRID * GRID)
-                    top = min(start_y, end_y // GRID * GRID)
-                    right = max(start_x + GRID,
-                                min(image.get_width(),
-                                    ((end_x + GRID - 1) // GRID) * GRID))
-                    bottom = max(start_y + GRID,
-                                 min(image.get_height(),
-                                     ((end_y + GRID - 1) // GRID) * GRID))
-                    selection = (left, top, right - left, bottom - top)
-                    columns = (image.get_width() + GRID - 1) // GRID
-                    sprite_id = (top // GRID) * columns + left // GRID
-                    print("atlas=%s id=%d x=%d y=%d width=%d height=%d" %
-                          (ATLAS_FILES[atlas_index].name, sprite_id,
-                           left, top, right - left, bottom - top))
-                dragging = False
+                event_x, event_y = event.pos
+                click_x = (event_x - image_x) // SCALE
+                click_y = (event_y - image_y) // SCALE
+                if (image_x <= event_x < image_x + image_width and
+                        image_y <= event_y < image_y + image_height):
+                    selected_sprite = sprite_id_at(
+                        image, click_x, click_y)
+                    bounds = sprite_bounds(image, selected_sprite)
+                    print(
+                        "atlas=%s id=%d x=%d y=%d width=%d height=%d"
+                        % (ATLAS_FILES[atlas_index].name, selected_sprite,
+                           bounds.x, bounds.y, SPRITE_SIZE, SPRITE_SIZE)
+                    )
 
         window.fill((24, 27, 31))
         atlas_name = ATLAS_FILES[atlas_index].name
         title = font.render(
-            "%s  %dx%d  |  A: squares (%d)  Tab: switch atlas  +/-: zoom"
-            "  |  Drag: select region"
-            % (atlas_name, image.get_width(), image.get_height(),
-               len(sprite_squares[atlas_index])),
+            "%s  %dx%d  |  Cell: 64x64  Tab: switch atlas  +/-: zoom"
+            "  |  Click: select sprite"
+            % (atlas_name, image.get_width(), image.get_height()),
             True, (245, 245, 245))
         window.blit(title, (12, 12))
         window.blit(pygame.transform.scale(image, (image_width, image_height)),
                     (image_x, image_y))
 
-        columns = (image.get_width() + GRID - 1) // GRID
-        for x in range(0, image.get_width() + 1, GRID):
-            screen_x = image_x + x * SCALE
-            pygame.draw.line(window, (0, 0, 0), (screen_x, image_y),
-                             (screen_x, image_y + image_height), 1)
-        for y in range(0, image.get_height() + 1, GRID):
-            screen_y = image_y + y * SCALE
-            pygame.draw.line(window, (0, 0, 0), (image_x, screen_y),
-                             (image_x + image_width, screen_y), 1)
-        if show_sprite_squares:
-            for sprite_id, square in enumerate(sprite_squares[atlas_index]):
-                screen_rect = pygame.Rect(
-                    image_x + square.x * SCALE,
-                    image_y + square.y * SCALE,
-                    square.width * SCALE,
-                    square.height * SCALE,
-                )
-                pygame.draw.rect(window, (80, 255, 150), screen_rect, 2)
-                label = small_font.render(
-                    str(sprite_id), True, (80, 255, 150))
-                window.blit(label, (screen_rect.x + 2, screen_rect.y + 2))
-        for row in range((image.get_height() + GRID - 1) // GRID):
+        for row in range(rows):
             for column in range(columns):
                 sprite_id = row * columns + column
-                label = small_font.render(str(sprite_id), True, (255, 255, 255))
-                window.blit(label, (image_x + column * GRID * SCALE + 2,
-                                    image_y + row * GRID * SCALE + 2))
+                screen_rect = pygame.Rect(
+                    image_x + column * SPRITE_SIZE * SCALE,
+                    image_y + row * SPRITE_SIZE * SCALE,
+                    SPRITE_SIZE * SCALE,
+                    SPRITE_SIZE * SCALE,
+                )
+                pygame.draw.rect(window, (0, 0, 0), screen_rect, 1)
+                label = small_font.render(
+                    str(sprite_id), True, (255, 255, 255))
+                window.blit(label, (screen_rect.x + 3, screen_rect.y + 3))
 
-        if inside:
-            pygame.draw.rect(
-                window, (255, 225, 40),
-                (image_x + cell_x * SCALE, image_y + cell_y * SCALE,
-                 GRID * SCALE, GRID * SCALE), 2)
-        if dragging and selection_start is not None:
-            start_x, start_y = selection_start
-            pygame.draw.rect(
-                window, (255, 80, 50),
-                (image_x + start_x * SCALE, image_y + start_y * SCALE,
-                 max(GRID, (source_x - start_x + 1) * SCALE),
-                 max(GRID, (source_y - start_y + 1) * SCALE)), 2)
-        if selection is None:
+        for sprite_id, color in (
+                (hovered_sprite, (255, 225, 40)),
+                (selected_sprite, (80, 255, 150))):
+            if sprite_id is not None:
+                bounds = sprite_bounds(image, sprite_id)
+                pygame.draw.rect(
+                    window, color,
+                    (image_x + bounds.x * SCALE,
+                     image_y + bounds.y * SCALE,
+                     SPRITE_SIZE * SCALE, SPRITE_SIZE * SCALE), 2)
+
+        active_sprite = selected_sprite
+        if active_sprite is None:
+            active_sprite = hovered_sprite
+        if active_sprite is None:
             detail = "Move over a sprite cell"
-            if inside:
-                detail = "Cell: x=%d y=%d" % (cell_x, cell_y)
         else:
-            sx, sy, sw, sh = selection
-            sprite_id = (sy // GRID) * columns + sx // GRID
-            detail = "Selection: ID %d  x=%d y=%d  %dx%d" % (
-                sprite_id, sx, sy, sw, sh)
+            bounds = sprite_bounds(image, active_sprite)
+            detail = "Sprite ID %d  x=%d y=%d  %dx%d" % (
+                active_sprite, bounds.x, bounds.y,
+                SPRITE_SIZE, SPRITE_SIZE)
         window.blit(font.render(detail, True, (245, 245, 245)),
                     (12, height - FOOTER_HEIGHT + 10))
         pygame.display.flip()

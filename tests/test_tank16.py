@@ -8,6 +8,37 @@ from src.SuomiCPU import KEYS_ADDR
 
 
 class Tank16Tests(unittest.TestCase):
+    def test_tank_slides_along_obstacle_when_diagonal_path_is_blocked(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = source_path.read_text(encoding="utf-8").replace(
+            "int main(void)", "int tank16_game_entry(void)", 1)
+        test_source = (
+            "int main(void) {\n"
+            "  setup_map();\n"
+            "  tanks[0].x = 176; tanks[0].y = 150;\n"
+            "  tanks[0].direction = 12;\n"
+            "  tanks[1].x = 560; tanks[1].y = 440;\n"
+            "  update_tank(0, 4, 0);\n"
+            "  slide_results[0] = tanks[0].x;\n"
+            "  slide_results[1] = tanks[0].y;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        filename = ROOT / "modules" / "Tank-16" / "slide_test.c"
+        cpu = make_cpu(compile_source(
+            "int slide_results[2];\nint main(void);\n" +
+            game_source + test_source,
+            str(filename),
+        ))
+        while cpu.running:
+            cpu.step()
+
+        results = [
+            cpu.read_16(GLOBAL_BASE + index * 2)
+            for index in range(2)
+        ]
+        self.assertEqual(results, [176, 151])
+
     def test_main_game_compiles_and_renders_a_frame(self):
         source = ROOT / "modules" / "Tank-16" / "main.c"
         cpu = make_cpu(compile_file(source))

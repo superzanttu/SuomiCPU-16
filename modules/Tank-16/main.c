@@ -9,6 +9,13 @@
 #define ROUND_FRAMES 9000
 #define ROUND_DELAY 90
 #define DIRECTION_SCALE 1000
+#define TANK_ROTATION_COUNT 32
+#define TANK_DIRECTION_MASK (TANK_ROTATION_COUNT - 1)
+#define TANK_SPRITE_WIDTH 32
+#define TANK_SPRITE_HEIGHT 32
+#define TANK_SPRITE_PIXEL_COUNT (TANK_SPRITE_WIDTH * TANK_SPRITE_HEIGHT)
+#define TANK_SPRITE_PLAYER_2_BASE 0
+#define TANK_SPRITE_PLAYER_1_BASE TANK_ROTATION_COUNT
 
 typedef struct {
     int x;
@@ -41,7 +48,7 @@ typedef struct {
 Tank tanks[2];
 Shot shots[MAX_SHOTS];
 unsigned char map_data[MAP_CELLS];
-unsigned char sprite_work[32 * 32];
+unsigned char sprite_work[TANK_SPRITE_PIXEL_COUNT];
 unsigned char mine_active[3];
 Obstacle obstacles[7];
 int wins[2];
@@ -51,10 +58,10 @@ int round_over;
 int round_winner;
 int previous_keys;
 int tank_sprite_slots[2];
-int directions_x[32] = {
+int directions_x[TANK_ROTATION_COUNT] = {
     0, 195, 383, 556, 707, 831, 924, 981, 1000, 981, 924, 831, 707, 556, 383, 195,
     0, -195, -383, -556, -707, -831, -924, -981, -1000, -981, -924, -831, -707, -556, -383, -195};
-int directions_y[32] = {
+int directions_y[TANK_ROTATION_COUNT] = {
     -1000, -981, -924, -831, -707, -556, -383, -195, 0, 195, 383, 556, 707, 831, 924, 981,
     1000, 981, 924, 831, 707, 556, 383, 195, 0, -195, -383, -556, -707, -831, -924, -981};
 
@@ -160,9 +167,11 @@ void load_tank_sprites(void)
     int pixel;
     unsigned char color;
 
-    for (angle = 0; angle < 32; angle++) {
-        gfx_sprite_upload(angle, 32, 32, tank_sprite_rotations[angle]);
-        for (pixel = 0; pixel < 32 * 32; pixel++) {
+    for (angle = 0; angle < TANK_ROTATION_COUNT; angle++) {
+        gfx_sprite_upload(TANK_SPRITE_PLAYER_2_BASE + angle,
+                          TANK_SPRITE_WIDTH, TANK_SPRITE_HEIGHT,
+                          tank_sprite_rotations[angle]);
+        for (pixel = 0; pixel < TANK_SPRITE_PIXEL_COUNT; pixel++) {
             color = tank_sprite_rotations[angle][pixel];
             if (color == RED) {
                 color = GREEN;
@@ -171,7 +180,8 @@ void load_tank_sprites(void)
             }
             sprite_work[pixel] = color;
         }
-        gfx_sprite_upload(angle + 32, 32, 32, sprite_work);
+        gfx_sprite_upload(TANK_SPRITE_PLAYER_1_BASE + angle,
+                          TANK_SPRITE_WIDTH, TANK_SPRITE_HEIGHT, sprite_work);
     }
 }
 
@@ -212,12 +222,13 @@ void setup_map(void)
 
     for (y = 0; y < MAP_ROWS; y++) {
         for (x = 0; x < MAP_COLUMNS; x++) {
-            tile = ((x * 7 + y * 11 + (x ^ y)) & 15) == 0 ? 1 : 0;
+            tile = ((x * 7 + y * 11 + (x ^ y)) & 15) == 0
+                       ? TILE_GRASS_DETAIL : TILE_GRASS;
             if (y >= 13 && y <= 16 && x >= 3 && x <= 36) {
-                tile = 2;
+                tile = TILE_HORIZONTAL_STRIP;
             }
             if ((x == 19 || x == 20) && y >= 4 && y <= 25) {
-                tile = 3;
+                tile = TILE_VERTICAL_STRIP;
             }
             map_data[y * MAP_COLUMNS + x] = (unsigned char)tile;
         }
@@ -235,7 +246,7 @@ void fire_shot(int player)
     }
     for (i = 0; i < MAX_SHOTS; i++) {
         if (shots[i].life == 0) {
-            direction = tanks[player].direction & 31;
+            direction = tanks[player].direction & TANK_DIRECTION_MASK;
             shot = &shots[i];
             shot->x = tanks[player].x +
                       direction_offset(directions_x[direction], 12);
@@ -262,6 +273,8 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     int next_y;
     int movement_numerator_x;
     int movement_numerator_y;
+    int can_move_x;
+    int can_move_y;
     int forward_key;
     int backward_key;
 
@@ -271,11 +284,13 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
                    (int)(extra & KEYX2_P2_BACKWARD);
     if ((player == 0 && (keys & 1)) ||
         (player == 1 && (extra & KEYX2_P2_LEFT))) {
-        tanks[player].direction = (tanks[player].direction - 1) & 31;
+        tanks[player].direction =
+            (tanks[player].direction - 1) & TANK_DIRECTION_MASK;
     }
     if ((player == 0 && (keys & 2)) ||
         (player == 1 && (extra & KEYX2_P2_RIGHT))) {
-        tanks[player].direction = (tanks[player].direction + 1) & 31;
+        tanks[player].direction =
+            (tanks[player].direction + 1) & TANK_DIRECTION_MASK;
     }
     old_x = tanks[player].x;
     old_y = tanks[player].y;
@@ -310,11 +325,26 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
         tanks[player].x = next_x;
         tanks[player].y = next_y;
         tanks[player].movement_remainder_x =
-            movement_numerator_x -
-            (next_x - old_x) * DIRECTION_SCALE;
+            movement_numerator_x - (next_x - old_x) * DIRECTION_SCALE;
         tanks[player].movement_remainder_y =
-            movement_numerator_y -
-            (next_y - old_y) * DIRECTION_SCALE;
+            movement_numerator_y - (next_y - old_y) * DIRECTION_SCALE;
+    } else {
+        tanks[player].movement_remainder_x = 0;
+        tanks[player].movement_remainder_y = 0;
+        can_move_x = !blocked(next_x, old_y, player);
+        can_move_y = !blocked(old_x, next_y, player);
+        if (can_move_x &&
+            (!can_move_y ||
+             absolute_value(next_x - old_x) >=
+             absolute_value(next_y - old_y))) {
+            tanks[player].x = next_x;
+            tanks[player].movement_remainder_x =
+                movement_numerator_x - (next_x - old_x) * DIRECTION_SCALE;
+        } else if (can_move_y) {
+            tanks[player].y = next_y;
+            tanks[player].movement_remainder_y =
+                movement_numerator_y - (next_y - old_y) * DIRECTION_SCALE;
+        }
     }
     if ((extra & (player == 0 ? KEYX2_P1_FIRE : KEYX2_P2_FIRE)) != 0) {
         fire_shot(player);
@@ -455,9 +485,11 @@ void draw_tank(int player)
 {
     int slot;
 
-    slot = tanks[player].direction & 31;
+    slot = tanks[player].direction & TANK_DIRECTION_MASK;
     if (player == 0) {
-        slot += 32;
+        slot += TANK_SPRITE_PLAYER_1_BASE;
+    } else {
+        slot += TANK_SPRITE_PLAYER_2_BASE;
     }
     if (tank_sprite_slots[player] != slot) {
         if (tank_sprite_slots[player] >= 0) {
@@ -577,7 +609,7 @@ int main(void)
                     (1 << LAYER_HUD));
     gfx_layer_transparency(LAYER_HUD, 15);
     load_tank_sprites();
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < TILE_COUNT; i++) {
         gfx_tile_upload(i, terrain_tiles[i]);
     }
     setup_map();
