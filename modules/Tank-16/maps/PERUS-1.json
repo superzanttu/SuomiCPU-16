@@ -477,7 +477,33 @@
       null,
       null,
       null,
-      null
+      {
+        "tile": [
+          0,
+          5
+        ],
+        "hp_change": 50,
+        "removal": "disappear"
+      }
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      {
+        "tile": [
+          0,
+          5
+        ],
+        "hp_change": 50,
+        "removal": "disappear"
+      }
     ],
     [
       null,
@@ -496,8 +522,48 @@
       null,
       null,
       null,
+      {
+        "tile": [
+          1,
+          1
+        ],
+        "hp_change": -25,
+        "removal": "explosion"
+      },
+      {
+        "tile": [
+          1,
+          1
+        ],
+        "hp_change": -25,
+        "removal": "explosion"
+      },
       null,
       null,
+      null,
+      null
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      {
+        "tile": [
+          1,
+          1
+        ],
+        "hp_change": -25,
+        "removal": "explosion"
+      },
+      {
+        "tile": [
+          1,
+          1
+        ],
+        "hp_change": -25,
+        "removal": "explosion"
+      },
       null,
       null,
       null,
@@ -516,31 +582,14 @@
       null
     ],
     [
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    ],
-    [
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    ],
-    [
-      null,
+      {
+        "tile": [
+          0,
+          5
+        ],
+        "hp_change": 50,
+        "removal": "disappear"
+      },
       null,
       null,
       null,
@@ -552,7 +601,14 @@
       null
     ],
     [
-      null,
+      {
+        "tile": [
+          0,
+          5
+        ],
+        "hp_change": 50,
+        "removal": "disappear"
+      },
       null,
       null,
       null,

@@ -66,6 +66,8 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_tile_camera": ("void", ("int", "int")),
     "gfx_split_camera": ("void", ("int", "int", "int", "int")),
     "gfx_world_tile": ("void", ("int", "int", "int")),
+    "gfx_mask_overlap": ("int", ("int", "int", "int", "int", "int", "int")),
+    "gfx_world_ammo": ("void", ("int", "int")),
     "gfx_tile_upload": ("void", ("int", "unsigned char*")),
     "gfx_tile_size": ("void", ("int",)),
     "gfx_sprite_upload": ("void", ("int", "int", "int", "unsigned char*")),

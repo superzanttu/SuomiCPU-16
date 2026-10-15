@@ -137,6 +137,7 @@ GPU_TILE_UPLOAD, GPU_TILE_CAMERA, GPU_SPLIT_CAMERA = 25, 26, 29
 GPU_PALETTE = 27
 GPU_TILE_SIZE = 28
 GPU_WORLD_TILE = 30
+GPU_MASK_OVERLAP, GPU_WORLD_AMMO = 31, 32
 GPU_SPRITE_SLOTS = 64
 GPU_SPRITE_MAX_SIZE = 64
 GPU_TILE_COUNT = 256
@@ -776,6 +777,58 @@ class SuomiCompute16:
             self._gpu_set_tile_size(x)
         elif command == GPU_WORLD_TILE:
             self._gpu_world_tile(color, x, y, layer)
+        elif command == GPU_MASK_OVERLAP:
+            first = self._gpu_collision_mask(self._gpu_word(10, False))
+            second = self._gpu_collision_mask(self._gpu_word(12, False))
+            self._gpu_result(self._gpu_masks_overlap(first, x, y, second, w, h))
+        elif command == GPU_WORLD_AMMO:
+            self._gpu_world_ammo(x, y, layer)
+
+    def _gpu_collision_mask(self, mask):
+        if 0 <= mask < GPU_SPRITE_SLOTS:
+            return self.sprite_memory[mask]
+        if GPU_SPRITE_SLOTS <= mask < GPU_SPRITE_SLOTS + GPU_TILE_COUNT:
+            size = self.tile_pixel_size
+            start = (mask - GPU_SPRITE_SLOTS) * GPU_TILE_MAX_SIZE ** 2
+            return size, size, self.tile_memory[start:start + size * size]
+        if mask == GPU_SPRITE_SLOTS + GPU_TILE_COUNT:
+            return 7, 7, bytes(
+                1 if abs(x - 3) + abs(y - 3) <= 3 else 0
+                for y in range(7) for x in range(7)
+            )
+        raise ValueError("Unknown GPU collision mask: %d" % mask)
+
+    @staticmethod
+    def _gpu_masks_overlap(first, x, y, second, other_x, other_y):
+        if first is None or second is None:
+            raise ValueError("Collision mask sprite has not been uploaded")
+        width, height, pixels = first
+        other_width, other_height, other_pixels = second
+        left, right = max(x, other_x), min(x + width, other_x + other_width)
+        top, bottom = max(y, other_y), min(y + height, other_y + other_height)
+        for row in range(top, bottom):
+            for column in range(left, right):
+                if (pixels[(row - y) * width + column - x] and
+                        other_pixels[(row - other_y) * other_width + column - other_x]):
+                    return 1
+        return 0
+
+    def _gpu_world_ammo(self, world_x, world_y, layer):
+        if layer == 0:
+            raise ValueError("World ammunition requires an unpacked graphics layer")
+        width, height = self._screen_size()
+        cameras = self.split_cameras
+        views = ((self.tile_camera, 0, width),) if cameras is None else (
+            (cameras[0], 0, width // 2), (cameras[1], width // 2, width))
+        target = self.gpu_layers[layer]
+        for (camera_x, camera_y), left, right in views:
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
+                    distance = abs(dx) + abs(dy)
+                    x = world_x + dx - camera_x + left
+                    y = world_y + dy - camera_y
+                    if distance <= 3 and left <= x < right and 0 <= y < height:
+                        target[y * width + x] = 1 if distance <= 1 else 5
 
     def _gpu_world_tile(self, tile, world_x, world_y, layer):
         if layer == 0:

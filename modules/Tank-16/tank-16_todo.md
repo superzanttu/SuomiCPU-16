@@ -23,6 +23,38 @@
 - [x] Add short muzzle flashes, shot-impact sparks, damage flashes, destruction bursts, and shooting/hit/healing sounds.
 - [x] Show reload progress below health bars, warn on low health, and separate the two camera views with a divider.
 - [x] Show round results and the next-round countdown inside each player's viewport.
+- [x] Use opaque-pixel collision masks for rotated tanks, obstacles, map objects, and ammunition; sweep moving shots to detect thin obstacles.
+- [x] Draw larger 7x7 ammunition with a white core and yellow outline, using the same shape for collision detection.
+- [x] Emit moving sparks and rising smoke from explosions and impacts, and flames/smoke from destroyed tanks during the round countdown.
+
+## Collision and particle effects
+
+Collision masks use the actual uploaded sprite/tile pixels: palette index zero is
+transparent. Map obstacles block tanks and ammunition only where opaque pixels
+overlap. Tank rotation is rejected if the new orientation overlaps an obstacle or
+the other tank. Ground tiles and cosmetic tracks, bursts, and particles are not
+colliders.
+
+Ammunition collides with opposing tanks, obstacles, active map objects, and other
+ammunition. Shooting an object consumes the shot; fixed objects remain, explosion
+objects are removed with an explosion, and disappear objects are removed without
+an object explosion. Object HP changes still apply only on tank contact.
+
+The particle system uses a fixed pool of `MAX_PARTICLES` (48) entries. New emissions
+replace the oldest entries when full. Sparks slow and fade through yellow, orange,
+and dark red; smoke rises, drifts, and expands. Particles expire after
+`PARTICLE_FRAMES` (24) updates or on leaving the map. Wrecks emit fire and smoke every
+`FIRE_EMISSION_INTERVAL` (3) updates, including during round-end countdowns.
+Starting a round clears all particles. Both camera views clip effects to their
+viewport and the map boundaries. Round-result banners sit near the bottom of
+each viewport so they do not cover the centered wreck fires.
+
+The graphics API exposes `gfx_mask_overlap(first, first_x, first_y, second,
+second_x, second_y)` with top-left world coordinates. Sprite mask IDs are 0-63;
+tile masks are `GFX_MASK_TILE_BASE + tile_id`; `GFX_MASK_AMMO` selects the 7x7
+projectile diamond. The result is 1 only for overlapping nonzero pixels.
+`gfx_world_ammo(x, y)` draws the same diamond centered at world coordinates on the
+selected non-background layer through both cameras.
 
 ## Remaining tasks
 - [ ] Add timed power-ups, such as increased speed, stronger shots, and health restoration.

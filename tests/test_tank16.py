@@ -1,5 +1,6 @@
 from pathlib import Path
 import math
+import re
 import runpy
 import tempfile
 import unittest
@@ -16,14 +17,159 @@ from tools.tank16_map_loader import (
 
 
 class Tank16Tests(unittest.TestCase):
+    def game_source(self, source_path, tile_size=64):
+        source = source_path.read_text(encoding="utf-8")
+        return re.sub(r"#define MAP_TILE_PIXEL_SIZE \d+",
+                      f"#define MAP_TILE_PIXEL_SIZE {tile_size}", source).replace(
+                          "int main(void)", "int tank16_game_entry(void)", 1)
+
+    def test_particles_move_expire_wrap_reset_and_burn_during_round_end(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        scenario = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480); start_round();\n"
+            "  tanks[0].x = 100; tanks[0].y = 100;\n"
+            "  tanks[1].x = 140; tanks[1].y = 100;\n"
+            "  emit_explosion(150, 160, 3);\n"
+            "  results[0] = next_particle;\n"
+            "  update_particles();\n"
+            "  results[1] = particles[0].y;\n"
+            "  results[2] = particles[8].y;\n"
+            "  results[3] = particles[0].life;\n"
+            "  gfx_split_camera(0, 0, 0, 0); draw_hud(); gfx_present();\n"
+            "  for (i = 0; i < PARTICLE_FRAMES; i++) update_particles();\n"
+            "  for (i = 0; i < MAX_PARTICLES; i++) results[4] += particles[i].life;\n"
+            "  emit_particle(0, 0, -1, -1, 0); update_particles();\n"
+            "  results[5] = particles[10].life;\n"
+            "  start_round();\n"
+            "  for (i = 0; i < MAX_PARTICLES + 3; i++) emit_particle(i, 100, 1, 0, 0);\n"
+            "  results[6] = next_particle;\n"
+            "  results[7] = particles[0].x;\n"
+            "  start_round();\n"
+            "  results[8] = next_particle;\n"
+            "  for (i = 0; i < MAX_PARTICLES; i++) results[9] += particles[i].life;\n"
+            "  tanks[1].health = 0; round_over = 1; round_delay = 60;\n"
+            "  for (i = 0; i < FIRE_EMISSION_INTERVAL; i++) update_game(0, 0);\n"
+            "  results[10] = next_particle;\n"
+            "  results[11] = particles[0].smoke;\n"
+            "  results[12] = particles[1].smoke;\n"
+            "  results[13] = round_delay;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[14];\n" + self.game_source(source_path) + scenario,
+            str(source_path)))
+        self.assertLess(run_frame(cpu), 400_000)
+        self.assertTrue(cpu.frame_yield)
+        for offset in (0, 320):
+            self.assertEqual(layer_pixel(cpu, 4, offset + 150, 157), 5)
+            self.assertEqual(layer_pixel(cpu, 4, offset + 148, 159), 10)
+        while cpu.running:
+            cpu.step()
+        self.assertEqual([cpu.read_16(GLOBAL_BASE + i * 2) for i in range(14)],
+                         [10, 157, 159, 23, 0, 0, 3, 48, 0, 0, 2, 0, 1, 57])
+
+    def test_pixel_collisions_rotation_thin_obstacles_and_crossing_ammo(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        scenario = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  prepare_collision_assets();\n"
+            "  for (i = 0; i < 1024; i++) sprite_work[i] = 0;\n"
+            "  sprite_work[528] = 1;\n"
+            "  gfx_sprite_upload(8, 32, 32, sprite_work);\n"
+            "  gfx_sprite_upload(24, 32, 32, sprite_work);\n"
+            "  sprite_work[528] = 0; sprite_work[529] = 1;\n"
+            "  gfx_sprite_upload(9, 32, 32, sprite_work);\n"
+            "  for (i = 0; i < 4096; i++) terrain_tiles[1][i] = 0;\n"
+            "  terrain_tiles[1][16 * 32 + 16] = 1;\n"
+            "  gfx_tile_upload(1, terrain_tiles[1]);\n"
+            "  map_obstacles[2 * MAP_COLUMNS + 3] = 1;\n"
+            "  tanks[0].x = 111; tanks[0].y = 80; tanks[0].direction = 8;\n"
+            "  tanks[1].x = 200; tanks[1].y = 100; tanks[1].direction = 24;\n"
+            "  tanks[0].health = 100; tanks[1].health = 100;\n"
+            "  results[0] = blocked(111, 80, 0);\n"
+            "  results[1] = blocked(112, 80, 0);\n"
+            "  update_tank(0, 2, 0); results[2] = tanks[0].direction;\n"
+            "  results[3] = tank_collision(199, 100, 0);\n"
+            "  results[4] = tank_collision(200, 100, 0);\n"
+            "  shots[0].x = 106; shots[0].y = 80; shots[0].life = 120;\n"
+            "  shots[0].direction = 8; update_shots();\n"
+            "  results[5] = shots[0].life;\n"
+            "  results[6] = shots[0].x;\n"
+            "  shots[0].x = 100; shots[0].y = 120; shots[0].life = 120;\n"
+            "  shots[1].x = 110; shots[1].y = 120; shots[1].life = 120;\n"
+            "  shots[1].direction = 24; update_shots();\n"
+            "  results[7] = shots[0].life; results[8] = shots[1].life;\n"
+            "  shots[0].x = 194; shots[0].y = 100; shots[0].life = 120;\n"
+            "  update_shots(); results[9] = tanks[1].health;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[10];\n" + self.game_source(source_path, 32) + scenario,
+            str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual([cpu.read_16(GLOBAL_BASE + i * 2) for i in range(10)],
+                         [0, 1, 8, 0, 1, 0, 109, 0, 0, 90])
+
+    def test_objects_require_opaque_contact_and_react_to_ammunition(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
+        data = editor["new_map"]("PIXELS", 10, 8)
+        for column, removal in enumerate(("explosion", "fixed", "disappear"), 1):
+            data["objects"][1][column] = {
+                "tile": [1, 0], "hp_change": -25, "removal": removal,
+            }
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "tools.tank16_map_loader.map_tile_pixel_size", return_value=32):
+            path = editor["save_map"](data, Path(directory))
+            header = build_map_header(path)
+        source = self.game_source(source_path, 32).replace(
+            '#include "map_assets.h"', header, 1)
+        scenario = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  start_round();\n"
+            "  for (i = 0; i < 1024; i++) sprite_work[i] = 0;\n"
+            "  sprite_work[528] = 1;\n"
+            "  gfx_sprite_upload(8, 32, 32, sprite_work);\n"
+            "  for (i = 0; i < 1024; i++) terrain_tiles[40][i] = 0;\n"
+            "  terrain_tiles[40][528] = 1; gfx_tile_upload(40, terrain_tiles[40]);\n"
+            "  tanks[0].x = 47; tanks[0].y = 48;\n"
+            "  tanks[1].x = 240; tanks[1].y = 180;\n"
+            "  update_objects(); results[0] = tanks[0].health;\n"
+            "  tanks[0].x = 48; update_objects(); results[1] = tanks[0].health;\n"
+            "  start_round(); tanks[1].x = 240; tanks[1].y = 180;\n"
+            "  shots[0].x = 42; shots[0].y = 48;\n"
+            "  shots[0].direction = 8; shots[0].life = 120; update_shots();\n"
+            "  results[2] = object_active[0]; results[3] = object_explosion[0];\n"
+            "  results[4] = next_particle;\n"
+            "  shots[0].x = 74; shots[0].life = 120; update_shots();\n"
+            "  results[5] = object_active[1]; results[6] = shots[0].life;\n"
+            "  shots[0].x = 106; shots[0].life = 120; update_shots();\n"
+            "  results[7] = object_active[2]; results[8] = object_explosion[2];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source("int results[9];\n" + source + scenario,
+                                     str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual([cpu.read_16(GLOBAL_BASE + i * 2) for i in range(9)],
+                         [100, 75, 0, 18, 20, 1, 0, 0, 0])
+
     def test_full_tracks_and_impact_pool_render_within_frame_budget(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        source = source_path.read_text(encoding="utf-8").replace(
-            "int main(void)", "int tank16_game_entry(void)", 1)
+        source = self.game_source(source_path)
         scenario = (
             "int main(void) {\n"
             "  int i;\n"
             "  gfx_mode(GFX_MODE_640_480);\n"
+            "  start_round(); gfx_present();\n"
             "  tanks[0].x = 160; tanks[0].y = 240; tanks[0].health = 65;\n"
             "  tanks[1].x = 480; tanks[1].y = 240; tanks[1].health = 20;\n"
             "  tank_sprite_slots[0] = -1; tank_sprite_slots[1] = -1;\n"
@@ -38,6 +184,11 @@ class Tank16Tests(unittest.TestCase):
             "  }\n"
             "  fire_shot(0); fire_shot(1);\n"
             "  hit_flash[1] = HIT_FLASH_FRAMES;\n"
+            "  for (i = 0; i < MAX_SHOTS; i++) {\n"
+            "    shots[i].life = 120; shots[i].x = 40 + i * 40;\n"
+            "    shots[i].y = 160; shots[i].direction = 0;\n"
+            "  }\n"
+            "  update_game(0, 0);\n"
             "  draw_game(); gfx_present();\n"
             "  return 0;\n"
             "}\n"
@@ -45,11 +196,12 @@ class Tank16Tests(unittest.TestCase):
         cpu = make_cpu(compile_source(source + scenario, str(source_path)))
         self.assertLess(run_frame(cpu), 400_000)
         self.assertTrue(cpu.frame_yield)
+        self.assertLess(run_frame(cpu), 400_000)
+        self.assertTrue(cpu.frame_yield)
 
     def test_combat_feedback_renders_expires_and_resets(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        source = source_path.read_text(encoding="utf-8").replace(
-            "int main(void)", "int tank16_game_entry(void)", 1)
+        source = self.game_source(source_path)
         test_source = (
             "int main(void) {\n"
             "  int i;\n"
@@ -107,12 +259,12 @@ class Tank16Tests(unittest.TestCase):
         self.assertTrue(cpu.frame_yield)
         self.assertEqual(cpu.sprites[24]["flags"], 0)
         for offset in (0, 320):
-            self.assertEqual(layer_pixel(cpu, 4, offset + 32, 220), 0)
-            self.assertEqual(layer_pixel(cpu, 4, offset + 34, 204),
+            self.assertEqual(layer_pixel(cpu, 4, offset + 32, 412), 0)
+            self.assertEqual(layer_pixel(cpu, 4, offset + 34, 396),
                              3 if offset == 0 else 2)
             self.assertTrue(any(
                 layer_pixel(cpu, 4, x, y) != 0
-                for y in range(220, 227)
+                for y in range(412, 419)
                 for x in range(offset + 130, offset + 190)
             ))
         while cpu.running:
@@ -174,13 +326,14 @@ class Tank16Tests(unittest.TestCase):
             data["objects"][1][column] = {
                 "tile": [1, 0], "hp_change": hp, "removal": removal,
             }
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "tools.tank16_map_loader.map_tile_pixel_size", return_value=64):
             path = editor["save_map"](data, Path(directory))
             header = build_map_header(path)
             _, tiles, _, _ = load_map_assets(path)
-        game_source = source_path.read_text(encoding="utf-8").replace(
+        game_source = self.game_source(source_path).replace(
             '#include "map_assets.h"', header, 1
-        ).replace("int main(void)", "int tank16_game_entry(void)", 1)
+        )
         test_source = (
             "int main(void) {\n"
             "  int i;\n"
@@ -263,18 +416,13 @@ class Tank16Tests(unittest.TestCase):
 
     def test_map_bounds_and_camera_clamping_follow_tile_pixel_size(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        source = source_path.read_text(encoding="utf-8")
         for tile_size, centered_camera, edge_camera in (
             (24, -40, -40),
             (32, 0, 0),
             (64, 160, 320),
         ):
             with self.subTest(tile_size=tile_size):
-                game_source = source.replace(
-                    "#define MAP_TILE_PIXEL_SIZE 64",
-                    f"#define MAP_TILE_PIXEL_SIZE {tile_size}",
-                    1,
-                ).replace("int main(void)", "int tank16_game_entry(void)", 1)
+                game_source = self.game_source(source_path, tile_size)
                 test_source = (
                     "int main(void) {\n"
                     "  int map_width;\n"
@@ -308,12 +456,15 @@ class Tank16Tests(unittest.TestCase):
 
     def test_tank_slides_along_obstacle_when_diagonal_path_is_blocked(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        game_source = source_path.read_text(encoding="utf-8").replace(
-            "int main(void)", "int tank16_game_entry(void)", 1)
+        game_source = self.game_source(source_path)
         test_source = (
             "int main(void) {\n"
+            "  int i;\n"
+            "  prepare_collision_assets();\n"
+            "  for (i = 0; i < 4096; i++) terrain_tiles[1][i] = 1;\n"
+            "  gfx_tile_upload(1, terrain_tiles[1]);\n"
             "  map_obstacles[2 * MAP_COLUMNS + 3] = 1;\n"
-            "  tanks[0].x = 176; tanks[0].y = 150;\n"
+            "  tanks[0].x = 177; tanks[0].y = 150;\n"
             "  tanks[0].direction = 12;\n"
             "  tanks[1].x = 560; tanks[1].y = 440;\n"
             "  update_tank(0, 4, 0);\n"
@@ -335,7 +486,7 @@ class Tank16Tests(unittest.TestCase):
             cpu.read_16(GLOBAL_BASE + index * 2)
             for index in range(2)
         ]
-        self.assertEqual(results, [176, 151])
+        self.assertEqual(results, [177, 151])
 
     def test_main_game_compiles_and_renders_a_frame(self):
         source = ROOT / "modules" / "Tank-16" / "main.c"
@@ -471,8 +622,7 @@ class Tank16Tests(unittest.TestCase):
 
     def test_tank_speed_and_sprite_heading_match_all_directions(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        game_source = source_path.read_text(encoding="utf-8").replace(
-            "int main(void)", "int tank16_game_entry(void)", 1)
+        game_source = self.game_source(source_path)
         test_source = (
             "int main(void) {\n"
             "  int direction;\n"
@@ -522,8 +672,7 @@ class Tank16Tests(unittest.TestCase):
 
     def test_shot_speed_and_aim_match_all_tank_directions(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        game_source = source_path.read_text(encoding="utf-8").replace(
-            "int main(void)", "int tank16_game_entry(void)", 1)
+        game_source = self.game_source(source_path)
         test_source = (
             "int main(void) {\n"
             "  int direction;\n"

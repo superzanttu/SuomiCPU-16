@@ -45,6 +45,71 @@ def back(cpu, x, y, layer=0):
 
 
 class GpuTests(unittest.TestCase):
+    def test_pixel_masks_use_opaque_pixels_at_every_supported_tile_scale(self):
+        cpu = bare_cpu()
+        cpu._ensure_gpu_state()
+        cpu.sprite_memory[0] = (3, 3, bytes((1, 0, 1, 0, 0, 0, 1, 0, 1)))
+        cpu.sprite_memory[1] = (1, 1, bytes((9,)))
+        for size in (24, 32, 64):
+            cpu.tile_pixel_size = size
+            cpu.tile_memory[:size * size] = bytes(size * size)
+            cpu.tile_memory[size + 1] = 42
+            for first, second in ((0, 1), (0, 64), (320, 0), (320, 320)):
+                a = cpu._gpu_collision_mask(first)
+                b = cpu._gpu_collision_mask(second)
+                for x in range(-8, 9):
+                    for y in range(-8, 9):
+                        opaque_a = {(px - 2, py - 3)
+                                    for py in range(a[1]) for px in range(a[0])
+                                    if a[2][py * a[0] + px]}
+                        opaque_b = {(px + x, py + y)
+                                    for py in range(b[1]) for px in range(b[0])
+                                    if b[2][py * b[0] + px]}
+                        gpu(cpu, 31, x=-2, y=-3, w=x, h=y,
+                            source=first | (second << 16))
+                        self.assertEqual(cpu.read_16(GPU_BASE + 14),
+                                         int(bool(opaque_a & opaque_b)))
+        with self.assertRaises(ValueError):
+            gpu(cpu, 31, source=63)
+        with self.assertRaises(ValueError):
+            cpu._gpu_collision_mask(321)
+
+    def test_c_mask_wrapper_returns_result_and_ammo_matches_visible_mask(self):
+        cpu = run_c(
+            "int results[3];\n"
+            "unsigned char sprite[9] = {1,0,1,0,0,0,1,0,1};\n"
+            "int main(void) {\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  gfx_sprite_upload(0, 3, 3, sprite);\n"
+            "  results[0] = gfx_mask_overlap(0, -1, -1, 0, 0, 0);\n"
+            "  results[1] = gfx_mask_overlap(0, -1, -1, 0, 1, 1);\n"
+            "  results[2] = gfx_mask_overlap(GFX_MASK_AMMO, 0, 0, 0, 3, 3);\n"
+            "  gfx_layer_select(LAYER_HUD);\n"
+            "  gfx_split_camera(0, 0, 100, 0);\n"
+            "  gfx_world_ammo(150, 100);\n"
+            "  gfx_present(); return 0;\n"
+            "}\n"
+        )
+        self.assertEqual([cpu.read_16(GLOBAL_BASE + i * 2) for i in range(3)],
+                         [0, 1, 1])
+        for center in (150, 370):
+            for dy in range(-4, 5):
+                for dx in range(-4, 5):
+                    distance = abs(dx) + abs(dy)
+                    self.assertEqual(back(cpu, center + dx, 100 + dy, 4),
+                                     1 if distance <= 1 else 5 if distance <= 3 else 0)
+        cpu.gpu_layers[4][:] = bytes(len(cpu.gpu_layers[4]))
+        cpu.split_cameras = ((0, 0), (320, 0))
+        gpu(cpu, 32, x=319, y=100)
+        for x in range(316, 323):
+            self.assertEqual(back(cpu, x, 100, 4),
+                             1 if x in (318, 319, 320) else 5)
+        cpu.gpu_layers[4][:] = bytes(len(cpu.gpu_layers[4]))
+        cpu.split_cameras = ((0, 0), (0, 0))
+        gpu(cpu, 32, x=0, y=0)
+        self.assertEqual(back(cpu, 319, 0, 4), 0)
+        self.assertEqual(back(cpu, 320, 0, 4), 1)
+
     def test_vram_reserves_only_640_by_480_four_bit_framebuffer(self):
         self.assertEqual(VRAM_SIZE, 640 * 480 // 2)
         self.assertEqual(VRAM_START + VRAM_SIZE, 0x75800)

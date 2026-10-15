@@ -42,6 +42,11 @@ void gfx_tile_camera(int cam_x, int cam_y);
 void gfx_split_camera(int player1_x, int player1_y,
                       int player2_x, int player2_y);
 void gfx_world_tile(int tile, int x, int y);
+int gfx_mask_overlap(int first, int first_x, int first_y,
+                     int second, int second_x, int second_y);
+void gfx_world_ammo(int x, int y);
+#define GFX_MASK_TILE_BASE 64
+#define GFX_MASK_AMMO 320
 /* Set one indexed color-map entry (index and RGB channels are 0..255). */
 #define GFX_PALETTE_SIZE 256
 void gfx_palette(unsigned char index, unsigned char red,

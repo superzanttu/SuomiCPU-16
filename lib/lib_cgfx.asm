@@ -545,6 +545,32 @@ gfx_world_tile:
     CALLX CGFX_GO
     RET
 
+gfx_mask_overlap:
+    LDWS R0, 6
+    LDWS R1, 8
+    LDWS R2, 12
+    LDWS R3, 14
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    LDWS R5, 10
+    CALLX CGFX_SRC
+    LDI R5, 31
+    CALLX CGFX_GO
+    LDI R6, 14
+    ADD R7, R6
+    LDW R0, R7
+    RET
+
+gfx_world_ammo:
+    LDWS R0, 4
+    LDWS R1, 6
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDI R5, 32
+    CALLX CGFX_GO
+    RET
+
 ; gfx_tile_upload(tile, pixels): copy one configured indexed tile into GPU tile RAM.
 gfx_tile_upload:
     LDWS R0, 4
