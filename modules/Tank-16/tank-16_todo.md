@@ -20,10 +20,13 @@
 - [x] Show both players' health and the game timer and win count in the HUD.
 - [x] Limit each round to five minutes; decide the winner by remaining health and declare a draw on equal health.
 - [x] Start a new round automatically after each round and retain wins; reset the win count when the game restarts.
+- [x] Add short muzzle flashes, shot-impact sparks, damage flashes, destruction bursts, and shooting/hit/healing sounds.
+- [x] Show reload progress below health bars, warn on low health, and separate the two camera views with a divider.
+- [x] Show round results and the next-round countdown inside each player's viewport.
 
 ## Remaining tasks
 - [ ] Add timed power-ups, such as increased speed, stronger shots, and health restoration.
-- [ ] Add sound effects for shooting, tank movement, and explosions.
+- [ ] Add tank movement sounds.
 
 ## Questions for the user
 Q: Which object-atlas sprites should be used for mines and obstacles?

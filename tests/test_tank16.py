@@ -3,6 +3,9 @@ import math
 import runpy
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import pygame
 
 from c_compiler import GLOBAL_BASE, compile_source
 from gfx_harness import ROOT, layer_pixel, make_cpu, run_frame
@@ -13,6 +16,152 @@ from tools.tank16_map_loader import (
 
 
 class Tank16Tests(unittest.TestCase):
+    def test_full_tracks_and_impact_pool_render_within_frame_budget(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        source = source_path.read_text(encoding="utf-8").replace(
+            "int main(void)", "int tank16_game_entry(void)", 1)
+        scenario = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  tanks[0].x = 160; tanks[0].y = 240; tanks[0].health = 65;\n"
+            "  tanks[1].x = 480; tanks[1].y = 240; tanks[1].health = 20;\n"
+            "  tank_sprite_slots[0] = -1; tank_sprite_slots[1] = -1;\n"
+            "  for (i = 0; i < MAX_TRACK_MARKS; i++) {\n"
+            "    track_x[i] = 40 + i * 5; track_y[i] = 210 + i;\n"
+            "    track_direction[i] = 8;\n"
+            "  }\n"
+            "  track_count = MAX_TRACK_MARKS;\n"
+            "  for (i = 0; i < MAX_IMPACTS; i++) {\n"
+            "    add_impact(70 + i * 40, 180 + i * 12, 12);\n"
+            "    impact_life[i] = 2;\n"
+            "  }\n"
+            "  fire_shot(0); fire_shot(1);\n"
+            "  hit_flash[1] = HIT_FLASH_FRAMES;\n"
+            "  draw_game(); gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source + scenario, str(source_path)))
+        self.assertLess(run_frame(cpu), 400_000)
+        self.assertTrue(cpu.frame_yield)
+
+    def test_combat_feedback_renders_expires_and_resets(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        source = source_path.read_text(encoding="utf-8").replace(
+            "int main(void)", "int tank16_game_entry(void)", 1)
+        test_source = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  tank_sprite_slots[0] = -1; tank_sprite_slots[1] = -1;\n"
+            "  start_round();\n"
+            "  tanks[0].x = 100; tanks[0].y = 100; tanks[0].direction = 8;\n"
+            "  tanks[1].x = 140; tanks[1].y = 100;\n"
+            "  fire_shot(0); fire_shot(0);\n"
+            "  results[0] = muzzle_flash[0];\n"
+            "  results[1] = tanks[0].cooldown;\n"
+            "  results[2] = shots[1].life;\n"
+            "  for (i = 0; i < 5; i++) update_shots();\n"
+            "  results[3] = tanks[1].health;\n"
+            "  results[4] = hit_flash[1];\n"
+            "  results[5] = impact_life[0];\n"
+            "  gfx_split_camera(0, 0, 0, 0);\n"
+            "  draw_hud(); gfx_present();\n"
+            "  change_health(1, 5);\n"
+            "  change_health(1, -100);\n"
+            "  results[6] = tanks[1].health;\n"
+            "  results[7] = impact_size[1];\n"
+            "  draw_tank(1);\n"
+            "  fire_shot(1);\n"
+            "  results[8] = muzzle_flash[1];\n"
+            "  round_over = 1; round_delay = 60;\n"
+            "  for (i = 0; i < IMPACT_FRAMES; i++) update_game(0, 0);\n"
+            "  results[9] = hit_flash[1];\n"
+            "  results[10] = impact_life[1];\n"
+            "  results[11] = muzzle_flash[0];\n"
+            "  draw_game(); gfx_present();\n"
+            "  start_round();\n"
+            "  results[12] = next_impact;\n"
+            "  results[13] = hit_flash[1];\n"
+            "  results[14] = tanks[1].health;\n"
+            "  change_health(1, 25);\n"
+            "  results[15] = tanks[1].health;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[16];\nint main(void);\n" + source + test_source,
+            str(source_path),
+        ))
+        self.assertLess(run_frame(cpu), 400_000)
+        self.assertTrue(cpu.frame_yield)
+        self.assertEqual(layer_pixel(cpu, 4, 120, 21), 0)
+        self.assertEqual(layer_pixel(cpu, 4, 68, 21), 0)
+        self.assertEqual(layer_pixel(cpu, 4, 528, 7), 1)
+        self.assertEqual(layer_pixel(cpu, 4, 319, 100), 10)
+        self.assertEqual(layer_pixel(cpu, 4, 320, 100), 10)
+        self.assertEqual(layer_pixel(cpu, 4, 118, 95), 1)
+        self.assertEqual(layer_pixel(cpu, 4, 438, 95), 1)
+        self.assertLess(run_frame(cpu), 400_000)
+        self.assertTrue(cpu.frame_yield)
+        self.assertEqual(cpu.sprites[24]["flags"], 0)
+        for offset in (0, 320):
+            self.assertEqual(layer_pixel(cpu, 4, offset + 32, 220), 0)
+            self.assertEqual(layer_pixel(cpu, 4, offset + 34, 204),
+                             3 if offset == 0 else 2)
+            self.assertTrue(any(
+                layer_pixel(cpu, 4, x, y) != 0
+                for y in range(220, 227)
+                for x in range(offset + 130, offset + 190)
+            ))
+        while cpu.running:
+            cpu.step()
+        results = [cpu.read_16(GLOBAL_BASE + i * 2) for i in range(16)]
+        self.assertEqual(results, [
+            3, 18, 0, 90, 8, 10, 0, 28, 0, 0, 0, 0, 0, 0, 100, 100,
+        ])
+        self.assertEqual(cpu.sound_log, [
+            (0, 230, 3, 1, 22),
+            (2, 160, 4, 1, 25),
+            (3, 660, 6, 2, 25),
+            (2, 65, 16, 1, 45),
+        ])
+
+    def test_object_tiles_scale_smoothly_with_configured_tile_size(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
+        data = editor["new_map"]("SCALED", 10, 8)
+        data["obstacles"][0][0] = [0, 0]
+        atlas, _, _ = editor["load_tileset"](
+            editor["OBJECT_TILESET_PATH"], pad_edges=True)
+        source_tile = atlas.subsurface((0, 0, 64, 64))
+        with tempfile.TemporaryDirectory() as directory:
+            path = editor["save_map"](data, Path(directory))
+            for size in (24, 32, 64):
+                with self.subTest(size=size), patch(
+                        "tools.tank16_map_loader.map_tile_pixel_size",
+                        return_value=size):
+                    _, tiles, palette, dimensions = load_map_assets(path)
+                self.assertEqual(dimensions[2], size)
+                self.assertEqual(len(tiles), 41)
+                self.assertEqual(len(tiles[40]), size * size)
+                expected = pygame.transform.smoothscale(source_tile, (size, size))
+                for y in range(size):
+                    for x in range(size):
+                        color = expected.get_at((x, y))
+                        pixel = tiles[40][y * size + x]
+                        if color.a < 128:
+                            self.assertEqual(pixel, 0)
+                        else:
+                            closest = min(
+                                range(1, len(palette)),
+                                key=lambda index: sum(
+                                    (color[channel] - palette[index][channel]) ** 2
+                                    for channel in range(3)),
+                            )
+                            self.assertEqual(pixel, closest + 31)
+
     def test_map_objects_obstacles_and_tracks_work_in_game(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
         editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
@@ -80,19 +229,30 @@ class Tank16Tests(unittest.TestCase):
             "  draw_ground();\n"
             "  start_round();\n"
             "  results[18] = track_count;\n"
+            "  tanks[0].x = 100; tanks[0].y = 260;\n"
+            "  tanks[0].direction = 8;\n"
+            "  tanks[1].x = 600; tanks[1].y = 440;\n"
+            "  last_track_x[0] = 100; last_track_y[0] = 260;\n"
+            "  for (i = 0; i < 200; i++) update_tank(0, 4, 0);\n"
+            "  results[19] = track_count;\n"
+            "  results[20] = next_track;\n"
+            "  object_explosion[0] = EXPLOSION_FRAMES;\n"
+            "  round_over = 1; round_delay = 90;\n"
+            "  for (i = 0; i < EXPLOSION_FRAMES; i++) update_game(0, 0);\n"
+            "  results[21] = object_explosion[0];\n"
             "  return 0;\n"
             "}\n"
         )
         cpu = make_cpu(compile_source(
-            "int results[19];\nint main(void);\n" + game_source + test_source,
+            "int results[22];\nint main(void);\n" + game_source + test_source,
             str(source_path),
         ))
         while cpu.running:
             cpu.step()
-        results = [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(19)]
+        results = [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(22)]
         self.assertEqual(results, [
             75, 0, 18, 75, 100, 0, 0, 90, 1, 80, 0,
-            1, 0, 1, 0, 0, 5, 5, 0,
+            1, 0, 1, 0, 0, 5, 5, 0, 96, 4, 0,
         ])
         obstacle_tile = tiles[40]
         for y in range(64):

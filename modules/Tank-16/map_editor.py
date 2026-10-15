@@ -12,6 +12,16 @@ DEFAULT_TILESET_FILENAME = TILESET_PATH.name
 OBJECT_TILESET_PATH = ROOT / "gfx" / "tiles_objects.png"
 LAYERS = ("terrain", "obstacles", "objects")
 REMOVAL_TYPES = ("fixed", "explosion", "disappear")
+LAYER_KEYS = {
+    pygame.K_g: "terrain",
+    pygame.K_o: "objects",
+    pygame.K_b: "obstacles",
+}
+LAYER_LABELS = {
+    "terrain": "GROUND [G]",
+    "objects": "OBJECTS [O]",
+    "obstacles": "OBSTACLES [B]",
+}
 TILE_SIZE = 64
 MAX_MAP_NAME_LENGTH = 8
 MAX_MAP_DIMENSION = 128
@@ -316,7 +326,7 @@ def _draw_sidebar(window: pygame.Surface, fonts: tuple, tileset: pygame.Surface,
     sidebar = pygame.Rect(0, 0, SIDEBAR_WIDTH, window.get_height())
     pygame.draw.rect(window, (32, 36, 42), sidebar)
     for name, rect in buttons.items():
-        label = {"LAYER": layer.upper(), "HP": "HP: %+d" % hp_change,
+        label = {"LAYER": LAYER_LABELS[layer], "HP": "HP: %+d" % hp_change,
                  "REMOVE": removal.upper()}.get(name, name)
         _draw_button(window, font, rect, label,
                      name not in ("HP", "REMOVE") or layer == "objects")
@@ -444,15 +454,15 @@ def main() -> int:
     running = True
 
     while running:
-        palette = tileset if active_layer == "terrain" else objects_tileset
-        palette_columns = tile_columns if active_layer == "terrain" else object_columns
-        palette_rows = tile_rows if active_layer == "terrain" else object_rows
         panel = _map_panel(window)
         cell_size = (float(TILE_SIZE) if zoom_level == 1 else
                      TILE_SIZE_OPTIONS[1] if zoom_level == 2 else
                      _fit_cell_size(map_data, panel))
         _clamp_scroll(scroll, map_data, panel, cell_size)
         for event in pygame.event.get():
+            palette_columns = (
+                tile_columns if active_layer == "terrain" else object_columns)
+            palette_rows = tile_rows if active_layer == "terrain" else object_rows
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.VIDEORESIZE:
@@ -538,6 +548,11 @@ def main() -> int:
             elif event.type == pygame.KEYDOWN and dialog is None:
                 if event.key == pygame.K_ESCAPE:
                     running = False
+                elif event.key in LAYER_KEYS:
+                    active_layer = LAYER_KEYS[event.key]
+                    selected_tile = (0, 0)
+                    tile_scroll = 0
+                    status = "Layer: " + LAYER_LABELS[active_layer]
                 elif event.key == pygame.K_1:
                     zoom_level = 1
                 elif event.key == pygame.K_2:

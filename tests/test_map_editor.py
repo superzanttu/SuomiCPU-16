@@ -1,8 +1,12 @@
 import runpy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import pygame
 
 
 EDITOR_PATH = (
@@ -21,6 +25,82 @@ validate_map = EDITOR["validate_map"]
 
 
 class MapEditorDataTests(unittest.TestCase):
+    def test_layer_shortcuts_paint_the_selected_layer_without_changing_zoom(self):
+        buttons = EDITOR["_button_rects"]()
+        cell_position = (180 + 2 * 64 + 32, 40 + 2 * 64 + 32)
+        list_top = buttons["REMOVE"].bottom + 14
+
+        def click(position):
+            return pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN, pos=position, button=1)
+
+        def key(keycode):
+            return pygame.event.Event(
+                pygame.KEYDOWN, key=keycode, unicode="")
+
+        events = [
+            [key(pygame.K_g), click((90, list_top + 89 + 32)),
+             click(cell_position)],
+            [key(pygame.K_o), click(cell_position)],
+            [key(pygame.K_b), click(cell_position)],
+            [click(buttons["SAVE"].center)],
+            [pygame.event.Event(pygame.QUIT)],
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"SDL_VIDEODRIVER": "dummy"}), \
+                    patch.dict(EDITOR["main"].__globals__, {
+                        "MAPS_DIR": Path(directory),
+                        "save_map": lambda data: save_map(data, Path(directory)),
+                    }), \
+                    patch("pygame.event.get", side_effect=events):
+                self.assertEqual(EDITOR["main"](), 0)
+            loaded = load_map(Path(directory) / "UNTITLED.json")
+        self.assertEqual(loaded["tiles"][2][2], [1, 0])
+        self.assertEqual(loaded["obstacles"][2][2], [0, 0])
+        self.assertEqual(loaded["objects"][2][2], {
+            "tile": [0, 0], "hp_change": -25, "removal": "explosion",
+        })
+        self.assertEqual(loaded["tiles"][1][1], [0, 0])
+
+    def test_editor_buttons_paint_properties_erase_and_save_layers(self):
+        buttons = EDITOR["_button_rects"]()
+
+        def click(position, button=1):
+            return pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN, pos=position, button=button)
+
+        def key(character, keycode=0):
+            return pygame.event.Event(
+                pygame.KEYDOWN, key=keycode, unicode=character)
+
+        obstacle_position = (180 + 64 + 32, 40 + 64 + 32)
+        object_position = (180 + 3 * 64 + 32, 40 + 2 * 64 + 32)
+        events = [
+            [click(buttons["LAYER"].center), click(obstacle_position)],
+            [click(buttons["LAYER"].center)],
+            [click(buttons["HP"].center)],
+            [key("+"), key("4"), key("0"), key("", pygame.K_RETURN)],
+            [click(buttons["REMOVE"].center), click(object_position)],
+            [click(object_position, 2)],
+            [click(object_position, 3)],
+            [click(object_position)],
+            [click(buttons["SAVE"].center)],
+            [pygame.event.Event(pygame.QUIT)],
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"SDL_VIDEODRIVER": "dummy"}), \
+                    patch.dict(EDITOR["main"].__globals__, {
+                        "MAPS_DIR": Path(directory),
+                        "save_map": lambda data: save_map(data, Path(directory)),
+                    }), \
+                    patch("pygame.event.get", side_effect=events):
+                self.assertEqual(EDITOR["main"](), 0)
+            loaded = load_map(Path(directory) / "UNTITLED.json")
+        self.assertEqual(loaded["obstacles"][1][1], [0, 0])
+        self.assertEqual(loaded["objects"][2][3], {
+            "tile": [0, 0], "hp_change": 40, "removal": "disappear",
+        })
+
     def test_layer_properties_round_trip_and_erase_without_changing_terrain(self):
         map_data = new_map("LAYERS", 3, 2)
         set_layer_tile(map_data, "obstacles", 0, 1, (2, 3), 7, 7)

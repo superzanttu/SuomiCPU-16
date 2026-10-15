@@ -18,6 +18,11 @@
 #define TRACK_SPACING 4
 #define TRACK_COLOR 12
 #define EXPLOSION_FRAMES 18
+#define SHOT_COOLDOWN 18
+#define MUZZLE_FLASH_FRAMES 3
+#define HIT_FLASH_FRAMES 8
+#define MAX_IMPACTS 12
+#define IMPACT_FRAMES 10
 
 typedef struct
 {
@@ -62,6 +67,15 @@ int round_over;
 int round_winner;
 int previous_keys;
 int tank_sprite_slots[2];
+int hit_flash[2];
+int muzzle_flash[2];
+int muzzle_x[2];
+int muzzle_y[2];
+int impact_x[MAX_IMPACTS];
+int impact_y[MAX_IMPACTS];
+int impact_life[MAX_IMPACTS];
+int impact_size[MAX_IMPACTS];
+int next_impact;
 int directions_x[TANK_ROTATION_COUNT] = {
     0, 195, 383, 556, 707, 831, 924, 981, 1000, 981, 924, 831, 707, 556, 383, 195,
     0, -195, -383, -556, -707, -831, -924, -981, -1000, -981, -924, -831, -707, -556, -383, -195};
@@ -111,6 +125,48 @@ int direction_offset(int component, int distance)
         offset -= DIRECTION_SCALE / 2;
     }
     return offset / DIRECTION_SCALE;
+}
+
+void add_impact(int x, int y, int size)
+{
+    impact_x[next_impact] = x;
+    impact_y[next_impact] = y;
+    impact_size[next_impact] = size;
+    impact_life[next_impact] = IMPACT_FRAMES;
+    next_impact = (next_impact + 1) % MAX_IMPACTS;
+}
+
+void change_health(int player, int amount)
+{
+    int previous_health;
+
+    previous_health = tanks[player].health;
+    tanks[player].health += amount;
+    if (tanks[player].health < 0)
+    {
+        tanks[player].health = 0;
+    }
+    if (tanks[player].health > 100)
+    {
+        tanks[player].health = 100;
+    }
+    if (tanks[player].health < previous_health)
+    {
+        hit_flash[player] = HIT_FLASH_FRAMES;
+        if (tanks[player].health == 0)
+        {
+            add_impact(tanks[player].x, tanks[player].y, 28);
+            gfx_sound(2, 65, 16, WAVE_NOISE, 45);
+        }
+        else
+        {
+            gfx_sound(2, 160, 4, WAVE_NOISE, 25);
+        }
+    }
+    else if (tanks[player].health > previous_health)
+    {
+        gfx_sound(3, 660, 6, WAVE_TRIANGLE, 25);
+    }
 }
 
 int touches_cell(int x, int y, int radius, int column, int row)
@@ -246,11 +302,18 @@ void start_round(void)
         tanks[i].collision_cooldown = 0;
         tanks[i].movement_remainder_x = 0;
         tanks[i].movement_remainder_y = 0;
+        hit_flash[i] = 0;
+        muzzle_flash[i] = 0;
     }
     for (i = 0; i < MAX_SHOTS; i++)
     {
         shots[i].life = 0;
     }
+    for (i = 0; i < MAX_IMPACTS; i++)
+    {
+        impact_life[i] = 0;
+    }
+    next_impact = 0;
     for (i = 0; i < MAP_OBJECT_COUNT; i++)
     {
         object_active[i] = 1;
@@ -305,7 +368,7 @@ void fire_shot(int player)
     int direction;
     Shot *shot;
 
-    if (tanks[player].cooldown > 0)
+    if (tanks[player].cooldown > 0 || tanks[player].health == 0)
     {
         return;
     }
@@ -324,7 +387,13 @@ void fire_shot(int player)
             shot->life = 120;
             shot->movement_remainder_x = 0;
             shot->movement_remainder_y = 0;
-            tanks[player].cooldown = 18;
+            tanks[player].cooldown = SHOT_COOLDOWN;
+            muzzle_x[player] = tanks[player].x +
+                               direction_offset(directions_x[direction], 18);
+            muzzle_y[player] = tanks[player].y +
+                               direction_offset(directions_y[direction], 18);
+            muzzle_flash[player] = MUZZLE_FLASH_FRAMES;
+            gfx_sound(player, 230, 3, WAVE_NOISE, 22);
             return;
         }
     }
@@ -378,21 +447,13 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     {
         if (tanks[player].collision_cooldown == 0)
         {
-            tanks[player].health -= 5;
+            change_health(player, -5);
             tanks[player].collision_cooldown = 30;
         }
         if (tanks[1 - player].collision_cooldown == 0)
         {
-            tanks[1 - player].health -= 5;
+            change_health(1 - player, -5);
             tanks[1 - player].collision_cooldown = 30;
-        }
-        if (tanks[player].health < 0)
-        {
-            tanks[player].health = 0;
-        }
-        if (tanks[1 - player].health < 0)
-        {
-            tanks[1 - player].health = 0;
         }
     }
     else if (!blocked(next_x, next_y, player))
@@ -484,10 +545,6 @@ void update_objects(void)
 
     for (i = 0; i < MAP_OBJECT_COUNT; i++)
     {
-        if (object_explosion[i] > 0)
-        {
-            object_explosion[i]--;
-        }
         if (!object_active[i])
         {
             continue;
@@ -503,15 +560,7 @@ void update_objects(void)
                 contacts |= mask;
                 if (!(object_contacts[i] & mask))
                 {
-                    tanks[player].health += map_object_hp[i];
-                    if (tanks[player].health < 0)
-                    {
-                        tanks[player].health = 0;
-                    }
-                    if (tanks[player].health > 100)
-                    {
-                        tanks[player].health = 100;
-                    }
+                    change_health(player, map_object_hp[i]);
                     if (map_object_removal[i] != OBJECT_FIXED)
                     {
                         object_active[i] = 0;
@@ -526,6 +575,34 @@ void update_objects(void)
             }
         }
         object_contacts[i] = (unsigned char)contacts;
+    }
+}
+
+void update_object_effects(void)
+{
+    int i;
+
+    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    {
+        if (object_explosion[i] > 0)
+        {
+            object_explosion[i]--;
+        }
+    }
+}
+
+void update_combat_effects(void)
+{
+    int i;
+
+    for (i = 0; i < 2; i++)
+    {
+        if (hit_flash[i] > 0) hit_flash[i]--;
+        if (muzzle_flash[i] > 0) muzzle_flash[i]--;
+    }
+    for (i = 0; i < MAX_IMPACTS; i++)
+    {
+        if (impact_life[i] > 0) impact_life[i]--;
     }
 }
 
@@ -567,6 +644,7 @@ void update_shots(void)
                        obstacle_collision(shot->x, shot->y, 2);
         if (blocked_shot)
         {
+            add_impact(shot->x, shot->y, 8);
             shot->life = 0;
             continue;
         }
@@ -574,11 +652,8 @@ void update_shots(void)
         if (absolute_value(shot->x - tanks[player].x) < 12 &&
             absolute_value(shot->y - tanks[player].y) < 12)
         {
-            tanks[player].health -= 10;
-            if (tanks[player].health < 0)
-            {
-                tanks[player].health = 0;
-            }
+            add_impact(shot->x, shot->y, 12);
+            change_health(player, -10);
             shot->life = 0;
         }
     }
@@ -593,6 +668,8 @@ void update_game(unsigned int keys, unsigned int extra)
         start_round();
     }
     previous_keys = (int)keys;
+    update_object_effects();
+    update_combat_effects();
     if (round_over)
     {
         if (round_delay > 0)
@@ -639,7 +716,8 @@ void draw_tank(int player)
         tank_sprite_slots[player] = slot;
     }
     gfx_sprite_move(slot, tanks[player].x - 16,
-                    tanks[player].y - 16, SPRITE_VISIBLE);
+                    tanks[player].y - 16,
+                    tanks[player].health > 0 ? SPRITE_VISIBLE : 0);
 }
 
 int camera_origin(int position, int viewport_size, int map_size)
@@ -840,6 +918,54 @@ void draw_ground(void)
     }
 }
 
+void draw_burst(int x, int y, int radius, int color,
+                int camera_x, int camera_y, int viewport_x)
+{
+    int direction;
+    int outer_x;
+    int outer_y;
+
+    for (direction = 0; direction < TANK_ROTATION_COUNT; direction += 4)
+    {
+        outer_x = x + direction_offset(directions_x[direction], radius);
+        outer_y = y + direction_offset(directions_y[direction], radius);
+        draw_world_rect_view(outer_x - 1, outer_y - 1, 3, 3,
+                             color, camera_x, camera_y, viewport_x);
+    }
+}
+
+void draw_combat_feedback(int camera_x, int camera_y, int viewport_x)
+{
+    int i;
+    int radius;
+    int color;
+
+    for (i = 0; i < MAX_IMPACTS; i++)
+    {
+        if (impact_life[i] > 0)
+        {
+            radius = 2 + (IMPACT_FRAMES - impact_life[i]) * impact_size[i] /
+                         IMPACT_FRAMES;
+            color = impact_life[i] > IMPACT_FRAMES / 2 ? YELLOW : ORANGE;
+            draw_burst(impact_x[i], impact_y[i], radius, color,
+                       camera_x, camera_y, viewport_x);
+        }
+    }
+    for (i = 0; i < 2; i++)
+    {
+        if (muzzle_flash[i] > 0)
+        {
+            draw_burst(muzzle_x[i], muzzle_y[i], 5, WHITE,
+                       camera_x, camera_y, viewport_x);
+        }
+        if (hit_flash[i] > 0 && tanks[i].health > 0)
+        {
+            draw_burst(tanks[i].x, tanks[i].y, 20, RED,
+                       camera_x, camera_y, viewport_x);
+        }
+    }
+}
+
 void draw_hud(void)
 {
     char health[6];
@@ -868,6 +994,7 @@ void draw_hud(void)
     {
         camera_x = camera_origin(tanks[viewport].x, 320, map_width);
         camera_y = camera_origin(tanks[viewport].y, 480, map_height);
+        draw_combat_feedback(camera_x, camera_y, viewport * 320);
         for (i = 0; i < MAP_OBJECT_COUNT; i++)
         {
             if (object_explosion[i] > 0)
@@ -878,12 +1005,10 @@ void draw_hud(void)
                               MAP_TILE_PIXEL_SIZE / 2;
                 radius = (EXPLOSION_FRAMES - object_explosion[i] + 4) *
                          MAP_TILE_PIXEL_SIZE / 32 + 2;
-                draw_world_rect_view(
-                    explosion_x - radius, explosion_y - 2, radius * 2, 4,
-                    ORANGE, camera_x, camera_y, viewport * 320);
-                draw_world_rect_view(
-                    explosion_x - 2, explosion_y - radius, 4, radius * 2,
-                    YELLOW, camera_x, camera_y, viewport * 320);
+                draw_burst(explosion_x, explosion_y, radius,
+                           object_explosion[i] > EXPLOSION_FRAMES / 2 ?
+                               YELLOW : ORANGE,
+                           camera_x, camera_y, viewport * 320);
             }
         }
         for (i = 0; i < MAX_SHOTS; i++)
@@ -908,17 +1033,26 @@ void draw_hud(void)
             }
         }
     }
+    gfx_rect(319, 30, 2, 450, DARK_GRAY);
     gfx_rect(0, 0, 640, 30, DARK_GRAY);
     gfx_text(8, 5, "P1", WHITE);
     number_text((unsigned int)tanks[0].health, health);
     gfx_text(28, 5, health, WHITE);
     gfx_rect(68, 7, 100, 10, DARK_RED);
-    gfx_rect(68, 7, tanks[0].health, 10, GREEN);
+    gfx_rect(68, 7, tanks[0].health, 10,
+             hit_flash[0] > 0 ? WHITE : tanks[0].health <= 25 ? ORANGE : GREEN);
+    gfx_rect(68, 21, 100, 3, BLACK);
+    gfx_rect(68, 21, (SHOT_COOLDOWN - tanks[0].cooldown) * 100 / SHOT_COOLDOWN,
+             3, tanks[0].cooldown == 0 ? YELLOW : GRAY);
     gfx_text(472, 5, "P2", WHITE);
     number_text((unsigned int)tanks[1].health, health);
     gfx_text(492, 5, health, WHITE);
     gfx_rect(528, 7, 100, 10, DARK_RED);
-    gfx_rect(528, 7, tanks[1].health, 10, RED);
+    gfx_rect(528, 7, tanks[1].health, 10,
+             hit_flash[1] > 0 ? WHITE : tanks[1].health <= 25 ? ORANGE : RED);
+    gfx_rect(528, 21, 100, 3, BLACK);
+    gfx_rect(528, 21, (SHOT_COOLDOWN - tanks[1].cooldown) * 100 / SHOT_COOLDOWN,
+             3, tanks[1].cooldown == 0 ? YELLOW : GRAY);
     seconds = (unsigned int)(round_frames > 0 ? (round_frames + 29) / 30 : 0);
     timer[0] = 'T';
     timer[1] = 'I';
@@ -950,6 +1084,8 @@ void draw_game(void)
     int camera1_y;
     int camera2_x;
     int camera2_y;
+    int viewport;
+    char countdown[6];
 
     map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
     map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
@@ -965,17 +1101,26 @@ void draw_game(void)
     draw_hud();
     if (round_over)
     {
-        if (round_winner < 0)
+        number_text((unsigned int)((round_delay + 29) / 30), countdown);
+        for (viewport = 0; viewport < 2; viewport++)
         {
-            gfx_text(285, 220, "DRAW", YELLOW);
-        }
-        else if (round_winner == 0)
-        {
-            gfx_text(270, 220, "PLAYER 1 WINS", GREEN);
-        }
-        else
-        {
-            gfx_text(270, 220, "PLAYER 2 WINS", RED);
+            gfx_rect(viewport * 320 + 32, 202, 256, 70, BLACK);
+            gfx_rect(viewport * 320 + 34, 204, 252, 2,
+                     viewport == 0 ? GREEN : RED);
+            if (round_winner < 0)
+            {
+                gfx_text(viewport * 320 + 145, 220, "DRAW", YELLOW);
+            }
+            else if (round_winner == viewport)
+            {
+                gfx_text(viewport * 320 + 139, 220, "YOU WIN", GREEN);
+            }
+            else
+            {
+                gfx_text(viewport * 320 + 136, 220, "YOU LOSE", RED);
+            }
+            gfx_text(viewport * 320 + 107, 245, "NEXT ROUND IN", WHITE);
+            gfx_text(viewport * 320 + 191, 245, countdown, YELLOW);
         }
     }
 }
