@@ -123,6 +123,47 @@ class GpuTests(unittest.TestCase):
                 self.assertEqual(cpu.gpu_layers[1][(size - 1) * 640 + size - 1], 42)
                 self.assertEqual(cpu.gpu_layers[1][(size - 1) * 640 + size], 0)
 
+    def test_split_cameras_clip_tiles_and_sprites_to_each_viewport(self):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
+        cpu._ensure_gpu_state()
+        cpu.tile_pixel_size = 2
+        cpu.tilemap_width = 4
+        cpu.tilemap_height = 1
+        cpu.tilemap_memory = bytes((1, 2, 3, 4))
+        for tile in range(1, 5):
+            start = tile * 64 * 64
+            cpu.tile_memory[start:start + 4] = bytes((tile,)) * 4
+        cpu.split_cameras = ((0, 0), (4, 0))
+        cpu._render_tile_layer()
+
+        self.assertEqual(cpu.gpu_layers[1][0], 1)
+        self.assertEqual(cpu.gpu_layers[1][2], 2)
+        self.assertEqual(cpu.gpu_layers[1][320], 3)
+        self.assertEqual(cpu.gpu_layers[1][322], 4)
+
+        cpu.sprite_memory[0] = (2, 2, bytes((9, 9, 9, 9)))
+        cpu.sprites[0] = {"x": 4, "y": 1, "flags": 1}
+        cpu._render_sprites()
+        self.assertEqual(cpu.gpu_layers[2][1 * 640 + 4], 9)
+        self.assertEqual(cpu.gpu_layers[2][1 * 640 + 320], 9)
+
+    def test_world_tiles_preserve_palette_transparency_and_viewport_clipping(self):
+        cpu = bare_cpu()
+        cpu.memory[GFX_MODE_ADDR] = GFX_MODE_640_480
+        cpu._ensure_gpu_state()
+        cpu.tile_pixel_size = 4
+        start = 3 * 64 * 64
+        cpu.tile_memory[start:start + 16] = bytes((0, 42, 43, 44)) * 4
+        cpu.gpu_layers[3][:] = bytes((9,)) * (640 * 480)
+        cpu.memory[GPU_BASE + 16] = 3
+        gpu(cpu, 29, x=0, y=0, w=318, h=0)
+        gpu(cpu, 30, color=3, x=318, y=10)
+        self.assertEqual(list(cpu.gpu_layers[3][10 * 640 + 318:10 * 640 + 324]),
+                         [9, 42, 9, 42, 43, 44])
+        self.assertEqual(cpu.gpu_layers[3][10 * 640 + 324], 9)
+        self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
+
     def test_c_layer_sprite_and_tile_apis_program_hardware_state(self):
         cpu = run_c(
             "unsigned char sprite[4] = {0,5,6,0};\n"
@@ -139,6 +180,7 @@ class GpuTests(unittest.TestCase):
             "  gfx_tile_upload(2, tile);\n"
             "  gfx_tilemap(map, 2, 1, 0, 0);\n"
             "  gfx_tile_camera(16, 32);\n"
+            "  gfx_split_camera(-10, -20, 30, 40);\n"
             "  gfx_present();\n"
             "  return 0;\n"
             "}\n"
@@ -156,6 +198,7 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(cpu.tilemap_width, 2)
         self.assertEqual(cpu.tilemap_height, 1)
         self.assertEqual(cpu.tile_camera, (16, 32))
+        self.assertEqual(cpu.split_cameras, ((-10, -20), (30, 40)))
 
     def test_640x480_packed_clear_pixel_rect_and_present(self):
         cpu = bare_cpu()

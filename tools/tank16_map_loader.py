@@ -14,6 +14,18 @@ EDITOR_PATH = GAME_DIR / "map_editor.py"
 MAIN_PATH = GAME_DIR / "main.c"
 RUNTIME_PALETTE_BASE = 32
 RUNTIME_PALETTE_CAPACITY = 256 - RUNTIME_PALETTE_BASE
+OBJECT_REMOVAL_TYPES = ("fixed", "explosion", "disappear")
+
+
+def object_tile_coordinates(map_data: dict) -> list[tuple[int, int]]:
+    coordinates = set()
+    for layer in ("obstacles", "objects"):
+        for row in map_data[layer]:
+            for cell in row:
+                if cell is not None:
+                    tile = cell if layer == "obstacles" else cell["tile"]
+                    coordinates.add(tuple(tile))
+    return sorted(coordinates, key=lambda tile: (tile[1], tile[0]))
 
 
 def map_tile_pixel_size() -> int:
@@ -92,22 +104,33 @@ def load_map_assets(
     map_data = editor["load_map"](Path(map_path))
     tileset_path = GAME_DIR / "gfx" / map_data["tileset"]
     tileset, columns, rows = editor["load_tileset"](tileset_path)
+    sources = [
+        tileset.subsurface((tile_x * 64, tile_y * 64, 64, 64))
+        for tile_y in range(rows) for tile_x in range(columns)
+    ]
+    object_coordinates = object_tile_coordinates(map_data)
+    if object_coordinates:
+        objects, _, _ = editor["load_tileset"](
+            GAME_DIR / "gfx" / map_data["objects_tileset"], pad_edges=True)
+        sources.extend(
+            objects.subsurface((x * 64, y * 64, 64, 64))
+            for x, y in object_coordinates
+        )
+    if len(sources) > 256:
+        raise ValueError("Terrain and used object tiles exceed 256 GPU tile slots")
     scaled_tiles = []
     histogram: Counter[tuple[int, int, int]] = Counter()
-    for tile_y in range(rows):
-        for tile_x in range(columns):
-            source_tile = tileset.subsurface(
-                (tile_x * 64, tile_y * 64, 64, 64))
-            scaled = pygame.transform.smoothscale(
-                source_tile, (tile_size, tile_size))
-            pixels = pygame.image.tostring(scaled, "RGBA")
-            scaled_tiles.append(pixels)
-            for offset in range(0, len(pixels), 4):
-                if pixels[offset + 3] >= 128:
-                    rgb = (
-                        pixels[offset], pixels[offset + 1], pixels[offset + 2],
-                    )
-                    histogram[rgb] += 1
+    for source_tile in sources:
+        scaled = pygame.transform.smoothscale(
+            source_tile, (tile_size, tile_size))
+        pixels = pygame.image.tostring(scaled, "RGBA")
+        scaled_tiles.append(pixels)
+        for offset in range(0, len(pixels), 4):
+            if pixels[offset + 3] >= 128:
+                rgb = (
+                    pixels[offset], pixels[offset + 1], pixels[offset + 2],
+                )
+                histogram[rgb] += 1
 
     if not histogram:
         raise ValueError("Tileset contains no opaque pixels")
@@ -160,6 +183,41 @@ def build_map_header(map_path: Path) -> str:
         "    gfx_tile_upload(%d, terrain_tiles[%d]);" % (index, index)
         for index in range(len(tile_data))
     )
+    coordinates = object_tile_coordinates(map_data)
+    terrain_count = dimensions[0] * dimensions[1]
+    object_ids = {
+        tile: terrain_count + index for index, tile in enumerate(coordinates)
+    }
+    obstacle_tiles = [
+        0 if cell is None else object_ids[tuple(cell)]
+        for row in map_data["obstacles"] for cell in row
+    ]
+    objects = [
+        (x, y, cell)
+        for y, row in enumerate(map_data["objects"])
+        for x, cell in enumerate(row) if cell is not None
+    ]
+    layer_header = (
+        "#define MAP_OBJECT_COUNT %d\n"
+        "#define MAP_OBJECT_CAPACITY %d\n"
+        "#define OBJECT_FIXED 0\n"
+        "#define OBJECT_EXPLOSION 1\n"
+        "#define OBJECT_DISAPPEAR 2\n"
+        "unsigned char map_obstacles[MAP_CELLS] = {\n%s\n};\n"
+    ) % (len(objects), max(1, len(objects)), format_array(obstacle_tiles, 16))
+    fields = {
+        "x": [x for x, _, _ in objects],
+        "y": [y for _, y, _ in objects],
+        "tile": [object_ids[tuple(cell["tile"])] for _, _, cell in objects],
+        "hp": [cell["hp_change"] for _, _, cell in objects],
+        "removal": [OBJECT_REMOVAL_TYPES.index(cell["removal"])
+                    for _, _, cell in objects],
+    }
+    for name, values in fields.items():
+        layer_header += (
+            "int map_object_%s[MAP_OBJECT_CAPACITY] = {\n%s\n};\n"
+            % (name, format_array(values or [0], 16))
+        )
     return (
         "#define MAP_COLUMNS %d\n"
         "#define MAP_ROWS %d\n"
@@ -181,6 +239,7 @@ def build_map_header(map_path: Path) -> str:
         "unsigned char map_data[MAP_CELLS] = {\n"
         "%s\n"
         "};\n"
+        "%s"
     ) % (
         map_data["width"], map_data["height"], len(tile_data),
         tile_size * tile_size, len(palette), RUNTIME_PALETTE_BASE,
@@ -189,7 +248,7 @@ def build_map_header(map_path: Path) -> str:
             "    {%s}" % ", ".join(str(channel) for channel in color)
             for color in palette
         ),
-        tile_arrays, upload_tiles, format_array(map_values, 16),
+        tile_arrays, upload_tiles, format_array(map_values, 16), layer_header,
     )
 
 

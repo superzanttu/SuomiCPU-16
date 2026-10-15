@@ -133,9 +133,10 @@ GPU_NET_OPEN, GPU_NET_CLOSE, GPU_NET_SEND, GPU_NET_RECV, GPU_NET_INFO = 16, 17, 
 GPU_TILEMAP = 21
 GPU_3D = 22
 GPU_SPRITE_UPLOAD, GPU_SPRITE_MOVE = 23, 24
-GPU_TILE_UPLOAD, GPU_TILE_CAMERA = 25, 26
+GPU_TILE_UPLOAD, GPU_TILE_CAMERA, GPU_SPLIT_CAMERA = 25, 26, 29
 GPU_PALETTE = 27
 GPU_TILE_SIZE = 28
+GPU_WORLD_TILE = 30
 GPU_SPRITE_SLOTS = 64
 GPU_SPRITE_MAX_SIZE = 64
 GPU_TILE_COUNT = 256
@@ -456,10 +457,13 @@ class SuomiCompute16:
             self.tilemap_width = 0
             self.tilemap_height = 0
             self.tile_camera = (0, 0)
+            self.split_cameras = None
             self.saved_layer = None
             self._tile_layer_dirty = True
             self._sprite_layer_dirty = True
             self._gpu_state_mode = self._graphics_mode()
+        if not hasattr(self, "split_cameras"):
+            self.split_cameras = None
         if not getattr(self, "_gpu_control_initialized", False):
             self.memory[GPU_LAYER_SELECT] = 0
             self.memory[GPU_LAYER_MASK] = GPU_LAYER_MASK_ALL
@@ -756,7 +760,13 @@ class SuomiCompute16:
             self._tile_layer_dirty = True
         elif command == GPU_TILE_CAMERA:
             self.tile_camera = (x, y)
+            self.split_cameras = None
+            self._sprite_layer_dirty = True
             self._tile_layer_dirty = True
+        elif command == GPU_SPLIT_CAMERA:
+            self.split_cameras = ((x, y), (w, h))
+            self._tile_layer_dirty = True
+            self._sprite_layer_dirty = True
         elif command == GPU_PALETTE:
             self._set_palette_entry(
                 color, x & 0xFF, y & 0xFF, w & 0xFF
@@ -764,6 +774,35 @@ class SuomiCompute16:
             self._gpu_result(0)
         elif command == GPU_TILE_SIZE:
             self._gpu_set_tile_size(x)
+        elif command == GPU_WORLD_TILE:
+            self._gpu_world_tile(color, x, y, layer)
+
+    def _gpu_world_tile(self, tile, world_x, world_y, layer):
+        if layer == 0:
+            self._gpu_result(1)
+            return
+        width, height = self._screen_size()
+        target = self.gpu_layers[layer]
+        size = self.tile_pixel_size
+        tile_start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
+        cameras = self.split_cameras
+        if cameras is None:
+            views = ((self.tile_camera, 0, width),)
+        else:
+            views = ((cameras[0], 0, width // 2),
+                     (cameras[1], width // 2, width))
+        for (camera_x, camera_y), clip_left, clip_right in views:
+            x = world_x - camera_x + clip_left
+            y = world_y - camera_y
+            left, right = max(x, clip_left), min(x + size, clip_right)
+            top, bottom = max(y, 0), min(y + size, height)
+            for screen_y in range(top, bottom):
+                source = tile_start + (screen_y - y) * size
+                for screen_x in range(left, right):
+                    pixel = self.tile_memory[source + screen_x - x]
+                    if pixel:
+                        target[screen_y * width + screen_x] = pixel
+        self._gpu_result(0)
 
     @staticmethod
     def _gpu3d_sincos(angle):
@@ -954,11 +993,23 @@ class SuomiCompute16:
         target[:] = bytes(len(target))
         if not self.tilemap_memory:
             return
-        camx, camy = self.tile_camera
+        cameras = self.split_cameras
+        if cameras is None:
+            self._render_tile_view(target, width, height, self.tile_camera, 0, width)
+            return
+        split_x = width // 2
+        self._render_tile_view(target, width, height, cameras[0], 0, split_x)
+        self._render_tile_view(target, width, height, cameras[1], split_x, width)
+
+    def _render_tile_view(self, target, width, height, camera, clip_left, clip_right):
+        camx, camy = camera
         tile_size = self.tile_pixel_size
         first_col = camx // tile_size
         first_row = camy // tile_size
-        cols = (width + (camx - first_col * tile_size) + tile_size - 1) // tile_size
+        cols = (
+            clip_right - clip_left
+            + (camx - first_col * tile_size) + tile_size - 1
+        ) // tile_size
         rows = (height + (camy - first_row * tile_size) + tile_size - 1) // tile_size
         for row in range(max(first_row, 0), min(first_row + rows, self.tilemap_height)):
             screen_y = row * tile_size - camy
@@ -966,8 +1017,9 @@ class SuomiCompute16:
                 map_index = row * self.tilemap_width + column
                 tile = self.tilemap_memory[map_index]
                 tile_start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
-                screen_x = column * tile_size - camx
-                left, right = max(screen_x, 0), min(screen_x + tile_size, width)
+                screen_x = column * tile_size - camx + clip_left
+                left = max(screen_x, clip_left)
+                right = min(screen_x + tile_size, clip_right)
                 top, bottom = max(screen_y, 0), min(screen_y + tile_size, height)
                 if left >= right or top >= bottom:
                     continue
@@ -985,26 +1037,38 @@ class SuomiCompute16:
         target = self.gpu_layers[2]
         target[:] = bytes(len(target))
         color_mask = 0x0F if self._graphics_mode() == GFX_MODE_640_480 else 0xFF
+        cameras = self.split_cameras
+        if cameras is None:
+            cameras = ((0, 0),)
+            clips = ((0, width),)
+        else:
+            split_x = width // 2
+            clips = ((0, split_x), (split_x, width))
         for slot, (sprite, descriptor) in enumerate(zip(self.sprite_memory, self.sprites)):
             if sprite is None or not descriptor["flags"] & 1:
                 continue
             sprite_width, sprite_height, pixels = sprite
-            x, y, flags = descriptor["x"], descriptor["y"], descriptor["flags"]
-            left, right = max(x, 0), min(x + sprite_width, width)
-            top, bottom = max(y, 0), min(y + sprite_height, height)
-            if left >= right or top >= bottom:
-                continue
-            for screen_y in range(top, bottom):
-                source_y = screen_y - y
-                if flags & 4:
-                    source_y = sprite_height - source_y - 1
-                for screen_x in range(left, right):
-                    source_x = screen_x - x
-                    if flags & 2:
-                        source_x = sprite_width - source_x - 1
-                    pixel = pixels[source_y * sprite_width + source_x]
-                    if pixel:
-                        target[screen_y * width + screen_x] = pixel & color_mask
+            world_x, world_y = descriptor["x"], descriptor["y"]
+            flags = descriptor["flags"]
+            for camera, (clip_left, clip_right) in zip(cameras, clips):
+                x = world_x - camera[0] + clip_left
+                y = world_y - camera[1]
+                left = max(x, clip_left, 0)
+                right = min(x + sprite_width, clip_right, width)
+                top, bottom = max(y, 0), min(y + sprite_height, height)
+                if left >= right or top >= bottom:
+                    continue
+                for screen_y in range(top, bottom):
+                    source_y = screen_y - y
+                    if flags & 4:
+                        source_y = sprite_height - source_y - 1
+                    for screen_x in range(left, right):
+                        source_x = screen_x - x
+                        if flags & 2:
+                            source_x = sprite_width - source_x - 1
+                        pixel = pixels[source_y * sprite_width + source_x]
+                        if pixel:
+                            target[screen_y * width + screen_x] = pixel & color_mask
 
     def _net_node(self):
         node = getattr(self, 'net', None)
@@ -2109,6 +2173,8 @@ class SuomiCompute16:
         self.memory[VSYNC_ADDR] = 0
         self.memory[GFX_MODE_ADDR] = GFX_MODE_320_240
         self.running = True
+        if hasattr(self, "split_cameras"):
+            self.split_cameras = None
         self._console_device().reset(
             preserve_history=preserve_console_history
         )

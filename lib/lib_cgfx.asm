@@ -523,6 +523,28 @@ gfx_tile_camera:
     CALLX CGFX_GO
     RET
 
+gfx_split_camera:
+    LDWS R0, 4
+    LDWS R1, 6
+    LDWS R2, 8
+    LDWS R3, 10
+    CALLX CGFX_FIELDS
+    LDI R5, 29
+    CALLX CGFX_GO
+    RET
+
+gfx_world_tile:
+    LDWS R0, 6
+    LDWS R1, 8
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    CALLX CGFX_COLOR
+    LDI R5, 30
+    CALLX CGFX_GO
+    RET
+
 ; gfx_tile_upload(tile, pixels): copy one configured indexed tile into GPU tile RAM.
 gfx_tile_upload:
     LDWS R0, 4

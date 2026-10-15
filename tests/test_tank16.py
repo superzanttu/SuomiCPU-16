@@ -1,21 +1,158 @@
 from pathlib import Path
 import math
+import runpy
+import tempfile
 import unittest
 
 from c_compiler import GLOBAL_BASE, compile_source
 from gfx_harness import ROOT, layer_pixel, make_cpu, run_frame
 from src.SuomiCPU import KEYS_ADDR, load_program_file
-from tools.tank16_map_loader import load_map_assets, map_tile_pixel_size
+from tools.tank16_map_loader import (
+    build_map_header, load_map_assets, map_tile_pixel_size,
+)
 
 
 class Tank16Tests(unittest.TestCase):
+    def test_map_objects_obstacles_and_tracks_work_in_game(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
+        data = editor["new_map"]("LAYER", 10, 8)
+        data["obstacles"][2][3] = [0, 0]
+        for column, hp, removal in (
+            (1, -25, "explosion"), (2, 30, "disappear"),
+            (4, -10, "fixed"), (5, -100, "disappear"),
+        ):
+            data["objects"][1][column] = {
+                "tile": [1, 0], "hp_change": hp, "removal": removal,
+            }
+        with tempfile.TemporaryDirectory() as directory:
+            path = editor["save_map"](data, Path(directory))
+            header = build_map_header(path)
+            _, tiles, _, _ = load_map_assets(path)
+        game_source = source_path.read_text(encoding="utf-8").replace(
+            '#include "map_assets.h"', header, 1
+        ).replace("int main(void)", "int tank16_game_entry(void)", 1)
+        test_source = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  start_round();\n"
+            "  tanks[1].x = 600; tanks[1].y = 440;\n"
+            "  tanks[0].x = 96; tanks[0].y = 96;\n"
+            "  update_objects();\n"
+            "  results[0] = tanks[0].health;\n"
+            "  results[1] = object_active[0];\n"
+            "  results[2] = object_explosion[0];\n"
+            "  update_objects();\n"
+            "  results[3] = tanks[0].health;\n"
+            "  tanks[0].x = 160; tanks[0].health = 90;\n"
+            "  update_objects();\n"
+            "  results[4] = tanks[0].health;\n"
+            "  results[5] = object_active[1];\n"
+            "  results[6] = object_explosion[1];\n"
+            "  tanks[0].x = 288;\n"
+            "  update_objects(); update_objects();\n"
+            "  results[7] = tanks[0].health;\n"
+            "  results[8] = object_active[2];\n"
+            "  tanks[0].y = 260; update_objects();\n"
+            "  tanks[0].y = 96; update_objects();\n"
+            "  results[9] = tanks[0].health;\n"
+            "  tanks[0].x = 352; update_objects();\n"
+            "  results[10] = tanks[0].health;\n"
+            "  start_round();\n"
+            "  results[11] = object_active[0];\n"
+            "  results[12] = object_explosion[0];\n"
+            "  results[13] = blocked(208, 150, 0);\n"
+            "  results[14] = blocked(176, 150, 0);\n"
+            "  tanks[0].x = 176; tanks[0].y = 150;\n"
+            "  tanks[0].direction = 8;\n"
+            "  fire_shot(0); update_shots();\n"
+            "  results[15] = shots[0].life;\n"
+            "  tanks[0].x = 100; tanks[0].y = 260;\n"
+            "  last_track_x[0] = 100; last_track_y[0] = 260;\n"
+            "  for (i = 0; i < 10; i++) update_tank(0, 4, 0);\n"
+            "  results[16] = track_count;\n"
+            "  update_tank(0, 0, 0);\n"
+            "  results[17] = track_count;\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  gfx_tile_size(MAP_TILE_PIXEL_SIZE);\n"
+            "  upload_terrain_tiles();\n"
+            "  gfx_split_camera(0, 0, 320, 0);\n"
+            "  draw_ground();\n"
+            "  start_round();\n"
+            "  results[18] = track_count;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[19];\nint main(void);\n" + game_source + test_source,
+            str(source_path),
+        ))
+        while cpu.running:
+            cpu.step()
+        results = [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(19)]
+        self.assertEqual(results, [
+            75, 0, 18, 75, 100, 0, 0, 90, 1, 80, 0,
+            1, 0, 1, 0, 0, 5, 5, 0,
+        ])
+        obstacle_tile = tiles[40]
+        for y in range(64):
+            for x in range(64):
+                value = obstacle_tile[y * 64 + x]
+                self.assertEqual(layer_pixel(cpu, 3, 192 + x, 128 + y), value)
+        self.assertEqual(layer_pixel(cpu, 3, 101, 249), 12)
+
+    def test_map_bounds_and_camera_clamping_follow_tile_pixel_size(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        source = source_path.read_text(encoding="utf-8")
+        for tile_size, centered_camera, edge_camera in (
+            (24, -40, -40),
+            (32, 0, 0),
+            (64, 160, 320),
+        ):
+            with self.subTest(tile_size=tile_size):
+                game_source = source.replace(
+                    "#define MAP_TILE_PIXEL_SIZE 64",
+                    f"#define MAP_TILE_PIXEL_SIZE {tile_size}",
+                    1,
+                ).replace("int main(void)", "int tank16_game_entry(void)", 1)
+                test_source = (
+                    "int main(void) {\n"
+                    "  int map_width;\n"
+                    "  tanks[1].x = -1000; tanks[1].y = -1000;\n"
+                    "  map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;\n"
+                    "  bounds_results[0] = blocked(16, 16, 0);\n"
+                    "  bounds_results[1] = blocked(map_width - 16, 16, 0);\n"
+                    "  bounds_results[2] = blocked(map_width - 15, 16, 0);\n"
+                    "  bounds_results[3] = camera_origin(map_width / 2, 320, map_width);\n"
+                    "  bounds_results[4] = camera_origin(map_width - 16, 320, map_width);\n"
+                    "  return 0;\n"
+                    "}\n"
+                )
+                cpu = make_cpu(compile_source(
+                    "int bounds_results[5];\n"
+                    "int main(void);\n" + game_source + test_source,
+                    str(source_path),
+                ))
+                while cpu.running:
+                    cpu.step()
+                results = [
+                    cpu.read_16(GLOBAL_BASE + index * 2)
+                    for index in range(5)
+                ]
+                results = [
+                    value - 0x10000 if value & 0x8000 else value
+                    for value in results
+                ]
+                expected = [0, 0, 1, centered_camera, edge_camera]
+                self.assertEqual(results, expected)
+
     def test_tank_slides_along_obstacle_when_diagonal_path_is_blocked(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
         game_source = source_path.read_text(encoding="utf-8").replace(
             "int main(void)", "int tank16_game_entry(void)", 1)
         test_source = (
             "int main(void) {\n"
-            "  setup_map();\n"
+            "  map_obstacles[2 * MAP_COLUMNS + 3] = 1;\n"
             "  tanks[0].x = 176; tanks[0].y = 150;\n"
             "  tanks[0].direction = 12;\n"
             "  tanks[1].x = 560; tanks[1].y = 440;\n"
@@ -69,15 +206,21 @@ class Tank16Tests(unittest.TestCase):
         player_two_sprite = next(
             sprite for slot, sprite in initial_sprites if slot < 32
         )
+        player_one_camera = cpu.split_cameras[0]
+        player_two_camera = cpu.split_cameras[1]
+        player_one_x = player_one_sprite["x"] - player_one_camera[0]
+        player_one_y = player_one_sprite["y"] - player_one_camera[1]
+        player_two_x = player_two_sprite["x"] - player_two_camera[0] + 320
+        player_two_y = player_two_sprite["y"] - player_two_camera[1]
         player_one = [
             layer_pixel(cpu, 2, x, y)
-            for y in range(player_one_sprite["y"], player_one_sprite["y"] + 32)
-            for x in range(player_one_sprite["x"], player_one_sprite["x"] + 32)
+            for y in range(player_one_y, player_one_y + 32)
+            for x in range(player_one_x, player_one_x + 32)
         ]
         player_two = [
             layer_pixel(cpu, 2, x, y)
-            for y in range(player_two_sprite["y"], player_two_sprite["y"] + 32)
-            for x in range(player_two_sprite["x"], player_two_sprite["x"] + 32)
+            for y in range(player_two_y, player_two_y + 32)
+            for x in range(player_two_x, player_two_x + 32)
         ]
         self.assertGreater(sum(value != 0 for value in player_one), 100)
         self.assertGreater(sum(value != 0 for value in player_two), 100)
@@ -143,19 +286,21 @@ class Tank16Tests(unittest.TestCase):
             )
         expected_layer = bytearray(640 * 480)
         for y in range(480):
-            map_y, source_y = divmod(y, dimensions[2])
-            for x in range(map_data["width"]):
-                tile_x, tile_y = map_data["tiles"][map_y][x]
+            for x in range(640):
+                viewport = 0 if x < 320 else 1
+                camera_x, camera_y = cpu.split_cameras[viewport]
+                world_x = x - viewport * 320 + camera_x
+                world_y = y + camera_y
+                if not (0 <= world_x < map_data["width"] * dimensions[2] and
+                        0 <= world_y < map_data["height"] * dimensions[2]):
+                    continue
+                map_x, source_x = divmod(world_x, dimensions[2])
+                map_y, source_y = divmod(world_y, dimensions[2])
+                tile_x, tile_y = map_data["tiles"][map_y][map_x]
                 tile_index = tile_y * 10 + tile_x
-                tile_start = source_y * dimensions[2]
-                destination = y * 640 + x * dimensions[2]
-                expected_layer[
-                    destination:destination + dimensions[2]
-                ] = bytes(
-                    tiles[tile_index][
-                        tile_start:tile_start + dimensions[2]
-                    ]
-                )
+                expected_layer[y * 640 + x] = tiles[tile_index][
+                    source_y * dimensions[2] + source_x
+                ]
         self.assertEqual(cpu.gpu_layers[1], expected_layer)
         self.assertTrue(any(pixel > 15 for pixel in tiles[0]))
         self.assertTrue(any(pixel > 15 for pixel in cpu.gpu_layers[1]))
@@ -172,7 +317,6 @@ class Tank16Tests(unittest.TestCase):
             "int main(void) {\n"
             "  int direction;\n"
             "  int frame;\n"
-            "  setup_map();\n"
             "  tank_sprite_slots[0] = -1;\n"
             "  for (direction = 0; direction < 32; direction++) {\n"
             "    start_round();\n"
@@ -225,8 +369,6 @@ class Tank16Tests(unittest.TestCase):
             "  int direction;\n"
             "  int frame;\n"
             "  int i;\n"
-            "  setup_map();\n"
-            "  for (i = 0; i < 7; i++) obstacles[i].x = 1000;\n"
             "  for (direction = 0; direction < 32; direction++) {\n"
             "    start_round();\n"
             "    tanks[0].x = 320; tanks[0].y = 240;\n"
@@ -305,7 +447,6 @@ class Tank16Tests(unittest.TestCase):
         test_source = (
             "int main(void) {\n"
             "  int i;\n"
-            "  setup_map();\n"
             "  start_round();\n"
             "  tanks[0].x = 100; tanks[0].y = 100; tanks[0].direction = 8;\n"
             "  tanks[1].x = 140; tanks[1].y = 100;\n"
@@ -314,7 +455,7 @@ class Tank16Tests(unittest.TestCase):
             "  results[0] = tanks[1].health;\n"
             "  start_round();\n"
             "  tanks[0].x = 136; tanks[0].y = 184;\n"
-            "  update_mines();\n"
+            "  update_objects();\n"
             "  results[1] = tanks[0].health;\n"
             "  start_round();\n"
             "  tanks[0].x = 100; tanks[0].y = 100;\n"
@@ -350,7 +491,7 @@ class Tank16Tests(unittest.TestCase):
             cpu.step()
 
         results = [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(12)]
-        self.assertEqual(results, [90, 75, 95, 95, 1, 0, 100, 1, 0, 0, 100, 23])
+        self.assertEqual(results, [90, 100, 95, 95, 1, 0, 100, 1, 0, 0, 100, 23])
 
 
 if __name__ == "__main__":

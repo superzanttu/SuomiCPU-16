@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parent
 MAPS_DIR = ROOT / "maps"
 TILESET_PATH = ROOT / "gfx" / "tiles_terrain.png"
 DEFAULT_TILESET_FILENAME = TILESET_PATH.name
+OBJECT_TILESET_PATH = ROOT / "gfx" / "tiles_objects.png"
+LAYERS = ("terrain", "obstacles", "objects")
+REMOVAL_TYPES = ("fixed", "explosion", "disappear")
 TILE_SIZE = 64
 MAX_MAP_NAME_LENGTH = 8
 MAX_MAP_DIMENSION = 128
@@ -21,21 +24,28 @@ MAP_DEFAULT_HEIGHT = 8
 TILE_SIZE_OPTIONS = (64, 32)
 
 
-def load_tileset(path: Path = TILESET_PATH) -> tuple[pygame.Surface, int, int]:
+def load_tileset(path: Path = TILESET_PATH, *,
+                 pad_edges: bool = False) -> tuple[pygame.Surface, int, int]:
     try:
         tileset = pygame.image.load(str(path))
     except (OSError, pygame.error) as error:
         raise ValueError("Could not load tileset %s: %s" %
                          (path.name, error)) from error
-    columns = tileset.get_width() // TILE_SIZE
-    rows = tileset.get_height() // TILE_SIZE
+    padding = TILE_SIZE - 1 if pad_edges else 0
+    columns = (tileset.get_width() + padding) // TILE_SIZE
+    rows = (tileset.get_height() + padding) // TILE_SIZE
     if columns == 0 or rows == 0:
         raise ValueError("Tileset must contain at least one 64x64 tile")
-    if (tileset.get_width() % TILE_SIZE or
-            tileset.get_height() % TILE_SIZE):
+    if not pad_edges and (tileset.get_width() % TILE_SIZE or
+                          tileset.get_height() % TILE_SIZE):
         raise ValueError("Tileset dimensions must be multiples of 64 pixels")
     if columns * rows > 256:
         raise ValueError("Tileset cannot contain more than 256 tiles")
+    if pad_edges:
+        padded = pygame.Surface(
+            (columns * TILE_SIZE, rows * TILE_SIZE), pygame.SRCALPHA)
+        padded.blit(tileset, (0, 0))
+        tileset = padded
     return tileset, columns, rows
 
 
@@ -73,6 +83,9 @@ def new_map(name: str, width: int, height: int,
         "height": height,
         "tile_size": TILE_SIZE,
         "tileset": DEFAULT_TILESET_FILENAME,
+        "objects_tileset": OBJECT_TILESET_PATH.name,
+        "obstacles": [[None for _ in range(width)] for _ in range(height)],
+        "objects": [[None for _ in range(width)] for _ in range(height)],
         "tiles": [
             [[tile_x, tile_y] for _ in range(width)]
             for _ in range(height)
@@ -87,6 +100,70 @@ def set_map_tile(map_data: dict, x: int, y: int, tile_x: int, tile_y: int,
     if not 0 <= tile_x < tileset_columns or not 0 <= tile_y < tileset_rows:
         raise ValueError("Tile coordinates are outside the tileset")
     map_data["tiles"][y][x] = [tile_x, tile_y]
+
+
+def set_layer_tile(map_data: dict, layer: str, x: int, y: int,
+                   tile: tuple[int, int] | None, columns: int, rows: int,
+                   hp_change: int = -25, removal: str = "explosion") -> None:
+    if layer not in ("obstacles", "objects"):
+        raise ValueError("Select the obstacle or object layer")
+    if not (0 <= x < map_data["width"] and 0 <= y < map_data["height"]):
+        raise ValueError("Map coordinates are outside the map")
+    if tile is not None and not (
+            0 <= tile[0] < columns and 0 <= tile[1] < rows):
+        raise ValueError("Tile coordinates are outside the object tileset")
+    if (not isinstance(hp_change, int) or isinstance(hp_change, bool) or
+            not -100 <= hp_change <= 100):
+        raise ValueError("HP change must be between -100 and 100")
+    if removal not in REMOVAL_TYPES:
+        raise ValueError("Removal must be fixed, explosion or disappear")
+    value = None if tile is None else list(tile)
+    if layer == "objects" and value is not None:
+        value = {"tile": value, "hp_change": hp_change, "removal": removal}
+    map_data[layer][y][x] = value
+
+
+def _validate_layers(map_data: dict, width: int, height: int) -> dict:
+    filename = map_data.get("objects_tileset", OBJECT_TILESET_PATH.name)
+    if filename != OBJECT_TILESET_PATH.name:
+        raise ValueError("Obstacle and object tileset must be tiles_objects.png")
+    _, columns, rows = load_tileset(OBJECT_TILESET_PATH, pad_edges=True)
+    normalized = {
+        "width": width, "height": height,
+        "objects_tileset": filename,
+        "obstacles": [[None for _ in range(width)] for _ in range(height)],
+        "objects": [[None for _ in range(width)] for _ in range(height)],
+    }
+    for layer in ("obstacles", "objects"):
+        grid = map_data.get(layer, normalized[layer])
+        if not isinstance(grid, list) or len(grid) != height:
+            raise ValueError("%s rows do not match map height" % layer)
+        for y, row in enumerate(grid):
+            if not isinstance(row, list) or len(row) != width:
+                raise ValueError("%s columns do not match map width" % layer)
+            for x, cell in enumerate(row):
+                if cell is None:
+                    continue
+                tile = cell
+                hp_change, removal = -25, "explosion"
+                if layer == "objects":
+                    if not isinstance(cell, dict):
+                        raise ValueError("Each object must contain tile, hp_change and removal")
+                    tile = cell.get("tile")
+                    hp_change = cell.get("hp_change")
+                    removal = cell.get("removal")
+                    if not isinstance(hp_change, int) or isinstance(hp_change, bool):
+                        raise ValueError("Object hp_change must be an integer")
+                    if not isinstance(removal, str):
+                        raise ValueError("Object removal must be text")
+                if (not isinstance(tile, list) or len(tile) != 2 or
+                        any(not isinstance(value, int) or isinstance(value, bool)
+                            for value in tile)):
+                    raise ValueError("Each layer tile must be an [x, y] pair")
+                set_layer_tile(normalized, layer, x, y, tuple(tile),
+                               columns, rows, hp_change, removal)
+    return {key: normalized[key] for key in
+            ("objects_tileset", "obstacles", "objects")}
 
 
 def validate_map(map_data: dict, tileset_columns: int,
@@ -137,6 +214,7 @@ def validate_map(map_data: dict, tileset_columns: int,
         "tile_size": TILE_SIZE,
         "tileset": tileset,
         "tiles": normalized_tiles,
+        **_validate_layers(map_data, width, height),
     }
 
 
@@ -182,7 +260,7 @@ def tile_surface(tileset: pygame.Surface, tile_x: int,
 
 
 def _button_rects() -> dict[str, pygame.Rect]:
-    names = ("NEW", "SAVE", "LOAD", "TILESET")
+    names = ("NEW", "SAVE", "LOAD", "TILESET", "LAYER", "HP", "REMOVE")
     return {
         name: pygame.Rect(
             10, HEADER_HEIGHT + 8 + index * (BUTTON_HEIGHT + BUTTON_GAP),
@@ -232,14 +310,18 @@ def _draw_button(window: pygame.Surface, font: pygame.font.Font,
 def _draw_sidebar(window: pygame.Surface, fonts: tuple, tileset: pygame.Surface,
                   columns: int, rows: int, selected_tile: tuple[int, int],
                   tile_scroll: int, buttons: dict[str, pygame.Rect],
-                  status: str) -> None:
+                  status: str, layer: str = "terrain",
+                  hp_change: int = -25, removal: str = "explosion") -> None:
     font, small_font = fonts
     sidebar = pygame.Rect(0, 0, SIDEBAR_WIDTH, window.get_height())
     pygame.draw.rect(window, (32, 36, 42), sidebar)
     for name, rect in buttons.items():
-        _draw_button(window, font, rect, name)
+        label = {"LAYER": layer.upper(), "HP": "HP: %+d" % hp_change,
+                 "REMOVE": removal.upper()}.get(name, name)
+        _draw_button(window, font, rect, label,
+                     name not in ("HP", "REMOVE") or layer == "objects")
 
-    list_top = buttons["TILESET"].bottom + 14
+    list_top = buttons["REMOVE"].bottom + 14
     footer = 44
     list_bottom = max(list_top, window.get_height() - footer)
     viewport = pygame.Rect(8, list_top, SIDEBAR_WIDTH - 16,
@@ -273,7 +355,8 @@ def _draw_sidebar(window: pygame.Surface, fonts: tuple, tileset: pygame.Surface,
 
 def _draw_map(window: pygame.Surface, map_data: dict,
               tileset: pygame.Surface, panel: pygame.Rect,
-              scroll: list[float], cell_size: float) -> None:
+              scroll: list[float], cell_size: float,
+              objects_tileset: pygame.Surface | None = None) -> None:
     previous_clip = window.get_clip()
     window.set_clip(panel)
     window.fill((18, 20, 24), panel)
@@ -297,8 +380,16 @@ def _draw_map(window: pygame.Surface, map_data: dict,
             destination = pygame.Rect(left, top, right - left, bottom - top)
             if destination.width > 0 and destination.height > 0:
                 if destination.size != tile.get_size():
-                    tile = pygame.transform.scale(tile, destination.size)
+                    tile = pygame.transform.smoothscale(tile, destination.size)
                 window.blit(tile, destination)
+                for layer in ("obstacles", "objects"):
+                    cell = map_data[layer][y][x]
+                    if cell is not None and objects_tileset is not None:
+                        coords = cell if layer == "obstacles" else cell["tile"]
+                        overlay = tile_surface(objects_tileset, *coords)
+                        overlay = pygame.transform.smoothscale(
+                            overlay, destination.size)
+                        window.blit(overlay, destination)
                 pygame.draw.rect(window, (0, 0, 0), destination, 1)
     window.set_clip(previous_clip)
 
@@ -323,6 +414,12 @@ def main() -> int:
     pygame.init()
     pygame.key.set_repeat(180, 35)
     tileset, tile_columns, tile_rows = load_tileset()
+    objects_tileset, object_columns, object_rows = load_tileset(
+        OBJECT_TILESET_PATH, pad_edges=True)
+    active_layer = "terrain"
+    hp_change = -25
+    removal = "explosion"
+    hp_input = ""
     MAPS_DIR.mkdir(parents=True, exist_ok=True)
     map_data = new_map("UNTITLED", MAP_DEFAULT_WIDTH, MAP_DEFAULT_HEIGHT)
     window = pygame.display.set_mode((1120, 760), pygame.RESIZABLE)
@@ -347,6 +444,9 @@ def main() -> int:
     running = True
 
     while running:
+        palette = tileset if active_layer == "terrain" else objects_tileset
+        palette_columns = tile_columns if active_layer == "terrain" else object_columns
+        palette_rows = tile_rows if active_layer == "terrain" else object_rows
         panel = _map_panel(window)
         cell_size = (float(TILE_SIZE) if zoom_level == 1 else
                      TILE_SIZE_OPTIONS[1] if zoom_level == 2 else
@@ -391,6 +491,24 @@ def main() -> int:
                         field_edited[active_field] = True
                     if len(current) < max_length:
                         new_fields[active_field] += event.unicode
+            elif dialog == "hp" and event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    dialog = None
+                elif event.key == pygame.K_BACKSPACE:
+                    hp_input = hp_input[:-1]
+                elif event.key == pygame.K_RETURN:
+                    try:
+                        value = int(hp_input)
+                        if not -100 <= value <= 100:
+                            raise ValueError("HP change must be -100 to +100")
+                        hp_change = value
+                        dialog = None
+                        status = "HP brush: %+d" % hp_change
+                    except ValueError as error:
+                        status = str(error)
+                elif event.unicode in "0123456789+-" and event.unicode:
+                    if len(hp_input) < 4:
+                        hp_input += event.unicode
             elif dialog == "load" and event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     dialog = None
@@ -408,11 +526,11 @@ def main() -> int:
                     tile_stride = TILE_SIZE + 25
                     viewport_height = max(
                         1, window.get_height() -
-                        (buttons["TILESET"].bottom + 14) - 44)
+                        (buttons["REMOVE"].bottom + 14) - 44)
                     visible_count = max(
                         1, (viewport_height + 24) // tile_stride)
                     tile_scroll = min(
-                        max(0, tile_columns * tile_rows - visible_count),
+                        max(0, palette_columns * palette_rows - visible_count),
                         max(0, tile_scroll - event.y))
                 elif zoom_level != 3:
                     scroll[1] += event.y * 48
@@ -520,26 +638,66 @@ def main() -> int:
                             dialog = "load"
                         elif action == "TILESET":
                             dialog = "tileset"
+                        elif action == "LAYER":
+                            active_layer = LAYERS[
+                                (LAYERS.index(active_layer) + 1) % len(LAYERS)]
+                            selected_tile = (0, 0)
+                            tile_scroll = 0
+                            status = "Layer: " + active_layer
+                        elif action == "HP" and active_layer == "objects":
+                            hp_input = ""
+                            dialog = "hp"
+                        elif action == "REMOVE" and active_layer == "objects":
+                            removal = REMOVAL_TYPES[
+                                (REMOVAL_TYPES.index(removal) + 1) %
+                                len(REMOVAL_TYPES)]
                         elif position[0] < SIDEBAR_WIDTH:
-                            list_top = buttons["TILESET"].bottom + 14
+                            list_top = buttons["REMOVE"].bottom + 14
                             if position[1] >= list_top:
                                 tile_stride = TILE_SIZE + 25
                                 tile_index = tile_scroll + max(
                                     0, (position[1] - list_top) // tile_stride)
-                                if tile_index < tile_columns * tile_rows:
+                                if tile_index < palette_columns * palette_rows:
                                     selected_tile = (
-                                        tile_index % tile_columns,
-                                        tile_index // tile_columns)
+                                        tile_index % palette_columns,
+                                        tile_index // palette_columns)
                         elif panel.collidepoint(position):
                             map_x, map_y = _event_to_cell(
                                 position, panel, scroll, cell_size)
                             if (0 <= map_x < map_data["width"] and
                                     0 <= map_y < map_data["height"]):
-                                set_map_tile(
-                                    map_data, map_x, map_y,
-                                    selected_tile[0], selected_tile[1],
-                                    tile_columns, tile_rows)
+                                if active_layer == "terrain":
+                                    set_map_tile(
+                                        map_data, map_x, map_y,
+                                        selected_tile[0], selected_tile[1],
+                                        tile_columns, tile_rows)
+                                else:
+                                    set_layer_tile(
+                                        map_data, active_layer, map_x, map_y,
+                                        selected_tile, object_columns, object_rows,
+                                        hp_change, removal)
                                 status = "Painted %d,%d" % (map_x, map_y)
+                elif event.button in (2, 3) and dialog is None:
+                    if panel.collidepoint(event.pos) and active_layer != "terrain":
+                        map_x, map_y = _event_to_cell(
+                            event.pos, panel, scroll, cell_size)
+                        if (0 <= map_x < map_data["width"] and
+                                0 <= map_y < map_data["height"]):
+                            if event.button == 3:
+                                set_layer_tile(
+                                    map_data, active_layer, map_x, map_y,
+                                    None, object_columns, object_rows)
+                                status = "Erased %d,%d" % (map_x, map_y)
+                            else:
+                                cell = map_data[active_layer][map_y][map_x]
+                                if cell is not None:
+                                    selected_tile = tuple(
+                                        cell if active_layer == "obstacles"
+                                        else cell["tile"])
+                                    if active_layer == "objects":
+                                        hp_change = cell["hp_change"]
+                                        removal = cell["removal"]
+                                    status = "Picked %d,%d" % (map_x, map_y)
                 elif event.button == 4:
                     if event.pos[0] < SIDEBAR_WIDTH:
                         tile_scroll = max(0, tile_scroll - 1)
@@ -553,7 +711,8 @@ def main() -> int:
                      _fit_cell_size(map_data, panel))
         _clamp_scroll(scroll, map_data, panel, cell_size)
         window.fill((18, 20, 24))
-        _draw_map(window, map_data, tileset, panel, scroll, cell_size)
+        _draw_map(window, map_data, tileset, panel, scroll, cell_size,
+                  objects_tileset)
         pygame.draw.rect(window, (100, 110, 120), panel, 1)
         name_text = font.render(
             "%s  %dx%d" % (map_data["name"], map_data["width"],
@@ -563,10 +722,13 @@ def main() -> int:
         zoom_text = small_font.render(
             "Zoom %d/3  (1-3)" % zoom_level, True, (220, 220, 220))
         window.blit(zoom_text, (window.get_width() - 120, 12))
+        palette = tileset if active_layer == "terrain" else objects_tileset
+        palette_columns = tile_columns if active_layer == "terrain" else object_columns
+        palette_rows = tile_rows if active_layer == "terrain" else object_rows
         _draw_sidebar(
-            window, (button_font, small_font), tileset,
-            tile_columns, tile_rows, selected_tile, tile_scroll,
-            buttons, status)
+            window, (button_font, small_font), palette,
+            palette_columns, palette_rows, selected_tile, tile_scroll,
+            buttons, status, active_layer, hp_change, removal)
 
         if dialog == "new":
             _draw_dialog(
@@ -592,6 +754,13 @@ def main() -> int:
                 window.blit(font.render(
                     status, True, (235, 190, 130)),
                     (box.x + 20, box.bottom - 28))
+        elif dialog == "hp":
+            _draw_dialog(
+                window, font, "Object HP change",
+                ["Signed change (-100 to +100): " + hp_input,
+                 "Enter applies; Esc cancels",
+                 "Applies to objects painted next.",
+                 status])
         elif dialog == "load":
             visible_files = load_files[load_scroll:load_scroll + 6]
             _draw_dialog(
@@ -615,10 +784,11 @@ def main() -> int:
         elif dialog == "tileset":
             _draw_dialog(
                 window, font, "Map tileset",
-                ["gfx/" + map_data["tileset"],
+                ["gfx/" + (map_data["tileset"] if active_layer == "terrain"
+                           else OBJECT_TILESET_PATH.name),
                  "%d x %d tiles; each tile is 64x64" %
                  (tile_columns, tile_rows),
-                 "Maps record the tileset used by the game.",
+                 "64x64 cells; partial object edge cells are padded.",
                  "Click or press Enter/Esc to close"])
 
         pygame.display.flip()

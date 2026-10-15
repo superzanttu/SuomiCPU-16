@@ -14,6 +14,10 @@
 #define TANK_SPRITE_PIXEL_COUNT (TANK_SPRITE_WIDTH * TANK_SPRITE_HEIGHT)
 #define TANK_SPRITE_PLAYER_2_BASE 0
 #define TANK_SPRITE_PLAYER_1_BASE TANK_ROTATION_COUNT
+#define MAX_TRACK_MARKS 96
+#define TRACK_SPACING 4
+#define TRACK_COLOR 12
+#define EXPLOSION_FRAMES 18
 
 typedef struct
 {
@@ -38,19 +42,19 @@ typedef struct
     int movement_remainder_y;
 } Shot;
 
-typedef struct
-{
-    int x;
-    int y;
-    int width;
-    int height;
-} Obstacle;
-
 Tank tanks[2];
 Shot shots[MAX_SHOTS];
 unsigned char sprite_work[TANK_SPRITE_PIXEL_COUNT];
-unsigned char mine_active[3];
-Obstacle obstacles[7];
+unsigned char object_active[MAP_OBJECT_CAPACITY];
+unsigned char object_contacts[MAP_OBJECT_CAPACITY];
+unsigned char object_explosion[MAP_OBJECT_CAPACITY];
+int track_x[MAX_TRACK_MARKS];
+int track_y[MAX_TRACK_MARKS];
+int track_direction[MAX_TRACK_MARKS];
+int track_count;
+int next_track;
+int last_track_x[2];
+int last_track_y[2];
 int wins[2];
 int round_frames;
 int round_delay;
@@ -109,29 +113,60 @@ int direction_offset(int component, int distance)
     return offset / DIRECTION_SCALE;
 }
 
-int overlaps(int x, int y, int radius, Obstacle *obstacle)
+int touches_cell(int x, int y, int radius, int column, int row)
 {
-    return x + radius > obstacle->x &&
-           x - radius < obstacle->x + obstacle->width &&
-           y + radius > obstacle->y &&
-           y - radius < obstacle->y + obstacle->height;
+    return x + radius > column * MAP_TILE_PIXEL_SIZE &&
+           x - radius < (column + 1) * MAP_TILE_PIXEL_SIZE &&
+           y + radius > row * MAP_TILE_PIXEL_SIZE &&
+           y - radius < (row + 1) * MAP_TILE_PIXEL_SIZE;
+}
+
+int obstacle_collision(int x, int y, int radius)
+{
+    int left;
+    int right;
+    int top;
+    int bottom;
+    int row;
+    int column;
+
+    left = (x - radius) / MAP_TILE_PIXEL_SIZE;
+    right = (x + radius - 1) / MAP_TILE_PIXEL_SIZE;
+    top = (y - radius) / MAP_TILE_PIXEL_SIZE;
+    bottom = (y + radius - 1) / MAP_TILE_PIXEL_SIZE;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right >= MAP_COLUMNS) right = MAP_COLUMNS - 1;
+    if (bottom >= MAP_ROWS) bottom = MAP_ROWS - 1;
+    for (row = top; row <= bottom; row++)
+    {
+        for (column = left; column <= right; column++)
+        {
+            if (map_obstacles[row * MAP_COLUMNS + column] != 0)
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 int blocked(int x, int y, int tank_index)
 {
-    int i;
     int other;
+    int map_width;
+    int map_height;
 
-    if (x < 16 || x > 624 || y < 46 || y > 464)
+    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
+    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
+    if (x < 16 || x > map_width - 16 ||
+        y < 16 || y > map_height - 16)
     {
         return 1;
     }
-    for (i = 0; i < 7; i++)
+    if (obstacle_collision(x, y, 16))
     {
-        if (overlaps(x, y, 16, &obstacles[i]))
-        {
-            return 1;
-        }
+        return 1;
     }
     other = 1 - tank_index;
     if (absolute_value(x - tanks[other].x) < 20 &&
@@ -216,9 +251,19 @@ void start_round(void)
     {
         shots[i].life = 0;
     }
-    mine_active[0] = 1;
-    mine_active[1] = 1;
-    mine_active[2] = 1;
+    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    {
+        object_active[i] = 1;
+        object_contacts[i] = 0;
+        object_explosion[i] = 0;
+    }
+    track_count = 0;
+    next_track = 0;
+    for (i = 0; i < 2; i++)
+    {
+        last_track_x[i] = tanks[i].x;
+        last_track_y[i] = tanks[i].y;
+    }
     round_frames = ROUND_FRAMES;
     round_delay = 0;
     round_over = 0;
@@ -252,38 +297,6 @@ void load_tank_sprites(void)
         gfx_sprite_upload(TANK_SPRITE_PLAYER_1_BASE + angle,
                           TANK_SPRITE_WIDTH, TANK_SPRITE_HEIGHT, sprite_work);
     }
-}
-
-void setup_map(void)
-{
-    obstacles[0].x = 192;
-    obstacles[0].y = 112;
-    obstacles[0].width = 56;
-    obstacles[0].height = 24;
-    obstacles[1].x = 392;
-    obstacles[1].y = 112;
-    obstacles[1].width = 56;
-    obstacles[1].height = 24;
-    obstacles[2].x = 192;
-    obstacles[2].y = 376;
-    obstacles[2].width = 56;
-    obstacles[2].height = 24;
-    obstacles[3].x = 392;
-    obstacles[3].y = 376;
-    obstacles[3].width = 56;
-    obstacles[3].height = 24;
-    obstacles[4].x = 296;
-    obstacles[4].y = 168;
-    obstacles[4].width = 48;
-    obstacles[4].height = 24;
-    obstacles[5].x = 296;
-    obstacles[5].y = 320;
-    obstacles[5].width = 48;
-    obstacles[5].height = 24;
-    obstacles[6].x = 304;
-    obstacles[6].y = 232;
-    obstacles[6].width = 32;
-    obstacles[6].height = 16;
 }
 
 void fire_shot(int player)
@@ -413,6 +426,21 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
                 movement_numerator_y - (next_y - old_y) * DIRECTION_SCALE;
         }
     }
+    if ((tanks[player].x != old_x || tanks[player].y != old_y) &&
+        absolute_value(tanks[player].x - last_track_x[player]) +
+        absolute_value(tanks[player].y - last_track_y[player]) >= TRACK_SPACING)
+    {
+        track_x[next_track] = old_x;
+        track_y[next_track] = old_y;
+        track_direction[next_track] = direction;
+        next_track = (next_track + 1) % MAX_TRACK_MARKS;
+        if (track_count < MAX_TRACK_MARKS)
+        {
+            track_count++;
+        }
+        last_track_x[player] = tanks[player].x;
+        last_track_y[player] = tanks[player].y;
+    }
     if ((extra & (player == 0 ? KEYX2_P1_FIRE : KEYX2_P2_FIRE)) != 0)
     {
         fire_shot(player);
@@ -447,38 +475,57 @@ void finish_round(void)
     }
 }
 
-void update_mines(void)
+void update_objects(void)
 {
     int i;
-    int mine_x[3];
-    int mine_y[3];
     int player;
+    int contacts;
+    int mask;
 
-    mine_x[0] = 136;
-    mine_y[0] = 184;
-    mine_x[1] = 504;
-    mine_y[1] = 184;
-    mine_x[2] = 320;
-    mine_y[2] = 280;
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < MAP_OBJECT_COUNT; i++)
     {
-        if (!mine_active[i])
+        if (object_explosion[i] > 0)
+        {
+            object_explosion[i]--;
+        }
+        if (!object_active[i])
         {
             continue;
         }
+        contacts = 0;
         for (player = 0; player < 2; player++)
         {
-            if (absolute_value(tanks[player].x - mine_x[i]) < 12 &&
-                absolute_value(tanks[player].y - mine_y[i]) < 12)
+            mask = 1 << player;
+            if (tanks[player].health > 0 &&
+                touches_cell(tanks[player].x, tanks[player].y, 16,
+                             map_object_x[i], map_object_y[i]))
             {
-                tanks[player].health -= 25;
-                if (tanks[player].health < 0)
+                contacts |= mask;
+                if (!(object_contacts[i] & mask))
                 {
-                    tanks[player].health = 0;
+                    tanks[player].health += map_object_hp[i];
+                    if (tanks[player].health < 0)
+                    {
+                        tanks[player].health = 0;
+                    }
+                    if (tanks[player].health > 100)
+                    {
+                        tanks[player].health = 100;
+                    }
+                    if (map_object_removal[i] != OBJECT_FIXED)
+                    {
+                        object_active[i] = 0;
+                        if (map_object_removal[i] == OBJECT_EXPLOSION)
+                        {
+                            object_explosion[i] = EXPLOSION_FRAMES;
+                            gfx_sound(0, 90, 8, WAVE_NOISE, 35);
+                        }
+                        break;
+                    }
                 }
-                mine_active[i] = 0;
             }
         }
+        object_contacts[i] = (unsigned char)contacts;
     }
 }
 
@@ -513,15 +560,11 @@ void update_shots(void)
         shot->x = next_x;
         shot->y = next_y;
         shot->life--;
-        blocked_shot = shot->x < 8 || shot->x > 632 ||
-                       shot->y < 32 || shot->y > 472;
-        for (player = 0; player < 7 && !blocked_shot; player++)
-        {
-            if (overlaps(shot->x, shot->y, 2, &obstacles[player]))
-            {
-                blocked_shot = 1;
-            }
-        }
+        blocked_shot = shot->x < 2 ||
+                       shot->x > MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 2 ||
+                       shot->y < 2 ||
+                       shot->y > MAP_ROWS * MAP_TILE_PIXEL_SIZE - 2 ||
+                       obstacle_collision(shot->x, shot->y, 2);
         if (blocked_shot)
         {
             shot->life = 0;
@@ -564,7 +607,7 @@ void update_game(unsigned int keys, unsigned int extra)
     }
     update_tank(0, keys, extra);
     update_tank(1, keys, extra);
-    update_mines();
+    update_objects();
     update_shots();
     round_frames--;
     if (tanks[0].health == 0 || tanks[1].health == 0 ||
@@ -599,6 +642,204 @@ void draw_tank(int player)
                     tanks[player].y - 16, SPRITE_VISIBLE);
 }
 
+int camera_origin(int position, int viewport_size, int map_size)
+{
+    int camera;
+
+    if (map_size <= viewport_size)
+    {
+        return (map_size - viewport_size) / 2;
+    }
+    camera = position - viewport_size / 2;
+    if (camera < 0)
+    {
+        return 0;
+    }
+    if (camera > map_size - viewport_size)
+    {
+        return map_size - viewport_size;
+    }
+    return camera;
+}
+
+void draw_world_rect_view(
+    int x, int y, int rect_width, int rect_height, int color,
+    int camera_x, int camera_y, int viewport_x)
+{
+    int map_width;
+    int map_height;
+    int left;
+    int right;
+    int top;
+    int bottom;
+
+    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
+    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
+    left = x > 0 ? x : 0;
+    right = x + rect_width < map_width ? x + rect_width : map_width;
+    top = y > 0 ? y : 0;
+    bottom = y + rect_height < map_height ? y + rect_height : map_height;
+    left = left - camera_x + viewport_x;
+    right = right - camera_x + viewport_x;
+    top -= camera_y;
+    bottom -= camera_y;
+    if (left < viewport_x)
+    {
+        left = viewport_x;
+    }
+    if (right > viewport_x + 320)
+    {
+        right = viewport_x + 320;
+    }
+    if (top < 0)
+    {
+        top = 0;
+    }
+    if (bottom > 480)
+    {
+        bottom = 480;
+    }
+    if (left < right && top < bottom)
+    {
+        gfx_rect(left, top, right - left, bottom - top, color);
+    }
+}
+
+void draw_world_line_view(
+    int x1, int y1, int x2, int y2, int color,
+    int camera_x, int camera_y, int viewport_x)
+{
+    int screen_x;
+    int screen_y;
+    int end_x;
+    int end_y;
+    int delta_x;
+    int delta_y;
+    int step_x;
+    int step_y;
+    int error;
+    int doubled_error;
+    int world_x;
+    int world_y;
+
+    screen_x = x1 - camera_x + viewport_x;
+    screen_y = y1 - camera_y;
+    end_x = x2 - camera_x + viewport_x;
+    end_y = y2 - camera_y;
+    delta_x = absolute_value(end_x - screen_x);
+    delta_y = -absolute_value(end_y - screen_y);
+    step_x = screen_x < end_x ? 1 : -1;
+    step_y = screen_y < end_y ? 1 : -1;
+    error = delta_x + delta_y;
+    while (1)
+    {
+        world_x = screen_x - viewport_x + camera_x;
+        world_y = screen_y + camera_y;
+        if (screen_x >= viewport_x && screen_x < viewport_x + 320 &&
+            screen_y >= 0 && screen_y < 480 &&
+            world_x >= 0 && world_x < MAP_COLUMNS * MAP_TILE_PIXEL_SIZE &&
+            world_y >= 0 && world_y < MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+        {
+            gfx_pixel(screen_x, screen_y, (unsigned char)color);
+        }
+        if (screen_x == end_x && screen_y == end_y)
+        {
+            break;
+        }
+        doubled_error = error * 2;
+        if (doubled_error >= delta_y)
+        {
+            error += delta_y;
+            screen_x += step_x;
+        }
+        if (doubled_error <= delta_x)
+        {
+            error += delta_x;
+            screen_y += step_y;
+        }
+    }
+}
+
+void draw_map_obstacles(int camera_x, int camera_y)
+{
+    int first_column;
+    int last_column;
+    int first_row;
+    int last_row;
+    int column;
+    int row;
+    int tile;
+
+    first_column = camera_x / MAP_TILE_PIXEL_SIZE;
+    first_row = camera_y / MAP_TILE_PIXEL_SIZE;
+    last_column = (camera_x + 319) / MAP_TILE_PIXEL_SIZE;
+    last_row = (camera_y + 479) / MAP_TILE_PIXEL_SIZE;
+    if (first_column < 0) first_column = 0;
+    if (first_row < 0) first_row = 0;
+    if (last_column >= MAP_COLUMNS) last_column = MAP_COLUMNS - 1;
+    if (last_row >= MAP_ROWS) last_row = MAP_ROWS - 1;
+    for (row = first_row; row <= last_row; row++)
+    {
+        for (column = first_column; column <= last_column; column++)
+        {
+            tile = map_obstacles[row * MAP_COLUMNS + column];
+            if (tile != 0)
+            {
+                gfx_world_tile(tile, column * MAP_TILE_PIXEL_SIZE,
+                               row * MAP_TILE_PIXEL_SIZE);
+            }
+        }
+    }
+}
+
+void draw_ground(void)
+{
+    int viewport;
+    int camera_x;
+    int camera_y;
+    int i;
+    int offset_x;
+    int offset_y;
+
+    gfx_layer_select(LAYER_3D);
+    gfx_clear(0);
+    for (viewport = 0; viewport < 2; viewport++)
+    {
+        camera_x = camera_origin(tanks[viewport].x, 320,
+                                 MAP_COLUMNS * MAP_TILE_PIXEL_SIZE);
+        camera_y = camera_origin(tanks[viewport].y, 480,
+                                 MAP_ROWS * MAP_TILE_PIXEL_SIZE);
+        for (i = 0; i < track_count; i++)
+        {
+            offset_x = direction_offset(directions_y[track_direction[i]], 10);
+            offset_y = -direction_offset(directions_x[track_direction[i]], 10);
+            draw_world_rect_view(
+                track_x[i] + offset_x - 1, track_y[i] + offset_y - 1, 3, 3,
+                TRACK_COLOR, camera_x, camera_y, viewport * 320);
+            draw_world_rect_view(
+                track_x[i] - offset_x - 1, track_y[i] - offset_y - 1, 3, 3,
+                TRACK_COLOR, camera_x, camera_y, viewport * 320);
+        }
+    }
+    for (viewport = 0; viewport < 2; viewport++)
+    {
+        camera_x = camera_origin(tanks[viewport].x, 320,
+                                 MAP_COLUMNS * MAP_TILE_PIXEL_SIZE);
+        camera_y = camera_origin(tanks[viewport].y, 480,
+                                 MAP_ROWS * MAP_TILE_PIXEL_SIZE);
+        draw_map_obstacles(camera_x, camera_y);
+    }
+    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    {
+        if (object_active[i])
+        {
+            gfx_world_tile(map_object_tile[i],
+                           map_object_x[i] * MAP_TILE_PIXEL_SIZE,
+                           map_object_y[i] * MAP_TILE_PIXEL_SIZE);
+        }
+    }
+}
+
 void draw_hud(void)
 {
     char health[6];
@@ -606,46 +847,65 @@ void draw_hud(void)
     char timer[16];
     unsigned int seconds;
     int i;
-    int mine_x[3];
-    int mine_y[3];
+    int viewport;
+    int camera_x;
+    int camera_y;
+    int map_width;
+    int map_height;
+    int shot_start_x;
+    int shot_start_y;
+    int shot_end_x;
+    int shot_end_y;
+    int explosion_x;
+    int explosion_y;
+    int radius;
 
     gfx_layer_select(LAYER_HUD);
     gfx_clear(15);
-    for (i = 0; i < 7; i++)
+    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
+    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
+    for (viewport = 0; viewport < 2; viewport++)
     {
-        gfx_rect(obstacles[i].x, obstacles[i].y,
-                 obstacles[i].width, obstacles[i].height, DARK_GRAY);
-        gfx_rect(obstacles[i].x + 2, obstacles[i].y + 2,
-                 obstacles[i].width - 4, obstacles[i].height - 4, GRAY);
-    }
-    mine_x[0] = 136;
-    mine_y[0] = 184;
-    mine_x[1] = 504;
-    mine_y[1] = 184;
-    mine_x[2] = 320;
-    mine_y[2] = 280;
-    for (i = 0; i < 3; i++)
-    {
-        if (mine_active[i])
+        camera_x = camera_origin(tanks[viewport].x, 320, map_width);
+        camera_y = camera_origin(tanks[viewport].y, 480, map_height);
+        for (i = 0; i < MAP_OBJECT_COUNT; i++)
         {
-            gfx_rect(mine_x[i] - 5, mine_y[i] - 5, 10, 10, ORANGE);
-            gfx_rect(mine_x[i] - 2, mine_y[i] - 2, 4, 4, DARK_RED);
+            if (object_explosion[i] > 0)
+            {
+                explosion_x = map_object_x[i] * MAP_TILE_PIXEL_SIZE +
+                              MAP_TILE_PIXEL_SIZE / 2;
+                explosion_y = map_object_y[i] * MAP_TILE_PIXEL_SIZE +
+                              MAP_TILE_PIXEL_SIZE / 2;
+                radius = (EXPLOSION_FRAMES - object_explosion[i] + 4) *
+                         MAP_TILE_PIXEL_SIZE / 32 + 2;
+                draw_world_rect_view(
+                    explosion_x - radius, explosion_y - 2, radius * 2, 4,
+                    ORANGE, camera_x, camera_y, viewport * 320);
+                draw_world_rect_view(
+                    explosion_x - 2, explosion_y - radius, 4, radius * 2,
+                    YELLOW, camera_x, camera_y, viewport * 320);
+            }
         }
-    }
-    for (i = 0; i < MAX_SHOTS; i++)
-    {
-        if (shots[i].life > 0)
+        for (i = 0; i < MAX_SHOTS; i++)
         {
-            gfx_line(
-                shots[i].x -
-                    direction_offset(directions_x[shots[i].direction], 4),
-                shots[i].y -
-                    direction_offset(directions_y[shots[i].direction], 4),
-                shots[i].x +
-                    direction_offset(directions_x[shots[i].direction], 4),
-                shots[i].y +
-                    direction_offset(directions_y[shots[i].direction], 4),
-                YELLOW);
+            if (shots[i].life > 0)
+            {
+                shot_start_x =
+                    shots[i].x -
+                    direction_offset(directions_x[shots[i].direction], 4);
+                shot_start_y =
+                    shots[i].y -
+                    direction_offset(directions_y[shots[i].direction], 4);
+                shot_end_x =
+                    shots[i].x +
+                    direction_offset(directions_x[shots[i].direction], 4);
+                shot_end_y =
+                    shots[i].y +
+                    direction_offset(directions_y[shots[i].direction], 4);
+                draw_world_line_view(
+                    shot_start_x, shot_start_y, shot_end_x, shot_end_y,
+                    YELLOW, camera_x, camera_y, viewport * 320);
+            }
         }
     }
     gfx_rect(0, 0, 640, 30, DARK_GRAY);
@@ -684,6 +944,21 @@ void draw_hud(void)
 
 void draw_game(void)
 {
+    int map_width;
+    int map_height;
+    int camera1_x;
+    int camera1_y;
+    int camera2_x;
+    int camera2_y;
+
+    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
+    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
+    camera1_x = camera_origin(tanks[0].x, 320, map_width);
+    camera1_y = camera_origin(tanks[0].y, 480, map_height);
+    camera2_x = camera_origin(tanks[1].x, 320, map_width);
+    camera2_y = camera_origin(tanks[1].y, 480, map_height);
+    gfx_split_camera(camera1_x, camera1_y, camera2_x, camera2_y);
+    draw_ground();
     gfx_layer_select(LAYER_SPRITES);
     draw_tank(0);
     draw_tank(1);
@@ -715,8 +990,11 @@ int main(void)
     gfx_speed(SPEED_MAX);
     gfx_vsync(1);
     gfx_layer_reset((1 << LAYER_TILES) | (1 << LAYER_SPRITES) |
-                    (1 << LAYER_HUD));
+                    (1 << LAYER_3D) | (1 << LAYER_HUD));
+    gfx_layer_order(LAYER_3D, 2);
+    gfx_layer_order(LAYER_SPRITES, 3);
     gfx_layer_transparency(LAYER_HUD, 15);
+    gfx_palette(TRACK_COLOR, 84, 71, 48);
     for (i = 1; i < MAP_PALETTE_COUNT; i++)
     {
         gfx_palette((unsigned char)(MAP_PALETTE_BASE + i - 1),
@@ -726,7 +1004,6 @@ int main(void)
     load_tank_sprites();
     gfx_tile_size(MAP_TILE_PIXEL_SIZE);
     upload_terrain_tiles();
-    setup_map();
     gfx_layer_select(LAYER_TILES);
     gfx_tilemap(map_data, MAP_COLUMNS, MAP_ROWS, 0, 0);
     wins[0] = 0;

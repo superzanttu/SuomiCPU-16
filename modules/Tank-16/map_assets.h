@@ -10524,3 +10524,30 @@ unsigned char map_data[MAP_CELLS] = {
     1, 0, 0, 1, 0, 7, 30, 20, 8, 0, 1, 0, 0, 3, 2, 29,
     22, 34, 8, 0, 15, 2, 0, 1, 0, 7, 30, 21, 8, 0, 0, 0
 };
+#define MAP_OBJECT_COUNT 0
+#define MAP_OBJECT_CAPACITY 1
+#define OBJECT_FIXED 0
+#define OBJECT_EXPLOSION 1
+#define OBJECT_DISAPPEAR 2
+unsigned char map_obstacles[MAP_CELLS] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+int map_object_x[MAP_OBJECT_CAPACITY] = {
+    0
+};
+int map_object_y[MAP_OBJECT_CAPACITY] = {
+    0
+};
+int map_object_tile[MAP_OBJECT_CAPACITY] = {
+    0
+};
+int map_object_hp[MAP_OBJECT_CAPACITY] = {
+    0
+};
+int map_object_removal[MAP_OBJECT_CAPACITY] = {
+    0
+};

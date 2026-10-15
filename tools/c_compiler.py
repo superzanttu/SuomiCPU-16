@@ -64,6 +64,8 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_mouse_wheel": ("int", ()),
     "gfx_tilemap": ("void", ("unsigned char*", "int", "int", "int", "int")),
     "gfx_tile_camera": ("void", ("int", "int")),
+    "gfx_split_camera": ("void", ("int", "int", "int", "int")),
+    "gfx_world_tile": ("void", ("int", "int", "int")),
     "gfx_tile_upload": ("void", ("int", "unsigned char*")),
     "gfx_tile_size": ("void", ("int",)),
     "gfx_sprite_upload": ("void", ("int", "int", "int", "unsigned char*")),

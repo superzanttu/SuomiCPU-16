@@ -39,6 +39,9 @@ void gfx_tile_upload(int tile, unsigned char *pixels);
 void gfx_tile_size(int size);
 void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y);
 void gfx_tile_camera(int cam_x, int cam_y);
+void gfx_split_camera(int player1_x, int player1_y,
+                      int player2_x, int player2_y);
+void gfx_world_tile(int tile, int x, int y);
 /* Set one indexed color-map entry (index and RGB channels are 0..255). */
 #define GFX_PALETTE_SIZE 256
 void gfx_palette(unsigned char index, unsigned char red,
