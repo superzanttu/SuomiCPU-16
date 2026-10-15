@@ -51,6 +51,18 @@ class MapEditorDataTests(unittest.TestCase):
 
         self.assertEqual(path.name, "ARENA.json")
         self.assertEqual(loaded, map_data)
+        self.assertEqual(loaded["tileset"], "tiles_terrain.png")
+
+    def test_saves_and_loads_map_with_its_tileset_filename(self):
+        map_data = new_map("atlas", 2, 2)
+        map_data["tileset"] = "tiles_terrain.png"
+        map_data["tiles"][0][0] = [1, 0]
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_map(map_data, Path(directory))
+            loaded = load_map(path)
+
+        self.assertEqual(loaded["tileset"], "tiles_terrain.png")
+        self.assertEqual(loaded["tiles"][0][0], [1, 0])
 
     def test_validates_map_dimensions_and_tile_sheet_coordinates(self):
         map_data = new_map("MAP", 2, 2)
@@ -61,6 +73,11 @@ class MapEditorDataTests(unittest.TestCase):
 
         malformed = new_map("MAP", 2, 2)
         malformed["tiles"][0][0] = [0, 4]
+        with self.assertRaises(ValueError):
+            validate_map(malformed, 10, 4)
+
+        malformed = new_map("MAP", 2, 2)
+        malformed["tileset"] = "../tiles_terrain.png"
         with self.assertRaises(ValueError):
             validate_map(malformed, 10, 4)
 

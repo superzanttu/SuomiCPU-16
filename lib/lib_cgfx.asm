@@ -168,6 +168,17 @@ gfx_present:
     CALLX CGFX_GO
     RET
 
+; gfx_tile_size(size): set tile dimensions (1..64 pixels per side).
+gfx_tile_size:
+    LDWS R0, 4
+    LDI R1, 0
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDI R5, 28
+    CALLX CGFX_GO
+    RET
+
 gfx_mode:
     LDWS R0, 4
     CALLX CGFX_HIGH
@@ -260,6 +271,19 @@ gfx_ticks:
     LDI R6, 14
     ADD R7, R6
     LDW R0, R7
+    RET
+
+; gfx_palette(index, red, green, blue) sets one 8-bit RGB palette entry.
+gfx_palette:
+    LDWS R0, 6
+    LDWS R1, 8
+    LDWS R2, 10
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    CALLX CGFX_COLOR
+    LDI R5, 27
+    CALLX CGFX_GO
     RET
 
 ; gfx_sound(channel, freq, frames, wave, volume): COLOR=channel, X=freq, Y=frames, W=wave, H=volume.

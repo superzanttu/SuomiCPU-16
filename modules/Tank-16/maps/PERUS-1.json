@@ -4,6 +4,7 @@
   "width": 10,
   "height": 8,
   "tile_size": 64,
+  "tileset": "tiles_terrain.png",
   "tiles": [
     [
       [

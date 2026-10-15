@@ -8,9 +8,10 @@ import pygame
 ROOT = Path(__file__).resolve().parent
 MAPS_DIR = ROOT / "maps"
 TILESET_PATH = ROOT / "gfx" / "tiles_terrain.png"
+DEFAULT_TILESET_FILENAME = TILESET_PATH.name
 TILE_SIZE = 64
 MAX_MAP_NAME_LENGTH = 8
-MAX_MAP_DIMENSION = 256
+MAX_MAP_DIMENSION = 128
 SIDEBAR_WIDTH = 180
 HEADER_HEIGHT = 40
 BUTTON_HEIGHT = 34
@@ -21,7 +22,11 @@ TILE_SIZE_OPTIONS = (64, 32)
 
 
 def load_tileset(path: Path = TILESET_PATH) -> tuple[pygame.Surface, int, int]:
-    tileset = pygame.image.load(str(path))
+    try:
+        tileset = pygame.image.load(str(path))
+    except (OSError, pygame.error) as error:
+        raise ValueError("Could not load tileset %s: %s" %
+                         (path.name, error)) from error
     columns = tileset.get_width() // TILE_SIZE
     rows = tileset.get_height() // TILE_SIZE
     if columns == 0 or rows == 0:
@@ -29,6 +34,8 @@ def load_tileset(path: Path = TILESET_PATH) -> tuple[pygame.Surface, int, int]:
     if (tileset.get_width() % TILE_SIZE or
             tileset.get_height() % TILE_SIZE):
         raise ValueError("Tileset dimensions must be multiples of 64 pixels")
+    if columns * rows > 256:
+        raise ValueError("Tileset cannot contain more than 256 tiles")
     return tileset, columns, rows
 
 
@@ -43,21 +50,29 @@ def validate_map_name(name: str) -> str:
     return name.upper()
 
 
+def validate_tileset_filename(filename: str) -> str:
+    if not isinstance(filename, str) or not re.fullmatch(
+            r"tiles_[A-Za-z0-9_-]+\.png", filename):
+        raise ValueError("Tileset must be a tiles_*.png filename")
+    return filename
+
+
 def new_map(name: str, width: int, height: int,
             tile_x: int = 0, tile_y: int = 0) -> dict:
     name = validate_map_name(name)
     if (not isinstance(width, int) or isinstance(width, bool) or
             not 1 <= width <= MAX_MAP_DIMENSION):
-        raise ValueError("Map width must be between 1 and 256 tiles")
+        raise ValueError("Map width must be between 1 and 128 tiles")
     if (not isinstance(height, int) or isinstance(height, bool) or
             not 1 <= height <= MAX_MAP_DIMENSION):
-        raise ValueError("Map height must be between 1 and 256 tiles")
+        raise ValueError("Map height must be between 1 and 128 tiles")
     return {
         "format_version": 1,
         "name": name,
         "width": width,
         "height": height,
         "tile_size": TILE_SIZE,
+        "tileset": DEFAULT_TILESET_FILENAME,
         "tiles": [
             [[tile_x, tile_y] for _ in range(width)]
             for _ in range(height)
@@ -85,12 +100,14 @@ def validate_map(map_data: dict, tileset_columns: int,
     height = map_data.get("height")
     if (not isinstance(width, int) or isinstance(width, bool) or
             not 1 <= width <= MAX_MAP_DIMENSION):
-        raise ValueError("Map width must be between 1 and 256 tiles")
+        raise ValueError("Map width must be between 1 and 128 tiles")
     if (not isinstance(height, int) or isinstance(height, bool) or
             not 1 <= height <= MAX_MAP_DIMENSION):
-        raise ValueError("Map height must be between 1 and 256 tiles")
+        raise ValueError("Map height must be between 1 and 128 tiles")
     if map_data.get("tile_size") != TILE_SIZE:
         raise ValueError("Map tile size must be 64 pixels")
+    tileset = validate_tileset_filename(
+        map_data.get("tileset", DEFAULT_TILESET_FILENAME))
 
     tiles = map_data.get("tiles")
     if not isinstance(tiles, list) or len(tiles) != height:
@@ -118,12 +135,17 @@ def validate_map(map_data: dict, tileset_columns: int,
         "width": width,
         "height": height,
         "tile_size": TILE_SIZE,
+        "tileset": tileset,
         "tiles": normalized_tiles,
     }
 
 
 def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
-    _, columns, rows = load_tileset()
+    if not isinstance(map_data, dict):
+        raise ValueError("Map file must contain a JSON object")
+    filename = validate_tileset_filename(
+        map_data.get("tileset", DEFAULT_TILESET_FILENAME))
+    _, columns, rows = load_tileset(ROOT / "gfx" / filename)
     normalized = validate_map(map_data, columns, rows)
     maps_dir.mkdir(parents=True, exist_ok=True)
     path = maps_dir / (normalized["name"] + ".json")
@@ -132,13 +154,24 @@ def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
     return path
 
 
-def load_map(path: Path, tileset_columns: int,
-             tileset_rows: int) -> dict:
+def load_map(path: Path, tileset_columns: int | None = None,
+             tileset_rows: int | None = None) -> dict:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("Could not read map: %s" % error) from error
-    return validate_map(document, tileset_columns, tileset_rows)
+    if not isinstance(document, dict):
+        raise ValueError("Map file must contain a JSON object")
+    tileset_value = document.get("tileset", DEFAULT_TILESET_FILENAME)
+    if not isinstance(tileset_value, str):
+        raise ValueError("Tileset must be a tiles_*.png filename")
+    filename = validate_tileset_filename(tileset_value)
+    _, actual_columns, actual_rows = load_tileset(ROOT / "gfx" / filename)
+    columns = actual_columns if tileset_columns is None else tileset_columns
+    rows = actual_rows if tileset_rows is None else tileset_rows
+    if (columns, rows) != (actual_columns, actual_rows):
+        raise ValueError("Tileset dimensions do not match the map tileset")
+    return validate_map(document, actual_columns, actual_rows)
 
 
 def tile_surface(tileset: pygame.Surface, tile_x: int,
@@ -340,7 +373,9 @@ def main() -> int:
                         map_data = new_map(
                             new_fields[0], int(new_fields[1]),
                             int(new_fields[2]))
+                        tileset, tile_columns, tile_rows = load_tileset()
                         selected_tile = (0, 0)
+                        tile_scroll = 0
                         scroll = [0.0, 0.0]
                         zoom_level = 1
                         status = "New map created"
@@ -442,8 +477,14 @@ def main() -> int:
                                                index * 28, box.width - 40, 26)
                             if rect.collidepoint(position):
                                 try:
-                                    map_data = load_map(
-                                        path, tile_columns, tile_rows)
+                                    loaded_map = load_map(path)
+                                    loaded_tileset, columns, rows = load_tileset(
+                                        ROOT / "gfx" / loaded_map["tileset"])
+                                    map_data = loaded_map
+                                    tileset = loaded_tileset
+                                    tile_columns, tile_rows = columns, rows
+                                    selected_tile = (0, 0)
+                                    tile_scroll = 0
                                     scroll = [0.0, 0.0]
                                     zoom_level = 1
                                     dialog = None
@@ -573,11 +614,11 @@ def main() -> int:
                 (box.x + 20, box.bottom - 26))
         elif dialog == "tileset":
             _draw_dialog(
-                window, font, "Fixed tileset",
-                ["gfx/tiles_terrain.png",
+                window, font, "Map tileset",
+                ["gfx/" + map_data["tileset"],
                  "%d x %d tiles; each tile is 64x64" %
                  (tile_columns, tile_rows),
-                 "Tileset selection is intentionally disabled.",
+                 "Maps record the tileset used by the game.",
                  "Click or press Enter/Esc to close"])
 
         pygame.display.flip()

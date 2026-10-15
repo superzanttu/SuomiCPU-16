@@ -134,9 +134,12 @@ GPU_TILEMAP = 21
 GPU_3D = 22
 GPU_SPRITE_UPLOAD, GPU_SPRITE_MOVE = 23, 24
 GPU_TILE_UPLOAD, GPU_TILE_CAMERA = 25, 26
+GPU_PALETTE = 27
+GPU_TILE_SIZE = 28
 GPU_SPRITE_SLOTS = 64
 GPU_SPRITE_MAX_SIZE = 64
 GPU_TILE_COUNT = 256
+GPU_TILE_MAX_SIZE = 64
 GPU_TILEMAP_MAX_SIZE = 128
 GPU3D_FILL, GPU3D_WIREFRAME = 1, 2
 GPU3D_OK, GPU3D_ERROR_SCENE, GPU3D_ERROR_FACE = 0, 1, 2
@@ -221,6 +224,16 @@ PALETTE_COLORS = [
     (255, 128, 192), (150, 100, 50), (46, 30, 22),
 ]
 
+
+def _default_palette() -> list[pygame.Color]:
+    colors = [pygame.Color(i, i, i) for i in range(256)]
+    colors[:len(PALETTE_COLORS)] = [
+        pygame.Color(*color) for color in PALETTE_COLORS
+    ]
+    colors[25] = pygame.Color(0, 0, 255)
+    return colors
+
+
 # Näppäimistön yhdistykset
 KEY_BITS = {
     pygame.K_LEFT: 1, pygame.K_a: 1, pygame.K_RIGHT: 2, pygame.K_d: 2,
@@ -241,21 +254,46 @@ def load_program_file(
     path: str | Path,
     logger: Callable[[str], None] | None = None,
 ) -> AssemblyImage:
-    """Lataa ohjelman tiedostosta (.asm, .c tai .bin)."""
+    """Lataa ohjelman tiedostosta (.asm, .c, .bin tai Tank-16-kartta)."""
     program_path = Path(path)
     report = logger if logger is not None else (lambda message: None)
     if program_path.suffix.lower() == ".c":
-        report(f"Compiling C source: {program_path.name}")
         try:
-            from tools.c_compiler import compile_file_with_assembly
+            tank16_main = (
+                Path(__file__).resolve().parent.parent
+                / "modules" / "Tank-16" / "main.c"
+            )
+            if program_path.resolve() == tank16_main:
+                from tools.tank16_map_loader import compile_map_file
 
-            image, assembly = compile_file_with_assembly(program_path)
+                report("Compiling Tank-16 source with its default map")
+                image = compile_map_file(
+                    tank16_main.parent / "maps" / "PERUS-1.json"
+                )
+                report("Tank-16 source, map, and tileset compiled into SC-16 image")
+            else:
+                report(f"Compiling C source: {program_path.name}")
+                from tools.c_compiler import compile_file_with_assembly
+
+                image, assembly = compile_file_with_assembly(program_path)
+                report(f"C source file size: {program_path.stat().st_size} bytes")
+                report(f"Generated assembly size: {len(assembly.encode('utf-8'))} bytes")
+                report("C compilation complete; SC-16 image ready")
         except (CCompilerError, OSError, ValueError) as exc:
             report(f"ERROR: C compilation failed: {exc}")
             raise
-        report(f"C source file size: {program_path.stat().st_size} bytes")
-        report(f"Generated assembly size: {len(assembly.encode('utf-8'))} bytes")
-        report("C compilation complete; SC-16 image ready")
+    elif (program_path.suffix.lower() == ".json" and
+          program_path.parent.name == "maps" and
+          program_path.parent.parent.name == "Tank-16"):
+        report(f"Loading Tank-16 map: {program_path.name}")
+        try:
+            from tools.tank16_map_loader import compile_map_file
+
+            image = compile_map_file(program_path)
+        except (CCompilerError, OSError, ValueError) as exc:
+            report(f"ERROR: Tank-16 map loading failed: {exc}")
+            raise
+        report("Tank-16 map and tileset compiled into SC-16 image")
     elif program_path.suffix.lower() == ".bin":
         report(f"Loading binary program: {program_path.name}")
         try:
@@ -353,10 +391,7 @@ class SuomiCompute16:
         self.paused = False
         self.reboot_requested = False
         self.bios_reset_requested = False
-        self.palette = [pygame.Color(i, i, i) for i in range(256)]
-        for index, color in enumerate(PALETTE_COLORS):
-            self.palette[index] = color
-        self.palette[25] = (0, 0, 255)
+        self.palette = _default_palette()
         self.frame_yield = False
         self._ensure_gpu_state()
         self.vram_surface = self._create_vram_surface()
@@ -398,10 +433,7 @@ class SuomiCompute16:
 
     def _ensure_gpu_state(self):
         if not hasattr(self, "palette"):
-            self.palette = [pygame.Color(i, i, i) for i in range(256)]
-            for index, value in enumerate(PALETTE_COLORS):
-                self.palette[index] = value
-            self.palette[25] = (0, 0, 255)
+            self.palette = _default_palette()
         if not hasattr(self, "gpu_layers"):
             width, height = self._screen_size()
             self.gpu_layers = [bytearray(width * height) for _ in range(GPU_LAYER_COUNT)]
@@ -409,12 +441,17 @@ class SuomiCompute16:
             self.sprites = [
                 {"x": 0, "y": 0, "flags": 0} for _ in range(GPU_SPRITE_SLOTS)
             ]
-            self.tile_memory = bytearray(GPU_TILE_COUNT * TILE_SIZE * TILE_SIZE)
+            self.tile_memory = bytearray(
+                GPU_TILE_COUNT * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
+            )
+            self.tile_pixel_size = TILE_SIZE
             for tile in range(1, GPU_TILE_COUNT):
-                start = tile * TILE_SIZE * TILE_SIZE
-                self.tile_memory[start:start + TILE_SIZE * TILE_SIZE] = bytes(
-                    [tile]
-                ) * (TILE_SIZE * TILE_SIZE)
+                start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
+                for row in range(TILE_SIZE):
+                    row_start = start + row * TILE_SIZE
+                    self.tile_memory[row_start:row_start + TILE_SIZE] = bytes(
+                        [tile]
+                    ) * TILE_SIZE
             self.tilemap_memory = bytearray()
             self.tilemap_width = 0
             self.tilemap_height = 0
@@ -438,6 +475,18 @@ class SuomiCompute16:
             self._gpu_state_mode = self._graphics_mode()
             self._tile_layer_dirty = True
             self._sprite_layer_dirty = True
+
+    def _apply_palette(self):
+        for surface in getattr(self, "_layer_surfaces", ()):
+            if surface is not None:
+                surface.set_palette(self.palette)
+        surface = getattr(self, "vram_surface", None)
+        if surface is not None:
+            surface.set_palette(self.palette)
+
+    def _set_palette_entry(self, index, red, green, blue):
+        self.palette[index] = pygame.Color(red, green, blue)
+        self._apply_palette()
 
     def _create_vram_surface(self):
         width, height = self._screen_size()
@@ -708,6 +757,13 @@ class SuomiCompute16:
         elif command == GPU_TILE_CAMERA:
             self.tile_camera = (x, y)
             self._tile_layer_dirty = True
+        elif command == GPU_PALETTE:
+            self._set_palette_entry(
+                color, x & 0xFF, y & 0xFF, w & 0xFF
+            )
+            self._gpu_result(0)
+        elif command == GPU_TILE_SIZE:
+            self._gpu_set_tile_size(x)
 
     @staticmethod
     def _gpu3d_sincos(angle):
@@ -857,14 +913,23 @@ class SuomiCompute16:
         self._gpu_result(0)
 
     def _gpu_tile_upload(self, tile, source):
-        if tile >= GPU_TILE_COUNT:
+        if not 0 <= tile < GPU_TILE_COUNT:
             self._gpu_result(1)
             return
-        start = tile * TILE_SIZE * TILE_SIZE
-        self.tile_memory[start:start + TILE_SIZE * TILE_SIZE] = bytes(
-            self.read((source + index) & MEM_MASK)
-            for index in range(TILE_SIZE * TILE_SIZE)
+        tile_size = self.tile_pixel_size
+        start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
+        size = tile_size * tile_size
+        self.tile_memory[start:start + size] = bytes(
+            self.read((source + index) & MEM_MASK) for index in range(size)
         )
+        self._tile_layer_dirty = True
+        self._gpu_result(0)
+
+    def _gpu_set_tile_size(self, tile_size):
+        if not 1 <= tile_size <= GPU_TILE_MAX_SIZE:
+            self._gpu_result(1)
+            return
+        self.tile_pixel_size = tile_size
         self._tile_layer_dirty = True
         self._gpu_result(0)
 
@@ -890,30 +955,29 @@ class SuomiCompute16:
         if not self.tilemap_memory:
             return
         camx, camy = self.tile_camera
-        first_col = camx // TILE_SIZE
-        first_row = camy // TILE_SIZE
-        cols = (width + (camx - first_col * TILE_SIZE) + TILE_SIZE - 1) // TILE_SIZE
-        rows = (height + (camy - first_row * TILE_SIZE) + TILE_SIZE - 1) // TILE_SIZE
+        tile_size = self.tile_pixel_size
+        first_col = camx // tile_size
+        first_row = camy // tile_size
+        cols = (width + (camx - first_col * tile_size) + tile_size - 1) // tile_size
+        rows = (height + (camy - first_row * tile_size) + tile_size - 1) // tile_size
         for row in range(max(first_row, 0), min(first_row + rows, self.tilemap_height)):
-            screen_y = row * TILE_SIZE - camy
+            screen_y = row * tile_size - camy
             for column in range(max(first_col, 0), min(first_col + cols, self.tilemap_width)):
                 map_index = row * self.tilemap_width + column
                 tile = self.tilemap_memory[map_index]
-                tile_start = tile * TILE_SIZE * TILE_SIZE
-                screen_x = column * TILE_SIZE - camx
-                left, right = max(screen_x, 0), min(screen_x + TILE_SIZE, width)
-                top, bottom = max(screen_y, 0), min(screen_y + TILE_SIZE, height)
+                tile_start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
+                screen_x = column * tile_size - camx
+                left, right = max(screen_x, 0), min(screen_x + tile_size, width)
+                top, bottom = max(screen_y, 0), min(screen_y + tile_size, height)
                 if left >= right or top >= bottom:
                     continue
                 source_x = left - screen_x
                 span = right - left
                 for dest_y in range(top, bottom):
                     source_y = dest_y - screen_y
-                    src = tile_start + source_y * TILE_SIZE + source_x
+                    src = tile_start + source_y * tile_size + source_x
                     dst = dest_y * width + left
                     tile_row = self.tile_memory[src:src + span]
-                    if self._graphics_mode() == GFX_MODE_640_480:
-                        tile_row = bytes(pixel & 0x0F for pixel in tile_row)
                     target[dst:dst + span] = tile_row
 
     def _render_sprites(self):
@@ -2035,6 +2099,9 @@ class SuomiCompute16:
 
     def reset(self, preserve_console_history=False):
         print("SC-16 starting...")
+        self.palette = _default_palette()
+        self._apply_palette()
+        self.tile_pixel_size = TILE_SIZE
         self.registers = [0]*8
         self.sp = MEM_MASK
         self.pc = self.entry_point
@@ -2207,7 +2274,7 @@ def main():
     parser.add_argument(
         "program_file",
         nargs="?",
-        help="optional .asm, .c, or flat .bin program to load",
+        help="optional .asm, .c, .bin, or Tank-16 maps/*.json file to load",
     )
     parser.add_argument("--net-port", type=int, default=DEFAULT_PORT,
                         help="UDP port for LAN games (all players must use the same port)")

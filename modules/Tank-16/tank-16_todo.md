@@ -10,8 +10,10 @@
 - [x] Give each player one life and 100 health; apply 10 damage for an ammunition hit, 25 for a mine, and 5 for a tank collision.
 - [x] End a round when a player's health reaches zero.
 - [x] Build the screen-sized map from 16×16 runtime terrain tiles.
+- [x] Load editor JSON maps and their named terrain tileset when Tank-16 is started with a map file.
+- [x] Preserve the tileset's source RGB colors through per-program palette entries.
 - [ ] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
-- [ ] Scale 64×64 atlas cells to the runtime size when preparing game sprite/tile data.
+- [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.
 - [x] Provide `sprite_viewer.py` to inspect 64×64 cells, atlas coordinates, and row-major IDs.
 - [x] Provide `gfx/tiles_template.png` as a transparent, numbered 64×64-cell atlas template.
 - [x] Precalculate 32 tank sprite rotations and projectile directions.
@@ -20,10 +22,6 @@
 - [x] Start a new round automatically after each round and retain wins; reset the win count when the game restarts.
 
 ## Remaining tasks
-- [ ] Align the packed artwork in `gfx/tiles_objects.png` to the 64×64 cell grid before relying on its cell IDs.
-- [ ] Use `sprite_viewer.py` to choose mine and obstacle sprites from the object atlas.
-- [ ] Define the chosen sprite coordinates in the game code and use those sprites instead of the current simple mine and obstacle drawings.
-- [ ] Add destructible and indestructible obstacles.
 - [ ] Add timed power-ups, such as increased speed, stronger shots, and health restoration.
 - [ ] Add sound effects for shooting, tank movement, and explosions.
 

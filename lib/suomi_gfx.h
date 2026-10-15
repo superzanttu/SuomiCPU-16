@@ -36,8 +36,13 @@ int gfx_mouse_wheel(void);
 void gfx_sprite_upload(int slot, int w, int h, unsigned char *data);
 void gfx_sprite_move(int slot, int x, int y, int flags);
 void gfx_tile_upload(int tile, unsigned char *pixels);
+void gfx_tile_size(int size);
 void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y);
 void gfx_tile_camera(int cam_x, int cam_y);
+/* Set one indexed color-map entry (index and RGB channels are 0..255). */
+#define GFX_PALETTE_SIZE 256
+void gfx_palette(unsigned char index, unsigned char red,
+                 unsigned char green, unsigned char blue);
 /* GPU scene: 10-word header, 3 words per vertex, then 4 words per triangle. */
 int gfx3d_draw(int *scene);
 #define GPU3D_ONE 256

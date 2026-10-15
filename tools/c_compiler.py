@@ -65,8 +65,12 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_tilemap": ("void", ("unsigned char*", "int", "int", "int", "int")),
     "gfx_tile_camera": ("void", ("int", "int")),
     "gfx_tile_upload": ("void", ("int", "unsigned char*")),
+    "gfx_tile_size": ("void", ("int",)),
     "gfx_sprite_upload": ("void", ("int", "int", "int", "unsigned char*")),
     "gfx_sprite_move": ("void", ("int", "int", "int", "int")),
+    "gfx_palette": ("void", (
+        "unsigned char", "unsigned char", "unsigned char", "unsigned char",
+    )),
     "gfx_layer_select": ("void", ("int",)),
     "gfx_layer_visibility": ("void", ("unsigned int",)),
     "gfx_layer_transparency": ("void", ("int", "unsigned char")),

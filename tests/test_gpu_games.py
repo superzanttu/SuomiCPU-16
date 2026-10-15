@@ -99,6 +99,30 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(cpu.gpu_layers[1][0], 9)
         self.assertEqual(cpu.gpu_layers[1][15 * 320 + 15], 9)
 
+    def test_configurable_tile_size_uploads_and_draws_variable_cells(self):
+        for size in (24, 32):
+            with self.subTest(size=size):
+                pixel_count = size * size
+                cpu = run_c(
+                    HEADER
+                    + f"unsigned char tile[{pixel_count}];\n"
+                    "unsigned char map[1] = {0};\n"
+                    "int main(void) {\n"
+                    "  int i;\n"
+                    f"  for (i = 0; i < {pixel_count}; i++) tile[i] = 42;\n"
+                    "  gfx_mode(GFX_MODE_640_480);\n"
+                    f"  gfx_tile_size({size});\n"
+                    "  gfx_tile_upload(0, tile);\n"
+                    "  gfx_tilemap(map, 1, 1, 0, 0);\n"
+                    "  gfx_present();\n"
+                    "  return 0;\n"
+                    "}\n",
+                )
+
+                self.assertEqual(cpu.tile_pixel_size, size)
+                self.assertEqual(cpu.gpu_layers[1][(size - 1) * 640 + size - 1], 42)
+                self.assertEqual(cpu.gpu_layers[1][(size - 1) * 640 + size], 0)
+
     def test_c_layer_sprite_and_tile_apis_program_hardware_state(self):
         cpu = run_c(
             "unsigned char sprite[4] = {0,5,6,0};\n"
@@ -352,6 +376,22 @@ def vram_pixel(cpu, x, y):
 
 
 class CGraphicsTests(unittest.TestCase):
+    def test_program_can_set_rgb_palette_entries(self):
+        cpu = run_c(
+            HEADER
+            + "int main(void) {\n"
+            "  gfx_palette(42, 12, 34, 56);\n"
+            "  gfx_layer_select(LAYER_HUD);\n"
+            "  gfx_pixel(5, 6, 42);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+
+        self.assertEqual(tuple(cpu.palette[42])[:3], (12, 34, 56))
+        self.assertEqual(
+            tuple(cpu.vram_surface.get_at((5, 6)))[:3], (12, 34, 56))
+
     def test_every_builtin_draws_and_presents(self):
         cpu = run_c(
             "unsigned char spr[4] = {2, 0, 0, 3};\n"
