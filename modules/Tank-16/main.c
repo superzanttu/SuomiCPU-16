@@ -725,10 +725,7 @@ int main(void)
     }
     load_tank_sprites();
     gfx_tile_size(MAP_TILE_PIXEL_SIZE);
-    for (i = 0; i < TILE_COUNT; i++)
-    {
-        gfx_tile_upload(i, terrain_tiles[i]);
-    }
+    upload_terrain_tiles();
     setup_map();
     gfx_layer_select(LAYER_TILES);
     gfx_tilemap(map_data, MAP_COLUMNS, MAP_ROWS, 0, 0);

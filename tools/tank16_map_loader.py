@@ -156,6 +156,10 @@ def build_map_header(map_path: Path) -> str:
         "    {" + format_array(values, 16).replace("\n", "\n     ") + "}"
         for values in tile_data
     )
+    upload_tiles = "\n".join(
+        "    gfx_tile_upload(%d, terrain_tiles[%d]);" % (index, index)
+        for index in range(len(tile_data))
+    )
     return (
         "#define MAP_COLUMNS %d\n"
         "#define MAP_ROWS %d\n"
@@ -171,6 +175,9 @@ def build_map_header(map_path: Path) -> str:
         "unsigned char terrain_tiles[TILE_COUNT][TILE_PIXEL_COUNT] = {\n"
         "%s\n"
         "};\n"
+        "void upload_terrain_tiles(void) {\n"
+        "%s\n"
+        "}\n"
         "unsigned char map_data[MAP_CELLS] = {\n"
         "%s\n"
         "};\n"
@@ -182,7 +189,7 @@ def build_map_header(map_path: Path) -> str:
             "    {%s}" % ", ".join(str(channel) for channel in color)
             for color in palette
         ),
-        tile_arrays, format_array(map_values, 16),
+        tile_arrays, upload_tiles, format_array(map_values, 16),
     )
 
 

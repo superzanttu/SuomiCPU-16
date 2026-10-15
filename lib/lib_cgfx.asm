@@ -523,7 +523,7 @@ gfx_tile_camera:
     CALLX CGFX_GO
     RET
 
-; gfx_tile_upload(tile, pixels): copy one 16x16 indexed tile into GPU tile RAM.
+; gfx_tile_upload(tile, pixels): copy one configured indexed tile into GPU tile RAM.
 gfx_tile_upload:
     LDWS R0, 4
     LDI R1, 0

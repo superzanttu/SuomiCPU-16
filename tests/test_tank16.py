@@ -134,9 +134,29 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(dimensions[2], map_tile_pixel_size())
         self.assertEqual(cpu.tile_pixel_size, dimensions[2])
         self.assertEqual(len(tiles[0]), dimensions[2] ** 2)
-        self.assertEqual(
-            cpu.tile_memory[:dimensions[2] ** 2], bytes(tiles[0])
-        )
+        tile_stride = 64 * 64
+        for tile_index, tile in enumerate(tiles):
+            start = tile_index * tile_stride
+            self.assertEqual(
+                cpu.tile_memory[start:start + len(tile)], bytes(tile),
+                "uploaded atlas tile %d differs from map tileset" % tile_index,
+            )
+        expected_layer = bytearray(640 * 480)
+        for y in range(480):
+            map_y, source_y = divmod(y, dimensions[2])
+            for x in range(map_data["width"]):
+                tile_x, tile_y = map_data["tiles"][map_y][x]
+                tile_index = tile_y * 10 + tile_x
+                tile_start = source_y * dimensions[2]
+                destination = y * 640 + x * dimensions[2]
+                expected_layer[
+                    destination:destination + dimensions[2]
+                ] = bytes(
+                    tiles[tile_index][
+                        tile_start:tile_start + dimensions[2]
+                    ]
+                )
+        self.assertEqual(cpu.gpu_layers[1], expected_layer)
         self.assertTrue(any(pixel > 15 for pixel in tiles[0]))
         self.assertTrue(any(pixel > 15 for pixel in cpu.gpu_layers[1]))
         for index, color in enumerate(palette[1:], start=32):
