@@ -24,7 +24,7 @@ LAYER_LABELS = {
 }
 TILE_SIZE = 64
 MAX_MAP_NAME_LENGTH = 8
-MAX_MAP_DIMENSION = 128
+MAX_MAP_DIMENSION = 1024
 SIDEBAR_WIDTH = 180
 HEADER_HEIGHT = 40
 BUTTON_HEIGHT = 34
@@ -32,6 +32,7 @@ BUTTON_GAP = 6
 MAP_DEFAULT_WIDTH = 10
 MAP_DEFAULT_HEIGHT = 8
 TILE_SIZE_OPTIONS = (64, 32)
+_overview_cache = {}
 
 
 def load_tileset(path: Path = TILESET_PATH, *,
@@ -82,10 +83,10 @@ def new_map(name: str, width: int, height: int,
     name = validate_map_name(name)
     if (not isinstance(width, int) or isinstance(width, bool) or
             not 1 <= width <= MAX_MAP_DIMENSION):
-        raise ValueError("Map width must be between 1 and 128 tiles")
+        raise ValueError("Map width must be between 1 and %d tiles" % MAX_MAP_DIMENSION)
     if (not isinstance(height, int) or isinstance(height, bool) or
             not 1 <= height <= MAX_MAP_DIMENSION):
-        raise ValueError("Map height must be between 1 and 128 tiles")
+        raise ValueError("Map height must be between 1 and %d tiles" % MAX_MAP_DIMENSION)
     return {
         "format_version": 1,
         "name": name,
@@ -110,6 +111,7 @@ def set_map_tile(map_data: dict, x: int, y: int, tile_x: int, tile_y: int,
     if not 0 <= tile_x < tileset_columns or not 0 <= tile_y < tileset_rows:
         raise ValueError("Tile coordinates are outside the tileset")
     map_data["tiles"][y][x] = [tile_x, tile_y]
+    _overview_cache.clear()
 
 
 def set_layer_tile(map_data: dict, layer: str, x: int, y: int,
@@ -131,6 +133,7 @@ def set_layer_tile(map_data: dict, layer: str, x: int, y: int,
     if layer == "objects" and value is not None:
         value = {"tile": value, "hp_change": hp_change, "removal": removal}
     map_data[layer][y][x] = value
+    _overview_cache.clear()
 
 
 def _validate_layers(map_data: dict, width: int, height: int) -> dict:
@@ -187,10 +190,10 @@ def validate_map(map_data: dict, tileset_columns: int,
     height = map_data.get("height")
     if (not isinstance(width, int) or isinstance(width, bool) or
             not 1 <= width <= MAX_MAP_DIMENSION):
-        raise ValueError("Map width must be between 1 and 128 tiles")
+        raise ValueError("Map width must be between 1 and %d tiles" % MAX_MAP_DIMENSION)
     if (not isinstance(height, int) or isinstance(height, bool) or
             not 1 <= height <= MAX_MAP_DIMENSION):
-        raise ValueError("Map height must be between 1 and 128 tiles")
+        raise ValueError("Map height must be between 1 and %d tiles" % MAX_MAP_DIMENSION)
     if map_data.get("tile_size") != TILE_SIZE:
         raise ValueError("Map tile size must be 64 pixels")
     tileset = validate_tileset_filename(
@@ -216,7 +219,7 @@ def validate_map(map_data: dict, tileset_columns: int,
             normalized_row.append([tile_x, tile_y])
         normalized_tiles.append(normalized_row)
 
-    return {
+    normalized = {
         "format_version": 1,
         "name": name,
         "width": width,
@@ -226,6 +229,11 @@ def validate_map(map_data: dict, tileset_columns: int,
         "tiles": normalized_tiles,
         **_validate_layers(map_data, width, height),
     }
+    if "geography" in map_data:
+        if not isinstance(map_data["geography"], dict):
+            raise ValueError("Map geography metadata must be an object")
+        normalized["geography"] = map_data["geography"]
+    return normalized
 
 
 def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
@@ -237,8 +245,11 @@ def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
     normalized = validate_map(map_data, columns, rows)
     maps_dir.mkdir(parents=True, exist_ok=True)
     path = maps_dir / (normalized["name"] + ".json")
-    path.write_text(
-        json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+    large_map = normalized["width"] * normalized["height"] > 128 * 128
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(normalized, handle, indent=None if large_map else 2,
+                  separators=(",", ":") if large_map else None)
+        handle.write("\n")
     return path
 
 
@@ -363,6 +374,43 @@ def _draw_sidebar(window: pygame.Surface, fonts: tuple, tileset: pygame.Surface,
         window.blit(status_text, (8, window.get_height() - footer + 3))
 
 
+def _map_overview(map_data: dict, tileset: pygame.Surface,
+                  objects_tileset: pygame.Surface | None) -> pygame.Surface:
+    if (_overview_cache.get("map") is map_data and
+            _overview_cache.get("tileset") is tileset and
+            _overview_cache.get("objects_tileset") is objects_tileset):
+        return _overview_cache["surface"]
+    overview = pygame.Surface((map_data["width"], map_data["height"]))
+    colors = {}
+    overlay_colors = {}
+    pixels = pygame.PixelArray(overview)
+    for y, row in enumerate(map_data["tiles"]):
+        for x, tile in enumerate(row):
+            coords = tuple(tile)
+            if coords not in colors:
+                colors[coords] = pygame.transform.smoothscale(
+                    tile_surface(tileset, *coords), (1, 1)).get_at((0, 0))
+            color = colors[coords]
+            for layer in ("obstacles", "objects"):
+                cell = map_data[layer][y][x]
+                if cell is not None and objects_tileset is not None:
+                    coords = tuple(cell if layer == "obstacles" else cell["tile"])
+                    if coords not in overlay_colors:
+                        overlay_colors[coords] = pygame.transform.smoothscale(
+                            tile_surface(objects_tileset, *coords), (1, 1)
+                        ).get_at((0, 0))
+                    overlay = overlay_colors[coords]
+                    alpha = overlay.a
+                    color = tuple((overlay[c] * alpha + color[c] * (255 - alpha)) // 255
+                                  for c in range(3))
+            pixels[x, y] = color
+    pixels.close()
+    _overview_cache.clear()
+    _overview_cache.update(map=map_data, tileset=tileset,
+                           objects_tileset=objects_tileset, surface=overview)
+    return overview
+
+
 def _draw_map(window: pygame.Surface, map_data: dict,
               tileset: pygame.Surface, panel: pygame.Rect,
               scroll: list[float], cell_size: float,
@@ -370,6 +418,14 @@ def _draw_map(window: pygame.Surface, map_data: dict,
     previous_clip = window.get_clip()
     window.set_clip(panel)
     window.fill((18, 20, 24), panel)
+    if cell_size < 2:
+        overview = _map_overview(map_data, tileset, objects_tileset)
+        dimensions = (max(1, round(map_data["width"] * cell_size)),
+                      max(1, round(map_data["height"] * cell_size)))
+        window.blit(pygame.transform.scale(overview, dimensions),
+                    (panel.x + round(scroll[0]), panel.y + round(scroll[1])))
+        window.set_clip(previous_clip)
+        return
     first_column = max(0, int(-scroll[0] // cell_size))
     first_row = max(0, int(-scroll[1] // cell_size))
     last_column = min(

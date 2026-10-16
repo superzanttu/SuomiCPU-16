@@ -25,6 +25,59 @@ validate_map = EDITOR["validate_map"]
 
 
 class MapEditorDataTests(unittest.TestCase):
+    def test_1024_square_map_supports_last_cell_on_every_layer(self):
+        data = new_map("BIG", 1024, 1024)
+        set_map_tile(data, 1023, 1023, 0, 4, 10, 6)
+        set_layer_tile(data, "obstacles", 1023, 1023, (0, 0), 7, 7)
+        set_layer_tile(data, "objects", 1023, 1023, (1, 0), 7, 7, 20, "fixed")
+        loaded = validate_map(data, 10, 6)
+        self.assertEqual((loaded["width"], loaded["height"]), (1024, 1024))
+        self.assertEqual(loaded["tiles"][1023][1023], [0, 4])
+        self.assertEqual(loaded["obstacles"][1023][1023], [0, 0])
+        self.assertEqual(loaded["objects"][1023][1023]["hp_change"], 20)
+        self.assertEqual(loaded["tiles"][0][0], [0, 0])
+
+    def test_1024_dimensions_round_trip_and_1025_is_rejected(self):
+        for width, height in ((1024, 1), (1, 1024)):
+            with self.subTest(width=width, height=height):
+                data = new_map("EDGE", width, height)
+                with tempfile.TemporaryDirectory() as directory:
+                    self.assertEqual(load_map(save_map(data, Path(directory))), data)
+        for width, height in ((1025, 1), (1, 1025), (True, 1), (1, True)):
+            with self.subTest(width=width, height=height), self.assertRaises(ValueError):
+                new_map("BAD", width, height)
+        for dimension in ("width", "height"):
+            data = new_map("BAD", 1, 1)
+            data[dimension] = 1025
+            with self.assertRaises(ValueError):
+                validate_map(data, 10, 6)
+
+    def test_overview_is_cached_and_updates_after_editing_any_layer(self):
+        data = new_map("SMALL", 8, 8)
+        terrain = pygame.Surface((128, 64))
+        terrain.fill((20, 180, 60), (0, 0, 64, 64))
+        terrain.fill((20, 90, 180), (64, 0, 64, 64))
+        objects = pygame.Surface((64, 64), pygame.SRCALPHA)
+        objects.fill((250, 10, 10))
+        overview = EDITOR["_map_overview"](data, terrain, objects)
+        self.assertIs(EDITOR["_map_overview"](data, terrain, objects), overview)
+        set_map_tile(data, 7, 7, 1, 0, 2, 1)
+        updated = EDITOR["_map_overview"](data, terrain, objects)
+        self.assertIsNot(updated, overview)
+        self.assertEqual(tuple(updated.get_at((7, 7)))[:3], (20, 90, 180))
+        set_layer_tile(data, "objects", 7, 7, (0, 0), 1, 1)
+        updated = EDITOR["_map_overview"](data, terrain, objects)
+        self.assertEqual(tuple(updated.get_at((7, 7)))[:3], (250, 10, 10))
+        set_layer_tile(data, "objects", 7, 7, None, 1, 1)
+        updated = EDITOR["_map_overview"](data, terrain, objects)
+        self.assertEqual(tuple(updated.get_at((7, 7)))[:3], (20, 90, 180))
+        window = pygame.Surface((20, 20))
+        clip = window.get_clip()
+        EDITOR["_draw_map"](window, data, terrain, pygame.Rect(4, 4, 8, 8),
+                            [0, 0], 0.5, objects)
+        self.assertEqual(window.get_clip(), clip)
+        self.assertNotEqual(window.get_at((4, 4)), window.get_at((0, 0)))
+
     def test_layer_shortcuts_paint_the_selected_layer_without_changing_zoom(self):
         buttons = EDITOR["_button_rects"]()
         cell_position = (180 + 2 * 64 + 32, 40 + 2 * 64 + 32)
@@ -182,7 +235,7 @@ class MapEditorDataTests(unittest.TestCase):
         set_map_tile(map_data, 1, 2, 5, 3, 10, 4)
         with tempfile.TemporaryDirectory() as directory:
             path = save_map(map_data, Path(directory))
-            loaded = load_map(path, 10, 4)
+            loaded = load_map(path, 10, 6)
 
         self.assertEqual(path.name, "ARENA.json")
         self.assertEqual(loaded, map_data)

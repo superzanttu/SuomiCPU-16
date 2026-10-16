@@ -31,6 +31,20 @@ CGFX_FIELDS:
     STW R7, R3
     RET
 
+CGFX_WIDE_FIELDS:
+    CALLX CGFX_BASE
+    LDI R6, 24
+    ADD R7, R6
+    LDI R6, 2
+    STW R7, R0
+    ADD R7, R6
+    STW R7, R1
+    ADD R7, R6
+    STW R7, R2
+    ADD R7, R6
+    STW R7, R3
+    RET
+
 CGFX_COLOR:
     CALLX CGFX_BASE
     INC R7
@@ -512,6 +526,27 @@ gfx_tilemap:
     CALLX CGFX_GO
     RET
 
+gfx_tilemap_wide:
+    LDWS R0, 14
+    LDWS R1, 18
+    LDWS R2, 8
+    LDWS R3, 10
+    CALLX CGFX_FIELDS
+    LDWS R0, 12
+    LDWS R1, 16
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_WIDE_FIELDS
+    LDWS R4, 4
+    MOVSP R7
+    LDI R6, 6
+    ADD R7, R6
+    LDW R5, R7
+    CALLX CGFX_SRC
+    LDI R5, 38
+    CALLX CGFX_GO
+    RET
+
 ; gfx_tile_camera(cam_x, cam_y): update the tile engine camera registers.
 gfx_tile_camera:
     LDWS R0, 4
@@ -520,6 +555,21 @@ gfx_tile_camera:
     LDI R3, 0
     CALLX CGFX_FIELDS
     LDI R5, 26
+    CALLX CGFX_GO
+    RET
+
+gfx_tile_camera_wide:
+    LDWS R0, 6
+    LDWS R1, 10
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R0, 4
+    LDWS R1, 8
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_WIDE_FIELDS
+    LDI R5, 36
     CALLX CGFX_GO
     RET
 
@@ -533,6 +583,21 @@ gfx_split_camera:
     CALLX CGFX_GO
     RET
 
+gfx_split_camera_wide:
+    LDWS R0, 6
+    LDWS R1, 10
+    LDWS R2, 14
+    LDWS R3, 18
+    CALLX CGFX_FIELDS
+    LDWS R0, 4
+    LDWS R1, 8
+    LDWS R2, 12
+    LDWS R3, 16
+    CALLX CGFX_WIDE_FIELDS
+    LDI R5, 37
+    CALLX CGFX_GO
+    RET
+
 gfx_world_tile:
     LDWS R0, 6
     LDWS R1, 8
@@ -542,6 +607,23 @@ gfx_world_tile:
     LDWS R4, 4
     CALLX CGFX_COLOR
     LDI R5, 30
+    CALLX CGFX_GO
+    RET
+
+gfx_world_tile_wide:
+    LDWS R0, 8
+    LDWS R1, 12
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R0, 6
+    LDWS R1, 10
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_WIDE_FIELDS
+    LDWS R4, 4
+    CALLX CGFX_COLOR
+    LDI R5, 39
     CALLX CGFX_GO
     RET
 
@@ -561,6 +643,27 @@ gfx_mask_overlap:
     LDW R0, R7
     RET
 
+gfx_mask_overlap_wide:
+    LDWS R0, 8
+    LDWS R1, 12
+    LDWS R2, 18
+    LDWS R3, 22
+    CALLX CGFX_FIELDS
+    LDWS R0, 6
+    LDWS R1, 10
+    LDWS R2, 16
+    LDWS R3, 20
+    CALLX CGFX_WIDE_FIELDS
+    LDWS R4, 4
+    LDWS R5, 14
+    CALLX CGFX_SRC
+    LDI R5, 45
+    CALLX CGFX_GO
+    LDI R6, 14
+    ADD R7, R6
+    LDW R0, R7
+    RET
+
 gfx_world_ammo:
     LDWS R0, 4
     LDWS R1, 6
@@ -568,6 +671,21 @@ gfx_world_ammo:
     LDI R3, 0
     CALLX CGFX_FIELDS
     LDI R5, 32
+    CALLX CGFX_GO
+    RET
+
+gfx_world_ammo_wide:
+    LDWS R0, 6
+    LDWS R1, 10
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R0, 4
+    LDWS R1, 8
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_WIDE_FIELDS
+    LDI R5, 40
     CALLX CGFX_GO
     RET
 
@@ -583,6 +701,23 @@ gfx_world_rect:
     CALLX CGFX_GO
     RET
 
+gfx_world_rect_wide:
+    LDWS R0, 6
+    LDWS R1, 10
+    LDWS R2, 12
+    LDWS R3, 14
+    CALLX CGFX_FIELDS
+    LDWS R0, 4
+    LDWS R1, 8
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_WIDE_FIELDS
+    LDWS R4, 16
+    CALLX CGFX_COLOR
+    LDI R5, 41
+    CALLX CGFX_GO
+    RET
+
 gfx_world_particle:
     LDWS R0, 4
     LDWS R1, 6
@@ -592,6 +727,23 @@ gfx_world_particle:
     LDWS R4, 10
     CALLX CGFX_COLOR
     LDI R5, 35
+    CALLX CGFX_GO
+    RET
+
+gfx_world_particle_wide:
+    LDWS R0, 6
+    LDWS R1, 10
+    LDWS R2, 12
+    LDWS R3, 16
+    CALLX CGFX_FIELDS
+    LDWS R0, 4
+    LDWS R1, 8
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_WIDE_FIELDS
+    LDWS R4, 14
+    CALLX CGFX_COLOR
+    LDI R5, 42
     CALLX CGFX_GO
     RET
 
@@ -605,6 +757,39 @@ gfx_world_emitters:
     LDWS R5, 6
     CALLX CGFX_SRC
     LDI R5, 34
+    CALLX CGFX_GO
+    RET
+
+gfx_world_emitters_wide:
+    LDWS R0, 8
+    LDWS R1, 10
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R4, 4
+    MOVSP R7
+    LDI R6, 6
+    ADD R7, R6
+    LDW R5, R7
+    CALLX CGFX_SRC
+    LDI R5, 43
+    CALLX CGFX_GO
+    RET
+
+gfx_sprite_move_wide:
+    LDWS R0, 8
+    LDWS R1, 12
+    LDWS R2, 14
+    LDI R3, 0
+    CALLX CGFX_FIELDS
+    LDWS R0, 6
+    LDWS R1, 10
+    LDI R2, 0
+    LDI R3, 0
+    CALLX CGFX_WIDE_FIELDS
+    LDWS R4, 4
+    CALLX CGFX_COLOR
+    LDI R5, 44
     CALLX CGFX_GO
     RET
 

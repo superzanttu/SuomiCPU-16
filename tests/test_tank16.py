@@ -277,8 +277,9 @@ class Tank16Tests(unittest.TestCase):
             "  for (i = 0; i < 1024; i++) sprite_work[i] = 0;\n"
             "  sprite_work[528] = 1;\n"
             "  gfx_sprite_upload(8, 32, 32, sprite_work);\n"
-            "  for (i = 0; i < 1024; i++) terrain_tiles[40][i] = 0;\n"
-            "  terrain_tiles[40][528] = 1; gfx_tile_upload(40, terrain_tiles[40]);\n"
+            "  for (i = 0; i < 1024; i++) terrain_tiles[MAP_TERRAIN_TILE_COUNT][i] = 0;\n"
+            "  terrain_tiles[MAP_TERRAIN_TILE_COUNT][528] = 1;\n"
+            "  gfx_tile_upload(MAP_TERRAIN_TILE_COUNT, terrain_tiles[MAP_TERRAIN_TILE_COUNT]);\n"
             "  tanks[0].x = 47; tanks[0].y = 48;\n"
             "  tanks[1].x = 240; tanks[1].y = 180;\n"
             "  update_objects(); results[0] = tanks[0].health;\n"
@@ -438,13 +439,14 @@ class Tank16Tests(unittest.TestCase):
                         return_value=size):
                     _, tiles, palette, dimensions = load_map_assets(path)
                 self.assertEqual(dimensions[2], size)
-                self.assertEqual(len(tiles), 41)
-                self.assertEqual(len(tiles[40]), size * size)
+                object_tile_id = dimensions[0] * dimensions[1]
+                self.assertEqual(len(tiles), object_tile_id + 1)
+                self.assertEqual(len(tiles[object_tile_id]), size * size)
                 expected = pygame.transform.smoothscale(source_tile, (size, size))
                 for y in range(size):
                     for x in range(size):
                         color = expected.get_at((x, y))
-                        pixel = tiles[40][y * size + x]
+                        pixel = tiles[object_tile_id][y * size + x]
                         if color.a < 128:
                             self.assertEqual(pixel, 0)
                         else:
@@ -472,7 +474,7 @@ class Tank16Tests(unittest.TestCase):
                 "tools.tank16_map_loader.map_tile_pixel_size", return_value=64):
             path = editor["save_map"](data, Path(directory))
             header = build_map_header(path)
-            _, tiles, _, _ = load_map_assets(path)
+            _, tiles, _, dimensions = load_map_assets(path)
         game_source = self.game_source(source_path).replace(
             '#include "map_assets.h"', header, 1
         )
@@ -553,7 +555,7 @@ class Tank16Tests(unittest.TestCase):
             75, 0, 18, 75, 100, 0, 0, 90, 1, 80, 0,
             1, 0, 1, 0, 0, 5, 5, 0, 100, 100, 0,
         ])
-        obstacle_tile = tiles[40]
+        obstacle_tile = tiles[dimensions[0] * dimensions[1]]
         for y in range(64):
             for x in range(64):
                 value = obstacle_tile[y * 64 + x]
@@ -767,6 +769,108 @@ class Tank16Tests(unittest.TestCase):
             self.assertEqual(tuple(cpu.palette[index])[:3], color)
         self.assertEqual(tuple(cpu.palette[2])[:3], (255, 48, 48))
         self.assertEqual(tuple(cpu.palette[3])[:3], (48, 220, 64))
+
+    def test_maximum_map_renders_and_collides_beyond_signed_word_range(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        map_header = (
+            "#define MAP_COLUMNS 1024\n"
+            "#define MAP_ROWS 1024\n"
+            "#define MAP_CELLS (MAP_COLUMNS * MAP_ROWS)\n"
+            "#define TILE_COUNT 2\n"
+            "#define TILE_PIXEL_COUNT 4096\n"
+            "#define MAP_PALETTE_COUNT 1\n"
+            "#define MAP_PALETTE_BASE 32\n"
+            "#define MAP_OBJECT_COUNT 0\n"
+            "#define MAP_OBJECT_CAPACITY 1\n"
+            "#define OBJECT_FIXED 0\n"
+            "#define OBJECT_EXPLOSION 1\n"
+            "#define OBJECT_DISAPPEAR 2\n"
+            "unsigned char map_palette[MAP_PALETTE_COUNT][3];\n"
+            "unsigned char terrain_tiles[TILE_COUNT][TILE_PIXEL_COUNT];\n"
+            "void upload_terrain_tiles(void) {\n"
+            "  gfx_tile_upload(0, terrain_tiles[0]);\n"
+            "  gfx_tile_upload(1, terrain_tiles[1]);\n"
+            "}\n"
+            + "".join(
+                f"unsigned char map_data_{page}[32768];\n"
+                for page in range(32)
+            )
+            + "#define map_data map_data_0\n"
+            + "".join(
+                f"unsigned char map_obstacles_{page}[32768];\n"
+                for page in range(32)
+            )
+            + "int map_object_x[MAP_OBJECT_CAPACITY];\n"
+            "int map_object_y[MAP_OBJECT_CAPACITY];\n"
+            "int map_object_tile[MAP_OBJECT_CAPACITY];\n"
+            "int map_object_hp[MAP_OBJECT_CAPACITY];\n"
+            "int map_object_removal[MAP_OBJECT_CAPACITY];\n"
+        )
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', map_header, 1
+        )
+        test_source = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480); gfx_tile_size(64);\n"
+            "  for (i = 0; i < 4096; i++) {\n"
+            "    terrain_tiles[0][i] = 3; terrain_tiles[1][i] = 1;\n"
+            "  }\n"
+            "  upload_terrain_tiles();\n"
+            "  map_obstacles_2[0] = 1;\n"
+            "  map_obstacles_31[32767] = 1;\n"
+            "  results[0] = map_obstacle_at(64, 0);\n"
+            "  results[1] = map_obstacle_at(1023, 1023);\n"
+            "  tanks[0].health = 100; tanks[0].direction = 8;\n"
+            "  results[2] = blocked(32, 4128, 0);\n"
+            "  results[3] = blocked(65504, 65504, 0);\n"
+            "  results[4] = blocked(65400, 65000, 0);\n"
+            "  start_round();\n"
+            "  tanks[0].x = 65504; tanks[0].y = 65504;\n"
+            "  tanks[1].x = 64000; tanks[1].y = 64000;\n"
+            "  gfx_layer_select(LAYER_TILES);\n"
+            "  gfx_tilemap(map_data, MAP_COLUMNS, MAP_ROWS, 0, 0);\n"
+            "  draw_game(); gfx_present(); return 0;\n"
+            "}\n"
+        )
+        image = compile_source(
+            "long results[8];\nint main(void);\n" +
+            game_source + test_source,
+            str(source_path),
+        )
+        cpu = make_cpu(image)
+        steps = 0
+        for _ in range(40):
+            if not cpu.running:
+                break
+            cpu.frame_yield = False
+            cpu.frames = (getattr(cpu, "frames", 0) + 1) & 0xFFFF
+            cpu.update_rtc()
+            frame_steps = 0
+            while cpu.running and not cpu.frame_yield and frame_steps < 400_000:
+                cpu.step()
+                frame_steps += 1
+            steps += frame_steps
+        self.assertFalse(cpu.running, "Maximum-map startup exceeded 40 frames")
+        results = [
+            cpu.read_32(GLOBAL_BASE + index * 4)
+            for index in range(8)
+        ]
+        results = [
+            value - 0x100000000 if value & 0x80000000 else value
+            for value in results
+        ]
+        self.assertEqual(
+            results[:5], [1, 1, 1, 1, 0],
+        )
+        self.assertEqual((cpu.tilemap_width, cpu.tilemap_height), (1024, 1024))
+        self.assertEqual(
+            cpu.split_cameras, ((65216, 65056), (63840, 63760))
+        )
+        self.assertEqual(cpu.sprites[40]["x"], 65488)
+        self.assertEqual(cpu.sprites[40]["y"], 65488)
+        self.assertEqual(layer_pixel(cpu, 1, 0, 0), 3)
+        self.assertEqual(layer_pixel(cpu, 3, 256, 416), 1)
 
     def test_tank_speed_and_sprite_heading_match_all_directions(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"

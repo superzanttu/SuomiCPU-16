@@ -175,6 +175,22 @@ def build_map_header(map_path: Path) -> str:
             for start in range(0, len(values), width)
         )
 
+    if len(map_values) <= 32768:
+        map_data_header = (
+            "unsigned char map_data[MAP_CELLS] = {\n%s\n};\n"
+            % format_array(map_values, 16)
+        )
+    else:
+        map_page_size = 32768
+        map_data_header = ""
+        for page, start in enumerate(range(0, len(map_values), map_page_size)):
+            values = map_values[start:start + map_page_size]
+            map_data_header += (
+                "unsigned char map_data_%d[%d] = {\n%s\n};\n"
+                % (page, len(values), format_array(values, 16))
+            )
+        map_data_header += "#define map_data map_data_0\n"
+
     tile_arrays = ",\n".join(
         "    {" + format_array(values, 16).replace("\n", "\n     ") + "}"
         for values in tile_data
@@ -203,8 +219,26 @@ def build_map_header(map_path: Path) -> str:
         "#define OBJECT_FIXED 0\n"
         "#define OBJECT_EXPLOSION 1\n"
         "#define OBJECT_DISAPPEAR 2\n"
-        "unsigned char map_obstacles[MAP_CELLS] = {\n%s\n};\n"
-    ) % (len(objects), max(1, len(objects)), format_array(obstacle_tiles, 16))
+    ) % (len(objects), max(1, len(objects)))
+    if len(obstacle_tiles) <= 32768:
+        layer_header += (
+            "unsigned char map_obstacles[MAP_CELLS] = {\n%s\n};\n"
+            % format_array(obstacle_tiles, 16)
+        )
+    elif not any(obstacle_tiles):
+        layer_header += "#define MAP_OBSTACLES_EMPTY 1\n"
+    else:
+        page_rows = 32
+        page_capacity = page_rows * map_data["width"]
+        page_count = (map_data["height"] + page_rows - 1) // page_rows
+        for page in range(page_count):
+            start = page * page_capacity
+            end = min(start + page_capacity, len(obstacle_tiles))
+            layer_header += (
+                "unsigned char map_obstacles_%d[%d] = {\n%s\n};\n"
+                % (page, page_capacity,
+                   format_array(obstacle_tiles[start:end], 16))
+            )
     fields = {
         "x": [x for x, _, _ in objects],
         "y": [y for _, y, _ in objects],
@@ -222,6 +256,7 @@ def build_map_header(map_path: Path) -> str:
         "#define MAP_COLUMNS %d\n"
         "#define MAP_ROWS %d\n"
         "#define MAP_CELLS (MAP_COLUMNS * MAP_ROWS)\n"
+        "#define MAP_TERRAIN_TILE_COUNT %d\n"
         "#define TILE_COUNT %d\n"
         "#define TILE_PIXEL_COUNT %d\n"
         "#define MAP_PALETTE_COUNT %d\n"
@@ -236,19 +271,17 @@ def build_map_header(map_path: Path) -> str:
         "void upload_terrain_tiles(void) {\n"
         "%s\n"
         "}\n"
-        "unsigned char map_data[MAP_CELLS] = {\n"
-        "%s\n"
-        "};\n"
+        "%s"
         "%s"
     ) % (
-        map_data["width"], map_data["height"], len(tile_data),
+        map_data["width"], map_data["height"], terrain_count, len(tile_data),
         tile_size * tile_size, len(palette), RUNTIME_PALETTE_BASE,
         map_data["tileset"],
         ",\n".join(
             "    {%s}" % ", ".join(str(channel) for channel in color)
             for color in palette
         ),
-        tile_arrays, upload_tiles, format_array(map_values, 16), layer_header,
+        tile_arrays, upload_tiles, map_data_header, layer_header,
     )
 
 

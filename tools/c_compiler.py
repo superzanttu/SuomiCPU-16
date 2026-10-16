@@ -24,7 +24,7 @@ FLOAT_TYPES = frozenset({"float", "double", "long double"})
 ARITHMETIC_TYPES = INTEGER_TYPES | FLOAT_TYPES
 CODE_BASE = 0x4800
 GLOBAL_BASE = 0x80000
-GLOBAL_LIMIT = 0x100000
+GLOBAL_LIMIT = 0x1000000
 STACK_OFFSET_LIMIT = 0xFF
 FRAME_SIZE_LIMIT = 0xFF
 SCREEN_LIBRARY_FUNCTIONS = {
@@ -65,16 +65,30 @@ GRAPHICS_LIBRARY_FUNCTIONS = {
     "gfx_tilemap": ("void", ("unsigned char*", "int", "int", "int", "int")),
     "gfx_tile_camera": ("void", ("int", "int")),
     "gfx_split_camera": ("void", ("int", "int", "int", "int")),
+    "gfx_tilemap_wide": ("void", ("unsigned char*", "int", "int", "long", "long")),
+    "gfx_tile_camera_wide": ("void", ("long", "long")),
+    "gfx_split_camera_wide": ("void", ("long", "long", "long", "long")),
     "gfx_world_tile": ("void", ("int", "int", "int")),
+    "gfx_world_tile_wide": ("void", ("int", "long", "long")),
     "gfx_mask_overlap": ("int", ("int", "int", "int", "int", "int", "int")),
+    "gfx_mask_overlap_wide": ("int", (
+        "int", "long", "long", "int", "long", "long",
+    )),
     "gfx_world_ammo": ("void", ("int", "int")),
+    "gfx_world_ammo_wide": ("void", ("long", "long")),
     "gfx_world_rect": ("void", ("int", "int", "int", "int", "int")),
+    "gfx_world_rect_wide": ("void", ("long", "long", "int", "int", "int")),
     "gfx_world_particle": ("void", ("int", "int", "int", "int", "int")),
+    "gfx_world_particle_wide": ("void", (
+        "long", "long", "int", "int", "int",
+    )),
     "gfx_world_emitters": ("void", ("void*", "int", "int")),
+    "gfx_world_emitters_wide": ("void", ("void*", "int", "int")),
     "gfx_tile_upload": ("void", ("int", "unsigned char*")),
     "gfx_tile_size": ("void", ("int",)),
     "gfx_sprite_upload": ("void", ("int", "int", "int", "unsigned char*")),
     "gfx_sprite_move": ("void", ("int", "int", "int", "int")),
+    "gfx_sprite_move_wide": ("void", ("int", "long", "long", "int")),
     "gfx_palette": ("void", (
         "unsigned char", "unsigned char", "unsigned char", "unsigned char",
     )),
@@ -1875,7 +1889,7 @@ class _CodeGenerator:
             static_data_end += sum(len(data) for _, data in self.string_data)
         if static_data_end > GLOBAL_LIMIT:
             raise CCompilerError(
-                f"{self.filename}: static data exceeds the 512 KiB C data region"
+                f"{self.filename}: static data exceeds the 16 MiB C data region"
             )
         self.emit(".address 0")
         self.emit("__c_entry:")
@@ -1932,7 +1946,7 @@ class _CodeGenerator:
             address += self._global_size(global_)
         if address > GLOBAL_LIMIT:
             raise CCompilerError(
-                f"{self.filename}: global variables exceed the 512 KiB C data region"
+                f"{self.filename}: global variables exceed the 16 MiB C data region"
             )
 
     def _collect_string_literals(self) -> None:

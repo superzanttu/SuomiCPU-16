@@ -139,11 +139,16 @@ GPU_TILE_SIZE = 28
 GPU_WORLD_TILE = 30
 GPU_MASK_OVERLAP, GPU_WORLD_AMMO = 31, 32
 GPU_WORLD_RECT, GPU_WORLD_EMITTERS, GPU_WORLD_PARTICLE = 33, 34, 35
+GPU_TILE_CAMERA_WIDE, GPU_SPLIT_CAMERA_WIDE, GPU_TILEMAP_WIDE = 36, 37, 38
+GPU_WORLD_TILE_WIDE, GPU_WORLD_AMMO_WIDE = 39, 40
+GPU_WORLD_RECT_WIDE, GPU_WORLD_PARTICLE_WIDE = 41, 42
+GPU_WORLD_EMITTERS_WIDE, GPU_SPRITE_MOVE_WIDE = 43, 44
+GPU_MASK_OVERLAP_WIDE = 45
 GPU_SPRITE_SLOTS = 64
 GPU_SPRITE_MAX_SIZE = 64
 GPU_TILE_COUNT = 256
 GPU_TILE_MAX_SIZE = 64
-GPU_TILEMAP_MAX_SIZE = 128
+GPU_TILEMAP_MAX_SIZE = 1024
 GPU3D_FILL, GPU3D_WIREFRAME = 1, 2
 GPU3D_OK, GPU3D_ERROR_SCENE, GPU3D_ERROR_FACE = 0, 1, 2
 GPU3D_MAX_VERTICES = 128
@@ -792,6 +797,65 @@ class SuomiCompute16:
             self._gpu_world_disc(x, y, w, color, h, layer)
         elif command == GPU_WORLD_EMITTERS:
             self._gpu_world_emitters(self._gpu_source(), x, y, layer)
+        elif command == GPU_TILE_CAMERA_WIDE:
+            self.tile_camera = (
+                self._gpu_wide_field(2, 24), self._gpu_wide_field(4, 26))
+            self.split_cameras = None
+            self._sprite_layer_dirty = True
+            self._tile_layer_dirty = True
+        elif command == GPU_SPLIT_CAMERA_WIDE:
+            self.split_cameras = tuple(
+                (self._gpu_wide_field(low, high),
+                 self._gpu_wide_field(low + 2, high + 2))
+                for low, high in ((2, 24), (6, 28))
+            )
+            self._tile_layer_dirty = True
+            self._sprite_layer_dirty = True
+        elif command == GPU_TILEMAP_WIDE:
+            self._gpu_tilemap(
+                self._gpu_wide_field(2, 24),
+                self._gpu_wide_field(4, 26), w, h, self._gpu_source())
+        elif command == GPU_WORLD_TILE_WIDE:
+            self._gpu_world_tile(
+                color, self._gpu_wide_field(2, 24),
+                self._gpu_wide_field(4, 26), layer)
+        elif command == GPU_WORLD_AMMO_WIDE:
+            self._gpu_world_ammo(
+                self._gpu_wide_field(2, 24),
+                self._gpu_wide_field(4, 26), layer)
+        elif command == GPU_WORLD_RECT_WIDE:
+            self._gpu_world_rect(
+                self._gpu_wide_field(2, 24),
+                self._gpu_wide_field(4, 26), w, h, color, layer)
+        elif command == GPU_WORLD_PARTICLE_WIDE:
+            if not 0 <= w <= 32 or not 0 <= h <= 16:
+                raise ValueError("World particle radius/opacity outside supported range")
+            self._gpu_world_disc(
+                self._gpu_wide_field(2, 24),
+                self._gpu_wide_field(4, 26), w, color, h, layer)
+        elif command == GPU_WORLD_EMITTERS_WIDE:
+            self._gpu_world_emitters(
+                self._gpu_source(), x, y, layer, wide=True)
+        elif command == GPU_SPRITE_MOVE_WIDE:
+            if color < GPU_SPRITE_SLOTS:
+                self.sprites[color] = {
+                    "x": self._gpu_wide_field(2, 24),
+                    "y": self._gpu_wide_field(4, 26), "flags": w & 7}
+                self._sprite_layer_dirty = True
+        elif command == GPU_MASK_OVERLAP_WIDE:
+            first = self._gpu_collision_mask(self._gpu_word(10, False))
+            second = self._gpu_collision_mask(self._gpu_word(12, False))
+            self._gpu_result(self._gpu_masks_overlap(
+                first, self._gpu_wide_field(2, 24),
+                self._gpu_wide_field(4, 26), second,
+                self._gpu_wide_field(6, 28),
+                self._gpu_wide_field(8, 30)))
+
+    def _gpu_wide_field(self, low_offset, high_offset):
+        value = (
+            self._gpu_word(high_offset, False) << 16
+        ) | self._gpu_word(low_offset, False)
+        return value - 0x100000000 if value & 0x80000000 else value
 
     def _gpu_world_views(self, x, y, width, height, layer):
         if layer == 0:
@@ -840,8 +904,9 @@ class SuomiCompute16:
                     if dither[(row & 3) * 4 + (column & 3)] < coverage:
                         target[(row + dy) * stride + column + dx] = color
 
-    def _gpu_world_emitters(self, source, count, tick, layer):
-        if count < 0 or source + count * 8 > len(self.memory):
+    def _gpu_world_emitters(self, source, count, tick, layer, wide=False):
+        record_size = 12 if wide else 8
+        if count < 0 or source + count * record_size > len(self.memory):
             raise ValueError("World emitter buffer outside guest memory")
         if layer == 0:
             raise ValueError("World emitters require an unpacked graphics layer")
@@ -849,10 +914,19 @@ class SuomiCompute16:
         drawn_sites = set()
         smoke_cells = set()
         for index in range(count):
-            address = source + index * 8
-            x, y, life, mask = (
-                self._gpu3d_signed_word(self.memory, address + offset)
-                for offset in (0, 2, 4, 6))
+            address = source + index * record_size
+            if wide:
+                x = self.read_32(address)
+                y = self.read_32(address + 4)
+                x = x - 0x100000000 if x & 0x80000000 else x
+                y = y - 0x100000000 if y & 0x80000000 else y
+                life, mask = (
+                    self._gpu3d_signed_word(self.memory, address + offset)
+                    for offset in (8, 10))
+            else:
+                x, y, life, mask = (
+                    self._gpu3d_signed_word(self.memory, address + offset)
+                    for offset in (0, 2, 4, 6))
             if life <= 0:
                 continue
             if not any(self._gpu_world_views(x - 24, y - 56, 48, 80, layer)):

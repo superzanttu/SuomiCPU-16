@@ -38,10 +38,39 @@
 #define PARTICLE_FLAME 2
 #define PARTICLE_DEBRIS 3
 
+#if MAP_COLUMNS * MAP_TILE_PIXEL_SIZE <= 32767 && MAP_ROWS * MAP_TILE_PIXEL_SIZE <= 32767
+#define world_tile(tile, x, y) gfx_world_tile(tile, (int)(x), (int)(y))
+#define world_rect(x, y, width, height, color) gfx_world_rect((int)(x), (int)(y), width, height, color)
+#define world_particle(x, y, radius, color, opacity) gfx_world_particle((int)(x), (int)(y), radius, color, opacity)
+#define world_ammo(x, y) gfx_world_ammo((int)(x), (int)(y))
+#else
+#define world_tile(tile, x, y) gfx_world_tile_wide(tile, x, y)
+#define world_rect(x, y, width, height, color) gfx_world_rect_wide(x, y, width, height, color)
+#define world_particle(x, y, radius, color, opacity) gfx_world_particle_wide(x, y, radius, color, opacity)
+#define world_ammo(x, y) gfx_world_ammo_wide(x, y)
+#endif
+
+#if MAP_COLUMNS * MAP_TILE_PIXEL_SIZE <= 32767 && MAP_ROWS * MAP_TILE_PIXEL_SIZE <= 32767
+typedef int WorldCoord;
+#define world_emitters(sites, count, tick) gfx_world_emitters(sites, count, tick)
+#else
+typedef long WorldCoord;
+#define world_emitters(sites, count, tick) gfx_world_emitters_wide(sites, count, tick)
+#endif
+
+#if MAP_COLUMNS * MAP_TILE_PIXEL_SIZE <= 32767 && MAP_ROWS * MAP_TILE_PIXEL_SIZE <= 32767
+#define mask_overlap_world(first, x, y, second, second_x, second_y) \
+    gfx_mask_overlap(first, (int)(x), (int)(y), second, \
+                     (int)(second_x), (int)(second_y))
+#else
+#define mask_overlap_world(first, x, y, second, second_x, second_y) \
+    gfx_mask_overlap_wide(first, x, y, second, second_x, second_y)
+#endif
+
 typedef struct
 {
-    int x;
-    int y;
+    WorldCoord x;
+    WorldCoord y;
     int direction;
     int health;
     int cooldown;
@@ -59,8 +88,8 @@ typedef struct
 
 typedef struct
 {
-    int x;
-    int y;
+    WorldCoord x;
+    WorldCoord y;
     int owner;
     int direction;
     int life;
@@ -70,8 +99,8 @@ typedef struct
 
 typedef struct
 {
-    int x;
-    int y;
+    WorldCoord x;
+    WorldCoord y;
     int velocity_x;
     int velocity_y;
     int life;
@@ -84,8 +113,8 @@ typedef struct
 
 typedef struct
 {
-    int x;
-    int y;
+    WorldCoord x;
+    WorldCoord y;
     int rounds;
     int mask;
 } BurnSite;
@@ -105,8 +134,8 @@ unsigned char sprite_work[TANK_SPRITE_PIXEL_COUNT];
 unsigned char object_active[MAP_OBJECT_CAPACITY];
 unsigned char object_contacts[MAP_OBJECT_CAPACITY];
 unsigned char object_explosion[MAP_OBJECT_CAPACITY];
-int track_x[MAX_TRACK_MARKS];
-int track_y[MAX_TRACK_MARKS];
+WorldCoord track_x[MAX_TRACK_MARKS];
+WorldCoord track_y[MAX_TRACK_MARKS];
 int track_direction[MAX_TRACK_MARKS];
 int track_offset_x[MAX_TRACK_MARKS];
 int track_offset_y[MAX_TRACK_MARKS];
@@ -123,10 +152,10 @@ int previous_keys;
 int tank_sprite_slots[2];
 int hit_flash[2];
 int muzzle_flash[2];
-int muzzle_x[2];
-int muzzle_y[2];
-int impact_x[MAX_IMPACTS];
-int impact_y[MAX_IMPACTS];
+WorldCoord muzzle_x[2];
+WorldCoord muzzle_y[2];
+WorldCoord impact_x[MAX_IMPACTS];
+WorldCoord impact_y[MAX_IMPACTS];
 int impact_life[MAX_IMPACTS];
 int impact_size[MAX_IMPACTS];
 int next_impact;
@@ -137,6 +166,118 @@ int directions_x[TANK_ROTATION_COUNT] = {
 int directions_y[TANK_ROTATION_COUNT] = {
     -1000, -981, -924, -831, -707, -556, -383, -195, 0, 195, 383, 556, 707, 831, 924, 981,
     1000, 981, 924, 831, 707, 556, 383, 195, 0, -195, -383, -556, -707, -831, -924, -981};
+
+int map_obstacle_at(int row, int column)
+{
+    if (row < 0 || row >= MAP_ROWS ||
+        column < 0 || column >= MAP_COLUMNS)
+        return 0;
+#ifdef MAP_OBSTACLES_EMPTY
+    return 0;
+#else
+#if MAP_CELLS <= 32768
+    return map_obstacles[row * MAP_COLUMNS + column];
+#else
+#if MAP_ROWS > 0
+    if (row < 32) return map_obstacles_0[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 32
+    if (row < 64) return map_obstacles_1[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 64
+    if (row < 96) return map_obstacles_2[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 96
+    if (row < 128) return map_obstacles_3[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 128
+    if (row < 160) return map_obstacles_4[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 160
+    if (row < 192) return map_obstacles_5[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 192
+    if (row < 224) return map_obstacles_6[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 224
+    if (row < 256) return map_obstacles_7[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 256
+    if (row < 288) return map_obstacles_8[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 288
+    if (row < 320) return map_obstacles_9[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 320
+    if (row < 352) return map_obstacles_10[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 352
+    if (row < 384) return map_obstacles_11[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 384
+    if (row < 416) return map_obstacles_12[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 416
+    if (row < 448) return map_obstacles_13[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 448
+    if (row < 480) return map_obstacles_14[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 480
+    if (row < 512) return map_obstacles_15[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 512
+    if (row < 544) return map_obstacles_16[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 544
+    if (row < 576) return map_obstacles_17[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 576
+    if (row < 608) return map_obstacles_18[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 608
+    if (row < 640) return map_obstacles_19[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 640
+    if (row < 672) return map_obstacles_20[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 672
+    if (row < 704) return map_obstacles_21[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 704
+    if (row < 736) return map_obstacles_22[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 736
+    if (row < 768) return map_obstacles_23[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 768
+    if (row < 800) return map_obstacles_24[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 800
+    if (row < 832) return map_obstacles_25[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 832
+    if (row < 864) return map_obstacles_26[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 864
+    if (row < 896) return map_obstacles_27[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 896
+    if (row < 928) return map_obstacles_28[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 928
+    if (row < 960) return map_obstacles_29[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 960
+    if (row < 992) return map_obstacles_30[(row % 32) * MAP_COLUMNS + column];
+#endif
+#if MAP_ROWS > 992
+    return map_obstacles_31[(row % 32) * MAP_COLUMNS + column];
+#endif
+#endif
+#endif
+    return 0;
+}
 
 void number_text(unsigned int value, char *out)
 {
@@ -161,7 +302,7 @@ void number_text(unsigned int value, char *out)
     out[count] = 0;
 }
 
-int absolute_value(int value)
+WorldCoord absolute_value(WorldCoord value)
 {
     return value < 0 ? -value : value;
 }
@@ -188,7 +329,7 @@ int effect_noise(int range)
     return (int)((effect_random >> 1) % (unsigned int)range);
 }
 
-void add_burn_site(int x, int y, int mask)
+void add_burn_site(WorldCoord x, WorldCoord y, int mask)
 {
     int i;
     int index;
@@ -204,10 +345,10 @@ void add_burn_site(int x, int y, int mask)
         {
             site->x = x < 0 ? 0 : x;
             site->y = y < 0 ? 0 : y;
-            if (site->x >= MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
-                site->x = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 1;
-            if (site->y >= MAP_ROWS * MAP_TILE_PIXEL_SIZE)
-                site->y = MAP_ROWS * MAP_TILE_PIXEL_SIZE - 1;
+            if (site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
+                site->x = (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 1;
+            if (site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+                site->y = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 1;
             site->rounds = BURN_ROUNDS + 1;
             site->mask = mask;
             if (index == burn_count)
@@ -265,10 +406,10 @@ void reset_battlefield(void)
     burn_capacity_error = 0;
 }
 
-void tank_impulse(int player, int x, int y, int strength)
+void tank_impulse(int player, WorldCoord x, WorldCoord y, int strength)
 {
-    tanks[player].impulse_x += x;
-    tanks[player].impulse_y += y;
+    tanks[player].impulse_x += (int)x;
+    tanks[player].impulse_y += (int)y;
     if (tanks[player].impulse_x > 48)
         tanks[player].impulse_x = 48;
     if (tanks[player].impulse_x < -48)
@@ -281,12 +422,12 @@ void tank_impulse(int player, int x, int y, int strength)
         tanks[player].shake = strength;
 }
 
-void blast_reaction(int x, int y, int strength)
+void blast_reaction(WorldCoord x, WorldCoord y, int strength)
 {
     int player;
-    int dx;
-    int dy;
-    int distance;
+    WorldCoord dx;
+    WorldCoord dy;
+    WorldCoord distance;
     int force;
 
     for (player = 0; player < 2; player++)
@@ -312,7 +453,7 @@ void blast_reaction(int x, int y, int strength)
     }
 }
 
-void emit_particle(int x, int y, int velocity_x, int velocity_y, int smoke)
+void emit_particle(WorldCoord x, WorldCoord y, int velocity_x, int velocity_y, int smoke)
 {
     Particle *particle;
 
@@ -331,7 +472,7 @@ void emit_particle(int x, int y, int velocity_x, int velocity_y, int smoke)
     next_particle = (next_particle + 1) % MAX_PARTICLES;
 }
 
-void emit_explosion(int x, int y, int speed)
+void emit_explosion(WorldCoord x, WorldCoord y, int speed)
 {
     int direction;
 
@@ -354,17 +495,17 @@ void emit_explosion(int x, int y, int speed)
 void explode_object(int index)
 {
     object_explosion[index] = EXPLOSION_FRAMES;
-    emit_explosion(map_object_x[index] * MAP_TILE_PIXEL_SIZE +
+    emit_explosion((WorldCoord)map_object_x[index] * MAP_TILE_PIXEL_SIZE +
                        MAP_TILE_PIXEL_SIZE / 2,
-                   map_object_y[index] * MAP_TILE_PIXEL_SIZE +
+                   (WorldCoord)map_object_y[index] * MAP_TILE_PIXEL_SIZE +
                        MAP_TILE_PIXEL_SIZE / 2,
                    2);
-    blast_reaction(map_object_x[index] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2,
-                   map_object_y[index] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2, 40);
+    blast_reaction((WorldCoord)map_object_x[index] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2,
+                   (WorldCoord)map_object_y[index] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2, 40);
     gfx_sound(0, 90, 8, WAVE_NOISE, 35);
 }
 
-void add_impact(int x, int y, int size)
+void add_impact(WorldCoord x, WorldCoord y, int size)
 {
     impact_x[next_impact] = x;
     impact_y[next_impact] = y;
@@ -434,7 +575,7 @@ int tank_mask(int player)
     return tanks[player].direction & TANK_DIRECTION_MASK;
 }
 
-int tank_collision(int x, int y, int player)
+int tank_collision(WorldCoord x, WorldCoord y, int player)
 {
     int other;
 
@@ -445,12 +586,12 @@ int tank_collision(int x, int y, int player)
         absolute_value(y - tanks[other].y) >= 32)
         return 0;
     prepare_collision_assets();
-    return gfx_mask_overlap(tank_mask(player), x - 16, y - 16,
-                            tank_mask(other), tanks[other].x - 16,
-                            tanks[other].y - 16);
+    return mask_overlap_world(tank_mask(player), x - 16, y - 16,
+                              tank_mask(other), tanks[other].x - 16,
+                              tanks[other].y - 16);
 }
 
-int obstacle_mask_collision(int mask, int x, int y, int size)
+int obstacle_mask_collision(int mask, WorldCoord x, WorldCoord y, int size)
 {
     int left;
     int right;
@@ -476,11 +617,11 @@ int obstacle_mask_collision(int mask, int x, int y, int size)
     {
         for (column = left; column <= right; column++)
         {
-            tile = map_obstacles[row * MAP_COLUMNS + column];
+            tile = map_obstacle_at(row, column);
             if (tile != 0 &&
-                gfx_mask_overlap(mask, x, y, GFX_MASK_TILE_BASE + tile,
-                                 column * MAP_TILE_PIXEL_SIZE,
-                                 row * MAP_TILE_PIXEL_SIZE))
+                mask_overlap_world(mask, x, y, GFX_MASK_TILE_BASE + tile,
+                                   (WorldCoord)column * MAP_TILE_PIXEL_SIZE,
+                                   (WorldCoord)row * MAP_TILE_PIXEL_SIZE))
             {
                 return 1;
             }
@@ -489,13 +630,13 @@ int obstacle_mask_collision(int mask, int x, int y, int size)
     return 0;
 }
 
-int blocked(int x, int y, int tank_index)
+int blocked(WorldCoord x, WorldCoord y, int tank_index)
 {
-    int map_width;
-    int map_height;
+    WorldCoord map_width;
+    WorldCoord map_height;
 
-    map_width = MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
-    map_height = MAP_ROWS * MAP_TILE_PIXEL_SIZE;
+    map_width = (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
+    map_height = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE;
     if (x < 16 || x > map_width - 16 ||
         y < 16 || y > map_height - 16)
     {
@@ -513,7 +654,8 @@ int blocked(int x, int y, int tank_index)
     return 0;
 }
 
-int movement_blocked(int old_x, int old_y, int x, int y, int player)
+int movement_blocked(WorldCoord old_x, WorldCoord old_y,
+                     WorldCoord x, WorldCoord y, int player)
 {
     int step;
     int steps;
@@ -538,15 +680,22 @@ void start_round(void)
     int player;
     int row;
     int column;
-    int x;
-    int y;
-    int target_x;
-    int target_y;
-    int best_x;
-    int best_y;
-    int best_score;
-    int score;
+    WorldCoord x;
+    WorldCoord y;
+    WorldCoord target_x;
+    WorldCoord target_y;
+    WorldCoord best_x;
+    WorldCoord best_y;
+    WorldCoord best_score;
+    WorldCoord score;
     int found;
+    int center_column;
+    int center_row;
+    int radius;
+    int first_row;
+    int last_row;
+    int first_column;
+    int last_column;
 
     if (round_over)
         age_burn_sites();
@@ -560,37 +709,54 @@ void start_round(void)
     for (player = 0; player < 2; player++)
     {
         target_x = player == 0
-                       ? MAP_COLUMNS * MAP_TILE_PIXEL_SIZE / 4
-                       : MAP_COLUMNS * MAP_TILE_PIXEL_SIZE * 3 / 4;
-        target_y = MAP_ROWS * MAP_TILE_PIXEL_SIZE / 2;
+                       ? (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE / 4
+                       : (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE * 3 / 4;
+        target_y = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE / 2;
+        center_column = target_x / MAP_TILE_PIXEL_SIZE;
+        center_row = target_y / MAP_TILE_PIXEL_SIZE;
         best_x = target_x;
         best_y = target_y;
         best_score = 32767;
         found = 0;
-        for (row = 0; row < MAP_ROWS; row++)
+        for (radius = 0;
+             radius < MAP_COLUMNS + MAP_ROWS && !found; radius++)
         {
-            y = row * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2;
-            for (column = 0; column < MAP_COLUMNS; column++)
+            first_row = center_row - radius;
+            if (first_row < 0)
+                first_row = 0;
+            last_row = center_row + radius;
+            if (last_row >= MAP_ROWS)
+                last_row = MAP_ROWS - 1;
+            first_column = center_column - radius;
+            if (first_column < 0)
+                first_column = 0;
+            last_column = center_column + radius;
+            if (last_column >= MAP_COLUMNS)
+                last_column = MAP_COLUMNS - 1;
+            for (row = first_row; row <= last_row; row++)
             {
-                if ((player == 0 && column >= MAP_COLUMNS / 2) ||
-                    (player == 1 && column < MAP_COLUMNS / 2))
+                for (column = first_column; column <= last_column; column++)
                 {
-                    continue;
-                }
-                x = column * MAP_TILE_PIXEL_SIZE +
-                    MAP_TILE_PIXEL_SIZE / 2;
-                if (blocked(x, y, player))
-                {
-                    continue;
-                }
-                score = absolute_value(x - target_x) +
-                        absolute_value(y - target_y);
-                if (!found || score < best_score)
-                {
-                    best_x = x;
-                    best_y = y;
-                    best_score = score;
-                    found = 1;
+                    if (absolute_value(column - center_column) +
+                            absolute_value(row - center_row) != radius ||
+                        (player == 0 && column >= MAP_COLUMNS / 2) ||
+                        (player == 1 && column < MAP_COLUMNS / 2))
+                        continue;
+                    x = (WorldCoord)column * MAP_TILE_PIXEL_SIZE +
+                        MAP_TILE_PIXEL_SIZE / 2;
+                    y = (WorldCoord)row * MAP_TILE_PIXEL_SIZE +
+                        MAP_TILE_PIXEL_SIZE / 2;
+                    if (blocked(x, y, player))
+                        continue;
+                    score = absolute_value(x - target_x) +
+                            absolute_value(y - target_y);
+                    if (!found || score < best_score)
+                    {
+                        best_x = x;
+                        best_y = y;
+                        best_score = score;
+                        found = 1;
+                    }
                 }
             }
         }
@@ -722,11 +888,11 @@ void fire_shot(int player)
 
 void update_tank(int player, unsigned int keys, unsigned int extra)
 {
-    int old_x;
-    int old_y;
+    WorldCoord old_x;
+    WorldCoord old_y;
     int direction;
-    int next_x;
-    int next_y;
+    WorldCoord next_x;
+    WorldCoord next_y;
     int movement_numerator_x;
     int movement_numerator_y;
     int can_move_x;
@@ -927,18 +1093,18 @@ void update_objects(void)
         {
             mask = 1 << player;
             if (tanks[player].health > 0 &&
-                gfx_mask_overlap(tank_mask(player),
-                                 tanks[player].x - 16, tanks[player].y - 16,
-                                 GFX_MASK_TILE_BASE + map_object_tile[i],
-                                 map_object_x[i] * MAP_TILE_PIXEL_SIZE,
-                                 map_object_y[i] * MAP_TILE_PIXEL_SIZE))
+                mask_overlap_world(tank_mask(player),
+                                   tanks[player].x - 16, tanks[player].y - 16,
+                                   GFX_MASK_TILE_BASE + map_object_tile[i],
+                                   (WorldCoord)map_object_x[i] * MAP_TILE_PIXEL_SIZE,
+                                   (WorldCoord)map_object_y[i] * MAP_TILE_PIXEL_SIZE))
             {
                 contacts |= mask;
                 if (!(object_contacts[i] & mask))
                 {
                     if (map_object_hp[i] < 0 && map_object_removal[i] != OBJECT_EXPLOSION)
-                        blast_reaction(map_object_x[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2,
-                                       map_object_y[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2, 24);
+                        blast_reaction((WorldCoord)map_object_x[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2,
+                                       (WorldCoord)map_object_y[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2, 24);
                     change_health(player, map_object_hp[i]);
                     if (map_object_removal[i] != OBJECT_FIXED)
                     {
@@ -1030,8 +1196,8 @@ void update_particles(void)
         particle->y += move;
         particle->remainder_y -= move * 4;
         if (particle->x < 0 || particle->y < 0 ||
-            particle->x >= MAP_COLUMNS * MAP_TILE_PIXEL_SIZE ||
-            particle->y >= MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+            particle->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE ||
+            particle->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
             particle->life = 0;
     }
     effect_tick = (effect_tick + 1) % 4320;
@@ -1045,15 +1211,15 @@ int shot_collision(int index)
 
     shot = &shots[index];
     if (shot->x < 3 || shot->y < 3 ||
-        shot->x >= MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 3 ||
-        shot->y >= MAP_ROWS * MAP_TILE_PIXEL_SIZE - 3 ||
+        shot->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 3 ||
+        shot->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 3 ||
         obstacle_mask_collision(GFX_MASK_AMMO, shot->x - 3, shot->y - 3, 7))
         return 1;
     player = 1 - shot->owner;
     if (tanks[player].health > 0 &&
-        gfx_mask_overlap(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
-                         tank_mask(player), tanks[player].x - 16,
-                         tanks[player].y - 16))
+        gfx_mask_overlap_wide(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
+                              tank_mask(player), tanks[player].x - 16,
+                              tanks[player].y - 16))
     {
         tank_impulse(player, direction_offset(directions_x[shot->direction], 24),
                      direction_offset(directions_y[shot->direction], 24), 8);
@@ -1063,10 +1229,10 @@ int shot_collision(int index)
     for (i = 0; i < MAP_OBJECT_COUNT; i++)
     {
         if (object_active[i] &&
-            gfx_mask_overlap(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
+            gfx_mask_overlap_wide(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
                              GFX_MASK_TILE_BASE + map_object_tile[i],
-                             map_object_x[i] * MAP_TILE_PIXEL_SIZE,
-                             map_object_y[i] * MAP_TILE_PIXEL_SIZE))
+                             (WorldCoord)map_object_x[i] * MAP_TILE_PIXEL_SIZE,
+                             (WorldCoord)map_object_y[i] * MAP_TILE_PIXEL_SIZE))
         {
             if (map_object_removal[i] != OBJECT_FIXED)
             {
@@ -1084,7 +1250,7 @@ int shot_collision(int index)
         if (i != index && shots[i].life > 0 &&
             absolute_value(shot->x - shots[i].x) <= 6 &&
             absolute_value(shot->y - shots[i].y) <= 6 &&
-            gfx_mask_overlap(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
+            gfx_mask_overlap_wide(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
                              GFX_MASK_AMMO, shots[i].x - 3, shots[i].y - 3))
         {
             add_burn_site(shots[i].x, shots[i].y, -1);
@@ -1099,12 +1265,12 @@ void update_shots(void)
 {
     int i;
     int step;
-    int old_x;
-    int old_y;
+    WorldCoord old_x;
+    WorldCoord old_y;
     int movement_numerator_x;
     int movement_numerator_y;
-    int next_x;
-    int next_y;
+    WorldCoord next_x;
+    WorldCoord next_y;
     Shot *shot;
 
     prepare_collision_assets();
@@ -1199,18 +1365,18 @@ void draw_tank(int player)
     {
         if (tank_sprite_slots[player] >= 0)
         {
-            gfx_sprite_move(tank_sprite_slots[player], 0, 0, 0);
+            gfx_sprite_move_wide(tank_sprite_slots[player], 0, 0, 0);
         }
         tank_sprite_slots[player] = slot;
     }
-    gfx_sprite_move(slot, tanks[player].x - 16,
-                    tanks[player].y - 16,
-                    tanks[player].health > 0 ? SPRITE_VISIBLE : 0);
+    gfx_sprite_move_wide(slot, tanks[player].x - 16,
+                         tanks[player].y - 16,
+                         tanks[player].health > 0 ? SPRITE_VISIBLE : 0);
 }
 
-int camera_origin(int position, int viewport_size, int map_size)
+WorldCoord camera_origin(WorldCoord position, int viewport_size, WorldCoord map_size)
 {
-    int camera;
+    WorldCoord camera;
 
     if (map_size <= viewport_size)
     {
@@ -1228,19 +1394,21 @@ int camera_origin(int position, int viewport_size, int map_size)
     return camera;
 }
 
-int tank_camera_x(int player)
+WorldCoord tank_camera_x(int player)
 {
-    return camera_origin(tanks[player].x, 320, MAP_COLUMNS * MAP_TILE_PIXEL_SIZE) +
+    return camera_origin(tanks[player].x, 320,
+                         (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE) +
            (effect_tick % 2 == 0 ? tanks[player].shake / 3 : -tanks[player].shake / 3);
 }
 
-int tank_camera_y(int player)
+WorldCoord tank_camera_y(int player)
 {
-    return camera_origin(tanks[player].y, 480, MAP_ROWS * MAP_TILE_PIXEL_SIZE) +
+    return camera_origin(tanks[player].y, 480,
+                         (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE) +
            (effect_tick % 3 == 0 ? tanks[player].shake / 4 : -tanks[player].shake / 4);
 }
 
-void draw_map_obstacles(int camera_x, int camera_y)
+void draw_map_obstacles(WorldCoord camera_x, WorldCoord camera_y)
 {
     int first_column;
     int last_column;
@@ -1266,11 +1434,11 @@ void draw_map_obstacles(int camera_x, int camera_y)
     {
         for (column = first_column; column <= last_column; column++)
         {
-            tile = map_obstacles[row * MAP_COLUMNS + column];
+            tile = map_obstacle_at(row, column);
             if (tile != 0)
             {
-                gfx_world_tile(tile, column * MAP_TILE_PIXEL_SIZE,
-                               row * MAP_TILE_PIXEL_SIZE);
+                world_tile(tile, (WorldCoord)column * MAP_TILE_PIXEL_SIZE,
+                           (WorldCoord)row * MAP_TILE_PIXEL_SIZE);
             }
         }
     }
@@ -1279,8 +1447,8 @@ void draw_map_obstacles(int camera_x, int camera_y)
 void draw_ground(void)
 {
     int viewport;
-    int camera_x;
-    int camera_y;
+    WorldCoord camera_x;
+    WorldCoord camera_y;
     int i;
     int offset_x;
     int offset_y;
@@ -1291,10 +1459,10 @@ void draw_ground(void)
     {
         offset_x = track_offset_x[i];
         offset_y = track_offset_y[i];
-        gfx_world_rect(track_x[i] + offset_x - 1, track_y[i] + offset_y - 1,
-                       3, 3, TRACK_COLOR);
-        gfx_world_rect(track_x[i] - offset_x - 1, track_y[i] - offset_y - 1,
-                       3, 3, TRACK_COLOR);
+        world_rect(track_x[i] + offset_x - 1,
+                   track_y[i] + offset_y - 1, 3, 3, TRACK_COLOR);
+        world_rect(track_x[i] - offset_x - 1,
+                   track_y[i] - offset_y - 1, 3, 3, TRACK_COLOR);
     }
     for (viewport = 0; viewport < 2; viewport++)
     {
@@ -1306,12 +1474,13 @@ void draw_ground(void)
     {
         if (object_active[i])
         {
-            gfx_world_tile(map_object_tile[i],
-                           map_object_x[i] * MAP_TILE_PIXEL_SIZE,
-                           map_object_y[i] * MAP_TILE_PIXEL_SIZE);
+            world_tile(
+                map_object_tile[i],
+                (WorldCoord)map_object_x[i] * MAP_TILE_PIXEL_SIZE,
+                (WorldCoord)map_object_y[i] * MAP_TILE_PIXEL_SIZE);
         }
     }
-    gfx_world_emitters(burn_sites, burn_count, effect_tick);
+    world_emitters(burn_sites, burn_count, effect_tick);
 }
 
 void draw_combat_feedback(void)
@@ -1326,20 +1495,20 @@ void draw_combat_feedback(void)
         {
             radius = 2 + impact_life[i] * impact_size[i] / (IMPACT_FRAMES * 2);
             color = impact_life[i] > IMPACT_FRAMES / 2 ? YELLOW : ORANGE;
-            gfx_world_particle(impact_x[i], impact_y[i], radius, color,
-                               impact_life[i] > 7 ? 12 : 4);
+            world_particle(impact_x[i], impact_y[i], radius, color,
+                           impact_life[i] > 7 ? 12 : 4);
         }
     }
     for (i = 0; i < 2; i++)
     {
         if (muzzle_flash[i] > 0)
         {
-            gfx_world_particle(muzzle_x[i], muzzle_y[i], 5, ORANGE, 8);
-            gfx_world_particle(muzzle_x[i], muzzle_y[i], 2, WHITE, 16);
+            world_particle(muzzle_x[i], muzzle_y[i], 5, ORANGE, 8);
+            world_particle(muzzle_x[i], muzzle_y[i], 2, WHITE, 16);
         }
         if (hit_flash[i] > 0 && tanks[i].health > 0)
         {
-            gfx_world_particle(tanks[i].x, tanks[i].y, 16, RED, 2);
+            world_particle(tanks[i].x, tanks[i].y, 16, RED, 2);
         }
     }
 }
@@ -1351,8 +1520,8 @@ void draw_hud(void)
     char timer[16];
     unsigned int seconds;
     int i;
-    int explosion_x;
-    int explosion_y;
+    WorldCoord explosion_x;
+    WorldCoord explosion_y;
     int radius;
     int particle_size;
     int particle_color;
@@ -1381,7 +1550,8 @@ void draw_hud(void)
                                                                                 : particle->age < 17  ? ORANGE
                                                                                                       : DARK_RED;
             }
-            gfx_world_particle(particle->x, particle->y, particle_size, particle_color, opacity);
+            world_particle(particle->x, particle->y,
+                           particle_size, particle_color, opacity);
         }
     }
     draw_combat_feedback();
@@ -1389,16 +1559,16 @@ void draw_hud(void)
     {
         if (object_explosion[i] > EXPLOSION_FRAMES - 4)
         {
-            explosion_x = map_object_x[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2;
-            explosion_y = map_object_y[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2;
+            explosion_x = (WorldCoord)map_object_x[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2;
+            explosion_y = (WorldCoord)map_object_y[i] * MAP_TILE_PIXEL_SIZE + MAP_TILE_PIXEL_SIZE / 2;
             radius = 4 + object_explosion[i] / 2;
-            gfx_world_particle(explosion_x, explosion_y, radius, ORANGE, 8);
+            world_particle(explosion_x, explosion_y, radius, ORANGE, 8);
         }
     }
     for (i = 0; i < MAX_SHOTS; i++)
     {
         if (shots[i].life > 0)
-            gfx_world_ammo(shots[i].x, shots[i].y);
+            world_ammo(shots[i].x, shots[i].y);
     }
     gfx_rect(319, 30, 2, 450, DARK_GRAY);
     gfx_rect(0, 0, 640, 30, DARK_GRAY);
@@ -1459,10 +1629,10 @@ void draw_hud(void)
 
 void draw_game(void)
 {
-    int camera1_x;
-    int camera1_y;
-    int camera2_x;
-    int camera2_y;
+    WorldCoord camera1_x;
+    WorldCoord camera1_y;
+    WorldCoord camera2_x;
+    WorldCoord camera2_y;
     int viewport;
     char countdown[6];
 
@@ -1470,7 +1640,7 @@ void draw_game(void)
     camera1_y = tank_camera_y(0);
     camera2_x = tank_camera_x(1);
     camera2_y = tank_camera_y(1);
-    gfx_split_camera(camera1_x, camera1_y, camera2_x, camera2_y);
+    gfx_split_camera_wide(camera1_x, camera1_y, camera2_x, camera2_y);
     draw_ground();
     gfx_layer_select(LAYER_SPRITES);
     draw_tank(0);
