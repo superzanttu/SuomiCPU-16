@@ -250,6 +250,14 @@ def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
         json.dump(normalized, handle, indent=None if large_map else 2,
                   separators=(",", ":") if large_map else None)
         handle.write("\n")
+    if maps_dir.resolve() == (ROOT / "maps").resolve():
+        disk_maps_dir = ROOT / "disks" / "maps"
+        disk_maps_dir.mkdir(parents=True, exist_ok=True)
+        with (disk_maps_dir / path.name).open(
+                "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(normalized, handle, indent=None if large_map else 2,
+                      separators=(",", ":") if large_map else None)
+            handle.write("\n")
     return path
 
 

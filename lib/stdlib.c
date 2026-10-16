@@ -5,8 +5,9 @@
 
 unsigned int __sc16_rand_seed;
 int errno;
-static unsigned char __sc16_heap[512];
-static unsigned char __sc16_heap_blocks[512];
+#define SC16_HEAP_CAPACITY 65535UL
+static unsigned char __sc16_heap[SC16_HEAP_CAPACITY];
+static unsigned char __sc16_heap_blocks[SC16_HEAP_CAPACITY];
 
 static unsigned char *__sc16_heap_start(void)
 {
@@ -178,11 +179,11 @@ void *malloc(size_t size)
         return NULL;
     heap_start = __sc16_heap_start();
     start = (size_t)(heap_start - __sc16_heap);
-    if (size > 512UL - start) {
+    if (size > SC16_HEAP_CAPACITY - start) {
         errno = ENOMEM;
         return NULL;
     }
-    while (start + size <= 512UL) {
+    while (start + size <= SC16_HEAP_CAPACITY) {
         run = 0;
         while (run < size && __sc16_heap_blocks[start + run] == 0)
             ++run;
@@ -210,14 +211,15 @@ void free(void *pointer)
         return;
     address = (unsigned char *)pointer;
     heap_start = __sc16_heap_start();
-    if (address < heap_start || address >= __sc16_heap + 512)
+    if (address < heap_start ||
+        address >= __sc16_heap + SC16_HEAP_CAPACITY)
         return;
     block = (size_t)(address - __sc16_heap);
     count = __sc16_heap_blocks[block];
     if (count != 1)
         return;
     __sc16_heap_blocks[block] = 0;
-    for (index = block + 1; index < 512UL &&
+    for (index = block + 1; index < SC16_HEAP_CAPACITY &&
          __sc16_heap_blocks[index] == 255; ++index)
         __sc16_heap_blocks[index] = 0;
 }

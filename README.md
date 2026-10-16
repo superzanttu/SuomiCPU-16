@@ -11,8 +11,8 @@ SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
   (not a fully conforming C90 implementation; see the
   [user guide](user_guide.md#9-ansi-c90-compiler)).
 - Memory-mapped console, BIOS data-disk selection, JSON-backed virtual disks,
-  a layered GPU with 640x480x4-bit VRAM, hardware tile/sprite engines, and a
-  fixed-point 3D graphics coprocessor.
+  module-sandboxed file reads, a layered GPU with 640x480x4-bit VRAM, hardware
+  tile/sprite engines, and a fixed-point 3D graphics coprocessor.
 
 ## Getting Started
 Start SC-16 without arguments to show the BIOS module selector. Select a

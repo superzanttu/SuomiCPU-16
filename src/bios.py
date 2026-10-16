@@ -167,10 +167,12 @@ def select_boot_program(cpu, modules_dir=None, initial_disk=None):
             if logger is None:
                 logger = getattr(cpu, "console_log", None)
             image = load_program_file(module.path, logger)
+            cpu.disk.set_file_root(module.path.parent / "disks")
             return BIOSSelection(module.path, image, selected_disk, module.name)
         except (
             AssemblyError,
             CCompilerError,
+            DiskDeviceError,
             OSError,
             UnicodeError,
             ValueError,

@@ -104,6 +104,13 @@ DISK_STATUS = DISK_BASE + 16
 # +10..+11: Block pointer (16-bit)
 # +12..+13: Buffer offset for RAM (16-bit)
 # +16: Last command status (0 = success, 1 = device/operation error)
+# +18..+21: Virtual file byte offset (32-bit, big-endian)
+# +22..+25: Absolute SC-16 address of virtual file path
+# +26..+29: Absolute SC-16 address of file buffer
+# +30..+31: Maximum file transfer size (up to 256 bytes)
+# +32..+35: Virtual file size (32-bit, big-endian)
+# 0x40: Read file chunk
+# 0x80: List files for the running module (index +10, output buffer +26)
 RTC_START   = 0x43010 # Reaaliaikakello
 CONSOLE_DATA = 0x43200
 CONSOLE_STATUS = 0x43201
@@ -616,6 +623,9 @@ class SuomiCompute16:
         mode = self._graphics_mode()
         layer = min(self.memory[GPU_LAYER_SELECT], GPU_LAYER_COUNT - 1)
         if command == GPU_CLEAR:
+            if layer == 1 and self._tile_layer_dirty:
+                self._render_tile_layer()
+                self._tile_layer_dirty = False
             if layer == 0 and mode == GFX_MODE_640_480:
                 fill = ((color & 0x0F) << 4) | (color & 0x0F)
                 self.memory[VRAM_START:VRAM_START + VRAM_SIZE] = bytes([fill]) * VRAM_SIZE
@@ -950,6 +960,9 @@ class SuomiCompute16:
         if layer == 0:
             self._gpu_result(1)
             return
+        if layer == 1 and self._tile_layer_dirty:
+            self._render_tile_layer()
+            self._tile_layer_dirty = False
         width, height = self._screen_size()
         target = self.gpu_layers[layer]
         size = self.tile_pixel_size
@@ -1288,6 +1301,55 @@ class SuomiCompute16:
                 for i, char in enumerate(text + "\0"):
                     self.write(RAM_START + offset + i, ord(char))
                 self.write(RAM_START + offset + 9, 1 if text and self.disk.is_protected(text) else 0)
+            if command & 0x80: # Directory: name of virtual file number [ptr] to RAM
+                index = self.read_16(DISK_BASE + 10)
+                buffer_address = int.from_bytes(
+                    self.memory[DISK_BASE + 26:DISK_BASE + 30], "big"
+                )
+                capacity = self.read_16(DISK_BASE + 30)
+                names = self.disk.list_files()
+                self.write_16(DISK_BASE + 14, len(names))
+                text = names[index] if index < len(names) else ""
+                encoded = text.encode("ascii") + b"\0"
+                if len(encoded) > capacity or buffer_address + len(encoded) > MEM_SIZE:
+                    raise DiskDeviceError("virtual file name buffer is too small")
+                for i, char in enumerate(encoded):
+                    self.write(buffer_address + i, char)
+            if command & 0x40: # Read a chunk from a virtual file
+                path_address = int.from_bytes(
+                    self.memory[DISK_BASE + 22:DISK_BASE + 26], "big"
+                )
+                buffer_address = int.from_bytes(
+                    self.memory[DISK_BASE + 26:DISK_BASE + 30], "big"
+                )
+                file_offset = (
+                    self.memory[DISK_BASE + 18] << 24
+                    | self.memory[DISK_BASE + 19] << 16
+                    | self.memory[DISK_BASE + 20] << 8
+                    | self.memory[DISK_BASE + 21]
+                )
+                length = min(self.read_16(DISK_BASE + 30), self.disk.BLOCK_SIZE)
+                if path_address >= MEM_SIZE or buffer_address + length > MEM_SIZE:
+                    raise DiskDeviceError("virtual file address is outside memory")
+                path_bytes = bytearray()
+                for i in range(129):
+                    if path_address + i >= MEM_SIZE:
+                        raise DiskDeviceError("virtual file path exceeds memory")
+                    char = self.read(path_address + i)
+                    if char == 0:
+                        break
+                    path_bytes.append(char)
+                else:
+                    raise DiskDeviceError("virtual file path is not null-terminated")
+                try:
+                    file_path = path_bytes.decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise DiskDeviceError("virtual file path must be ASCII") from exc
+                data, file_size = self.disk.read_file(file_path, file_offset, length)
+                for i, value in enumerate(data):
+                    self.write(buffer_address + i, value)
+                self.write_16(DISK_BASE + 14, len(data))
+                self.memory[DISK_BASE + 32:DISK_BASE + 36] = file_size.to_bytes(4, "big")
             if command & 0x08: # Write block
                 ptr = self.read_16(DISK_BASE + 10)
                 offset = self.read_16(DISK_BASE + 12)
@@ -2541,6 +2603,9 @@ def main():
         while True:
             if program_file:
                 sc16.module_name = Path(program_file).stem
+                sc16.disk.set_file_root(
+                    Path(program_file).resolve().parent / "disks"
+                )
                 try:
                     program = load_program_file(program_file, sc16.console_progress)
                 except (AssemblyError, CCompilerError, OSError, ValueError) as exc:

@@ -2354,7 +2354,7 @@ class CCompilerTests(unittest.TestCase):
         image = compile_source(
             "#include <stdlib.h>\n"
             "#include <errno.h>\n"
-            "int results[9];\n"
+            "int results[10];\n"
             "int main(void) {\n"
             "  char *memory;\n"
             "  char *end;\n"
@@ -2370,27 +2370,30 @@ class CCompilerTests(unittest.TestCase):
             "  results[2] = memory != NULL && memory[0] == 0 && "
             "memory[7] == 0;\n"
             "  free(memory);\n"
-            "  memory = (char *)malloc(600UL);\n"
-            "  results[3] = memory == NULL && errno == ENOMEM;\n"
+            "  memory = (char *)malloc(1024UL);\n"
+            "  results[3] = memory != NULL;\n"
+            "  free(memory);\n"
+            "  memory = (char *)malloc(65536UL);\n"
+            "  results[4] = memory == NULL && errno == ENOMEM;\n"
             "  number = strtod(\" -12.5e1tail\", &end);\n"
-            "  results[4] = number == -125.0;\n"
-            "  results[5] = *end == 't';\n"
+            "  results[5] = number == -125.0;\n"
+            "  results[6] = *end == 't';\n"
             "  number = strtod(\"invalid\", &end);\n"
-            "  results[6] = number == 0.0 && *end == 'i';\n"
-            "  results[7] = div(-17, 5).quot == -3 && "
+            "  results[7] = number == 0.0 && *end == 'i';\n"
+            "  results[8] = div(-17, 5).quot == -3 && "
             "div(-17, 5).rem == -2;\n"
             "  errno = 0;\n"
             "  number = strtod(\"0.000030517578125e9\", &end);\n"
-            "  results[8] = number > 25000.0 && number < 40000.0 && "
+            "  results[9] = number > 25000.0 && number < 40000.0 && "
             "errno == 0 && *end == '\\0';\n"
             "  return 0;\n"
             "}\n"
         )
-        cpu, _ = run_image(image)
+        cpu, _ = run_image(image, maximum_steps=1_000_000)
         self.assertFalse(cpu.running)
         self.assertEqual(
-            [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(9)],
-            [1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [cpu.read_16(GLOBAL_BASE + 2 + index * 2) for index in range(10)],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
         )
 
     def test_c90_math_library_core_functions(self):

@@ -310,7 +310,7 @@ class BIOSBootTests(unittest.TestCase):
             ],
         )
 
-    def test_default_tank_module_uses_random_round_map_pool(self):
+    def test_default_tank_module_compiles_assets_without_embedding_maps(self):
         from src.SuomiCPU import load_program_file
 
         main_path = (
@@ -319,16 +319,16 @@ class BIOSBootTests(unittest.TestCase):
         )
         image = AssemblyImage((MemorySegment(0, b"\x00\x01"),), 0)
         with patch(
-            "tools.tank16_map_loader.compile_map_file",
+            "tools.tank16_map_loader.compile_runtime_tank16",
             return_value=image,
+        ) as compile_runtime, patch(
+            "tools.tank16_map_loader.compile_map_file",
         ) as compile_map:
             loaded = load_program_file(main_path)
 
         self.assertIs(loaded, image)
-        compile_map.assert_called_once_with(
-            main_path.parent / "maps" / "FINLAND.json",
-            randomize_rounds=True,
-        )
+        compile_runtime.assert_called_once_with()
+        compile_map.assert_not_called()
 
 
 if __name__ == "__main__":

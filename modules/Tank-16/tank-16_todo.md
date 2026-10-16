@@ -9,9 +9,10 @@
 - [x] Map controls: Player 1 uses A/D to turn, W/S to adjust throttle, and C to fire; Player 2 uses J/L to turn, I/K to adjust throttle, and period to fire.
 - [x] Give each player one life and 100 health; apply 10 damage for an ammunition hit, 25 for a mine, and 5 for a tank collision.
 - [x] End a round when a player's health reaches zero.
-- [x] Build the screen-sized map from 16×16 runtime terrain tiles.
-- [x] Load editor JSON maps and their named terrain tileset when Tank-16 is started with a map file.
-- [x] Use `maps/FINLAND.json` for the first round, then randomly select a compatible map before each later round when Tank-16 is started from the module selector.
+- [x] Render terrain only for the cells visible in each camera view.
+- [x] Load finite JSON maps and seeded, effectively unbounded terrain from the module's `disks/maps/` folder through the generic file API.
+- [x] Keep map data out of the executable; compile only the terrain and object graphics assets.
+- [x] Use `disks/maps/FINLAND.json` for the first round, then randomly select a map before every later round.
 - [x] Preserve the tileset's source RGB colors through per-program palette entries.
 - [ ] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
 - [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.

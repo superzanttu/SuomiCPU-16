@@ -2,6 +2,7 @@ from collections import Counter
 from pathlib import Path
 import re
 import runpy
+import tempfile
 
 import pygame
 
@@ -385,6 +386,94 @@ def build_map_header(
         ),
         tile_arrays, upload_tiles, map_data_header, layer_header,
     )
+
+
+def build_runtime_assets_header() -> str:
+    editor = runpy.run_path(str(EDITOR_PATH))
+    objects, object_columns, object_rows = editor["load_tileset"](
+        GAME_DIR / "gfx" / "tiles_objects.png", pad_edges=True
+    )
+    map_data = editor["new_map"]("RUNTIME", object_columns * object_rows, 1)
+    for index in range(object_columns * object_rows):
+        map_data["objects"][0][index] = {
+            "tile": [index % object_columns, index // object_columns],
+            "hp_change": -25,
+            "removal": "explosion",
+        }
+    with tempfile.TemporaryDirectory() as directory:
+        map_path = editor["save_map"](map_data, Path(directory))
+        _, tile_data, palette, dimensions = load_map_assets(map_path)
+
+    terrain_columns, terrain_rows, tile_size = dimensions
+    terrain_count = terrain_columns * terrain_rows
+    tile_pixels = tile_size * tile_size
+
+    def format_array(values: list[int], width: int) -> str:
+        return ",\n".join(
+            "    " + ", ".join(str(value) for value in values[start:start + width])
+            for start in range(0, len(values), width)
+        )
+
+    tiles = ",\n".join(
+        "    {" + format_array(values, 32).replace("\n", "\n     ") + "}"
+        for values in tile_data
+    )
+    uploads = "\n".join(
+        "    gfx_tile_upload(%d, terrain_tiles[%d]);" % (index, index)
+        for index in range(len(tile_data))
+    )
+    palette_data = ",\n".join(
+        "    {%s}" % ", ".join(str(channel) for channel in color)
+        for color in palette
+    )
+    return (
+        "#define RUNTIME_MAP_LOADING 1\n"
+        "#define MAP_COLUMNS map_columns\n"
+        "#define MAP_ROWS map_rows\n"
+        "#define MAP_OBJECT_COUNT 0\n"
+        "#define MAP_OBJECT_CAPACITY 1024\n"
+        "#define OBJECT_FIXED 0\n"
+        "#define OBJECT_EXPLOSION 1\n"
+        "#define OBJECT_DISAPPEAR 2\n"
+        f"#define TERRAIN_COLUMNS {terrain_columns}\n"
+        f"#define TERRAIN_ROWS {terrain_rows}\n"
+        f"#define TERRAIN_TILE_COUNT {terrain_count}\n"
+        f"#define OBJECT_TILE_BASE {terrain_count}\n"
+        f"#define OBJECT_COLUMNS {object_columns}\n"
+        f"#define OBJECT_ROWS {object_rows}\n"
+        f"#define RUNTIME_TILE_COUNT {len(tile_data)}\n"
+        f"#define TILE_PIXEL_COUNT {tile_pixels}\n"
+        f"#define MAP_PALETTE_COUNT {len(palette)}\n"
+        f"#define MAP_PALETTE_BASE {RUNTIME_PALETTE_BASE}\n"
+        "int map_columns;\n"
+        "int map_rows;\n"
+        "unsigned char *map_data;\n"
+        "unsigned char *map_obstacles;\n"
+        "volatile unsigned char map_json_chunk[256];\n"
+        "volatile char map_path_buffer[129];\n"
+        "char map_selected_path[129];\n"
+        "int map_object_x[MAP_OBJECT_CAPACITY];\n"
+        "int map_object_y[MAP_OBJECT_CAPACITY];\n"
+        "int map_object_tile[MAP_OBJECT_CAPACITY];\n"
+        "int map_object_hp[MAP_OBJECT_CAPACITY];\n"
+        "int map_object_removal[MAP_OBJECT_CAPACITY];\n"
+        f"unsigned char map_palette[MAP_PALETTE_COUNT][3] = {{\n"
+        f"{palette_data}\n}};\n"
+        f"unsigned char terrain_tiles[RUNTIME_TILE_COUNT][TILE_PIXEL_COUNT] = {{\n"
+        f"{tiles}\n}};\n"
+        "void upload_terrain_tiles(void)\n{\n"
+        f"{uploads}\n"
+        "}\n"
+    )
+
+
+def compile_runtime_tank16():
+    source = MAIN_PATH.read_text(encoding="utf-8")
+    include = '#include "map_assets.h"'
+    if source.count(include) != 1:
+        raise ValueError("Tank-16 main.c must include map_assets.h exactly once")
+    source = source.replace(include, build_runtime_assets_header(), 1)
+    return compile_source(source, str(MAIN_PATH))
 
 
 def discover_round_maps(map_path: Path) -> list[Path]:

@@ -1,5 +1,6 @@
 from pathlib import Path
 import math
+import json
 import re
 import runpy
 import tempfile
@@ -10,9 +11,10 @@ import pygame
 
 from c_compiler import GLOBAL_BASE, compile_source
 from gfx_harness import ROOT, layer_pixel, make_cpu, run_frame
-from src.SuomiCPU import KEYS_ADDR, load_program_file
+from src.SuomiCPU import DISK_STATUS, KEYS_ADDR, load_program_file
+from src.lib_disk import DiskDevice
 from tools.tank16_map_loader import (
-    build_map_header, discover_round_maps, load_map_assets,
+    build_map_header, build_runtime_assets_header, discover_round_maps, load_map_assets,
     map_tile_pixel_size,
 )
 
@@ -642,20 +644,83 @@ class Tank16Tests(unittest.TestCase):
     def test_main_game_compiles_and_renders_a_frame(self):
         source = ROOT / "modules" / "Tank-16" / "main.c"
         map_path = ROOT / "modules" / "Tank-16" / "maps" / "PERUS-1.json"
-        _, tiles, _, dimensions = load_map_assets(map_path)
+        _, _, _, dimensions = load_map_assets(map_path)
         cpu = make_cpu(load_program_file(source))
-        for _ in range(8):
-            run_frame(cpu)
-            if cpu.frame_yield:
-                break
+        world_tile_calls = []
+        original_world_tile = cpu._gpu_world_tile
+
+        def record_world_tile(tile, world_x, world_y, layer):
+            if len(world_tile_calls) < 10:
+                world_tile_calls.append((tile, world_x, world_y, layer))
+            original_world_tile(tile, world_x, world_y, layer)
+
+        cpu._gpu_world_tile = record_world_tile
+        with tempfile.TemporaryDirectory() as directory:
+            module_disks = Path(directory) / "module" / "disks"
+            maps_dir = module_disks / "maps"
+            maps_dir.mkdir(parents=True)
+            map_document = json.loads(map_path.read_text(encoding="utf-8"))
+            map_document["tiles"] = [
+                [[1, 0] for _ in range(map_document["width"])]
+                for _ in range(map_document["height"])
+            ]
+            map_document["obstacles"] = [
+                [None for _ in range(map_document["width"])]
+                for _ in range(map_document["height"])
+            ]
+            map_document["objects"] = [
+                [None for _ in range(map_document["width"])]
+                for _ in range(map_document["height"])
+            ]
+            (maps_dir / "FINLAND.json").write_text(
+                json.dumps(map_document), encoding="utf-8"
+            )
+            cpu.disk = DiskDevice(Path(directory) / "virtual-disks")
+            cpu.disk.set_file_root(module_disks)
+            for _ in range(40):
+                run_frame(cpu)
+                if cpu.frame_yield:
+                    break
 
         self.assertTrue(cpu.frame_yield)
-        self.assertEqual(cpu.tilemap_width, 10)
-        self.assertEqual(cpu.tilemap_height, 8)
+        self.assertEqual(cpu.memory[DISK_STATUS], 0)
+        self.assertEqual(cpu.tilemap_width, 0)
+        self.assertEqual(cpu.tilemap_height, 0)
         self.assertEqual(cpu.tile_pixel_size, map_tile_pixel_size())
         self.assertEqual(dimensions[2], cpu.tile_pixel_size)
-        self.assertEqual(
-            cpu.tile_memory[:cpu.tile_pixel_size ** 2], bytes(tiles[0])
+        tile_pixels = cpu.tile_pixel_size ** 2
+        tile_one = cpu.tile_memory[tile_pixels:tile_pixels * 2]
+        expected_layer = bytearray(640 * 480)
+        for screen_y in range(480):
+            for screen_x in range(640):
+                viewport = 0 if screen_x < 320 else 1
+                camera_x, camera_y = cpu.split_cameras[viewport]
+                world_x = screen_x - viewport * 320 + camera_x
+                world_y = screen_y + camera_y
+                if not (0 <= world_x < 640 and 0 <= world_y < 512):
+                    continue
+                tile_offset = (
+                    (world_y % cpu.tile_pixel_size) * cpu.tile_pixel_size +
+                    world_x % cpu.tile_pixel_size
+                )
+                expected_layer[screen_y * 640 + screen_x] = tile_one[tile_offset]
+        actual_layer = cpu.gpu_layers[1]
+        mismatches = [
+            (index, actual_layer[index], expected_layer[index])
+            for index in range(len(expected_layer))
+            if actual_layer[index] != expected_layer[index]
+        ]
+        self.assertFalse(
+            mismatches,
+            "Terrain layer mismatch: first=%s count=%d cameras=%s tile_size=%d "
+            "tile_one=%s world_tiles=%s" % (
+                mismatches[:10],
+                len(mismatches),
+                cpu.split_cameras,
+                cpu.tile_pixel_size,
+                list(tile_one[:16]),
+                world_tile_calls,
+            ),
         )
         initial_sprites = [
             (slot, sprite)
@@ -757,56 +822,38 @@ class Tank16Tests(unittest.TestCase):
         ]
         self.assertEqual(results, [0, 40, 0, 1, 0, 0])
 
-    def test_map_file_loads_its_tiles_and_tileset_into_the_game(self):
+    def test_runtime_assets_exclude_maps_and_disk_maps_include_infinite_world(self):
+        game_dir = ROOT / "modules" / "Tank-16"
+        header = build_runtime_assets_header()
+        self.assertIn("#define RUNTIME_MAP_LOADING 1", header)
+        self.assertIn("#define MAP_COLUMNS map_columns", header)
+        self.assertIn("unsigned char *map_data;", header)
+        self.assertIn("unsigned char *map_obstacles;", header)
+        self.assertNotIn("map_data[", header)
+        self.assertNotIn("map_obstacles[", header)
+
+        disk_maps = game_dir / "disks" / "maps"
+        finland = json.loads(
+            (disk_maps / "FINLAND.json").read_text(encoding="utf-8")
+        )
+        infinite = json.loads(
+            (disk_maps / "INFINITE.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual((finland["width"], finland["height"]), (100, 100))
+        self.assertTrue(infinite["infinite"])
+        self.assertTrue(infinite["terrain_tiles"])
+        self.assertTrue(infinite["obstacle_tiles"])
+
+    def test_json_map_is_data_not_an_executable_program(self):
         map_path = ROOT / "modules" / "Tank-16" / "maps" / "PERUS-1.json"
         map_data, tiles, palette, dimensions = load_map_assets(map_path)
-        cpu = make_cpu(load_program_file(map_path))
-        for _ in range(8):
-            run_frame(cpu)
-            if cpu.frame_yield:
-                break
-
-        expected_map = bytes(
-            tile_y * 10 + tile_x
-            for row in map_data["tiles"]
-            for tile_x, tile_y in row
-        )
-        self.assertEqual((cpu.tilemap_width, cpu.tilemap_height), (10, 8))
-        self.assertEqual(cpu.tilemap_memory, expected_map)
+        self.assertEqual((map_data["width"], map_data["height"]), (10, 8))
         self.assertEqual(dimensions[2], map_tile_pixel_size())
-        self.assertEqual(cpu.tile_pixel_size, dimensions[2])
         self.assertEqual(len(tiles[0]), dimensions[2] ** 2)
-        tile_stride = 64 * 64
-        for tile_index, tile in enumerate(tiles):
-            start = tile_index * tile_stride
-            self.assertEqual(
-                cpu.tile_memory[start:start + len(tile)], bytes(tile),
-                "uploaded atlas tile %d differs from map tileset" % tile_index,
-            )
-        expected_layer = bytearray(640 * 480)
-        for y in range(480):
-            for x in range(640):
-                viewport = 0 if x < 320 else 1
-                camera_x, camera_y = cpu.split_cameras[viewport]
-                world_x = x - viewport * 320 + camera_x
-                world_y = y + camera_y
-                if not (0 <= world_x < map_data["width"] * dimensions[2] and
-                        0 <= world_y < map_data["height"] * dimensions[2]):
-                    continue
-                map_x, source_x = divmod(world_x, dimensions[2])
-                map_y, source_y = divmod(world_y, dimensions[2])
-                tile_x, tile_y = map_data["tiles"][map_y][map_x]
-                tile_index = tile_y * 10 + tile_x
-                expected_layer[y * 640 + x] = tiles[tile_index][
-                    source_y * dimensions[2] + source_x
-                ]
-        self.assertEqual(cpu.gpu_layers[1], expected_layer)
         self.assertTrue(any(pixel > 15 for pixel in tiles[0]))
-        self.assertTrue(any(pixel > 15 for pixel in cpu.gpu_layers[1]))
-        for index, color in enumerate(palette[1:], start=32):
-            self.assertEqual(tuple(cpu.palette[index])[:3], color)
-        self.assertEqual(tuple(cpu.palette[2])[:3], (255, 48, 48))
-        self.assertEqual(tuple(cpu.palette[3])[:3], (48, 220, 64))
+        self.assertTrue(palette)
+        with self.assertRaisesRegex(ValueError, "JSON files are data"):
+            load_program_file(map_path)
 
     def test_maximum_map_renders_and_collides_beyond_signed_word_range(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"

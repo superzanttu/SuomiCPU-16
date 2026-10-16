@@ -25,14 +25,11 @@ def load_program_file(
                 / "modules" / "Tank-16" / "main.c"
             )
             if program_path.resolve() == tank16_main:
-                from tools.tank16_map_loader import compile_map_file
+                from tools.tank16_map_loader import compile_runtime_tank16
 
-                report("Compiling Tank-16 source with its default map")
-                image = compile_map_file(
-                    tank16_main.parent / "maps" / "FINLAND.json",
-                    randomize_rounds=True,
-                )
-                report("Tank-16 source, map, and tileset compiled into SC-16 image")
+                report("Compiling Tank-16 source and graphics assets")
+                image = compile_runtime_tank16()
+                report("Tank-16 source and graphics assets compiled into SC-16 image")
             else:
                 report(f"Compiling C source: {program_path.name}")
                 from tools.c_compiler import compile_file_with_assembly
@@ -44,20 +41,8 @@ def load_program_file(
         except (CCompilerError, OSError, ValueError) as exc:
             report(f"ERROR: C compilation failed: {exc}")
             raise
-    elif (
-        program_path.suffix.lower() == ".json" and
-        program_path.parent.name == "maps" and
-        program_path.parent.parent.name == "Tank-16"
-    ):
-        report(f"Loading Tank-16 map: {program_path.name}")
-        try:
-            from tools.tank16_map_loader import compile_map_file
-
-            image = compile_map_file(program_path)
-        except (CCompilerError, OSError, ValueError) as exc:
-            report(f"ERROR: Tank-16 map loading failed: {exc}")
-            raise
-        report("Tank-16 map and tileset compiled into SC-16 image")
+    elif program_path.suffix.lower() == ".json":
+        raise ValueError("JSON files are data; load them through the disk API")
     elif program_path.suffix.lower() == ".bin":
         report(f"Loading binary program: {program_path.name}")
         try:

@@ -290,6 +290,21 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(cpu.gpu_layers[3][10 * 640 + 324], 9)
         self.assertEqual(cpu.read_16(GPU_BASE + 14), 0)
 
+    def test_world_tiles_survive_deferred_tilemap_rendering(self):
+        cpu = run_c(
+            "unsigned char tile[256]; unsigned char map[1] = {0};\n"
+            "int main(void) {\n"
+            "  int i; for (i = 0; i < 256; i++) tile[i] = 5;\n"
+            "  gfx_tile_size(16); gfx_tile_upload(0, tile);\n"
+            "  gfx_tilemap(map, 1, 1, 0, 0);\n"
+            "  gfx_layer_select(LAYER_TILES); gfx_world_tile(0, 16, 0);\n"
+            "  gfx_present(); return 0;\n"
+            "}\n",
+        )
+
+        self.assertEqual(cpu.gpu_layers[1][0], 5)
+        self.assertEqual(cpu.gpu_layers[1][16], 5)
+
     def test_c_layer_sprite_and_tile_apis_program_hardware_state(self):
         cpu = run_c(
             "unsigned char sprite[4] = {0,5,6,0};\n"

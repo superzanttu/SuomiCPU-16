@@ -14,6 +14,7 @@ class DiskDevice:
     BLOCK_SIZE = 256
     MAX_BLOCKS = 0x10000
     DISK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8}\Z")
+    FILE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9_.-]+\Z")
 
     def __init__(self, storage_dir="disks"):
         root = Path(__file__).resolve().parent.parent
@@ -23,6 +24,7 @@ class DiskDevice:
         self.current_disk = None
         self.write_protected = False
         self.disk_data = {}
+        self.file_root = None
 
     @classmethod
     def _validate_id(cls, disk_id):
@@ -38,6 +40,25 @@ class DiskDevice:
         ):
             raise DiskDeviceError("disk blocks must contain exactly 256 bytes")
         return data
+
+    @classmethod
+    def _validate_file_path(cls, file_path):
+        if (
+            not isinstance(file_path, str)
+            or not file_path
+            or len(file_path) > 128
+            or "\\" in file_path
+            or file_path.startswith("/")
+        ):
+            raise DiskDeviceError("invalid virtual file path")
+        parts = file_path.split("/")
+        if any(
+            part in ("", ".", "..")
+            or not cls.FILE_COMPONENT_PATTERN.fullmatch(part)
+            for part in parts
+        ):
+            raise DiskDeviceError("invalid virtual file path")
+        return Path(*parts)
 
     def load_disk(self, disk_id):
         self._validate_id(disk_id)
@@ -90,6 +111,75 @@ class DiskDevice:
             )
         except OSError as exc:
             raise DiskDeviceError(f"cannot list virtual disks: {exc}") from exc
+
+    def list_files(self):
+        if self.file_root is None:
+            raise DiskDeviceError("the running module has no disk folder")
+        root = self.file_root
+        if not root.exists():
+            return []
+        try:
+            resolved_root = root.resolve()
+            names = []
+            for path in root.rglob("*"):
+                if not path.is_file() or not path.resolve().is_relative_to(
+                    resolved_root
+                ):
+                    continue
+                name = path.relative_to(root).as_posix()
+                try:
+                    self._validate_file_path(name)
+                except DiskDeviceError:
+                    continue
+                names.append(name)
+            return sorted(names)
+        except OSError as exc:
+            raise DiskDeviceError(
+                f"cannot list files on disk {self.current_disk}: {exc}"
+            ) from exc
+
+    def read_file(self, file_path, offset, length):
+        if self.file_root is None:
+            raise DiskDeviceError("the running module has no disk folder")
+        relative_path = self._validate_file_path(file_path)
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or not 0 <= offset <= 0xFFFFFFFF
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or not 0 <= length <= self.BLOCK_SIZE
+        ):
+            raise DiskDeviceError("invalid virtual file read range")
+        root = self.file_root
+        path = root / relative_path
+        try:
+            resolved_root = root.resolve()
+            if not path.resolve().is_relative_to(resolved_root):
+                raise DiskDeviceError("virtual file path escapes the disk")
+            with path.open("rb") as file_handle:
+                file_handle.seek(0, os.SEEK_END)
+                file_size = file_handle.tell()
+                if file_size > 0xFFFFFFFF:
+                    raise DiskDeviceError(
+                        f"virtual file {file_path!r} exceeds the 32-bit size limit"
+                    )
+                file_handle.seek(offset)
+                return file_handle.read(length), file_size
+        except FileNotFoundError as exc:
+            raise DiskDeviceError(
+                f"virtual file {file_path!r} does not exist"
+            ) from exc
+        except OSError as exc:
+            raise DiskDeviceError(
+                f"cannot read virtual file {file_path!r}: {exc}"
+            ) from exc
+
+    def set_file_root(self, root):
+        try:
+            self.file_root = Path(root).resolve()
+        except OSError as exc:
+            raise DiskDeviceError(f"cannot configure module disk folder: {exc}") from exc
 
     def is_protected(self, disk_id):
         self._validate_id(disk_id)

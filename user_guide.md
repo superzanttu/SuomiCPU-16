@@ -767,7 +767,7 @@ The target has no 64-bit integer type. `<stddef.h>` defines `size_t`,
 The string and memory routines, C-locale character routines, and several
 `<stdlib.h>` services are linked when referenced. These include integer and
 decimal-string conversions, `div`/`ldiv`, random numbers, and a bounded
-512-byte heap for `malloc`, `calloc`, `realloc`, and `free`. Allocation failure
+64-KiB heap for `malloc`, `calloc`, `realloc`, and `free`. Allocation failure
 returns `NULL` and reports `ENOMEM`; zero-size allocation returns `NULL`.
 `qsort` and `bsearch` are unavailable because callback function pointers are
 not supported. `exit(status)` and `abort()` halt the target; the emulator has
@@ -857,6 +857,33 @@ index is at `+10`, the RAM buffer offset at `+12`, and command results are at
 `+14`; `+16` reports status (`0` success, `1` operation error). Invalid IDs,
 absent media, malformed images, and write-protected writes set the error
 status. Disk IDs are exactly eight ASCII letters, digits, `_`, or `-`.
+
+Programs can also read host files from their own module's `disks/` directory,
+for example `modules/Tank-16/disks/maps/FINLAND.json`. File commands are
+independent of the mounted block disk and cannot access another module's files
+or paths outside this directory. Add `#include "disk.h"` to use
+`disk_read_file(path, offset, buffer, capacity, &file_size)` for byte chunks
+of up to 256 bytes, and
+`disk_list_files(index, path_buffer, capacity)` to enumerate
+files. The register protocol uses command `0x40` for a file-read chunk and
+`0x80` to list files. File offset is a 32-bit byte offset at `+18..+21`,
+absolute SC-16 path and buffer addresses are at `+22..+25` and `+26..+29`,
+transfer capacity is at `+30..+31`, and file size is returned at `+32..+35`.
+The returned byte count is at `+14`.
+Paths use `/`, are relative to the module disk folder, and are limited to 128
+ASCII characters. Chunk reads allow JSON documents of any size without
+requiring the whole file in guest memory. This does not add file-backed
+`stdio` streams; programs can process JSON incrementally with the chunk API.
+
+Tank-16 uses this generic API to load map JSON from
+`modules/Tank-16/disks/maps/` at round start. The first round prefers
+`FINLAND.json`; subsequent rounds randomly select among the JSON maps in that
+folder. Finite maps use the map editor's tile-grid format. An infinite map
+uses `"infinite": true`, a seed, row-major terrain tile IDs, and optional
+obstacle density and tile IDs; terrain and obstacles are generated
+deterministically from tile coordinates. Only graphics atlases are included in
+the Tank-16 executable, not map data. The map editor mirrors saved maps into
+the module's `disks/maps/` folder.
 
 `<stdio.h>` currently provides console `getchar`, `putchar`, `puts`, `gets`,
 `fgetc`, `fgets`, `fputc`, `fputs`, `printf`, `fprintf`, `vprintf`, and `vfprintf`.

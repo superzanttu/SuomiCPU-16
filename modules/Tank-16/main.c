@@ -1,6 +1,17 @@
 #include "suomi_gfx.h"
 #include "map_assets.h"
 #include "tank_sprite_rotations.h"
+#ifdef RUNTIME_MAP_LOADING
+#include <stdlib.h>
+#include <string.h>
+#include "disk.h"
+#endif
+
+#ifdef RUNTIME_MAP_LOADING
+#define RUNTIME_MAP_MAX_CELLS 10000UL
+unsigned char runtime_map_data[RUNTIME_MAP_MAX_CELLS];
+unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
+#endif
 
 #define MAP_TILE_PIXEL_SIZE 64
 #define MAX_SHOTS 12
@@ -42,6 +53,16 @@
 #define MAP_VARIANT_COUNT 1
 #endif
 
+#ifdef RUNTIME_MAP_LOADING
+#define world_tile(tile, x, y) gfx_world_tile_wide(tile, x, y)
+#define world_rect(x, y, width, height, color) gfx_world_rect_wide(x, y, width, height, color)
+#define world_particle(x, y, radius, color, opacity) gfx_world_particle_wide(x, y, radius, color, opacity)
+#define world_ammo(x, y) gfx_world_ammo_wide(x, y)
+typedef long WorldCoord;
+#define world_emitters(sites, count, tick) gfx_world_emitters_wide(sites, count, tick)
+#define mask_overlap_world(first, x, y, second, second_x, second_y) \
+    gfx_mask_overlap_wide(first, x, y, second, second_x, second_y)
+#else
 #if MAP_COLUMNS * MAP_TILE_PIXEL_SIZE <= 32767 && MAP_ROWS * MAP_TILE_PIXEL_SIZE <= 32767
 #define world_tile(tile, x, y) gfx_world_tile(tile, (int)(x), (int)(y))
 #define world_rect(x, y, width, height, color) gfx_world_rect((int)(x), (int)(y), width, height, color)
@@ -69,6 +90,7 @@ typedef long WorldCoord;
 #else
 #define mask_overlap_world(first, x, y, second, second_x, second_y) \
     gfx_mask_overlap_wide(first, x, y, second, second_x, second_y)
+#endif
 #endif
 
 typedef struct
@@ -155,6 +177,17 @@ int round_winner;
 int map_object_count = MAP_OBJECT_COUNT;
 int current_map_variant = -1;
 int round_map_selection_started;
+#ifdef RUNTIME_MAP_LOADING
+int map_infinite;
+unsigned long map_seed;
+unsigned char map_terrain_choices[16];
+int map_terrain_choice_count;
+unsigned char map_infinite_obstacles[16];
+int map_infinite_obstacle_count;
+int map_obstacle_density;
+int map_load_error;
+int map_debug_stage;
+#endif
 int previous_keys;
 int tank_sprite_slots[2];
 int hit_flash[2];
@@ -174,8 +207,549 @@ int directions_y[TANK_ROTATION_COUNT] = {
     -1000, -981, -924, -831, -707, -556, -383, -195, 0, 195, 383, 556, 707, 831, 924, 981,
     1000, 981, 924, 831, 707, 556, 383, 195, 0, -195, -383, -556, -707, -831, -924, -981};
 
+#ifdef RUNTIME_MAP_LOADING
+unsigned long map_hash(int row, int column)
+{
+    unsigned long value;
+
+    value = map_seed ^ (unsigned long)column * 2654435761UL;
+    value ^= (unsigned long)row * 2246822519UL;
+    value ^= value >> 13;
+    value *= 3266489917UL;
+    value ^= value >> 16;
+    return value;
+}
+
+void json_skip_space(char **cursor)
+{
+    while (**cursor == ' ' || **cursor == '\n' || **cursor == '\r' ||
+           **cursor == '\t' || **cursor == ',')
+        (*cursor)++;
+}
+
+void json_skip_whitespace(char **cursor)
+{
+    while (**cursor == ' ' || **cursor == '\n' || **cursor == '\r' ||
+           **cursor == '\t')
+        (*cursor)++;
+}
+
+char *json_value(char *json, char *key)
+{
+    char needle[32];
+    char *found;
+
+    needle[0] = '"';
+    strcpy(needle + 1, key);
+    strcat(needle, "\"");
+    found = strstr(json, needle);
+    if (found == 0)
+        return 0;
+    found = found + strlen(needle);
+    while (*found == ' ' || *found == '\t' || *found == '\r' ||
+           *found == '\n')
+        found++;
+    if (*found++ != ':')
+        return 0;
+    while (*found == ' ' || *found == '\t' || *found == '\r' ||
+           *found == '\n')
+        found++;
+    return found;
+}
+
+int json_string_is(char *value, char *expected)
+{
+    int length;
+
+    if (value == 0 || *value != '"')
+        return 0;
+    value++;
+    length = strlen(expected);
+    return strncmp(value, expected, length) == 0 && value[length] == '"';
+}
+
+int json_integer(char **cursor, int *value)
+{
+    int sign;
+    int result;
+    int digit;
+
+    json_skip_whitespace(cursor);
+    sign = 1;
+    if (**cursor == '-')
+    {
+        sign = -1;
+        (*cursor)++;
+    }
+    if (**cursor < '0' || **cursor > '9')
+        return 0;
+    result = 0;
+    while (**cursor >= '0' && **cursor <= '9')
+    {
+        digit = **cursor - '0';
+        if (result > (32767 - digit) / 10)
+            return 0;
+        result = result * 10 + digit;
+        (*cursor)++;
+    }
+    *value = sign * result;
+    return 1;
+}
+
+int json_unsigned_long(char **cursor, unsigned long *value)
+{
+    unsigned long result;
+    int digit;
+
+    json_skip_whitespace(cursor);
+    if (**cursor < '0' || **cursor > '9')
+        return 0;
+    result = 0;
+    while (**cursor >= '0' && **cursor <= '9')
+    {
+        digit = **cursor - '0';
+        if (result > (4294967295UL - (unsigned long)digit) / 10UL)
+            return 0;
+        result = result * 10UL + (unsigned long)digit;
+        (*cursor)++;
+    }
+    *value = result;
+    return 1;
+}
+
+int json_pair(char **cursor, int *tile_x, int *tile_y)
+{
+    json_skip_space(cursor);
+    if (**cursor != '[')
+        return 0;
+    (*cursor)++;
+    if (!json_integer(cursor, tile_x))
+        return 0;
+    json_skip_whitespace(cursor);
+    if (**cursor != ',')
+        return 0;
+    (*cursor)++;
+    if (!json_integer(cursor, tile_y))
+        return 0;
+    json_skip_whitespace(cursor);
+    if (**cursor != ']')
+        return 0;
+    (*cursor)++;
+    return 1;
+}
+
+int load_json_bytes(char *path, char **json, unsigned long *size)
+{
+    unsigned long offset;
+    int length;
+    int i;
+    unsigned long copied;
+
+    map_debug_stage = 41;
+    length = disk_read_file(path, 0, map_json_chunk, 256, size);
+    map_debug_stage = 42;
+    if (length < 0 || *size == 0 || *size > 67108864UL)
+        return 0;
+    *json = (char *)malloc(*size + 1);
+    map_debug_stage = 43;
+    if (*json == 0)
+        return 0;
+    map_debug_stage = 44;
+    offset = 0;
+    copied = 0;
+    while (offset < *size)
+    {
+        length = disk_read_file(path, offset, map_json_chunk, 256, size);
+        if (length <= 0)
+        {
+            map_debug_stage = 45;
+            free(*json);
+            *json = 0;
+            return 0;
+        }
+        for (i = 0; i < length; i++)
+            (*json)[offset + (unsigned long)i] = map_json_chunk[i];
+        offset += (unsigned long)length;
+        copied += length;
+    }
+    (*json)[copied] = 0;
+    map_debug_stage = 46;
+    return 1;
+}
+
+int map_dimensions(char *json, int *width, int *height)
+{
+    char *value;
+
+    value = json_value(json, "width");
+    if (value == 0)
+    {
+        map_debug_stage = 100 + (unsigned char)json[1];
+        return 0;
+    }
+    if (!json_integer(&value, width))
+    {
+        map_debug_stage = 52;
+        return 0;
+    }
+    value = json_value(json, "height");
+    if (value == 0)
+    {
+        map_debug_stage = 53;
+        return 0;
+    }
+    if (!json_integer(&value, height))
+    {
+        map_debug_stage = 54;
+        return 0;
+    }
+    map_debug_stage = 55;
+    return *width > 0 && *height > 0 &&
+           (unsigned long)*width * (unsigned long)*height <= 16777216UL;
+}
+
+int load_finite_map(char *json, int width, int height)
+{
+    char *cursor;
+    char *cell;
+    char *value;
+    int row;
+    int column;
+    int tile_x;
+    int tile_y;
+    int hp;
+    int removal;
+    unsigned long cells;
+    unsigned long index;
+    char *removal_text;
+
+    map_debug_stage = 8;
+    cells = (unsigned long)width * (unsigned long)height;
+    if (cells > RUNTIME_MAP_MAX_CELLS)
+        return 0;
+    map_data = runtime_map_data;
+    map_obstacles = runtime_map_obstacles;
+    memset(map_data, 0, cells);
+    memset(map_obstacles, 0, cells);
+    cursor = json_value(json, "tiles");
+    if (cursor == 0)
+        return 0;
+    json_skip_space(&cursor);
+    if (*cursor++ != '[')
+        return 0;
+    for (row = 0; row < height; row++)
+    {
+        json_skip_space(&cursor);
+        if (*cursor++ != '[')
+            return 0;
+        for (column = 0; column < width; column++)
+        {
+            if (!json_pair(&cursor, &tile_x, &tile_y) ||
+                tile_x < 0 || tile_x >= TERRAIN_COLUMNS ||
+                tile_y < 0 || tile_y >= TERRAIN_ROWS)
+                return 0;
+            map_data[(unsigned long)row * (unsigned long)width + column] =
+                (unsigned char)(tile_y * TERRAIN_COLUMNS + tile_x);
+        }
+        json_skip_space(&cursor);
+        if (*cursor++ != ']')
+            return 0;
+    }
+    json_skip_space(&cursor);
+    if (*cursor++ != ']')
+        return 0;
+
+    map_debug_stage = 9;
+    cursor = json_value(json, "obstacles");
+    if (cursor != 0)
+    {
+        json_skip_space(&cursor);
+        if (*cursor++ != '[')
+            return 0;
+        for (row = 0; row < height; row++)
+        {
+            json_skip_space(&cursor);
+            if (*cursor++ != '[')
+                return 0;
+            for (column = 0; column < width; column++)
+            {
+                json_skip_space(&cursor);
+                index = (unsigned long)row * (unsigned long)width +
+                        (unsigned long)column;
+                if (strncmp(cursor, "null", 4) == 0)
+                {
+                    cursor += 4;
+                    continue;
+                }
+                if (!json_pair(&cursor, &tile_x, &tile_y) ||
+                    tile_x < 0 || tile_x >= OBJECT_COLUMNS ||
+                    tile_y < 0 || tile_y >= OBJECT_ROWS)
+                    return 0;
+                map_obstacles[index] =
+                    (unsigned char)(OBJECT_TILE_BASE +
+                                    tile_y * OBJECT_COLUMNS + tile_x);
+            }
+            json_skip_space(&cursor);
+            if (*cursor++ != ']')
+                return 0;
+        }
+        json_skip_space(&cursor);
+        if (*cursor++ != ']')
+            return 0;
+    }
+
+    map_debug_stage = 10;
+    cursor = json_value(json, "objects");
+    if (cursor != 0)
+    {
+        json_skip_space(&cursor);
+        if (*cursor++ != '[')
+            return 0;
+        for (row = 0; row < height; row++)
+        {
+            json_skip_space(&cursor);
+            if (*cursor++ != '[')
+                return 0;
+            for (column = 0; column < width; column++)
+            {
+                json_skip_space(&cursor);
+                if (strncmp(cursor, "null", 4) == 0)
+                {
+                    cursor += 4;
+                    continue;
+                }
+                if (*cursor != '{' || map_object_count >= MAP_OBJECT_CAPACITY)
+                    return 0;
+                cell = cursor;
+                cursor = strstr(cursor, "\"tile\"");
+                if (cursor == 0)
+                    return 0;
+                cursor = strchr(cursor, ':');
+                if (cursor == 0)
+                    return 0;
+                cursor++;
+                if (!json_pair(&cursor, &tile_x, &tile_y) ||
+                    tile_x < 0 || tile_x >= OBJECT_COLUMNS ||
+                    tile_y < 0 || tile_y >= OBJECT_ROWS)
+                    return 0;
+                hp = -25;
+                removal = OBJECT_EXPLOSION;
+                value = json_value(cell, "hp_change");
+                if (value != 0 && !json_integer(&value, &hp))
+                    return 0;
+                value = json_value(cell, "removal");
+                if (value != 0 && *value == '"')
+                {
+                    removal_text = value + 1;
+                    if (strncmp(removal_text, "fixed", 5) == 0)
+                        removal = OBJECT_FIXED;
+                    else if (strncmp(removal_text, "disappear", 9) == 0)
+                        removal = OBJECT_DISAPPEAR;
+                }
+                map_object_x[map_object_count] = column;
+                map_object_y[map_object_count] = row;
+                map_object_tile[map_object_count] =
+                    OBJECT_TILE_BASE + tile_y * OBJECT_COLUMNS + tile_x;
+                cursor = cell;
+                cursor = strchr(cursor, '}');
+                if (cursor == 0)
+                    return 0;
+                map_object_hp[map_object_count] = hp;
+                map_object_removal[map_object_count] = removal;
+                map_object_count++;
+                cursor++;
+            }
+            json_skip_space(&cursor);
+            if (*cursor++ != ']')
+                return 0;
+        }
+        json_skip_space(&cursor);
+        if (*cursor++ != ']')
+            return 0;
+    }
+    map_columns = width;
+    map_rows = height;
+    map_infinite = 0;
+    map_debug_stage = 11;
+    return 1;
+}
+
+int load_infinite_map(char *json)
+{
+    char *value;
+    char *cursor;
+    int number;
+    unsigned long seed;
+
+    map_infinite = 1;
+    map_columns = 0;
+    map_rows = 0;
+    map_seed = 1;
+    map_terrain_choice_count = 0;
+    map_infinite_obstacle_count = 0;
+    map_obstacle_density = 0;
+    map_object_count = 0;
+    value = json_value(json, "seed");
+    if (value != 0)
+    {
+        if (!json_unsigned_long(&value, &seed))
+            return 0;
+        map_seed = seed;
+    }
+    value = json_value(json, "obstacle_density");
+    if (value != 0)
+    {
+        if (!json_integer(&value, &number) || number < 0)
+            return 0;
+        map_obstacle_density = number;
+    }
+    value = json_value(json, "terrain_tiles");
+    if (value != 0)
+    {
+        cursor = value;
+        json_skip_space(&cursor);
+        if (*cursor++ != '[')
+            return 0;
+        while (map_terrain_choice_count < 16)
+        {
+            json_skip_space(&cursor);
+            if (*cursor == ']')
+                break;
+            if (!json_integer(&cursor, &number) ||
+                number < 0 || number >= TERRAIN_TILE_COUNT)
+                return 0;
+            map_terrain_choices[map_terrain_choice_count++] =
+                (unsigned char)number;
+        }
+        json_skip_space(&cursor);
+        if (*cursor != ']')
+            return 0;
+    }
+    if (map_terrain_choice_count == 0)
+    {
+        map_terrain_choices[0] = 0;
+        map_terrain_choice_count = 1;
+    }
+    value = json_value(json, "obstacle_tiles");
+    if (value != 0)
+    {
+        cursor = value;
+        json_skip_space(&cursor);
+        if (*cursor++ != '[')
+            return 0;
+        while (map_infinite_obstacle_count < 16)
+        {
+            json_skip_space(&cursor);
+            if (*cursor == ']')
+                break;
+            if (!json_integer(&cursor, &number) ||
+                number < 0 || number >= OBJECT_COLUMNS * OBJECT_ROWS)
+                return 0;
+            map_infinite_obstacles[map_infinite_obstacle_count++] =
+                (unsigned char)(OBJECT_TILE_BASE + number);
+        }
+        json_skip_space(&cursor);
+        if (*cursor != ']')
+            return 0;
+    }
+    map_data = 0;
+    map_obstacles = 0;
+    return 1;
+}
+
+int load_map_path(char *path)
+{
+    char *json;
+    char *value;
+    unsigned long file_size;
+    int width;
+    int height;
+    int result;
+
+    map_debug_stage = 4;
+    if (!load_json_bytes(path, &json, &file_size))
+        return 0;
+    map_debug_stage = 5;
+    map_object_count = 0;
+    value = json_value(json, "infinite");
+    if (value != 0 && strncmp(value, "true", 4) == 0)
+    {
+        result = load_infinite_map(json);
+    }
+    else if (map_dimensions(json, &width, &height))
+    {
+        map_debug_stage = 6;
+        value = json_value(json, "tileset");
+        if (!json_string_is(value, "tiles_terrain.png"))
+        {
+            result = 0;
+        }
+        else
+        {
+            map_debug_stage = 7;
+            value = json_value(json, "objects_tileset");
+            result = value == 0 ||
+                     json_string_is(value, "tiles_objects.png");
+            if (result)
+                result = load_finite_map(json, width, height);
+        }
+    }
+    else
+    {
+        result = 0;
+    }
+    free(json);
+    return result;
+}
+
+int map_tile_at(int row, int column)
+{
+    unsigned long hash;
+
+    if (!map_infinite)
+    {
+        if (row < 0 || row >= map_rows || column < 0 || column >= map_columns)
+            return 0;
+        return map_data[(unsigned long)row * (unsigned long)map_columns +
+                        (unsigned long)column];
+    }
+    hash = map_hash(row, column);
+    return map_terrain_choices[hash % (unsigned int)map_terrain_choice_count];
+}
+
+int map_coordinate(WorldCoord position)
+{
+    int coordinate;
+
+    coordinate = (int)(position / MAP_TILE_PIXEL_SIZE);
+    if (position < 0 && position % MAP_TILE_PIXEL_SIZE != 0)
+        coordinate--;
+    return coordinate;
+}
+#endif
+
 int map_obstacle_at(int row, int column)
 {
+#ifdef RUNTIME_MAP_LOADING
+    unsigned long hash;
+
+    if (map_infinite)
+    {
+        if (map_obstacle_density <= 0 ||
+            map_infinite_obstacle_count == 0)
+            return 0;
+        hash = map_hash(row, column) ^ 0x9E3779B9UL;
+        if (hash % (unsigned int)map_obstacle_density != 0)
+            return 0;
+        return map_infinite_obstacles[
+            (hash >> 8) % (unsigned int)map_infinite_obstacle_count];
+    }
+    if (row < 0 || row >= map_rows ||
+        column < 0 || column >= map_columns)
+        return 0;
+    return map_obstacles[(unsigned long)row * (unsigned long)map_columns +
+                         (unsigned long)column];
+#else
     if (row < 0 || row >= MAP_ROWS ||
         column < 0 || column >= MAP_COLUMNS)
         return 0;
@@ -283,6 +857,7 @@ int map_obstacle_at(int row, int column)
 #endif
 #endif
 #endif
+#endif
     return 0;
 }
 
@@ -336,8 +911,135 @@ int effect_noise(int range)
     return (int)((effect_random >> 1) % (unsigned int)range);
 }
 
+#ifdef RUNTIME_MAP_LOADING
+int is_runtime_map_path(volatile char *path)
+{
+    int length;
+
+    if (path[0] != 'm' || path[1] != 'a' || path[2] != 'p' ||
+        path[3] != 's' || path[4] != '/')
+        return 0;
+    length = 0;
+    while (length < 129 && path[length] != 0)
+        length++;
+    return length > 5 && path[length - 5] == '.' &&
+           path[length - 4] == 'j' && path[length - 3] == 's' &&
+           path[length - 2] == 'o' && path[length - 1] == 'n';
+}
+
+int runtime_path_is_finland(volatile char *path)
+{
+    char expected[18];
+    int index;
+
+    strcpy(expected, "maps/FINLAND.json");
+    for (index = 0; index < 17; index++)
+    {
+        if (path[index] != expected[index])
+            return 0;
+    }
+    return path[17] == 0;
+}
+
+void use_default_infinite_map(void)
+{
+    map_data = 0;
+    map_obstacles = 0;
+    map_infinite = 1;
+    map_columns = 0;
+    map_rows = 0;
+    map_seed = effect_random;
+    map_terrain_choices[0] = 0;
+    map_terrain_choice_count = 1;
+    map_infinite_obstacle_count = 0;
+    map_obstacle_density = 0;
+    map_object_count = 0;
+}
+
+void select_runtime_round_map(void)
+{
+    int file_count;
+    int map_count;
+    int first_map;
+    int finland_map;
+    int chosen_map;
+    int map_index;
+    int i;
+
+    map_data = 0;
+    map_obstacles = 0;
+    map_object_count = 0;
+    map_load_error = 0;
+    file_count = disk_list_files(0, map_path_buffer,
+                                 sizeof(map_path_buffer));
+    map_count = 0;
+    first_map = -1;
+    finland_map = -1;
+    if (file_count > 0)
+    {
+        for (i = 0; i < file_count; i++)
+        {
+            if (disk_list_files(i, map_path_buffer,
+                                sizeof(map_path_buffer)) < 0 ||
+                !is_runtime_map_path(map_path_buffer))
+                continue;
+            if (first_map < 0)
+                first_map = map_count;
+            if (runtime_path_is_finland(map_path_buffer))
+                finland_map = map_count;
+            map_count++;
+        }
+    }
+    if (map_count > 0)
+    {
+        if (round_map_selection_started == 0 && finland_map >= 0)
+            chosen_map = finland_map;
+        else if (round_map_selection_started == 0)
+            chosen_map = first_map;
+        else
+            chosen_map = effect_noise(map_count);
+        map_index = 0;
+        map_selected_path[0] = 0;
+        for (i = 0; i < file_count; i++)
+        {
+            if (disk_list_files(i, map_path_buffer,
+                                sizeof(map_path_buffer)) < 0 ||
+                !is_runtime_map_path(map_path_buffer))
+                continue;
+            if (map_index++ == chosen_map)
+            {
+                map_index = 0;
+                while (map_path_buffer[map_index] != 0 &&
+                       map_index < 128)
+                {
+                    map_selected_path[map_index] =
+                        map_path_buffer[map_index];
+                    map_index++;
+                }
+                map_selected_path[map_index] = 0;
+                break;
+            }
+        }
+        if (map_selected_path[0] != 0 && load_map_path(map_selected_path))
+        {
+            round_map_selection_started++;
+            current_map_variant = round_map_selection_started - 1;
+            return;
+        }
+    }
+    use_default_infinite_map();
+    map_terrain_choices[0] = (unsigned char)(20 + map_debug_stage);
+    map_load_error = 1;
+    round_map_selection_started++;
+    current_map_variant = -1;
+}
+#endif
+
 void select_round_map(void)
 {
+#ifdef RUNTIME_MAP_LOADING
+    select_runtime_round_map();
+#else
 #if MAP_VARIANT_COUNT > 1
     int variant;
     int i;
@@ -372,6 +1074,7 @@ void select_round_map(void)
     current_map_variant = 0;
     map_object_count = MAP_OBJECT_COUNT;
 #endif
+#endif
 }
 
 void add_burn_site(WorldCoord x, WorldCoord y, int mask)
@@ -388,12 +1091,34 @@ void add_burn_site(WorldCoord x, WorldCoord y, int mask)
     {
         if (site->rounds == 0)
         {
+#ifdef RUNTIME_MAP_LOADING
+            if (map_infinite)
+            {
+                site->x = x;
+                site->y = y;
+            }
+            else
+            {
+#endif
             site->x = x < 0 ? 0 : x;
             site->y = y < 0 ? 0 : y;
-            if (site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
-                site->x = (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 1;
-            if (site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
-                site->y = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 1;
+#ifdef RUNTIME_MAP_LOADING
+            }
+#endif
+#ifdef RUNTIME_MAP_LOADING
+                    if (!map_infinite &&
+                        site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
+#else
+                    if (site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
+#endif
+                        site->x = (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 1;
+#ifdef RUNTIME_MAP_LOADING
+                    if (!map_infinite &&
+                        site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+#else
+                    if (site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+#endif
+                        site->y = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 1;
             site->rounds = BURN_ROUNDS + 1;
             site->mask = mask;
             if (index == burn_count)
@@ -646,10 +1371,21 @@ int obstacle_mask_collision(int mask, WorldCoord x, WorldCoord y, int size)
     int column;
     int tile;
 
+ #ifdef RUNTIME_MAP_LOADING
+    left = map_coordinate(x);
+    right = map_coordinate(x + size - 1);
+    top = map_coordinate(y);
+    bottom = map_coordinate(y + size - 1);
+ #else
     left = x / MAP_TILE_PIXEL_SIZE;
     right = (x + size - 1) / MAP_TILE_PIXEL_SIZE;
     top = y / MAP_TILE_PIXEL_SIZE;
     bottom = (y + size - 1) / MAP_TILE_PIXEL_SIZE;
+ #endif
+#ifdef RUNTIME_MAP_LOADING
+    if (!map_infinite)
+    {
+#endif
     if (left < 0)
         left = 0;
     if (top < 0)
@@ -658,6 +1394,9 @@ int obstacle_mask_collision(int mask, WorldCoord x, WorldCoord y, int size)
         right = MAP_COLUMNS - 1;
     if (bottom >= MAP_ROWS)
         bottom = MAP_ROWS - 1;
+#ifdef RUNTIME_MAP_LOADING
+    }
+#endif
     for (row = top; row <= bottom; row++)
     {
         for (column = left; column <= right; column++)
@@ -682,8 +1421,14 @@ int blocked(WorldCoord x, WorldCoord y, int tank_index)
 
     map_width = (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE;
     map_height = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE;
+#ifdef RUNTIME_MAP_LOADING
+    if (!map_infinite &&
+        (x < 16 || x > map_width - 16 ||
+         y < 16 || y > map_height - 16))
+#else
     if (x < 16 || x > map_width - 16 ||
         y < 16 || y > map_height - 16)
+#endif
     {
         return 1;
     }
@@ -741,6 +1486,7 @@ void start_round(void)
     int last_row;
     int first_column;
     int last_column;
+    int radius_limit;
 
     if (round_over)
         age_burn_sites();
@@ -754,39 +1500,98 @@ void start_round(void)
     tanks[1].y = -1000;
     for (player = 0; player < 2; player++)
     {
+#ifdef RUNTIME_MAP_LOADING
+        if (map_infinite)
+        {
+            target_x = player == 0 ? -128 : 128;
+            target_y = 0;
+            radius_limit = 12;
+        }
+        else
+        {
+#endif
         target_x = player == 0
                        ? (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE / 4
                        : (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE * 3 / 4;
         target_y = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE / 2;
+#ifdef RUNTIME_MAP_LOADING
+            radius_limit = MAP_COLUMNS + MAP_ROWS;
+        }
+#else
+        radius_limit = MAP_COLUMNS + MAP_ROWS;
+#endif
+#ifdef RUNTIME_MAP_LOADING
+        center_column = map_infinite
+                            ? map_coordinate(target_x)
+                            : (int)(target_x / MAP_TILE_PIXEL_SIZE);
+        center_row = map_infinite
+                         ? map_coordinate(target_y)
+                         : (int)(target_y / MAP_TILE_PIXEL_SIZE);
+#else
         center_column = target_x / MAP_TILE_PIXEL_SIZE;
         center_row = target_y / MAP_TILE_PIXEL_SIZE;
+#endif
         best_x = target_x;
         best_y = target_y;
         best_score = 32767;
         found = 0;
-        for (radius = 0;
-             radius < MAP_COLUMNS + MAP_ROWS && !found; radius++)
+        for (radius = 0; radius < radius_limit && !found; radius++)
         {
             first_row = center_row - radius;
+#ifdef RUNTIME_MAP_LOADING
+            if (!map_infinite)
+            {
+#endif
             if (first_row < 0)
                 first_row = 0;
+#ifdef RUNTIME_MAP_LOADING
+            }
+#endif
             last_row = center_row + radius;
+#ifdef RUNTIME_MAP_LOADING
+            if (!map_infinite)
+            {
+#endif
             if (last_row >= MAP_ROWS)
                 last_row = MAP_ROWS - 1;
+#ifdef RUNTIME_MAP_LOADING
+            }
+#endif
             first_column = center_column - radius;
+#ifdef RUNTIME_MAP_LOADING
+            if (!map_infinite)
+            {
+#endif
             if (first_column < 0)
                 first_column = 0;
+#ifdef RUNTIME_MAP_LOADING
+            }
+#endif
             last_column = center_column + radius;
+#ifdef RUNTIME_MAP_LOADING
+            if (!map_infinite)
+            {
+#endif
             if (last_column >= MAP_COLUMNS)
                 last_column = MAP_COLUMNS - 1;
+#ifdef RUNTIME_MAP_LOADING
+            }
+#endif
             for (row = first_row; row <= last_row; row++)
             {
                 for (column = first_column; column <= last_column; column++)
                 {
                     if (absolute_value(column - center_column) +
-                            absolute_value(row - center_row) != radius ||
-                        (player == 0 && column >= MAP_COLUMNS / 2) ||
+                            absolute_value(row - center_row) != radius)
+                        continue;
+#ifdef RUNTIME_MAP_LOADING
+                    if (!map_infinite &&
+                        ((player == 0 && column >= MAP_COLUMNS / 2) ||
+                         (player == 1 && column < MAP_COLUMNS / 2)))
+#else
+                    if ((player == 0 && column >= MAP_COLUMNS / 2) ||
                         (player == 1 && column < MAP_COLUMNS / 2))
+#endif
                         continue;
                     x = (WorldCoord)column * MAP_TILE_PIXEL_SIZE +
                         MAP_TILE_PIXEL_SIZE / 2;
@@ -1241,9 +2046,16 @@ void update_particles(void)
         move = particle->remainder_y / 4;
         particle->y += move;
         particle->remainder_y -= move * 4;
+#ifdef RUNTIME_MAP_LOADING
+        if (!map_infinite &&
+            (particle->x < 0 || particle->y < 0 ||
+             particle->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE ||
+             particle->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE))
+#else
         if (particle->x < 0 || particle->y < 0 ||
             particle->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE ||
             particle->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+#endif
             particle->life = 0;
     }
     effect_tick = (effect_tick + 1) % 4320;
@@ -1256,10 +2068,18 @@ int shot_collision(int index)
     Shot *shot;
 
     shot = &shots[index];
+#ifdef RUNTIME_MAP_LOADING
+    if ((!map_infinite &&
+         (shot->x < 3 || shot->y < 3 ||
+          shot->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 3 ||
+          shot->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 3)) ||
+        obstacle_mask_collision(GFX_MASK_AMMO, shot->x - 3, shot->y - 3, 7))
+#else
     if (shot->x < 3 || shot->y < 3 ||
         shot->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 3 ||
         shot->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 3 ||
         obstacle_mask_collision(GFX_MASK_AMMO, shot->x - 3, shot->y - 3, 7))
+#endif
         return 1;
     player = 1 - shot->owner;
     if (tanks[player].health > 0 &&
@@ -1442,6 +2262,12 @@ WorldCoord camera_origin(WorldCoord position, int viewport_size, WorldCoord map_
 
 WorldCoord tank_camera_x(int player)
 {
+#ifdef RUNTIME_MAP_LOADING
+    if (map_infinite)
+        return tanks[player].x - 160 +
+               (effect_tick % 2 == 0 ? tanks[player].shake / 3
+                                     : -tanks[player].shake / 3);
+#endif
     return camera_origin(tanks[player].x, 320,
                          (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE) +
            (effect_tick % 2 == 0 ? tanks[player].shake / 3 : -tanks[player].shake / 3);
@@ -1449,6 +2275,12 @@ WorldCoord tank_camera_x(int player)
 
 WorldCoord tank_camera_y(int player)
 {
+#ifdef RUNTIME_MAP_LOADING
+    if (map_infinite)
+        return tanks[player].y - 240 +
+               (effect_tick % 3 == 0 ? tanks[player].shake / 4
+                                     : -tanks[player].shake / 4);
+#endif
     return camera_origin(tanks[player].y, 480,
                          (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE) +
            (effect_tick % 3 == 0 ? tanks[player].shake / 4 : -tanks[player].shake / 4);
@@ -1464,10 +2296,21 @@ void draw_map_obstacles(WorldCoord camera_x, WorldCoord camera_y)
     int row;
     int tile;
 
+ #ifdef RUNTIME_MAP_LOADING
+    first_column = map_coordinate(camera_x);
+    first_row = map_coordinate(camera_y);
+    last_column = map_coordinate(camera_x + 319);
+    last_row = map_coordinate(camera_y + 479);
+ #else
     first_column = camera_x / MAP_TILE_PIXEL_SIZE;
     first_row = camera_y / MAP_TILE_PIXEL_SIZE;
     last_column = (camera_x + 319) / MAP_TILE_PIXEL_SIZE;
     last_row = (camera_y + 479) / MAP_TILE_PIXEL_SIZE;
+ #endif
+#ifdef RUNTIME_MAP_LOADING
+    if (!map_infinite)
+    {
+#endif
     if (first_column < 0)
         first_column = 0;
     if (first_row < 0)
@@ -1476,6 +2319,9 @@ void draw_map_obstacles(WorldCoord camera_x, WorldCoord camera_y)
         last_column = MAP_COLUMNS - 1;
     if (last_row >= MAP_ROWS)
         last_row = MAP_ROWS - 1;
+#ifdef RUNTIME_MAP_LOADING
+    }
+#endif
     for (row = first_row; row <= last_row; row++)
     {
         for (column = first_column; column <= last_column; column++)
@@ -1490,6 +2336,43 @@ void draw_map_obstacles(WorldCoord camera_x, WorldCoord camera_y)
     }
 }
 
+#ifdef RUNTIME_MAP_LOADING
+void draw_runtime_terrain(WorldCoord camera_x, WorldCoord camera_y)
+{
+    int first_column;
+    int last_column;
+    int first_row;
+    int last_row;
+    int row;
+    int column;
+
+    first_column = map_coordinate(camera_x);
+    first_row = map_coordinate(camera_y);
+    last_column = map_coordinate(camera_x + 319);
+    last_row = map_coordinate(camera_y + 479);
+    if (!map_infinite)
+    {
+        if (first_column < 0)
+            first_column = 0;
+        if (first_row < 0)
+            first_row = 0;
+        if (last_column >= MAP_COLUMNS)
+            last_column = MAP_COLUMNS - 1;
+        if (last_row >= MAP_ROWS)
+            last_row = MAP_ROWS - 1;
+    }
+    for (row = first_row; row <= last_row; row++)
+    {
+        for (column = first_column; column <= last_column; column++)
+        {
+            world_tile(map_tile_at(row, column),
+                       (WorldCoord)column * MAP_TILE_PIXEL_SIZE,
+                       (WorldCoord)row * MAP_TILE_PIXEL_SIZE);
+        }
+    }
+}
+#endif
+
 void draw_ground(void)
 {
     int viewport;
@@ -1499,6 +2382,13 @@ void draw_ground(void)
     int offset_x;
     int offset_y;
 
+    gfx_layer_select(LAYER_TILES);
+    gfx_clear(0);
+#ifdef RUNTIME_MAP_LOADING
+    for (viewport = 0; viewport < 2; viewport++)
+        draw_runtime_terrain(tank_camera_x(viewport),
+                             tank_camera_y(viewport));
+#endif
     gfx_layer_select(LAYER_3D);
     gfx_clear(0);
     for (i = 0; i < track_count; i++)
@@ -1671,6 +2561,10 @@ void draw_hud(void)
     gfx_rect(398, 19, absolute_value(tanks[1].throttle) * 2, 4, YELLOW);
     if (burn_capacity_error)
         gfx_text(240, 34, "FIRE CAPACITY REACHED", RED);
+#ifdef RUNTIME_MAP_LOADING
+    if (map_load_error)
+        gfx_text(268, 34, "MAP LOAD FAILED", RED);
+#endif
 }
 
 void draw_game(void)
@@ -1743,8 +2637,10 @@ int main(void)
     gfx_tile_size(MAP_TILE_PIXEL_SIZE);
     upload_terrain_tiles();
     collision_assets_ready = 1;
+#ifndef RUNTIME_MAP_LOADING
     gfx_layer_select(LAYER_TILES);
     gfx_tilemap(map_data, MAP_COLUMNS, MAP_ROWS, 0, 0);
+#endif
     wins[0] = 0;
     wins[1] = 0;
     previous_keys = 0;
