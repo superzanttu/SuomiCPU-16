@@ -295,7 +295,7 @@ class BIOSBootTests(unittest.TestCase):
             asm_path.write_text("HALT\n")
             assembly_size = asm_path.stat().st_size
             image = AssemblyImage((MemorySegment(0, b"\x00\x01"),), 0)
-            with patch("src.SuomiCPU.assemble_file", return_value=image):
+            with patch("src.program_loader.assemble_file", return_value=image):
                 loaded = load_program_file(asm_path, messages.append)
 
         self.assertIs(loaded, image)
@@ -306,8 +306,28 @@ class BIOSBootTests(unittest.TestCase):
                 f"Assembly source file size: {assembly_size} bytes",
                 "Assembly complete; SC-16 image ready",
                 "Program image: 2 bytes across 1 segments; address span 2 bytes; "
-                "memory capacity 524288 bytes",
+                "memory capacity 1073741824 bytes",
             ],
+        )
+
+    def test_default_tank_module_uses_random_round_map_pool(self):
+        from src.SuomiCPU import load_program_file
+
+        main_path = (
+            Path(__file__).resolve().parent.parent
+            / "modules" / "Tank-16" / "main.c"
+        )
+        image = AssemblyImage((MemorySegment(0, b"\x00\x01"),), 0)
+        with patch(
+            "tools.tank16_map_loader.compile_map_file",
+            return_value=image,
+        ) as compile_map:
+            loaded = load_program_file(main_path)
+
+        self.assertIs(loaded, image)
+        compile_map.assert_called_once_with(
+            main_path.parent / "maps" / "FINLAND.json",
+            randomize_rounds=True,
         )
 
 

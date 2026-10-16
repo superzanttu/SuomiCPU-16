@@ -12,7 +12,8 @@ from c_compiler import GLOBAL_BASE, compile_source
 from gfx_harness import ROOT, layer_pixel, make_cpu, run_frame
 from src.SuomiCPU import KEYS_ADDR, load_program_file
 from tools.tank16_map_loader import (
-    build_map_header, load_map_assets, map_tile_pixel_size,
+    build_map_header, discover_round_maps, load_map_assets,
+    map_tile_pixel_size,
 )
 
 
@@ -718,6 +719,43 @@ class Tank16Tests(unittest.TestCase):
         self.assertLess(player_two_x, map_width)
         self.assertLess(player_one_y, map_height)
         self.assertLess(player_two_y, map_height)
+
+    def test_round_start_switches_between_bundled_compatible_maps(self):
+        game_dir = ROOT / "modules" / "Tank-16"
+        first_map = game_dir / "maps" / "FINLAND.json"
+        second_map = game_dir / "maps" / "100.json"
+        self.assertIn(second_map, discover_round_maps(first_map))
+        header = build_map_header(first_map, [second_map])
+        source_path = game_dir / "main.c"
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', header, 1
+        )
+        test_source = (
+            "int main(void) {\n"
+            "  current_map_variant = -1; effect_random = 1; select_round_map();\n"
+            "  results[0] = current_map_variant; results[1] = map_data[0];\n"
+            "  results[2] = map_object_count;\n"
+            "  effect_random = 1;\n"
+            "  select_round_map();\n"
+            "  results[3] = current_map_variant; results[4] = map_data[0];\n"
+            "  results[5] = map_object_count;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        image = compile_source(
+            "int results[6];\nint main(void);\n" + game_source + test_source,
+            str(source_path),
+        )
+        cpu = make_cpu(image)
+        for _ in range(100):
+            run_frame(cpu)
+            if not cpu.running:
+                break
+        self.assertFalse(cpu.running)
+        results = [
+            cpu.read_16(GLOBAL_BASE + index * 2) for index in range(6)
+        ]
+        self.assertEqual(results, [0, 40, 0, 1, 0, 0])
 
     def test_map_file_loads_its_tiles_and_tileset_into_the_game(self):
         map_path = ROOT / "modules" / "Tank-16" / "maps" / "PERUS-1.json"

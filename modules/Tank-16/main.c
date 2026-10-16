@@ -38,6 +38,10 @@
 #define PARTICLE_FLAME 2
 #define PARTICLE_DEBRIS 3
 
+#ifndef MAP_VARIANT_COUNT
+#define MAP_VARIANT_COUNT 1
+#endif
+
 #if MAP_COLUMNS * MAP_TILE_PIXEL_SIZE <= 32767 && MAP_ROWS * MAP_TILE_PIXEL_SIZE <= 32767
 #define world_tile(tile, x, y) gfx_world_tile(tile, (int)(x), (int)(y))
 #define world_rect(x, y, width, height, color) gfx_world_rect((int)(x), (int)(y), width, height, color)
@@ -148,6 +152,9 @@ int round_frames;
 int round_delay;
 int round_over;
 int round_winner;
+int map_object_count = MAP_OBJECT_COUNT;
+int current_map_variant = -1;
+int round_map_selection_started;
 int previous_keys;
 int tank_sprite_slots[2];
 int hit_flash[2];
@@ -327,6 +334,44 @@ int effect_noise(int range)
 {
     effect_random = effect_random * 25173 + 13849;
     return (int)((effect_random >> 1) % (unsigned int)range);
+}
+
+void select_round_map(void)
+{
+#if MAP_VARIANT_COUNT > 1
+    int variant;
+    int i;
+
+    if (round_map_selection_started == 0)
+    {
+        variant = 0;
+        round_map_selection_started = 1;
+    }
+    else
+    {
+        variant = effect_noise(MAP_VARIANT_COUNT);
+    }
+    current_map_variant = variant;
+    for (i = 0; i < MAP_CELLS; i++)
+    {
+        map_data[i] = map_variant_data[variant][i];
+        map_obstacles[i] = map_variant_obstacles[variant][i];
+    }
+    map_object_count = map_variant_object_count[variant];
+    for (i = 0; i < MAP_OBJECT_CAPACITY; i++)
+    {
+        map_object_x[i] = map_variant_object_x[variant][i];
+        map_object_y[i] = map_variant_object_y[variant][i];
+        map_object_tile[i] = map_variant_object_tile[variant][i];
+        map_object_hp[i] = map_variant_object_hp[variant][i];
+        map_object_removal[i] = map_variant_object_removal[variant][i];
+    }
+    gfx_layer_select(LAYER_TILES);
+    gfx_tilemap(map_data, MAP_COLUMNS, MAP_ROWS, 0, 0);
+#else
+    current_map_variant = 0;
+    map_object_count = MAP_OBJECT_COUNT;
+#endif
 }
 
 void add_burn_site(WorldCoord x, WorldCoord y, int mask)
@@ -699,6 +744,7 @@ void start_round(void)
 
     if (round_over)
         age_burn_sites();
+    select_round_map();
     prepare_collision_assets();
     tanks[0].direction = 8;
     tanks[1].direction = 24;
@@ -796,7 +842,7 @@ void start_round(void)
         particles[i].life = 0;
     }
     next_particle = 0;
-    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    for (i = 0; i < map_object_count; i++)
     {
         object_active[i] = 1;
         object_contacts[i] = 0;
@@ -1082,7 +1128,7 @@ void update_objects(void)
     int contacts;
     int mask;
 
-    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    for (i = 0; i < map_object_count; i++)
     {
         if (!object_active[i])
         {
@@ -1126,7 +1172,7 @@ void update_object_effects(void)
 {
     int i;
 
-    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    for (i = 0; i < map_object_count; i++)
     {
         if (object_explosion[i] > 0)
         {
@@ -1226,7 +1272,7 @@ int shot_collision(int index)
         change_health(player, -10);
         return 1;
     }
-    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    for (i = 0; i < map_object_count; i++)
     {
         if (object_active[i] &&
             gfx_mask_overlap_wide(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
@@ -1470,7 +1516,7 @@ void draw_ground(void)
         camera_y = tank_camera_y(viewport);
         draw_map_obstacles(camera_x, camera_y);
     }
-    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    for (i = 0; i < map_object_count; i++)
     {
         if (object_active[i])
         {
@@ -1555,7 +1601,7 @@ void draw_hud(void)
         }
     }
     draw_combat_feedback();
-    for (i = 0; i < MAP_OBJECT_COUNT; i++)
+    for (i = 0; i < map_object_count; i++)
     {
         if (object_explosion[i] > EXPLOSION_FRAMES - 4)
         {

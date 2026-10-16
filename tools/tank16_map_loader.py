@@ -160,7 +160,9 @@ def load_map_assets(
     return map_data, tiles, palette, (columns, rows, tile_size)
 
 
-def build_map_header(map_path: Path) -> str:
+def build_map_header(
+    map_path: Path, round_map_paths: list[Path] | None = None,
+) -> str:
     map_data, tile_data, palette, dimensions = load_map_assets(map_path)
     columns, _, tile_size = dimensions
     map_values = [
@@ -168,6 +170,32 @@ def build_map_header(map_path: Path) -> str:
         for row in map_data["tiles"]
         for tile_x, tile_y in row
     ]
+    editor = runpy.run_path(str(EDITOR_PATH))
+    round_maps = [map_data]
+    for round_map_path in round_map_paths or ():
+        round_map = editor["load_map"](Path(round_map_path))
+        if (round_map["width"], round_map["height"], round_map["tileset"]) != (
+            map_data["width"], map_data["height"], map_data["tileset"],
+        ):
+            raise ValueError(
+                f"Round map {round_map_path} must match the selected map's "
+                "dimensions and terrain tileset"
+            )
+        if (
+            object_tile_coordinates(round_map) and
+            round_map["objects_tileset"] != map_data["objects_tileset"]
+        ):
+            raise ValueError(
+                f"Round map {round_map_path} uses a different object tileset"
+            )
+        if not set(object_tile_coordinates(round_map)).issubset(
+            object_tile_coordinates(map_data)
+        ):
+            raise ValueError(
+                f"Round map {round_map_path} uses object tiles not included "
+                "by the selected map"
+            )
+        round_maps.append(round_map)
 
     def format_array(values: list[int], width: int) -> str:
         return ",\n".join(
@@ -213,13 +241,19 @@ def build_map_header(map_path: Path) -> str:
         for y, row in enumerate(map_data["objects"])
         for x, cell in enumerate(row) if cell is not None
     ]
+    map_object_capacity = max(
+        1,
+        *(sum(cell is not None for row in round_map["objects"] for cell in row)
+          for round_map in round_maps),
+    )
     layer_header = (
+        "#define MAP_VARIANT_COUNT %d\n"
         "#define MAP_OBJECT_COUNT %d\n"
         "#define MAP_OBJECT_CAPACITY %d\n"
         "#define OBJECT_FIXED 0\n"
         "#define OBJECT_EXPLOSION 1\n"
         "#define OBJECT_DISAPPEAR 2\n"
-    ) % (len(objects), max(1, len(objects)))
+    ) % (len(round_maps), len(objects), map_object_capacity)
     if len(obstacle_tiles) <= 32768:
         layer_header += (
             "unsigned char map_obstacles[MAP_CELLS] = {\n%s\n};\n"
@@ -252,6 +286,74 @@ def build_map_header(map_path: Path) -> str:
             "int map_object_%s[MAP_OBJECT_CAPACITY] = {\n%s\n};\n"
             % (name, format_array(values or [0], 16))
         )
+    if len(round_maps) > 1:
+        variant_map_values = []
+        variant_obstacles = []
+        variant_objects = {name: [] for name in fields}
+        variant_object_counts = []
+        for round_map in round_maps:
+            variant_map_values.append([
+                tile_y * columns + tile_x
+                for row in round_map["tiles"]
+                for tile_x, tile_y in row
+            ])
+            variant_obstacles.append([
+                0 if cell is None else object_ids[tuple(cell)]
+                for row in round_map["obstacles"] for cell in row
+            ])
+            round_objects = [
+                (x, y, cell)
+                for y, row in enumerate(round_map["objects"])
+                for x, cell in enumerate(row) if cell is not None
+            ]
+            variant_object_counts.append(len(round_objects))
+            round_fields = {
+                "x": [x for x, _, _ in round_objects],
+                "y": [y for _, y, _ in round_objects],
+                "tile": [
+                    object_ids[tuple(cell["tile"])]
+                    for _, _, cell in round_objects
+                ],
+                "hp": [cell["hp_change"] for _, _, cell in round_objects],
+                "removal": [
+                    OBJECT_REMOVAL_TYPES.index(cell["removal"])
+                    for _, _, cell in round_objects
+                ],
+            }
+            for name, values in round_fields.items():
+                variant_objects[name].append(
+                    values + [0] * (map_object_capacity - len(values))
+                )
+        layer_header += (
+            "unsigned char map_variant_data[MAP_VARIANT_COUNT][MAP_CELLS] = {\n%s\n};\n"
+            % ",\n".join(
+                "    {%s}" % format_array(values, 16).replace("\n", "\n     ")
+                for values in variant_map_values
+            )
+        )
+        layer_header += (
+            "unsigned char map_variant_obstacles[MAP_VARIANT_COUNT][MAP_CELLS] = {\n%s\n};\n"
+            % ",\n".join(
+                "    {%s}" % format_array(values, 16).replace("\n", "\n     ")
+                for values in variant_obstacles
+            )
+        )
+        layer_header += (
+            "int map_variant_object_count[MAP_VARIANT_COUNT] = {%s};\n"
+            % ", ".join(str(count) for count in variant_object_counts)
+        )
+        for name, values in variant_objects.items():
+            layer_header += (
+                "int map_variant_object_%s[MAP_VARIANT_COUNT][MAP_OBJECT_CAPACITY] = {\n%s\n};\n"
+                % (
+                    name,
+                    ",\n".join(
+                        "    {%s}" % format_array(row, 16).replace(
+                            "\n", "\n     ")
+                        for row in values
+                    ),
+                )
+            )
     return (
         "#define MAP_COLUMNS %d\n"
         "#define MAP_ROWS %d\n"
@@ -285,10 +387,53 @@ def build_map_header(map_path: Path) -> str:
     )
 
 
-def compile_map_file(map_path: Path):
+def discover_round_maps(map_path: Path) -> list[Path]:
+    editor = runpy.run_path(str(EDITOR_PATH))
+    selected_map = editor["load_map"](Path(map_path))
+    selected_object_tiles = set(object_tile_coordinates(selected_map))
+    compatible_maps = []
+    for candidate in sorted((GAME_DIR / "maps").glob("*.json")):
+        if candidate.resolve() == Path(map_path).resolve():
+            continue
+        with candidate.open(encoding="utf-8") as map_file:
+            header = map_file.read(1024)
+        width = re.search(r'"width"\s*:\s*(\d+)', header)
+        height = re.search(r'"height"\s*:\s*(\d+)', header)
+        tileset = re.search(r'"tileset"\s*:\s*"([^"]+)"', header)
+        if width is None or height is None or tileset is None:
+            continue
+        if (
+            int(width.group(1)) != selected_map["width"] or
+            int(height.group(1)) != selected_map["height"] or
+            tileset.group(1) != selected_map["tileset"]
+        ):
+            continue
+        candidate_map = editor["load_map"](candidate)
+        if (
+            (
+                not object_tile_coordinates(candidate_map) or
+                candidate_map["objects_tileset"] ==
+                selected_map["objects_tileset"]
+            ) and
+            set(object_tile_coordinates(candidate_map)).issubset(
+                selected_object_tiles
+            )
+        ):
+            compatible_maps.append(candidate)
+    return compatible_maps
+
+
+def compile_map_file(map_path: Path, randomize_rounds: bool = False):
     source = MAIN_PATH.read_text(encoding="utf-8")
     include = '#include "map_assets.h"'
     if source.count(include) != 1:
         raise ValueError("Tank-16 main.c must include map_assets.h exactly once")
-    source = source.replace(include, build_map_header(Path(map_path)), 1)
+    round_map_paths = (
+        discover_round_maps(Path(map_path)) if randomize_rounds else []
+    )
+    source = source.replace(
+        include,
+        build_map_header(Path(map_path), round_map_paths),
+        1,
+    )
     return compile_source(source, str(MAIN_PATH))

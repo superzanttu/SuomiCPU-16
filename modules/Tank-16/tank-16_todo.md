@@ -11,6 +11,7 @@
 - [x] End a round when a player's health reaches zero.
 - [x] Build the screen-sized map from 16×16 runtime terrain tiles.
 - [x] Load editor JSON maps and their named terrain tileset when Tank-16 is started with a map file.
+- [x] Use `maps/FINLAND.json` for the first round, then randomly select a compatible map before each later round when Tank-16 is started from the module selector.
 - [x] Preserve the tileset's source RGB colors through per-program palette entries.
 - [ ] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
 - [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.

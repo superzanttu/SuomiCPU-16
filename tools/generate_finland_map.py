@@ -14,6 +14,11 @@ WATER_TILE_BASE = 40
 SOURCE_BASE = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
 COUNTRIES_SOURCE = SOURCE_BASE + "ne_10m_admin_0_countries.geojson"
 LAKES_SOURCE = SOURCE_BASE + "ne_10m_lakes.geojson"
+ROADS_SOURCE = SOURCE_BASE + "ne_10m_roads.geojson"
+ROAD_TILE_BY_CONNECTIONS = {
+    1: 19, 2: 9, 3: 15, 4: 1, 5: 1, 6: 13, 7: 3,
+    8: 2, 9: 16, 10: 2, 11: 6, 12: 14, 13: 4, 14: 5, 15: 11,
+}
 
 
 def project(longitude: float, latitude: float) -> tuple[float, float]:
@@ -103,11 +108,17 @@ def extend_atlas(path: Path = ATLAS_PATH) -> None:
 
 def generate_map(countries_path: Path, lakes_path: Path,
                  output: Path, size: int = 1000,
-                 preview: Path | None = None) -> dict:
+                 preview: Path | None = None,
+                 roads_path: Path | None = None) -> dict:
     if not 1 <= size <= 1024:
         raise ValueError("Map size must be between 1 and 1024 tiles")
     countries = json.loads(countries_path.read_text(encoding="utf-8"))
     lakes = json.loads(lakes_path.read_text(encoding="utf-8"))
+    roads = (
+        json.loads(roads_path.read_text(encoding="utf-8"))
+        if roads_path is not None else None
+    )
+    road_source = ROADS_SOURCE if roads is not None else None
     finland = next(feature for feature in countries["features"]
                    if feature["properties"].get("ADMIN") == "Finland")
     points = [project(*point[:2])
@@ -151,24 +162,81 @@ def generate_map(countries_path: Path, lakes_path: Path,
     draw_geometry(national, finland["geometry"], 1)
     for feature in lakes["features"]:
         draw_geometry(water, feature["geometry"], 1)
+    road_cells = pygame.Surface((size, size), depth=8)
+    road_feature_count = 0
+    if roads is not None:
+        for feature in roads["features"]:
+            geometry = feature["geometry"]
+            if geometry["type"] == "LineString":
+                lines = [geometry["coordinates"]]
+            elif geometry["type"] == "MultiLineString":
+                lines = geometry["coordinates"]
+            else:
+                continue
+            feature_drawn = False
+            for line in lines:
+                if not any(
+                    18 <= point[0] <= 34 and 59 <= point[1] <= 72
+                    for point in line
+                ):
+                    continue
+                projected = [pixel(point) for point in line]
+                if len(projected) < 2:
+                    continue
+                if (
+                    max(point[0] for point in projected) < 0 or
+                    min(point[0] for point in projected) >= size or
+                    max(point[1] for point in projected) < 0 or
+                    min(point[1] for point in projected) >= size
+                ):
+                    continue
+                pygame.draw.lines(road_cells, 1, False, projected, 1)
+                feature_drawn = True
+            road_feature_count += int(feature_drawn)
     land_pixels = pygame.image.tobytes(land, "P")
     finland_pixels = pygame.image.tobytes(national, "P")
     lake_pixels = pygame.image.tobytes(water, "P")
+    road_pixels = pygame.image.tobytes(road_cells, "P")
     dry = bytes(1 if ground and not lake else 0
                 for ground, lake in zip(land_pixels, lake_pixels))
+    finland_roads = bytes(
+        1 if road and ground and national
+        else 0
+        for road, ground, national in zip(
+            road_pixels, dry, finland_pixels)
+    )
     tiles = []
-    counts = {"finland_land": 0, "neighbor_land": 0, "water": 0}
+    counts = {
+        "finland_land": 0, "neighbor_land": 0, "water": 0,
+        "road_tiles": 0,
+    }
     for y in range(size):
         row = []
         for x in range(size):
             position = y * size + x
             if dry[position]:
                 if finland_pixels[position]:
-                    tile = [0, 0]
                     counts["finland_land"] += 1
+                    base = 0
                 else:
-                    tile = [0, 2]
                     counts["neighbor_land"] += 1
+                    base = 20
+                if finland_roads[position]:
+                    connections = (
+                        (1 if y > 0 and finland_roads[position - size] else 0) |
+                        (2 if x + 1 < size and finland_roads[position + 1] else 0) |
+                        (4 if y + 1 < size and finland_roads[position + size] else 0) |
+                        (8 if x > 0 and finland_roads[position - 1] else 0)
+                    )
+                    road_tile = ROAD_TILE_BY_CONNECTIONS.get(connections)
+                    if road_tile is not None:
+                        tile_id = base + road_tile
+                        tile = [tile_id % 10, tile_id // 10]
+                        counts["road_tiles"] += 1
+                    else:
+                        tile = [0, 0] if base == 0 else [0, 2]
+                else:
+                    tile = [0, 0] if base == 0 else [0, 2]
             else:
                 neighbors = (
                     (1 if y > 0 and dry[position - size] else 0) |
@@ -181,8 +249,11 @@ def generate_map(countries_path: Path, lakes_path: Path,
             row.append(tile)
         tiles.append(row)
     metadata = {
-        "source": "Natural Earth 1:10m country boundaries and lakes (public domain)",
-        "source_urls": [COUNTRIES_SOURCE, LAKES_SOURCE],
+        "source": "Natural Earth 1:10m country boundaries, lakes, and roads (public domain)",
+        "source_urls": [
+            COUNTRIES_SOURCE, LAKES_SOURCE,
+            *([ROADS_SOURCE] if roads is not None else []),
+        ],
         "projection": "Spherical Lambert azimuthal equal-area, center 26E 64.5N",
         "earth_radius_km": 6371.0088,
         "projected_bounds_km": [left, top - span, left + span, top],
@@ -192,9 +263,11 @@ def generate_map(countries_path: Path, lakes_path: Path,
                    "water_tile_ids": list(range(40, 56)),
                    "shore_land_neighbor_bits": {"north": 1, "east": 2, "south": 4, "west": 8}},
         "tile_counts": counts,
+        "roads_source": road_source,
+        "road_features": road_feature_count,
     }
     document = {
-        "format_version": 1, "name": "SUOMI", "width": size, "height": size,
+        "format_version": 1, "name": "FINLAND", "width": size, "height": size,
         "tile_size": 64, "tileset": "tiles_terrain.png",
         "objects_tileset": "tiles_objects.png", "geography": metadata,
         "tiles": tiles,
@@ -212,16 +285,22 @@ def generate_map(countries_path: Path, lakes_path: Path,
                          (",\n" if index + 1 < size else "\n"))
         handle.write("  ]\n}\n")
     if preview is not None:
-        image = pygame.Surface((size, size))
-        colors = {"finland_land": (50, 188, 117), "neighbor_land": (224, 203, 150),
-                  "water": (36, 105, 157)}
-        pixels = pygame.PixelArray(image)
-        for y in range(size):
-            for x in range(size):
-                position = y * size + x
-                kind = ("finland_land" if finland_pixels[position] else "neighbor_land") if dry[position] else "water"
-                pixels[x, y] = colors[kind]
-        pixels.close()
+        atlas = pygame.image.load(str(ATLAS_PATH))
+        preview_scale = max(1, min(8, 800 // size))
+        scaled_tiles = {}
+        image = pygame.Surface(
+            (size * preview_scale, size * preview_scale))
+        for tile_id in range(60):
+            source_tile = atlas.subsurface(
+                (tile_id % 10 * TILE_SIZE, tile_id // 10 * TILE_SIZE,
+                 TILE_SIZE, TILE_SIZE))
+            scaled_tiles[tile_id] = pygame.transform.scale(
+                source_tile, (preview_scale, preview_scale))
+        for y, row in enumerate(tiles):
+            for x, (tile_x, tile_y) in enumerate(row):
+                image.blit(
+                    scaled_tiles[tile_y * 10 + tile_x],
+                    (x * preview_scale, y * preview_scale))
         pygame.image.save(image, str(preview))
     return document
 
@@ -230,15 +309,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--countries", type=Path, required=True)
     parser.add_argument("--lakes", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=GAME_DIR / "maps" / "suomi.json")
-    parser.add_argument("--size", type=int, default=1000)
+    parser.add_argument("--roads", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=GAME_DIR / "maps" / "FINLAND.json")
+    parser.add_argument("--size", type=int, default=100)
     parser.add_argument("--extend-atlas", action="store_true")
     parser.add_argument("--preview", type=Path)
     arguments = parser.parse_args()
     if arguments.extend_atlas:
         extend_atlas()
     document = generate_map(arguments.countries, arguments.lakes,
-                            arguments.output, arguments.size, arguments.preview)
+                            arguments.output, arguments.size, arguments.preview,
+                            arguments.roads)
     print(json.dumps({"path": str(arguments.output),
                       "dimensions": [document["width"], document["height"]],
                       "counts": document["geography"]["tile_counts"]}))
