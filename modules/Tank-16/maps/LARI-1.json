@@ -1748,7 +1748,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -1773,7 +1773,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -1798,7 +1798,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -1823,7 +1823,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -1848,7 +1848,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -2108,10 +2108,7 @@
   "objects": [
     [
       {
-        "tile": [
-          2,
-          4
-        ],
+        "tile": [5, 4],
         "hp_change": 100,
         "removal": "fixed"
       },
@@ -2134,10 +2131,7 @@
       null,
       null,
       {
-        "tile": [
-          2,
-          4
-        ],
+        "tile": [5, 4],
         "hp_change": 100,
         "removal": "fixed"
       }
@@ -2288,18 +2282,12 @@
       null,
       null,
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "disappear"
       },
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "disappear"
       },
@@ -2324,18 +2312,12 @@
       null,
       null,
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "disappear"
       },
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "disappear"
       },
@@ -2358,10 +2340,7 @@
       null,
       null,
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "disappear"
       },
@@ -2386,10 +2365,7 @@
       null,
       null,
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "disappear"
       },
@@ -2582,10 +2558,7 @@
     ],
     [
       {
-        "tile": [
-          2,
-          4
-        ],
+        "tile": [5, 4],
         "hp_change": 100,
         "removal": "fixed"
       },
@@ -2608,10 +2581,7 @@
       null,
       null,
       {
-        "tile": [
-          2,
-          4
-        ],
+        "tile": [5, 4],
         "hp_change": 100,
         "removal": "fixed"
       }

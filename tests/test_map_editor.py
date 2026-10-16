@@ -206,6 +206,14 @@ class MapEditorDataTests(unittest.TestCase):
             EDITOR["OBJECT_TILESET_PATH"], pad_edges=True)
         self.assertEqual(tileset.get_size(), (columns * 64, rows * 64))
         self.assertEqual(tileset.get_at((columns * 64 - 1, rows * 64 - 1)).a, 0)
+        self.assertEqual((columns, rows), (6, 8))
+        for row in range(rows):
+            for column in range(columns):
+                tile = tileset.subsurface((column * 64, row * 64, 64, 64))
+                self.assertTrue(any(
+                    tile.get_at((x, y)).a > 0
+                    for y in range(64) for x in range(64)
+                ))
 
     def test_creates_and_paints_map_with_xy_tiles(self):
         map_data = new_map("test", 3, 2)

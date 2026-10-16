@@ -349,7 +349,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -364,7 +364,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -379,7 +379,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -399,7 +399,7 @@
       null,
       [
         0,
-        0
+        5
       ],
       null,
       null,
@@ -411,7 +411,7 @@
       null,
       [
         0,
-        0
+        5
       ],
       null,
       null,
@@ -429,7 +429,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -444,7 +444,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -459,7 +459,7 @@
       null,
       null,
       [
-        1,
+        0,
         0
       ],
       null,
@@ -478,10 +478,7 @@
       null,
       null,
       {
-        "tile": [
-          0,
-          5
-        ],
+        "tile": [3, 2],
         "hp_change": 50,
         "removal": "disappear"
       }
@@ -497,10 +494,7 @@
       null,
       null,
       {
-        "tile": [
-          0,
-          5
-        ],
+        "tile": [3, 2],
         "hp_change": 50,
         "removal": "disappear"
       }
@@ -523,18 +517,12 @@
       null,
       null,
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "explosion"
       },
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "explosion"
       },
@@ -549,18 +537,12 @@
       null,
       null,
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "explosion"
       },
       {
-        "tile": [
-          1,
-          1
-        ],
+        "tile": [5, 3],
         "hp_change": -25,
         "removal": "explosion"
       },
@@ -583,10 +565,7 @@
     ],
     [
       {
-        "tile": [
-          0,
-          5
-        ],
+        "tile": [3, 2],
         "hp_change": 50,
         "removal": "disappear"
       },
@@ -602,10 +581,7 @@
     ],
     [
       {
-        "tile": [
-          0,
-          5
-        ],
+        "tile": [3, 2],
         "hp_change": 50,
         "removal": "disappear"
       },

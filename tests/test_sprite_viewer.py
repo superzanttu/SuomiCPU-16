@@ -61,7 +61,7 @@ class SpriteViewerTests(unittest.TestCase):
         objects = load_atlas(root / "tiles_objects.png")
         self.assertEqual(objects.get_width() % 64, 0)
         self.assertEqual(objects.get_height() % 64, 0)
-        self.assertEqual(objects.get_size(), (448, 448))
+        self.assertEqual(objects.get_size(), (384, 512))
 
     def test_template_is_a_transparent_numbered_64_pixel_grid(self):
         template_path = SPRITE_VIEWER_PATH.parent / "gfx" / "tiles_template.png"
