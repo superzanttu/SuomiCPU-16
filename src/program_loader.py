@@ -14,6 +14,7 @@ def load_program_file(
     path: str | Path,
     logger: Callable[[str], None] | None,
     memory_capacity: int,
+    verbose: bool = False,
 ) -> AssemblyImage:
     """Load an assembly, C, binary, or supported map program."""
     program_path = Path(path)
@@ -27,14 +28,36 @@ def load_program_file(
             if program_path.resolve() == tank16_main:
                 from tools.tank16_map_loader import compile_runtime_tank16
 
-                report("Compiling Tank-16 source and graphics assets")
-                image = compile_runtime_tank16()
+                report(
+                    "Compiling Tank-16 with shared graphics assets; "
+                    "map layouts are loaded dynamically at runtime"
+                )
+                if verbose:
+                    report(
+                        f"[SC-16 program loader] Tank-16 C source: "
+                        f"{program_path.resolve()}"
+                    )
+                    report(
+                        "[SC-16 program loader] Building graphics assets and "
+                        "compiling runtime image"
+                    )
+                if verbose:
+                    image = compile_runtime_tank16(logger=report)
+                else:
+                    image = compile_runtime_tank16()
                 report("Tank-16 source and graphics assets compiled into SC-16 image")
             else:
                 report(f"Compiling C source: {program_path.name}")
+                if verbose:
+                    report(
+                        f"[SC-16 program loader] Passing C source to the compiler: "
+                        f"{program_path.resolve()}"
+                    )
                 from tools.c_compiler import compile_file_with_assembly
 
-                image, assembly = compile_file_with_assembly(program_path)
+                image, assembly = compile_file_with_assembly(
+                    program_path, logger=report if verbose else None
+                )
                 report(f"C source file size: {program_path.stat().st_size} bytes")
                 report(f"Generated assembly size: {len(assembly.encode('utf-8'))} bytes")
                 report("C compilation complete; SC-16 image ready")
@@ -45,6 +68,11 @@ def load_program_file(
         raise ValueError("JSON files are data; load them through the disk API")
     elif program_path.suffix.lower() == ".bin":
         report(f"Loading binary program: {program_path.name}")
+        if verbose:
+            report(
+                f"[SC-16 program loader] Reading raw SC-16 binary: "
+                f"{program_path.resolve()}"
+            )
         try:
             binary = program_path.read_bytes()
             if len(binary) > memory_capacity:
@@ -56,8 +84,15 @@ def load_program_file(
             raise
     else:
         report(f"Assembling source: {program_path.name}")
+        if verbose:
+            report(
+                f"[SC-16 program loader] Passing assembly source to the assembler: "
+                f"{program_path.resolve()}"
+            )
         try:
-            image = assemble_file(program_path)
+            image = assemble_file(
+                program_path, logger=report if verbose else None
+            )
             report(f"Assembly source file size: {program_path.stat().st_size} bytes")
         except (AssemblyError, OSError, ValueError) as exc:
             report(f"ERROR: Assembly failed: {exc}")

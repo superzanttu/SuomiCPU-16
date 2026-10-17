@@ -11,7 +11,11 @@ import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from tools.assembler import AssemblyError, AssemblyImage, assemble
 
@@ -447,12 +451,29 @@ def _is_arithmetic_type(c_type: str) -> bool:
     return c_type in ARITHMETIC_TYPES
 
 
-def _lex_raw(source: str, filename: str) -> list[Token]:
+def _lex_raw(
+    source: str,
+    filename: str,
+    logger: Callable[[str], None] | None = None,
+) -> list[Token]:
     tokens: list[Token] = []
     position = 0
     line = 1
     token_filename = filename
+    next_progress = max(64 * 1024, len(source) // 10)
+    if logger is not None and len(source) >= 256 * 1024:
+        logger(
+            f"[SC-16 C compiler] Tokenizing preprocessed source from {filename} "
+            f"({len(source)} bytes)"
+        )
     while position < len(source):
+        if logger is not None and position >= next_progress:
+            logger(
+                f"[SC-16 C compiler] Tokenizing {filename}: "
+                f"{position * 100 // len(source)}% "
+                f"({position}/{len(source)} bytes)"
+            )
+            next_progress += max(64 * 1024, len(source) // 10)
         char = source[position]
         if char.isspace():
             if char == "\n":
@@ -610,10 +631,17 @@ def _lex_raw(source: str, filename: str) -> list[Token]:
 
 
 class _Parser:
-    def __init__(self, source: str, filename: str):
+    def __init__(
+        self,
+        source: str,
+        filename: str,
+        logger: Callable[[str], None] | None = None,
+    ):
         self.filename = filename
-        self.tokens = _lex(source, filename)
+        self._logger = logger
+        self.tokens = _lex(source, filename, logger)
         self.position = 0
+        self._next_parse_log = 50_000
         self.globals: list[Global] = []
         self.functions: list[Function] = []
         self.prototypes: dict[
@@ -652,6 +680,13 @@ class _Parser:
         self.position += 1
         if token.filename is not None:
             self.filename = token.filename
+        if self._logger is not None and self.position >= self._next_parse_log:
+            self._logger(
+                f"[SC-16 C compiler] Parsing {self.filename}: "
+                f"{self.position}/{len(self.tokens)} tokens "
+                f"({self.position * 100 // len(self.tokens)}%)"
+            )
+            self._next_parse_log += 50_000
         return token
 
     def accept(self, value: str) -> bool:
@@ -5056,9 +5091,20 @@ class _CodeGenerator:
             self._generate_shift(helper)
 
 
-def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
-    parser = _Parser(source, filename)
+def _compile(
+    source: str,
+    filename: str,
+    logger: Callable[[str], None] | None = None,
+) -> tuple[str, AssemblyImage]:
+    if logger is not None:
+        logger(f"[SC-16 C compiler] Preprocessing and parsing C source: {filename}")
+    parser = _Parser(source, filename, logger)
     globals_, functions = parser.parse()
+    if logger is not None:
+        logger(
+            f"[SC-16 C compiler] Parsed {len(globals_)} global declarations and "
+            f"{len(functions)} function definitions from {filename}"
+        )
     standard_calls = _called_functions(parser) - {
         function.name for function in functions
     }
@@ -5072,12 +5118,22 @@ def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
     if runtime_sources:
         library_root = Path(__file__).resolve().parent.parent / "lib"
         library_contents: dict[str, str] = {}
+        if logger is not None:
+            logger(
+                f"[SC-16 C compiler] Resolving standard-library dependencies "
+                f"referenced by {filename}"
+            )
         while True:
             for runtime_source in sorted(runtime_sources):
                 if runtime_source in library_contents:
                     continue
                 library_path = library_root / runtime_source
                 try:
+                    if logger is not None:
+                        logger(
+                            f"[SC-16 C compiler] Reading runtime C source: "
+                            f"{library_path}"
+                        )
                     library_contents[runtime_source] = library_path.read_text(
                         encoding="utf-8"
                     )
@@ -5089,7 +5145,12 @@ def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
             combined_source = source + "\n" + "\n".join(
                 library_contents[name] for name in sorted(library_contents)
             )
-            parser = _Parser(combined_source, filename)
+            if logger is not None:
+                logger(
+                    f"[SC-16 C compiler] Parsing {filename} with runtime sources: "
+                    f"{', '.join(str(library_root / name) for name in sorted(library_contents))}"
+                )
+            parser = _Parser(combined_source, filename, logger)
             globals_, functions = parser.parse()
             unresolved_calls = _called_functions(parser) - {
                 function.name for function in functions
@@ -5106,12 +5167,24 @@ def _compile(source: str, filename: str) -> tuple[str, AssemblyImage]:
     generator = _CodeGenerator(globals_, functions, filename, parser.records)
     generator.prototypes = parser.prototypes
     generator.enum_constants = parser.enum_constants
+    if logger is not None:
+        logger(f"[SC-16 C compiler] Generating SC-16 assembly from {filename}")
     assembly = generator.generate()
     try:
         source_directory = Path(filename).resolve().parent
-        image = assemble(assembly, base_directory=source_directory)
+        image = assemble(
+            assembly,
+            base_directory=source_directory,
+            logger=logger,
+            source_name=f"generated from {filename}",
+        )
     except AssemblyError as exc:
         raise CCompilerError(f"{filename}: generated SC-16 assembly is invalid: {exc}") from exc
+    if logger is not None:
+        logger(
+            f"[SC-16 C compiler] Compilation complete for {filename}: "
+            f"{len(assembly.encode('utf-8'))} assembly bytes"
+        )
     return assembly, image
 
 
@@ -5142,29 +5215,45 @@ def _called_functions(parser: _Parser) -> set[str]:
     return names
 
 
-def compile_to_assembly(source: str, filename: str = "<input>") -> str:
+def compile_to_assembly(
+    source: str,
+    filename: str = "<input>",
+    logger: Callable[[str], None] | None = None,
+) -> str:
     """Compile the supported C90 subset to SC-16 assembly source."""
-    assembly, _ = _compile(source, filename)
+    assembly, _ = _compile(source, filename, logger)
     return assembly
 
 
-def compile_source(source: str, filename: str = "<input>") -> AssemblyImage:
+def compile_source(
+    source: str,
+    filename: str = "<input>",
+    logger: Callable[[str], None] | None = None,
+) -> AssemblyImage:
     """Compile C source to an assembled SC-16 program image."""
-    return _compile(source, filename)[1]
+    return _compile(source, filename, logger)[1]
 
 
-def compile_file(path: str | Path) -> AssemblyImage:
-    return compile_file_with_assembly(path)[0]
+def compile_file(
+    path: str | Path,
+    logger: Callable[[str], None] | None = None,
+) -> AssemblyImage:
+    return compile_file_with_assembly(path, logger)[0]
 
 
-def compile_file_with_assembly(path: str | Path) -> tuple[AssemblyImage, str]:
+def compile_file_with_assembly(
+    path: str | Path,
+    logger: Callable[[str], None] | None = None,
+) -> tuple[AssemblyImage, str]:
     """Compile a source file once and return its image and generated assembly."""
     source_path = Path(path).resolve()
+    if logger is not None:
+        logger(f"[SC-16 C compiler] Reading C source file: {source_path}")
     try:
         source = source_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise CCompilerError(f"cannot read {source_path}: {exc}") from exc
-    assembly, image = _compile(source, str(source_path))
+    assembly, image = _compile(source, str(source_path), logger)
     return image, assembly
 
 
@@ -5189,14 +5278,37 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="emit assembly source instead of a flat binary image",
     )
+    logging_group = parser.add_mutually_exclusive_group()
+    logging_group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        dest="verbose",
+        help="show compiler and assembler stages with source file paths (default)",
+    )
+    logging_group.add_argument(
+        "-q",
+        "--quiet",
+        action="store_false",
+        dest="verbose",
+        help="hide detailed compiler and assembler stage logs",
+    )
+    parser.set_defaults(verbose=True)
     args = parser.parse_args(argv)
     source_path = Path(args.source)
     output_path = Path(args.output) if args.output else source_path.with_suffix(
         ".asm" if args.assembly else ".bin"
     )
     try:
+        if args.verbose:
+            print(f"[SC-16 C compiler] Input: {source_path.resolve()}", file=sys.stderr)
+            print(f"[SC-16 C compiler] Output: {output_path.resolve()}", file=sys.stderr)
         source = source_path.read_text(encoding="utf-8-sig")
-        assembly, image = _compile(source, str(source_path))
+        logger = (
+            (lambda message: print(message, file=sys.stderr))
+            if args.verbose else None
+        )
+        assembly, image = _compile(source, str(source_path), logger)
         if args.assembly:
             output_directory = output_path.resolve().parent
             for library in ("lib_text.asm", "lib_cgfx.asm", "fonts/font5x7.asm"):
@@ -5565,17 +5677,32 @@ def _preprocess(
     filename: str,
     defines: dict[str, _Macro],
     depth: int = 0,
+    logger: Callable[[str], None] | None = None,
 ) -> str:
     if depth > 8:
         raise CCompilerError(f"{filename}: #include nested too deeply")
+    if logger is not None:
+        logger(f"[SC-16 C compiler] Preprocessing C source file: {filename}")
     lines = _translation_lines(source)
+    if logger is not None and len(lines) >= 5000:
+        logger(
+            f"[SC-16 C compiler] Preprocessing {filename}: "
+            f"{len(lines)} source lines"
+        )
     output: list[str] = []
     conditionals: list[dict[str, bool]] = []
     active = True
     number = 0
     line_offset = 0
     diagnostic_filename = filename
+    next_progress = 5000
     while number < len(lines):
+        if logger is not None and number >= next_progress:
+            logger(
+                f"[SC-16 C compiler] Preprocessed {number}/{len(lines)} lines "
+                f"from {filename}"
+            )
+            next_progress += 5000
         text = lines[number]
         number += 1
         logical_line = number + line_offset
@@ -5693,10 +5820,17 @@ def _preprocess(
                 included = found.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
                 raise CCompilerError(f"{where}: cannot read include file {target!r}: {exc}") from exc
+            if logger is not None:
+                logger(
+                    f"[SC-16 C compiler] {where} includes C source file: "
+                    f"{found.resolve()}"
+                )
             output.append(
                 f"\0SC16_LINE:1:{str(found).encode('utf-8').hex()}"
             )
-            output.append(_preprocess(included, str(found), defines, depth + 1))
+            output.append(
+                _preprocess(included, str(found), defines, depth + 1, logger)
+            )
             output.append(
                 f"\0SC16_LINE:{logical_line}:"
                 f"{diagnostic_filename.encode('utf-8').hex()}"
@@ -5734,7 +5868,11 @@ def _preprocess(
     return "\n".join(output)
 
 
-def _lex(source: str, filename: str) -> list[Token]:
+def _lex(
+    source: str,
+    filename: str,
+    logger: Callable[[str], None] | None = None,
+) -> list[Token]:
     timestamp = datetime.datetime.now()
     defines: dict[str, _Macro] = {
         "__STDC__": _Macro(None, "1"),
@@ -5742,8 +5880,12 @@ def _lex(source: str, filename: str) -> list[Token]:
         "__DATE__": _Macro(None, '"' + timestamp.strftime("%b %d %Y") + '"'),
         "__TIME__": _Macro(None, '"' + timestamp.strftime("%H:%M:%S") + '"'),
     }
-    source = _preprocess(source, filename, defines)
-    tokens = _lex_raw(source, filename)
+    source = _preprocess(source, filename, defines, logger=logger)
+    tokens = _lex_raw(source, filename, logger)
+    if logger is not None:
+        logger(
+            f"[SC-16 C compiler] Tokenized {len(tokens) - 1} tokens from {filename}"
+        )
     if defines:
         tokens = _expand_macros(tokens, defines, filename)
     concatenated: list[Token] = []

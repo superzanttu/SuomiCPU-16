@@ -269,8 +269,9 @@ KEY_BITS = {
 def load_program_file(
     path: str | Path,
     logger: Callable[[str], None] | None = None,
+    verbose: bool = False,
 ) -> AssemblyImage:
-    return _load_program_file(path, logger, MEM_SIZE)
+    return _load_program_file(path, logger, MEM_SIZE, verbose)
 
 _JIT = False  # False = not tried yet, None = unavailable
 
@@ -1650,12 +1651,25 @@ class SuomiCompute16:
             converted = math.trunc(value)
         self._write_integer_register(destination, integer_width, converted)
 
-    def load_program(self, image):
+    def load_program(self, image, source_name=None):
+        source_label = (
+            str(Path(source_name).resolve())
+            if source_name is not None
+            else getattr(self, "program_source", None)
+            or getattr(self, "module_name", None)
+            or "in-memory program image"
+        )
         for segment in image.segments:
             end = segment.address + len(segment.data)
             if segment.address < 0 or end > MEM_SIZE:
                 self.console_log("ERROR: Program segment does not fit in memory")
                 raise ValueError("program segment does not fit in memory")
+            if getattr(self, "verbose_logging", False):
+                self.console_log(
+                    f"[SC-16 memory loader] Copying {len(segment.data)} bytes from "
+                    f"{source_label} to memory range "
+                    f"[{segment.address:#x}, {end:#x})"
+                )
             self.memory[segment.address:end] = segment.data
         if not 0 <= image.entry_point < MEM_SIZE:
             self.console_log("ERROR: Program entry point is outside memory")
@@ -1674,6 +1688,11 @@ class SuomiCompute16:
         self.program_image_span = image_span
         self.program_memory_remaining = MEM_SIZE - image_size
         self.program_loaded = True
+        if getattr(self, "verbose_logging", False):
+            self.console_log(
+                f"[SC-16 memory loader] Entry point for {source_label}: "
+                f"{image.entry_point:#x}"
+            )
         self.console_log("Program image loaded into memory")
         self.console_log(
             f"Program memory: {image_size} image bytes used; "
@@ -2464,6 +2483,12 @@ class SuomiCompute16:
             console_window = ConsoleWindow(self)
             self.console_window = console_window
         self.console_log("Program execution started")
+        if getattr(self, "verbose_logging", False):
+            source_name = getattr(self, "program_source", None)
+            self.console_log(
+                f"[SC-16 emulator] Executing "
+                f"{source_name or getattr(self, 'module_name', None) or 'loaded program'}"
+            )
         pygame.key.start_text_input()
         deferred_release = 0
         last_console_update = 0.0
@@ -2577,6 +2602,22 @@ def main():
                         help="UDP port for LAN games (all players must use the same port)")
     parser.add_argument("--fullscreen", action="store_true",
                         help="start in fullscreen mode (toggle at runtime with F11)")
+    logging_group = parser.add_mutually_exclusive_group()
+    logging_group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        dest="verbose",
+        help="show detailed compiler, assembler, loader, and emulator logs (default)",
+    )
+    logging_group.add_argument(
+        "-q",
+        "--quiet",
+        action="store_false",
+        dest="verbose",
+        help="hide detailed compiler, assembler, and loader stage logs",
+    )
+    parser.set_defaults(verbose=True)
     parser.add_argument(
         "--disk",
         metavar="ID",
@@ -2589,8 +2630,10 @@ def main():
     try:
         sc16 = SuomiCompute16(fullscreen=args.fullscreen)
         sc16.net_port = args.net_port
+        sc16.verbose_logging = args.verbose
         program_file = args.program_file
         sc16.module_name = Path(program_file).stem if program_file else None
+        sc16.program_source = str(Path(program_file).resolve()) if program_file else None
         sc16.reset()
         sc16.boot_time = time.monotonic()
         console_window = ConsoleWindow(sc16)
@@ -2603,11 +2646,16 @@ def main():
         while True:
             if program_file:
                 sc16.module_name = Path(program_file).stem
+                sc16.program_source = str(Path(program_file).resolve())
                 sc16.disk.set_file_root(
                     Path(program_file).resolve().parent / "disks"
                 )
                 try:
-                    program = load_program_file(program_file, sc16.console_progress)
+                    program = load_program_file(
+                        program_file,
+                        sc16.console_progress,
+                        verbose=args.verbose,
+                    )
                 except (AssemblyError, CCompilerError, OSError, ValueError) as exc:
                     parser.error(str(exc))
                 sc16.load_program(program)
@@ -2628,6 +2676,7 @@ def main():
                     except BIOSError as exc:
                         parser.error(str(exc))
                 sc16.module_name = selection.module_name or selection.module_path.stem
+                sc16.program_source = str(selection.module_path.resolve())
                 sc16.load_program(selection.image)
 
             first_boot = False

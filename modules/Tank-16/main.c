@@ -7,6 +7,18 @@
 #include "disk.h"
 #endif
 
+#ifndef POWERUP_HEALTH_TILE
+#ifdef RUNTIME_MAP_LOADING
+#define POWERUP_HEALTH_TILE (TERRAIN_TILE_COUNT + 15)
+#define POWERUP_DAMAGE_TILE (TERRAIN_TILE_COUNT + 16)
+#define POWERUP_SPEED_TILE (TERRAIN_TILE_COUNT + 17)
+#else
+#define POWERUP_HEALTH_TILE (TILE_COUNT + 15)
+#define POWERUP_DAMAGE_TILE (TILE_COUNT + 16)
+#define POWERUP_SPEED_TILE (TILE_COUNT + 17)
+#endif
+#endif
+
 #ifdef RUNTIME_MAP_LOADING
 #define RUNTIME_MAP_MAX_CELLS 10000UL
 unsigned char runtime_map_data[RUNTIME_MAP_MAX_CELLS];
@@ -17,6 +29,10 @@ unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
 #define MAX_SHOTS 12
 #define ROUND_FRAMES 9000
 #define ROUND_DELAY 90
+#define POWERUP_DURATION 300
+#define POWERUP_SPAWN_DELAY 300
+#define POWERUP_RESPAWN_DELAY 360
+#define POWERUP_LIFETIME 360
 #define DIRECTION_SCALE 1000
 #define TANK_ROTATION_COUNT 32
 #define TANK_DIRECTION_MASK (TANK_ROTATION_COUNT - 1)
@@ -43,11 +59,14 @@ unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
 #define MAX_REVERSE_SPEED 16
 #define MOVING_TURN_FRAMES 4
 #define STATIONARY_TURN_FRAMES 2
-#define HANDBRAKE_DECELERATION 1
+#define HANDBRAKE_DECELERATION 8
 #define PARTICLE_SPARK 0
 #define PARTICLE_SMOKE 1
 #define PARTICLE_FLAME 2
 #define PARTICLE_DEBRIS 3
+#define POWERUP_HEALTH 0
+#define POWERUP_SPEED 1
+#define POWERUP_DAMAGE 2
 
 #ifndef MAP_VARIANT_COUNT
 #define MAP_VARIANT_COUNT 1
@@ -110,6 +129,8 @@ typedef struct
     int impulse_y;
     int shake;
     int handbrake;
+    int speed_boost_frames;
+    int damage_boost_frames;
 } Tank;
 
 typedef struct
@@ -119,9 +140,18 @@ typedef struct
     int owner;
     int direction;
     int life;
+    int damage;
     int movement_remainder_x;
     int movement_remainder_y;
 } Shot;
+
+typedef struct
+{
+    WorldCoord x;
+    WorldCoord y;
+    int type;
+    int life;
+} PowerUp;
 
 typedef struct
 {
@@ -156,6 +186,9 @@ int burn_capacity_error;
 int effect_tick;
 unsigned int effect_random = 12345;
 int next_particle;
+PowerUp powerup;
+int powerup_spawn_timer;
+int movement_sound_cooldown[2];
 unsigned char sprite_work[TANK_SPRITE_PIXEL_COUNT];
 unsigned char object_active[MAP_OBJECT_CAPACITY];
 unsigned char object_contacts[MAP_OBJECT_CAPACITY];
@@ -186,7 +219,6 @@ unsigned char map_infinite_obstacles[16];
 int map_infinite_obstacle_count;
 int map_obstacle_density;
 int map_load_error;
-int map_debug_stage;
 #endif
 int previous_keys;
 int tank_sprite_slots[2];
@@ -345,16 +377,12 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
     int i;
     unsigned long copied;
 
-    map_debug_stage = 41;
     length = disk_read_file(path, 0, map_json_chunk, 256, size);
-    map_debug_stage = 42;
     if (length < 0 || *size == 0 || *size > 67108864UL)
         return 0;
     *json = (char *)malloc(*size + 1);
-    map_debug_stage = 43;
     if (*json == 0)
         return 0;
-    map_debug_stage = 44;
     offset = 0;
     copied = 0;
     while (offset < *size)
@@ -362,7 +390,6 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
         length = disk_read_file(path, offset, map_json_chunk, 256, size);
         if (length <= 0)
         {
-            map_debug_stage = 45;
             free(*json);
             *json = 0;
             return 0;
@@ -373,7 +400,6 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
         copied += length;
     }
     (*json)[copied] = 0;
-    map_debug_stage = 46;
     return 1;
 }
 
@@ -383,27 +409,14 @@ int map_dimensions(char *json, int *width, int *height)
 
     value = json_value(json, "width");
     if (value == 0)
-    {
-        map_debug_stage = 100 + (unsigned char)json[1];
         return 0;
-    }
     if (!json_integer(&value, width))
-    {
-        map_debug_stage = 52;
         return 0;
-    }
     value = json_value(json, "height");
     if (value == 0)
-    {
-        map_debug_stage = 53;
         return 0;
-    }
     if (!json_integer(&value, height))
-    {
-        map_debug_stage = 54;
         return 0;
-    }
-    map_debug_stage = 55;
     return *width > 0 && *height > 0 &&
            (unsigned long)*width * (unsigned long)*height <= 16777216UL;
 }
@@ -423,7 +436,6 @@ int load_finite_map(char *json, int width, int height)
     unsigned long index;
     char *removal_text;
 
-    map_debug_stage = 8;
     cells = (unsigned long)width * (unsigned long)height;
     if (cells > RUNTIME_MAP_MAX_CELLS)
         return 0;
@@ -459,7 +471,6 @@ int load_finite_map(char *json, int width, int height)
     if (*cursor++ != ']')
         return 0;
 
-    map_debug_stage = 9;
     cursor = json_value(json, "obstacles");
     if (cursor != 0)
     {
@@ -478,7 +489,7 @@ int load_finite_map(char *json, int width, int height)
                         (unsigned long)column;
                 if (strncmp(cursor, "null", 4) == 0)
                 {
-                    cursor += 4;
+                    cursor = cursor + 4;
                     continue;
                 }
                 if (!json_pair(&cursor, &tile_x, &tile_y) ||
@@ -498,7 +509,6 @@ int load_finite_map(char *json, int width, int height)
             return 0;
     }
 
-    map_debug_stage = 10;
     cursor = json_value(json, "objects");
     if (cursor != 0)
     {
@@ -515,7 +525,7 @@ int load_finite_map(char *json, int width, int height)
                 json_skip_space(&cursor);
                 if (strncmp(cursor, "null", 4) == 0)
                 {
-                    cursor += 4;
+                    cursor = cursor + 4;
                     continue;
                 }
                 if (*cursor != '{' || map_object_count >= MAP_OBJECT_CAPACITY)
@@ -570,7 +580,6 @@ int load_finite_map(char *json, int width, int height)
     map_columns = width;
     map_rows = height;
     map_infinite = 0;
-    map_debug_stage = 11;
     return 1;
 }
 
@@ -666,10 +675,8 @@ int load_map_path(char *path)
     int height;
     int result;
 
-    map_debug_stage = 4;
     if (!load_json_bytes(path, &json, &file_size))
         return 0;
-    map_debug_stage = 5;
     map_object_count = 0;
     value = json_value(json, "infinite");
     if (value != 0 && strncmp(value, "true", 4) == 0)
@@ -678,7 +685,6 @@ int load_map_path(char *path)
     }
     else if (map_dimensions(json, &width, &height))
     {
-        map_debug_stage = 6;
         value = json_value(json, "tileset");
         if (!json_string_is(value, "tiles_terrain.png"))
         {
@@ -686,7 +692,6 @@ int load_map_path(char *path)
         }
         else
         {
-            map_debug_stage = 7;
             value = json_value(json, "objects_tileset");
             result = value == 0 ||
                      json_string_is(value, "tiles_objects.png");
@@ -927,20 +932,6 @@ int is_runtime_map_path(volatile char *path)
            path[length - 2] == 'o' && path[length - 1] == 'n';
 }
 
-int runtime_path_is_finland(volatile char *path)
-{
-    char expected[18];
-    int index;
-
-    strcpy(expected, "maps/FINLAND.json");
-    for (index = 0; index < 17; index++)
-    {
-        if (path[index] != expected[index])
-            return 0;
-    }
-    return path[17] == 0;
-}
-
 void use_default_infinite_map(void)
 {
     map_data = 0;
@@ -960,10 +951,10 @@ void select_runtime_round_map(void)
 {
     int file_count;
     int map_count;
-    int first_map;
-    int finland_map;
     int chosen_map;
     int map_index;
+    int target_map;
+    int attempt;
     int i;
 
     map_data = 0;
@@ -973,8 +964,6 @@ void select_runtime_round_map(void)
     file_count = disk_list_files(0, map_path_buffer,
                                  sizeof(map_path_buffer));
     map_count = 0;
-    first_map = -1;
-    finland_map = -1;
     if (file_count > 0)
     {
         for (i = 0; i < file_count; i++)
@@ -983,52 +972,46 @@ void select_runtime_round_map(void)
                                 sizeof(map_path_buffer)) < 0 ||
                 !is_runtime_map_path(map_path_buffer))
                 continue;
-            if (first_map < 0)
-                first_map = map_count;
-            if (runtime_path_is_finland(map_path_buffer))
-                finland_map = map_count;
             map_count++;
         }
     }
     if (map_count > 0)
     {
-        if (round_map_selection_started == 0 && finland_map >= 0)
-            chosen_map = finland_map;
-        else if (round_map_selection_started == 0)
-            chosen_map = first_map;
-        else
-            chosen_map = effect_noise(map_count);
-        map_index = 0;
-        map_selected_path[0] = 0;
-        for (i = 0; i < file_count; i++)
+        chosen_map = effect_noise(map_count);
+        for (attempt = 0; attempt < map_count; attempt++)
         {
-            if (disk_list_files(i, map_path_buffer,
-                                sizeof(map_path_buffer)) < 0 ||
-                !is_runtime_map_path(map_path_buffer))
-                continue;
-            if (map_index++ == chosen_map)
+            target_map = (chosen_map + attempt) % map_count;
+            map_index = 0;
+            for (i = 0; i < file_count; i++)
             {
-                map_index = 0;
-                while (map_path_buffer[map_index] != 0 &&
-                       map_index < 128)
+                if (disk_list_files(i, map_path_buffer,
+                                    sizeof(map_path_buffer)) < 0 ||
+                    !is_runtime_map_path(map_path_buffer))
+                    continue;
+                if (map_index++ == target_map)
                 {
-                    map_selected_path[map_index] =
-                        map_path_buffer[map_index];
-                    map_index++;
+                    map_index = 0;
+                    while (map_path_buffer[map_index] != 0 &&
+                           map_index < 128)
+                    {
+                        map_selected_path[map_index] =
+                            map_path_buffer[map_index];
+                        map_index++;
+                    }
+                    map_selected_path[map_index] = 0;
+                    break;
                 }
-                map_selected_path[map_index] = 0;
-                break;
             }
-        }
-        if (map_selected_path[0] != 0 && load_map_path(map_selected_path))
-        {
-            round_map_selection_started++;
-            current_map_variant = round_map_selection_started - 1;
-            return;
+            if (map_selected_path[0] != 0 &&
+                load_map_path(map_selected_path))
+            {
+                round_map_selection_started++;
+                current_map_variant = round_map_selection_started - 1;
+                return;
+            }
         }
     }
     use_default_infinite_map();
-    map_terrain_choices[0] = (unsigned char)(20 + map_debug_stage);
     map_load_error = 1;
     round_map_selection_started++;
     current_map_variant = -1;
@@ -1630,6 +1613,8 @@ void start_round(void)
         tanks[i].impulse_y = 0;
         tanks[i].shake = 0;
         tanks[i].handbrake = 0;
+        tanks[i].speed_boost_frames = 0;
+        tanks[i].damage_boost_frames = 0;
         hit_flash[i] = 0;
         muzzle_flash[i] = 0;
     }
@@ -1664,6 +1649,10 @@ void start_round(void)
     round_delay = 0;
     round_over = 0;
     round_winner = -1;
+    powerup.life = 0;
+    powerup_spawn_timer = POWERUP_SPAWN_DELAY;
+    movement_sound_cooldown[0] = 0;
+    movement_sound_cooldown[1] = 0;
 }
 
 void load_tank_sprites(void)
@@ -1718,6 +1707,7 @@ void fire_shot(int player)
             shot->owner = player;
             shot->direction = direction;
             shot->life = 120;
+            shot->damage = tanks[player].damage_boost_frames > 0 ? 20 : 10;
             shot->movement_remainder_x = 0;
             shot->movement_remainder_y = 0;
             tanks[player].cooldown = SHOT_COOLDOWN;
@@ -1755,11 +1745,20 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     int turn_frames;
     int left_key;
     int right_key;
+    int maximum_forward_speed;
+    int maximum_reverse_speed;
+    int steering_speed;
 
     if (tanks[player].health <= 0)
         return;
 
     old_direction = tanks[player].direction;
+    maximum_forward_speed = tanks[player].speed_boost_frames > 0
+                                ? MAX_FORWARD_SPEED * 3 / 2
+                                : MAX_FORWARD_SPEED;
+    maximum_reverse_speed = tanks[player].speed_boost_frames > 0
+                                ? MAX_REVERSE_SPEED * 3 / 2
+                                : MAX_REVERSE_SPEED;
     forward_key = player == 0 ? (int)(keys & 4) : (int)(extra & KEYX2_P2_FORWARD);
     backward_key = player == 0 ? (int)(keys & 8) : (int)(extra & KEYX2_P2_BACKWARD);
     left_key = player == 0 ? (int)(keys & 1) : (int)(extra & KEYX2_P2_LEFT);
@@ -1781,10 +1780,20 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     }
     else
     {
-        if (forward_key && !backward_key && tanks[player].throttle < MAX_FORWARD_SPEED)
+        if (forward_key && !backward_key &&
+            tanks[player].throttle < maximum_forward_speed)
             tanks[player].throttle++;
-        if (backward_key && !forward_key && tanks[player].throttle > -MAX_REVERSE_SPEED)
+        if (backward_key && !forward_key &&
+            tanks[player].throttle > -maximum_reverse_speed)
             tanks[player].throttle--;
+        if (tanks[player].throttle > maximum_forward_speed)
+            tanks[player].throttle = maximum_forward_speed;
+        if (tanks[player].throttle < -maximum_reverse_speed)
+            tanks[player].throttle = -maximum_reverse_speed;
+        if (tanks[player].speed > maximum_forward_speed)
+            tanks[player].speed = maximum_forward_speed;
+        if (tanks[player].speed < -maximum_reverse_speed)
+            tanks[player].speed = -maximum_reverse_speed;
         if (tanks[player].speed < tanks[player].throttle)
             tanks[player].speed++;
         if (tanks[player].speed > tanks[player].throttle)
@@ -1793,8 +1802,11 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     turn = (right_key != 0) - (left_key != 0);
     if (turn != 0)
     {
+        steering_speed = absolute_value(tanks[player].speed);
+        if (steering_speed > MAX_FORWARD_SPEED)
+            steering_speed = MAX_FORWARD_SPEED;
         turn_frames = STATIONARY_TURN_FRAMES +
-                      absolute_value(tanks[player].speed) *
+                      steering_speed *
                           (MOVING_TURN_FRAMES - STATIONARY_TURN_FRAMES) / MAX_FORWARD_SPEED;
         tanks[player].turn_tick++;
         if (tanks[player].turn_tick >= turn_frames)
@@ -1899,6 +1911,15 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     if (tanks[player].cooldown > 0)
     {
         tanks[player].cooldown--;
+    }
+    if (movement_sound_cooldown[player] > 0)
+        movement_sound_cooldown[player]--;
+    if (absolute_value(tanks[player].speed) >= 4 &&
+        movement_sound_cooldown[player] == 0)
+    {
+        gfx_sound(player, 72 + absolute_value(tanks[player].speed) * 3,
+                  5, WAVE_TRIANGLE, 12);
+        movement_sound_cooldown[player] = 12;
     }
     if (tanks[player].collision_cooldown > 0)
     {
@@ -2089,7 +2110,7 @@ int shot_collision(int index)
     {
         tank_impulse(player, direction_offset(directions_x[shot->direction], 24),
                      direction_offset(directions_y[shot->direction], 24), 8);
-        change_health(player, -10);
+        change_health(player, -(shot->damage > 0 ? shot->damage : 10));
         return 1;
     }
     for (i = 0; i < map_object_count; i++)
@@ -2176,6 +2197,121 @@ void update_shots(void)
     }
 }
 
+int spawn_powerup(void)
+{
+    int attempt;
+    int row;
+    int column;
+#ifdef RUNTIME_MAP_LOADING
+    int center_row;
+    int center_column;
+#endif
+    WorldCoord x;
+    WorldCoord y;
+
+#ifdef RUNTIME_MAP_LOADING
+    if (map_infinite)
+    {
+        center_column = map_coordinate((tanks[0].x + tanks[1].x) / 2);
+        center_row = map_coordinate((tanks[0].y + tanks[1].y) / 2);
+    }
+#endif
+    for (attempt = 0; attempt < 48; attempt++)
+    {
+#ifdef RUNTIME_MAP_LOADING
+        if (map_infinite)
+        {
+            column = center_column + effect_noise(41) - 20;
+            row = center_row + effect_noise(41) - 20;
+        }
+        else
+#endif
+        {
+#ifdef RUNTIME_MAP_LOADING
+            column = effect_noise(map_columns);
+            row = effect_noise(map_rows);
+#else
+            column = effect_noise(MAP_COLUMNS);
+            row = effect_noise(MAP_ROWS);
+#endif
+        }
+        x = (WorldCoord)column * MAP_TILE_PIXEL_SIZE +
+            MAP_TILE_PIXEL_SIZE / 2;
+        y = (WorldCoord)row * MAP_TILE_PIXEL_SIZE +
+            MAP_TILE_PIXEL_SIZE / 2;
+        if (blocked(x, y, 0) || blocked(x, y, 1))
+            continue;
+        powerup.x = x;
+        powerup.y = y;
+        powerup.type = effect_noise(3);
+        powerup.life = POWERUP_LIFETIME;
+        return 1;
+    }
+    return 0;
+}
+
+void update_powerups(void)
+{
+    int player;
+    int maximum_forward_speed;
+    int maximum_reverse_speed;
+
+    for (player = 0; player < 2; player++)
+    {
+        if (tanks[player].speed_boost_frames > 0)
+        {
+            tanks[player].speed_boost_frames--;
+            if (tanks[player].speed_boost_frames == 0)
+            {
+                maximum_forward_speed = MAX_FORWARD_SPEED;
+                maximum_reverse_speed = MAX_REVERSE_SPEED;
+                if (tanks[player].throttle > maximum_forward_speed)
+                    tanks[player].throttle = maximum_forward_speed;
+                if (tanks[player].throttle < -maximum_reverse_speed)
+                    tanks[player].throttle = -maximum_reverse_speed;
+                if (tanks[player].speed > maximum_forward_speed)
+                    tanks[player].speed = maximum_forward_speed;
+                if (tanks[player].speed < -maximum_reverse_speed)
+                    tanks[player].speed = -maximum_reverse_speed;
+            }
+        }
+        if (tanks[player].damage_boost_frames > 0)
+            tanks[player].damage_boost_frames--;
+    }
+    if (powerup.life > 0)
+    {
+        for (player = 0; player < 2; player++)
+        {
+            if (tanks[player].health > 0 &&
+                absolute_value(tanks[player].x - powerup.x) < 24 &&
+                absolute_value(tanks[player].y - powerup.y) < 24)
+            {
+                if (powerup.type == POWERUP_HEALTH)
+                    change_health(player, 25);
+                else if (powerup.type == POWERUP_SPEED)
+                    tanks[player].speed_boost_frames = POWERUP_DURATION;
+                else
+                    tanks[player].damage_boost_frames = POWERUP_DURATION;
+                powerup.life = 0;
+                powerup_spawn_timer = POWERUP_RESPAWN_DELAY;
+                gfx_sound(3, 880, 4, WAVE_TRIANGLE, 30);
+                return;
+            }
+        }
+        powerup.life--;
+        if (powerup.life == 0)
+            powerup_spawn_timer = POWERUP_RESPAWN_DELAY;
+        return;
+    }
+    if (powerup_spawn_timer > 0)
+    {
+        powerup_spawn_timer--;
+        return;
+    }
+    if (!spawn_powerup())
+        powerup_spawn_timer = 30;
+}
+
 void update_game(unsigned int keys, unsigned int extra)
 {
     if ((keys & 32) && !(previous_keys & 32))
@@ -2202,6 +2338,7 @@ void update_game(unsigned int keys, unsigned int extra)
         }
         return;
     }
+    update_powerups();
     update_tank(0, keys, extra);
     update_tank(1, keys, extra);
     update_objects();
@@ -2415,6 +2552,17 @@ void draw_ground(void)
                 (WorldCoord)map_object_x[i] * MAP_TILE_PIXEL_SIZE,
                 (WorldCoord)map_object_y[i] * MAP_TILE_PIXEL_SIZE);
         }
+    }
+    if (powerup.life > 0)
+    {
+        if (powerup.type == POWERUP_HEALTH)
+            i = POWERUP_HEALTH_TILE;
+        else if (powerup.type == POWERUP_SPEED)
+            i = POWERUP_SPEED_TILE;
+        else
+            i = POWERUP_DAMAGE_TILE;
+        world_tile(i, powerup.x - MAP_TILE_PIXEL_SIZE / 2,
+                   powerup.y - MAP_TILE_PIXEL_SIZE / 2);
     }
     world_emitters(burn_sites, burn_count, effect_tick);
 }
@@ -2644,6 +2792,9 @@ int main(void)
     wins[0] = 0;
     wins[1] = 0;
     previous_keys = 0;
+#ifdef RUNTIME_MAP_LOADING
+    effect_random = ((unsigned int)gfx_random() << 8) ^ gfx_random();
+#endif
     tank_sprite_slots[0] = -1;
     tank_sprite_slots[1] = -1;
     start_round();

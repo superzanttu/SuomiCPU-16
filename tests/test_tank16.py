@@ -646,15 +646,6 @@ class Tank16Tests(unittest.TestCase):
         map_path = ROOT / "modules" / "Tank-16" / "maps" / "PERUS-1.json"
         _, _, _, dimensions = load_map_assets(map_path)
         cpu = make_cpu(load_program_file(source))
-        world_tile_calls = []
-        original_world_tile = cpu._gpu_world_tile
-
-        def record_world_tile(tile, world_x, world_y, layer):
-            if len(world_tile_calls) < 10:
-                world_tile_calls.append((tile, world_x, world_y, layer))
-            original_world_tile(tile, world_x, world_y, layer)
-
-        cpu._gpu_world_tile = record_world_tile
         with tempfile.TemporaryDirectory() as directory:
             module_disks = Path(directory) / "module" / "disks"
             maps_dir = module_disks / "maps"
@@ -710,18 +701,7 @@ class Tank16Tests(unittest.TestCase):
             for index in range(len(expected_layer))
             if actual_layer[index] != expected_layer[index]
         ]
-        self.assertFalse(
-            mismatches,
-            "Terrain layer mismatch: first=%s count=%d cameras=%s tile_size=%d "
-            "tile_one=%s world_tiles=%s" % (
-                mismatches[:10],
-                len(mismatches),
-                cpu.split_cameras,
-                cpu.tile_pixel_size,
-                list(tile_one[:16]),
-                world_tile_calls,
-            ),
-        )
+        self.assertFalse(mismatches)
         initial_sprites = [
             (slot, sprite)
             for slot, sprite in enumerate(cpu.sprites)
@@ -773,8 +753,8 @@ class Tank16Tests(unittest.TestCase):
             if sprite["flags"] & 1
         ]
         self.assertEqual(visible_slots, [22, 38])
-        map_width = cpu.tilemap_width * cpu.tile_pixel_size
-        map_height = cpu.tilemap_height * cpu.tile_pixel_size
+        map_width = map_document["width"] * cpu.tile_pixel_size
+        map_height = map_document["height"] * cpu.tile_pixel_size
         player_two_x = cpu.sprites[22]["x"] + 16
         player_two_y = cpu.sprites[22]["y"] + 16
         player_one_x = cpu.sprites[38]["x"] + 16
@@ -791,6 +771,9 @@ class Tank16Tests(unittest.TestCase):
         second_map = game_dir / "maps" / "100.json"
         self.assertIn(second_map, discover_round_maps(first_map))
         header = build_map_header(first_map, [second_map])
+        self.assertIn("#define POWERUP_HEALTH_TILE", header)
+        self.assertIn("#define POWERUP_DAMAGE_TILE", header)
+        self.assertIn("#define POWERUP_SPEED_TILE", header)
         source_path = game_dir / "main.c"
         game_source = self.game_source(source_path).replace(
             '#include "map_assets.h"', header, 1
@@ -822,6 +805,63 @@ class Tank16Tests(unittest.TestCase):
         ]
         self.assertEqual(results, [0, 40, 0, 1, 0, 0])
 
+    def test_runtime_round_selection_randomly_loads_disk_map_files(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1
+        )
+        test_source = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  for (i = 0; i < 32; i++) {\n"
+            "    effect_random = i;\n"
+            "    round_map_selection_started = 0;\n"
+            "    select_runtime_round_map();\n"
+            "    results[i * 2] = map_columns;\n"
+            "    results[i * 2 + 1] = map_rows;\n"
+            "    if (map_load_error) return 1;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            module_disks = Path(directory) / "module" / "disks"
+            maps_dir = module_disks / "maps"
+            maps_dir.mkdir(parents=True)
+            for name, width, height, tile_x in (
+                    ("A.json", 4, 3, 1), ("B.json", 5, 4, 2)):
+                (maps_dir / name).write_text(json.dumps({
+                    "width": width,
+                    "height": height,
+                    "tileset": "tiles_terrain.png",
+                    "tiles": [
+                        [[tile_x, 0] for _ in range(width)]
+                        for _ in range(height)
+                    ],
+                }), encoding="utf-8")
+            image = compile_source(
+                "int results[64];\n" + game_source + test_source,
+                str(source_path),
+            )
+            cpu = make_cpu(image)
+            cpu.disk = DiskDevice(Path(directory) / "virtual-disks")
+            cpu.disk.set_file_root(module_disks)
+            for _ in range(40):
+                run_frame(cpu)
+                if not cpu.running:
+                    break
+
+        self.assertFalse(cpu.running)
+        results = [
+            cpu.read_16(GLOBAL_BASE + index * 2)
+            for index in range(64)
+        ]
+        selected_dimensions = {
+            tuple(results[index:index + 2])
+            for index in range(0, len(results), 2)
+        }
+        self.assertEqual(selected_dimensions, {(4, 3), (5, 4)})
+
     def test_runtime_assets_exclude_maps_and_disk_maps_include_infinite_world(self):
         game_dir = ROOT / "modules" / "Tank-16"
         header = build_runtime_assets_header()
@@ -843,6 +883,52 @@ class Tank16Tests(unittest.TestCase):
         self.assertTrue(infinite["infinite"])
         self.assertTrue(infinite["terrain_tiles"])
         self.assertTrue(infinite["obstacle_tiles"])
+        self.assertIn("#define POWERUP_HEALTH_TILE", header)
+        self.assertIn("#define POWERUP_DAMAGE_TILE", header)
+        self.assertIn("#define POWERUP_SPEED_TILE", header)
+
+    def test_timed_powerups_heal_boost_speed_and_increase_shot_damage(self):
+        results = self.scenario_results(
+            "int i;\n"
+            "start_round();\n"
+            "tanks[0].health = 50;\n"
+            "powerup.type = POWERUP_HEALTH;\n"
+            "powerup.x = tanks[0].x; powerup.y = tanks[0].y;\n"
+            "powerup.life = 10; update_powerups();\n"
+            "results[0] = tanks[0].health;\n"
+            "powerup.type = POWERUP_SPEED;\n"
+            "powerup.x = tanks[0].x; powerup.y = tanks[0].y;\n"
+            "powerup.life = 10; update_powerups();\n"
+            "results[1] = tanks[0].speed_boost_frames;\n"
+            "for (i = 0; i < 55; i++) update_tank(0, 4, 0);\n"
+            "results[2] = tanks[0].speed;\n"
+            "for (i = 0; i < 300; i++) update_powerups();\n"
+            "results[3] = tanks[0].speed_boost_frames;\n"
+            "results[4] = tanks[0].speed;\n"
+            "powerup.type = POWERUP_DAMAGE;\n"
+            "powerup.x = tanks[0].x; powerup.y = tanks[0].y;\n"
+            "powerup.life = 10; update_powerups();\n"
+            "fire_shot(0); results[5] = shots[0].damage;\n",
+            6,
+        )
+        self.assertEqual(results, [75, 300, 48, 0, 32, 20])
+
+    def test_tank_movement_emits_periodic_engine_sound(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = self.game_source(source_path)
+        source = (
+            game_source +
+            "int main(void) {\n"
+            "  start_round();\n"
+            "  tanks[0].speed = 16; tanks[0].throttle = 16;\n"
+            "  update_tank(0, 0, 0);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertIn((0, 120, 5, 2, 12), cpu.sound_log)
 
     def test_json_map_is_data_not_an_executable_program(self):
         map_path = ROOT / "modules" / "Tank-16" / "maps" / "PERUS-1.json"

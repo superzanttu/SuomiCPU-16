@@ -12,9 +12,9 @@
 - [x] Render terrain only for the cells visible in each camera view.
 - [x] Load finite JSON maps and seeded, effectively unbounded terrain from the module's `disks/maps/` folder through the generic file API.
 - [x] Keep map data out of the executable; compile only the terrain and object graphics assets.
-- [x] Use `disks/maps/FINLAND.json` for the first round, then randomly select a map before every later round.
+- [x] Randomly select a valid JSON map from `disks/maps/` when the game starts and at the beginning of every new round; keep map data out of the executable.
 - [x] Preserve the tileset's source RGB colors through per-program palette entries.
-- [ ] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
+- [x] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
 - [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.
 - [x] Provide `sprite_viewer.py` to inspect 64×64 cells, atlas coordinates, and row-major IDs.
 - [x] Provide `gfx/tiles_template.png` as a transparent, numbered 64×64-cell atlas template.
@@ -31,6 +31,8 @@
 - [x] Keep burning wrecks and ammunition impact fires throughout ten subsequent rounds.
 - [x] Add inertial throttle, reverse, slower moving turns, recoil, blast knockback, and per-player camera shake.
 - [x] Retain three times as many track marks and show forward/reverse throttle in the HUD.
+- [x] Add timed health, speed, and shot-damage power-ups.
+- [x] Add periodic tank movement sounds.
 
 ## Driving and battle reactions
 
@@ -115,14 +117,6 @@ wreck). These commands require a non-background layer. The game owns persistence
 the GPU uses the animation tick and stable seeds to reconstruct rising flame and
 smoke particles without allocating one guest particle pool per old fire.
 
-## Remaining tasks
-- [ ] Add timed power-ups, such as increased speed, stronger shots, and health restoration.
-- [ ] Add tank movement sounds.
-
-## Questions for the user
-Q: Which object-atlas sprites should be used for mines and obstacles?
-A: No sprite choices have been specified yet. Use `sprite_viewer.py` to find the 64×64 cell ID and coordinates, then record them in the game code.
-
 ## 64x64 atlas cells
 
 Run `sprite_viewer.py` to view either atlas. Use Tab to switch atlases, +/- to zoom, and click a cell to print its atlas name, ID, and coordinates. IDs are numbered from zero, left-to-right and then top-to-bottom within the selected atlas. The viewer pads incomplete edge cells for display.
@@ -131,4 +125,14 @@ The Python helpers `sprite_id_at(image, x, y)`, `sprite_bounds(image, sprite_id)
 
 In `main.c`, `TILE_*` defines name the tile IDs stored in the map, while `TANK_SPRITE_*_BASE` defines the sprite-slot ranges used by the two players' rotated tanks. Use these names instead of raw IDs when referring to the game's tile and sprite slots.
 
-Terrain atlas cells are 64×64 and align to the grid. The object atlas currently has packed artwork and is padded by the viewer to a 7×7 grid; align its art to the grid before using those IDs as final sprite references. The current game API stores runtime terrain tiles as 16×16 and sprite images up to 64×64.
+Both atlas images use aligned 64×64 cells. The object atlas is a 6×8 grid; its final cells are aligned forest tiles, and the health, damage, and speed power-ups use row 2, columns 3-5. The current game API stores runtime terrain tiles at the configured map-tile size and sprite images up to 64×64.
+
+## Timed power-ups and movement audio
+
+One power-up appears after five seconds, then another can appear 12 seconds after
+the previous one is collected or expires. A power-up remains for 12 seconds and
+spawns on a clear map tile. Health restores up to 25 points immediately; speed
+raises forward and reverse limits by 50%; damage doubles shot damage. Speed and
+damage boosts last ten seconds and reset each round. Pickup icons use the health,
+ammunition, and blue shield/speed cells in the object atlas. While moving, each
+tank emits a quiet short engine tone every 12 frames, with pitch tied to speed.

@@ -1,4 +1,5 @@
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 import re
 import runpy
@@ -19,7 +20,7 @@ OBJECT_REMOVAL_TYPES = ("fixed", "explosion", "disappear")
 
 
 def object_tile_coordinates(map_data: dict) -> list[tuple[int, int]]:
-    coordinates = set()
+    coordinates = {(3, 2), (4, 2), (5, 2)}
     for layer in ("obstacles", "objects"):
         for row in map_data[layer]:
             for cell in row:
@@ -93,17 +94,23 @@ def _median_cut_palette(
 
 def load_map_assets(
     map_path: Path, tile_size: int | None = None,
+    logger: Callable[[str], None] | None = None,
 ) -> tuple[
     dict, list[list[int]], list[tuple[int, int, int]],
     tuple[int, int, int],
 ]:
+    report = logger if logger is not None else (lambda message: None)
+    report(f"[Tank-16 assets] Reading map source: {Path(map_path).resolve()}")
     if tile_size is None:
+        report(f"[Tank-16 assets] Reading tile-size setting from {MAIN_PATH}")
         tile_size = map_tile_pixel_size()
     if not 1 <= tile_size <= 64:
         raise ValueError("Map tile pixel size must be between 1 and 64")
+    report(f"[Tank-16 assets] Loading map editor: {EDITOR_PATH}")
     editor = runpy.run_path(str(EDITOR_PATH))
     map_data = editor["load_map"](Path(map_path))
     tileset_path = GAME_DIR / "gfx" / map_data["tileset"]
+    report(f"[Tank-16 assets] Loading terrain tileset: {tileset_path}")
     tileset, columns, rows = editor["load_tileset"](tileset_path)
     sources = [
         tileset.subsurface((tile_x * 64, tile_y * 64, 64, 64))
@@ -111,14 +118,23 @@ def load_map_assets(
     ]
     object_coordinates = object_tile_coordinates(map_data)
     if object_coordinates:
+        objects_path = GAME_DIR / "gfx" / map_data["objects_tileset"]
+        report(
+            f"[Tank-16 assets] Loading {len(object_coordinates)} used object "
+            f"tiles from {objects_path}"
+        )
         objects, _, _ = editor["load_tileset"](
-            GAME_DIR / "gfx" / map_data["objects_tileset"], pad_edges=True)
+            objects_path, pad_edges=True)
         sources.extend(
             objects.subsurface((x * 64, y * 64, 64, 64))
             for x, y in object_coordinates
         )
     if len(sources) > 256:
         raise ValueError("Terrain and used object tiles exceed 256 GPU tile slots")
+    report(
+        f"[Tank-16 assets] Scaling {len(sources)} tiles from "
+        f"{map_data['tileset']} to {tile_size}x{tile_size} pixels"
+    )
     scaled_tiles = []
     histogram: Counter[tuple[int, int, int]] = Counter()
     for source_tile in sources:
@@ -135,17 +151,26 @@ def load_map_assets(
 
     if not histogram:
         raise ValueError("Tileset contains no opaque pixels")
+    report(
+        f"[Tank-16 assets] Building runtime palette from "
+        f"{len(histogram)} opaque colors"
+    )
     atlas_palette = _median_cut_palette(histogram, RUNTIME_PALETTE_CAPACITY)
     palette = [(0, 0, 0), *atlas_palette]
-    color_indices = {
-        color: min(
+    color_indices = {}
+    for color_number, color in enumerate(histogram, start=1):
+        if color_number == 1 or color_number % 512 == 0:
+            report(
+                f"[Tank-16 assets] Mapping source colors: "
+                f"{color_number}/{len(histogram)}"
+            )
+        color_indices[color] = min(
             range(len(atlas_palette)),
             key=lambda index: sum(
                 (color[channel] - atlas_palette[index][channel]) ** 2
                 for channel in range(3)),
         ) + RUNTIME_PALETTE_BASE
-        for color in histogram
-    }
+    report(f"[Tank-16 assets] Converting {len(scaled_tiles)} tiles to palette indices")
     tiles = []
     for pixels in scaled_tiles:
         tile_pixels = []
@@ -251,10 +276,16 @@ def build_map_header(
         "#define MAP_VARIANT_COUNT %d\n"
         "#define MAP_OBJECT_COUNT %d\n"
         "#define MAP_OBJECT_CAPACITY %d\n"
+        "#define POWERUP_HEALTH_TILE %d\n"
+        "#define POWERUP_DAMAGE_TILE %d\n"
+        "#define POWERUP_SPEED_TILE %d\n"
         "#define OBJECT_FIXED 0\n"
         "#define OBJECT_EXPLOSION 1\n"
         "#define OBJECT_DISAPPEAR 2\n"
-    ) % (len(round_maps), len(objects), map_object_capacity)
+    ) % (
+        len(round_maps), len(objects), map_object_capacity,
+        object_ids[(3, 2)], object_ids[(4, 2)], object_ids[(5, 2)],
+    )
     if len(obstacle_tiles) <= 32768:
         layer_header += (
             "unsigned char map_obstacles[MAP_CELLS] = {\n%s\n};\n"
@@ -388,10 +419,21 @@ def build_map_header(
     )
 
 
-def build_runtime_assets_header() -> str:
+def build_runtime_assets_header(
+    logger: Callable[[str], None] | None = None,
+) -> str:
+    report = logger if logger is not None else (lambda message: None)
+    report(
+        f"[Tank-16 assets] Loading object tileset: "
+        f"{GAME_DIR / 'gfx' / 'tiles_objects.png'}"
+    )
     editor = runpy.run_path(str(EDITOR_PATH))
     objects, object_columns, object_rows = editor["load_tileset"](
         GAME_DIR / "gfx" / "tiles_objects.png", pad_edges=True
+    )
+    report(
+        f"[Tank-16 assets] Preparing object tile atlas from "
+        f"{object_columns * object_rows} object tiles"
     )
     map_data = editor["new_map"]("RUNTIME", object_columns * object_rows, 1)
     for index in range(object_columns * object_rows):
@@ -402,7 +444,7 @@ def build_runtime_assets_header() -> str:
         }
     with tempfile.TemporaryDirectory() as directory:
         map_path = editor["save_map"](map_data, Path(directory))
-        _, tile_data, palette, dimensions = load_map_assets(map_path)
+        _, tile_data, palette, dimensions = load_map_assets(map_path, logger=logger)
 
     terrain_columns, terrain_rows, tile_size = dimensions
     terrain_count = terrain_columns * terrain_rows
@@ -426,7 +468,11 @@ def build_runtime_assets_header() -> str:
         "    {%s}" % ", ".join(str(channel) for channel in color)
         for color in palette
     )
-    return (
+    report(
+        f"[Tank-16 assets] Serializing {len(tile_data)} runtime tiles and "
+        f"{len(palette)} palette entries into C source"
+    )
+    header = (
         "#define RUNTIME_MAP_LOADING 1\n"
         "#define MAP_COLUMNS map_columns\n"
         "#define MAP_ROWS map_rows\n"
@@ -441,6 +487,9 @@ def build_runtime_assets_header() -> str:
         f"#define OBJECT_TILE_BASE {terrain_count}\n"
         f"#define OBJECT_COLUMNS {object_columns}\n"
         f"#define OBJECT_ROWS {object_rows}\n"
+        f"#define POWERUP_HEALTH_TILE {terrain_count + 2 * object_columns + 3}\n"
+        f"#define POWERUP_DAMAGE_TILE {terrain_count + 2 * object_columns + 4}\n"
+        f"#define POWERUP_SPEED_TILE {terrain_count + 2 * object_columns + 5}\n"
         f"#define RUNTIME_TILE_COUNT {len(tile_data)}\n"
         f"#define TILE_PIXEL_COUNT {tile_pixels}\n"
         f"#define MAP_PALETTE_COUNT {len(palette)}\n"
@@ -465,15 +514,34 @@ def build_runtime_assets_header() -> str:
         f"{uploads}\n"
         "}\n"
     )
+    report(
+        f"[Tank-16 assets] Generated runtime asset header: "
+        f"{len(header.encode('utf-8'))} bytes"
+    )
+    return header
 
 
-def compile_runtime_tank16():
+def compile_runtime_tank16(
+    logger: Callable[[str], None] | None = None,
+):
+    report = logger if logger is not None else (lambda message: None)
+    report(f"[Tank-16 loader] Reading C source file: {MAIN_PATH}")
     source = MAIN_PATH.read_text(encoding="utf-8")
     include = '#include "map_assets.h"'
     if source.count(include) != 1:
         raise ValueError("Tank-16 main.c must include map_assets.h exactly once")
-    source = source.replace(include, build_runtime_assets_header(), 1)
-    return compile_source(source, str(MAIN_PATH))
+    report(f"[Tank-16 loader] Generating runtime graphics from {GAME_DIR / 'gfx'}")
+    runtime_header = build_runtime_assets_header(logger)
+    report(f"[Tank-16 loader] Injecting generated assets into {MAIN_PATH}")
+    source = source.replace(include, runtime_header, 1)
+    report(f"[Tank-16 loader] Compiling {MAIN_PATH} with generated assets")
+    image = compile_source(source, str(MAIN_PATH), logger=logger)
+    image_size = sum(len(segment.data) for segment in image.segments)
+    report(
+        f"[Tank-16 loader] Compilation finished: {image_size} bytes across "
+        f"{len(image.segments)} segments"
+    )
+    return image
 
 
 def discover_round_maps(map_path: Path) -> list[Path]:

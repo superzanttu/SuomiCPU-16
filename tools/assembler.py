@@ -1,5 +1,6 @@
 import ast
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,6 +90,8 @@ def _expand_includes(
     source: str,
     base_directory: Path,
     include_stack: tuple[Path, ...] = (),
+    logger: Callable[[str], None] | None = None,
+    source_name: str = "<memory>",
 ) -> str:
     expanded_lines: list[str] = []
     for line_number, line in enumerate(source.splitlines(), 1):
@@ -131,11 +134,18 @@ def _expand_includes(
             included_source = include_path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeError) as exc:
             raise _error(line_number, f"cannot include {include_path}: {exc}") from exc
+        if logger is not None:
+            logger(
+                f"[SC-16 assembler] {source_name}:{line_number} includes "
+                f"{include_path}"
+            )
         expanded_lines.append(
             _expand_includes(
                 included_source,
                 include_path.parent,
                 (*include_stack, include_path),
+                logger,
+                str(include_path),
             )
         )
     return "\n".join(expanded_lines)
@@ -634,14 +644,26 @@ def assemble(
     source: str,
     origin: int = 0,
     base_directory: str | Path | None = None,
+    logger: Callable[[str], None] | None = None,
+    source_name: str | Path | None = None,
 ) -> AssemblyImage:
     """Assemble source into segments; .include paths are relative to base_directory."""
     if not 0 <= origin < MEMORY_SIZE:
         raise AssemblyError(f"invalid assembly origin {origin:#x}")
 
     include_directory = Path(base_directory) if base_directory is not None else Path.cwd()
-    source = _expand_includes(source, include_directory.resolve())
+    source_label = str(source_name) if source_name is not None else "<memory assembly>"
+    if logger is not None:
+        logger(f"[SC-16 assembler] Expanding assembly source: {source_label}")
+    source = _expand_includes(
+        source, include_directory.resolve(), logger=logger, source_name=source_label
+    )
     statements = _source_statements(source)
+    if logger is not None:
+        logger(
+            f"[SC-16 assembler] Parsed {len(statements)} statements from "
+            f"{source_label}; resolving labels and addresses"
+        )
     labels: dict[str, int] = {}
     located_statements: list[tuple[int, str, int, bytes | None]] = []
     address = origin
@@ -684,6 +706,8 @@ def assemble(
         if address > MEMORY_SIZE:
             raise _error(line_number, "assembled program exceeds available memory")
 
+    if logger is not None:
+        logger(f"[SC-16 assembler] Encoding instructions and data from {source_label}")
     memory_bytes: dict[int, int] = {}
     for line_number, text, start, data in located_statements:
         if text.lower().startswith(".address"):
@@ -717,17 +741,32 @@ def assemble(
         entry_point = first_emitted_address
     else:
         entry_point = origin
-    return AssemblyImage(tuple(segments), entry_point)
+    image = AssemblyImage(tuple(segments), entry_point)
+    if logger is not None:
+        image_size = sum(len(segment.data) for segment in image.segments)
+        logger(
+            f"[SC-16 assembler] Finished {source_label}: {image_size} bytes in "
+            f"{len(image.segments)} segments; entry point {entry_point:#x}"
+        )
+    return image
 
 
-def assemble_file(path: str | Path, origin: int = 0) -> AssemblyImage:
+def assemble_file(
+    path: str | Path,
+    origin: int = 0,
+    logger: Callable[[str], None] | None = None,
+) -> AssemblyImage:
     """Read and assemble an UTF-8 SC-16 assembly file."""
     source_path = Path(path).resolve()
+    if logger is not None:
+        logger(f"[SC-16 assembler] Reading assembly source file: {source_path}")
     try:
         source = source_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise AssemblyError(f"cannot read {source_path}: {exc}") from exc
     try:
-        return assemble(source, origin, source_path.parent)
+        return assemble(
+            source, origin, source_path.parent, logger=logger, source_name=source_path
+        )
     except AssemblyError as exc:
         raise AssemblyError(f"{source_path}: {exc}") from exc

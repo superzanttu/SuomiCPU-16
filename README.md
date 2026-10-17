@@ -35,6 +35,9 @@ Press **F2** in the emulator window to hide/show the console; **F11** toggles
 windowed/fullscreen game display. Start directly in fullscreen with
 `python main.py --fullscreen` or
 `.\run.ps1 -Fullscreen`.
+Detailed stage logs are on by default and show which SC-16 component is
+processing each source file, including compiler, assembler, include, and
+memory-loading stages. Use `--quiet` to hide these details.
 
 Run an example directly from the repository root:
 ```console

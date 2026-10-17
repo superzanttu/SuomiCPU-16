@@ -53,10 +53,15 @@ class SpriteViewerTests(unittest.TestCase):
     def test_atlas_files_use_64_pixel_cell_dimensions(self):
         root = SPRITE_VIEWER_PATH.parent / "gfx"
         terrain = pygame.image.load(str(root / "tiles_terrain.png"))
-        self.assertEqual(terrain.get_size(), (640, 384))
+        self.assertEqual(terrain.get_size(), (640, 576))
         self.assertEqual(sprite_bounds(terrain, 39), pygame.Rect(576, 192, 64, 64))
         self.assertEqual(sprite_bounds(terrain, 40), pygame.Rect(0, 256, 64, 64))
         self.assertEqual(sprite_bounds(terrain, 59), pygame.Rect(576, 320, 64, 64))
+        self.assertEqual(sprite_bounds(terrain, 60), pygame.Rect(0, 384, 64, 64))
+        self.assertEqual(sprite_bounds(terrain, 69), pygame.Rect(576, 384, 64, 64))
+        self.assertEqual(sprite_bounds(terrain, 70), pygame.Rect(0, 448, 64, 64))
+        self.assertEqual(sprite_bounds(terrain, 85), pygame.Rect(320, 512, 64, 64))
+        self.assertEqual(sprite_bounds(terrain, 89), pygame.Rect(576, 512, 64, 64))
 
         objects = load_atlas(root / "tiles_objects.png")
         self.assertEqual(objects.get_width() % 64, 0)
