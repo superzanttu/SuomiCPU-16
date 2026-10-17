@@ -2691,13 +2691,18 @@ class SuomiCompute16:
                     deferred_release = 0
                 display_now = time.monotonic()
                 max_speed = self._max_speed()
+                vsync_frame = (
+                    self._vsync_enabled() and
+                    getattr(self, "_presented_frame", False)
+                )
                 display_interval_elapsed = (
                     display_now - last_display_update >= 1 / DISPLAY_FPS
                 )
-                if self.paused or not max_speed or display_interval_elapsed:
+                if (self.paused or not max_speed or vsync_frame or
+                        display_interval_elapsed):
                     self.update_display()
                     last_display_update = display_now
-                if self.paused or not max_speed:
+                if self.paused or not max_speed or vsync_frame:
                     self.clock.tick(DISPLAY_FPS)
         finally:
             pygame.key.stop_text_input()

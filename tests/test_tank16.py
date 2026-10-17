@@ -264,7 +264,7 @@ class Tank16Tests(unittest.TestCase):
             "  change_health(1, -100); round_over = 1; round_delay = 60;\n"
             "  for (i = 0; i < 3; i++) update_game(0, 0);\n"
             "  results[10] = burn_count;\n"
-            "  results[11] = burn_sites[0].rounds;\n"
+            "  results[11] = burn_sites[0].remaining_seconds;\n"
             "  results[12] = burn_sites[0].mask;\n"
             "  results[13] = round_delay;\n"
             "  return 0;\n"
@@ -285,7 +285,7 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(results[:3], [2, 157, 159])
         self.assertGreaterEqual(results[3], 17)
         self.assertLessEqual(results[3], 35)
-        self.assertEqual(results[4:], [0, 0, 3, 80, 0, 0, 1, 11, 24, 57])
+        self.assertEqual(results[4:], [0, 0, 3, 80, 0, 0, 1, 30, 24, 57])
 
     def test_pixel_collisions_rotation_thin_obstacles_and_crossing_ammo(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
@@ -407,6 +407,7 @@ class Tank16Tests(unittest.TestCase):
             "    shots[i].life = 120; shots[i].x = 40 + i * 40;\n"
             "    shots[i].y = 160; shots[i].direction = 0;\n"
             "  }\n"
+            "  gfx_present();\n"
             "  update_game(0, 0);\n"
             "  draw_game(); gfx_present();\n"
             "  return 0;\n"
@@ -414,6 +415,8 @@ class Tank16Tests(unittest.TestCase):
         )
         cpu = make_cpu(compile_source(source + scenario, str(source_path)))
         self.assertLess(run_frame(cpu), 400_000)
+        self.assertTrue(cpu.frame_yield)
+        run_frame(cpu, 2_000_000)
         self.assertTrue(cpu.frame_yield)
         self.assertLess(run_frame(cpu), 400_000)
         self.assertTrue(cpu.frame_yield)
@@ -516,7 +519,7 @@ class Tank16Tests(unittest.TestCase):
                     _, tiles, palette, dimensions = load_map_assets(path)
                 self.assertEqual(dimensions[2], size)
                 object_tile_id = dimensions[0] * dimensions[1]
-                self.assertEqual(len(tiles), object_tile_id + 1)
+                self.assertEqual(len(tiles), object_tile_id + 4)
                 self.assertEqual(len(tiles[object_tile_id]), size * size)
                 expected = pygame.transform.smoothscale(source_tile, (size, size))
                 for y in range(size):

@@ -4,8 +4,8 @@ import math
 import pygame
 
 
-ROOT = Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "modules" / "Tank-16" / "gfx" / "tiles_objects.png"
+GAME_DIR = Path(__file__).resolve().parent
+OUTPUT = GAME_DIR / "gfx" / "tiles_objects.png"
 SIZE = 64
 COLORS = {
     "outline": (28, 34, 35),

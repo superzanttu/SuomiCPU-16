@@ -1993,7 +1993,9 @@ void draw_runtime_loading_screen(char *message, int current, int total)
         }
         gfx_rect(dot_x, dot_y, 6, 6, dot == spinner ? YELLOW : GRAY);
     }
+    gfx_vsync(0);
     gfx_present();
+    gfx_vsync(1);
 }
 #endif
 

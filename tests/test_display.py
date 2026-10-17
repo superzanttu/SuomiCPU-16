@@ -203,7 +203,7 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(emulator.update_display.call_count, 6)
         emulator.clock.tick.assert_not_called()
 
-    def test_vsync_does_not_throttle_max_speed_and_display_stays_at_30_fps(self):
+    def test_vsync_paces_presented_frames_at_max_speed(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
         emulator.memory = create_memory()
         emulator.memory[SPEED_ADDR] = SPEED_MAX
@@ -218,28 +218,24 @@ class DisplayTests(unittest.TestCase):
         emulator.running = True
         emulator.reset = Mock()
         emulator.execute_frame = Mock(
-            side_effect=lambda: setattr(emulator, "frame_yield", True))
+            side_effect=lambda: setattr(emulator, "_presented_frame", True))
         emulator.update_rtc = Mock()
         emulator.begin_mouse_frame = Mock()
         emulator.end_mouse_frame = Mock()
-        emulator.update_display = Mock()
+        emulator.update_display = Mock(
+            side_effect=lambda: setattr(emulator, "_presented_frame", False))
         quit_event = pygame.event.Event(pygame.QUIT)
         event_batches = [[] for _ in range(8)] + [[quit_event]]
-        monotonic_calls = 0
-
-        def monotonic():
-            nonlocal monotonic_calls
-            monotonic_calls += 1
-            return 10 + (monotonic_calls - 1) // 2 / 30
 
         with patch.object(pygame.event, "get", side_effect=event_batches):
-            with patch("src.SuomiCPU.time.monotonic", side_effect=monotonic):
+            with patch("src.SuomiCPU.time.monotonic", return_value=10.0):
                 with patch("src.SuomiCPU.ConsoleWindow"):
                     emulator.run()
 
         self.assertEqual(emulator.execute_frame.call_count, 8)
-        self.assertEqual(emulator.update_display.call_count, 4)
-        emulator.clock.tick.assert_not_called()
+        self.assertEqual(emulator.update_display.call_count, 8)
+        self.assertEqual(emulator.clock.tick.call_count, 8)
+        emulator.clock.tick.assert_called_with(30)
 
     def test_f11_toggles_fullscreen_during_emulation(self):
         emulator = SuomiCompute16.__new__(SuomiCompute16)
