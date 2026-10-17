@@ -922,11 +922,11 @@ class Tank16Tests(unittest.TestCase):
             "  original_map = map_selected_path[5];\n"
             "  add_ammo_burn_site(10, 20, 0);\n"
             "  effect_random = 17; select_runtime_round_map();\n"
-            "  results[64] = burn_count;\n"
+            "  results[4] = burn_count;\n"
             "  effect_random = 0; select_runtime_round_map();\n"
             "  found_map_change = map_selected_path[5] != original_map;\n"
-            "  results[65] = burn_count;\n"
-            "  results[66] = found_map_change;\n"
+            "  results[5] = burn_count;\n"
+            "  results[6] = found_map_change;\n"
             "  return 0;\n"
             "}\n"
         )
@@ -946,7 +946,7 @@ class Tank16Tests(unittest.TestCase):
                     ],
                 }), encoding="utf-8")
             image = compile_source(
-                "int results[67];\n" + game_source + test_source,
+                "int results[16];\n" + game_source + test_source,
                 str(source_path),
             )
             cpu = make_cpu(image)
@@ -969,7 +969,7 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(selected_dimensions, {(4, 3), (5, 4)})
         self.assertEqual([
             cpu.read_16(GLOBAL_BASE + index * 2)
-            for index in range(64, 67)
+            for index in range(4, 7)
         ], [1, 0, 1])
         runtime_log = cpu.console_device.output.decode("ascii")
         self.assertIn("MAP FILE: maps/A.json", runtime_log)
@@ -1037,7 +1037,7 @@ class Tank16Tests(unittest.TestCase):
             cpu.read_16(GLOBAL_BASE), 1,
             cpu.console_device.output.decode("ascii", errors="replace"))
         actual_tile = bytes(cpu.tile_memory[:64 * 64])
-        expected_tile = bytes(first_tile["pixels"])
+        expected_tile = bytes.fromhex(first_tile["pixels"])
         first_difference = next(
             (index for index, pixels in enumerate(
                 zip(actual_tile, expected_tile)) if pixels[0] != pixels[1]),

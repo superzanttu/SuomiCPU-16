@@ -245,22 +245,115 @@ def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
         map_data.get("tileset", DEFAULT_TILESET_FILENAME))
     _, columns, rows = load_tileset(ROOT / "gfx" / filename)
     normalized = validate_map(map_data, columns, rows)
+    object_columns = load_tileset(
+        OBJECT_TILESET_PATH, pad_edges=True)[1]
+    serialized = dict(normalized)
+    serialized["runtime_encoding"] = "flat-v1"
+    serialized["tiles"] = [
+        tile_y * columns + tile_x
+        for row in normalized["tiles"]
+        for tile_x, tile_y in row
+    ]
+    serialized["obstacles"] = []
+    serialized["objects"] = []
+    removal_codes = {"fixed": 0, "explosion": 1, "disappear": 2}
+    for y in range(normalized["height"]):
+        for x in range(normalized["width"]):
+            index = y * normalized["width"] + x
+            obstacle = normalized["obstacles"][y][x]
+            if obstacle is not None:
+                tile_x, tile_y = obstacle
+                serialized["obstacles"].append(
+                    [index, tile_y * object_columns + tile_x])
+            object_cell = normalized["objects"][y][x]
+            if object_cell is not None:
+                tile_x, tile_y = object_cell["tile"]
+                removal = object_cell["removal"]
+                if removal not in removal_codes:
+                    raise ValueError("Unsupported object removal type")
+                serialized["objects"].append([
+                    index, tile_y * object_columns + tile_x,
+                    object_cell["hp_change"], removal_codes[removal],
+                ])
     maps_dir.mkdir(parents=True, exist_ok=True)
     path = maps_dir / (normalized["name"] + ".json")
-    large_map = normalized["width"] * normalized["height"] > 128 * 128
     with path.open("w", encoding="utf-8", newline="\n") as handle:
-        json.dump(normalized, handle, indent=None if large_map else 2,
-                  separators=(",", ":") if large_map else None)
+        json.dump(serialized, handle, separators=(",", ":"))
         handle.write("\n")
     if maps_dir.resolve() == (ROOT / "maps").resolve():
         disk_maps_dir = ROOT / "disks" / "maps"
         disk_maps_dir.mkdir(parents=True, exist_ok=True)
         with (disk_maps_dir / path.name).open(
                 "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(normalized, handle, indent=None if large_map else 2,
-                      separators=(",", ":") if large_map else None)
+            json.dump(serialized, handle, separators=(",", ":"))
             handle.write("\n")
     return path
+
+
+def _expand_runtime_map(
+        document: dict, terrain_columns: int, terrain_rows: int,
+        object_columns: int, object_rows: int) -> dict:
+    width = document.get("width")
+    height = document.get("height")
+    if (not isinstance(width, int) or isinstance(width, bool) or width < 1 or
+            not isinstance(height, int) or isinstance(height, bool) or
+            height < 1 or width * height > MAX_MAP_DIMENSION ** 2):
+        raise ValueError("Invalid compact map dimensions")
+    cell_count = width * height
+    flat_tiles = document.get("tiles")
+    if not isinstance(flat_tiles, list) or len(flat_tiles) != cell_count:
+        raise ValueError("Compact map tile count does not match its dimensions")
+    tiles = []
+    for index, tile in enumerate(flat_tiles):
+        if (not isinstance(tile, int) or isinstance(tile, bool) or
+                not 0 <= tile < terrain_columns * terrain_rows):
+            raise ValueError("Compact map contains an invalid terrain tile")
+        if index % width == 0:
+            tiles.append([])
+        tiles[-1].append([tile % terrain_columns, tile // terrain_columns])
+
+    obstacles = [[None for _ in range(width)] for _ in range(height)]
+    objects = [[None for _ in range(width)] for _ in range(height)]
+    layer_specs = (
+        ("obstacles", obstacles, 2),
+        ("objects", objects, 4),
+    )
+    for name, layer, expected_length in layer_specs:
+        entries = document.get(name, [])
+        if not isinstance(entries, list):
+            raise ValueError("Compact %s layer must be a list" % name)
+        seen = set()
+        for entry in entries:
+            if (not isinstance(entry, list) or
+                    len(entry) != expected_length or
+                    any(not isinstance(value, int) or isinstance(value, bool)
+                        for value in entry)):
+                raise ValueError("Invalid compact %s entry" % name)
+            index, tile = entry[:2]
+            if (not 0 <= index < cell_count or index in seen or
+                    not 0 <= tile < object_columns * object_rows):
+                raise ValueError("Compact %s entry is outside the map" % name)
+            seen.add(index)
+            x, y = index % width, index // width
+            coordinates = [tile % object_columns, tile // object_columns]
+            if name == "obstacles":
+                layer[y][x] = coordinates
+            else:
+                removal_codes = ("fixed", "explosion", "disappear")
+                _, _, hp_change, removal_code = entry
+                if not 0 <= removal_code < len(removal_codes):
+                    raise ValueError("Invalid compact object removal code")
+                layer[y][x] = {
+                    "tile": coordinates,
+                    "hp_change": hp_change,
+                    "removal": removal_codes[removal_code],
+                }
+    expanded = dict(document)
+    expanded.pop("runtime_encoding")
+    expanded["tiles"] = tiles
+    expanded["obstacles"] = obstacles
+    expanded["objects"] = objects
+    return expanded
 
 
 def convert_tilesets_to_json(
@@ -306,7 +399,8 @@ def convert_tilesets_to_json(
     for index, pixels in enumerate(tiles):
         tile_path = tiles_dir / ("tile_%03d.json" % index)
         with tile_path.open("w", encoding="utf-8", newline="\n") as handle:
-            json.dump({"pixels": pixels}, handle, separators=(",", ":"))
+            json.dump({"pixels": bytes(pixels).hex()}, handle,
+                      separators=(",", ":"))
             handle.write("\n")
     with output_path.open("w", encoding="utf-8", newline="\n") as handle:
         json.dump(document, handle, separators=(",", ":"))
@@ -334,6 +428,15 @@ def load_map(path: Path, tileset_columns: int | None = None,
     rows = actual_rows if tileset_rows is None else tileset_rows
     if (columns, rows) != (actual_columns, actual_rows):
         raise ValueError("Tileset dimensions do not match the map tileset")
+    encoding = document.get("runtime_encoding")
+    if encoding is not None:
+        if encoding != "flat-v1":
+            raise ValueError("Unsupported runtime map encoding")
+        _, object_columns, object_rows = load_tileset(
+            OBJECT_TILESET_PATH, pad_edges=True)
+        document = _expand_runtime_map(
+            document, actual_columns, actual_rows,
+            object_columns, object_rows)
     return validate_map(document, actual_columns, actual_rows)
 
 

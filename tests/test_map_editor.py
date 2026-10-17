@@ -248,7 +248,7 @@ class MapEditorDataTests(unittest.TestCase):
         set_map_tile(map_data, 1, 2, 5, 3, 10, 4)
         with tempfile.TemporaryDirectory() as directory:
             path = save_map(map_data, Path(directory))
-            loaded = load_map(path, 10, 6)
+            loaded = load_map(path, 10, 9)
 
         self.assertEqual(path.name, "ARENA.json")
         self.assertEqual(loaded, map_data)
