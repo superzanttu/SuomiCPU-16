@@ -12,7 +12,7 @@ jobs:
     env:
       SDL_VIDEODRIVER: dummy
       SDL_AUDIODRIVER: dummy
-      PYTHONPATH: .:tools
+      PYTHONPATH: .:tools:src
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

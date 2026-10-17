@@ -464,6 +464,8 @@ def build_runtime_assets_header(
         "int runtime_tile_size;\n"
         "int runtime_tile_count;\n"
         "int runtime_palette_count;\n"
+        "int runtime_tile_data_ready;\n"
+        "int runtime_tile_loaded[256];\n"
         "unsigned char *map_data;\n"
         "unsigned char *map_obstacles;\n"
         "volatile unsigned char map_json_chunk[256];\n"

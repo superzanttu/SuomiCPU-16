@@ -21,8 +21,11 @@ from generate_finland_map import (
 class FinlandMapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.data = json.loads(
-            (GAME_DIR / "maps" / "FINLAND.json").read_text(encoding="utf-8"))
+        cls.map_path = GAME_DIR / "maps" / "FINLAND.json"
+        cls.runtime_document = json.loads(
+            cls.map_path.read_text(encoding="utf-8"))
+        editor = runpy.run_path(str(GAME_DIR / "map_editor.py"))
+        cls.data = editor["load_map"](cls.map_path)
 
     def test_generated_finland_has_natural_features_and_runtime_tile_ids(self):
         data = self.data
@@ -67,6 +70,32 @@ class FinlandMapTests(unittest.TestCase):
         self.assertGreater(counts["finland_land"], 1_000)
         self.assertGreater(counts["water"], 1_000)
 
+    def test_runtime_json_contains_only_referenced_tile_indices(self):
+        document = self.runtime_document
+        self.assertEqual(document["runtime_encoding"], "flat-v1")
+        self.assertLess(self.map_path.stat().st_size, 65_535)
+        disk_map = GAME_DIR / "disks" / "maps" / self.map_path.name
+        self.assertEqual(disk_map.read_bytes(), self.map_path.read_bytes())
+        expected_terrain = {
+            tile_y * 10 + tile_x
+            for row in self.data["tiles"]
+            for tile_x, tile_y in row
+        }
+        self.assertEqual(set(document["tiles"]), expected_terrain)
+        expected_objects = set()
+        for layer in ("obstacles", "objects"):
+            for row in self.data[layer]:
+                for cell in row:
+                    if cell is not None:
+                        tile = cell if layer == "obstacles" else cell["tile"]
+                        expected_objects.add(tile[1] * 6 + tile[0])
+        stored_objects = {
+            entry[1]
+            for layer in ("obstacles", "objects")
+            for entry in document[layer]
+        }
+        self.assertEqual(stored_objects, expected_objects)
+
     def test_land_cities_and_real_lakes_are_at_correct_projected_locations(self):
         bounds = self.data["geography"]["projected_bounds_km"]
         span = bounds[2] - bounds[0]
@@ -101,7 +130,7 @@ class FinlandMapTests(unittest.TestCase):
         self.assertIsNone(loaded["objects"][-1][-1])
         with tempfile.TemporaryDirectory() as directory:
             saved = editor["save_map"](loaded, Path(directory))
-            self.assertLess(saved.stat().st_size, 700_000)
+            self.assertLess(saved.stat().st_size, 65_535)
             restored = editor["load_map"](saved)
         self.assertEqual(restored, loaded)
 
@@ -248,7 +277,8 @@ class FinlandMapTests(unittest.TestCase):
                 countries_path, lakes_path, output, 64,
                 roads_path=roads_path, railways_path=railways_path,
                 cities_path=cities_path)
-            self.assertEqual(json.loads(output.read_text()), data)
+            editor = runpy.run_path(str(GAME_DIR / "map_editor.py"))
+            self.assertEqual(editor["load_map"](output), data)
             counts = data["geography"]["tile_counts"]
             self.assertEqual(
                 counts["finland_land"] + counts["neighbor_land"] +

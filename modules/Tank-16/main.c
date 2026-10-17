@@ -26,6 +26,13 @@ unsigned char runtime_map_data[RUNTIME_MAP_MAX_CELLS];
 unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
 int runtime_terrain_usage[256];
 int runtime_obstacle_usage[256];
+unsigned char runtime_tile_needed[256];
+int runtime_tile_progress_total;
+int runtime_tile_progress_loaded;
+int runtime_loading_active;
+int runtime_loading_frame;
+char *runtime_loading_stage;
+void draw_runtime_loading_screen(char *message, int current, int total);
 #endif
 
 #define MAP_TILE_PIXEL_SIZE 64
@@ -404,6 +411,7 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
     int length;
     int i;
     unsigned long copied;
+    int progress_chunks;
 
     length = disk_read_file(path, 0, map_json_chunk, 256, size);
     if (length < 0 || *size == 0 || *size > 67108864UL)
@@ -421,6 +429,7 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
     }
     offset = 0;
     copied = 0;
+    progress_chunks = 0;
     while (offset < *size)
     {
         length = disk_read_file(path, offset, map_json_chunk, 256, size);
@@ -436,6 +445,11 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
             (*json)[offset + (unsigned long)i] = map_json_chunk[i];
         offset += (unsigned long)length;
         copied += length;
+        progress_chunks++;
+        if (runtime_loading_active && progress_chunks % 32 == 0)
+            draw_runtime_loading_screen(
+                runtime_loading_stage, runtime_tile_progress_loaded,
+                runtime_tile_progress_total);
     }
     (*json)[copied] = 0;
     return 1;
@@ -455,11 +469,9 @@ int load_runtime_tile_data(void)
     int tile_count;
     int declared_tile_count;
     int tile;
-    int pixel;
     int red;
     int green;
     int blue;
-    int index;
     int result;
 
     printf("TILE DATA: reading %s\n", path);
@@ -607,82 +619,111 @@ int load_runtime_tile_data(void)
     }
     printf("TILE DATA: %s (%lu bytes)\n", path, file_size);
     runtime_tile_count = tile_count;
+    runtime_tile_data_ready = 1;
+    for (tile = 0; tile < 256; tile++)
+        runtime_tile_loaded[tile] = 0;
     free(json);
-    json = 0;
-    for (tile = 0; tile < tile_count; tile++)
+    return 1;
+}
+
+int ensure_runtime_tile_loaded(int tile)
+{
+    char tile_path[] = "assets/tiles/tile_000.json";
+    char *tile_json;
+    char *cursor;
+    unsigned long tile_file_size;
+    int pixel;
+    int red;
+    int green;
+    int index;
+    int palette_entries;
+
+    if (!runtime_tile_data_ready || tile < 0 ||
+        tile >= runtime_tile_count)
     {
-        char tile_path[] = "assets/tiles/tile_000.json";
-        char *tile_json;
-        unsigned long tile_file_size;
-
-        tile_path[18] = (char)('0' + tile / 100);
-        tile_path[19] = (char)('0' + (tile / 10) % 10);
-        tile_path[20] = (char)('0' + tile % 10);
-        if (!load_json_bytes(tile_path, &tile_json, &tile_file_size))
-        {
-            printf("TILE DATA ERROR: could not read %s\n", tile_path);
-            return 0;
-        }
-        cursor = json_value(tile_json, "pixels");
-        if (cursor == 0)
-        {
-            free(tile_json);
-            return 0;
-        }
-        json_skip_whitespace(&cursor);
-        if (*cursor++ != '"')
-        {
-            free(tile_json);
-            return 0;
-        }
-        for (pixel = 0; pixel < TILE_PIXEL_COUNT; pixel++)
-        {
-            red = json_hex_digit(*cursor++);
-            green = json_hex_digit(*cursor++);
-            index = red * 16 + green;
-            if (red < 0 || green < 0 ||
-                (index != 0 &&
-                 (index < MAP_PALETTE_BASE ||
-                  index >= MAP_PALETTE_BASE + palette_entries)))
-            {
-                free(tile_json);
-                return 0;
-            }
-            runtime_tile_pixels[pixel] = (unsigned char)index;
-        }
-        if (*cursor++ != '"')
-        {
-            free(tile_json);
-            return 0;
-        }
-        json_skip_whitespace(&cursor);
-        if (*cursor++ != '}')
-        {
-            free(tile_json);
-            return 0;
-        }
-        json_skip_whitespace(&cursor);
-        if (*cursor != 0)
-        {
-            free(tile_json);
-            return 0;
-        }
-        gfx_tile_upload(tile, runtime_tile_pixels);
-        if (tile < terrain_count)
-            printf("TILE %d terrain source=(%d,%d) loaded (%lu bytes)\n", tile,
-                   tile % runtime_terrain_columns,
-                   tile / runtime_terrain_columns, tile_file_size);
-        else
-        {
-            int object_tile;
-
-            object_tile = tile - terrain_count;
-            printf("TILE %d object source=(%d,%d) loaded (%lu bytes)\n", tile,
-                   object_tile % runtime_object_columns,
-                   object_tile / runtime_object_columns, tile_file_size);
-        }
-        free(tile_json);
+        printf("TILE DATA ERROR: invalid tile request id=%d\n", tile);
+        return 0;
     }
+    if (runtime_tile_loaded[tile])
+        return 1;
+    tile_path[18] = (char)('0' + tile / 100);
+    tile_path[19] = (char)('0' + (tile / 10) % 10);
+    tile_path[20] = (char)('0' + tile % 10);
+    if (!load_json_bytes(tile_path, &tile_json, &tile_file_size))
+    {
+        printf("TILE DATA ERROR: could not read %s\n", tile_path);
+        return 0;
+    }
+    cursor = json_value(tile_json, "pixels");
+    if (cursor == 0)
+    {
+        free(tile_json);
+        return 0;
+    }
+    json_skip_whitespace(&cursor);
+    if (*cursor++ != '"')
+    {
+        free(tile_json);
+        return 0;
+    }
+    palette_entries = runtime_palette_count - 1;
+    for (pixel = 0; pixel < TILE_PIXEL_COUNT; pixel++)
+    {
+        red = json_hex_digit(*cursor++);
+        green = json_hex_digit(*cursor++);
+        index = red * 16 + green;
+        if (red < 0 || green < 0 ||
+            (index != 0 &&
+             (index < MAP_PALETTE_BASE ||
+              index >= MAP_PALETTE_BASE + palette_entries)))
+        {
+            free(tile_json);
+            return 0;
+        }
+        runtime_tile_pixels[pixel] = (unsigned char)index;
+    }
+    if (*cursor++ != '"')
+    {
+        free(tile_json);
+        return 0;
+    }
+    json_skip_whitespace(&cursor);
+    if (*cursor++ != '}')
+    {
+        free(tile_json);
+        return 0;
+    }
+    json_skip_whitespace(&cursor);
+    if (*cursor != 0)
+    {
+        free(tile_json);
+        return 0;
+    }
+    gfx_tile_upload(tile, runtime_tile_pixels);
+    runtime_tile_loaded[tile] = 1;
+    if (runtime_loading_active)
+    {
+        runtime_tile_progress_loaded++;
+        if (runtime_tile_progress_loaded % 4 == 0 ||
+            runtime_tile_progress_loaded == runtime_tile_progress_total)
+            draw_runtime_loading_screen(
+                "LOADING TILES", runtime_tile_progress_loaded,
+                runtime_tile_progress_total);
+    }
+    if (tile < TERRAIN_TILE_COUNT)
+        printf("TILE %d terrain source=(%d,%d) loaded (%lu bytes)\n", tile,
+               tile % runtime_terrain_columns,
+               tile / runtime_terrain_columns, tile_file_size);
+    else
+    {
+        int object_tile;
+
+        object_tile = tile - TERRAIN_TILE_COUNT;
+        printf("TILE %d object source=(%d,%d) loaded (%lu bytes)\n", tile,
+               object_tile % runtime_object_columns,
+               object_tile / runtime_object_columns, tile_file_size);
+    }
+    free(tile_json);
     return 1;
 }
 
@@ -737,12 +778,12 @@ int load_finite_map_flat(char *json, int width, int height)
         map_data[index] = (unsigned char)tile;
         if (index + 1 < cells)
         {
-            json_skip_space(&cursor);
+            json_skip_whitespace(&cursor);
             if (*cursor++ != ',')
                 return 0;
         }
     }
-    json_skip_space(&cursor);
+    json_skip_whitespace(&cursor);
     if (*cursor++ != ']')
         return 0;
 
@@ -779,7 +820,6 @@ int load_finite_map_flat(char *json, int width, int height)
                 return 0;
         }
     }
-
     value = json_value(json, "objects");
     if (value != 0)
     {
@@ -1080,6 +1120,96 @@ int load_infinite_map(char *json)
     return 1;
 }
 
+int load_runtime_map_tiles(void)
+{
+    unsigned long index;
+    int tile;
+    int object;
+    int i;
+
+    if (!runtime_tile_data_ready)
+        return 1;
+    for (i = 0; i < runtime_tile_count; i++)
+        runtime_tile_needed[i] = 0;
+    runtime_tile_needed[POWERUP_HEALTH_TILE] = 1;
+    runtime_tile_needed[POWERUP_DAMAGE_TILE] = 1;
+    runtime_tile_needed[POWERUP_SPEED_TILE] = 1;
+    if (map_infinite)
+    {
+        for (tile = 0; tile < map_terrain_choice_count; tile++)
+            runtime_tile_needed[map_terrain_choices[tile]] = 1;
+        for (tile = 0; tile < map_infinite_obstacle_count; tile++)
+            runtime_tile_needed[map_infinite_obstacles[tile]] = 1;
+    }
+    else
+    {
+        for (index = 0; index < (unsigned long)map_columns *
+                                (unsigned long)map_rows; index++)
+        {
+            runtime_tile_needed[map_data[index]] = 1;
+            if (map_obstacles[index] != 0)
+                runtime_tile_needed[map_obstacles[index]] = 1;
+        }
+        for (object = 0; object < map_object_count; object++)
+            runtime_tile_needed[map_object_tile[object]] = 1;
+    }
+    runtime_tile_progress_total = 0;
+    runtime_tile_progress_loaded = 0;
+    for (i = 0; i < runtime_tile_count; i++)
+        if (runtime_tile_needed[i] && !runtime_tile_loaded[i])
+            runtime_tile_progress_total++;
+    runtime_loading_stage = "LOADING TILES";
+    draw_runtime_loading_screen("LOADING TILES", 0,
+                                runtime_tile_progress_total);
+    if (!ensure_runtime_tile_loaded(POWERUP_HEALTH_TILE) ||
+        !ensure_runtime_tile_loaded(POWERUP_DAMAGE_TILE) ||
+        !ensure_runtime_tile_loaded(POWERUP_SPEED_TILE))
+    {
+        runtime_loading_active = 0;
+        return 0;
+    }
+    if (map_infinite)
+    {
+        for (tile = 0; tile < map_terrain_choice_count; tile++)
+            if (!ensure_runtime_tile_loaded(map_terrain_choices[tile]))
+            {
+                runtime_loading_active = 0;
+                return 0;
+            }
+        for (tile = 0; tile < map_infinite_obstacle_count; tile++)
+            if (!ensure_runtime_tile_loaded(map_infinite_obstacles[tile]))
+            {
+                runtime_loading_active = 0;
+                return 0;
+            }
+        draw_runtime_loading_screen("MAP READY", 1, 1);
+        return 1;
+    }
+    for (index = 0; index < (unsigned long)map_columns *
+                            (unsigned long)map_rows; index++)
+    {
+        if (!ensure_runtime_tile_loaded(map_data[index]))
+        {
+            runtime_loading_active = 0;
+            return 0;
+        }
+        if (map_obstacles[index] != 0 &&
+            !ensure_runtime_tile_loaded(map_obstacles[index]))
+        {
+            runtime_loading_active = 0;
+            return 0;
+        }
+    }
+    for (object = 0; object < map_object_count; object++)
+        if (!ensure_runtime_tile_loaded(map_object_tile[object]))
+        {
+            runtime_loading_active = 0;
+            return 0;
+        }
+    draw_runtime_loading_screen("MAP READY", 1, 1);
+    return 1;
+}
+
 int load_map_path(char *path)
 {
     char *json;
@@ -1117,6 +1247,10 @@ int load_map_path(char *path)
     {
         result = 0;
     }
+    if (result)
+        result = load_runtime_map_tiles();
+    if (!result)
+        printf("MAP LOAD ERROR: invalid or unavailable map %s\n", path);
     free(json);
     return result;
 }
@@ -1366,6 +1500,93 @@ void number_text(unsigned int value, char *out)
     out[count] = 0;
 }
 
+#ifdef RUNTIME_MAP_LOADING
+void draw_runtime_loading_screen(char *message, int current, int total)
+{
+    char percent[6];
+    int percentage;
+    int fill_width;
+    int spinner;
+    int dot_x;
+    int dot_y;
+    int dot;
+
+    runtime_loading_stage = message;
+    runtime_tile_progress_loaded = current;
+    runtime_tile_progress_total = total;
+    percentage = total > 0 ? current * 100 / total : 0;
+    if (percentage < 0)
+        percentage = 0;
+    if (percentage > 100)
+        percentage = 100;
+    fill_width = percentage * 4;
+
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(BLACK);
+    gfx_rect(72, 164, 496, 152, DARK_GRAY);
+    gfx_rect(76, 168, 488, 144, BLACK);
+    gfx_text(270, 188, "TANK-16", YELLOW);
+    gfx_text(220, 226, message, WHITE);
+    gfx_rect(120, 270, 400, 18, DARK_GRAY);
+    if (fill_width > 0)
+        gfx_rect(120, 270, fill_width, 18, GREEN);
+    number_text((unsigned int)percentage, percent);
+    dot = 0;
+    while (percent[dot] != 0 && dot < 4)
+        dot++;
+    percent[dot++] = '%';
+    percent[dot] = 0;
+    gfx_text(308, 298, percent, YELLOW);
+
+    spinner = runtime_loading_frame++ % 8;
+    for (dot = 0; dot < 8; dot++)
+    {
+        if (dot == 0)
+        {
+            dot_x = 497;
+            dot_y = 212;
+        }
+        else if (dot == 1)
+        {
+            dot_x = 513;
+            dot_y = 220;
+        }
+        else if (dot == 2)
+        {
+            dot_x = 521;
+            dot_y = 236;
+        }
+        else if (dot == 3)
+        {
+            dot_x = 513;
+            dot_y = 252;
+        }
+        else if (dot == 4)
+        {
+            dot_x = 497;
+            dot_y = 260;
+        }
+        else if (dot == 5)
+        {
+            dot_x = 481;
+            dot_y = 252;
+        }
+        else if (dot == 6)
+        {
+            dot_x = 473;
+            dot_y = 236;
+        }
+        else
+        {
+            dot_x = 481;
+            dot_y = 220;
+        }
+        gfx_rect(dot_x, dot_y, 6, 6, dot == spinner ? YELLOW : GRAY);
+    }
+    gfx_present();
+}
+#endif
+
 WorldCoord absolute_value(WorldCoord value)
 {
     return value < 0 ? -value : value;
@@ -1438,6 +1659,9 @@ void select_runtime_round_map(void)
     map_obstacles = 0;
     map_object_count = 0;
     map_load_error = 0;
+    runtime_loading_active = 1;
+    runtime_loading_stage = "FINDING MAP";
+    draw_runtime_loading_screen("FINDING MAP", 0, 0);
     file_count = disk_list_files(0, map_path_buffer,
                                  sizeof(map_path_buffer));
     map_count = 0;
@@ -1479,33 +1703,41 @@ void select_runtime_round_map(void)
                     break;
                 }
             }
-            if (map_selected_path[0] != 0 &&
-                load_map_path(map_selected_path))
+            if (map_selected_path[0] != 0)
             {
-                log_loaded_map(map_selected_path);
-                map_index = 0;
-                while (map_index < 128 &&
-                       current_map_path[map_index] != 0 &&
-                       current_map_path[map_index] ==
-                           map_selected_path[map_index])
-                    map_index++;
-                if (current_map_path[map_index] !=
-                    map_selected_path[map_index])
+                runtime_loading_active = 1;
+                runtime_loading_stage = "READING MAP";
+                draw_runtime_loading_screen("READING MAP", 0, 0);
+                if (load_map_path(map_selected_path))
                 {
-                    reset_battlefield();
                     map_index = 0;
+                    log_loaded_map(map_selected_path);
                     while (map_index < 128 &&
-                           map_selected_path[map_index] != 0)
+                           current_map_path[map_index] != 0 &&
+                           current_map_path[map_index] ==
+                               map_selected_path[map_index])
                     {
-                        current_map_path[map_index] =
-                            map_selected_path[map_index];
                         map_index++;
                     }
-                    current_map_path[map_index] = 0;
+                    if (current_map_path[map_index] !=
+                        map_selected_path[map_index])
+                    {
+                        reset_battlefield();
+                        map_index = 0;
+                        while (map_index < 128 &&
+                               map_selected_path[map_index] != 0)
+                        {
+                            current_map_path[map_index] =
+                                map_selected_path[map_index];
+                            map_index++;
+                        }
+                        current_map_path[map_index] = 0;
+                    }
+                    round_map_selection_started++;
+                    current_map_variant = round_map_selection_started - 1;
+                    runtime_loading_active = 0;
+                    return;
                 }
-                round_map_selection_started++;
-                current_map_variant = round_map_selection_started - 1;
-                return;
             }
         }
     }
@@ -1515,6 +1747,7 @@ void select_runtime_round_map(void)
     map_load_error = 1;
     round_map_selection_started++;
     current_map_variant = -1;
+    runtime_loading_active = 0;
 }
 #endif
 
@@ -3398,13 +3631,20 @@ int main(void)
     load_tank_sprites();
     gfx_tile_size(MAP_TILE_PIXEL_SIZE);
 #ifdef RUNTIME_MAP_LOADING
+    runtime_loading_active = 1;
+    runtime_loading_stage = "LOADING TILE DATA";
+    runtime_tile_progress_loaded = 0;
+    runtime_tile_progress_total = 0;
+    draw_runtime_loading_screen("LOADING TILE DATA", 0, 0);
     if (!load_runtime_tile_data())
     {
+        runtime_loading_active = 0;
         gfx_layer_select(LAYER_HUD);
         gfx_text(218, 230, "TILE DATA LOAD FAILED", RED);
         while (1)
             gfx_present();
     }
+    runtime_loading_active = 0;
 #else
     upload_terrain_tiles();
 #endif

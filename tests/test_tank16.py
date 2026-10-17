@@ -842,15 +842,18 @@ class Tank16Tests(unittest.TestCase):
         first_map = game_dir / "maps" / "FINLAND.json"
         second_map = game_dir / "maps" / "100.json"
         self.assertIn(second_map, discover_round_maps(first_map))
-        header = build_map_header(first_map, [second_map])
+        header = build_runtime_assets_header()
         self.assertIn("#define POWERUP_HEALTH_TILE", header)
         self.assertIn("#define POWERUP_DAMAGE_TILE", header)
         self.assertIn("#define POWERUP_SPEED_TILE", header)
+        self.assertIn("#define RUNTIME_MAP_LOADING 1", header)
         self.assertIn(
             '#define RUNTIME_TILE_DATA_PATH "assets/TANK16_TILES.json"',
             header)
         self.assertNotIn("terrain_tiles[", header)
         self.assertNotIn("map_palette[", header)
+        self.assertLess(first_map.stat().st_size, 65_535)
+        self.assertLess(second_map.stat().st_size, 65_535)
         self.assertTrue(RUNTIME_TILE_DATA_PATH.is_file())
         tileset = json.loads(RUNTIME_TILE_DATA_PATH.read_text(encoding="utf-8"))
         self.assertEqual(tileset["format"], "SC16-TANK16-TILES")
@@ -865,36 +868,6 @@ class Tank16Tests(unittest.TestCase):
         tile_files = sorted(
             (RUNTIME_TILE_DATA_PATH.parent / "tiles").glob("tile_*.json"))
         self.assertEqual(len(tile_files), tileset["tile_count"])
-        source_path = game_dir / "main.c"
-        game_source = self.game_source(source_path).replace(
-            '#include "map_assets.h"', header, 1
-        )
-        test_source = (
-            "int main(void) {\n"
-            "  current_map_variant = -1; effect_random = 1; select_round_map();\n"
-            "  results[0] = current_map_variant; results[1] = map_data[0];\n"
-            "  results[2] = map_object_count;\n"
-            "  effect_random = 1;\n"
-            "  select_round_map();\n"
-            "  results[3] = current_map_variant; results[4] = map_data[0];\n"
-            "  results[5] = map_object_count;\n"
-            "  return 0;\n"
-            "}\n"
-        )
-        image = compile_source(
-            "int results[6];\nint main(void);\n" + game_source + test_source,
-            str(source_path),
-        )
-        cpu = make_cpu(image)
-        for _ in range(100):
-            run_frame(cpu)
-            if not cpu.running:
-                break
-        self.assertFalse(cpu.running)
-        results = [
-            cpu.read_16(GLOBAL_BASE + index * 2) for index in range(6)
-        ]
-        self.assertEqual(results, [0, 40, 0, 1, 0, 0])
 
     def test_runtime_round_selection_randomly_loads_disk_map_files(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
@@ -910,6 +883,8 @@ class Tank16Tests(unittest.TestCase):
             "  runtime_object_columns = 6; runtime_object_rows = 8;\n"
             "  runtime_tile_size = 64; runtime_tile_count = 138;\n"
             "  runtime_palette_count = 225;\n"
+            "  results[8] = load_map_path(\"maps/B.json\");\n"
+            "  results[9] = map_columns;\n"
             "  for (i = 0; i < 2; i++) {\n"
             "    effect_random = i;\n"
             "    round_map_selection_started = 0;\n"
@@ -973,7 +948,13 @@ class Tank16Tests(unittest.TestCase):
             tuple(results[index:index + 2])
             for index in range(0, 4, 2)
         }
-        self.assertEqual(selected_dimensions, {(4, 3), (5, 4)})
+        self.assertEqual(
+            selected_dimensions, {(4, 3), (5, 4)},
+            cpu.console_device.output.decode("ascii", errors="replace"))
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in (8, 9)],
+            [1, 5],
+            cpu.console_device.output.decode("ascii", errors="replace"))
         self.assertEqual([
             cpu.read_16(GLOBAL_BASE + index * 2)
             for index in range(4, 7)
@@ -1023,10 +1004,12 @@ class Tank16Tests(unittest.TestCase):
             '#include "map_assets.h"', header, 1
         )
         source = (
-            "int results[1];\n" + game_source +
+            "int results[3];\n" + game_source +
             "int main(void) {\n"
             "  gfx_tile_size(MAP_TILE_PIXEL_SIZE);\n"
             "  results[0] = load_runtime_tile_data();\n"
+            "  results[1] = ensure_runtime_tile_loaded(0);\n"
+            "  results[2] = ensure_runtime_tile_loaded(90);\n"
             "  return 0;\n"
             "}\n"
         )
@@ -1034,14 +1017,15 @@ class Tank16Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cpu.disk = DiskDevice(Path(directory))
             cpu.disk.set_file_root(ROOT / "modules" / "Tank-16" / "disks")
-            for _ in range(200):
+            for _ in range(40):
                 run_frame(cpu)
                 if not cpu.running:
                     break
 
         self.assertFalse(cpu.running)
         self.assertEqual(
-            cpu.read_16(GLOBAL_BASE), 1,
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(3)],
+            [1, 1, 1],
             cpu.console_device.output.decode("ascii", errors="replace"))
         actual_tile = bytes(cpu.tile_memory[:64 * 64])
         expected_tile = bytes.fromhex(first_tile["pixels"])
@@ -1064,6 +1048,37 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn("#define POWERUP_HEALTH_TILE", header)
         self.assertIn("#define POWERUP_DAMAGE_TILE", header)
         self.assertIn("#define POWERUP_SPEED_TILE", header)
+
+    def test_runtime_loading_screen_shows_progress_and_rotates_spinner(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1
+        )
+        source = (
+            game_source +
+            "int main(void) {\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  gfx_layer_reset(1 << LAYER_HUD);\n"
+            "  gfx_layer_transparency(LAYER_HUD, 15);\n"
+            "  draw_runtime_loading_screen(\"LOADING TILES\", 50, 100);\n"
+            "  draw_runtime_loading_screen(\"LOADING TILES\", 50, 100);\n"
+            "  draw_runtime_loading_screen(\"LOADING TILES\", 100, 100);\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(source_path)))
+
+        run_frame(cpu)
+        first_spinner_frame = bytes(cpu.gpu_layers[4])
+        run_frame(cpu)
+        second_spinner_frame = bytes(cpu.gpu_layers[4])
+        self.assertNotEqual(first_spinner_frame, second_spinner_frame)
+        self.assertEqual(layer_pixel(cpu, 4, 150, 278), 3)
+        self.assertEqual(layer_pixel(cpu, 4, 400, 278), 10)
+        run_frame(cpu)
+        self.assertEqual(layer_pixel(cpu, 4, 500, 278), 3)
+        run_frame(cpu)
+        self.assertFalse(cpu.running)
 
     def test_timed_powerups_heal_boost_speed_and_increase_shot_damage(self):
         results = self.scenario_results(

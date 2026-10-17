@@ -15,7 +15,7 @@
 - [x] Store finite runtime maps as compact flat terrain indices and sparse object layers so large map JSON files fit the SC-16 heap.
 - [x] Randomly select a valid JSON map from `disks/maps/` when the game starts and at the beginning of every new round; keep map data out of the executable.
 - [x] Preserve the tileset's source RGB colors through per-program palette entries.
-- [x] Convert terrain and object PNG atlases into a JSON manifest and per-tile JSON pixel files, then upload tiles from disk at startup.
+- [x] Convert terrain and object PNG atlases into a JSON manifest and per-tile JSON pixel files, then upload only map/game-used tiles from disk on demand.
 - [x] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
 - [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.
 - [x] Provide `sprite_viewer.py` to inspect 64×64 cells, atlas coordinates, and row-major IDs.

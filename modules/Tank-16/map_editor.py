@@ -238,7 +238,7 @@ def validate_map(map_data: dict, tileset_columns: int,
     return normalized
 
 
-def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
+def encode_runtime_map(map_data: dict) -> dict:
     if not isinstance(map_data, dict):
         raise ValueError("Map file must contain a JSON object")
     filename = validate_tileset_filename(
@@ -275,8 +275,13 @@ def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
                     index, tile_y * object_columns + tile_x,
                     object_cell["hp_change"], removal_codes[removal],
                 ])
+    return serialized
+
+
+def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
+    serialized = encode_runtime_map(map_data)
     maps_dir.mkdir(parents=True, exist_ok=True)
-    path = maps_dir / (normalized["name"] + ".json")
+    path = maps_dir / (serialized["name"] + ".json")
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         json.dump(serialized, handle, separators=(",", ":"))
         handle.write("\n")

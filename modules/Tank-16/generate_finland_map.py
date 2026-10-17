@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pygame
 
+from map_editor import encode_runtime_map
+
 
 ROOT = Path(__file__).resolve().parents[2]
 GAME_DIR = ROOT / "modules" / "Tank-16"
@@ -702,17 +704,10 @@ def generate_map(countries_path: Path, lakes_path: Path,
         "obstacles": obstacles, "objects": objects, "tiles": tiles,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
+    runtime_document = encode_runtime_map(document)
     with output.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("{\n")
-        for name, value in document.items():
-            if name == "tiles":
-                continue
-            handle.write("  " + json.dumps(name) + ": " + json.dumps(value) + ",\n")
-        handle.write('  "tiles": [\n')
-        for index, row in enumerate(tiles):
-            handle.write("    " + json.dumps(row, separators=(",", ":")) +
-                         (",\n" if index + 1 < size else "\n"))
-        handle.write("  ]\n}\n")
+        json.dump(runtime_document, handle, separators=(",", ":"))
+        handle.write("\n")
     if preview is not None:
         atlas = pygame.image.load(str(ATLAS_PATH))
         objects_atlas = pygame.image.load(
