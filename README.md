@@ -15,15 +15,18 @@ SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
   tile/sprite engines, and a fixed-point 3D graphics coprocessor.
 
 ## Getting Started
+Install the Python dependency with `python -m pip install -r requirements.txt`.
+The emulator can then be started on Windows or Linux with:
+
+```console
+python main.py
+```
+
 Start SC-16 without arguments to show the BIOS module selector. Select a
 module folder from `modules/` to compile and load its C program into memory.
 Folders with multiple `.c` files use `main.c` as the entry source. Press **D**
 to cycle through available data disks or choose no disk; virtual disks store
 application data only.
-```console
-python main.py
-```
-
 Use `--disk ID` to preselect a data disk in BIOS, or mount it with a directly
 launched program.
 The game fills its own window by default. The 80×25 console opens in a separate

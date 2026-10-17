@@ -936,7 +936,7 @@ class Tank16Tests(unittest.TestCase):
             maps_dir.mkdir(parents=True)
             for name, width, height, tile_x in (
                     ("A.json", 4, 3, 1), ("B.json", 5, 4, 2)):
-                (maps_dir / name).write_text(json.dumps({
+                map_document = {
                     "width": width,
                     "height": height,
                     "tileset": "tiles_terrain.png",
@@ -944,7 +944,14 @@ class Tank16Tests(unittest.TestCase):
                         [[tile_x, 0] for _ in range(width)]
                         for _ in range(height)
                     ],
-                }), encoding="utf-8")
+                }
+                if name == "B.json":
+                    map_document["runtime_encoding"] = "flat-v1"
+                    map_document["tiles"] = [tile_x] * (width * height)
+                    map_document["obstacles"] = []
+                    map_document["objects"] = []
+                (maps_dir / name).write_text(
+                    json.dumps(map_document), encoding="utf-8")
             image = compile_source(
                 "int results[16];\n" + game_source + test_source,
                 str(source_path),
@@ -1027,7 +1034,7 @@ class Tank16Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cpu.disk = DiskDevice(Path(directory))
             cpu.disk.set_file_root(ROOT / "modules" / "Tank-16" / "disks")
-            for _ in range(10):
+            for _ in range(200):
                 run_frame(cpu)
                 if not cpu.running:
                     break
