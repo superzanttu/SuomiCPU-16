@@ -1957,7 +1957,12 @@ class _CodeGenerator:
             libraries.append("fonts/font5x7.asm")
         for library in libraries:
             if "font5x7.asm" in library:
-                library_path = Path(__file__).resolve().parent.parent / "fonts" / Path(library).name
+                local_font = source_directory / Path(library).name
+                library_path = (
+                    local_font if local_font.is_file()
+                    else Path(__file__).resolve().parent.parent / "fonts" /
+                    Path(library).name
+                )
             else:
                 library_path = Path(__file__).resolve().parent.parent / "lib" / Path(library).name
             include_path = os.path.relpath(library_path, source_directory).replace("\\", "/")
@@ -5312,7 +5317,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.assembly:
             output_directory = output_path.resolve().parent
             for library in ("lib_text.asm", "lib_cgfx.asm", "fonts/font5x7.asm"):
-                library_path = Path(__file__).resolve().parent / library
+                local_font = source_path.resolve().parent / Path(library).name
+                library_path = (
+                    local_font
+                    if library.endswith("font5x7.asm") and local_font.is_file()
+                    else Path(__file__).resolve().parent / library
+                )
                 include_path = os.path.relpath(library_path, output_directory).replace("\\", "/")
                 assembly = re.sub(
                     rf'(?m)^\.include "[^"]*{re.escape(Path(library).name)}"$',

@@ -48,6 +48,10 @@ void draw_runtime_loading_screen(char *message, int current, int total);
 #endif
 
 #define MAP_TILE_PIXEL_SIZE 64
+#define TANK16_HUD_HEIGHT 30
+#define MINIMAP_MAX_WIDTH 96
+#define MINIMAP_MAX_HEIGHT 24
+#define MAP_OBJECT_SOLID_CAPACITY 10000
 #define MAX_SHOTS 12
 #define ROUND_FRAMES 9000
 #define ROUND_DELAY 90
@@ -242,6 +246,7 @@ int round_delay;
 int round_over;
 int round_winner;
 int map_object_count = MAP_OBJECT_COUNT;
+unsigned char solid_map_objects[MAP_OBJECT_SOLID_CAPACITY];
 int current_map_variant = -1;
 int round_map_selection_started;
 void reset_battlefield(void);
@@ -2640,6 +2645,104 @@ int obstacle_mask_collision(int mask, WorldCoord x, WorldCoord y, int size)
     return 0;
 }
 
+int is_solid_map_object(int object)
+{
+    int tile;
+
+    if (object < 0 || object >= map_object_count)
+        return 0;
+#ifdef RUNTIME_MAP_LOADING
+    tile = map_object_tile[object] - OBJECT_TILE_BASE;
+#else
+    tile = map_object_tile[object] - TILE_COUNT;
+#endif
+    return tile >= 0 && (tile <= 8 || (tile >= 12 && tile <= 14));
+}
+
+void set_solid_map_object(int object, int active)
+{
+    int cell;
+
+#ifdef RUNTIME_MAP_LOADING
+    if (map_infinite)
+        return;
+    cell = map_object_y[object] * map_columns + map_object_x[object];
+#else
+    cell = map_object_y[object] * MAP_COLUMNS + map_object_x[object];
+#endif
+    if (cell < 0 || cell >= MAP_OBJECT_SOLID_CAPACITY)
+        return;
+    solid_map_objects[cell] = active
+                                  ? (unsigned char)map_object_tile[object]
+                                  : 0;
+}
+
+void rebuild_solid_map_objects(void)
+{
+    int i;
+    int object;
+
+    for (i = 0; i < MAP_OBJECT_SOLID_CAPACITY; i++)
+        solid_map_objects[i] = 0;
+    for (object = 0; object < map_object_count; object++)
+    {
+        if (object_active[object] && is_solid_map_object(object))
+            set_solid_map_object(object, 1);
+    }
+}
+
+int solid_map_object_collision(int mask, WorldCoord x, WorldCoord y, int size)
+{
+    int left;
+    int right;
+    int top;
+    int bottom;
+    int row;
+    int column;
+    int cell;
+    int tile;
+
+#ifdef RUNTIME_MAP_LOADING
+    if (map_infinite)
+        return 0;
+    left = map_coordinate(x);
+    right = map_coordinate(x + size - 1);
+    top = map_coordinate(y);
+    bottom = map_coordinate(y + size - 1);
+#else
+    left = x / MAP_TILE_PIXEL_SIZE;
+    right = (x + size - 1) / MAP_TILE_PIXEL_SIZE;
+    top = y / MAP_TILE_PIXEL_SIZE;
+    bottom = (y + size - 1) / MAP_TILE_PIXEL_SIZE;
+#endif
+    for (row = top; row <= bottom; row++)
+    {
+        for (column = left; column <= right; column++)
+        {
+#ifdef RUNTIME_MAP_LOADING
+            if (row < 0 || row >= map_rows ||
+                column < 0 || column >= map_columns)
+                continue;
+            cell = row * map_columns + column;
+#else
+            if (row < 0 || row >= MAP_ROWS ||
+                column < 0 || column >= MAP_COLUMNS)
+                continue;
+            cell = row * MAP_COLUMNS + column;
+#endif
+            if (cell < 0 || cell >= MAP_OBJECT_SOLID_CAPACITY)
+                continue;
+            tile = solid_map_objects[cell];
+            if (tile != 0 &&
+                mask_overlap_world(mask, x, y, GFX_MASK_TILE_BASE + tile,
+                                   (WorldCoord)column * MAP_TILE_PIXEL_SIZE,
+                                   (WorldCoord)row * MAP_TILE_PIXEL_SIZE))
+                return 1;
+        }
+    }
+    return 0;
+}
+
 int blocked(WorldCoord x, WorldCoord y, int tank_index)
 {
     WorldCoord map_width;
@@ -2663,6 +2766,9 @@ int blocked(WorldCoord x, WorldCoord y, int tank_index)
     {
         return 1;
     }
+    if (solid_map_object_collision(tank_mask(tank_index),
+                                   x - 16, y - 16, 32))
+        return 1;
     if (tank_collision(x, y, tank_index))
     {
         return 1;
@@ -2715,6 +2821,13 @@ void start_round(void)
     int radius_limit;
 
     select_round_map();
+    for (i = 0; i < map_object_count; i++)
+    {
+        object_active[i] = 1;
+        object_contacts[i] = 0;
+        object_explosion[i] = 0;
+    }
+    rebuild_solid_map_objects();
     prepare_collision_assets();
     tanks[0].direction = 8;
     tanks[1].direction = 24;
@@ -2873,12 +2986,6 @@ void start_round(void)
         particles[i].life = 0;
     }
     next_particle = 0;
-    for (i = 0; i < map_object_count; i++)
-    {
-        object_active[i] = 1;
-        object_contacts[i] = 0;
-        object_explosion[i] = 0;
-    }
     track_count = 0;
     next_track = 0;
     for (i = 0; i < 2; i++)
@@ -3222,6 +3329,7 @@ void update_objects(void)
                     if (map_object_removal[i] != OBJECT_FIXED)
                     {
                         object_active[i] = 0;
+                        set_solid_map_object(i, 0);
                         if (map_object_removal[i] == OBJECT_EXPLOSION)
                         {
                             explode_object(i);
@@ -3365,6 +3473,7 @@ int shot_collision(int index)
             if (map_object_removal[i] != OBJECT_FIXED)
             {
                 object_active[i] = 0;
+                set_solid_map_object(i, 0);
                 if (map_object_removal[i] == OBJECT_EXPLOSION)
                 {
                     explode_object(i);
@@ -3656,13 +3765,24 @@ WorldCoord tank_camera_y(int player)
 {
 #ifdef RUNTIME_MAP_LOADING
     if (map_infinite)
-        return tanks[player].y - 240 +
+        return tanks[player].y - (TANK16_HUD_HEIGHT +
+                                  (480 - TANK16_HUD_HEIGHT) / 2) +
                (effect_tick % 3 == 0 ? tanks[player].shake / 4
                                      : -tanks[player].shake / 4);
 #endif
-    return camera_origin(tanks[player].y, 480,
-                         (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE) +
-           (effect_tick % 3 == 0 ? tanks[player].shake / 4 : -tanks[player].shake / 4);
+    {
+        WorldCoord camera;
+
+        camera = camera_origin(
+                     tanks[player].y, 480 - TANK16_HUD_HEIGHT,
+                     (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE) -
+                 TANK16_HUD_HEIGHT;
+        camera += effect_tick % 3 == 0 ? tanks[player].shake / 4
+                                       : -tanks[player].shake / 4;
+        if (camera > -TANK16_HUD_HEIGHT)
+            camera = -TANK16_HUD_HEIGHT;
+        return camera;
+    }
 }
 
 void draw_map_obstacles(WorldCoord camera_x, WorldCoord camera_y)
@@ -3860,6 +3980,137 @@ void draw_combat_feedback(void)
     }
 }
 
+int minimap_tile_color(int tile)
+{
+    if (tile >= 40 && tile <= 59)
+        return BLUE;
+    if (tile >= 60 && tile <= 69)
+        return TRACK_COLOR;
+    if (tile >= 70 && tile <= 89)
+        return GRAY;
+    return GREEN;
+}
+
+void draw_minimap(void)
+{
+    int columns;
+    int rows;
+    int left;
+    int top;
+    int width;
+    int height;
+    int x;
+    int y;
+    int column;
+    int row;
+    int tile;
+    int pixel_column;
+    int pixel_row;
+    int player;
+    int player_column;
+    int player_row;
+    WorldCoord first_column;
+    WorldCoord first_row;
+    WorldCoord column_span;
+    WorldCoord row_span;
+
+#ifdef RUNTIME_MAP_LOADING
+    if (map_infinite)
+    {
+        first_column = map_coordinate(tanks[0].x);
+        first_row = map_coordinate(tanks[0].y);
+        if (map_coordinate(tanks[1].x) < first_column)
+            first_column = map_coordinate(tanks[1].x);
+        if (map_coordinate(tanks[1].y) < first_row)
+            first_row = map_coordinate(tanks[1].y);
+        column_span = absolute_value(
+            map_coordinate(tanks[0].x) - map_coordinate(tanks[1].x)) + 16;
+        row_span = absolute_value(
+            map_coordinate(tanks[0].y) - map_coordinate(tanks[1].y)) + 16;
+        if (column_span < 32)
+        {
+            first_column -= (32 - column_span) / 2;
+            column_span = 32;
+        }
+        if (row_span < 32)
+        {
+            first_row -= (32 - row_span) / 2;
+            row_span = 32;
+        }
+        columns = (int)column_span;
+        rows = (int)row_span;
+        left = (int)first_column;
+        top = (int)first_row;
+    }
+    else
+    {
+        columns = map_columns;
+        rows = map_rows;
+        left = 0;
+        top = 0;
+    }
+#else
+    columns = MAP_COLUMNS;
+    rows = MAP_ROWS;
+    left = 0;
+    top = 0;
+#endif
+
+    gfx_rect(269, 31, 102, 28, DARK_GRAY);
+    gfx_rect(271, 33, 98, 24, BLACK);
+    if (columns <= 0 || rows <= 0)
+        return;
+
+    width = MINIMAP_MAX_WIDTH;
+    height = MINIMAP_MAX_HEIGHT;
+    if ((long)columns * MINIMAP_MAX_HEIGHT >
+        (long)rows * MINIMAP_MAX_WIDTH)
+        height = (int)((long)rows * MINIMAP_MAX_WIDTH / columns);
+    else
+        width = (int)((long)columns * MINIMAP_MAX_HEIGHT / rows);
+    if (width < 1)
+        width = 1;
+    if (height < 1)
+        height = 1;
+    x = 320 - width / 2;
+    y = 33 + (MINIMAP_MAX_HEIGHT - height) / 2;
+
+    for (pixel_row = 0; pixel_row < height; pixel_row++)
+    {
+        row = top + (int)((long)pixel_row * rows / height);
+#ifdef RUNTIME_MAP_LOADING
+        if (!map_infinite && runtime_map_lazy &&
+            (row < 0 || row >= map_rows || !runtime_row_loaded[row]))
+            continue;
+#endif
+        for (pixel_column = 0; pixel_column < width; pixel_column++)
+        {
+            column = left + (int)((long)pixel_column * columns / width);
+            tile = map_tile_at(row, column);
+            gfx_rect(x + pixel_column, y + pixel_row, 1, 1,
+                     minimap_tile_color(tile));
+        }
+    }
+
+    for (player = 0; player < 2; player++)
+    {
+        player_column = (int)(
+            ((long)map_coordinate(tanks[player].x) - left) * width / columns);
+        player_row = (int)(
+            ((long)map_coordinate(tanks[player].y) - top) * height / rows);
+        if (player_column < 0)
+            player_column = 0;
+        if (player_column >= width)
+            player_column = width - 1;
+        if (player_row < 0)
+            player_row = 0;
+        if (player_row >= height)
+            player_row = height - 1;
+        gfx_rect(x + player_column - 1, y + player_row - 1, 3, 3,
+                 player == 0 ? CYAN : RED);
+    }
+}
+
 void draw_hud(void)
 {
     char health[6];
@@ -3970,11 +4221,12 @@ void draw_hud(void)
              WHITE);
     gfx_rect(398, 19, 64, 4, BLACK);
     gfx_rect(398, 19, absolute_value(tanks[1].throttle) * 2, 4, YELLOW);
+    draw_minimap();
     if (burn_capacity_error)
-        gfx_text(240, 34, "FIRE CAPACITY REACHED", RED);
+        gfx_text(240, 60, "FIRE CAPACITY REACHED", RED);
 #ifdef RUNTIME_MAP_LOADING
     if (map_load_error)
-        gfx_text(268, 34, "MAP LOAD FAILED", RED);
+        gfx_text(268, 60, "MAP LOAD FAILED", RED);
 #endif
 }
 
