@@ -1,5 +1,6 @@
 import json
 import re
+import tempfile
 from pathlib import Path
 
 import pygame
@@ -10,6 +11,7 @@ MAPS_DIR = ROOT / "maps"
 TILESET_PATH = ROOT / "gfx" / "tiles_terrain.png"
 DEFAULT_TILESET_FILENAME = TILESET_PATH.name
 OBJECT_TILESET_PATH = ROOT / "gfx" / "tiles_objects.png"
+RUNTIME_ASSETS_DIR = ROOT / "disks" / "assets"
 LAYERS = ("terrain", "obstacles", "objects")
 REMOVAL_TYPES = ("fixed", "explosion", "disappear")
 LAYER_KEYS = {
@@ -259,6 +261,60 @@ def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
                       separators=(",", ":") if large_map else None)
             handle.write("\n")
     return path
+
+
+def convert_tilesets_to_json(
+        output_path: Path = RUNTIME_ASSETS_DIR / "TANK16_TILES.json",
+        tile_size: int = TILE_SIZE, logger=None) -> Path:
+    from tank16_map_loader import load_map_assets
+
+    _, terrain_columns, terrain_rows = load_tileset(TILESET_PATH)
+    _, object_columns, object_rows = load_tileset(
+        OBJECT_TILESET_PATH, pad_edges=True)
+    if logger is not None:
+        logger(
+            "Converting terrain atlas %s (%d tiles) and object atlas %s "
+            "(%d tiles) to runtime JSON" % (
+                TILESET_PATH, terrain_columns * terrain_rows,
+                OBJECT_TILESET_PATH, object_columns * object_rows))
+    map_data = new_map("RUNTIME", object_columns * object_rows, 1)
+    for index in range(object_columns * object_rows):
+        map_data["objects"][0][index] = {
+            "tile": [index % object_columns, index // object_columns],
+            "hp_change": -25,
+            "removal": "explosion",
+        }
+    with tempfile.TemporaryDirectory() as directory:
+        map_path = save_map(map_data, Path(directory))
+        _, tiles, palette, dimensions = load_map_assets(
+            map_path, tile_size=tile_size, logger=logger)
+    document = {
+        "format": "SC16-TANK16-TILES",
+        "version": 1,
+        "tile_size": dimensions[2],
+        "terrain_columns": dimensions[0],
+        "terrain_rows": dimensions[1],
+        "object_columns": object_columns,
+        "object_rows": object_rows,
+        "palette": [list(color) for color in palette[1:]],
+        "tile_count": len(tiles),
+    }
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tiles_dir = output_path.parent / "tiles"
+    tiles_dir.mkdir(parents=True, exist_ok=True)
+    for index, pixels in enumerate(tiles):
+        tile_path = tiles_dir / ("tile_%03d.json" % index)
+        with tile_path.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"pixels": pixels}, handle, separators=(",", ":"))
+            handle.write("\n")
+    with output_path.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(document, handle, separators=(",", ":"))
+        handle.write("\n")
+    if logger is not None:
+        logger("Wrote runtime tile metadata: %s (%d bytes); %d pixel files in %s" % (
+            output_path, output_path.stat().st_size, len(tiles), tiles_dir))
+    return output_path
 
 
 def load_map(path: Path, tileset_columns: int | None = None,

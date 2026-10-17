@@ -3,19 +3,25 @@ import math
 import json
 import re
 import runpy
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import pygame
 
+GAME_DIR = Path(__file__).resolve().parents[1] / "modules" / "Tank-16"
+if str(GAME_DIR) not in sys.path:
+    sys.path.insert(0, str(GAME_DIR))
+
 from c_compiler import GLOBAL_BASE, compile_source
 from gfx_harness import ROOT, layer_pixel, make_cpu, run_frame
 from src.SuomiCPU import DISK_STATUS, KEYS_ADDR, load_program_file
+from src.SuomiCPU import RTC_START
 from src.lib_disk import DiskDevice
-from tools.tank16_map_loader import (
-    build_map_header, build_runtime_assets_header, discover_round_maps, load_map_assets,
-    map_tile_pixel_size,
+from tank16_map_loader import (
+    RUNTIME_TILE_DATA_PATH, build_map_header, build_runtime_assets_header,
+    discover_round_maps, load_map_assets, map_tile_pixel_size,
 )
 
 
@@ -97,9 +103,8 @@ class Tank16Tests(unittest.TestCase):
             "}\n", 14)
         self.assertEqual(results, [24, 0, 0, 8, 102, 0, 0, 0, 0, 24, 1, 14, 12, 11])
 
-    def test_wreck_and_impact_fires_survive_ten_future_rounds_and_restart_clears(self):
+    def test_ammo_and_tank_fires_use_distinct_real_time_lifetimes(self):
         results = self.scenario_results(
-            "int i;\n"
             "start_round();\n"
             "tanks[0].x = 100; tanks[0].y = 100;\n"
             "tanks[1].x = 140; tanks[1].y = 100;\n"
@@ -108,32 +113,99 @@ class Tank16Tests(unittest.TestCase):
             "change_health(1, -100);\n"
             "results[0] = burn_count; results[1] = burn_sites[0].mask;\n"
             "results[2] = burn_sites[1].mask;\n"
-            "results[3] = burn_sites[1].x; results[4] = burn_sites[1].y;\n"
-            "change_health(1, -100); results[5] = burn_count;\n"
-            "for (i = 0; i < 10; i++) { finish_round(); start_round(); }\n"
-            "results[6] = burn_sites[0].rounds; results[7] = burn_sites[1].rounds;\n"
-            "finish_round(); start_round();\n"
-            "results[8] = burn_sites[0].rounds; results[9] = burn_sites[1].rounds;\n"
-            "add_burn_site(100, 100, -1); update_game(32, 0);\n"
-            "results[10] = burn_count; results[11] = burn_sites[0].rounds;\n", 12)
-        self.assertEqual(results, [2, -1, 24, 140, 100, 2, 1, 1, 0, 0, 0, 0])
+            "results[3] = burn_sites[0].remaining_seconds;\n"
+            "results[4] = burn_sites[1].remaining_seconds;\n"
+            "results[5] = burn_owner[1]; results[6] = burn_kind[1];\n"
+            "age_burn_sites(10);\n"
+            "results[7] = burn_sites[0].remaining_seconds;\n"
+            "results[8] = burn_sites[1].remaining_seconds;\n"
+            "age_burn_sites(20);\n"
+            "results[9] = burn_sites[1].remaining_seconds;\n"
+            "reset_battlefield(); results[10] = burn_count;\n", 11)
+        self.assertEqual(results, [
+            2, -1, 24, 10, 30, 1, 1, 0, 20, 0, 0,
+        ])
 
-    def test_burn_capacity_keeps_sites_until_expiry_and_crosses_64k_address_boundary(self):
+    def test_burn_site_lifetimes_follow_wall_clock_seconds(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        source = self.game_source(source_path).replace(
+            "int main(void)", "int tank16_game_entry(void)", 1)
+        test_source = (
+            "int main(void) {\n"
+            "  add_ammo_burn_site(10, 20, 0);\n"
+            "  add_tank_burn_site(30, 40, 0, 1);\n"
+            "  update_burn_site_lifetimes();\n"
+            "  gfx_present();\n"
+            "  update_burn_site_lifetimes();\n"
+            "  results[0] = burn_sites[0].remaining_seconds;\n"
+            "  results[1] = burn_sites[1].remaining_seconds;\n"
+            "  gfx_present();\n"
+            "  update_burn_site_lifetimes();\n"
+            "  results[2] = burn_sites[1].remaining_seconds;\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[4];\nint main(void);\n" + source + test_source,
+            str(source_path)))
+        run_frame(cpu)
+        current_time = (
+            cpu.memory[RTC_START + 1] * 60 + cpu.memory[RTC_START])
+
+        def advance_clock(seconds):
+            nonlocal current_time
+            current_time += seconds
+            cpu.memory[RTC_START] = current_time % 60
+            cpu.memory[RTC_START + 1] = current_time // 60 % 60
+            cpu.frame_yield = False
+            while cpu.running and not cpu.frame_yield:
+                cpu.step()
+
+        advance_clock(10)
+        advance_clock(20)
+        values = [
+            cpu.read_16(GLOBAL_BASE + index * 2)
+            for index in range(3)
+        ]
+        self.assertEqual(values, [0, 20, 0])
+
+    def test_burn_site_rendering_is_bounded_and_round_robin(self):
+        results = self.scenario_results(
+            "gfx_layer_select(LAYER_3D);\n"
+            "burn_count = MAX_BURN_SITES;\n"
+            "burn_active_count = MAX_BURN_SITES;\n"
+            "draw_burn_sites(); results[0] = burn_render_cursor;\n"
+            "draw_burn_sites(); results[1] = burn_render_cursor;\n"
+            "draw_burn_sites(); results[2] = burn_render_cursor;\n", 3)
+        self.assertEqual(results, [8, 16, 0])
+
+    def test_ammo_and_destroyed_tank_fires_are_capped_per_player(self):
         results = self.scenario_results(
             "int i;\n"
-            "BurnSite *site;\n"
-            "for (i = 0; i < MAX_BURN_SITES; i++) add_burn_site(50, 100, -1);\n"
-            "results[0] = burn_count;\n"
-            "results[1] = next_burn_site == burn_sites;\n"
-            "site = burn_sites;\n"
-            "for (i = 0; i < 9000; i++) site++;\n"
-            "results[2] = site->rounds;\n"
-            "add_burn_site(200, 100, -1);\n"
-            "results[3] = burn_capacity_error; results[4] = burn_sites[0].x;\n"
-            "for (i = 0; i < BURN_ROUNDS + 1; i++) age_burn_sites();\n"
-            "add_burn_site(200, 100, -1);\n"
-            "results[5] = burn_sites[0].x; results[6] = burn_sites[0].rounds;\n", 7)
-        self.assertEqual(results, [11022, 1, 11, 1, 50, 200, 11])
+            "int ammo[2]; int tanks_count[2];\n"
+            "ammo[0] = 0; ammo[1] = 0;\n"
+            "tanks_count[0] = 0; tanks_count[1] = 0;\n"
+            "for (i = 0; i < 12; i++) {\n"
+            "  add_ammo_burn_site(i, 100, 0);\n"
+            "  add_ammo_burn_site(i, 200, 1);\n"
+            "}\n"
+            "for (i = 0; i < 4; i++) {\n"
+            "  add_tank_burn_site(i, 300, 0, 0);\n"
+            "  add_tank_burn_site(i, 400, 0, 1);\n"
+            "}\n"
+            "for (i = 0; i < MAX_BURN_SITES; i++) {\n"
+            "  if (burn_sites[i].remaining_seconds > 0) {\n"
+            "    if (burn_kind[i] == BURN_KIND_AMMO)\n"
+            "      ammo[burn_owner[i]]++;\n"
+            "    else\n"
+            "      tanks_count[burn_owner[i]]++;\n"
+            "  }\n"
+            "}\n"
+            "results[0] = ammo[0]; results[1] = ammo[1];\n"
+            "results[2] = tanks_count[0]; results[3] = tanks_count[1];\n"
+            "results[4] = burn_count; results[5] = burn_capacity_error;\n", 6)
+        self.assertEqual(results, [10, 10, 2, 2, 24, 0])
 
     def test_recoil_hit_and_blast_impulses_respect_obstacles_and_decay(self):
         results = self.scenario_results(
@@ -268,7 +340,7 @@ class Tank16Tests(unittest.TestCase):
                 "tile": [1, 0], "hp_change": -25, "removal": removal,
             }
         with tempfile.TemporaryDirectory() as directory, patch(
-                "tools.tank16_map_loader.map_tile_pixel_size", return_value=32):
+                "tank16_map_loader.map_tile_pixel_size", return_value=32):
             path = editor["save_map"](data, Path(directory))
             header = build_map_header(path)
         source = self.game_source(source_path, 32).replace(
@@ -438,7 +510,7 @@ class Tank16Tests(unittest.TestCase):
             path = editor["save_map"](data, Path(directory))
             for size in (24, 32, 64):
                 with self.subTest(size=size), patch(
-                        "tools.tank16_map_loader.map_tile_pixel_size",
+                        "tank16_map_loader.map_tile_pixel_size",
                         return_value=size):
                     _, tiles, palette, dimensions = load_map_assets(path)
                 self.assertEqual(dimensions[2], size)
@@ -474,7 +546,7 @@ class Tank16Tests(unittest.TestCase):
                 "tile": [1, 0], "hp_change": hp, "removal": removal,
             }
         with tempfile.TemporaryDirectory() as directory, patch(
-                "tools.tank16_map_loader.map_tile_pixel_size", return_value=64):
+                "tank16_map_loader.map_tile_pixel_size", return_value=64):
             path = editor["save_map"](data, Path(directory))
             header = build_map_header(path)
             _, tiles, _, dimensions = load_map_assets(path)
@@ -774,6 +846,25 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn("#define POWERUP_HEALTH_TILE", header)
         self.assertIn("#define POWERUP_DAMAGE_TILE", header)
         self.assertIn("#define POWERUP_SPEED_TILE", header)
+        self.assertIn(
+            '#define RUNTIME_TILE_DATA_PATH "assets/TANK16_TILES.json"',
+            header)
+        self.assertNotIn("terrain_tiles[", header)
+        self.assertNotIn("map_palette[", header)
+        self.assertTrue(RUNTIME_TILE_DATA_PATH.is_file())
+        tileset = json.loads(RUNTIME_TILE_DATA_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(tileset["format"], "SC16-TANK16-TILES")
+        self.assertEqual(tileset["version"], 1)
+        self.assertEqual(tileset["tile_size"], 64)
+        self.assertEqual(
+            (tileset["terrain_columns"], tileset["terrain_rows"]), (10, 9))
+        self.assertEqual(
+            (tileset["object_columns"], tileset["object_rows"]), (6, 8))
+        self.assertEqual(len(tileset["palette"]), 224)
+        self.assertEqual(tileset["tile_count"], 138)
+        tile_files = sorted(
+            (RUNTIME_TILE_DATA_PATH.parent / "tiles").glob("tile_*.json"))
+        self.assertEqual(len(tile_files), tileset["tile_count"])
         source_path = game_dir / "main.c"
         game_source = self.game_source(source_path).replace(
             '#include "map_assets.h"', header, 1
@@ -813,7 +904,13 @@ class Tank16Tests(unittest.TestCase):
         test_source = (
             "int main(void) {\n"
             "  int i;\n"
-            "  for (i = 0; i < 32; i++) {\n"
+            "  int original_map;\n"
+            "  int found_map_change;\n"
+            "  runtime_terrain_columns = 10; runtime_terrain_rows = 9;\n"
+            "  runtime_object_columns = 6; runtime_object_rows = 8;\n"
+            "  runtime_tile_size = 64; runtime_tile_count = 138;\n"
+            "  runtime_palette_count = 225;\n"
+            "  for (i = 0; i < 2; i++) {\n"
             "    effect_random = i;\n"
             "    round_map_selection_started = 0;\n"
             "    select_runtime_round_map();\n"
@@ -821,6 +918,15 @@ class Tank16Tests(unittest.TestCase):
             "    results[i * 2 + 1] = map_rows;\n"
             "    if (map_load_error) return 1;\n"
             "  }\n"
+            "  effect_random = 17; select_runtime_round_map();\n"
+            "  original_map = map_selected_path[5];\n"
+            "  add_ammo_burn_site(10, 20, 0);\n"
+            "  effect_random = 17; select_runtime_round_map();\n"
+            "  results[64] = burn_count;\n"
+            "  effect_random = 0; select_runtime_round_map();\n"
+            "  found_map_change = map_selected_path[5] != original_map;\n"
+            "  results[65] = burn_count;\n"
+            "  results[66] = found_map_change;\n"
             "  return 0;\n"
             "}\n"
         )
@@ -840,7 +946,7 @@ class Tank16Tests(unittest.TestCase):
                     ],
                 }), encoding="utf-8")
             image = compile_source(
-                "int results[64];\n" + game_source + test_source,
+                "int results[67];\n" + game_source + test_source,
                 str(source_path),
             )
             cpu = make_cpu(image)
@@ -858,9 +964,22 @@ class Tank16Tests(unittest.TestCase):
         ]
         selected_dimensions = {
             tuple(results[index:index + 2])
-            for index in range(0, len(results), 2)
+            for index in range(0, 4, 2)
         }
         self.assertEqual(selected_dimensions, {(4, 3), (5, 4)})
+        self.assertEqual([
+            cpu.read_16(GLOBAL_BASE + index * 2)
+            for index in range(64, 67)
+        ], [1, 0, 1])
+        runtime_log = cpu.console_device.output.decode("ascii")
+        self.assertIn("MAP FILE: maps/A.json", runtime_log)
+        self.assertIn(
+            "MAP COORDINATES: x=0..3 y=0..2 cells=12", runtime_log)
+        self.assertIn(
+            "MAP TERRAIN TILE: id=1 source=(1,0) cells=12", runtime_log)
+        self.assertIn("MAP FILE: maps/B.json", runtime_log)
+        self.assertIn(
+            "MAP TERRAIN TILE: id=2 source=(2,0) cells=20", runtime_log)
 
     def test_runtime_assets_exclude_maps_and_disk_maps_include_infinite_world(self):
         game_dir = ROOT / "modules" / "Tank-16"
@@ -871,6 +990,8 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn("unsigned char *map_obstacles;", header)
         self.assertNotIn("map_data[", header)
         self.assertNotIn("map_obstacles[", header)
+        self.assertNotIn("terrain_tiles[", header)
+        self.assertNotIn("map_palette[", header)
 
         disk_maps = game_dir / "disks" / "maps"
         finland = json.loads(
@@ -883,6 +1004,56 @@ class Tank16Tests(unittest.TestCase):
         self.assertTrue(infinite["infinite"])
         self.assertTrue(infinite["terrain_tiles"])
         self.assertTrue(infinite["obstacle_tiles"])
+
+    def test_runtime_tile_json_is_loaded_and_uploaded_from_module_disk(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        header = build_runtime_assets_header()
+        tileset = json.loads(RUNTIME_TILE_DATA_PATH.read_text(encoding="utf-8"))
+        first_tile = json.loads(
+            (RUNTIME_TILE_DATA_PATH.parent / "tiles" / "tile_000.json")
+            .read_text(encoding="utf-8"))
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', header, 1
+        )
+        source = (
+            "int results[1];\n" + game_source +
+            "int main(void) {\n"
+            "  gfx_tile_size(MAP_TILE_PIXEL_SIZE);\n"
+            "  results[0] = load_runtime_tile_data();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(source_path)))
+        with tempfile.TemporaryDirectory() as directory:
+            cpu.disk = DiskDevice(Path(directory))
+            cpu.disk.set_file_root(ROOT / "modules" / "Tank-16" / "disks")
+            for _ in range(10):
+                run_frame(cpu)
+                if not cpu.running:
+                    break
+
+        self.assertFalse(cpu.running)
+        self.assertEqual(
+            cpu.read_16(GLOBAL_BASE), 1,
+            cpu.console_device.output.decode("ascii", errors="replace"))
+        actual_tile = bytes(cpu.tile_memory[:64 * 64])
+        expected_tile = bytes(first_tile["pixels"])
+        first_difference = next(
+            (index for index, pixels in enumerate(
+                zip(actual_tile, expected_tile)) if pixels[0] != pixels[1]),
+            None,
+        )
+        self.assertEqual(actual_tile, expected_tile, first_difference)
+        palette_rgb = tuple(tileset["palette"][0])
+        loaded_palette_indices = [
+            index for index, color in enumerate(cpu.palette)
+            if tuple(color)[:3] == palette_rgb
+        ]
+        self.assertIn(32, loaded_palette_indices, loaded_palette_indices)
+        runtime_log = cpu.console_device.output.decode("ascii")
+        self.assertIn("TILE DATA: assets/TANK16_TILES.json", runtime_log)
+        self.assertIn("TILE 0 terrain source=(0,0) loaded", runtime_log)
+        self.assertIn("TILE 90 object source=(0,0) loaded", runtime_log)
         self.assertIn("#define POWERUP_HEALTH_TILE", header)
         self.assertIn("#define POWERUP_DAMAGE_TILE", header)
         self.assertIn("#define POWERUP_SPEED_TILE", header)

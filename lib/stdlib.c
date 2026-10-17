@@ -5,7 +5,7 @@
 
 unsigned int __sc16_rand_seed;
 int errno;
-#define SC16_HEAP_CAPACITY 65535UL
+#define SC16_HEAP_CAPACITY 1048576UL
 static unsigned char __sc16_heap[SC16_HEAP_CAPACITY];
 static unsigned char __sc16_heap_blocks[SC16_HEAP_CAPACITY];
 

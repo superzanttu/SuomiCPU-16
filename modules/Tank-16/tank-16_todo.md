@@ -11,9 +11,10 @@
 - [x] End a round when a player's health reaches zero.
 - [x] Render terrain only for the cells visible in each camera view.
 - [x] Load finite JSON maps and seeded, effectively unbounded terrain from the module's `disks/maps/` folder through the generic file API.
-- [x] Keep map data out of the executable; compile only the terrain and object graphics assets.
+- [x] Keep map and terrain/object pixel data out of the executable; load map JSON and the tile-atlas JSON from the module disk at runtime.
 - [x] Randomly select a valid JSON map from `disks/maps/` when the game starts and at the beginning of every new round; keep map data out of the executable.
 - [x] Preserve the tileset's source RGB colors through per-program palette entries.
+- [x] Convert terrain and object PNG atlases into runtime JSON and upload tiles from disk at startup.
 - [x] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
 - [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.
 - [x] Provide `sprite_viewer.py` to inspect 64×64 cells, atlas coordinates, and row-major IDs.

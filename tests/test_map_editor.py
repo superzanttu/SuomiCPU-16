@@ -1,6 +1,7 @@
 import runpy
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,10 @@ EDITOR_PATH = (
     / "Tank-16"
     / "map_editor.py"
 )
+GAME_DIR = EDITOR_PATH.parent
+if str(GAME_DIR) not in sys.path:
+    sys.path.insert(0, str(GAME_DIR))
+
 EDITOR = runpy.run_path(str(EDITOR_PATH))
 load_map = EDITOR["load_map"]
 new_map = EDITOR["new_map"]

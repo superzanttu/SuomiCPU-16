@@ -2,19 +2,24 @@ import runpy
 import tempfile
 import unittest
 from pathlib import Path
-
-from tools.generate_natural_maps import MAPS, generate_maps
-
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-EDITOR_PATH = ROOT / "modules" / "Tank-16" / "map_editor.py"
+GAME_DIR = ROOT / "modules" / "Tank-16"
+if str(GAME_DIR) not in sys.path:
+    sys.path.insert(0, str(GAME_DIR))
+
+from generate_natural_maps import MAPS, generate_maps
+
+
+EDITOR_PATH = GAME_DIR / "map_editor.py"
 
 
 class NaturalMapTests(unittest.TestCase):
     def test_generated_maps_are_installed_in_editor_and_runtime_folders(self):
         editor = runpy.run_path(str(EDITOR_PATH))
-        maps_dir = ROOT / "modules" / "Tank-16" / "maps"
-        runtime_dir = ROOT / "modules" / "Tank-16" / "disks" / "maps"
+        maps_dir = GAME_DIR / "maps"
+        runtime_dir = GAME_DIR / "disks" / "maps"
         for name, _, _ in MAPS:
             editor_path = maps_dir / f"{name}.json"
             runtime_path = runtime_dir / f"{name}.json"

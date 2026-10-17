@@ -4,6 +4,7 @@
 #ifdef RUNTIME_MAP_LOADING
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include "disk.h"
 #endif
 
@@ -23,6 +24,8 @@
 #define RUNTIME_MAP_MAX_CELLS 10000UL
 unsigned char runtime_map_data[RUNTIME_MAP_MAX_CELLS];
 unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
+int runtime_terrain_usage[256];
+int runtime_obstacle_usage[256];
 #endif
 
 #define MAP_TILE_PIXEL_SIZE 64
@@ -52,8 +55,14 @@ unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
 #define IMPACT_FRAMES 10
 #define MAX_PARTICLES 80
 #define PARTICLE_FRAMES 36
-#define BURN_ROUNDS 10
-#define MAX_BURN_SITES ((ROUND_FRAMES / SHOT_COOLDOWN * 2 + 2) * (BURN_ROUNDS + 1))
+#define AMMO_BURN_SECONDS 10
+#define TANK_BURN_SECONDS 30
+#define MAX_AMMO_BURN_SITES_PER_PLAYER 10
+#define MAX_TANK_BURN_SITES_PER_PLAYER 2
+#define MAX_BURN_SITES ((MAX_AMMO_BURN_SITES_PER_PLAYER + MAX_TANK_BURN_SITES_PER_PLAYER) * 2)
+#define BURN_RENDER_BATCH 8
+#define BURN_KIND_AMMO 0
+#define BURN_KIND_TANK 1
 #define SPEED_SCALE 16
 #define MAX_FORWARD_SPEED 32
 #define MAX_REVERSE_SPEED 16
@@ -171,7 +180,7 @@ typedef struct
 {
     WorldCoord x;
     WorldCoord y;
-    int rounds;
+    int remaining_seconds;
     int mask;
 } BurnSite;
 
@@ -179,10 +188,16 @@ Tank tanks[2];
 Shot shots[MAX_SHOTS];
 Particle particles[MAX_PARTICLES];
 BurnSite burn_sites[MAX_BURN_SITES];
+unsigned char burn_owner[MAX_BURN_SITES];
+unsigned char burn_kind[MAX_BURN_SITES];
 BurnSite *next_burn_site;
 int next_burn_index;
 int burn_count;
+int burn_active_count;
+int burn_render_cursor;
 int burn_capacity_error;
+unsigned int burn_last_time;
+int burn_clock_initialized;
 int effect_tick;
 unsigned int effect_random = 12345;
 int next_particle;
@@ -210,8 +225,10 @@ int round_winner;
 int map_object_count = MAP_OBJECT_COUNT;
 int current_map_variant = -1;
 int round_map_selection_started;
+void reset_battlefield(void);
 #ifdef RUNTIME_MAP_LOADING
 int map_infinite;
+char current_map_path[129];
 unsigned long map_seed;
 unsigned char map_terrain_choices[16];
 int map_terrain_choice_count;
@@ -379,10 +396,18 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
 
     length = disk_read_file(path, 0, map_json_chunk, 256, size);
     if (length < 0 || *size == 0 || *size > 67108864UL)
+    {
+        printf("JSON READ ERROR: %s first-chunk=%d size=%lu\n",
+               path, length, *size);
         return 0;
+    }
     *json = (char *)malloc(*size + 1);
     if (*json == 0)
+    {
+        printf("JSON READ ERROR: %s allocation failed (%lu bytes)\n",
+               path, *size + 1);
         return 0;
+    }
     offset = 0;
     copied = 0;
     while (offset < *size)
@@ -390,6 +415,8 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
         length = disk_read_file(path, offset, map_json_chunk, 256, size);
         if (length <= 0)
         {
+            printf("JSON READ ERROR: %s offset=%lu chunk=%d\n",
+                   path, offset, length);
             free(*json);
             *json = 0;
             return 0;
@@ -400,6 +427,259 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
         copied += length;
     }
     (*json)[copied] = 0;
+    return 1;
+}
+
+int load_runtime_tile_data(void)
+{
+    char path[] = RUNTIME_TILE_DATA_PATH;
+    char *json;
+    char *cursor;
+    char *value;
+    unsigned long file_size;
+    int version;
+    int palette_entries;
+    int terrain_count;
+    int object_count;
+    int tile_count;
+    int declared_tile_count;
+    int tile;
+    int pixel;
+    int red;
+    int green;
+    int blue;
+    int index;
+    int result;
+
+    printf("TILE DATA: reading %s\n", path);
+    if (!load_json_bytes(path, &json, &file_size))
+    {
+        printf("TILE DATA ERROR: could not read JSON file\n");
+        return 0;
+    }
+    value = json_value(json, "format");
+    result = json_string_is(value, "SC16-TANK16-TILES");
+    value = json_value(json, "version");
+    if (!result || value == 0 || !json_integer(&value, &version) ||
+        version != 1)
+    {
+        free(json);
+        return 0;
+    }
+    value = json_value(json, "tile_size");
+    if (value == 0 || !json_integer(&value, &runtime_tile_size) ||
+        runtime_tile_size != MAP_TILE_PIXEL_SIZE ||
+        runtime_tile_size < 1 || runtime_tile_size > 64)
+    {
+        free(json);
+        return 0;
+    }
+    value = json_value(json, "terrain_columns");
+    if (value == 0 || !json_integer(&value, &runtime_terrain_columns) ||
+        runtime_terrain_columns < 1 || runtime_terrain_columns > 16)
+    {
+        free(json);
+        return 0;
+    }
+    value = json_value(json, "terrain_rows");
+    if (value == 0 || !json_integer(&value, &runtime_terrain_rows) ||
+        runtime_terrain_rows < 1 || runtime_terrain_rows > 16)
+    {
+        free(json);
+        return 0;
+    }
+    value = json_value(json, "object_columns");
+    if (value == 0 || !json_integer(&value, &runtime_object_columns) ||
+        runtime_object_columns < 1 || runtime_object_columns > 16)
+    {
+        free(json);
+        return 0;
+    }
+    value = json_value(json, "object_rows");
+    if (value == 0 || !json_integer(&value, &runtime_object_rows) ||
+        runtime_object_rows < 1 || runtime_object_rows > 16)
+    {
+        free(json);
+        return 0;
+    }
+    terrain_count = TERRAIN_TILE_COUNT;
+    object_count = OBJECT_COLUMNS * OBJECT_ROWS;
+    tile_count = terrain_count + object_count;
+    if (tile_count > 256 || tile_count < 1)
+    {
+        free(json);
+        return 0;
+    }
+    printf("TILE DATA HEADER: tile-size=%d terrain=%dx%d objects=%dx%d "
+           "tiles=%d\n", runtime_tile_size,
+           runtime_terrain_columns, runtime_terrain_rows,
+           runtime_object_columns, runtime_object_rows, tile_count);
+    cursor = json_value(json, "palette");
+    if (cursor == 0)
+    {
+        free(json);
+        return 0;
+    }
+    json_skip_whitespace(&cursor);
+    if (*cursor++ != '[')
+    {
+        free(json);
+        return 0;
+    }
+    palette_entries = 0;
+    json_skip_whitespace(&cursor);
+    while (*cursor != ']')
+    {
+        if (palette_entries >= 224)
+        {
+            free(json);
+            return 0;
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != '[' ||
+            !json_integer(&cursor, &red) || red < 0 || red > 255)
+        {
+            free(json);
+            return 0;
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ',' ||
+            !json_integer(&cursor, &green) || green < 0 || green > 255)
+        {
+            free(json);
+            return 0;
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ',' ||
+            !json_integer(&cursor, &blue) || blue < 0 || blue > 255)
+        {
+            free(json);
+            return 0;
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ']')
+        {
+            free(json);
+            return 0;
+        }
+        gfx_palette((unsigned char)(MAP_PALETTE_BASE + palette_entries),
+                    (unsigned char)red, (unsigned char)green,
+                    (unsigned char)blue);
+        palette_entries++;
+        json_skip_whitespace(&cursor);
+        if (*cursor == ',')
+        {
+            cursor++;
+            json_skip_whitespace(&cursor);
+        }
+        else if (*cursor != ']')
+        {
+            free(json);
+            return 0;
+        }
+    }
+    cursor++;
+    if (palette_entries < 1)
+    {
+        free(json);
+        return 0;
+    }
+    runtime_palette_count = palette_entries + 1;
+    printf("TILE DATA PALETTE: %d RGB colors loaded\n", palette_entries);
+
+    value = json_value(json, "tile_count");
+    if (value == 0 || !json_integer(&value, &declared_tile_count) ||
+        declared_tile_count != tile_count)
+    {
+        free(json);
+        return 0;
+    }
+    printf("TILE DATA: %s (%lu bytes)\n", path, file_size);
+    runtime_tile_count = tile_count;
+    free(json);
+    json = 0;
+    for (tile = 0; tile < tile_count; tile++)
+    {
+        char tile_path[] = "assets/tiles/tile_000.json";
+        char *tile_json;
+        unsigned long tile_file_size;
+
+        tile_path[18] = (char)('0' + tile / 100);
+        tile_path[19] = (char)('0' + (tile / 10) % 10);
+        tile_path[20] = (char)('0' + tile % 10);
+        if (!load_json_bytes(tile_path, &tile_json, &tile_file_size))
+        {
+            printf("TILE DATA ERROR: could not read %s\n", tile_path);
+            return 0;
+        }
+        cursor = json_value(tile_json, "pixels");
+        if (cursor == 0)
+        {
+            free(tile_json);
+            return 0;
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != '[')
+        {
+            free(tile_json);
+            return 0;
+        }
+        for (pixel = 0; pixel < TILE_PIXEL_COUNT; pixel++)
+        {
+            if (!json_integer(&cursor, &index) ||
+                index < 0 || index > 255 ||
+                (index != 0 &&
+                 (index < MAP_PALETTE_BASE ||
+                  index >= MAP_PALETTE_BASE + palette_entries)))
+            {
+                free(tile_json);
+                return 0;
+            }
+            runtime_tile_pixels[pixel] = (unsigned char)index;
+            if (pixel + 1 < TILE_PIXEL_COUNT)
+            {
+                json_skip_whitespace(&cursor);
+                if (*cursor++ != ',')
+                {
+                    free(tile_json);
+                    return 0;
+                }
+            }
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ']')
+        {
+            free(tile_json);
+            return 0;
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != '}')
+        {
+            free(tile_json);
+            return 0;
+        }
+        json_skip_whitespace(&cursor);
+        if (*cursor != 0)
+        {
+            free(tile_json);
+            return 0;
+        }
+        gfx_tile_upload(tile, runtime_tile_pixels);
+        if (tile < terrain_count)
+            printf("TILE %d terrain source=(%d,%d) loaded\n", tile,
+                   tile % runtime_terrain_columns,
+                   tile / runtime_terrain_columns);
+        else
+        {
+            int object_tile;
+
+            object_tile = tile - terrain_count;
+            printf("TILE %d object source=(%d,%d) loaded\n", tile,
+                   object_tile % runtime_object_columns,
+                   object_tile / runtime_object_columns);
+        }
+        free(tile_json);
+    }
     return 1;
 }
 
@@ -707,6 +987,69 @@ int load_map_path(char *path)
     return result;
 }
 
+void log_loaded_map(char *path)
+{
+    int i;
+    int tile;
+
+    printf("MAP FILE: %s\n", path);
+    if (map_infinite)
+    {
+        printf("MAP COORDINATES: unbounded; seed=%lu\n", map_seed);
+        for (i = 0; i < map_terrain_choice_count; i++)
+        {
+            tile = map_terrain_choices[i];
+            printf("MAP TERRAIN TILE: id=%d source=(%d,%d)\n", tile,
+                   tile % TERRAIN_COLUMNS, tile / TERRAIN_COLUMNS);
+        }
+        for (i = 0; i < map_infinite_obstacle_count; i++)
+        {
+            tile = map_infinite_obstacles[i] - OBJECT_TILE_BASE;
+            printf("MAP OBSTACLE TILE: source=(%d,%d)\n",
+                   tile % OBJECT_COLUMNS, tile / OBJECT_COLUMNS);
+        }
+        return;
+    }
+
+    for (i = 0; i < 256; i++)
+    {
+        runtime_terrain_usage[i] = 0;
+        runtime_obstacle_usage[i] = 0;
+    }
+    for (i = 0; i < map_rows * map_columns; i++)
+    {
+        runtime_terrain_usage[map_data[i]]++;
+        if (map_obstacles[i] != 0)
+            runtime_obstacle_usage[map_obstacles[i]]++;
+    }
+    printf("MAP COORDINATES: x=0..%d y=0..%d cells=%d\n",
+           map_columns - 1, map_rows - 1, map_columns * map_rows);
+    for (tile = 0; tile < TERRAIN_TILE_COUNT; tile++)
+    {
+        if (runtime_terrain_usage[tile] > 0)
+            printf("MAP TERRAIN TILE: id=%d source=(%d,%d) cells=%d\n",
+                   tile, tile % TERRAIN_COLUMNS,
+                   tile / TERRAIN_COLUMNS, runtime_terrain_usage[tile]);
+    }
+    for (tile = OBJECT_TILE_BASE;
+         tile < OBJECT_TILE_BASE + OBJECT_COLUMNS * OBJECT_ROWS; tile++)
+    {
+        if (runtime_obstacle_usage[tile] > 0)
+            printf("MAP OBSTACLE TILE: id=%d source=(%d,%d) cells=%d\n",
+                   tile, (tile - OBJECT_TILE_BASE) % OBJECT_COLUMNS,
+                   (tile - OBJECT_TILE_BASE) / OBJECT_COLUMNS,
+                   runtime_obstacle_usage[tile]);
+    }
+    for (i = 0; i < map_object_count; i++)
+    {
+        tile = map_object_tile[i] - OBJECT_TILE_BASE;
+        printf("MAP OBJECT: at=(%d,%d) source=(%d,%d) hp=%d removal=%d\n",
+               map_object_x[i], map_object_y[i],
+               tile % OBJECT_COLUMNS, tile / OBJECT_COLUMNS,
+               map_object_hp[i], map_object_removal[i]);
+    }
+}
+
 int map_tile_at(int row, int column)
 {
     unsigned long hash;
@@ -1005,12 +1348,35 @@ void select_runtime_round_map(void)
             if (map_selected_path[0] != 0 &&
                 load_map_path(map_selected_path))
             {
+                log_loaded_map(map_selected_path);
+                map_index = 0;
+                while (map_index < 128 &&
+                       current_map_path[map_index] != 0 &&
+                       current_map_path[map_index] ==
+                           map_selected_path[map_index])
+                    map_index++;
+                if (current_map_path[map_index] !=
+                    map_selected_path[map_index])
+                {
+                    reset_battlefield();
+                    map_index = 0;
+                    while (map_index < 128 &&
+                           map_selected_path[map_index] != 0)
+                    {
+                        current_map_path[map_index] =
+                            map_selected_path[map_index];
+                        map_index++;
+                    }
+                    current_map_path[map_index] = 0;
+                }
                 round_map_selection_started++;
                 current_map_variant = round_map_selection_started - 1;
                 return;
             }
         }
     }
+    reset_battlefield();
+    current_map_path[0] = 0;
     use_default_infinite_map();
     map_load_error = 1;
     round_map_selection_started++;
@@ -1020,6 +1386,11 @@ void select_runtime_round_map(void)
 
 void select_round_map(void)
 {
+#ifndef RUNTIME_MAP_LOADING
+    int previous_map_variant;
+
+    previous_map_variant = current_map_variant;
+#endif
 #ifdef RUNTIME_MAP_LOADING
     select_runtime_round_map();
 #else
@@ -1058,77 +1429,128 @@ void select_round_map(void)
     map_object_count = MAP_OBJECT_COUNT;
 #endif
 #endif
+#ifndef RUNTIME_MAP_LOADING
+    if (previous_map_variant >= 0 &&
+        previous_map_variant != current_map_variant)
+        reset_battlefield();
+#endif
+}
+
+void store_burn_site(WorldCoord x, WorldCoord y, int mask, int player,
+                     int kind)
+{
+    int i;
+    int index;
+    int matching_count;
+    int replacement_index;
+    int limit;
+    BurnSite *site;
+
+    limit = kind == BURN_KIND_TANK ?
+        MAX_TANK_BURN_SITES_PER_PLAYER :
+        MAX_AMMO_BURN_SITES_PER_PLAYER;
+    matching_count = 0;
+    replacement_index = -1;
+    for (i = 0; i < MAX_BURN_SITES; i++)
+    {
+        index = next_burn_index + i;
+        if (index >= MAX_BURN_SITES)
+            index -= MAX_BURN_SITES;
+        site = &burn_sites[index];
+        if (site->remaining_seconds > 0 && burn_owner[index] == player &&
+            burn_kind[index] == kind)
+        {
+            matching_count++;
+            if (replacement_index < 0)
+                replacement_index = index;
+        }
+    }
+    if (matching_count >= limit)
+    {
+        index = replacement_index;
+    }
+    else
+    {
+        index = -1;
+        for (i = 0; i < MAX_BURN_SITES; i++)
+        {
+            int candidate;
+
+            candidate = next_burn_index + i;
+            if (candidate >= MAX_BURN_SITES)
+                candidate -= MAX_BURN_SITES;
+            if (burn_sites[candidate].remaining_seconds == 0)
+            {
+                index = candidate;
+                break;
+            }
+        }
+    }
+    if (index < 0)
+    {
+        burn_capacity_error = 1;
+        return;
+    }
+    site = &burn_sites[index];
+    if (site->remaining_seconds == 0)
+    {
+        burn_active_count++;
+        if (index >= burn_count)
+            burn_count = index + 1;
+    }
+#ifdef RUNTIME_MAP_LOADING
+    if (map_infinite)
+    {
+        site->x = x;
+        site->y = y;
+    }
+    else
+#endif
+    {
+        site->x = x < 0 ? 0 : x;
+        site->y = y < 0 ? 0 : y;
+    }
+#ifdef RUNTIME_MAP_LOADING
+    if (!map_infinite &&
+        site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
+#else
+    if (site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
+#endif
+        site->x = (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 1;
+#ifdef RUNTIME_MAP_LOADING
+    if (!map_infinite &&
+        site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+#else
+    if (site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
+#endif
+        site->y = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 1;
+    site->remaining_seconds = kind == BURN_KIND_TANK ?
+        TANK_BURN_SECONDS : AMMO_BURN_SECONDS;
+    site->mask = mask;
+    burn_owner[index] = (unsigned char)player;
+    burn_kind[index] = (unsigned char)kind;
+    next_burn_index = index + 1;
+    if (next_burn_index == MAX_BURN_SITES)
+        next_burn_index = 0;
+    next_burn_site = &burn_sites[next_burn_index];
 }
 
 void add_burn_site(WorldCoord x, WorldCoord y, int mask)
 {
-    int i;
-    int index;
-    BurnSite *site;
-
-    index = next_burn_index;
-    site = next_burn_site;
-    if (site == 0)
-        site = burn_sites;
-    for (i = 0; i < MAX_BURN_SITES; i++)
-    {
-        if (site->rounds == 0)
-        {
-#ifdef RUNTIME_MAP_LOADING
-            if (map_infinite)
-            {
-                site->x = x;
-                site->y = y;
-            }
-            else
-            {
-#endif
-            site->x = x < 0 ? 0 : x;
-            site->y = y < 0 ? 0 : y;
-#ifdef RUNTIME_MAP_LOADING
-            }
-#endif
-#ifdef RUNTIME_MAP_LOADING
-                    if (!map_infinite &&
-                        site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
-#else
-                    if (site->x >= (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE)
-#endif
-                        site->x = (WorldCoord)MAP_COLUMNS * MAP_TILE_PIXEL_SIZE - 1;
-#ifdef RUNTIME_MAP_LOADING
-                    if (!map_infinite &&
-                        site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
-#else
-                    if (site->y >= (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE)
-#endif
-                        site->y = (WorldCoord)MAP_ROWS * MAP_TILE_PIXEL_SIZE - 1;
-            site->rounds = BURN_ROUNDS + 1;
-            site->mask = mask;
-            if (index == burn_count)
-                burn_count++;
-            site++;
-            index++;
-            if (index == MAX_BURN_SITES)
-            {
-                site = burn_sites;
-                index = 0;
-            }
-            next_burn_site = site;
-            next_burn_index = index;
-            return;
-        }
-        site++;
-        index++;
-        if (index == MAX_BURN_SITES)
-        {
-            site = burn_sites;
-            index = 0;
-        }
-    }
-    burn_capacity_error = 1;
+    store_burn_site(x, y, mask, 0, BURN_KIND_AMMO);
 }
 
-void age_burn_sites(void)
+void add_ammo_burn_site(WorldCoord x, WorldCoord y, int player)
+{
+    store_burn_site(x, y, -1, player, BURN_KIND_AMMO);
+}
+
+void add_tank_burn_site(WorldCoord x, WorldCoord y, int mask, int player)
+{
+    store_burn_site(x, y, mask, player, BURN_KIND_TANK);
+}
+
+void age_burn_sites(unsigned int elapsed_seconds)
 {
     int i;
     BurnSite *site;
@@ -1136,9 +1558,42 @@ void age_burn_sites(void)
     site = burn_sites;
     for (i = 0; i < burn_count; i++)
     {
-        if (site->rounds > 0)
-            site->rounds--;
+        if (site->remaining_seconds > 0)
+        {
+            if ((unsigned int)site->remaining_seconds <= elapsed_seconds)
+            {
+                site->remaining_seconds = 0;
+                burn_active_count--;
+            }
+            else
+                site->remaining_seconds -= (int)elapsed_seconds;
+        }
         site++;
+    }
+}
+
+void update_burn_site_lifetimes(void)
+{
+    unsigned int now;
+    unsigned int elapsed;
+
+    if (burn_active_count == 0)
+    {
+        burn_clock_initialized = 0;
+        return;
+    }
+    now = gfx_rtc(1) * 60 + gfx_rtc(0);
+    if (!burn_clock_initialized)
+    {
+        burn_last_time = now;
+        burn_clock_initialized = 1;
+        return;
+    }
+    elapsed = (now + 3600 - burn_last_time) % 3600;
+    if (elapsed > 0)
+    {
+        age_burn_sites(elapsed);
+        burn_last_time = now;
     }
 }
 
@@ -1150,13 +1605,16 @@ void reset_battlefield(void)
     site = burn_sites;
     for (i = 0; i < burn_count; i++)
     {
-        site->rounds = 0;
+        site->remaining_seconds = 0;
         site++;
     }
     burn_count = 0;
-    next_burn_site = burn_sites;
+    burn_active_count = 0;
+    burn_render_cursor = 0;
     next_burn_index = 0;
+    next_burn_site = burn_sites;
     burn_capacity_error = 0;
+    burn_clock_initialized = 0;
 }
 
 void tank_impulse(int player, WorldCoord x, WorldCoord y, int strength)
@@ -1287,8 +1745,9 @@ void change_health(int player, int amount)
         hit_flash[player] = HIT_FLASH_FRAMES;
         if (tanks[player].health == 0)
         {
-            add_burn_site(tanks[player].x, tanks[player].y,
-                          tanks[player].direction & TANK_DIRECTION_MASK);
+            add_tank_burn_site(tanks[player].x, tanks[player].y,
+                               tanks[player].direction & TANK_DIRECTION_MASK,
+                               player);
             tanks[player].speed = 0;
             tanks[player].throttle = 0;
             blast_reaction(tanks[player].x, tanks[player].y, 48);
@@ -1318,7 +1777,9 @@ void prepare_collision_assets(void)
                               tank_sprite_rotations[angle]);
         }
         gfx_tile_size(MAP_TILE_PIXEL_SIZE);
+#ifndef RUNTIME_MAP_LOADING
         upload_terrain_tiles();
+#endif
         collision_assets_ready = 1;
     }
 }
@@ -1471,8 +1932,6 @@ void start_round(void)
     int last_column;
     int radius_limit;
 
-    if (round_over)
-        age_burn_sites();
     select_round_map();
     prepare_collision_assets();
     tanks[0].direction = 8;
@@ -2140,7 +2599,7 @@ int shot_collision(int index)
             gfx_mask_overlap_wide(GFX_MASK_AMMO, shot->x - 3, shot->y - 3,
                              GFX_MASK_AMMO, shots[i].x - 3, shots[i].y - 3))
         {
-            add_burn_site(shots[i].x, shots[i].y, -1);
+            add_ammo_burn_site(shots[i].x, shots[i].y, shot->owner);
             shots[i].life = 0;
             return 1;
         }
@@ -2187,7 +2646,7 @@ void update_shots(void)
             if (shot_collision(i))
             {
                 add_impact(shot->x, shot->y, 12);
-                add_burn_site(shot->x, shot->y, -1);
+                add_ammo_burn_site(shot->x, shot->y, shot->owner);
                 shot->life = 0;
                 break;
             }
@@ -2314,6 +2773,7 @@ void update_powerups(void)
 
 void update_game(unsigned int keys, unsigned int extra)
 {
+    update_burn_site_lifetimes();
     if ((keys & 32) && !(previous_keys & 32))
     {
         wins[0] = 0;
@@ -2510,12 +2970,30 @@ void draw_runtime_terrain(WorldCoord camera_x, WorldCoord camera_y)
 }
 #endif
 
+void draw_burn_sites(void)
+{
+    int batch_count;
+
+    if (burn_active_count <= 0 || burn_count <= 0)
+        return;
+    if (burn_render_cursor >= burn_count)
+        burn_render_cursor = 0;
+    batch_count = burn_count - burn_render_cursor;
+    if (batch_count > BURN_RENDER_BATCH)
+        batch_count = BURN_RENDER_BATCH;
+    world_emitters(&burn_sites[burn_render_cursor], batch_count, effect_tick);
+    burn_render_cursor += batch_count;
+    if (burn_render_cursor >= burn_count)
+        burn_render_cursor = 0;
+}
+
 void draw_ground(void)
 {
     int viewport;
     WorldCoord camera_x;
     WorldCoord camera_y;
     int i;
+    int batch_count;
     int offset_x;
     int offset_y;
 
@@ -2564,7 +3042,7 @@ void draw_ground(void)
         world_tile(i, powerup.x - MAP_TILE_PIXEL_SIZE / 2,
                    powerup.y - MAP_TILE_PIXEL_SIZE / 2);
     }
-    world_emitters(burn_sites, burn_count, effect_tick);
+    draw_burn_sites();
 }
 
 void draw_combat_feedback(void)
@@ -2775,15 +3253,27 @@ int main(void)
     gfx_layer_order(LAYER_SPRITES, 3);
     gfx_layer_transparency(LAYER_HUD, 15);
     gfx_palette(TRACK_COLOR, 84, 71, 48);
+#ifndef RUNTIME_MAP_LOADING
     for (i = 1; i < MAP_PALETTE_COUNT; i++)
     {
         gfx_palette((unsigned char)(MAP_PALETTE_BASE + i - 1),
                     map_palette[i][0],
                     map_palette[i][1], map_palette[i][2]);
     }
+#endif
     load_tank_sprites();
     gfx_tile_size(MAP_TILE_PIXEL_SIZE);
+#ifdef RUNTIME_MAP_LOADING
+    if (!load_runtime_tile_data())
+    {
+        gfx_layer_select(LAYER_HUD);
+        gfx_text(218, 230, "TILE DATA LOAD FAILED", RED);
+        while (1)
+            gfx_present();
+    }
+#else
     upload_terrain_tiles();
+#endif
     collision_assets_ready = 1;
 #ifndef RUNTIME_MAP_LOADING
     gfx_layer_select(LAYER_TILES);

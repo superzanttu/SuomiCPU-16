@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+import sys
 from unittest.mock import patch
 
 import pygame
@@ -9,6 +10,10 @@ from src import bios
 from src.lib_disk import DiskDevice
 from src.SuomiCPU import main as emulator_main
 from tools.assembler import AssemblyImage, MemorySegment
+
+TANK16_DIR = Path(__file__).resolve().parents[1] / "modules" / "Tank-16"
+if str(TANK16_DIR) not in sys.path:
+    sys.path.insert(0, str(TANK16_DIR))
 
 
 class BIOSBootTests(unittest.TestCase):
@@ -319,10 +324,10 @@ class BIOSBootTests(unittest.TestCase):
         )
         image = AssemblyImage((MemorySegment(0, b"\x00\x01"),), 0)
         with patch(
-            "tools.tank16_map_loader.compile_runtime_tank16",
+            "tank16_map_loader.compile_runtime_tank16",
             return_value=image,
         ) as compile_runtime, patch(
-            "tools.tank16_map_loader.compile_map_file",
+            "tank16_map_loader.compile_map_file",
         ) as compile_map:
             loaded = load_program_file(main_path)
 

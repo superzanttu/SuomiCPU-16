@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from pathlib import Path
+import sys
 
 from tools.assembler import (
     AssemblyError,
@@ -26,7 +27,10 @@ def load_program_file(
                 / "modules" / "Tank-16" / "main.c"
             )
             if program_path.resolve() == tank16_main:
-                from tools.tank16_map_loader import compile_runtime_tank16
+                tank16_dir = tank16_main.parent
+                if str(tank16_dir) not in sys.path:
+                    sys.path.insert(0, str(tank16_dir))
+                from tank16_map_loader import compile_runtime_tank16
 
                 report(
                     "Compiling Tank-16 with shared graphics assets; "

@@ -4,10 +4,15 @@ import runpy
 import tempfile
 import unittest
 from pathlib import Path
+import sys
 
 import pygame
 
-from tools.generate_finland_map import (
+GAME_DIR = Path(__file__).resolve().parents[1] / "modules" / "Tank-16"
+if str(GAME_DIR) not in sys.path:
+    sys.path.insert(0, str(GAME_DIR))
+
+from generate_finland_map import (
     ATLAS_PATH, GAME_DIR, bridge_tile, extend_atlas, generate_map,
     project, rail_bridge_tile, train_track_tile, water_tile,
 )

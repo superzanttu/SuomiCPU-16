@@ -3,14 +3,14 @@ import json
 import math
 from pathlib import Path
 
-from tools.generate_finland_map import (
+from generate_finland_map import (
     OBJECT_BUILDING_CELLS,
     ROAD_TILE_BY_CONNECTIONS,
     bridge_tile_id,
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 GAME_DIR = ROOT / "modules" / "Tank-16"
 MAP_WIDTH = 48
 MAP_HEIGHT = 32

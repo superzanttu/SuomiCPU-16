@@ -6,7 +6,7 @@ from pathlib import Path
 import pygame
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 GAME_DIR = ROOT / "modules" / "Tank-16"
 ATLAS_PATH = GAME_DIR / "gfx" / "tiles_terrain.png"
 TILE_SIZE = 64

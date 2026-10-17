@@ -3,17 +3,21 @@ from collections.abc import Callable
 from pathlib import Path
 import re
 import runpy
-import tempfile
+import sys
 
 import pygame
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from tools.c_compiler import compile_source
 
 
-ROOT = Path(__file__).resolve().parents[1]
 GAME_DIR = ROOT / "modules" / "Tank-16"
 EDITOR_PATH = GAME_DIR / "map_editor.py"
 MAIN_PATH = GAME_DIR / "main.c"
+RUNTIME_TILE_DATA_PATH = GAME_DIR / "disks" / "assets" / "TANK16_TILES.json"
 RUNTIME_PALETTE_BASE = 32
 RUNTIME_PALETTE_CAPACITY = 256 - RUNTIME_PALETTE_BASE
 OBJECT_REMOVAL_TYPES = ("fixed", "explosion", "disappear")
@@ -421,57 +425,12 @@ def build_map_header(
 
 def build_runtime_assets_header(
     logger: Callable[[str], None] | None = None,
+    tile_json_path: Path = RUNTIME_TILE_DATA_PATH,
 ) -> str:
     report = logger if logger is not None else (lambda message: None)
-    report(
-        f"[Tank-16 assets] Loading object tileset: "
-        f"{GAME_DIR / 'gfx' / 'tiles_objects.png'}"
-    )
     editor = runpy.run_path(str(EDITOR_PATH))
-    objects, object_columns, object_rows = editor["load_tileset"](
-        GAME_DIR / "gfx" / "tiles_objects.png", pad_edges=True
-    )
-    report(
-        f"[Tank-16 assets] Preparing object tile atlas from "
-        f"{object_columns * object_rows} object tiles"
-    )
-    map_data = editor["new_map"]("RUNTIME", object_columns * object_rows, 1)
-    for index in range(object_columns * object_rows):
-        map_data["objects"][0][index] = {
-            "tile": [index % object_columns, index // object_columns],
-            "hp_change": -25,
-            "removal": "explosion",
-        }
-    with tempfile.TemporaryDirectory() as directory:
-        map_path = editor["save_map"](map_data, Path(directory))
-        _, tile_data, palette, dimensions = load_map_assets(map_path, logger=logger)
-
-    terrain_columns, terrain_rows, tile_size = dimensions
-    terrain_count = terrain_columns * terrain_rows
-    tile_pixels = tile_size * tile_size
-
-    def format_array(values: list[int], width: int) -> str:
-        return ",\n".join(
-            "    " + ", ".join(str(value) for value in values[start:start + width])
-            for start in range(0, len(values), width)
-        )
-
-    tiles = ",\n".join(
-        "    {" + format_array(values, 32).replace("\n", "\n     ") + "}"
-        for values in tile_data
-    )
-    uploads = "\n".join(
-        "    gfx_tile_upload(%d, terrain_tiles[%d]);" % (index, index)
-        for index in range(len(tile_data))
-    )
-    palette_data = ",\n".join(
-        "    {%s}" % ", ".join(str(channel) for channel in color)
-        for color in palette
-    )
-    report(
-        f"[Tank-16 assets] Serializing {len(tile_data)} runtime tiles and "
-        f"{len(palette)} palette entries into C source"
-    )
+    json_path = Path(tile_json_path)
+    editor["convert_tilesets_to_json"](json_path, logger=logger)
     header = (
         "#define RUNTIME_MAP_LOADING 1\n"
         "#define MAP_COLUMNS map_columns\n"
@@ -481,21 +440,30 @@ def build_runtime_assets_header(
         "#define OBJECT_FIXED 0\n"
         "#define OBJECT_EXPLOSION 1\n"
         "#define OBJECT_DISAPPEAR 2\n"
-        f"#define TERRAIN_COLUMNS {terrain_columns}\n"
-        f"#define TERRAIN_ROWS {terrain_rows}\n"
-        f"#define TERRAIN_TILE_COUNT {terrain_count}\n"
-        f"#define OBJECT_TILE_BASE {terrain_count}\n"
-        f"#define OBJECT_COLUMNS {object_columns}\n"
-        f"#define OBJECT_ROWS {object_rows}\n"
-        f"#define POWERUP_HEALTH_TILE {terrain_count + 2 * object_columns + 3}\n"
-        f"#define POWERUP_DAMAGE_TILE {terrain_count + 2 * object_columns + 4}\n"
-        f"#define POWERUP_SPEED_TILE {terrain_count + 2 * object_columns + 5}\n"
-        f"#define RUNTIME_TILE_COUNT {len(tile_data)}\n"
-        f"#define TILE_PIXEL_COUNT {tile_pixels}\n"
-        f"#define MAP_PALETTE_COUNT {len(palette)}\n"
+        "#define TERRAIN_COLUMNS runtime_terrain_columns\n"
+        "#define TERRAIN_ROWS runtime_terrain_rows\n"
+        "#define TERRAIN_TILE_COUNT (runtime_terrain_columns * runtime_terrain_rows)\n"
+        "#define OBJECT_TILE_BASE TERRAIN_TILE_COUNT\n"
+        "#define OBJECT_COLUMNS runtime_object_columns\n"
+        "#define OBJECT_ROWS runtime_object_rows\n"
+        "#define RUNTIME_TILE_SIZE runtime_tile_size\n"
+        "#define POWERUP_HEALTH_TILE (OBJECT_TILE_BASE + 2 * OBJECT_COLUMNS + 3)\n"
+        "#define POWERUP_DAMAGE_TILE (OBJECT_TILE_BASE + 2 * OBJECT_COLUMNS + 4)\n"
+        "#define POWERUP_SPEED_TILE (OBJECT_TILE_BASE + 2 * OBJECT_COLUMNS + 5)\n"
+        "#define RUNTIME_TILE_COUNT runtime_tile_count\n"
+        "#define TILE_PIXEL_COUNT (RUNTIME_TILE_SIZE * RUNTIME_TILE_SIZE)\n"
+        "#define MAP_PALETTE_COUNT runtime_palette_count\n"
         f"#define MAP_PALETTE_BASE {RUNTIME_PALETTE_BASE}\n"
+        '#define RUNTIME_TILE_DATA_PATH "assets/TANK16_TILES.json"\n'
         "int map_columns;\n"
         "int map_rows;\n"
+        "int runtime_terrain_columns;\n"
+        "int runtime_terrain_rows;\n"
+        "int runtime_object_columns;\n"
+        "int runtime_object_rows;\n"
+        "int runtime_tile_size;\n"
+        "int runtime_tile_count;\n"
+        "int runtime_palette_count;\n"
         "unsigned char *map_data;\n"
         "unsigned char *map_obstacles;\n"
         "volatile unsigned char map_json_chunk[256];\n"
@@ -506,16 +474,10 @@ def build_runtime_assets_header(
         "int map_object_tile[MAP_OBJECT_CAPACITY];\n"
         "int map_object_hp[MAP_OBJECT_CAPACITY];\n"
         "int map_object_removal[MAP_OBJECT_CAPACITY];\n"
-        f"unsigned char map_palette[MAP_PALETTE_COUNT][3] = {{\n"
-        f"{palette_data}\n}};\n"
-        f"unsigned char terrain_tiles[RUNTIME_TILE_COUNT][TILE_PIXEL_COUNT] = {{\n"
-        f"{tiles}\n}};\n"
-        "void upload_terrain_tiles(void)\n{\n"
-        f"{uploads}\n"
-        "}\n"
+        "unsigned char runtime_tile_pixels[4096];\n"
     )
     report(
-        f"[Tank-16 assets] Generated runtime asset header: "
+        f"[Tank-16 assets] Generated runtime metadata header for {json_path}: "
         f"{len(header.encode('utf-8'))} bytes"
     )
     return header
