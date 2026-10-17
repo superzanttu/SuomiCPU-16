@@ -455,6 +455,7 @@ def build_runtime_assets_header(
         "#define MAP_PALETTE_COUNT runtime_palette_count\n"
         f"#define MAP_PALETTE_BASE {RUNTIME_PALETTE_BASE}\n"
         '#define RUNTIME_TILE_DATA_PATH "assets/TANK16_TILES.json"\n'
+        '#define RUNTIME_TILE_BINARY_PATH "assets/TANK16_TILES.bin"\n'
         "int map_columns;\n"
         "int map_rows;\n"
         "int runtime_terrain_columns;\n"
@@ -465,10 +466,11 @@ def build_runtime_assets_header(
         "int runtime_tile_count;\n"
         "int runtime_palette_count;\n"
         "int runtime_tile_data_ready;\n"
+        "int runtime_tile_binary;\n"
         "int runtime_tile_loaded[256];\n"
         "unsigned char *map_data;\n"
         "unsigned char *map_obstacles;\n"
-        "volatile unsigned char map_json_chunk[256];\n"
+        "volatile unsigned char map_json_chunk[4096];\n"
         "volatile char map_path_buffer[129];\n"
         "char map_selected_path[129];\n"
         "int map_object_x[MAP_OBJECT_CAPACITY];\n"

@@ -389,6 +389,7 @@ def convert_tilesets_to_json(
     document = {
         "format": "SC16-TANK16-TILES",
         "version": 1,
+        "pixel_encoding": "raw-index-v1",
         "tile_size": dimensions[2],
         "terrain_columns": dimensions[0],
         "terrain_rows": dimensions[1],
@@ -399,6 +400,8 @@ def convert_tilesets_to_json(
     }
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    binary_path = output_path.with_suffix(".bin")
+    binary_path.write_bytes(b"".join(bytes(pixels) for pixels in tiles))
     tiles_dir = output_path.parent / "tiles"
     tiles_dir.mkdir(parents=True, exist_ok=True)
     for index, pixels in enumerate(tiles):
@@ -411,8 +414,11 @@ def convert_tilesets_to_json(
         json.dump(document, handle, separators=(",", ":"))
         handle.write("\n")
     if logger is not None:
-        logger("Wrote runtime tile metadata: %s (%d bytes); %d pixel files in %s" % (
-            output_path, output_path.stat().st_size, len(tiles), tiles_dir))
+        logger(
+            "Wrote runtime tile metadata: %s (%d bytes); raw tile data: %s "
+            "(%d bytes); %d JSON tile files in %s" % (
+                output_path, output_path.stat().st_size, binary_path,
+                binary_path.stat().st_size, len(tiles), tiles_dir))
     return output_path
 
 

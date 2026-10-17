@@ -24,6 +24,7 @@
 #define RUNTIME_MAP_MAX_CELLS 10000UL
 unsigned char runtime_map_data[RUNTIME_MAP_MAX_CELLS];
 unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
+unsigned char runtime_empty_tilemap[1];
 int runtime_terrain_usage[256];
 int runtime_obstacle_usage[256];
 unsigned char runtime_tile_needed[256];
@@ -413,8 +414,9 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
     unsigned long copied;
     int progress_chunks;
 
-    length = disk_read_file(path, 0, map_json_chunk, 256, size);
-    if (length < 0 || *size == 0 || *size > 67108864UL)
+    length = disk_read_file(path, 0, map_json_chunk, 4096, size);
+    if (length <= 0 || *size == 0 || length > *size ||
+        *size > 67108864UL)
     {
         printf("JSON READ ERROR: %s first-chunk=%d size=%lu\n",
                path, length, *size);
@@ -427,12 +429,14 @@ int load_json_bytes(char *path, char **json, unsigned long *size)
                path, *size + 1);
         return 0;
     }
-    offset = 0;
-    copied = 0;
+    for (i = 0; i < length; i++)
+        (*json)[i] = map_json_chunk[i];
+    offset = (unsigned long)length;
+    copied = offset;
     progress_chunks = 0;
     while (offset < *size)
     {
-        length = disk_read_file(path, offset, map_json_chunk, 256, size);
+        length = disk_read_file(path, offset, map_json_chunk, 4096, size);
         if (length <= 0)
         {
             printf("JSON READ ERROR: %s offset=%lu chunk=%d\n",
@@ -610,6 +614,17 @@ int load_runtime_tile_data(void)
     runtime_palette_count = palette_entries + 1;
     printf("TILE DATA PALETTE: %d RGB colors loaded\n", palette_entries);
 
+    value = json_value(json, "pixel_encoding");
+    runtime_tile_binary = 0;
+    if (value != 0)
+    {
+        if (!json_string_is(value, "raw-index-v1"))
+        {
+            free(json);
+            return 0;
+        }
+        runtime_tile_binary = 1;
+    }
     value = json_value(json, "tile_count");
     if (value == 0 || !json_integer(&value, &declared_tile_count) ||
         declared_tile_count != tile_count)
@@ -629,9 +644,11 @@ int load_runtime_tile_data(void)
 int ensure_runtime_tile_loaded(int tile)
 {
     char tile_path[] = "assets/tiles/tile_000.json";
+    char binary_path[] = RUNTIME_TILE_BINARY_PATH;
     char *tile_json;
     char *cursor;
     unsigned long tile_file_size;
+    int length;
     int pixel;
     int red;
     int green;
@@ -646,6 +663,62 @@ int ensure_runtime_tile_loaded(int tile)
     }
     if (runtime_tile_loaded[tile])
         return 1;
+    if (runtime_tile_binary)
+    {
+        length = disk_read_file(binary_path,
+                                (unsigned long)tile *
+                                    (unsigned long)TILE_PIXEL_COUNT,
+                                runtime_tile_pixels, TILE_PIXEL_COUNT,
+                                &tile_file_size);
+        if (length != TILE_PIXEL_COUNT ||
+            tile_file_size != (unsigned long)runtime_tile_count *
+                                  (unsigned long)TILE_PIXEL_COUNT)
+        {
+            printf("TILE DATA ERROR: invalid binary tile %d read=%d "
+                   "size=%lu\n", tile, length, tile_file_size);
+            return 0;
+        }
+        palette_entries = runtime_palette_count - 1;
+        for (pixel = 0; pixel < TILE_PIXEL_COUNT; pixel++)
+        {
+            index = runtime_tile_pixels[pixel];
+            if (index != 0 &&
+                (index < MAP_PALETTE_BASE ||
+                 index >= MAP_PALETTE_BASE + palette_entries))
+            {
+                printf("TILE DATA ERROR: invalid palette index %d in tile %d\n",
+                       index, tile);
+                return 0;
+            }
+        }
+        gfx_tile_upload(tile, runtime_tile_pixels);
+        runtime_tile_loaded[tile] = 1;
+        if (runtime_loading_active)
+        {
+            runtime_tile_progress_loaded++;
+            if (runtime_tile_progress_loaded % 4 == 0 ||
+                runtime_tile_progress_loaded == runtime_tile_progress_total)
+                draw_runtime_loading_screen(
+                    "LOADING TILES", runtime_tile_progress_loaded,
+                    runtime_tile_progress_total);
+        }
+        if (tile < TERRAIN_TILE_COUNT)
+            printf("TILE %d terrain source=(%d,%d) loaded (%lu bytes)\n",
+                   tile, tile % runtime_terrain_columns,
+                   tile / runtime_terrain_columns, tile_file_size /
+                       (unsigned long)runtime_tile_count);
+        else
+        {
+            int object_tile;
+
+            object_tile = tile - TERRAIN_TILE_COUNT;
+            printf("TILE %d object source=(%d,%d) loaded (%lu bytes)\n",
+                   tile, object_tile % runtime_object_columns,
+                   object_tile / runtime_object_columns,
+                   tile_file_size / (unsigned long)runtime_tile_count);
+        }
+        return 1;
+    }
     tile_path[18] = (char)('0' + tile / 100);
     tile_path[19] = (char)('0' + (tile / 10) % 10);
     tile_path[20] = (char)('0' + tile % 10);
@@ -1210,6 +1283,15 @@ int load_runtime_map_tiles(void)
     return 1;
 }
 
+void configure_runtime_tilemap(void)
+{
+    gfx_layer_select(LAYER_TILES);
+    if (map_infinite)
+        gfx_tilemap(runtime_empty_tilemap, 1, 1, 0, 0);
+    else
+        gfx_tilemap(map_data, map_columns, map_rows, 0, 0);
+}
+
 int load_map_path(char *path)
 {
     char *json;
@@ -1249,6 +1331,8 @@ int load_map_path(char *path)
     }
     if (result)
         result = load_runtime_map_tiles();
+    if (result)
+        configure_runtime_tilemap();
     if (!result)
         printf("MAP LOAD ERROR: invalid or unavailable map %s\n", path);
     free(json);
@@ -1744,6 +1828,7 @@ void select_runtime_round_map(void)
     reset_battlefield();
     current_map_path[0] = 0;
     use_default_infinite_map();
+    configure_runtime_tilemap();
     map_load_error = 1;
     round_map_selection_started++;
     current_map_variant = -1;
@@ -3365,11 +3450,14 @@ void draw_ground(void)
     int offset_y;
 
     gfx_layer_select(LAYER_TILES);
-    gfx_clear(0);
 #ifdef RUNTIME_MAP_LOADING
-    for (viewport = 0; viewport < 2; viewport++)
-        draw_runtime_terrain(tank_camera_x(viewport),
-                             tank_camera_y(viewport));
+    if (map_infinite)
+    {
+        gfx_clear(0);
+        for (viewport = 0; viewport < 2; viewport++)
+            draw_runtime_terrain(tank_camera_x(viewport),
+                                 tank_camera_y(viewport));
+    }
 #endif
     gfx_layer_select(LAYER_3D);
     gfx_clear(0);

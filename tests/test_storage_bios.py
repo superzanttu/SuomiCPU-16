@@ -62,6 +62,22 @@ class StorageBIOSIntegrationTests(unittest.TestCase):
                 len(payload),
             )
 
+            large_buffer_address = RAM_START + 0x1000
+            cpu.memory[DISK_BASE + 26:DISK_BASE + 30] = (
+                large_buffer_address.to_bytes(4, "big")
+            )
+            cpu.write_16(DISK_BASE + 30, 4096)
+            cpu.memory[DISK_BASE + 18:DISK_BASE + 22] = (4096).to_bytes(
+                4, "big"
+            )
+            cpu.write(DISK_BASE, 0x40)
+            self.assertEqual(cpu.read_16(DISK_BASE + 14), 4096)
+            self.assertEqual(
+                bytes(cpu.memory[large_buffer_address:
+                                 large_buffer_address + 4096]),
+                payload[4096:8192],
+            )
+
             output_address = RAM_START + 0x400
             cpu.write_16(DISK_BASE + 10, 0)
             cpu.memory[DISK_BASE + 26:DISK_BASE + 30] = output_address.to_bytes(

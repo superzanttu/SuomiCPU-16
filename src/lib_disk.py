@@ -9,9 +9,10 @@ class DiskDeviceError(Exception):
 
 
 class DiskDevice:
-    """JSON-backed virtual disks with 256-byte blocks."""
+    """Virtual disks with 256-byte blocks and bounded virtual-file reads."""
 
     BLOCK_SIZE = 256
+    MAX_FILE_READ_SIZE = 4096
     MAX_BLOCKS = 0x10000
     DISK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8}\Z")
     FILE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9_.-]+\Z")
@@ -148,7 +149,7 @@ class DiskDevice:
             or not 0 <= offset <= 0xFFFFFFFF
             or not isinstance(length, int)
             or isinstance(length, bool)
-            or not 0 <= length <= self.BLOCK_SIZE
+            or not 0 <= length <= self.MAX_FILE_READ_SIZE
         ):
             raise DiskDeviceError("invalid virtual file read range")
         root = self.file_root

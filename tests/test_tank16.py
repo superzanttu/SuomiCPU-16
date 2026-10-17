@@ -850,6 +850,11 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn(
             '#define RUNTIME_TILE_DATA_PATH "assets/TANK16_TILES.json"',
             header)
+        self.assertIn(
+            '#define RUNTIME_TILE_BINARY_PATH "assets/TANK16_TILES.bin"',
+            header)
+        self.assertIn("volatile unsigned char map_json_chunk[4096];",
+                      header)
         self.assertNotIn("terrain_tiles[", header)
         self.assertNotIn("map_palette[", header)
         self.assertLess(first_map.stat().st_size, 65_535)
@@ -858,6 +863,7 @@ class Tank16Tests(unittest.TestCase):
         tileset = json.loads(RUNTIME_TILE_DATA_PATH.read_text(encoding="utf-8"))
         self.assertEqual(tileset["format"], "SC16-TANK16-TILES")
         self.assertEqual(tileset["version"], 1)
+        self.assertEqual(tileset["pixel_encoding"], "raw-index-v1")
         self.assertEqual(tileset["tile_size"], 64)
         self.assertEqual(
             (tileset["terrain_columns"], tileset["terrain_rows"]), (10, 9))
@@ -865,6 +871,11 @@ class Tank16Tests(unittest.TestCase):
             (tileset["object_columns"], tileset["object_rows"]), (6, 8))
         self.assertEqual(len(tileset["palette"]), 224)
         self.assertEqual(tileset["tile_count"], 138)
+        binary_path = RUNTIME_TILE_DATA_PATH.with_suffix(".bin")
+        self.assertEqual(
+            binary_path.stat().st_size,
+            tileset["tile_count"] * tileset["tile_size"] ** 2,
+        )
         tile_files = sorted(
             (RUNTIME_TILE_DATA_PATH.parent / "tiles").glob("tile_*.json"))
         self.assertEqual(len(tile_files), tileset["tile_count"])
@@ -1000,16 +1011,19 @@ class Tank16Tests(unittest.TestCase):
         first_tile = json.loads(
             (RUNTIME_TILE_DATA_PATH.parent / "tiles" / "tile_000.json")
             .read_text(encoding="utf-8"))
+        binary_tiles = RUNTIME_TILE_DATA_PATH.with_suffix(".bin").read_bytes()
         game_source = self.game_source(source_path).replace(
             '#include "map_assets.h"', header, 1
         )
         source = (
-            "int results[3];\n" + game_source +
+            "int results[4];\n" + game_source +
             "int main(void) {\n"
             "  gfx_tile_size(MAP_TILE_PIXEL_SIZE);\n"
             "  results[0] = load_runtime_tile_data();\n"
             "  results[1] = ensure_runtime_tile_loaded(0);\n"
             "  results[2] = ensure_runtime_tile_loaded(90);\n"
+            "  runtime_tile_binary = 0; runtime_tile_loaded[0] = 0;\n"
+            "  results[3] = ensure_runtime_tile_loaded(0);\n"
             "  return 0;\n"
             "}\n"
         )
@@ -1024,11 +1038,12 @@ class Tank16Tests(unittest.TestCase):
 
         self.assertFalse(cpu.running)
         self.assertEqual(
-            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(3)],
-            [1, 1, 1],
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(4)],
+            [1, 1, 1, 1],
             cpu.console_device.output.decode("ascii", errors="replace"))
         actual_tile = bytes(cpu.tile_memory[:64 * 64])
         expected_tile = bytes.fromhex(first_tile["pixels"])
+        self.assertEqual(binary_tiles[:64 * 64], expected_tile)
         first_difference = next(
             (index for index, pixels in enumerate(
                 zip(actual_tile, expected_tile)) if pixels[0] != pixels[1]),
@@ -1045,6 +1060,10 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn("TILE DATA: assets/TANK16_TILES.json", runtime_log)
         self.assertIn("TILE 0 terrain source=(0,0) loaded", runtime_log)
         self.assertIn("TILE 90 object source=(0,0) loaded", runtime_log)
+        self.assertIn("TILE 0 terrain source=(0,0) loaded (4096 bytes)",
+                      runtime_log)
+        self.assertIn("TILE 0 terrain source=(0,0) loaded (8206 bytes)",
+                      runtime_log)
         self.assertIn("#define POWERUP_HEALTH_TILE", header)
         self.assertIn("#define POWERUP_DAMAGE_TILE", header)
         self.assertIn("#define POWERUP_SPEED_TILE", header)
@@ -1079,6 +1098,42 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(layer_pixel(cpu, 4, 500, 278), 3)
         run_frame(cpu)
         self.assertFalse(cpu.running)
+
+    def test_finite_runtime_terrain_uses_split_screen_tilemap_renderer(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1
+        )
+        source = (
+            "unsigned char test_tile_pixels[4096];\n" +
+            game_source +
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  gfx_layer_reset(1 << LAYER_TILES);\n"
+            "  gfx_layer_transparency(LAYER_TILES, 15);\n"
+            "  gfx_tile_size(MAP_TILE_PIXEL_SIZE);\n"
+            "  for (i = 0; i < 4096; i++) test_tile_pixels[i] = 7;\n"
+            "  gfx_tile_upload(0, test_tile_pixels);\n"
+            "  for (i = 0; i < 4096; i++) test_tile_pixels[i] = 8;\n"
+            "  gfx_tile_upload(1, test_tile_pixels);\n"
+            "  map_data = runtime_map_data;\n"
+            "  map_data[0] = 0; map_data[1] = 1;\n"
+            "  map_columns = 2; map_rows = 1; map_infinite = 0;\n"
+            "  configure_runtime_tilemap();\n"
+            "  gfx_split_camera_wide(0, 0, 0, 0);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source, str(source_path)))
+
+        run_frame(cpu)
+
+        self.assertEqual(layer_pixel(cpu, 1, 20, 20), 7)
+        self.assertEqual(layer_pixel(cpu, 1, 80, 20), 8)
+        self.assertEqual(layer_pixel(cpu, 1, 340, 20), 7)
+        self.assertEqual(layer_pixel(cpu, 1, 400, 20), 8)
 
     def test_timed_powerups_heal_boost_speed_and_increase_shot_damage(self):
         results = self.scenario_results(

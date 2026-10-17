@@ -53,7 +53,7 @@ static int disk_read_file(const char *path, unsigned long offset,
     volatile unsigned char *registers;
     int length;
 
-    if (path == 0 || buffer == 0 || capacity < 0 || capacity > 256)
+    if (path == 0 || buffer == 0 || capacity < 0 || capacity > 4096)
         return -1;
     registers = (volatile unsigned char *)0x43100UL;
     sc16_disk_write32(registers, 18, offset);

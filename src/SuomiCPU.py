@@ -107,7 +107,7 @@ DISK_STATUS = DISK_BASE + 16
 # +18..+21: Virtual file byte offset (32-bit, big-endian)
 # +22..+25: Absolute SC-16 address of virtual file path
 # +26..+29: Absolute SC-16 address of file buffer
-# +30..+31: Maximum file transfer size (up to 256 bytes)
+# +30..+31: Maximum file transfer size (up to 4096 bytes)
 # +32..+35: Virtual file size (32-bit, big-endian)
 # 0x40: Read file chunk
 # 0x80: List files for the running module (index +10, output buffer +26)
@@ -1329,7 +1329,10 @@ class SuomiCompute16:
                     | self.memory[DISK_BASE + 20] << 8
                     | self.memory[DISK_BASE + 21]
                 )
-                length = min(self.read_16(DISK_BASE + 30), self.disk.BLOCK_SIZE)
+                length = min(
+                    self.read_16(DISK_BASE + 30),
+                    self.disk.MAX_FILE_READ_SIZE,
+                )
                 if path_address >= MEM_SIZE or buffer_address + length > MEM_SIZE:
                     raise DiskDeviceError("virtual file address is outside memory")
                 path_bytes = bytearray()
