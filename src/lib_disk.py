@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 
@@ -13,6 +14,7 @@ class DiskDevice:
 
     BLOCK_SIZE = 256
     MAX_FILE_READ_SIZE = 4096
+    FILE_LIST_CACHE_SECONDS = 1.0
     MAX_BLOCKS = 0x10000
     DISK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8}\Z")
     FILE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9_.-]+\Z")
@@ -117,23 +119,35 @@ class DiskDevice:
         if self.file_root is None:
             raise DiskDeviceError("the running module has no disk folder")
         root = self.file_root
+        cached = getattr(self, "_file_list_cache", None)
+        now = time.monotonic()
+        if (cached is not None and cached[0] == root
+                and now - cached[1] < self.FILE_LIST_CACHE_SECONDS):
+            return list(cached[2])
         if not root.exists():
             return []
         try:
             resolved_root = root.resolve()
             names = []
-            for path in root.rglob("*"):
-                if not path.is_file() or not path.resolve().is_relative_to(
-                    resolved_root
-                ):
-                    continue
-                name = path.relative_to(root).as_posix()
-                try:
-                    self._validate_file_path(name)
-                except DiskDeviceError:
-                    continue
-                names.append(name)
-            return sorted(names)
+            for directory, subdirectories, files in os.walk(root):
+                directory_path = Path(directory)
+                subdirectories.sort()
+                for file_name in files:
+                    path = directory_path / file_name
+                    if path.is_symlink() and (
+                        not path.is_file()
+                        or not path.resolve().is_relative_to(resolved_root)
+                    ):
+                        continue
+                    name = path.relative_to(root).as_posix()
+                    try:
+                        self._validate_file_path(name)
+                    except DiskDeviceError:
+                        continue
+                    names.append(name)
+            names.sort()
+            self._file_list_cache = (root, now, tuple(names))
+            return names
         except OSError as exc:
             raise DiskDeviceError(
                 f"cannot list files on disk {self.current_disk}: {exc}"
@@ -153,11 +167,16 @@ class DiskDevice:
         ):
             raise DiskDeviceError("invalid virtual file read range")
         root = self.file_root
-        path = root / relative_path
+        safe_paths = getattr(self, "_safe_paths", None)
+        if safe_paths is None:
+            safe_paths = self._safe_paths = {}
         try:
-            resolved_root = root.resolve()
-            if not path.resolve().is_relative_to(resolved_root):
-                raise DiskDeviceError("virtual file path escapes the disk")
+            path = safe_paths.get((root, file_path))
+            if path is None:
+                path = root / relative_path
+                if not path.resolve().is_relative_to(root.resolve()):
+                    raise DiskDeviceError("virtual file path escapes the disk")
+                safe_paths[(root, file_path)] = path
             with path.open("rb") as file_handle:
                 file_handle.seek(0, os.SEEK_END)
                 file_size = file_handle.tell()
@@ -179,6 +198,8 @@ class DiskDevice:
     def set_file_root(self, root):
         try:
             self.file_root = Path(root).resolve()
+            self._file_list_cache = None
+            self._safe_paths = {}
         except OSError as exc:
             raise DiskDeviceError(f"cannot configure module disk folder: {exc}") from exc
 

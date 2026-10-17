@@ -21,7 +21,7 @@ from generate_finland_map import (
 class FinlandMapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.map_path = GAME_DIR / "maps" / "FINLAND.json"
+        cls.map_path = GAME_DIR / "disks" / "maps" / "FINLAND.json"
         cls.runtime_document = json.loads(
             cls.map_path.read_text(encoding="utf-8"))
         editor = runpy.run_path(str(GAME_DIR / "map_editor.py"))
@@ -72,29 +72,42 @@ class FinlandMapTests(unittest.TestCase):
 
     def test_runtime_json_contains_only_referenced_tile_indices(self):
         document = self.runtime_document
-        self.assertEqual(document["runtime_encoding"], "flat-v1")
+        self.assertEqual(document["runtime_encoding"], "grid-hex-v2")
         self.assertLess(self.map_path.stat().st_size, 65_535)
-        disk_map = GAME_DIR / "disks" / "maps" / self.map_path.name
-        self.assertEqual(disk_map.read_bytes(), self.map_path.read_bytes())
+        self.assertFalse((GAME_DIR / "maps").exists())
         expected_terrain = {
             tile_y * 10 + tile_x
             for row in self.data["tiles"]
             for tile_x, tile_y in row
         }
-        self.assertEqual(set(document["tiles"]), expected_terrain)
-        expected_objects = set()
-        for layer in ("obstacles", "objects"):
-            for row in self.data[layer]:
-                for cell in row:
-                    if cell is not None:
-                        tile = cell if layer == "obstacles" else cell["tile"]
-                        expected_objects.add(tile[1] * 6 + tile[0])
-        stored_objects = {
-            entry[1]
-            for layer in ("obstacles", "objects")
-            for entry in document[layer]
+        self.assertEqual(
+            {tile for tile, _ in document["used_tiles"]}, expected_terrain)
+        self.assertEqual(
+            sum(count for _, count in document["used_tiles"]),
+            document["width"] * document["height"])
+        expected_obstacles = {
+            cell[1] * 6 + cell[0]
+            for row in self.data["obstacles"] for cell in row
+            if cell is not None
         }
-        self.assertEqual(stored_objects, expected_objects)
+        self.assertEqual(
+            {tile for tile, _ in document["used_obstacles"]},
+            expected_obstacles)
+        expected_objects = {
+            cell["tile"][1] * 6 + cell["tile"][0]
+            for row in self.data["objects"] for cell in row
+            if cell is not None
+        }
+        self.assertEqual(
+            {entry[1] for entry in document["objects"]}, expected_objects)
+        raw = self.map_path.read_bytes()
+        stride = document["width"] * 4 + 4
+        self.assertLessEqual(document["grid_offset"], 4096)
+        for row in (0, document["height"] // 2, document["height"] - 1):
+            start = document["grid_offset"] + row * stride + 1
+            self.assertEqual(
+                raw[start:start + document["width"] * 4].decode("ascii"),
+                document["grid"][row])
 
     def test_land_cities_and_real_lakes_are_at_correct_projected_locations(self):
         bounds = self.data["geography"]["projected_bounds_km"]
@@ -122,7 +135,7 @@ class FinlandMapTests(unittest.TestCase):
 
     def test_finland_opens_in_editor_and_retains_source_metadata(self):
         editor = runpy.run_path(str(GAME_DIR / "map_editor.py"))
-        loaded = editor["load_map"](GAME_DIR / "maps" / "FINLAND.json")
+        loaded = editor["load_map"](GAME_DIR / "disks" / "maps" / "FINLAND.json")
         self.assertEqual(loaded["geography"], self.data["geography"])
         self.assertEqual(loaded["tiles"][-1], self.data["tiles"][-1])
         self.assertEqual(len(loaded["obstacles"]), 100)

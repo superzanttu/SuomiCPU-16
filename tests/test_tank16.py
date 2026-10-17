@@ -3,6 +3,7 @@ import math
 import json
 import re
 import runpy
+import shutil
 import sys
 import tempfile
 import unittest
@@ -715,7 +716,7 @@ class Tank16Tests(unittest.TestCase):
 
     def test_main_game_compiles_and_renders_a_frame(self):
         source = ROOT / "modules" / "Tank-16" / "main.c"
-        map_path = ROOT / "modules" / "Tank-16" / "maps" / "PERUS-1.json"
+        map_path = ROOT / "modules" / "Tank-16" / "disks" / "maps" / "PERUS-1.json"
         _, _, _, dimensions = load_map_assets(map_path)
         cpu = make_cpu(load_program_file(source))
         with tempfile.TemporaryDirectory() as directory:
@@ -723,6 +724,14 @@ class Tank16Tests(unittest.TestCase):
             maps_dir = module_disks / "maps"
             maps_dir.mkdir(parents=True)
             map_document = json.loads(map_path.read_text(encoding="utf-8"))
+            map_document = {
+                "name": map_document["name"],
+                "format_version": 1,
+                "tile_size": 64,
+                "width": map_document["width"],
+                "height": map_document["height"],
+                "tileset": "tiles_terrain.png",
+            }
             map_document["tiles"] = [
                 [[1, 0] for _ in range(map_document["width"])]
                 for _ in range(map_document["height"])
@@ -735,20 +744,25 @@ class Tank16Tests(unittest.TestCase):
                 [None for _ in range(map_document["width"])]
                 for _ in range(map_document["height"])
             ]
-            (maps_dir / "FINLAND.json").write_text(
-                json.dumps(map_document), encoding="utf-8"
-            )
+            editor = runpy.run_path(str(source.with_name("map_editor.py")))
+            (maps_dir / "FINLAND.json").write_bytes(
+                editor["serialize_runtime_map"](
+                    editor["encode_runtime_map"](map_document)
+                ).encode("ascii"))
+            shutil.copytree(
+                source.parent / "disks" / "assets", module_disks / "assets")
             cpu.disk = DiskDevice(Path(directory) / "virtual-disks")
             cpu.disk.set_file_root(module_disks)
-            for _ in range(40):
+            for _ in range(400):
                 run_frame(cpu)
-                if cpu.frame_yield:
+                if cpu.frame_yield and cpu.split_cameras:
                     break
 
         self.assertTrue(cpu.frame_yield)
+        self.assertTrue(cpu.split_cameras)
         self.assertEqual(cpu.memory[DISK_STATUS], 0)
-        self.assertEqual(cpu.tilemap_width, 0)
-        self.assertEqual(cpu.tilemap_height, 0)
+        self.assertEqual(cpu.tilemap_width, map_document["width"])
+        self.assertEqual(cpu.tilemap_height, map_document["height"])
         self.assertEqual(cpu.tile_pixel_size, map_tile_pixel_size())
         self.assertEqual(dimensions[2], cpu.tile_pixel_size)
         tile_pixels = cpu.tile_pixel_size ** 2
@@ -839,8 +853,8 @@ class Tank16Tests(unittest.TestCase):
 
     def test_round_start_switches_between_bundled_compatible_maps(self):
         game_dir = ROOT / "modules" / "Tank-16"
-        first_map = game_dir / "maps" / "FINLAND.json"
-        second_map = game_dir / "maps" / "100.json"
+        first_map = game_dir / "disks" / "maps" / "FINLAND.json"
+        second_map = game_dir / "disks" / "maps" / "100.json"
         self.assertIn(second_map, discover_round_maps(first_map))
         header = build_runtime_assets_header()
         self.assertIn("#define POWERUP_HEALTH_TILE", header)
@@ -896,6 +910,12 @@ class Tank16Tests(unittest.TestCase):
             "  runtime_palette_count = 225;\n"
             "  results[8] = load_map_path(\"maps/B.json\");\n"
             "  results[9] = map_columns;\n"
+            "  results[10] = load_map_path(\"maps/A.json\");\n"
+            "  results[11] = runtime_map_lazy * 100 + runtime_map_rows_loaded;\n"
+            "  results[12] = map_tile_at(2, 3);\n"
+            "  results[13] = map_obstacle_at(1, 2) - OBJECT_TILE_BASE;\n"
+            "  results[14] = map_obstacle_at(0, 0);\n"
+            "  results[15] = runtime_map_rows_loaded;\n"
             "  for (i = 0; i < 2; i++) {\n"
             "    effect_random = i;\n"
             "    round_map_selection_started = 0;\n"
@@ -920,6 +940,7 @@ class Tank16Tests(unittest.TestCase):
             module_disks = Path(directory) / "module" / "disks"
             maps_dir = module_disks / "maps"
             maps_dir.mkdir(parents=True)
+            editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
             for name, width, height, tile_x in (
                     ("A.json", 4, 3, 1), ("B.json", 5, 4, 2)):
                 map_document = {
@@ -936,8 +957,22 @@ class Tank16Tests(unittest.TestCase):
                     map_document["tiles"] = [tile_x] * (width * height)
                     map_document["obstacles"] = []
                     map_document["objects"] = []
-                (maps_dir / name).write_text(
-                    json.dumps(map_document), encoding="utf-8")
+                    (maps_dir / name).write_text(
+                        json.dumps(map_document), encoding="utf-8")
+                    continue
+                map_document["name"] = "A"
+                map_document["format_version"] = 1
+                map_document["tile_size"] = 64
+                map_document["tiles"][2][3] = [5, 0]
+                map_document["obstacles"] = [
+                    [None] * width for _ in range(height)]
+                map_document["obstacles"][1][2] = [4, 1]
+                map_document["objects"] = [
+                    [None] * width for _ in range(height)]
+                (maps_dir / name).write_bytes(
+                    editor["serialize_runtime_map"](
+                        editor["encode_runtime_map"](map_document)
+                    ).encode("ascii"))
             image = compile_source(
                 "int results[16];\n" + game_source + test_source,
                 str(source_path),
@@ -975,7 +1010,13 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn(
             "MAP COORDINATES: x=0..3 y=0..2 cells=12", runtime_log)
         self.assertIn(
-            "MAP TERRAIN TILE: id=1 source=(1,0) cells=12", runtime_log)
+            "MAP TERRAIN TILE: id=1 source=(1,0) cells=11", runtime_log)
+        self.assertIn("MAP INDEX: rows=3 stride=20", runtime_log)
+        self.assertIn("MAP ROWS: y=0..2 loaded (60 bytes, 3/3 rows)",
+                      runtime_log)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(10, 16)],
+            [1, 100, 5, 1 * 6 + 4, 0, 3], runtime_log)
         self.assertIn("MAP FILE: maps/B.json", runtime_log)
         self.assertIn(
             "MAP TERRAIN TILE: id=2 source=(2,0) cells=20", runtime_log)
@@ -1179,7 +1220,7 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn((0, 120, 5, 2, 12), cpu.sound_log)
 
     def test_json_map_is_data_not_an_executable_program(self):
-        map_path = ROOT / "modules" / "Tank-16" / "maps" / "PERUS-1.json"
+        map_path = ROOT / "modules" / "Tank-16" / "disks" / "maps" / "PERUS-1.json"
         map_data, tiles, palette, dimensions = load_map_assets(map_path)
         self.assertEqual((map_data["width"], map_data["height"]), (10, 8))
         self.assertEqual(dimensions[2], map_tile_pixel_size())

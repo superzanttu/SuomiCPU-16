@@ -8,6 +8,7 @@ from generate_finland_map import (
     ROAD_TILE_BY_CONNECTIONS,
     bridge_tile_id,
 )
+from map_editor import write_runtime_map
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -303,50 +304,27 @@ def generate_map(name: str, seed: int, kind: str) -> dict:
 
 
 def _write_map(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as output:
-        output.write("{\n")
-        for key, value in data.items():
-            if key in ("tiles", "obstacles", "objects"):
-                continue
-            output.write("  " + json.dumps(key) + ": " +
-                         json.dumps(value, separators=(",", ":")) + ",\n")
-        for key in ("obstacles", "objects", "tiles"):
-            output.write("  " + json.dumps(key) + ": [\n")
-            for row_index, row in enumerate(data[key]):
-                suffix = "," if row_index + 1 < len(data[key]) else ""
-                output.write("    " + json.dumps(
-                    row, separators=(",", ":")) + suffix + "\n")
-            output.write("  ],\n" if key != "tiles" else "  ]\n")
-        output.write("}\n")
+    write_runtime_map(data, path)
 
 
-def generate_maps(
-    maps_dir: Path = GAME_DIR / "maps",
-    runtime_maps_dir: Path = GAME_DIR / "disks" / "maps",
-) -> list[Path]:
+def generate_maps(maps_dir: Path = GAME_DIR / "disks" / "maps") -> list[Path]:
     generated = []
     for name, seed, kind in MAPS:
         data = generate_map(name, seed, kind)
-        editor_path = maps_dir / f"{name}.json"
-        runtime_path = runtime_maps_dir / f"{name}.json"
-        _write_map(editor_path, data)
-        _write_map(runtime_path, data)
-        generated.append(editor_path)
+        path = maps_dir / f"{name}.json"
+        _write_map(path, data)
+        generated.append(path)
     return generated
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--maps-dir", type=Path, default=GAME_DIR / "maps")
     parser.add_argument(
-        "--runtime-maps-dir", type=Path,
-        default=GAME_DIR / "disks" / "maps")
+        "--maps-dir", type=Path, default=GAME_DIR / "disks" / "maps")
     arguments = parser.parse_args()
-    generated = generate_maps(arguments.maps_dir, arguments.runtime_maps_dir)
+    generated = generate_maps(arguments.maps_dir)
     print(json.dumps({
         "maps": [str(path) for path in generated],
-        "runtime_maps_dir": str(arguments.runtime_maps_dir),
         "count": len(generated),
     }))
 

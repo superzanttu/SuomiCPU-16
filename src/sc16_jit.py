@@ -3,8 +3,8 @@
 `run_block` executes instructions exactly like `SuomiCompute16.step()`, but compiled to
 machine code. It handles the instruction set (classic opcodes, extended ALU, MUL/DIV,
 far branches and jumps) and stops ("bails out") *before* executing an instruction that
-needs the Python emulator: a store to the graphics command register, HALT, floating-point
-instructions and 32-bit register-pair instructions. The caller then runs that one
+needs the Python emulator: a store to a device command register, HALT and floating-point
+instructions. The caller then runs that one
 instruction with `step()` and resumes. After an instruction that leaves an interrupt
 pending the loop returns so Python can dispatch it.
 
@@ -181,8 +181,24 @@ def run_block(mem, regs, st, budget):
         elif op == 31 and (instr & 0xF8FF) == 0xF81E:
             control = _rd16(mem, npc)
             npc += 2
-            if (control >> 12) in (8, 9, 10, 11):
-                bail = True
+            if (control >> 12) in (8, 9):
+                address = regs[control & 7]
+                if _hits_mmio(address, 4):
+                    bail = True
+                elif (control >> 12) == 8:
+                    low = _rd16(mem, address)
+                    high = _rd16(mem, address + 2) & 0x3FFF
+                    regs[rd] = (high << 16) | low
+                else:
+                    value = regs[rd] & MEM_MASK
+                    _wr16(mem, address, value)
+                    _wr16(mem, address + 2, value >> 16)
+            elif (control >> 12) == 10:
+                value = regs[rd] & MEM_MASK
+                regs[rd] = value >> 16
+                regs[control & 7] = value & 0xFFFF
+            elif (control >> 12) == 11:
+                regs[rd] = ((regs[rd] & 0x3FFF) << 16) | (regs[control & 7] & 0xFFFF)
             elif (control >> 12) == 7:
                 high = _rd16(mem, npc) & 0x3FFF
                 regs[rd] = ((high << 16) | _rd16(mem, npc + 2)) & MEM_MASK
@@ -227,7 +243,120 @@ def run_block(mem, regs, st, budget):
                 z = 1 if result == 0 else 0
                 c = carry
         elif op == 31 and (instr & 0xF81F) == 0xF81A:
-            bail = True
+            control = _rd16(mem, npc)
+            npc += 2
+            oper = control >> 12
+            src = control & 7
+            if (rd & 1) or rd > 6 or (
+                    not (6 <= oper <= 9) and ((src & 1) or src > 6)):
+                bail = True
+            else:
+                left = ((regs[rd] & 0xFFFF) << 16) | (regs[rd + 1] & 0xFFFF)
+                write = True
+                result = 0
+                if oper == 9:
+                    result = (-left) & 0xFFFFFFFF
+                    c = 1 if left != 0 else 0
+                    v = 1 if left == 0x80000000 else 0
+                    z = 1 if result == 0 else 0
+                    n = result >> 31
+                elif oper == 10:
+                    regs[rd] = regs[src] & 0xFFFF
+                    regs[rd + 1] = regs[src + 1] & 0xFFFF
+                    write = False
+                elif oper == 11 or oper == 12:
+                    address = (((regs[src] & 0xFFFF) << 16)
+                               | (regs[src + 1] & 0xFFFF)) & MEM_MASK
+                    if _hits_mmio(address, 4):
+                        bail = True
+                    elif oper == 11:
+                        regs[rd] = _rd16(mem, address)
+                        regs[rd + 1] = _rd16(mem, address + 2)
+                    else:
+                        _wr16(mem, address, regs[rd])
+                        _wr16(mem, address + 2, regs[rd + 1])
+                    write = False
+                elif oper >= 13:
+                    right = ((regs[src] & 0xFFFF) << 16) | (regs[src + 1] & 0xFFFF)
+                    if oper == 13:
+                        result = (left * right) & 0xFFFFFFFF
+                        c = 1 if left != 0 and right > 0xFFFFFFFF // left else 0
+                        sl = left - 0x100000000 if left & 0x80000000 else left
+                        sr = right - 0x100000000 if right & 0x80000000 else right
+                        sp_ = sl * sr
+                        v = 0 if -0x80000000 <= sp_ <= 0x7FFFFFFF else 1
+                    else:
+                        signed = (control & 0x0800) != 0
+                        if right == 0:
+                            result = left if oper == 15 else 0
+                            c = 1
+                        elif signed:
+                            sl = left - 0x100000000 if left & 0x80000000 else left
+                            sr = right - 0x100000000 if right & 0x80000000 else right
+                            q = abs(sl) // abs(sr)
+                            if (sl < 0) != (sr < 0):
+                                q = -q
+                            if oper == 14:
+                                result = q & 0xFFFFFFFF
+                            else:
+                                result = (sl - q * sr) & 0xFFFFFFFF
+                            c = 0
+                        else:
+                            result = left // right if oper == 14 else left % right
+                            c = 0
+                        v = 0
+                    z = 1 if result == 0 else 0
+                    n = result >> 31
+                elif oper >= 6:
+                    if control & 0x0800:
+                        cnt = control & 0x1F
+                    else:
+                        cnt = regs[src] & 0x1F
+                    if oper == 6:
+                        if cnt:
+                            c = (left >> (32 - cnt)) & 1
+                        result = (left << cnt) & 0xFFFFFFFF
+                    elif oper == 7:
+                        if cnt:
+                            c = (left >> (cnt - 1)) & 1
+                        result = left >> cnt
+                    else:
+                        sv = left - 0x100000000 if left & 0x80000000 else left
+                        if cnt:
+                            c = (sv >> (cnt - 1)) & 1
+                        result = (sv >> cnt) & 0xFFFFFFFF
+                    z = 1 if result == 0 else 0
+                    n = result >> 31
+                    v = 0
+                else:
+                    right = ((regs[src] & 0xFFFF) << 16) | (regs[src + 1] & 0xFFFF)
+                    if oper <= 2:
+                        if oper == 0:
+                            total = left + right
+                            result = total & 0xFFFFFFFF
+                            c = 1 if total > 0xFFFFFFFF else 0
+                            v = 1 if (~(left ^ right) & (left ^ result) & 0x80000000) else 0
+                        else:
+                            total = left - right
+                            result = total & 0xFFFFFFFF
+                            c = 1 if total < 0 else 0
+                            v = 1 if ((left ^ right) & (left ^ result) & 0x80000000) else 0
+                        if oper == 2:
+                            write = False
+                    else:
+                        if oper == 3:
+                            result = left & right
+                        elif oper == 4:
+                            result = left | right
+                        else:
+                            result = left ^ right
+                        c = 0
+                        v = 0
+                    z = 1 if result == 0 else 0
+                    n = result >> 31
+                if write and not bail:
+                    regs[rd] = (result >> 16) & 0xFFFF
+                    regs[rd + 1] = result & 0xFFFF
         elif op == 31 and (instr & 0xF8FF) == 0xF81F:
             control = _rd16(mem, npc)
             npc += 2

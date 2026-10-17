@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Tank-16 runtime maps use fixed byte offsets; never convert line endings
+modules/Tank-16/disks/maps/*.json -text

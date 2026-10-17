@@ -515,7 +515,7 @@ def discover_round_maps(map_path: Path) -> list[Path]:
     selected_map = editor["load_map"](Path(map_path))
     selected_object_tiles = set(object_tile_coordinates(selected_map))
     compatible_maps = []
-    for candidate in sorted((GAME_DIR / "maps").glob("*.json")):
+    for candidate in sorted((GAME_DIR / "disks" / "maps").glob("*.json")):
         if candidate.resolve() == Path(map_path).resolve():
             continue
         with candidate.open(encoding="utf-8") as map_file:

@@ -22,8 +22,19 @@
 
 #ifdef RUNTIME_MAP_LOADING
 #define RUNTIME_MAP_MAX_CELLS 10000UL
+#define RUNTIME_MAP_MAX_ROWS 1024
+#define RUNTIME_MAP_CHUNK 4096UL
 unsigned char runtime_map_data[RUNTIME_MAP_MAX_CELLS];
 unsigned char runtime_map_obstacles[RUNTIME_MAP_MAX_CELLS];
+unsigned char runtime_row_loaded[RUNTIME_MAP_MAX_ROWS];
+int runtime_map_lazy;
+unsigned long runtime_grid_offset;
+unsigned long runtime_row_stride;
+int runtime_band_rows;
+int runtime_map_rows_loaded;
+int runtime_tilemap_dirty;
+char runtime_map_path[129];
+int load_map_band(int row);
 unsigned char runtime_empty_tilemap[1];
 int runtime_terrain_usage[256];
 int runtime_obstacle_usage[256];
@@ -818,6 +829,56 @@ int map_dimensions(char *json, int *width, int *height)
            (unsigned long)*width * (unsigned long)*height <= 16777216UL;
 }
 
+int parse_object_list(char *cursor, unsigned long cells, int width)
+{
+    int cell;
+    int tile;
+    int hp;
+    int removal;
+
+    json_skip_whitespace(&cursor);
+    if (*cursor++ != '[')
+        return 0;
+    json_skip_whitespace(&cursor);
+    while (*cursor != ']')
+    {
+        if (*cursor++ != '[' ||
+            !json_integer(&cursor, &cell) || cell < 0 ||
+            (unsigned long)cell >= cells)
+            return 0;
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ',' ||
+            !json_integer(&cursor, &tile) ||
+            tile < 0 || tile >= OBJECT_COLUMNS * OBJECT_ROWS)
+            return 0;
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ',' || !json_integer(&cursor, &hp))
+            return 0;
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ',' || !json_integer(&cursor, &removal) ||
+            removal < OBJECT_FIXED || removal > OBJECT_DISAPPEAR)
+            return 0;
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ']' || map_object_count >= MAP_OBJECT_CAPACITY)
+            return 0;
+        map_object_x[map_object_count] = cell % width;
+        map_object_y[map_object_count] = cell / width;
+        map_object_tile[map_object_count] = OBJECT_TILE_BASE + tile;
+        map_object_hp[map_object_count] = hp;
+        map_object_removal[map_object_count] = removal;
+        map_object_count++;
+        json_skip_whitespace(&cursor);
+        if (*cursor == ',')
+        {
+            cursor++;
+            json_skip_whitespace(&cursor);
+        }
+        else if (*cursor != ']')
+            return 0;
+    }
+    return 1;
+}
+
 int load_finite_map_flat(char *json, int width, int height)
 {
     char *cursor;
@@ -894,55 +955,272 @@ int load_finite_map_flat(char *json, int width, int height)
         }
     }
     value = json_value(json, "objects");
-    if (value != 0)
-    {
-        cursor = value;
-        json_skip_space(&cursor);
-        if (*cursor++ != '[')
-            return 0;
-        json_skip_whitespace(&cursor);
-        while (*cursor != ']')
-        {
-            if (*cursor++ != '[' ||
-                !json_integer(&cursor, &cell) || cell < 0 ||
-                (unsigned long)cell >= cells)
-                return 0;
-            json_skip_whitespace(&cursor);
-            if (*cursor++ != ',' ||
-                !json_integer(&cursor, &tile) ||
-                tile < 0 || tile >= OBJECT_COLUMNS * OBJECT_ROWS)
-                return 0;
-            json_skip_whitespace(&cursor);
-            if (*cursor++ != ',' || !json_integer(&cursor, &hp))
-                return 0;
-            json_skip_whitespace(&cursor);
-            if (*cursor++ != ',' || !json_integer(&cursor, &removal) ||
-                removal < OBJECT_FIXED || removal > OBJECT_DISAPPEAR)
-                return 0;
-            json_skip_whitespace(&cursor);
-            if (*cursor++ != ']' || map_object_count >= MAP_OBJECT_CAPACITY)
-                return 0;
-            map_object_x[map_object_count] = cell % width;
-            map_object_y[map_object_count] = cell / width;
-            map_object_tile[map_object_count] =
-                OBJECT_TILE_BASE + tile;
-            map_object_hp[map_object_count] = hp;
-            map_object_removal[map_object_count] = removal;
-            map_object_count++;
-            json_skip_whitespace(&cursor);
-            if (*cursor == ',')
-            {
-                cursor++;
-                json_skip_whitespace(&cursor);
-            }
-            else if (*cursor != ']')
-                return 0;
-        }
-    }
+    if (value != 0 && !parse_object_list(value, cells, width))
+        return 0;
     map_columns = width;
     map_rows = height;
     map_infinite = 0;
     return 1;
+}
+
+int parse_usage_list(char *cursor, int *usage, int base, int limit)
+{
+    int tile;
+    int count;
+
+    if (cursor == 0)
+        return 0;
+    json_skip_whitespace(&cursor);
+    if (*cursor++ != '[')
+        return 0;
+    json_skip_whitespace(&cursor);
+    while (*cursor != ']')
+    {
+        if (*cursor++ != '[' || !json_integer(&cursor, &tile) ||
+            tile < 0 || tile >= limit)
+            return 0;
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ',' || !json_integer(&cursor, &count) || count < 0)
+            return 0;
+        json_skip_whitespace(&cursor);
+        if (*cursor++ != ']')
+            return 0;
+        usage[base + tile] = count;
+        json_skip_whitespace(&cursor);
+        if (*cursor == ',')
+        {
+            cursor++;
+            json_skip_whitespace(&cursor);
+        }
+        else if (*cursor != ']')
+            return 0;
+    }
+    return 1;
+}
+
+int read_file_range(char *path, unsigned long offset, unsigned long size,
+                    char **out)
+{
+    unsigned long copied;
+    unsigned long file_size;
+    int request;
+    int length;
+
+    *out = (char *)malloc(size + 1);
+    if (*out == 0)
+    {
+        printf("MAP READ ERROR: %s allocation failed (%lu bytes)\n",
+               path, size + 1);
+        return 0;
+    }
+    copied = 0;
+    while (copied < size)
+    {
+        request = size - copied > 4096UL ? 4096 : (int)(size - copied);
+        length = disk_read_file(
+            path, offset + copied,
+            (volatile unsigned char *)(*out + copied), request, &file_size);
+        if (length <= 0)
+        {
+            printf("MAP READ ERROR: %s offset=%lu chunk=%d\n",
+                   path, offset + copied, length);
+            free(*out);
+            *out = 0;
+            return 0;
+        }
+        copied += (unsigned long)length;
+    }
+    (*out)[size] = 0;
+    return 1;
+}
+
+int load_finite_map_grid(char *path, char *header, int width, int height)
+{
+    char *value;
+    char *objects;
+    unsigned long cells;
+    unsigned long objects_offset;
+    unsigned long objects_size;
+    int i;
+    int result;
+
+    cells = (unsigned long)width * (unsigned long)height;
+    if (cells > RUNTIME_MAP_MAX_CELLS || height > RUNTIME_MAP_MAX_ROWS)
+        return 0;
+    value = json_value(header, "grid_offset");
+    if (value == 0 || !json_unsigned_long(&value, &runtime_grid_offset))
+        return 0;
+    runtime_row_stride = (unsigned long)width * 4UL + 4UL;
+    runtime_band_rows = (int)(RUNTIME_MAP_CHUNK / runtime_row_stride);
+    if (runtime_band_rows < 1)
+        runtime_band_rows = 1;
+    map_data = runtime_map_data;
+    map_obstacles = runtime_map_obstacles;
+    memset(map_data, 0, cells);
+    memset(map_obstacles, 0, cells);
+    for (i = 0; i < height; i++)
+        runtime_row_loaded[i] = 0;
+    for (i = 0; i < 256; i++)
+    {
+        runtime_terrain_usage[i] = 0;
+        runtime_obstacle_usage[i] = 0;
+    }
+    if (!parse_usage_list(json_value(header, "used_tiles"),
+                          runtime_terrain_usage, 0, TERRAIN_TILE_COUNT) ||
+        !parse_usage_list(json_value(header, "used_obstacles"),
+                          runtime_obstacle_usage, OBJECT_TILE_BASE,
+                          OBJECT_COLUMNS * OBJECT_ROWS))
+        return 0;
+    value = json_value(header, "objects_offset");
+    if (value == 0 || !json_unsigned_long(&value, &objects_offset))
+        return 0;
+    value = json_value(header, "objects_size");
+    if (value == 0 || !json_unsigned_long(&value, &objects_size) ||
+        objects_size < 2 || objects_size > 65000UL)
+        return 0;
+    if (!read_file_range(path, objects_offset, objects_size, &objects))
+        return 0;
+    result = parse_object_list(objects, cells, width);
+    free(objects);
+    if (!result)
+    {
+        printf("MAP FORMAT ERROR: %s objects not at offset %lu "
+               "(were line endings converted?)\n", path, objects_offset);
+        return 0;
+    }
+    for (i = 0; i < 128 && path[i] != 0; i++)
+        runtime_map_path[i] = path[i];
+    runtime_map_path[i] = 0;
+    map_columns = width;
+    map_rows = height;
+    map_infinite = 0;
+    runtime_map_lazy = 1;
+    runtime_map_rows_loaded = 0;
+    printf("MAP INDEX: rows=%d stride=%lu grid-offset=%lu band=%d rows "
+           "objects=%d\n", height, runtime_row_stride, runtime_grid_offset,
+           runtime_band_rows, map_object_count);
+    return 1;
+}
+
+int load_map_band(int row)
+{
+    int first;
+    int last;
+    int current_row;
+    int column_char;
+    int row_chars;
+    int length;
+    int request;
+    int i;
+    int digit;
+    int value;
+    unsigned long offset;
+    unsigned long end;
+    unsigned long cell;
+    unsigned long file_size;
+
+    first = row - row % runtime_band_rows;
+    last = first + runtime_band_rows;
+    if (last > map_rows)
+        last = map_rows;
+    offset = runtime_grid_offset + (unsigned long)first * runtime_row_stride;
+    end = runtime_grid_offset + (unsigned long)last * runtime_row_stride;
+    current_row = first;
+    column_char = 0;
+    value = 0;
+    row_chars = map_columns * 4;
+    cell = (unsigned long)first * (unsigned long)map_columns;
+    for (i = first; i < last; i++)
+        runtime_row_loaded[i] = 1;
+    while (offset < end)
+    {
+        request = end - offset > 4096UL ? 4096 : (int)(end - offset);
+        length = disk_read_file(runtime_map_path, offset, map_json_chunk,
+                                request, &file_size);
+        if (length <= 0)
+        {
+            printf("MAP ROW ERROR: %s y=%d..%d offset=%lu\n",
+                   runtime_map_path, first, last - 1, offset);
+            map_load_error = 1;
+            return 0;
+        }
+        for (i = 0; i < length; i++)
+        {
+            if (column_char == 0)
+            {
+                if (map_json_chunk[i] != '"')
+                {
+                    printf("MAP ROW ERROR: %s y=%d is not at %lu\n",
+                           runtime_map_path, current_row, offset + i);
+                    map_load_error = 1;
+                    return 0;
+                }
+            }
+            else if (column_char <= row_chars)
+            {
+                digit = json_hex_digit(map_json_chunk[i]);
+                if (digit < 0)
+                {
+                    map_load_error = 1;
+                    return 0;
+                }
+                value = value * 16 + digit;
+                if ((column_char & 3) == 2)
+                {
+                    if (value >= TERRAIN_TILE_COUNT)
+                        value = 0;
+                    map_data[cell] = (unsigned char)value;
+                    value = 0;
+                }
+                else if ((column_char & 3) == 0)
+                {
+                    if (value > 0 && value <= OBJECT_COLUMNS * OBJECT_ROWS)
+                        map_obstacles[cell] =
+                            (unsigned char)(OBJECT_TILE_BASE + value - 1);
+                    value = 0;
+                    cell++;
+                }
+            }
+            column_char++;
+            if ((unsigned long)column_char == runtime_row_stride)
+            {
+                column_char = 0;
+                current_row++;
+            }
+        }
+        offset += (unsigned long)length;
+    }
+    runtime_map_rows_loaded += last - first;
+    runtime_tilemap_dirty = 1;
+    printf("MAP ROWS: y=%d..%d loaded (%lu bytes, %d/%d rows)\n",
+           first, last - 1, end - (runtime_grid_offset +
+           (unsigned long)first * runtime_row_stride),
+           runtime_map_rows_loaded, map_rows);
+    return 1;
+}
+
+void ensure_map_rows(int first_row, int last_row)
+{
+    int row;
+
+    if (!runtime_map_lazy)
+        return;
+    if (first_row < 0)
+        first_row = 0;
+    if (last_row >= map_rows)
+        last_row = map_rows - 1;
+    for (row = first_row; row <= last_row; row++)
+        if (!runtime_row_loaded[row])
+            load_map_band(row);
+}
+
+void sync_runtime_tilemap(void)
+{
+    if (runtime_tilemap_dirty && !map_infinite && map_data != 0)
+    {
+        gfx_tilemap(map_data, map_columns, map_rows, 0, 0);
+        runtime_tilemap_dirty = 0;
+    }
 }
 
 int load_finite_map(char *json, int width, int height)
@@ -1216,13 +1494,10 @@ int load_runtime_map_tiles(void)
     }
     else
     {
-        for (index = 0; index < (unsigned long)map_columns *
-                                (unsigned long)map_rows; index++)
-        {
-            runtime_tile_needed[map_data[index]] = 1;
-            if (map_obstacles[index] != 0)
-                runtime_tile_needed[map_obstacles[index]] = 1;
-        }
+        for (tile = 0; tile < 256; tile++)
+            if (runtime_terrain_usage[tile] > 0 ||
+                runtime_obstacle_usage[tile] > 0)
+                runtime_tile_needed[tile] = 1;
         for (object = 0; object < map_object_count; object++)
             runtime_tile_needed[map_object_tile[object]] = 1;
     }
@@ -1258,23 +1533,8 @@ int load_runtime_map_tiles(void)
         draw_runtime_loading_screen("MAP READY", 1, 1);
         return 1;
     }
-    for (index = 0; index < (unsigned long)map_columns *
-                            (unsigned long)map_rows; index++)
-    {
-        if (!ensure_runtime_tile_loaded(map_data[index]))
-        {
-            runtime_loading_active = 0;
-            return 0;
-        }
-        if (map_obstacles[index] != 0 &&
-            !ensure_runtime_tile_loaded(map_obstacles[index]))
-        {
-            runtime_loading_active = 0;
-            return 0;
-        }
-    }
-    for (object = 0; object < map_object_count; object++)
-        if (!ensure_runtime_tile_loaded(map_object_tile[object]))
+    for (i = 0; i < runtime_tile_count; i++)
+        if (runtime_tile_needed[i] && !ensure_runtime_tile_loaded(i))
         {
             runtime_loading_active = 0;
             return 0;
@@ -1283,59 +1543,132 @@ int load_runtime_map_tiles(void)
     return 1;
 }
 
+void compute_map_usage(void)
+{
+    unsigned long index;
+    unsigned long cells;
+    int i;
+
+    for (i = 0; i < 256; i++)
+    {
+        runtime_terrain_usage[i] = 0;
+        runtime_obstacle_usage[i] = 0;
+    }
+    cells = (unsigned long)map_columns * (unsigned long)map_rows;
+    for (index = 0; index < cells; index++)
+    {
+        runtime_terrain_usage[map_data[index]]++;
+        if (map_obstacles[index] != 0)
+            runtime_obstacle_usage[map_obstacles[index]]++;
+    }
+}
+
 void configure_runtime_tilemap(void)
 {
     gfx_layer_select(LAYER_TILES);
+    runtime_tilemap_dirty = 0;
     if (map_infinite)
         gfx_tilemap(runtime_empty_tilemap, 1, 1, 0, 0);
     else
         gfx_tilemap(map_data, map_columns, map_rows, 0, 0);
 }
 
+int load_map_header(char *path, char **header, unsigned long *file_size)
+{
+    char *value;
+    unsigned long grid_offset;
+    int length;
+
+    length = disk_read_file(path, 0, map_json_chunk, 4096, file_size);
+    if (length <= 0 || *file_size == 0)
+    {
+        printf("MAP READ ERROR: %s header=%d\n", path, length);
+        return 0;
+    }
+    *header = (char *)malloc(length + 1);
+    if (*header == 0)
+        return 0;
+    memcpy(*header, (char *)map_json_chunk, length);
+    (*header)[length] = 0;
+    value = json_value(*header, "runtime_encoding");
+    if (!json_string_is(value, "grid-hex-v2"))
+    {
+        free(*header);
+        *header = 0;
+        return 1;
+    }
+    value = json_value(*header, "grid_offset");
+    if (value == 0 || !json_unsigned_long(&value, &grid_offset) ||
+        grid_offset > (unsigned long)length)
+    {
+        free(*header);
+        *header = 0;
+        return 0;
+    }
+    (*header)[grid_offset] = 0;
+    printf("MAP HEADER: %s %lu of %lu bytes read\n",
+           path, grid_offset, *file_size);
+    return 1;
+}
+
+int check_map_tilesets(char *json)
+{
+    char *value;
+
+    value = json_value(json, "tileset");
+    if (!json_string_is(value, "tiles_terrain.png"))
+        return 0;
+    value = json_value(json, "objects_tileset");
+    return value == 0 || json_string_is(value, "tiles_objects.png");
+}
+
 int load_map_path(char *path)
 {
     char *json;
+    char *header;
     char *value;
     unsigned long file_size;
     int width;
     int height;
     int result;
 
-    if (!load_json_bytes(path, &json, &file_size))
-        return 0;
     map_object_count = 0;
-    value = json_value(json, "infinite");
-    if (value != 0 && strncmp(value, "true", 4) == 0)
+    runtime_map_lazy = 0;
+    runtime_tilemap_dirty = 0;
+    if (!load_map_header(path, &header, &file_size))
+        return 0;
+    json = 0;
+    if (header != 0)
     {
-        result = load_infinite_map(json);
-    }
-    else if (map_dimensions(json, &width, &height))
-    {
-        value = json_value(json, "tileset");
-        if (!json_string_is(value, "tiles_terrain.png"))
-        {
-            result = 0;
-        }
-        else
-        {
-            value = json_value(json, "objects_tileset");
-            result = value == 0 ||
-                     json_string_is(value, "tiles_objects.png");
-            if (result)
-                result = load_finite_map(json, width, height);
-        }
+        result = map_dimensions(header, &width, &height) &&
+                 check_map_tilesets(header) &&
+                 load_finite_map_grid(path, header, width, height);
+        free(header);
     }
     else
     {
-        result = 0;
+        if (!load_json_bytes(path, &json, &file_size))
+            return 0;
+        value = json_value(json, "infinite");
+        if (value != 0 && strncmp(value, "true", 4) == 0)
+            result = load_infinite_map(json);
+        else
+            result = map_dimensions(json, &width, &height) &&
+                     check_map_tilesets(json) &&
+                     load_finite_map(json, width, height);
+        if (result && !map_infinite)
+            compute_map_usage();
+        free(json);
     }
     if (result)
         result = load_runtime_map_tiles();
     if (result)
         configure_runtime_tilemap();
     if (!result)
+    {
+        runtime_map_lazy = 0;
         printf("MAP LOAD ERROR: invalid or unavailable map %s\n", path);
-    free(json);
+    }
     return result;
 }
 
@@ -1363,17 +1696,6 @@ void log_loaded_map(char *path)
         return;
     }
 
-    for (i = 0; i < 256; i++)
-    {
-        runtime_terrain_usage[i] = 0;
-        runtime_obstacle_usage[i] = 0;
-    }
-    for (i = 0; i < map_rows * map_columns; i++)
-    {
-        runtime_terrain_usage[map_data[i]]++;
-        if (map_obstacles[i] != 0)
-            runtime_obstacle_usage[map_obstacles[i]]++;
-    }
     printf("MAP COORDINATES: x=0..%d y=0..%d cells=%d\n",
            map_columns - 1, map_rows - 1, map_columns * map_rows);
     for (tile = 0; tile < TERRAIN_TILE_COUNT; tile++)
@@ -1410,6 +1732,8 @@ int map_tile_at(int row, int column)
     {
         if (row < 0 || row >= map_rows || column < 0 || column >= map_columns)
             return 0;
+        if (runtime_map_lazy && !runtime_row_loaded[row])
+            load_map_band(row);
         return map_data[(unsigned long)row * (unsigned long)map_columns +
                         (unsigned long)column];
     }
@@ -1447,6 +1771,8 @@ int map_obstacle_at(int row, int column)
     if (row < 0 || row >= map_rows ||
         column < 0 || column >= map_columns)
         return 0;
+    if (runtime_map_lazy && !runtime_row_loaded[row])
+        load_map_band(row);
     return map_obstacles[(unsigned long)row * (unsigned long)map_columns +
                          (unsigned long)column];
 #else
@@ -1718,6 +2044,7 @@ void use_default_infinite_map(void)
 {
     map_data = 0;
     map_obstacles = 0;
+    runtime_map_lazy = 0;
     map_infinite = 1;
     map_columns = 0;
     map_rows = 0;
@@ -1741,6 +2068,7 @@ void select_runtime_round_map(void)
 
     map_data = 0;
     map_obstacles = 0;
+    runtime_map_lazy = 0;
     map_object_count = 0;
     map_load_error = 0;
     runtime_loading_active = 1;
@@ -3661,6 +3989,16 @@ void draw_game(void)
     camera1_y = tank_camera_y(0);
     camera2_x = tank_camera_x(1);
     camera2_y = tank_camera_y(1);
+#ifdef RUNTIME_MAP_LOADING
+    if (runtime_map_lazy)
+    {
+        ensure_map_rows(map_coordinate(camera1_y),
+                        map_coordinate(camera1_y + 479));
+        ensure_map_rows(map_coordinate(camera2_y),
+                        map_coordinate(camera2_y + 479));
+        sync_runtime_tilemap();
+    }
+#endif
     gfx_split_camera_wide(camera1_x, camera1_y, camera2_x, camera2_y);
     draw_ground();
     gfx_layer_select(LAYER_SPRITES);

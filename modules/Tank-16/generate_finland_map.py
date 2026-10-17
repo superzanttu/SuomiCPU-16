@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pygame
 
-from map_editor import encode_runtime_map
+from map_editor import write_runtime_map
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -704,10 +704,7 @@ def generate_map(countries_path: Path, lakes_path: Path,
         "obstacles": obstacles, "objects": objects, "tiles": tiles,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
-    runtime_document = encode_runtime_map(document)
-    with output.open("w", encoding="utf-8", newline="\n") as handle:
-        json.dump(runtime_document, handle, separators=(",", ":"))
-        handle.write("\n")
+    write_runtime_map(document, output)
     if preview is not None:
         atlas = pygame.image.load(str(ATLAS_PATH))
         objects_atlas = pygame.image.load(
@@ -759,7 +756,7 @@ def main() -> None:
     parser.add_argument("--countries", type=Path, required=True)
     parser.add_argument("--lakes", type=Path, required=True)
     parser.add_argument("--roads", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=GAME_DIR / "maps" / "FINLAND.json")
+    parser.add_argument("--output", type=Path, default=GAME_DIR / "disks" / "maps" / "FINLAND.json")
     parser.add_argument("--runtime-output", type=Path)
     parser.add_argument("--size", type=int, default=100)
     parser.add_argument("--railways", type=Path)
@@ -774,9 +771,6 @@ def main() -> None:
                             arguments.roads, arguments.railways,
                             arguments.cities)
     runtime_output = arguments.runtime_output
-    default_output = GAME_DIR / "maps" / "FINLAND.json"
-    if runtime_output is None and arguments.output.resolve() == default_output.resolve():
-        runtime_output = GAME_DIR / "disks" / "maps" / "FINLAND.json"
     if runtime_output is not None:
         runtime_output.parent.mkdir(parents=True, exist_ok=True)
         runtime_output.write_bytes(arguments.output.read_bytes())

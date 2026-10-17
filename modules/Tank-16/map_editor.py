@@ -7,7 +7,7 @@ import pygame
 
 
 ROOT = Path(__file__).resolve().parent
-MAPS_DIR = ROOT / "maps"
+MAPS_DIR = ROOT / "disks" / "maps"
 TILESET_PATH = ROOT / "gfx" / "tiles_terrain.png"
 DEFAULT_TILESET_FILENAME = TILESET_PATH.name
 OBJECT_TILESET_PATH = ROOT / "gfx" / "tiles_objects.png"
@@ -34,6 +34,9 @@ BUTTON_GAP = 6
 MAP_DEFAULT_WIDTH = 10
 MAP_DEFAULT_HEIGHT = 8
 TILE_SIZE_OPTIONS = (64, 32)
+RUNTIME_MAP_ENCODING = "grid-hex-v2"
+RUNTIME_MAP_FORMAT_VERSION = 2
+RUNTIME_MAP_HEADER_LIMIT = 4096
 _overview_cache = {}
 
 
@@ -239,59 +242,143 @@ def validate_map(map_data: dict, tileset_columns: int,
 
 
 def encode_runtime_map(map_data: dict) -> dict:
+    """Return the coordinate-addressable grid-hex-v2 runtime document.
+
+    Each grid row is a hex string with four characters per cell: terrain
+    tile id followed by obstacle object-tile id + 1 (00 = no obstacle).
+    """
     if not isinstance(map_data, dict):
         raise ValueError("Map file must contain a JSON object")
     filename = validate_tileset_filename(
         map_data.get("tileset", DEFAULT_TILESET_FILENAME))
     _, columns, rows = load_tileset(ROOT / "gfx" / filename)
     normalized = validate_map(map_data, columns, rows)
-    object_columns = load_tileset(
-        OBJECT_TILESET_PATH, pad_edges=True)[1]
-    serialized = dict(normalized)
-    serialized["runtime_encoding"] = "flat-v1"
-    serialized["tiles"] = [
-        tile_y * columns + tile_x
-        for row in normalized["tiles"]
-        for tile_x, tile_y in row
-    ]
-    serialized["obstacles"] = []
-    serialized["objects"] = []
+    object_columns, object_rows = load_tileset(
+        OBJECT_TILESET_PATH, pad_edges=True)[1:]
+    if columns * rows > 256 or object_columns * object_rows > 255:
+        raise ValueError("Tilesets are too large for the runtime grid encoding")
+    width = normalized["width"]
+    height = normalized["height"]
+    terrain_usage: dict[int, int] = {}
+    obstacle_usage: dict[int, int] = {}
+    grid = []
+    objects = []
     removal_codes = {"fixed": 0, "explosion": 1, "disappear": 2}
-    for y in range(normalized["height"]):
-        for x in range(normalized["width"]):
-            index = y * normalized["width"] + x
+    for y in range(height):
+        row_hex = []
+        for x in range(width):
+            tile_x, tile_y = normalized["tiles"][y][x]
+            terrain = tile_y * columns + tile_x
+            terrain_usage[terrain] = terrain_usage.get(terrain, 0) + 1
             obstacle = normalized["obstacles"][y][x]
+            obstacle_code = 0
             if obstacle is not None:
-                tile_x, tile_y = obstacle
-                serialized["obstacles"].append(
-                    [index, tile_y * object_columns + tile_x])
+                obstacle_tile = obstacle[1] * object_columns + obstacle[0]
+                obstacle_usage[obstacle_tile] = (
+                    obstacle_usage.get(obstacle_tile, 0) + 1)
+                obstacle_code = obstacle_tile + 1
+            row_hex.append("%02x%02x" % (terrain, obstacle_code))
             object_cell = normalized["objects"][y][x]
             if object_cell is not None:
                 tile_x, tile_y = object_cell["tile"]
                 removal = object_cell["removal"]
                 if removal not in removal_codes:
                     raise ValueError("Unsupported object removal type")
-                serialized["objects"].append([
-                    index, tile_y * object_columns + tile_x,
+                objects.append([
+                    y * width + x, tile_y * object_columns + tile_x,
                     object_cell["hp_change"], removal_codes[removal],
                 ])
+        grid.append("".join(row_hex))
+    serialized = {
+        "format_version": RUNTIME_MAP_FORMAT_VERSION,
+        "runtime_encoding": RUNTIME_MAP_ENCODING,
+        "name": normalized["name"],
+        "width": width,
+        "height": height,
+        "tile_size": normalized["tile_size"],
+        "tileset": normalized["tileset"],
+        "objects_tileset": normalized.get(
+            "objects_tileset", OBJECT_TILESET_PATH.name),
+        "used_tiles": sorted([tile, count]
+                             for tile, count in terrain_usage.items()),
+        "used_obstacles": sorted([tile, count]
+                                 for tile, count in obstacle_usage.items()),
+        "object_count": len(objects),
+        "grid": grid,
+        "objects": objects,
+    }
+    if "geography" in normalized:
+        serialized["geography"] = normalized["geography"]
     return serialized
 
 
-def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
-    serialized = encode_runtime_map(map_data)
-    maps_dir.mkdir(parents=True, exist_ok=True)
-    path = maps_dir / (serialized["name"] + ".json")
+def serialize_runtime_map(document: dict) -> str:
+    """Lay out a grid-hex-v2 document so rows sit at fixed byte offsets."""
+    width = document["width"]
+    grid = document["grid"]
+    if len(grid) != document["height"] or any(
+            len(row) != 4 * width for row in grid):
+        raise ValueError("Runtime map grid does not match its dimensions")
+    row_stride = 4 * width + 4
+    head_keys = (
+        "format_version", "runtime_encoding", "name", "width", "height",
+        "tile_size", "tileset", "objects_tileset", "used_tiles",
+        "used_obstacles", "object_count",
+    )
+    head = ",".join(
+        json.dumps(key) + ":" + json.dumps(document[key], separators=(",", ":"))
+        for key in head_keys)
+    grid_text = "".join(
+        '"%s"%s\n' % (row, "," if index + 1 < len(grid) else " ")
+        for index, row in enumerate(grid))
+    objects_text = json.dumps(document["objects"], separators=(",", ":"))
+    tail = ""
+    if "geography" in document:
+        tail = ',\n"geography":' + json.dumps(
+            document["geography"], separators=(",", ":"))
+    offsets = {"grid_offset": 0, "objects_offset": 0, "objects_size": 0}
+    while True:
+        prefix = "{" + head + "".join(
+            ',"%s":%d' % item for item in offsets.items())
+        grid_open = ',\n"grid":[\n'
+        grid_offset = len((prefix + grid_open).encode("utf-8"))
+        objects_offset = (
+            grid_offset + len(grid_text) + len('],\n"objects":'))
+        updated = {
+            "grid_offset": grid_offset,
+            "objects_offset": objects_offset,
+            "objects_size": len(objects_text),
+        }
+        if updated == offsets:
+            break
+        offsets = updated
+    if grid_offset > RUNTIME_MAP_HEADER_LIMIT:
+        raise ValueError("Runtime map header exceeds %d bytes"
+                         % RUNTIME_MAP_HEADER_LIMIT)
+    text = (prefix + grid_open + grid_text + '],\n"objects":' +
+            objects_text + tail + "}\n")
+    encoded = text.encode("utf-8")
+    assert encoded[grid_offset:grid_offset + 1] == b'"'
+    assert encoded[objects_offset:objects_offset + 1] == b"["
+    return text
+
+
+def write_runtime_map(map_data: dict, path: Path) -> Path:
+    text = serialize_runtime_map(encode_runtime_map(map_data))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as handle:
-        json.dump(serialized, handle, separators=(",", ":"))
-        handle.write("\n")
-    if maps_dir.resolve() == (ROOT / "maps").resolve():
-        disk_maps_dir = ROOT / "disks" / "maps"
-        disk_maps_dir.mkdir(parents=True, exist_ok=True)
-        with (disk_maps_dir / path.name).open(
-                "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(serialized, handle, separators=(",", ":"))
-            handle.write("\n")
+        handle.write(text)
+    return path
+
+
+def save_map(map_data: dict, maps_dir: Path = MAPS_DIR) -> Path:
+    text = serialize_runtime_map(encode_runtime_map(map_data))
+    name = validate_map_name(map_data.get("name"))
+    maps_dir.mkdir(parents=True, exist_ok=True)
+    path = maps_dir / (name + ".json")
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
     return path
 
 
@@ -441,14 +528,46 @@ def load_map(path: Path, tileset_columns: int | None = None,
         raise ValueError("Tileset dimensions do not match the map tileset")
     encoding = document.get("runtime_encoding")
     if encoding is not None:
-        if encoding != "flat-v1":
-            raise ValueError("Unsupported runtime map encoding")
         _, object_columns, object_rows = load_tileset(
             OBJECT_TILESET_PATH, pad_edges=True)
+        if encoding == RUNTIME_MAP_ENCODING:
+            document = _grid_to_flat_document(document)
+        elif encoding != "flat-v1":
+            raise ValueError("Unsupported runtime map encoding")
         document = _expand_runtime_map(
             document, actual_columns, actual_rows,
             object_columns, object_rows)
     return validate_map(document, actual_columns, actual_rows)
+
+
+def _grid_to_flat_document(document: dict) -> dict:
+    width = document.get("width")
+    height = document.get("height")
+    grid = document.get("grid")
+    if (not isinstance(width, int) or not isinstance(height, int) or
+            not isinstance(grid, list) or len(grid) != height or
+            any(not isinstance(row, str) or len(row) != 4 * width
+                for row in grid)):
+        raise ValueError("Runtime map grid does not match its dimensions")
+    tiles = []
+    obstacles = []
+    try:
+        for y, row in enumerate(grid):
+            for x in range(width):
+                tiles.append(int(row[4 * x:4 * x + 2], 16))
+                obstacle = int(row[4 * x + 2:4 * x + 4], 16)
+                if obstacle:
+                    obstacles.append([y * width + x, obstacle - 1])
+    except ValueError as error:
+        raise ValueError("Runtime map grid contains invalid hex") from error
+    flat = {key: value for key, value in document.items()
+            if key not in ("grid", "used_tiles", "used_obstacles",
+                           "object_count", "grid_offset", "objects_offset",
+                           "objects_size")}
+    flat["format_version"] = 1
+    flat["tiles"] = tiles
+    flat["obstacles"] = obstacles
+    return flat
 
 
 def tile_surface(tileset: pygame.Surface, tile_x: int,

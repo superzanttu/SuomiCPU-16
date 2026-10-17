@@ -27,7 +27,7 @@ try:
 except ImportError:
     HAVE_JIT = False
 
-PREFIXES = (0xF81E, 0xF81F, 0xF80D, 0xF83E, 0xF81C)
+PREFIXES = (0xF81E, 0xF81F, 0xF80D, 0xF83E, 0xF81C, 0xF81A)
 
 
 def random_cpu(seed, use_jit):
@@ -250,6 +250,32 @@ class JitEquivalenceTests(unittest.TestCase):
                 fast._execute_jit(2500)
                 self.assertTrue(state(slow) == state(fast), f"seed {seed} diverged")
         self.assertGreater(compared, 200)
+
+    def test_wide_pair_and_muldiv_memory_ops_run_inside_jit(self):
+        program = assemble(
+            "LDI R0, 0x1234\nLDI R1, 0x5678\n"
+            "LDI R2, 0\nLDI R3, 0x100\nADD32 R0, R2\nSHL32 R0, 3\n"
+            "ST32 R0, R2\nLD32 R4, R2\nNEG32 R4\nHALT"
+        )
+        slow = make_cpu(program)
+        fast = make_cpu(program)
+        slow.use_jit = False
+        fast.use_jit = True
+        for cpu in (slow, fast):
+            cpu.gpu_log = []
+            cpu.flags = {"Z": 0, "C": 0, "N": 0, "V": 0}
+        steps = []
+        original_step = fast.step
+
+        def counting_step():
+            steps.append(fast.pc)
+            original_step()
+
+        fast.step = counting_step
+        reference_run(slow, 100)
+        fast._execute_jit(100)
+        self.assertEqual(state(slow), state(fast))
+        self.assertLessEqual(len(steps), 1, "wide ops left the JIT")
     def test_constants_match(self):
         self.assertEqual(
             sc16_jit.CONSTANTS,

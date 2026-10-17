@@ -193,6 +193,14 @@ def create_memory():
     return mmap.mmap(-1, MEM_SIZE)
 
 
+_NIBBLE_HIGH = bytes(value >> 4 for value in range(256))
+_INDEX_PALETTE = [(index, index, index) for index in range(256)]
+_NIBBLE_LOW = bytes(value & 0x0F for value in range(256))
+_CRUMB_TABLES = tuple(
+    bytes((value >> shift) & 3 for value in range(256)) for shift in (6, 4, 2, 0)
+)
+
+
 def _display_viewport(screen_size, virtual_size=(SCREEN_WIDTH, SCREEN_HEIGHT)):
     virtual_width, virtual_height = virtual_size
     scale = min(screen_size[0] / virtual_width, screen_size[1] / virtual_height)
@@ -347,9 +355,11 @@ class SuomiCompute16:
         pygame.display.set_caption("SuomiCPU-16 Emulator")
 
     def _graphics_mode(self):
-        memory = getattr(self, "memory", None)
-        mode = memory[GFX_MODE_ADDR] if memory is not None else 0
-        return mode if mode in range(len(DISPLAY_MODES)) else GFX_MODE_320_240
+        try:
+            mode = self.memory[GFX_MODE_ADDR]
+        except (AttributeError, TypeError):
+            return GFX_MODE_320_240
+        return mode if mode < len(DISPLAY_MODES) else GFX_MODE_320_240
 
     def _screen_size(self):
         width, height, _ = DISPLAY_MODES[self._graphics_mode()]
@@ -363,19 +373,19 @@ class SuomiCompute16:
         packed_size = width * height * bits_per_pixel // 8
         packed = self.memory[address:address + packed_size]
         if bits_per_pixel == 4:
-            for index, value in enumerate(packed):
-                offset = index * 2
-                pixels[offset] = value >> 4
-                pixels[offset + 1] = value & 0x0F
+            pixels[0::2] = packed.translate(_NIBBLE_HIGH)
+            pixels[1::2] = packed.translate(_NIBBLE_LOW)
         elif bits_per_pixel == 2:
-            for index, value in enumerate(packed):
-                offset = index * 4
-                pixels[offset:offset + 4] = bytes(
-                    ((value >> 6) & 3, (value >> 4) & 3, (value >> 2) & 3, value & 3)
-                )
+            for index, table in enumerate(_CRUMB_TABLES):
+                pixels[index::4] = packed.translate(table)
         return pixels
 
     def _ensure_gpu_state(self):
+        state = self.__dict__
+        if (state.get("_gpu_control_initialized")
+                and "palette" in state and "split_cameras" in state
+                and state.get("_gpu_state_mode") == self._graphics_mode()):
+            return
         if not hasattr(self, "palette"):
             self.palette = _default_palette()
         if not hasattr(self, "gpu_layers"):
@@ -462,12 +472,14 @@ class SuomiCompute16:
         if self._sprite_layer_dirty:
             self._render_sprites()
             self._sprite_layer_dirty = False
-        base = pygame.image.frombuffer(
-            self._decode_framebuffer(VRAM_START), (width, height), "P"
-        )
-        base.set_palette(self.palette)
-        self.vram_surface.fill(0)
         visible = self.memory[GPU_LAYER_MASK] & GPU_LAYER_MASK_ALL
+        base = None
+        if visible & 1:
+            base = pygame.image.frombuffer(
+                self._decode_framebuffer(VRAM_START), (width, height), "P"
+            )
+            base.set_palette(self.palette)
+        self.vram_surface.fill(0)
         order = sorted(
             range(GPU_LAYER_COUNT),
             key=lambda index: (self.memory[GPU_LAYER_ORDER + index], index),
@@ -659,6 +671,7 @@ class SuomiCompute16:
             self._gpu_text(x, y, color)
         elif command == GPU_PRESENT:
             self._composite_layers()
+            self._presented_frame = True
             self.frame_yield = True
         elif command == GPU_TICKS:
             ticks = getattr(self, 'frames', 0)
@@ -725,7 +738,7 @@ class SuomiCompute16:
         elif command == GPU_MASK_OVERLAP:
             first = self._gpu_collision_mask(self._gpu_word(10, False))
             second = self._gpu_collision_mask(self._gpu_word(12, False))
-            self._gpu_result(self._gpu_masks_overlap(first, x, y, second, w, h))
+            self._gpu_result(self._fast_masks_overlap(first, x, y, second, w, h))
         elif command == GPU_WORLD_AMMO:
             self._gpu_world_ammo(x, y, layer)
         elif command == GPU_WORLD_RECT:
@@ -784,7 +797,7 @@ class SuomiCompute16:
         elif command == GPU_MASK_OVERLAP_WIDE:
             first = self._gpu_collision_mask(self._gpu_word(10, False))
             second = self._gpu_collision_mask(self._gpu_word(12, False))
-            self._gpu_result(self._gpu_masks_overlap(
+            self._gpu_result(self._fast_masks_overlap(
                 first, self._gpu_wide_field(2, 24),
                 self._gpu_wide_field(4, 26), second,
                 self._gpu_wide_field(6, 28),
@@ -925,6 +938,31 @@ class SuomiCompute16:
             )
         raise ValueError("Unknown GPU collision mask: %d" % mask)
 
+    def _fast_masks_overlap(self, first, x, y, second, other_x, other_y):
+        if first is None or second is None:
+            raise ValueError("Collision mask sprite has not been uploaded")
+        width, height, _ = first
+        other_width, other_height, _ = second
+        if (x >= other_x + other_width or other_x >= x + width or
+                y >= other_y + other_height or other_y >= y + height):
+            return 0
+        return 1 if self._pygame_mask(first).overlap(
+            self._pygame_mask(second), (other_x - x, other_y - y)) else 0
+
+    def _pygame_mask(self, mask):
+        width, height, pixels = mask
+        key = (width, height, bytes(pixels))
+        cache = self.__dict__.setdefault("_collision_masks", {})
+        result = cache.get(key)
+        if result is None:
+            if len(cache) >= 1024:
+                cache.clear()
+            surface = self._index_surface(bytearray(key[2]), width, height)
+            surface.set_colorkey(0)
+            result = pygame.mask.from_surface(surface)
+            cache[key] = result
+        return result
+
     @staticmethod
     def _gpu_masks_overlap(first, x, y, second, other_x, other_y):
         if first is None or second is None:
@@ -957,6 +995,38 @@ class SuomiCompute16:
                     if distance <= 3 and left <= x < right and 0 <= y < height:
                         target[y * width + x] = 1 if distance <= 1 else 5
 
+    def _index_surface(self, pixels, width, height):
+        surface = pygame.image.frombuffer(pixels, (width, height), "P")
+        surface.set_palette(_INDEX_PALETTE)
+        return surface
+
+    def _layer_blit_surface(self, layer):
+        return self._buffer_surface(self.gpu_layers[layer])
+
+    def _buffer_surface(self, pixels):
+        """A palette-neutral pygame view sharing an indexed screen-sized buffer."""
+        cache = self.__dict__.setdefault("_layer_blit_surfaces", {})
+        width, height = self._screen_size()
+        entry = cache.get(id(pixels))
+        if entry is None or entry[0] is not pixels or entry[1].get_size() != (width, height):
+            entry = (pixels, self._index_surface(pixels, width, height))
+            cache[id(pixels)] = entry
+        return entry[1]
+
+    def _tile_surface(self, tile):
+        size = self.tile_pixel_size
+        start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
+        pixels = bytes(self.tile_memory[start:start + size * size])
+        cache = self.__dict__.setdefault("_tile_surfaces", {})
+        key = (size, pixels)
+        surface = cache.get(key)
+        if surface is None:
+            if len(cache) >= 1024:
+                cache.clear()
+            surface = self._index_surface(pixels, size, size)
+            cache[key] = surface
+        return surface
+
     def _gpu_world_tile(self, tile, world_x, world_y, layer):
         if layer == 0:
             self._gpu_result(1)
@@ -965,26 +1035,29 @@ class SuomiCompute16:
             self._render_tile_layer()
             self._tile_layer_dirty = False
         width, height = self._screen_size()
-        target = self.gpu_layers[layer]
         size = self.tile_pixel_size
-        tile_start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
         cameras = self.split_cameras
         if cameras is None:
             views = ((self.tile_camera, 0, width),)
         else:
             views = ((cameras[0], 0, width // 2),
                      (cameras[1], width // 2, width))
+        source = None
+        target = None
         for (camera_x, camera_y), clip_left, clip_right in views:
             x = world_x - camera_x + clip_left
             y = world_y - camera_y
-            left, right = max(x, clip_left), min(x + size, clip_right)
-            top, bottom = max(y, 0), min(y + size, height)
-            for screen_y in range(top, bottom):
-                source = tile_start + (screen_y - y) * size
-                for screen_x in range(left, right):
-                    pixel = self.tile_memory[source + screen_x - x]
-                    if pixel:
-                        target[screen_y * width + screen_x] = pixel
+            if (max(x, clip_left) >= min(x + size, clip_right)
+                    or max(y, 0) >= min(y + size, height)):
+                continue
+            if target is None:
+                source = self._tile_surface(tile)
+                source.set_colorkey(0)
+                target = self._layer_blit_surface(layer)
+            target.set_clip((clip_left, 0, clip_right - clip_left, height))
+            target.blit(source, (x, y))
+        if target is not None:
+            target.set_clip(None)
         self._gpu_result(0)
 
     @staticmethod
@@ -1120,6 +1193,14 @@ class SuomiCompute16:
                 self._gpu_line(*points[2], *points[0], color)
         self._gpu_result(GPU3D_OK)
 
+    def _read_block(self, source, size):
+        """Copy guest memory with one slice unless it overlaps read-sensitive MMIO."""
+        source &= MEM_MASK
+        end = source + size
+        if end <= MEM_SIZE and (end <= MOUSE_ADDR or source > CONSOLE_CONTROL):
+            return bytes(self.memory[source:end])
+        return bytes(self.read((source + index) & MEM_MASK) for index in range(size))
+
     def _gpu_sprite_upload(self, slot, width, height, source):
         if (slot >= GPU_SPRITE_SLOTS or not 1 <= width <= GPU_SPRITE_MAX_SIZE
                 or not 1 <= height <= GPU_SPRITE_MAX_SIZE):
@@ -1128,8 +1209,7 @@ class SuomiCompute16:
         self.sprite_memory[slot] = (
             width,
             height,
-            bytes(self.read((source + index) & MEM_MASK)
-                  for index in range(width * height)),
+            self._read_block(source, width * height),
         )
         self._sprite_layer_dirty = True
         self._gpu_result(0)
@@ -1141,9 +1221,7 @@ class SuomiCompute16:
         tile_size = self.tile_pixel_size
         start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
         size = tile_size * tile_size
-        self.tile_memory[start:start + size] = bytes(
-            self.read((source + index) & MEM_MASK) for index in range(size)
-        )
+        self.tile_memory[start:start + size] = self._read_block(source, size)
         self._tile_layer_dirty = True
         self._gpu_result(0)
 
@@ -1162,10 +1240,7 @@ class SuomiCompute16:
             return
         self.tilemap_width = map_w
         self.tilemap_height = map_h
-        self.tilemap_memory = bytes(
-            self.read((source + index) & MEM_MASK)
-            for index in range(map_w * map_h)
-        )
+        self.tilemap_memory = self._read_block(source, map_w * map_h)
         self.tile_camera = (camx, camy)
         self._tile_layer_dirty = True
         self._gpu_result(0)
@@ -1194,26 +1269,25 @@ class SuomiCompute16:
             + (camx - first_col * tile_size) + tile_size - 1
         ) // tile_size
         rows = (height + (camy - first_row * tile_size) + tile_size - 1) // tile_size
-        for row in range(max(first_row, 0), min(first_row + rows, self.tilemap_height)):
-            screen_y = row * tile_size - camy
-            for column in range(max(first_col, 0), min(first_col + cols, self.tilemap_width)):
-                map_index = row * self.tilemap_width + column
-                tile = self.tilemap_memory[map_index]
-                tile_start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE
-                screen_x = column * tile_size - camx + clip_left
-                left = max(screen_x, clip_left)
-                right = min(screen_x + tile_size, clip_right)
-                top, bottom = max(screen_y, 0), min(screen_y + tile_size, height)
-                if left >= right or top >= bottom:
-                    continue
-                source_x = left - screen_x
-                span = right - left
-                for dest_y in range(top, bottom):
-                    source_y = dest_y - screen_y
-                    src = tile_start + source_y * tile_size + source_x
-                    dst = dest_y * width + left
-                    tile_row = self.tile_memory[src:src + span]
-                    target[dst:dst + span] = tile_row
+        dest = self._buffer_surface(target)
+        dest.set_clip((clip_left, 0, clip_right - clip_left, height))
+        surfaces = {}
+        tilemap = self.tilemap_memory
+        map_width = self.tilemap_width
+        try:
+            for row in range(max(first_row, 0), min(first_row + rows, self.tilemap_height)):
+                screen_y = row * tile_size - camy
+                row_start = row * map_width
+                for column in range(max(first_col, 0), min(first_col + cols, map_width)):
+                    tile = tilemap[row_start + column]
+                    surface = surfaces.get(tile)
+                    if surface is None:
+                        surface = self._tile_surface(tile)
+                        surface.set_colorkey(None)
+                        surfaces[tile] = surface
+                    dest.blit(surface, (column * tile_size - camx + clip_left, screen_y))
+        finally:
+            dest.set_clip(None)
 
     def _render_sprites(self):
         width, height = self._screen_size()
@@ -1268,6 +1342,14 @@ class SuomiCompute16:
         value &= 0xFFFF
         self.memory[GPU_BASE + 14] = value >> 8
         self.memory[GPU_BASE + 15] = value & 0xFF
+
+    def _copy_to_memory(self, address, data):
+        end = address + len(data)
+        if end <= MEM_SIZE and (end <= GPU_BASE or address > CONSOLE_CONTROL):
+            self.memory[address:end] = data
+            return
+        for i, value in enumerate(data):
+            self.write(address + i, value)
 
     def disk_control(self, command):
         """Disk device memory-mapped control."""
@@ -1350,8 +1432,7 @@ class SuomiCompute16:
                 except UnicodeDecodeError as exc:
                     raise DiskDeviceError("virtual file path must be ASCII") from exc
                 data, file_size = self.disk.read_file(file_path, file_offset, length)
-                for i, value in enumerate(data):
-                    self.write(buffer_address + i, value)
+                self._copy_to_memory(buffer_address, data)
                 self.write_16(DISK_BASE + 14, len(data))
                 self.memory[DISK_BASE + 32:DISK_BASE + 36] = file_size.to_bytes(4, "big")
             if command & 0x08: # Write block
@@ -1503,6 +1584,15 @@ class SuomiCompute16:
         while len(raw) < 255 and self.memory[(source + len(raw)) & (MEM_SIZE - 1)]:
             raw.append(self.memory[(source + len(raw)) & (MEM_SIZE - 1)])
         left = x
+        self._ensure_gpu_state()
+        width, height = self._screen_size()
+        layer = min(
+            getattr(self, "_drawing_layer", self.memory[GPU_LAYER_SELECT]),
+            GPU_LAYER_COUNT - 1,
+        )
+        target = self.gpu_layers[layer] if layer else None
+        value = color & 0x0F if self._graphics_mode() == GFX_MODE_640_480 else color
+        memory = self.memory
         for char in raw.decode("utf-8", errors="replace"):
             if char == "\n":
                 x, y = left, y + 8
@@ -1514,10 +1604,21 @@ class SuomiCompute16:
             else:
                 glyph = ord("?") - 32
             for row in range(7):
-                bits = self.memory[FONT_ADDR + glyph * 8 + row]
+                bits = memory[FONT_ADDR + glyph * 8 + row]
+                if not bits:
+                    continue
+                if target is None:
+                    for column in range(5):
+                        if bits & (0x80 >> column):
+                            self._back_pixel(x + column, y + row, color)
+                    continue
+                pixel_y = y + row
+                if not 0 <= pixel_y < height:
+                    continue
+                row_start = pixel_y * width
                 for column in range(5):
-                    if bits & (0x80 >> column):
-                        self._back_pixel(x + column, y + row, color)
+                    if bits & (0x80 >> column) and 0 <= x + column < width:
+                        target[row_start + x + column] = value
             x += 6
 
     def write_16(self, addr, val):
@@ -2284,7 +2385,10 @@ class SuomiCompute16:
         mode = self._graphics_mode()
         if mode != getattr(self, "_surface_mode", mode):
             self.vram_surface = self._create_vram_surface()
-        self._composite_layers()
+            self._presented_frame = False
+        if not getattr(self, "_presented_frame", False):
+            self._composite_layers()
+        self._presented_frame = False
         _present_scaled(self.vram_surface, self.screen)
 
     def _max_speed(self):
@@ -2328,30 +2432,38 @@ class SuomiCompute16:
         regs = np.array(self.registers, dtype=np.int64)
         st = np.zeros(6, dtype=np.int64)
         flags = self.flags
+        step = self.step
+        check_interrupts = self.check_interrupts
+        memory = np.frombuffer(self.memory, dtype=np.uint8)
         remaining = budget
-        while remaining > 0 and self.running and not self.frame_yield:
-            st[0] = self.pc
-            st[1] = self.sp
-            st[2] = flags['Z']
-            st[3] = flags['C']
-            st[4] = flags.get('N', 0)
-            st[5] = flags.get('V', 0)
-            regs[:] = self.registers
-            memory = np.frombuffer(self.memory, dtype=np.uint8)
-            count, status = run_block(memory, regs, st, remaining)
+        try:
+            while remaining > 0 and self.running and not self.frame_yield:
+                st[0] = self.pc
+                st[1] = self.sp
+                st[2] = flags['Z']
+                st[3] = flags['C']
+                st[4] = flags.get('N', 0)
+                st[5] = flags.get('V', 0)
+                regs[:] = self.registers
+                count, status = run_block(memory, regs, st, remaining)
+                self.registers[:] = regs.tolist()
+                pc, sp, z, c, n, v = st.tolist()
+                self.pc = pc
+                self.sp = sp
+                flags['Z'] = z
+                flags['C'] = c
+                flags['N'] = n
+                flags['V'] = v
+                remaining -= count
+                if status == 0:
+                    break
+                if status == 2:
+                    check_interrupts()
+                else:
+                    step()
+                    remaining -= 1
+        finally:
             del memory
-            self.registers[:] = regs.tolist()
-            self.pc = int(st[0])
-            self.sp = int(st[1])
-            flags['Z'], flags['C'], flags['N'], flags['V'] = (int(x) for x in st[2:6])
-            remaining -= count
-            if status == 0:
-                break
-            if status == 2:
-                self.check_interrupts()
-            else:
-                self.step()
-                remaining -= 1
 
     # Mouse button bits: held (MOUSE_ADDR+4) bit0 left, bit1 right.
     # Events (MOUSE_ADDR+5): bit0/1 left/right press, bit2/3 left/right double click,
