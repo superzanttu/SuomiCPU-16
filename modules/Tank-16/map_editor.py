@@ -37,6 +37,9 @@ TILE_SIZE_OPTIONS = (64, 32)
 RUNTIME_MAP_ENCODING = "grid-hex-v2"
 RUNTIME_MAP_FORMAT_VERSION = 2
 RUNTIME_MAP_HEADER_LIMIT = 4096
+DEEP_WATER_TILE = 90
+WATER_TILE_MIN = 40
+WATER_TILE_MAX = 59
 _overview_cache = {}
 
 
@@ -253,6 +256,7 @@ def encode_runtime_map(map_data: dict) -> dict:
         map_data.get("tileset", DEFAULT_TILESET_FILENAME))
     _, columns, rows = load_tileset(ROOT / "gfx" / filename)
     normalized = validate_map(map_data, columns, rows)
+    apply_water_depth_tiles(normalized)
     object_columns, object_rows = load_tileset(
         OBJECT_TILESET_PATH, pad_edges=True)[1:]
     if columns * rows > 256 or object_columns * object_rows > 255:
@@ -537,7 +541,42 @@ def load_map(path: Path, tileset_columns: int | None = None,
         document = _expand_runtime_map(
             document, actual_columns, actual_rows,
             object_columns, object_rows)
-    return validate_map(document, actual_columns, actual_rows)
+    normalized = validate_map(document, actual_columns, actual_rows)
+    apply_water_depth_tiles(normalized)
+    return normalized
+
+
+def apply_water_depth_tiles(map_data: dict) -> None:
+    tiles = map_data["tiles"]
+    width = map_data["width"]
+    height = map_data["height"]
+    source_tiles = [
+        [56 if tile[1] * 10 + tile[0] == DEEP_WATER_TILE
+         else tile[1] * 10 + tile[0] for tile in row]
+        for row in tiles
+    ]
+    for y in range(height):
+        for x in range(width):
+            if tiles[y][x][1] * 10 + tiles[y][x][0] == DEEP_WATER_TILE:
+                tiles[y][x] = [6, 5]
+            tile = source_tiles[y][x]
+            if not WATER_TILE_MIN <= tile <= WATER_TILE_MAX:
+                continue
+            near_land = False
+            for neighbor_y in range(max(0, y - 2), min(height, y + 3)):
+                for neighbor_x in range(max(0, x - 2), min(width, x + 3)):
+                    neighbor_tile = source_tiles[neighbor_y][neighbor_x]
+                    if (WATER_TILE_MIN <= neighbor_tile <= WATER_TILE_MAX or
+                            60 <= neighbor_tile <= 69 or
+                            86 <= neighbor_tile <= 89):
+                        continue
+                    near_land = True
+                    break
+                if near_land:
+                    break
+            if not near_land:
+                tiles[y][x] = [DEEP_WATER_TILE % 10,
+                               DEEP_WATER_TILE // 10]
 
 
 def _grid_to_flat_document(document: dict) -> dict:

@@ -22,6 +22,11 @@
 - [x] Provide `gfx/tiles_template.png` as a transparent, numbered 64×64-cell atlas template.
 - [x] Precalculate 32 tank sprite rotations and projectile directions.
 - [x] Show both players' health and the game timer and win count in the HUD.
+- [x] Show the active map name beneath the timer in the existing top bar.
+- [x] Show a centered minimap below the unchanged 30-pixel HUD bar, across both viewports.
+- [x] Keep the visible map area below the HUD bar and make wall/building objects block tanks.
+- [x] Use the Tank-16 military-stencil font in the existing SC-16 5x7 font format.
+- [x] Apply terrain-dependent tank speed and deep-water damage.
 - [x] Limit each round to five minutes; decide the winner by remaining health and declare a draw on equal health.
 - [x] Start a new round automatically after each round and retain wins; reset the win count when the game restarts.
 - [x] Add short muzzle flashes, shot-impact sparks, damage flashes, destruction bursts, and shooting/hit/healing sounds.
@@ -66,10 +71,12 @@ affected player's camera. Fresh rounds clear throttle, impulses, and camera shak
 ## Collision and particle effects
 
 Collision masks use the actual uploaded sprite/tile pixels: palette index zero is
-transparent. Map obstacles block tanks and ammunition only where opaque pixels
-overlap. Tank rotation is rejected if the new orientation overlaps an obstacle or
-the other tank. Ground tiles and cosmetic tracks, bursts, and particles are not
-colliders.
+transparent. Map obstacle cells block tanks and ammunition only where opaque
+pixels overlap. Wall atlas tiles 0-5 and building tiles 6-8 and 12-14 in the
+object layer also block tanks; ammunition already collides with active map
+objects. Tank rotation is rejected if the new orientation overlaps an obstacle
+or the other tank. Ground tiles and cosmetic tracks, bursts, and particles are
+not colliders.
 
 Ammunition collides with opposing tanks, obstacles, active map objects, and other
 ammunition. Shooting an object consumes the shot; fixed objects remain, explosion
@@ -102,6 +109,21 @@ Round-result banners stay near the bottom so centered wreck fires remain visible
 
 `MAX_TRACK_MARKS` is 288 (previously 96), at the same spacing: visible trail history
 is three times longer. Track marks clear between rounds as before.
+
+The HUD bar remains 30 pixels tall. The minimap is centered immediately below it
+and rendered on the full-screen HUD layer, spanning both camera views. Finite-map
+minimap rendering samples already-loaded rows only, so it does not defeat lazy
+map loading. On infinite maps it shows a local region around both tanks. The
+camera keeps the play area below the top bar at finite-map edges.
+
+Every tank samples nine terrain locations across its footprint. Water limits
+forward/reverse speed to 10% of the vehicle maximum; grass and sand limit it to
+70%; paved roads and road bridges allow the full maximum. Mixed terrain blends
+these limits by sample count. On dark-water tile 90, five or more of the nine
+samples trigger 10 HP damage per second; leaving deep water resets the damage
+timer. Map loading and saving automatically mark water more than two tiles from
+land as deep water, while preserving shoreline tiles near land and not treating
+road or rail bridges as land.
 
 The graphics API exposes `gfx_mask_overlap(first, first_x, first_y, second,
 second_x, second_y)` with top-left world coordinates. Sprite mask IDs are 0-63;
@@ -175,7 +197,13 @@ Q: How long do tank tracks remain?
 A: Moving tanks leave two ground tracks, including when reversing. They are world-space marks visible in either camera, below objects and tanks. The latest 288 pairs remain until replaced or a new round starts; stationary tanks do not create marks.
 
 Q: Where are the water, bridge, and train track tiles?
-A: `gfx/tiles_terrain.png` is 10 columns by 9 rows of 64x64 cells. Its original 40 cells (rows 0-3) are unchanged. IDs 40-55 are irregular shoreline variants; add north/east/south/west land-neighbor bits 1/2/4/8 to 40 to choose the shoreline shape. ID 40, coordinate (0, 4), is open water; IDs 56-59 are additional open-water ripple variants. IDs 60-69 are wooden and stone bridges in horizontal/vertical orientations, including end-cap and plank variants. IDs 70-85 are railroad track tiles, where ID = 70 plus the north/east/south/west connection bits 1/2/4/8; adjacent connections curve naturally. IDs 86-89 are wooden and stone rail bridges in horizontal/vertical orientations. Tile coordinates remain zero-based and IDs remain row-major.
+A: `gfx/tiles_terrain.png` is 10 columns by 10 rows of 64x64 cells. Its original 40 cells (rows 0-3) are unchanged. IDs 40-55 are irregular shoreline variants; add north/east/south/west land-neighbor bits 1/2/4/8 to 40 to choose the shoreline shape. ID 40, coordinate (0, 4), is open water; IDs 56-59 are additional open-water ripple variants. ID 90, coordinate (0, 9), is dark-blue deep water. Loading or saving a map automatically uses it for water more than two tiles from land; road and rail bridges do not count as land for this distance. IDs 60-69 are wooden and stone bridges in horizontal/vertical orientations, including end-cap and plank variants. IDs 70-85 are railroad track tiles, where ID = 70 plus the north/east/south/west connection bits 1/2/4/8; adjacent connections curve naturally. IDs 86-89 are wooden and stone rail bridges in horizontal/vertical orientations. Tile coordinates remain zero-based and IDs remain row-major.
+
+Q: Which font does Tank-16 use?
+A: Tank-16 uses `../../fonts/tank16_military5x7.asm`, a military-stencil font
+with the same 5×7 glyph bitmap, 6×8 cell, and glyph ordering as the standard
+SC-16 font. Its local `font5x7.asm` wrapper selects this font only when compiling
+Tank-16.
 
 Q: What geography is used by `disks/maps/FINLAND.json`?
 A: It is a 100x100 north-up Finland overview rasterized from Natural Earth's public-domain 1:10m country boundaries, lakes, roads, railways, and populated places. It includes irregular shorelines, road and railway connection tiles, road/rail bridges over water, city blocks, forest trees, and rocks. The square uses a Lambert azimuthal equal-area projection centered on 26E, 64.5N and covers Finland including Aland with a surrounding margin. At this overview scale, routes show major connections only and are not navigational data. Source URLs, projection bounds, scale, feature counts, cities, and tile counts are stored in the optional `geography` metadata, which the editor preserves.

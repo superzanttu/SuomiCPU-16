@@ -20,6 +20,7 @@ MAIN_PATH = GAME_DIR / "main.c"
 RUNTIME_TILE_DATA_PATH = GAME_DIR / "disks" / "assets" / "TANK16_TILES.json"
 RUNTIME_PALETTE_BASE = 32
 RUNTIME_PALETTE_CAPACITY = 256 - RUNTIME_PALETTE_BASE
+OBJECT_COLUMNS = 6
 OBJECT_REMOVAL_TYPES = ("fixed", "explosion", "disappear")
 
 
@@ -313,6 +314,10 @@ def build_map_header(
         "x": [x for x, _, _ in objects],
         "y": [y for _, y, _ in objects],
         "tile": [object_ids[tuple(cell["tile"])] for _, _, cell in objects],
+        "source_tile": [
+            cell["tile"][1] * OBJECT_COLUMNS + cell["tile"][0]
+            for _, _, cell in objects
+        ],
         "hp": [cell["hp_change"] for _, _, cell in objects],
         "removal": [OBJECT_REMOVAL_TYPES.index(cell["removal"])
                     for _, _, cell in objects],
@@ -348,6 +353,10 @@ def build_map_header(
                 "y": [y for _, y, _ in round_objects],
                 "tile": [
                     object_ids[tuple(cell["tile"])]
+                    for _, _, cell in round_objects
+                ],
+                "source_tile": [
+                    cell["tile"][1] * OBJECT_COLUMNS + cell["tile"][0]
                     for _, _, cell in round_objects
                 ],
                 "hp": [cell["hp_change"] for _, _, cell in round_objects],
@@ -476,6 +485,7 @@ def build_runtime_assets_header(
         "int map_object_x[MAP_OBJECT_CAPACITY];\n"
         "int map_object_y[MAP_OBJECT_CAPACITY];\n"
         "int map_object_tile[MAP_OBJECT_CAPACITY];\n"
+        "int map_object_source_tile[MAP_OBJECT_CAPACITY];\n"
         "int map_object_hp[MAP_OBJECT_CAPACITY];\n"
         "int map_object_removal[MAP_OBJECT_CAPACITY];\n"
         "unsigned char runtime_tile_pixels[4096];\n"

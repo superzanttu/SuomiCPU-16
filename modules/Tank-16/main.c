@@ -89,6 +89,9 @@ void draw_runtime_loading_screen(char *message, int current, int total);
 #define SPEED_SCALE 16
 #define MAX_FORWARD_SPEED 32
 #define MAX_REVERSE_SPEED 16
+#define DEEP_WATER_TILE_ID 90
+#define WATER_DAMAGE_INTERVAL 30
+#define WATER_DAMAGE_AMOUNT 10
 #define MOVING_TURN_FRAMES 4
 #define STATIONARY_TURN_FRAMES 2
 #define HANDBRAKE_DECELERATION 8
@@ -227,6 +230,7 @@ int next_particle;
 PowerUp powerup;
 int powerup_spawn_timer;
 int movement_sound_cooldown[2];
+int deep_water_frames[2];
 unsigned char sprite_work[TANK_SPRITE_PIXEL_COUNT];
 unsigned char object_active[MAP_OBJECT_CAPACITY];
 unsigned char object_contacts[MAP_OBJECT_CAPACITY];
@@ -869,6 +873,7 @@ int parse_object_list(char *cursor, unsigned long cells, int width)
         map_object_x[map_object_count] = cell % width;
         map_object_y[map_object_count] = cell / width;
         map_object_tile[map_object_count] = OBJECT_TILE_BASE + tile;
+        map_object_source_tile[map_object_count] = tile;
         map_object_hp[map_object_count] = hp;
         map_object_removal[map_object_count] = removal;
         map_object_count++;
@@ -1370,6 +1375,8 @@ int load_finite_map(char *json, int width, int height)
                 map_object_y[map_object_count] = row;
                 map_object_tile[map_object_count] =
                     OBJECT_TILE_BASE + tile_y * OBJECT_COLUMNS + tile_x;
+                map_object_source_tile[map_object_count] =
+                    tile_y * OBJECT_COLUMNS + tile_x;
                 cursor = cell;
                 cursor = strchr(cursor, '}');
                 if (cursor == 0)
@@ -1756,6 +1763,67 @@ int map_coordinate(WorldCoord position)
     return coordinate;
 }
 #endif
+
+int terrain_tile_at(int row, int column)
+{
+#ifdef RUNTIME_MAP_LOADING
+    return map_tile_at(row, column);
+#else
+    if (row < 0 || row >= MAP_ROWS ||
+        column < 0 || column >= MAP_COLUMNS)
+        return 0;
+    return map_data[row * MAP_COLUMNS + column];
+#endif
+}
+
+int is_road_terrain(int tile)
+{
+    return (tile >= 0 && tile <= 3) || (tile >= 10 && tile <= 13) ||
+           (tile >= 60 && tile <= 69) ||
+           (tile >= 86 && tile <= 89);
+}
+
+int tank_terrain_speed_percent(WorldCoord x, WorldCoord y,
+                               int *deep_water_samples)
+{
+    int offset_x;
+    int offset_y;
+    int row;
+    int column;
+    int tile;
+    int speed_percent;
+    int speed_percent_total;
+
+    speed_percent_total = 0;
+    *deep_water_samples = 0;
+    for (offset_y = -12; offset_y <= 12; offset_y += 12)
+    {
+        for (offset_x = -12; offset_x <= 12; offset_x += 12)
+        {
+#ifdef RUNTIME_MAP_LOADING
+            row = map_coordinate(y + offset_y);
+            column = map_coordinate(x + offset_x);
+#else
+            row = (y + offset_y) / MAP_TILE_PIXEL_SIZE;
+            column = (x + offset_x) / MAP_TILE_PIXEL_SIZE;
+#endif
+            tile = terrain_tile_at(row, column);
+            if ((tile >= 40 && tile <= 59) ||
+                tile == DEEP_WATER_TILE_ID)
+            {
+                speed_percent = 10;
+                if (tile == DEEP_WATER_TILE_ID)
+                    (*deep_water_samples)++;
+            }
+            else if (is_road_terrain(tile))
+                speed_percent = 100;
+            else
+                speed_percent = 70;
+            speed_percent_total += speed_percent;
+        }
+    }
+    return (speed_percent_total + 4) / 9;
+}
 
 int map_obstacle_at(int row, int column)
 {
@@ -2206,6 +2274,8 @@ void select_round_map(void)
         map_object_x[i] = map_variant_object_x[variant][i];
         map_object_y[i] = map_variant_object_y[variant][i];
         map_object_tile[i] = map_variant_object_tile[variant][i];
+        map_object_source_tile[i] =
+            map_variant_object_source_tile[variant][i];
         map_object_hp[i] = map_variant_object_hp[variant][i];
         map_object_removal[i] = map_variant_object_removal[variant][i];
     }
@@ -2651,11 +2721,7 @@ int is_solid_map_object(int object)
 
     if (object < 0 || object >= map_object_count)
         return 0;
-#ifdef RUNTIME_MAP_LOADING
-    tile = map_object_tile[object] - OBJECT_TILE_BASE;
-#else
-    tile = map_object_tile[object] - TILE_COUNT;
-#endif
+    tile = map_object_source_tile[object];
     return tile >= 0 && (tile <= 8 || (tile >= 12 && tile <= 14));
 }
 
@@ -2701,6 +2767,7 @@ int solid_map_object_collision(int mask, WorldCoord x, WorldCoord y, int size)
     int column;
     int cell;
     int tile;
+    int object;
 
 #ifdef RUNTIME_MAP_LOADING
     if (map_infinite)
@@ -2730,9 +2797,24 @@ int solid_map_object_collision(int mask, WorldCoord x, WorldCoord y, int size)
                 continue;
             cell = row * MAP_COLUMNS + column;
 #endif
-            if (cell < 0 || cell >= MAP_OBJECT_SOLID_CAPACITY)
+            if (cell < 0)
                 continue;
-            tile = solid_map_objects[cell];
+            tile = cell < MAP_OBJECT_SOLID_CAPACITY
+                       ? solid_map_objects[cell] : 0;
+            if (cell >= MAP_OBJECT_SOLID_CAPACITY)
+            {
+                for (object = 0; object < map_object_count; object++)
+                {
+                    if (object_active[object] &&
+                        map_object_x[object] == column &&
+                        map_object_y[object] == row &&
+                        is_solid_map_object(object))
+                    {
+                        tile = map_object_tile[object];
+                        break;
+                    }
+                }
+            }
             if (tile != 0 &&
                 mask_overlap_world(mask, x, y, GFX_MASK_TILE_BASE + tile,
                                    (WorldCoord)column * MAP_TILE_PIXEL_SIZE,
@@ -2969,6 +3051,7 @@ void start_round(void)
         tanks[i].handbrake = 0;
         tanks[i].speed_boost_frames = 0;
         tanks[i].damage_boost_frames = 0;
+        deep_water_frames[i] = 0;
         hit_flash[i] = 0;
         muzzle_flash[i] = 0;
     }
@@ -3095,6 +3178,11 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     int right_key;
     int maximum_forward_speed;
     int maximum_reverse_speed;
+    int terrain_max_forward_speed;
+    int terrain_max_reverse_speed;
+    int target_speed;
+    int terrain_speed_percent;
+    int deep_water_samples;
     int steering_speed;
 
     if (tanks[player].health <= 0)
@@ -3107,6 +3195,29 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     maximum_reverse_speed = tanks[player].speed_boost_frames > 0
                                 ? MAX_REVERSE_SPEED * 3 / 2
                                 : MAX_REVERSE_SPEED;
+    terrain_speed_percent = tank_terrain_speed_percent(
+        tanks[player].x, tanks[player].y, &deep_water_samples);
+    terrain_max_forward_speed =
+        maximum_forward_speed * terrain_speed_percent / 100;
+    terrain_max_reverse_speed =
+        maximum_reverse_speed * terrain_speed_percent / 100;
+    if (terrain_max_forward_speed < 1)
+        terrain_max_forward_speed = 1;
+    if (terrain_max_reverse_speed < 1)
+        terrain_max_reverse_speed = 1;
+    if (deep_water_samples >= 5)
+    {
+        deep_water_frames[player]++;
+        if (deep_water_frames[player] >= WATER_DAMAGE_INTERVAL)
+        {
+            deep_water_frames[player] = 0;
+            change_health(player, -WATER_DAMAGE_AMOUNT);
+            if (tanks[player].health <= 0)
+                return;
+        }
+    }
+    else
+        deep_water_frames[player] = 0;
     forward_key = player == 0 ? (int)(keys & 4) : (int)(extra & KEYX2_P2_FORWARD);
     backward_key = player == 0 ? (int)(keys & 8) : (int)(extra & KEYX2_P2_BACKWARD);
     left_key = player == 0 ? (int)(keys & 1) : (int)(extra & KEYX2_P2_LEFT);
@@ -3138,13 +3249,18 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
             tanks[player].throttle = maximum_forward_speed;
         if (tanks[player].throttle < -maximum_reverse_speed)
             tanks[player].throttle = -maximum_reverse_speed;
-        if (tanks[player].speed > maximum_forward_speed)
-            tanks[player].speed = maximum_forward_speed;
-        if (tanks[player].speed < -maximum_reverse_speed)
-            tanks[player].speed = -maximum_reverse_speed;
-        if (tanks[player].speed < tanks[player].throttle)
+        if (tanks[player].speed > terrain_max_forward_speed)
+            tanks[player].speed = terrain_max_forward_speed;
+        if (tanks[player].speed < -terrain_max_reverse_speed)
+            tanks[player].speed = -terrain_max_reverse_speed;
+        target_speed = tanks[player].throttle;
+        if (target_speed > terrain_max_forward_speed)
+            target_speed = terrain_max_forward_speed;
+        if (target_speed < -terrain_max_reverse_speed)
+            target_speed = -terrain_max_reverse_speed;
+        if (tanks[player].speed < target_speed)
             tanks[player].speed++;
-        if (tanks[player].speed > tanks[player].throttle)
+        if (tanks[player].speed > target_speed)
             tanks[player].speed--;
     }
     turn = (right_key != 0) - (left_key != 0);
@@ -3234,6 +3350,10 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
         tanks[player].impulse_x = 0;
         tanks[player].impulse_y = 0;
     }
+    if (tanks[player].speed > terrain_max_forward_speed)
+        tanks[player].speed = terrain_max_forward_speed;
+    if (tanks[player].speed < -terrain_max_reverse_speed)
+        tanks[player].speed = -terrain_max_reverse_speed;
     if ((tanks[player].x != old_x || tanks[player].y != old_y) &&
         absolute_value(tanks[player].x - last_track_x[player]) +
                 absolute_value(tanks[player].y - last_track_y[player]) >=
@@ -3991,6 +4111,47 @@ int minimap_tile_color(int tile)
     return GREEN;
 }
 
+void draw_map_name(void)
+{
+#ifdef RUNTIME_MAP_LOADING
+    char name[13];
+    int path_index;
+    int name_length;
+
+    path_index = 0;
+    name_length = 0;
+    while (current_map_path[path_index] != 0)
+    {
+        if (current_map_path[path_index] == '/' ||
+            current_map_path[path_index] == '\\')
+            name_length = path_index + 1;
+        path_index++;
+    }
+    if (path_index == 0)
+        return;
+    path_index = name_length;
+    name_length = 0;
+    while (current_map_path[path_index] != 0 &&
+           current_map_path[path_index] != '.' && name_length < 12)
+    {
+        name[name_length++] = current_map_path[path_index++];
+    }
+    if (name_length == 0)
+        return;
+    name[name_length] = 0;
+    gfx_text(301 - name_length * 3, 17, name, WHITE);
+#endif
+}
+
+int minimap_coordinate(WorldCoord position)
+{
+#ifdef RUNTIME_MAP_LOADING
+    return map_coordinate(position);
+#else
+    return position / MAP_TILE_PIXEL_SIZE;
+#endif
+}
+
 void draw_minimap(void)
 {
     int columns;
@@ -4017,16 +4178,18 @@ void draw_minimap(void)
 #ifdef RUNTIME_MAP_LOADING
     if (map_infinite)
     {
-        first_column = map_coordinate(tanks[0].x);
-        first_row = map_coordinate(tanks[0].y);
-        if (map_coordinate(tanks[1].x) < first_column)
-            first_column = map_coordinate(tanks[1].x);
-        if (map_coordinate(tanks[1].y) < first_row)
-            first_row = map_coordinate(tanks[1].y);
+        first_column = minimap_coordinate(tanks[0].x);
+        first_row = minimap_coordinate(tanks[0].y);
+        if (minimap_coordinate(tanks[1].x) < first_column)
+            first_column = minimap_coordinate(tanks[1].x);
+        if (minimap_coordinate(tanks[1].y) < first_row)
+            first_row = minimap_coordinate(tanks[1].y);
         column_span = absolute_value(
-            map_coordinate(tanks[0].x) - map_coordinate(tanks[1].x)) + 16;
+            minimap_coordinate(tanks[0].x) -
+            minimap_coordinate(tanks[1].x)) + 16;
         row_span = absolute_value(
-            map_coordinate(tanks[0].y) - map_coordinate(tanks[1].y)) + 16;
+            minimap_coordinate(tanks[0].y) -
+            minimap_coordinate(tanks[1].y)) + 16;
         if (column_span < 32)
         {
             first_column -= (32 - column_span) / 2;
@@ -4086,7 +4249,11 @@ void draw_minimap(void)
         for (pixel_column = 0; pixel_column < width; pixel_column++)
         {
             column = left + (int)((long)pixel_column * columns / width);
+#ifdef RUNTIME_MAP_LOADING
             tile = map_tile_at(row, column);
+#else
+            tile = map_data[row * MAP_COLUMNS + column];
+#endif
             gfx_rect(x + pixel_column, y + pixel_row, 1, 1,
                      minimap_tile_color(tile));
         }
@@ -4095,9 +4262,11 @@ void draw_minimap(void)
     for (player = 0; player < 2; player++)
     {
         player_column = (int)(
-            ((long)map_coordinate(tanks[player].x) - left) * width / columns);
+            ((long)minimap_coordinate(tanks[player].x) - left) *
+            width / columns);
         player_row = (int)(
-            ((long)map_coordinate(tanks[player].y) - top) * height / rows);
+            ((long)minimap_coordinate(tanks[player].y) - top) *
+            height / rows);
         if (player_column < 0)
             player_column = 0;
         if (player_column >= width)
@@ -4202,6 +4371,7 @@ void draw_hud(void)
     timer[8] = (char)('0' + seconds % 10);
     timer[9] = 0;
     gfx_text(274, 5, timer, YELLOW);
+    draw_map_name();
     number_text((unsigned int)wins[0], score);
     i = 0;
     while (score[i] != 0 && i < 5)

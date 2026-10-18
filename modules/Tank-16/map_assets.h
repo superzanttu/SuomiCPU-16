@@ -10545,6 +10545,9 @@ int map_object_y[MAP_OBJECT_CAPACITY] = {
 int map_object_tile[MAP_OBJECT_CAPACITY] = {
     0
 };
+int map_object_source_tile[MAP_OBJECT_CAPACITY] = {
+    0
+};
 int map_object_hp[MAP_OBJECT_CAPACITY] = {
     0
 };

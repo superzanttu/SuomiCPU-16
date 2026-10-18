@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pygame
 
-from map_editor import write_runtime_map
+from map_editor import apply_water_depth_tiles, write_runtime_map
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -341,13 +341,29 @@ def rail_bridge_tile(orientation: str, style: str) -> pygame.Surface:
     return tile
 
 
+def deep_water_tile() -> pygame.Surface:
+    source = water_tile(0, 1)
+    tile = pygame.Surface((TILE_SIZE, TILE_SIZE), pygame.SRCALPHA)
+    for y in range(TILE_SIZE):
+        for x in range(TILE_SIZE):
+            red, green, blue, alpha = source.get_at((x, y))
+            variation = max(0, min(255, blue - 145))
+            tile.set_at((x, y), (
+                5 + variation // 20,
+                18 + variation // 3,
+                52 + variation * 3 // 4,
+                alpha,
+            ))
+    return tile
+
+
 def extend_atlas(path: Path = ATLAS_PATH) -> None:
     original = pygame.image.load(str(path))
     if original.get_size() not in (
-            (640, 256), (640, 384), (640, 448), (640, 576)):
+            (640, 256), (640, 384), (640, 448), (640, 576), (640, 640)):
         raise ValueError(
-            "Expected a 640x256, 640x384, 640x448 or 640x576 terrain atlas")
-    atlas = pygame.Surface((640, 576), pygame.SRCALPHA)
+            "Expected a 640x256, 640x384, 640x448, 640x576 or 640x640 terrain atlas")
+    atlas = pygame.Surface((640, 640), pygame.SRCALPHA)
     atlas.blit(original, (0, 0))
     for index in range(20):
         tile_id = WATER_TILE_BASE + index
@@ -374,6 +390,7 @@ def extend_atlas(path: Path = ATLAS_PATH) -> None:
         tile = rail_bridge_tile(orientation, style)
         atlas.blit(tile, ((tile_id % 10) * TILE_SIZE,
                           (tile_id // 10) * TILE_SIZE))
+    atlas.blit(deep_water_tile(), (0, 9 * TILE_SIZE))
     pygame.image.save(atlas, str(path))
 
 
@@ -703,6 +720,7 @@ def generate_map(countries_path: Path, lakes_path: Path,
         "objects_tileset": "tiles_objects.png", "geography": metadata,
         "obstacles": obstacles, "objects": objects, "tiles": tiles,
     }
+    apply_water_depth_tiles(document)
     output.parent.mkdir(parents=True, exist_ok=True)
     write_runtime_map(document, output)
     if preview is not None:
@@ -714,7 +732,7 @@ def generate_map(countries_path: Path, lakes_path: Path,
         scaled_objects = {}
         image = pygame.Surface(
             (size * preview_scale, size * preview_scale))
-        for tile_id in range(90):
+        for tile_id in range(100):
             source_tile = atlas.subsurface(
                 (tile_id % 10 * TILE_SIZE, tile_id // 10 * TILE_SIZE,
                  TILE_SIZE, TILE_SIZE))

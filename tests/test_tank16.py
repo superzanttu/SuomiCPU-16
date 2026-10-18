@@ -72,11 +72,11 @@ class Tank16Tests(unittest.TestCase):
             "results[11] = tanks[1].speed;\n"
             "for (i = 0; i < 64; i++) update_tank(1, 0, KEYX2_P2_BACKWARD);\n"
             "results[12] = tanks[1].speed;\n", 13)
-        self.assertEqual(results[:3], [1, 100, 32])
-        self.assertEqual(results[3:7], [133, 32, 149, 0])
+        self.assertEqual(results[:3], [1, 100, 26])
+        self.assertEqual(results[3:7], [131, 30, 145, 0])
         self.assertEqual(results[7], -16)
         self.assertLess(results[8], 180)
-        self.assertEqual(results[9:], [12, 10, 32, -16])
+        self.assertEqual(results[9:], [12, 10, 22, -11])
 
     def test_handbrake_overrides_throttle_stops_both_players_and_turning_tracks_speed(self):
         results = self.scenario_results(
@@ -102,7 +102,7 @@ class Tank16Tests(unittest.TestCase):
             "  for (i = 0; i < 12; i++) update_tank(0, 2, 0);\n"
             "  results[11 + speed] = tanks[0].direction;\n"
             "}\n", 14)
-        self.assertEqual(results, [24, 0, 0, 8, 102, 0, 0, 0, 0, 24, 1, 14, 12, 11])
+        self.assertEqual(results, [22, 0, 0, 8, 101, 0, 0, 0, 0, 24, 1, 14, 12, 12])
 
     def test_ammo_and_tank_fires_use_distinct_real_time_lifetimes(self):
         results = self.scenario_results(
@@ -641,6 +641,229 @@ class Tank16Tests(unittest.TestCase):
                 self.assertEqual(layer_pixel(cpu, 3, 192 + x, 128 + y), value)
         self.assertEqual(layer_pixel(cpu, 3, 101, 249), 12)
 
+    def test_wall_and_building_objects_block_tanks_and_ammunition(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
+        data = editor["new_map"]("SOLID", 10, 8)
+        for column, tile in ((1, [0, 0]), (4, [0, 1])):
+            data["objects"][1][column] = {
+                "tile": tile, "hp_change": -25, "removal": "fixed",
+            }
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "tank16_map_loader.map_tile_pixel_size", return_value=64):
+            path = editor["save_map"](data, Path(directory))
+            header = build_map_header(path)
+        source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', header, 1)
+        scenario = (
+            "int main(void) {\n"
+            "  int i; int tile;\n"
+            "  start_round();\n"
+            "  tanks[1].x = 560; tanks[1].y = 400;\n"
+            "  for (tile = 0; tile < 2; tile++) {\n"
+            "    for (i = 0; i < TILE_PIXEL_COUNT; i++)\n"
+            "      terrain_tiles[map_object_tile[tile]][i] = 1;\n"
+            "    gfx_tile_upload(map_object_tile[tile],\n"
+            "                    terrain_tiles[map_object_tile[tile]]);\n"
+            "  }\n"
+            "  results[0] = map_object_source_tile[0];\n"
+            "  results[1] = map_object_source_tile[1];\n"
+            "  results[2] = blocked(96, 96, 0);\n"
+            "  results[3] = blocked(288, 96, 0);\n"
+            "  results[4] = blocked(192, 96, 0);\n"
+            "  shots[0].x = 56; shots[0].y = 96;\n"
+            "  shots[0].direction = 8; shots[0].life = 120; update_shots();\n"
+            "  results[5] = shots[0].life;\n"
+            "  results[6] = object_active[0];\n"
+            "  shots[0].x = 248; shots[0].y = 96;\n"
+            "  shots[0].life = 120; update_shots();\n"
+            "  results[7] = shots[0].life;\n"
+            "  results[8] = object_active[1];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[9];\n" + source + scenario, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(9)],
+            [0, 6, 1, 1, 0, 0, 1, 0, 1],
+        )
+
+    def test_minimap_is_below_header_over_both_viewports(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        scenario = (
+            "int main(void) {\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  start_round();\n"
+            "  tanks[0].x = 96; tanks[0].y = 16;\n"
+            "  tanks[1].x = 576; tanks[1].y = 448;\n"
+            "  results[0] = TANK16_HUD_HEIGHT;\n"
+            "  results[1] = tank_camera_y(0);\n"
+            "  results[2] = tanks[0].y - tank_camera_y(0);\n"
+            "  gfx_layer_select(LAYER_HUD); gfx_clear(15); draw_minimap();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[3];\n" + self.game_source(source_path) + scenario,
+            str(source_path)))
+        while cpu.running:
+            cpu.step()
+        results = [
+            cpu.read_16(GLOBAL_BASE + index * 2) for index in range(3)
+        ]
+        results = [
+            value - 65536 if value >= 32768 else value for value in results
+        ]
+        self.assertEqual(results, [30, -30, 46])
+        self.assertEqual(layer_pixel(cpu, 4, 308, 33), 6)
+        self.assertEqual(layer_pixel(cpu, 4, 332, 54), 2)
+
+    def test_map_name_is_drawn_beneath_timer_without_extension(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1)
+        scenario = (
+            "int main(void) {\n"
+            "  int i; char path[] = \"maps/FINLAND.json\";\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  for (i = 0; path[i] != 0; i++) current_map_path[i] = path[i];\n"
+            "  current_map_path[i] = 0;\n"
+            "  gfx_layer_select(LAYER_HUD); gfx_clear(0); draw_map_name();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            source + scenario, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        lit_pixels = sum(
+            layer_pixel(cpu, 4, x, y) != 0
+            for x in range(280, 322) for y in range(17, 25)
+        )
+        self.assertGreater(lit_pixels, 0)
+        self.assertEqual(layer_pixel(cpu, 4, 274, 17), 0)
+        self.assertEqual(layer_pixel(cpu, 4, 322, 17), 0)
+
+    def test_water_depth_keeps_shoreline_and_marks_open_water(self):
+        editor = runpy.run_path(
+            str(GAME_DIR / "map_editor.py"))
+        map_data = editor["new_map"]("DEPTH", 9, 9, 0, 4)
+        for row in map_data["tiles"]:
+            for column in range(len(row)):
+                row[column] = [0, 4]
+        map_data["tiles"][4][4] = [0, 2]
+        editor["apply_water_depth_tiles"](map_data)
+        self.assertEqual(map_data["tiles"][4][5], [0, 4])
+        self.assertEqual(map_data["tiles"][4][6], [0, 4])
+        self.assertEqual(map_data["tiles"][4][7], [0, 9])
+        self.assertEqual(map_data["tiles"][6][6], [0, 4])
+        self.assertEqual(map_data["tiles"][7][7], [0, 9])
+
+        with tempfile.TemporaryDirectory() as directory:
+            saved = editor["save_map"](map_data, Path(directory))
+            restored = editor["load_map"](saved)
+        self.assertEqual(restored["tiles"][4][7], [0, 9])
+        self.assertEqual(restored["tiles"][7][7], [0, 9])
+
+        map_data["tiles"][4][6] = [0, 2]
+        editor["apply_water_depth_tiles"](map_data)
+        self.assertEqual(map_data["tiles"][4][7], [6, 5])
+
+        open_water = editor["new_map"]("BRIDGE", 9, 9, 0, 4)
+        for row in open_water["tiles"]:
+            for column in range(len(row)):
+                row[column] = [0, 4]
+        open_water["tiles"][0][0] = [0, 2]
+        open_water["tiles"][4][4] = [0, 6]
+        editor["apply_water_depth_tiles"](open_water)
+        self.assertEqual(open_water["tiles"][4][3], [0, 9])
+
+    def test_terrain_speed_averages_tank_samples_and_deep_water_damages(self):
+        source_path = GAME_DIR / "main.c"
+        source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1)
+        scenario = (
+            "int main(void) {\n"
+            "  int i; int samples;\n"
+            "  runtime_terrain_columns = 10; runtime_terrain_rows = 10;\n"
+            "  runtime_object_columns = 6; runtime_object_rows = 8;\n"
+            "  runtime_tile_size = 64; runtime_tile_count = 148;\n"
+            "  runtime_palette_count = 225;\n"
+            "  map_infinite = 0; map_columns = 10; map_rows = 8;\n"
+            "  runtime_map_lazy = 0;\n"
+            "  map_data = runtime_map_data; map_obstacles = runtime_map_obstacles;\n"
+            "  for (i = 0; i < 80; i++) {\n"
+            "    runtime_map_data[i] = 20; runtime_map_obstacles[i] = 0;\n"
+            "  }\n"
+            "  runtime_map_data[1 * map_columns + 1] = 0;\n"
+            "  runtime_map_data[1 * map_columns + 2] = 20;\n"
+            "  runtime_map_data[1 * map_columns + 3] = DEEP_WATER_TILE_ID;\n"
+            "  results[0] = tank_terrain_speed_percent(96, 96, &samples);\n"
+            "  results[1] = samples;\n"
+            "  results[2] = tank_terrain_speed_percent(160, 96, &samples);\n"
+            "  results[3] = tank_terrain_speed_percent(224, 96, &samples);\n"
+            "  results[4] = samples;\n"
+            "  results[5] = tank_terrain_speed_percent(128, 96, &samples);\n"
+            "  tanks[0].health = 100; tanks[0].x = 96; tanks[0].y = 96;\n"
+            "  tanks[0].direction = 8; tanks[0].speed = MAX_FORWARD_SPEED;\n"
+            "  tanks[0].throttle = MAX_FORWARD_SPEED; tanks[1].health = 0;\n"
+            "  update_tank(0, 0, 0); results[6] = tanks[0].speed;\n"
+            "  tanks[0].x = 160; tanks[0].speed = MAX_FORWARD_SPEED;\n"
+            "  update_tank(0, 0, 0); results[7] = tanks[0].speed;\n"
+            "  tanks[0].x = 224; tanks[0].speed = MAX_FORWARD_SPEED;\n"
+            "  for (i = 0; i < 29; i++) update_tank(0, 0, 0);\n"
+            "  results[8] = tanks[0].health;\n"
+            "  update_tank(0, 0, 0); results[9] = tanks[0].health;\n"
+            "  results[10] = tanks[0].speed;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[11];\n" + source + scenario, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(11)],
+            [100, 0, 70, 10, 9, 80, 32, 22, 100, 90, 3],
+        )
+
+    def test_minimap_does_not_load_unloaded_lazy_map_rows(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1)
+        scenario = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  map_infinite = 1; tanks[0].y = 16;\n"
+            "  results[0] = tank_camera_y(0);\n"
+            "  results[1] = tanks[0].y - tank_camera_y(0);\n"
+            "  map_infinite = 0; map_columns = 10; map_rows = 8;\n"
+            "  runtime_map_lazy = 1; map_data = runtime_map_data;\n"
+            "  tanks[0].x = 96; tanks[0].y = 96;\n"
+            "  tanks[1].x = 576; tanks[1].y = 448;\n"
+            "  gfx_layer_select(LAYER_HUD); gfx_clear(15); draw_minimap();\n"
+            "  for (i = 0; i < 8; i++) results[2] += runtime_row_loaded[i];\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[3];\n" + source + scenario, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        results = [
+            cpu.read_16(GLOBAL_BASE + index * 2) for index in range(3)
+        ]
+        results = [
+            value - 65536 if value >= 32768 else value for value in results
+        ]
+        self.assertEqual(results, [-239, 255, 0])
+        self.assertEqual(layer_pixel(cpu, 4, 308, 36), 6)
+        self.assertEqual(layer_pixel(cpu, 4, 332, 54), 2)
+
     def test_map_bounds_and_camera_clamping_follow_tile_pixel_size(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
         for tile_size, centered_camera, edge_camera in (
@@ -883,11 +1106,11 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(tileset["pixel_encoding"], "raw-index-v1")
         self.assertEqual(tileset["tile_size"], 64)
         self.assertEqual(
-            (tileset["terrain_columns"], tileset["terrain_rows"]), (10, 9))
+            (tileset["terrain_columns"], tileset["terrain_rows"]), (10, 10))
         self.assertEqual(
             (tileset["object_columns"], tileset["object_rows"]), (6, 8))
         self.assertEqual(len(tileset["palette"]), 224)
-        self.assertEqual(tileset["tile_count"], 138)
+        self.assertEqual(tileset["tile_count"], 148)
         binary_path = RUNTIME_TILE_DATA_PATH.with_suffix(".bin")
         self.assertEqual(
             binary_path.stat().st_size,
@@ -907,13 +1130,15 @@ class Tank16Tests(unittest.TestCase):
             "  int i;\n"
             "  int original_map;\n"
             "  int found_map_change;\n"
-            "  runtime_terrain_columns = 10; runtime_terrain_rows = 9;\n"
+            "  runtime_terrain_columns = 10; runtime_terrain_rows = 10;\n"
             "  runtime_object_columns = 6; runtime_object_rows = 8;\n"
-            "  runtime_tile_size = 64; runtime_tile_count = 138;\n"
+            "  runtime_tile_size = 64; runtime_tile_count = 148;\n"
             "  runtime_palette_count = 225;\n"
             "  results[8] = load_map_path(\"maps/B.json\");\n"
             "  results[9] = map_columns;\n"
             "  results[10] = load_map_path(\"maps/A.json\");\n"
+            "  results[16] = map_object_count;\n"
+            "  results[17] = map_object_source_tile[0];\n"
             "  results[11] = runtime_map_lazy * 100 + runtime_map_rows_loaded;\n"
             "  results[12] = map_tile_at(2, 3);\n"
             "  results[13] = map_obstacle_at(1, 2) - OBJECT_TILE_BASE;\n"
@@ -972,12 +1197,15 @@ class Tank16Tests(unittest.TestCase):
                 map_document["obstacles"][1][2] = [4, 1]
                 map_document["objects"] = [
                     [None] * width for _ in range(height)]
+                map_document["objects"][1][1] = {
+                    "tile": [0, 1], "hp_change": -25, "removal": "fixed",
+                }
                 (maps_dir / name).write_bytes(
                     editor["serialize_runtime_map"](
                         editor["encode_runtime_map"](map_document)
                     ).encode("ascii"))
             image = compile_source(
-                "int results[16];\n" + game_source + test_source,
+                "int results[18];\n" + game_source + test_source,
                 str(source_path),
             )
             cpu = make_cpu(image)
@@ -1020,6 +1248,9 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(
             [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(10, 16)],
             [1, 100, 5, 1 * 6 + 4, 0, 3], runtime_log)
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in (16, 17)],
+            [1, 6], runtime_log)
         self.assertIn("MAP FILE: maps/B.json", runtime_log)
         self.assertIn(
             "MAP TERRAIN TILE: id=2 source=(2,0) cells=20", runtime_log)
@@ -1103,7 +1334,7 @@ class Tank16Tests(unittest.TestCase):
         runtime_log = cpu.console_device.output.decode("ascii")
         self.assertIn("TILE DATA: assets/TANK16_TILES.json", runtime_log)
         self.assertIn("TILE 0 terrain source=(0,0) loaded", runtime_log)
-        self.assertIn("TILE 90 object source=(0,0) loaded", runtime_log)
+        self.assertIn("TILE 90 terrain source=(0,9) loaded", runtime_log)
         self.assertIn("TILE 0 terrain source=(0,0) loaded (4096 bytes)",
                       runtime_log)
         self.assertIn("TILE 0 terrain source=(0,0) loaded (8206 bytes)",

@@ -13,7 +13,7 @@ if str(GAME_DIR) not in sys.path:
     sys.path.insert(0, str(GAME_DIR))
 
 from generate_finland_map import (
-    ATLAS_PATH, GAME_DIR, bridge_tile, extend_atlas, generate_map,
+    ATLAS_PATH, GAME_DIR, bridge_tile, deep_water_tile, extend_atlas, generate_map,
     project, rail_bridge_tile, train_track_tile, water_tile,
 )
 
@@ -40,7 +40,7 @@ class FinlandMapTests(unittest.TestCase):
             for tile in row:
                 self.assertEqual(len(tile), 2)
                 self.assertTrue(all(type(component) is int for component in tile))
-                self.assertTrue(0 <= tile[0] < 10 and 0 <= tile[1] < 9)
+                self.assertTrue(0 <= tile[0] < 10 and 0 <= tile[1] < 10)
                 tile_id = tile[1] * 10 + tile[0]
                 terrain_ids.add(tile_id)
         counts = data["geography"]["tile_counts"]
@@ -52,6 +52,7 @@ class FinlandMapTests(unittest.TestCase):
         self.assertGreater(counts["road_bridges"], 0)
         self.assertGreater(counts["rail_bridges"], 0)
         self.assertTrue(any(40 <= tile_id <= 59 for tile_id in terrain_ids))
+        self.assertIn(90, terrain_ids)
         self.assertTrue(any(60 <= tile_id <= 69 for tile_id in terrain_ids))
         self.assertTrue(any(70 <= tile_id <= 85 for tile_id in terrain_ids))
         self.assertGreater(data["geography"]["road_features"], 0)
@@ -122,10 +123,11 @@ class FinlandMapTests(unittest.TestCase):
                 column = round((x - bounds[0]) / span * 99)
                 row = round((bounds[3] - y) / span * 99)
                 nearby_water = [
-                    40 <= (
+                    (40 <= (
                         self.data["tiles"][nearby_row][nearby_column][1] * 10
                         + self.data["tiles"][nearby_row][nearby_column][0]
-                    ) <= 69
+                    ) <= 69 or
+                     self.data["tiles"][nearby_row][nearby_column] == [0, 9])
                     for nearby_row in range(max(0, row - 1), min(100, row + 2))
                     for nearby_column in range(
                         max(0, column - 1), min(100, column + 2))
@@ -179,7 +181,7 @@ class FinlandMapTests(unittest.TestCase):
 
     def test_water_atlas_preserves_original_pixels_and_64_pixel_grid(self):
         atlas = pygame.image.load(str(ATLAS_PATH))
-        self.assertEqual(atlas.get_size(), (640, 576))
+        self.assertEqual(atlas.get_size(), (640, 640))
         original = pygame.image.tobytes(atlas.subsurface((0, 0, 640, 256)), "RGBA")
         self.assertEqual(hashlib.sha256(original).hexdigest(),
                          "bf26f8100fab109cbfda6d152a86b8777cf0a4e5b278692830d1ff5ddda5421c")
@@ -191,6 +193,11 @@ class FinlandMapTests(unittest.TestCase):
                                  index if index < 16 else 0, max(0, index - 15)), "RGBA"))
             self.assertEqual(tile.get_at((32, 32)).a, 255)
             self.assertGreater(tile.get_at((32, 32)).b, tile.get_at((32, 32)).r)
+        deep_water = atlas.subsurface((0, 9 * 64, 64, 64))
+        self.assertEqual(
+            pygame.image.tobytes(deep_water, "RGBA"),
+            pygame.image.tobytes(deep_water_tile(), "RGBA"))
+        self.assertLess(deep_water.get_at((32, 32)).b, 100)
         shoreline_depths = []
         for x in range(4, 61, 4):
             shoreline_depths.append(next(
@@ -244,7 +251,7 @@ class FinlandMapTests(unittest.TestCase):
             extend_atlas(path)
             self.assertEqual(path.read_bytes(), generated)
             extended = pygame.image.load(str(path))
-            self.assertEqual(extended.get_size(), (640, 576))
+            self.assertEqual(extended.get_size(), (640, 640))
 
     def test_generator_rasterizes_polygons_holes_and_lakes_without_network(self):
         countries = {"features": [{
