@@ -1,5 +1,6 @@
-use crate::cpu::{Cpu, GpuLine, GpuTriangle};
+use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle};
 use crate::image::{ImageError, ProgramImage, build_source, load_binary};
+use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, Rect, Texture2D, WHITE,
     clear_background, draw_line, draw_texture_ex, draw_triangle, get_keys_down, get_keys_pressed,
@@ -13,6 +14,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const SPEED_ADDR: usize = 0x43003;
 const RTC_START: usize = 0x43010;
 const GFX_MODE_ADDR: usize = 0x43014;
+const SOUND_RATE: u32 = 22_050;
+const SOUND_FPS: u32 = 60;
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -51,6 +54,128 @@ impl From<std::io::Error> for RuntimeError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+struct ActiveSound {
+    command: GpuSoundCommand,
+    sound: Sound,
+}
+
+struct AudioEngine {
+    channels: [Option<ActiveSound>; 4],
+}
+
+impl AudioEngine {
+    fn new() -> Self {
+        Self {
+            channels: std::array::from_fn(|_| None),
+        }
+    }
+
+    async fn apply(&mut self, command: GpuSoundCommand) -> Result<(), RuntimeError> {
+        let channel = command.channel as usize;
+        if command.frequency == 0 {
+            if let Some(active) = self.channels[channel].take() {
+                stop_sound(&active.sound);
+            }
+            return Ok(());
+        }
+        if command.frames == 0
+            && self.channels[channel]
+                .as_ref()
+                .is_some_and(|active| active.command == command)
+        {
+            return Ok(());
+        }
+        if let Some(active) = self.channels[channel].take() {
+            stop_sound(&active.sound);
+        }
+        let wav = synthesize_sound(command);
+        let sound = load_sound_from_bytes(&wav).await.map_err(|error| {
+            RuntimeError::Window(format!("cannot load synthesized sound: {error}"))
+        })?;
+        play_sound(
+            &sound,
+            PlaySoundParams {
+                looped: command.frames == 0,
+                volume: 1.0,
+            },
+        );
+        self.channels[channel] = Some(ActiveSound { command, sound });
+        Ok(())
+    }
+}
+
+fn synthesize_sound(command: GpuSoundCommand) -> Vec<u8> {
+    let frequency = u32::from(command.frequency).clamp(20, SOUND_RATE / 2);
+    let period = (SOUND_RATE + frequency / 2) / frequency;
+    let sample_count = if command.frames == 0 {
+        if command.waveform == 1 {
+            SOUND_RATE / 2
+        } else {
+            let quarter_second = SOUND_RATE / 4;
+            period * (quarter_second / period).max(1)
+        }
+    } else {
+        u32::from(command.frames) * SOUND_RATE / SOUND_FPS
+    } as usize;
+    let volume = if command.volume == 0 {
+        100
+    } else {
+        command.volume.min(100)
+    };
+    let amplitude = 32_767i32 * i32::from(volume.max(1)) / 100 / 2;
+    let data_bytes = sample_count * 2;
+    let mut wav = Vec::with_capacity(44 + data_bytes);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36u32 + data_bytes as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&SOUND_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SOUND_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+
+    let mut noise_state = 0x16c0_ffee ^ u32::from(command.frequency);
+    for index in 0..sample_count {
+        let phase = index as u32 % period;
+        let mut sample = match command.waveform {
+            1 => {
+                if phase == 0 {
+                    noise_state ^= noise_state << 13;
+                    noise_state ^= noise_state >> 17;
+                    noise_state ^= noise_state << 5;
+                }
+                let range = (amplitude * 2 + 1) as u32;
+                (noise_state % range) as i32 - amplitude
+            }
+            2 => {
+                let centered =
+                    (phase as i64 * 4 * amplitude as i64 / period as i64) - (2 * amplitude as i64);
+                if centered < 0 {
+                    (-centered - amplitude as i64) as i32
+                } else {
+                    (centered - amplitude as i64) as i32
+                }
+            }
+            _ => {
+                if phase < period / 2 {
+                    amplitude
+                } else {
+                    -amplitude
+                }
+            }
+        };
+        if command.frames != 0 {
+            sample = (sample as i64 * (sample_count - index) as i64 / sample_count as i64) as i32;
+        }
+        wav.extend_from_slice(&(sample as i16).to_le_bytes());
+    }
+    wav
 }
 
 struct Canvas {
@@ -168,6 +293,7 @@ pub async fn run(
     let font = load_font();
     let mut pixels = vec![0u32; 640 * 480];
     let mut canvas = Canvas::new();
+    let mut audio = AudioEngine::new();
     if let Some(source) = program {
         let image = build_program(root, source)?;
         cpu.load_program(&image.segments, image.entry_point)
@@ -217,6 +343,9 @@ pub async fn run(
         };
         cpu.run(budget)
             .map_err(|error| RuntimeError::Window(error.to_string()))?;
+        for command in cpu.take_sound_commands() {
+            audio.apply(command).await?;
+        }
         render_cpu(&cpu, &mut pixels);
         let (width, height) = screen_size(&cpu);
         canvas
@@ -584,6 +713,34 @@ fn draw_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_synthesis_produces_valid_pcm_wav_with_requested_duration() {
+        let wav = synthesize_sound(GpuSoundCommand {
+            channel: 0,
+            frequency: 440,
+            frames: 60,
+            waveform: 0,
+            volume: 50,
+        });
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 44_100);
+        assert_eq!(wav.len(), 44 + 44_100);
+    }
+
+    #[test]
+    fn looping_noise_synthesis_generates_half_second_of_pcm() {
+        let wav = synthesize_sound(GpuSoundCommand {
+            channel: 3,
+            frequency: 220,
+            frames: 0,
+            waveform: 1,
+            volume: 100,
+        });
+        assert_eq!(wav.len(), 44 + (SOUND_RATE as usize));
+    }
 
     #[test]
     fn retained_c_compiler_builds_and_rust_executes_program() {

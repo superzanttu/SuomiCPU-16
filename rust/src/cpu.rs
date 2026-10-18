@@ -34,6 +34,7 @@ const GPU_RANDOM: u8 = 9;
 const GPU_POLY: u8 = 10;
 const GPU_TICKS: u8 = 11;
 const GPU_RTC: u8 = 12;
+const GPU_SOUND: u8 = 13;
 const GPU_TILEMAP: u8 = 21;
 const GPU_3D: u8 = 22;
 const GPU_SPRITE_UPLOAD: u8 = 23;
@@ -44,10 +45,20 @@ const GPU_SAVE: u8 = 14;
 const GPU_LOAD: u8 = 15;
 const GPU_TILE_SIZE: u8 = 28;
 const GPU_SPLIT_CAMERA: u8 = 29;
+const GPU_MASK_OVERLAP: u8 = 31;
+const GPU_WORLD_TILE: u8 = 30;
+const GPU_WORLD_AMMO: u8 = 32;
+const GPU_WORLD_RECT: u8 = 33;
+const GPU_WORLD_PARTICLE: u8 = 35;
 const GPU_TILE_CAMERA_WIDE: u8 = 36;
 const GPU_SPLIT_CAMERA_WIDE: u8 = 37;
 const GPU_TILEMAP_WIDE: u8 = 38;
+const GPU_WORLD_TILE_WIDE: u8 = 39;
+const GPU_WORLD_AMMO_WIDE: u8 = 40;
+const GPU_WORLD_RECT_WIDE: u8 = 41;
+const GPU_WORLD_PARTICLE_WIDE: u8 = 42;
 const GPU_SPRITE_MOVE_WIDE: u8 = 44;
+const GPU_MASK_OVERLAP_WIDE: u8 = 45;
 const GPU_SPRITE_SLOTS: usize = 64;
 const GPU_TILE_COUNT: usize = 256;
 const GPU_TILE_MAX_SIZE: usize = 64;
@@ -154,6 +165,15 @@ pub struct GpuLine {
     pub color: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuSoundCommand {
+    pub channel: u8,
+    pub frequency: u16,
+    pub frames: u16,
+    pub waveform: u16,
+    pub volume: u16,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GpuSprite {
     width: usize,
@@ -216,6 +236,7 @@ pub struct Cpu {
     pub palette: [[u8; 3]; 256],
     pub gpu_triangles: Vec<GpuTriangle>,
     pub gpu_lines: Vec<GpuLine>,
+    sound_commands: [Option<GpuSoundCommand>; 4],
     sprites: [Option<GpuSprite>; GPU_SPRITE_SLOTS],
     sprite_descriptors: [(i32, i32, u8); GPU_SPRITE_SLOTS],
     tile_memory: Vec<u8>,
@@ -298,6 +319,7 @@ impl Cpu {
             palette,
             gpu_triangles: Vec::new(),
             gpu_lines: Vec::new(),
+            sound_commands: [None; 4],
             sprites: std::array::from_fn(|_| None),
             sprite_descriptors: [(0, 0, 0); GPU_SPRITE_SLOTS],
             tile_memory,
@@ -1150,6 +1172,13 @@ impl Cpu {
         }
     }
 
+    pub fn take_sound_commands(&mut self) -> Vec<GpuSoundCommand> {
+        self.sound_commands
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect()
+    }
+
     fn gpu_word(&self, offset: u32) -> i16 {
         let high = self.memory[(GPU_BASE + offset) as usize];
         let low = self.memory[(GPU_BASE + offset + 1) as usize];
@@ -1260,7 +1289,7 @@ impl Cpu {
         target.fill(0);
         let split_x = screen_width / 2;
         let views = self.split_cameras.map_or_else(
-            || vec![((0, 0), 0, screen_width)],
+            || vec![(self.tile_camera, 0, screen_width)],
             |cameras| {
                 vec![
                     (cameras[0], 0, split_x),
@@ -1307,6 +1336,231 @@ impl Cpu {
                 }
             }
         }
+    }
+
+    fn collision_mask(&self, mask: u16) -> Option<(usize, usize, Vec<u8>)> {
+        if usize::from(mask) < GPU_SPRITE_SLOTS {
+            let sprite = self.sprites[mask as usize].as_ref()?;
+            return Some((sprite.width, sprite.height, sprite.pixels.clone()));
+        }
+        let tile = usize::from(mask).checked_sub(GPU_SPRITE_SLOTS)?;
+        if tile < GPU_TILE_COUNT {
+            let size = self.tile_pixel_size;
+            let start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
+            return Some((
+                size,
+                size,
+                self.tile_memory[start..start + size * size].to_vec(),
+            ));
+        }
+        if usize::from(mask) == GPU_SPRITE_SLOTS + GPU_TILE_COUNT {
+            let pixels = (0i32..7)
+                .flat_map(|y| (0i32..7).map(move |x| u8::from((x - 3).abs() + (y - 3).abs() <= 3)))
+                .collect();
+            return Some((7, 7, pixels));
+        }
+        None
+    }
+
+    fn masks_overlap(
+        first: &(usize, usize, Vec<u8>),
+        first_x: i32,
+        first_y: i32,
+        second: &(usize, usize, Vec<u8>),
+        second_x: i32,
+        second_y: i32,
+    ) -> bool {
+        let left = i64::from(first_x).max(i64::from(second_x));
+        let top = i64::from(first_y).max(i64::from(second_y));
+        let right =
+            (i64::from(first_x) + first.0 as i64).min(i64::from(second_x) + second.0 as i64);
+        let bottom =
+            (i64::from(first_y) + first.1 as i64).min(i64::from(second_y) + second.1 as i64);
+        for y in top..bottom {
+            for x in left..right {
+                let first_index = ((y - i64::from(first_y)) as usize) * first.0
+                    + (x - i64::from(first_x)) as usize;
+                let second_index = ((y - i64::from(second_y)) as usize) * second.0
+                    + (x - i64::from(second_x)) as usize;
+                if first.2[first_index] != 0 && second.2[second_index] != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn gpu_world_views(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Vec<(i64, i64, i64, i64, i64, i64, i64)> {
+        let (screen_width, screen_height) = self.screen_size();
+        let split_x = screen_width / 2;
+        let views = self.split_cameras.map_or_else(
+            || vec![(self.tile_camera, 0, screen_width)],
+            |cameras| {
+                vec![
+                    (cameras[0], 0, split_x),
+                    (cameras[1], split_x, screen_width),
+                ]
+            },
+        );
+        let mut result = Vec::with_capacity(views.len());
+        for ((camera_x, camera_y), clip_left, clip_right) in views {
+            let (camera_x, camera_y) = (i64::from(camera_x), i64::from(camera_y));
+            let mut left = i64::from(x).max(camera_x);
+            let mut right =
+                (i64::from(x) + i64::from(width)).min(camera_x + i64::from(clip_right - clip_left));
+            let mut top = i64::from(y).max(camera_y);
+            let mut bottom =
+                (i64::from(y) + i64::from(height)).min(camera_y + i64::from(screen_height));
+            if self.tilemap_width > 0 && self.tilemap_height > 0 {
+                left = left.max(0);
+                right = right.min((self.tilemap_width * self.tile_pixel_size) as i64);
+                top = top.max(0);
+                bottom = bottom.min((self.tilemap_height * self.tile_pixel_size) as i64);
+            }
+            if left < right && top < bottom {
+                result.push((
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    i64::from(clip_left) - camera_x,
+                    -camera_y,
+                    i64::from(screen_width),
+                ));
+            }
+        }
+        result
+    }
+
+    fn gpu_world_tile(&mut self, tile: u8, origin_x: i32, origin_y: i32) {
+        let layer =
+            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        if layer == 0 {
+            self.set_gpu_result(1);
+            return;
+        }
+        let size = self.tile_pixel_size as i32;
+        let views = self.gpu_world_views(origin_x, origin_y, size, size);
+        let source_start = usize::from(tile) * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
+        for (left, top, right, bottom, dx, dy, stride) in views {
+            for pixel_y in top..bottom {
+                let source_y = (pixel_y - i64::from(origin_y)) as usize;
+                for pixel_x in left..right {
+                    let source_x = (pixel_x - i64::from(origin_x)) as usize;
+                    let pixel =
+                        self.tile_memory[source_start + source_y * self.tile_pixel_size + source_x];
+                    if pixel != 0 {
+                        let screen_x = pixel_x + dx;
+                        let screen_y = pixel_y + dy;
+                        let index = (screen_y * stride + screen_x) as usize;
+                        self.layers[layer][index] = pixel;
+                    }
+                }
+            }
+        }
+        self.set_gpu_result(0);
+    }
+
+    fn gpu_world_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: u8) {
+        let layer =
+            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        if layer == 0 {
+            self.set_gpu_result(1);
+            return;
+        }
+        for (left, top, right, bottom, dx, dy, stride) in self.gpu_world_views(x, y, width, height)
+        {
+            for world_y in top..bottom {
+                let start = ((world_y + dy) * stride + left + dx) as usize;
+                let end = start + (right - left) as usize;
+                self.layers[layer][start..end].fill(color);
+            }
+        }
+        self.set_gpu_result(0);
+    }
+
+    fn gpu_world_disc(&mut self, x: i32, y: i32, radius: i32, color: u8, opacity: i32) {
+        let layer =
+            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        if layer == 0 || !(0..=32).contains(&radius) || !(0..=16).contains(&opacity) {
+            self.set_gpu_result(1);
+            return;
+        }
+        const DITHER: [i32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+        for (left, top, right, bottom, dx, dy, stride) in self.gpu_world_views(
+            x.saturating_sub(radius),
+            y.saturating_sub(radius),
+            radius * 2 + 1,
+            radius * 2 + 1,
+        ) {
+            for world_y in top..bottom {
+                for world_x in left..right {
+                    let offset_x = world_x - i64::from(x);
+                    let offset_y = world_y - i64::from(y);
+                    let distance = offset_x * offset_x + offset_y * offset_y;
+                    if distance > i64::from(radius) * i64::from(radius) {
+                        continue;
+                    }
+                    let mut coverage = opacity;
+                    if radius > 2 && distance > i64::from(radius - 1) * i64::from(radius - 1) {
+                        coverage /= 2;
+                    }
+                    let dither_index = (world_y.rem_euclid(4) * 4 + world_x.rem_euclid(4)) as usize;
+                    if DITHER[dither_index] < coverage {
+                        let screen_x = world_x + dx;
+                        let screen_y = world_y + dy;
+                        self.layers[layer][(screen_y * stride + screen_x) as usize] = color;
+                    }
+                }
+            }
+        }
+        self.set_gpu_result(0);
+    }
+
+    fn gpu_world_ammo(&mut self, world_x: i32, world_y: i32) {
+        let layer =
+            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        if layer == 0 {
+            self.set_gpu_result(1);
+            return;
+        }
+        let (screen_width, screen_height) = self.screen_size();
+        let split_x = screen_width / 2;
+        let views = self.split_cameras.map_or_else(
+            || vec![(self.tile_camera, 0, screen_width)],
+            |cameras| {
+                vec![
+                    (cameras[0], 0, split_x),
+                    (cameras[1], split_x, screen_width),
+                ]
+            },
+        );
+        for ((camera_x, camera_y), clip_left, clip_right) in views {
+            for offset_y in -3i32..=3 {
+                for offset_x in -3i32..=3 {
+                    let distance = offset_x.abs() + offset_y.abs();
+                    let x = world_x
+                        .saturating_add(offset_x)
+                        .saturating_sub(camera_x)
+                        .saturating_add(clip_left);
+                    let y = world_y.saturating_add(offset_y).saturating_sub(camera_y);
+                    if distance <= 3
+                        && (clip_left..clip_right).contains(&x)
+                        && (0..screen_height).contains(&y)
+                    {
+                        self.layers[layer][(y * screen_width + x) as usize] =
+                            if distance <= 1 { 1 } else { 5 };
+                    }
+                }
+            }
+        }
+        self.set_gpu_result(0);
     }
 
     fn screen_size(&self) -> (i32, i32) {
@@ -1630,6 +1884,16 @@ impl Cpu {
                     0
                 };
             }
+            GPU_SOUND => {
+                let command = GpuSoundCommand {
+                    channel: color & 3,
+                    frequency: self.gpu_word(2) as u16,
+                    frames: self.gpu_word(4) as u16,
+                    waveform: self.gpu_word(6) as u16,
+                    volume: self.gpu_word(8) as u16,
+                };
+                self.sound_commands[command.channel as usize] = Some(command);
+            }
             GPU_PALETTE => {
                 let red = self.gpu_word(2) as u8;
                 let green = self.gpu_word(4) as u8;
@@ -1713,6 +1977,21 @@ impl Cpu {
             GPU_TILEMAP_WIDE => {
                 self.gpu_tilemap(self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26), w, h)
             }
+            GPU_MASK_OVERLAP => {
+                let first = self.collision_mask(self.gpu_word(10) as u16);
+                let second = self.collision_mask(self.gpu_word(12) as u16);
+                let result = match (first, second) {
+                    (Some(first), Some(second)) => {
+                        u16::from(Self::masks_overlap(&first, x, y, &second, w, h))
+                    }
+                    _ => u16::MAX,
+                };
+                self.set_gpu_result(result);
+            }
+            GPU_WORLD_TILE => self.gpu_world_tile(color, x, y),
+            GPU_WORLD_AMMO => self.gpu_world_ammo(x, y),
+            GPU_WORLD_RECT => self.gpu_world_rect(x, y, w, h, color),
+            GPU_WORLD_PARTICLE => self.gpu_world_disc(x, y, w, color, h),
             GPU_SPRITE_MOVE_WIDE => {
                 let sprite_x = self.gpu_wide_field(2, 24);
                 let sprite_y = self.gpu_wide_field(4, 26);
@@ -1721,6 +2000,44 @@ impl Cpu {
                     self.render_sprites();
                 }
             }
+            GPU_MASK_OVERLAP_WIDE => {
+                let first = self.collision_mask(self.gpu_word(10) as u16);
+                let second = self.collision_mask(self.gpu_word(12) as u16);
+                let result = match (first, second) {
+                    (Some(first), Some(second)) => u16::from(Self::masks_overlap(
+                        &first,
+                        self.gpu_wide_field(2, 24),
+                        self.gpu_wide_field(4, 26),
+                        &second,
+                        self.gpu_wide_field(6, 28),
+                        self.gpu_wide_field(8, 30),
+                    )),
+                    _ => u16::MAX,
+                };
+                self.set_gpu_result(result);
+            }
+            GPU_WORLD_TILE_WIDE => self.gpu_world_tile(
+                color,
+                self.gpu_wide_field(2, 24),
+                self.gpu_wide_field(4, 26),
+            ),
+            GPU_WORLD_AMMO_WIDE => {
+                self.gpu_world_ammo(self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26))
+            }
+            GPU_WORLD_RECT_WIDE => self.gpu_world_rect(
+                self.gpu_wide_field(2, 24),
+                self.gpu_wide_field(4, 26),
+                w,
+                h,
+                color,
+            ),
+            GPU_WORLD_PARTICLE_WIDE => self.gpu_world_disc(
+                self.gpu_wide_field(2, 24),
+                self.gpu_wide_field(4, 26),
+                w,
+                color,
+                h,
+            ),
             GPU_3D => self.gpu_3d(self.gpu_source()),
             GPU_SAVE => {
                 let (width, height) = self.screen_size();
@@ -2197,6 +2514,41 @@ mod tests {
     }
 
     #[test]
+    fn gpu_sound_commands_capture_unsigned_parameters_per_channel() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_BASE + 1, 5);
+        cpu.write_u16(GPU_BASE + 2, 440);
+        cpu.write_u16(GPU_BASE + 4, 60);
+        cpu.write_u16(GPU_BASE + 6, 2);
+        cpu.write_u16(GPU_BASE + 8, 75);
+        cpu.write(GPU_BASE, GPU_SOUND);
+        cpu.write(GPU_BASE + 1, 2);
+        cpu.write_u16(GPU_BASE + 2, 0);
+        cpu.write(GPU_BASE, GPU_SOUND);
+
+        assert_eq!(
+            cpu.take_sound_commands(),
+            [
+                GpuSoundCommand {
+                    channel: 1,
+                    frequency: 440,
+                    frames: 60,
+                    waveform: 2,
+                    volume: 75,
+                },
+                GpuSoundCommand {
+                    channel: 2,
+                    frequency: 0,
+                    frames: 60,
+                    waveform: 2,
+                    volume: 75,
+                },
+            ]
+        );
+        assert!(cpu.take_sound_commands().is_empty());
+    }
+
+    #[test]
     fn tile_upload_and_tilemap_render_indexed_pixels() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         for index in 0..256 {
@@ -2257,6 +2609,110 @@ mod tests {
         assert_eq!(&cpu.layers[2][row_start..row_start + 2], &[0, 1]);
         let next_row = row_start + 320;
         assert_eq!(&cpu.layers[2][next_row..next_row + 2], &[3, 2]);
+    }
+
+    #[test]
+    fn collision_masks_check_opaque_pixels_and_report_missing_masks() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.memory[0x1000..0x1004].copy_from_slice(&[1, 0, 0, 0]);
+        cpu.memory[0x1100..0x1104].copy_from_slice(&[0, 1, 0, 0]);
+        for (slot, source) in [(0, 0x1000), (1, 0x1100)] {
+            cpu.write_u16(GPU_BASE + 10, source);
+            cpu.write(GPU_BASE + 1, slot);
+            cpu.write_u16(GPU_BASE + 6, 2);
+            cpu.write_u16(GPU_BASE + 8, 2);
+            cpu.write(GPU_BASE, GPU_SPRITE_UPLOAD);
+            assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        }
+
+        cpu.write_u16(GPU_BASE + 10, 0);
+        cpu.write_u16(GPU_BASE + 12, 1);
+        cpu.write_u16(GPU_BASE + 2, 10);
+        cpu.write_u16(GPU_BASE + 4, 20);
+        cpu.write_u16(GPU_BASE + 6, 10);
+        cpu.write_u16(GPU_BASE + 8, 20);
+        cpu.write(GPU_BASE, GPU_MASK_OVERLAP);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+
+        cpu.write_u16(GPU_BASE + 6, 9);
+        cpu.write(GPU_BASE, GPU_MASK_OVERLAP);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+
+        cpu.write_u16(GPU_BASE + 12, 63);
+        cpu.write(GPU_BASE, GPU_MASK_OVERLAP);
+        assert_eq!(
+            &cpu.memory[(GPU_BASE + 14) as usize..(GPU_BASE + 16) as usize],
+            &[255, 255]
+        );
+    }
+
+    #[test]
+    fn wide_collision_masks_support_signed_32_bit_coordinates() {
+        let first = (2, 2, vec![1, 0, 0, 0]);
+        let second = (2, 2, vec![0, 1, 0, 0]);
+        assert!(Cpu::masks_overlap(&first, -70_000, 0, &second, -70_001, 0));
+        assert!(!Cpu::masks_overlap(
+            &first,
+            i32::MAX,
+            0,
+            &second,
+            i32::MIN,
+            0
+        ));
+    }
+
+    #[test]
+    fn world_rect_and_ammo_draw_relative_to_the_active_camera() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_LAYER_SELECT, 1);
+        cpu.write_u16(GPU_BASE + 2, 10);
+        cpu.write_u16(GPU_BASE + 4, 20);
+        cpu.write(GPU_BASE, GPU_TILE_CAMERA);
+
+        cpu.write(GPU_BASE + 1, 6);
+        cpu.write_u16(GPU_BASE + 2, 11);
+        cpu.write_u16(GPU_BASE + 4, 21);
+        cpu.write_u16(GPU_BASE + 6, 2);
+        cpu.write_u16(GPU_BASE + 8, 1);
+        cpu.write(GPU_BASE, GPU_WORLD_RECT);
+        assert_eq!(cpu.layers[1][320 + 1], 6);
+        assert_eq!(cpu.layers[1][320 + 2], 6);
+        assert_eq!(cpu.layers[1][320], 0);
+
+        cpu.write_u16(GPU_BASE + 2, 13);
+        cpu.write_u16(GPU_BASE + 4, 22);
+        cpu.write(GPU_BASE, GPU_WORLD_AMMO);
+        assert_eq!(cpu.layers[1][2 * 320 + 3], 1);
+        assert_eq!(cpu.layers[1][2 * 320 + 5], 5);
+    }
+
+    #[test]
+    fn world_tiles_preserve_zero_transparency_and_particle_inputs_validate() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let tile_start = 2 * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
+        cpu.tile_memory[tile_start..tile_start + 16 * 16].fill(0);
+        cpu.tile_memory[tile_start] = 9;
+        cpu.write(GPU_LAYER_SELECT, 2);
+        cpu.write(GPU_BASE + 1, 2);
+        cpu.write_u16(GPU_BASE + 2, 0);
+        cpu.write_u16(GPU_BASE + 4, 0);
+        cpu.write(GPU_BASE, GPU_WORLD_TILE);
+        assert_eq!(cpu.layers[2][0], 9);
+        assert_eq!(cpu.layers[2][1], 0);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+
+        cpu.write(GPU_BASE + 1, 5);
+        cpu.write_u16(GPU_BASE + 2, 20);
+        cpu.write_u16(GPU_BASE + 4, 20);
+        cpu.write_u16(GPU_BASE + 6, 1);
+        cpu.write_u16(GPU_BASE + 8, 16);
+        cpu.write(GPU_BASE, GPU_WORLD_PARTICLE);
+        assert_eq!(cpu.layers[2][20 * 320 + 20], 5);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+
+        cpu.write_u16(GPU_BASE + 6, 33);
+        cpu.write(GPU_BASE, GPU_WORLD_PARTICLE);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
     }
 
     #[test]
