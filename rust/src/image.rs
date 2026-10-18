@@ -1,0 +1,171 @@
+use crate::{CpuError, MemorySegment};
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAGIC: &[u8; 8] = b"SC16IMG1";
+const MEMORY_SIZE: u64 = 1 << 30;
+
+#[derive(Debug)]
+pub enum ImageError {
+    Io(io::Error),
+    BuildFailed,
+    InvalidFormat(&'static str),
+    Cpu(CpuError),
+}
+
+impl std::fmt::Display for ImageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "{error}"),
+            Self::BuildFailed => write!(formatter, "Python SC-16 build tool failed"),
+            Self::InvalidFormat(reason) => write!(formatter, "invalid SC-16 image: {reason}"),
+            Self::Cpu(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ImageError {}
+
+impl From<io::Error> for ImageError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<CpuError> for ImageError {
+    fn from(error: CpuError) -> Self {
+        Self::Cpu(error)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProgramImage {
+    pub entry_point: u32,
+    pub segments: Vec<MemorySegment>,
+}
+
+pub fn load_binary(path: &Path) -> Result<ProgramImage, ImageError> {
+    let data = fs::read(path)?;
+    if data.len() as u64 > MEMORY_SIZE {
+        return Err(ImageError::InvalidFormat("binary exceeds SC-16 memory"));
+    }
+    Ok(ProgramImage {
+        entry_point: 0,
+        segments: vec![MemorySegment { address: 0, data }],
+    })
+}
+
+pub fn build_source(root: &Path, source: &Path, python: &str) -> Result<ProgramImage, ImageError> {
+    let temp_path = unique_temp_path();
+    let result = (|| {
+        let helper = root.join("tools").join("sc16_build_image.py");
+        let status = Command::new(python)
+            .arg(helper)
+            .arg(source)
+            .arg(&temp_path)
+            .current_dir(root)
+            .status()?;
+        if !status.success() {
+            return Err(ImageError::BuildFailed);
+        }
+        read_image(&temp_path)
+    })();
+    match fs::remove_file(&temp_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ImageError::Io(error)),
+    }
+    result
+}
+
+fn unique_temp_path() -> PathBuf {
+    let ticks = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("sc16-image-{}-{ticks}.tmp", std::process::id()))
+}
+
+pub fn read_image(path: &Path) -> Result<ProgramImage, ImageError> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header)?;
+    if &header[..8] != MAGIC {
+        return Err(ImageError::InvalidFormat("bad magic"));
+    }
+    let entry_point = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    let segment_count = u32::from_be_bytes(header[12..16].try_into().unwrap());
+    if u64::from(segment_count) > MEMORY_SIZE / 12 {
+        return Err(ImageError::InvalidFormat("segment count is excessive"));
+    }
+    let mut segments = Vec::with_capacity(segment_count as usize);
+    let mut total = 0u64;
+    for _ in 0..segment_count {
+        let mut segment_header = [0u8; 12];
+        file.read_exact(&mut segment_header)?;
+        let address = u32::from_be_bytes(segment_header[..4].try_into().unwrap());
+        let length = u64::from_be_bytes(segment_header[4..].try_into().unwrap());
+        let end = u64::from(address)
+            .checked_add(length)
+            .ok_or(ImageError::InvalidFormat("segment range overflow"))?;
+        if end > MEMORY_SIZE || length > MEMORY_SIZE {
+            return Err(ImageError::InvalidFormat("segment is outside memory"));
+        }
+        total = total
+            .checked_add(length)
+            .ok_or(ImageError::InvalidFormat("total image size overflow"))?;
+        if total > MEMORY_SIZE {
+            return Err(ImageError::InvalidFormat("image exceeds memory"));
+        }
+        let mut data = vec![0; length as usize];
+        file.read_exact(&mut data)?;
+        segments.push(MemorySegment { address, data });
+    }
+    let mut trailing = [0; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(ImageError::InvalidFormat("trailing bytes"));
+    }
+    Ok(ProgramImage {
+        entry_point,
+        segments,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_segmented_program_image() {
+        let path = std::env::temp_dir().join(format!("sc16-fixture-{}.img", std::process::id()));
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&0x10u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&0x10u32.to_be_bytes());
+        bytes.extend_from_slice(&2u64.to_be_bytes());
+        bytes.extend_from_slice(&[0x12, 0x34]);
+        bytes.extend_from_slice(&0x100u32.to_be_bytes());
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.push(0xab);
+        fs::write(&path, bytes).unwrap();
+        let parsed = read_image(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(parsed.entry_point, 0x10);
+        assert_eq!(
+            parsed.segments,
+            vec![
+                MemorySegment {
+                    address: 0x10,
+                    data: vec![0x12, 0x34],
+                },
+                MemorySegment {
+                    address: 0x100,
+                    data: vec![0xab],
+                },
+            ]
+        );
+    }
+}

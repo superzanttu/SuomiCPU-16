@@ -10,3 +10,7 @@ path = "rust/src/lib.rs"
 name = "suomicpu16"
 path = "rust/src/main.rs"
 
+[dependencies]
+memmap2 = "0.9"
+minifb = "0.28"
+

@@ -1,9 +1,35 @@
+use memmap2::MmapMut;
+use std::collections::VecDeque;
+
 pub const MEMORY_SIZE: usize = 1 << 30;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
 
 const ICR_ADDR: u32 = 0x43002;
 const KEY_VECTOR_ADDR: u32 = 0x0002;
 const RTC_VECTOR_ADDR: u32 = 0x0006;
+const KEYBOARD_ADDR: u32 = 0x43000;
+const KEYS_ADDR: u32 = 0x43004;
+const GPU_BASE: u32 = 0x43020;
+const RTC_START: u32 = 0x43010;
+const CONSOLE_DATA: u32 = 0x43200;
+const CONSOLE_STATUS: u32 = 0x43201;
+const CONSOLE_CONTROL: u32 = 0x43202;
+const VRAM_START: u32 = 0x50000;
+const GPU_CLEAR: u8 = 1;
+const GPU_PIXEL: u8 = 2;
+const GPU_RECT: u8 = 3;
+const GPU_LINE: u8 = 4;
+const GPU_SPRITE: u8 = 5;
+const GPU_BITMAP: u8 = 6;
+const GPU_TEXT: u8 = 7;
+const GPU_PRESENT: u8 = 8;
+const GPU_RANDOM: u8 = 9;
+const GPU_POLY: u8 = 10;
+const GPU_TICKS: u8 = 11;
+const GPU_RTC: u8 = 12;
+const GPU_SAVE: u8 = 14;
+const GPU_LOAD: u8 = 15;
+const FONT_ADDR: usize = 0x4400;
 const OP_HALT: u16 = 0x00;
 const OP_LDI: u16 = 0x01;
 const OP_LD: u16 = 0x02;
@@ -40,6 +66,14 @@ const FAR_CONTROL_MASK: u16 = 0xf83f;
 const FAR_CONTROL_PREFIX: u16 = 0xf83e;
 const FAR_BRANCH_MASK: u16 = 0xf80f;
 const FAR_BRANCH_PREFIX: u16 = 0xf80d;
+const FLOAT_MASK: u16 = 0xf81f;
+const FLOAT_PREFIX: u16 = 0xf81b;
+const MULDIV_MASK: u16 = 0xf8ff;
+const MULDIV_PREFIX: u16 = 0xf81e;
+const WIDE_MASK: u16 = 0xf81f;
+const WIDE_PREFIX: u16 = 0xf81a;
+const ALU_MASK: u16 = 0xf8ff;
+const ALU_PREFIX: u16 = 0xf81f;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -76,8 +110,10 @@ pub struct MemorySegment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpuError {
     InvalidMemorySize(usize),
+    MemoryMap(String),
     SegmentOutOfBounds { address: u32, length: usize },
     InvalidEntryPoint(u32),
+    InvalidRegisterPair(u16),
     UnsupportedInstruction(u16),
 }
 
@@ -87,6 +123,7 @@ impl std::fmt::Display for CpuError {
             Self::InvalidMemorySize(size) => {
                 write!(f, "memory size must be a power of two, got {size}")
             }
+            Self::MemoryMap(error) => write!(f, "cannot allocate SC-16 memory: {error}"),
             Self::SegmentOutOfBounds { address, length } => {
                 write!(
                     f,
@@ -95,6 +132,9 @@ impl std::fmt::Display for CpuError {
             }
             Self::InvalidEntryPoint(address) => {
                 write!(f, "entry point {address:#x} is outside memory")
+            }
+            Self::InvalidRegisterPair(instruction) => {
+                write!(f, "invalid register pair in instruction {instruction:#06x}")
             }
             Self::UnsupportedInstruction(instruction) => {
                 write!(f, "unsupported instruction {instruction:#06x}")
@@ -106,12 +146,18 @@ impl std::fmt::Display for CpuError {
 impl std::error::Error for CpuError {}
 
 pub struct Cpu {
-    pub memory: Vec<u8>,
+    pub memory: MmapMut,
     pub registers: [u32; 8],
     pub pc: u32,
     pub sp: u32,
     pub flags: Flags,
     pub running: bool,
+    pub frame_yield: bool,
+    pub frame_count: u16,
+    pub console_input: VecDeque<u8>,
+    pub console_output: Vec<u8>,
+    pub saved_video: Option<Vec<u8>>,
+    pub random_state: u32,
     memory_mask: u32,
 }
 
@@ -125,13 +171,27 @@ impl Cpu {
             return Err(CpuError::InvalidMemorySize(size));
         }
         let memory_mask = (size - 1) as u32;
+        let memory =
+            MmapMut::map_anon(size).map_err(|error| CpuError::MemoryMap(error.to_string()))?;
+        let mut memory = memory;
+        if size > CONSOLE_CONTROL as usize {
+            memory[CONSOLE_CONTROL as usize] = 3;
+            memory[(GPU_BASE - 12) as usize] = 0;
+            memory[(GPU_BASE - 13) as usize] = 2;
+        }
         Ok(Self {
-            memory: vec![0; size],
+            memory,
             registers: [0; 8],
             pc: 0,
             sp: memory_mask,
             flags: Flags::default(),
             running: true,
+            frame_yield: false,
+            frame_count: 0,
+            console_input: VecDeque::new(),
+            console_output: Vec::new(),
+            saved_video: None,
+            random_state: 0x16c0_ffee,
             memory_mask,
         })
     }
@@ -164,16 +224,47 @@ impl Cpu {
         Ok(())
     }
 
-    pub fn read(&self, address: u32) -> u8 {
-        self.memory[(address & self.memory_mask) as usize]
+    pub fn read(&mut self, address: u32) -> u8 {
+        let address = address & self.memory_mask;
+        match address {
+            CONSOLE_DATA => {
+                let value = self.console_input.pop_front().unwrap_or(0);
+                if self.memory[CONSOLE_CONTROL as usize] & 1 != 0 && value != 0 {
+                    self.console_output.push(value);
+                    print!("{}", char::from(value));
+                }
+                value
+            }
+            CONSOLE_STATUS => {
+                if self.console_input.is_empty() && self.running {
+                    self.frame_yield = true;
+                }
+                u8::from(!self.console_input.is_empty()) | 2
+            }
+            CONSOLE_CONTROL => self.memory[address as usize] & 3,
+            _ => self.memory[address as usize],
+        }
     }
 
     pub fn write(&mut self, address: u32, value: u8) {
-        let index = (address & self.memory_mask) as usize;
+        let address = address & self.memory_mask;
+        let index = address as usize;
         self.memory[index] = value;
+        match address {
+            GPU_BASE => self.gpu_command(value),
+            CONSOLE_DATA => {
+                self.console_output.push(value);
+                print!("{}", char::from(value));
+                if value == b'\n' {
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
+            CONSOLE_CONTROL => self.memory[index] = value & 3,
+            _ => {}
+        }
     }
 
-    pub fn read_u16(&self, address: u32) -> u16 {
+    pub fn read_u16(&mut self, address: u32) -> u16 {
         u16::from_be_bytes([self.read(address), self.read(address.wrapping_add(1))])
     }
 
@@ -181,6 +272,518 @@ impl Cpu {
         let [high, low] = value.to_be_bytes();
         self.write(address, high);
         self.write(address.wrapping_add(1), low);
+    }
+
+    fn read_u32(&mut self, address: u32) -> u32 {
+        (u32::from(self.read(address)) << 24)
+            | (u32::from(self.read(address.wrapping_add(1))) << 16)
+            | (u32::from(self.read(address.wrapping_add(2))) << 8)
+            | u32::from(self.read(address.wrapping_add(3)))
+    }
+
+    fn write_u32(&mut self, address: u32, value: u32) {
+        for offset in 0..4 {
+            self.write(
+                address.wrapping_add(offset),
+                (value >> (24 - offset * 8)) as u8,
+            );
+        }
+    }
+
+    fn read_u64_registers(&self, register: usize) -> u64 {
+        (0..4).fold(0, |value, offset| {
+            (value << 16) | u64::from(self.registers[register + offset] as u16)
+        })
+    }
+
+    fn write_u64_registers(&mut self, register: usize, value: u64) {
+        for offset in 0..4 {
+            self.registers[register + offset] = ((value >> (48 - offset * 16)) & 0xffff) as u32;
+        }
+    }
+
+    fn read_float_register(&self, register: usize, width: u8) -> f64 {
+        if width == 32 {
+            let bits = ((self.registers[register] & 0xffff) << 16)
+                | (self.registers[register + 1] & 0xffff);
+            f64::from(f32::from_bits(bits))
+        } else {
+            f64::from_bits(self.read_u64_registers(register))
+        }
+    }
+
+    fn write_float_register(&mut self, register: usize, width: u8, value: f64) {
+        if width == 32 {
+            let bits = if value.is_nan() {
+                0x7fc0_0000
+            } else {
+                (value as f32).to_bits()
+            };
+            self.registers[register] = bits >> 16;
+            self.registers[register + 1] = bits & 0xffff;
+        } else {
+            let bits = if value.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else {
+                value.to_bits()
+            };
+            self.write_u64_registers(register, bits);
+        }
+    }
+
+    fn read_integer_register(&self, register: usize, width: u8, unsigned: bool) -> i64 {
+        let bits = if width == 16 {
+            u64::from(self.registers[register] as u16)
+        } else {
+            u64::from(
+                ((self.registers[register] & 0xffff) << 16)
+                    | (self.registers[register + 1] & 0xffff),
+            )
+        };
+        if !unsigned && bits & (1 << (width - 1)) != 0 {
+            (bits as i64) - (1i64 << width)
+        } else {
+            bits as i64
+        }
+    }
+
+    fn write_integer_register(&mut self, register: usize, width: u8, value: u64) {
+        let masked = value & ((1u64 << width) - 1);
+        if width == 16 {
+            self.registers[register] = masked as u32;
+        } else {
+            self.registers[register] = (masked >> 16) as u32;
+            self.registers[register + 1] = (masked & 0xffff) as u32;
+        }
+    }
+
+    fn execute_float(&mut self, action: u16, destination: usize, source: usize) {
+        if action <= 9 {
+            let width = if action < 5 { 32 } else { 64 };
+            let left = self.read_float_register(destination, width);
+            let right = self.read_float_register(source, width);
+            match action % 5 {
+                0 => self.write_float_register(destination, width, left + right),
+                1 => self.write_float_register(destination, width, left - right),
+                2 => self.write_float_register(destination, width, left * right),
+                3 => self.write_float_register(destination, width, left / right),
+                _ => {
+                    let unordered = left.is_nan() || right.is_nan();
+                    self.flags.zero = !unordered && left == right;
+                    self.flags.carry = !unordered && left < right;
+                    self.flags.negative = false;
+                    self.flags.overflow = false;
+                }
+            }
+            return;
+        }
+        if (10..=17).contains(&action) {
+            let format = (action - 10) % 4;
+            let integer_width = if format < 2 { 16 } else { 32 };
+            let unsigned = format == 1 || format == 3;
+            let precision = if action < 14 { 32 } else { 64 };
+            let value = self.read_integer_register(source, integer_width, unsigned);
+            self.write_float_register(destination, precision, value as f64);
+            return;
+        }
+        if action == 18 || action == 19 {
+            let (from, to) = if action == 18 { (32, 64) } else { (64, 32) };
+            let value = self.read_float_register(source, from);
+            self.write_float_register(destination, to, value);
+            return;
+        }
+        if (20..=23).contains(&action) {
+            let width = if action == 20 || action == 22 { 32 } else { 64 };
+            let value = self.read_float_register(source, width);
+            let result = match action {
+                20 | 21 => -value,
+                _ => value.sqrt(),
+            };
+            self.write_float_register(destination, width, result);
+            return;
+        }
+
+        let precision = if action < 28 { 32 } else { 64 };
+        let conversion = (action - 24) % 4;
+        let integer_width = if conversion < 2 { 16 } else { 32 };
+        let value = self.read_float_register(source, precision);
+        let mask = (1u64 << integer_width) - 1;
+        let converted = if value.is_finite() {
+            value.trunc().rem_euclid((mask + 1) as f64) as u64
+        } else {
+            0
+        };
+        self.write_integer_register(destination, integer_width, converted);
+    }
+
+    fn execute_muldiv(&mut self, destination: usize) {
+        let control = self.read_u16(self.pc);
+        self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+        let operation = control >> 12;
+        let source = (control & 7) as usize;
+        if operation == 7 {
+            let high = self.read_u16(self.pc) & 0x3fff;
+            let low = self.read_u16(self.pc.wrapping_add(2));
+            self.registers[destination] =
+                ((u32::from(high) << 16) | u32::from(low)) & self.memory_mask;
+            self.pc = self.pc.wrapping_add(4) & self.memory_mask;
+            return;
+        }
+        if operation == 8 {
+            let address = self.registers[source];
+            let low = self.read_u16(address);
+            let high = self.read_u16(address.wrapping_add(2)) & 0x3fff;
+            self.registers[destination] = (u32::from(high) << 16) | u32::from(low);
+            return;
+        }
+        if operation == 9 {
+            let address = self.registers[source];
+            let value = self.registers[destination] & self.memory_mask;
+            self.write_u16(address, value as u16);
+            self.write_u16(address.wrapping_add(2), (value >> 16) as u16);
+            return;
+        }
+        if operation == 10 {
+            let value = self.registers[destination] & self.memory_mask;
+            self.registers[destination] = value >> 16;
+            self.registers[source] = value & 0xffff;
+            return;
+        }
+        if operation == 11 {
+            self.registers[destination] =
+                ((self.registers[destination] & 0x3fff) << 16) | (self.registers[source] & 0xffff);
+            return;
+        }
+        let right = if control & 0x0800 != 0 {
+            let value = self.read_u16(self.pc);
+            self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+            value
+        } else {
+            self.registers[source] as u16
+        };
+        let left = self.registers[destination] as u16;
+        let signed_left = left as i16 as i32;
+        let signed_right = right as i16 as i32;
+        let mut carry = false;
+        let result = match operation {
+            0 => {
+                let product = u32::from(left) * u32::from(right);
+                carry = product > 0xffff;
+                product as u16
+            }
+            1 => ((u32::from(left) * u32::from(right)) >> 16) as u16,
+            2 => (((signed_left * signed_right) >> 16) & 0xffff) as u16,
+            3 if right != 0 => left / right,
+            5 if right != 0 => left % right,
+            4 if right != 0 => (signed_left / signed_right) as u16,
+            6 if right != 0 => (signed_left % signed_right) as u16,
+            3..=6 => {
+                carry = true;
+                if operation == 5 || operation == 6 {
+                    left
+                } else {
+                    0
+                }
+            }
+            _ => return,
+        };
+        self.registers[destination] = u32::from(result);
+        self.flags.zero = result == 0;
+        self.flags.carry = carry;
+    }
+
+    fn execute_wide(&mut self, instruction: u16, destination: usize) -> Result<(), CpuError> {
+        let control = self.read_u16(self.pc);
+        self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+        let operation = control >> 12;
+        let immediate = control & 0x0800 != 0;
+        let source = (control & 7) as usize;
+        if destination & 1 != 0
+            || destination > 6
+            || (!matches!(operation, 6..=9) && (source & 1 != 0 || source > 6))
+        {
+            return Err(CpuError::InvalidRegisterPair(instruction));
+        }
+        let left = ((self.registers[destination] & 0xffff) << 16)
+            | (self.registers[destination + 1] & 0xffff);
+        if operation == 9 {
+            let result = left.wrapping_neg();
+            self.set_32_flags(result, left != 0, left == 0x8000_0000);
+            self.set_pair(destination, result);
+            return Ok(());
+        }
+        if operation == 10 {
+            self.set_pair(
+                destination,
+                ((self.registers[source] & 0xffff) << 16) | (self.registers[source + 1] & 0xffff),
+            );
+            return Ok(());
+        }
+        if operation == 11 || operation == 12 {
+            let address = (((self.registers[source] & 0xffff) << 16)
+                | (self.registers[source + 1] & 0xffff))
+                & self.memory_mask;
+            if operation == 11 {
+                let value = self.read_u32(address);
+                self.set_pair(destination, value);
+            } else {
+                self.write_u32(address, left);
+            }
+            return Ok(());
+        }
+        if (13..=15).contains(&operation) {
+            let right =
+                ((self.registers[source] & 0xffff) << 16) | (self.registers[source + 1] & 0xffff);
+            let result = if operation == 13 {
+                let product = u64::from(left) * u64::from(right);
+                let signed_product = (left as i32 as i64) * (right as i32 as i64);
+                self.flags.carry = product > u64::from(u32::MAX);
+                self.flags.overflow =
+                    signed_product < i64::from(i32::MIN) || signed_product > i64::from(i32::MAX);
+                product as u32
+            } else {
+                let signed = control & 0x0800 != 0;
+                if right == 0 {
+                    self.flags.carry = true;
+                    if operation == 15 { left } else { 0 }
+                } else if signed {
+                    let dividend = left as i32 as i64;
+                    let divisor = right as i32 as i64;
+                    self.flags.carry = false;
+                    if operation == 14 {
+                        dividend.wrapping_div(divisor) as u32
+                    } else {
+                        dividend.wrapping_rem(divisor) as u32
+                    }
+                } else {
+                    self.flags.carry = false;
+                    if operation == 14 {
+                        left / right
+                    } else {
+                        left % right
+                    }
+                }
+            };
+            self.flags.zero = result == 0;
+            self.flags.negative = result & 0x8000_0000 != 0;
+            if operation != 13 {
+                self.flags.overflow = false;
+            }
+            self.set_pair(destination, result);
+            return Ok(());
+        }
+        let result = if matches!(operation, 6..=8) {
+            let count = if immediate {
+                u32::from(control & 0x1f)
+            } else {
+                self.registers[source] & 0x1f
+            };
+            let carry = if count == 0 {
+                self.flags.carry
+            } else if operation == 6 {
+                (left >> (32 - count)) & 1 != 0
+            } else {
+                (left >> (count - 1)) & 1 != 0
+            };
+            self.flags.carry = carry;
+            self.flags.overflow = false;
+            match operation {
+                6 => left.wrapping_shl(count),
+                7 => left.wrapping_shr(count),
+                _ => ((left as i32) >> count) as u32,
+            }
+        } else {
+            let right =
+                ((self.registers[source] & 0xffff) << 16) | (self.registers[source + 1] & 0xffff);
+            match operation {
+                0 => {
+                    let (result, carry) = left.overflowing_add(right);
+                    self.flags.carry = carry;
+                    self.flags.overflow = (!(left ^ right) & (left ^ result) & 0x8000_0000) != 0;
+                    result
+                }
+                1 | 2 => {
+                    let (result, borrow) = left.overflowing_sub(right);
+                    self.flags.carry = borrow;
+                    self.flags.overflow = ((left ^ right) & (left ^ result) & 0x8000_0000) != 0;
+                    if operation == 2 {
+                        self.flags.zero = result == 0;
+                        self.flags.negative = result & 0x8000_0000 != 0;
+                        return Ok(());
+                    }
+                    result
+                }
+                3 => left & right,
+                4 => left | right,
+                _ => left ^ right,
+            }
+        };
+        self.flags.zero = result == 0;
+        self.flags.negative = result & 0x8000_0000 != 0;
+        if operation >= 3 {
+            self.flags.carry = false;
+            self.flags.overflow = false;
+        }
+        self.set_pair(destination, result);
+        Ok(())
+    }
+
+    fn set_pair(&mut self, register: usize, value: u32) {
+        self.registers[register] = value >> 16;
+        self.registers[register + 1] = value & 0xffff;
+    }
+
+    fn set_32_flags(&mut self, result: u32, carry: bool, overflow: bool) {
+        self.flags.zero = result == 0;
+        self.flags.negative = result & 0x8000_0000 != 0;
+        self.flags.carry = carry;
+        self.flags.overflow = overflow;
+    }
+
+    fn execute_shift(&mut self, destination: usize, value: u16, operation: u16, count: u32) {
+        if count == 0 {
+            self.set_flags(value, self.flags.carry, false);
+            self.registers[destination] = u32::from(value);
+            return;
+        }
+        let (result, carry) = match operation {
+            0 => (
+                ((u32::from(value) << count) & 0xffff) as u16,
+                (value >> (16 - count)) & 1,
+            ),
+            1 => (value >> count, (value >> (count - 1)) & 1),
+            2 => (
+                ((value as i16) >> count) as u16,
+                (((value as i16) >> (count - 1)) & 1) as u16,
+            ),
+            3 => {
+                let result = value.rotate_left(count);
+                (result, result & 1)
+            }
+            _ => {
+                let result = value.rotate_right(count);
+                (result, result >> 15)
+            }
+        };
+        self.set_flags(result, carry != 0, false);
+        self.registers[destination] = u32::from(result);
+    }
+
+    fn set_flags(&mut self, result: u16, carry: bool, overflow: bool) {
+        self.flags.zero = result == 0;
+        self.flags.negative = result & 0x8000 != 0;
+        self.flags.carry = carry;
+        self.flags.overflow = overflow;
+    }
+
+    fn execute_misc(&mut self, destination: usize, value: u16, selector: u16, control: u16) {
+        match selector {
+            0 => self.registers[destination] = u32::from(value.rotate_left(8)),
+            1 => {
+                let result = (value & 0xff) | if value & 0x80 != 0 { 0xff00 } else { 0 };
+                self.registers[destination] = u32::from(result);
+                self.set_flags(result, self.flags.carry, false);
+            }
+            2 => self.pc = u32::from(value) & self.memory_mask,
+            3 => {
+                self.push_u32(self.pc);
+                self.pc = u32::from(value) & self.memory_mask;
+            }
+            4 => self.push_u16(self.pack_flags()),
+            5 => {
+                let flags = self.pop_u16();
+                self.restore_flags(flags);
+            }
+            6 => self.flags.carry = true,
+            7 => self.flags.carry = false,
+            8 => self.sp = u32::from(value) & self.memory_mask,
+            9 => {
+                self.registers[destination] = value.leading_zeros();
+                self.flags.zero = value == 0;
+            }
+            10 => self.registers[destination] = (self.sp >> 16) & 0x3fff,
+            11 | 12 => {
+                let high_register = ((control >> 9) & 7) as usize;
+                let target = ((self.registers[high_register] & 0x3fff) << 16) | u32::from(value);
+                if selector == 11 {
+                    self.push_u32(self.pc);
+                }
+                self.pc = target & self.memory_mask;
+            }
+            13 => {
+                self.sp = (self.sp & 0xffff) | (u32::from(value & 0x3fff) << 16);
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_alu(&mut self, destination: usize) {
+        let control = self.read_u16(self.pc);
+        self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+        let operation = control >> 12;
+        let left = self.registers[destination] as u16;
+        if operation == 15 {
+            self.execute_misc(destination, left, control & 0x1f, control);
+            return;
+        }
+        let immediate = control & 0x0800 != 0;
+        let source = (control & 7) as usize;
+        if operation <= 4 {
+            let count = if immediate {
+                u32::from(control & 0xf)
+            } else {
+                self.registers[source] & 0xf
+            };
+            self.execute_shift(destination, left, operation, count);
+            return;
+        }
+        if operation == 7 {
+            let result = left.wrapping_neg();
+            self.set_flags(result, left != 0, left == 0x8000);
+            self.registers[destination] = u32::from(result);
+            return;
+        }
+        let right = if immediate {
+            let value = self.read_u16(self.pc);
+            self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+            value
+        } else {
+            self.registers[source] as u16
+        };
+        let carry_in = u16::from(self.flags.carry);
+        let result;
+        match operation {
+            5 | 9 => {
+                let total = u32::from(left)
+                    + u32::from(right)
+                    + if operation == 5 {
+                        u32::from(carry_in)
+                    } else {
+                        0
+                    };
+                result = total as u16;
+                let overflow = (!(left ^ right) & (left ^ result) & 0x8000) != 0;
+                self.set_flags(result, total > 0xffff, overflow);
+            }
+            6 | 10 | 14 => {
+                let borrow = if operation == 6 { carry_in } else { 0 };
+                let total = i32::from(left) - i32::from(right) - i32::from(borrow);
+                result = total as u16;
+                let overflow = ((left ^ right) & (left ^ result) & 0x8000) != 0;
+                self.set_flags(result, total < 0, overflow);
+            }
+            _ => {
+                result = match operation {
+                    8 | 11 => left & right,
+                    12 => left | right,
+                    _ => left ^ right,
+                };
+                self.set_flags(result, false, false);
+            }
+        }
+        if operation != 8 && operation != 14 {
+            self.registers[destination] = u32::from(result);
+        }
     }
 
     pub fn step(&mut self) -> Result<(), CpuError> {
@@ -239,8 +842,14 @@ impl Cpu {
                 self.set_sub_flags(left, right, left.wrapping_sub(right));
             }
             OP_LDI_H => self.registers[rd] = (immediate << 8) | (self.registers[rd] & 0xff),
-            OP_EI => self.write(ICR_ADDR, self.read(ICR_ADDR) | 1),
-            OP_DI => self.write(ICR_ADDR, self.read(ICR_ADDR) & !1),
+            OP_EI => {
+                let value = self.read(ICR_ADDR) | 1;
+                self.write(ICR_ADDR, value);
+            }
+            OP_DI => {
+                let value = self.read(ICR_ADDR) & !1;
+                self.write(ICR_ADDR, value);
+            }
             OP_RTI => {
                 let saved_flags = self.pop_u16();
                 self.restore_flags(saved_flags);
@@ -277,6 +886,20 @@ impl Cpu {
                     self.pc = (instruction & 0x7ff) as u32;
                 }
             }
+            OP_SHR if instruction & FLOAT_MASK == FLOAT_PREFIX => {
+                let control = self.read_u16(self.pc);
+                self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+                self.execute_float((control >> 11) & 0x1f, rd, (control & 7) as usize);
+            }
+            OP_SHR if instruction & MULDIV_MASK == MULDIV_PREFIX => {
+                self.execute_muldiv(rd);
+            }
+            OP_SHR if instruction & WIDE_MASK == WIDE_PREFIX => {
+                self.execute_wide(instruction, rd)?;
+            }
+            OP_SHR if instruction & ALU_MASK == ALU_PREFIX => {
+                self.execute_alu(rd);
+            }
             OP_SHR if instruction & FAR_BRANCH_MASK == FAR_BRANCH_PREFIX => {
                 let condition = ((instruction >> 7) & 0xf) as u8;
                 let target = (((self.read_u16(self.pc) & 0x3fff) as u32) << 16)
@@ -302,14 +925,6 @@ impl Cpu {
                     _ => {}
                 }
             }
-            OP_SHR
-                if instruction & 0xf81f == 0xf81b
-                    || instruction & 0xf8ff == 0xf81e
-                    || instruction & 0xf81f == 0xf81a
-                    || instruction & 0xf8ff == 0xf81f =>
-            {
-                return Err(CpuError::UnsupportedInstruction(instruction));
-            }
             OP_SHR => {
                 let extension = (instruction >> 5) & 7;
                 if extension == 0 {
@@ -319,7 +934,28 @@ impl Cpu {
                         (self.registers[rd] & 0xffff) >> 1
                     };
                 } else {
-                    return Err(CpuError::UnsupportedInstruction(instruction));
+                    let source = ((instruction >> 2) & 7) as usize;
+                    let left = f16_to_f32(self.registers[rd] as u16);
+                    let right = f16_to_f32(self.registers[source] as u16);
+                    match extension {
+                        1 => self.registers[rd] = u32::from(f32_to_f16(left + right)),
+                        2 => self.registers[rd] = u32::from(f32_to_f16(left - right)),
+                        3 => self.registers[rd] = u32::from(f32_to_f16(left * right)),
+                        4 => self.registers[rd] = u32::from(f32_to_f16(left / right)),
+                        5 => {
+                            self.flags.zero = left == right;
+                            self.flags.carry = left < right;
+                        }
+                        6 => {
+                            self.registers[rd] =
+                                u32::from(f32_to_f16((self.registers[rd] as u16 as i16) as f32))
+                        }
+                        7 => {
+                            self.registers[rd] =
+                                ((f16_to_f32(self.registers[rd] as u16) as i32) as u32) & 0xffff
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => return Err(CpuError::UnsupportedInstruction(instruction)),
@@ -333,11 +969,294 @@ impl Cpu {
 
     pub fn run(&mut self, instruction_budget: usize) -> Result<usize, CpuError> {
         let mut executed = 0;
-        while executed < instruction_budget && self.running {
+        while executed < instruction_budget && self.running && !self.frame_yield {
             self.step()?;
             executed += 1;
         }
         Ok(executed)
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.frame_yield = false;
+        self.frame_count = self.frame_count.wrapping_add(1);
+    }
+
+    pub fn receive_console_input(&mut self, bytes: &[u8]) {
+        self.console_input.extend(bytes.iter().copied());
+    }
+
+    pub fn signal_keyboard_event(&mut self, keycode: u8) {
+        self.write(KEYBOARD_ADDR, keycode);
+        let icr = self.read(ICR_ADDR) | 2;
+        self.write(ICR_ADDR, icr);
+    }
+
+    pub fn set_key(&mut self, mask: u32, pressed: bool) {
+        for offset in 0..3 {
+            let address = KEYS_ADDR + offset;
+            let shift = (2 - offset) * 8;
+            let bit = ((mask >> shift) & 0xff) as u8;
+            if pressed {
+                self.memory[address as usize] |= bit;
+            } else {
+                self.memory[address as usize] &= !bit;
+            }
+        }
+    }
+
+    fn gpu_word(&self, offset: u32) -> i16 {
+        let high = self.memory[(GPU_BASE + offset) as usize];
+        let low = self.memory[(GPU_BASE + offset + 1) as usize];
+        i16::from_be_bytes([high, low])
+    }
+
+    fn gpu_source(&self) -> u32 {
+        (u32::from(self.memory[(GPU_BASE + 12) as usize]) << 24)
+            | (u32::from(self.memory[(GPU_BASE + 13) as usize]) << 16)
+            | (u32::from(self.memory[(GPU_BASE + 10) as usize]) << 8)
+            | u32::from(self.memory[(GPU_BASE + 11) as usize])
+    }
+
+    fn screen_size(&self) -> (i32, i32) {
+        if self.memory[(GPU_BASE - 12) as usize] == 1 {
+            (640, 480)
+        } else {
+            (320, 240)
+        }
+    }
+
+    fn gpu_pixel(&mut self, x: i32, y: i32, color: u8) {
+        let (width, height) = self.screen_size();
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return;
+        }
+        if width == 320 {
+            let address = VRAM_START + (y * width + x) as u32;
+            self.memory[address as usize] = color;
+        } else {
+            let address = VRAM_START + (y * (width / 2) + x / 2) as u32;
+            let shift = if x & 1 == 0 { 4 } else { 0 };
+            let mask = 0xf << shift;
+            self.memory[address as usize] =
+                (self.memory[address as usize] & !mask) | ((color & 0xf) << shift);
+        }
+    }
+
+    fn gpu_command(&mut self, command: u8) {
+        let color = self.memory[(GPU_BASE + 1) as usize];
+        let x = i32::from(self.gpu_word(2));
+        let y = i32::from(self.gpu_word(4));
+        let w = i32::from(self.gpu_word(6));
+        let h = i32::from(self.gpu_word(8));
+        match command {
+            GPU_CLEAR => {
+                let (width, height) = self.screen_size();
+                if width == 320 {
+                    let start = VRAM_START as usize;
+                    self.memory[start..start + (width * height) as usize].fill(color);
+                } else {
+                    let start = VRAM_START as usize;
+                    let fill = ((color & 0xf) << 4) | (color & 0xf);
+                    self.memory[start..start + (width * height / 2) as usize].fill(fill);
+                }
+            }
+            GPU_PIXEL => self.gpu_pixel(x, y, color),
+            GPU_RECT => {
+                for row in y.max(0)..(y + h).min(self.screen_size().1) {
+                    for column in x.max(0)..(x + w).min(self.screen_size().0) {
+                        self.gpu_pixel(column, row, color);
+                    }
+                }
+            }
+            GPU_LINE => {
+                let (mut x0, mut y0) = (x, y);
+                let (x1, y1) = (w, h);
+                let dx = (x1 - x0).abs();
+                let sx = if x0 < x1 { 1 } else { -1 };
+                let dy = -(y1 - y0).abs();
+                let sy = if y0 < y1 { 1 } else { -1 };
+                let mut error = dx + dy;
+                for _ in 0..2000 {
+                    self.gpu_pixel(x0, y0, color);
+                    if x0 == x1 && y0 == y1 {
+                        break;
+                    }
+                    let twice = 2 * error;
+                    if twice >= dy {
+                        error += dy;
+                        x0 += sx;
+                    }
+                    if twice <= dx {
+                        error += dx;
+                        y0 += sy;
+                    }
+                }
+            }
+            GPU_SPRITE => {
+                let source = self.gpu_source();
+                let (screen_width, screen_height) = self.screen_size();
+                for row in 0..h.max(0).min(screen_height) {
+                    for column in 0..w.max(0).min(screen_width) {
+                        let address =
+                            source.wrapping_add((row * w + column) as u32) & self.memory_mask;
+                        let pixel = self.memory[address as usize];
+                        if pixel != 0 {
+                            self.gpu_pixel(x + column, y + row, pixel);
+                        }
+                    }
+                }
+            }
+            GPU_BITMAP => {
+                let source = self.gpu_source();
+                let (screen_width, screen_height) = self.screen_size();
+                let draw_width = w.max(0).min(screen_width);
+                let draw_height = h.max(0).min(screen_height);
+                let row_bytes = (draw_width + 7) / 8;
+                for row in 0..draw_height {
+                    for column in 0..draw_width {
+                        let address = source.wrapping_add((row * row_bytes + column / 8) as u32)
+                            & self.memory_mask;
+                        if self.memory[address as usize] & (0x80 >> (column % 8)) != 0 {
+                            self.gpu_pixel(x + column, y + row, color);
+                        }
+                    }
+                }
+            }
+            GPU_TEXT => self.gpu_text(x, y, color),
+            GPU_PRESENT => self.frame_yield = true,
+            GPU_RANDOM => {
+                let mut value = self.random_state;
+                value ^= value << 13;
+                value ^= value >> 17;
+                value ^= value << 5;
+                self.random_state = value;
+                self.memory[(GPU_BASE + 14) as usize] = value as u8;
+            }
+            GPU_POLY => self.gpu_polygon(x, y, w, color),
+            GPU_TICKS => {
+                let count = self.frame_count.to_be_bytes();
+                self.memory[(GPU_BASE + 14) as usize] = count[0];
+                self.memory[(GPU_BASE + 15) as usize] = count[1];
+            }
+            GPU_RTC => {
+                let index = color as usize;
+                self.memory[(GPU_BASE + 14) as usize] = if index < 3 {
+                    self.memory[(RTC_START as usize) + index]
+                } else {
+                    0
+                };
+            }
+            GPU_SAVE => {
+                let (width, height) = self.screen_size();
+                let size = if width == 640 {
+                    (width * height / 2) as usize
+                } else {
+                    (width * height) as usize
+                };
+                self.saved_video =
+                    Some(self.memory[VRAM_START as usize..VRAM_START as usize + size].to_vec());
+            }
+            GPU_LOAD => {
+                if let Some(saved) = &self.saved_video {
+                    let end = VRAM_START as usize + saved.len();
+                    self.memory[VRAM_START as usize..end].copy_from_slice(saved);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn gpu_text(&mut self, mut x: i32, mut y: i32, color: u8) {
+        let left = x;
+        let source = self.gpu_source();
+        let mut bytes = Vec::with_capacity(64);
+        for offset in 0..255u32 {
+            let address = source.wrapping_add(offset) & self.memory_mask;
+            let value = self.memory[address as usize];
+            if value == 0 {
+                break;
+            }
+            bytes.push(value);
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        for character in text.chars() {
+            if character == '\n' {
+                x = left;
+                y += 8;
+                continue;
+            }
+            let glyph = match character {
+                ' '..='~' => character as usize - 32,
+                'ö' => 95,
+                'ä' => 96,
+                'å' => 97,
+                'Ö' => 98,
+                'Ä' => 99,
+                'Å' => 100,
+                _ => '?' as usize - 32,
+            };
+            for row in 0..7 {
+                let address = FONT_ADDR + glyph * 8 + row;
+                if address >= self.memory.len() {
+                    continue;
+                }
+                let bits = self.memory[address];
+                for column in 0..5 {
+                    if bits & (0x80 >> column) != 0 {
+                        self.gpu_pixel(x + column, y + row as i32, color);
+                    }
+                }
+            }
+            x += 6;
+        }
+    }
+
+    fn gpu_polygon(&mut self, x: i32, y: i32, count: i32, color: u8) {
+        let source = self.gpu_source();
+        let point_count = count.clamp(0, 64) as u32;
+        let mut points = Vec::with_capacity(point_count as usize);
+        for index in 0..point_count {
+            let address = source.wrapping_add(index * 2) & self.memory_mask;
+            let dx = self.memory[address as usize] as i8 as i32;
+            let dy =
+                self.memory[(address.wrapping_add(1) & self.memory_mask) as usize] as i8 as i32;
+            points.push((x + dx, y + dy));
+        }
+        match points.as_slice() {
+            [] => {}
+            [point] => self.gpu_pixel(point.0, point.1, color),
+            _ => {
+                for index in 0..points.len() {
+                    let start = points[index];
+                    let end = points[(index + 1) % points.len()];
+                    self.gpu_line(start.0, start.1, end.0, end.1, color);
+                }
+            }
+        }
+    }
+
+    fn gpu_line(&mut self, x: i32, y: i32, end_x: i32, end_y: i32, color: u8) {
+        let (mut x, mut y) = (x, y);
+        let dx = (end_x - x).abs();
+        let step_x = if x < end_x { 1 } else { -1 };
+        let dy = -(end_y - y).abs();
+        let step_y = if y < end_y { 1 } else { -1 };
+        let mut error = dx + dy;
+        for _ in 0..2000 {
+            self.gpu_pixel(x, y, color);
+            if x == end_x && y == end_y {
+                break;
+            }
+            let doubled = error * 2;
+            if doubled >= dy {
+                error += dy;
+                x += step_x;
+            }
+            if doubled <= dx {
+                error += dx;
+                y += step_y;
+            }
+        }
     }
 
     fn set_sub_flags(&mut self, left: u16, right: u16, result: u16) {
@@ -403,17 +1322,75 @@ impl Cpu {
         if let Some(vector) = vector {
             self.push_u32(self.pc);
             self.push_u16(self.pack_flags());
-            self.write(ICR_ADDR, self.read(ICR_ADDR) & !1);
-            self.write(ICR_ADDR, self.read(ICR_ADDR) & !2 & !8);
+            let icr = self.read(ICR_ADDR) & !1;
+            self.write(ICR_ADDR, icr);
+            let icr = self.read(ICR_ADDR) & !2 & !8;
+            self.write(ICR_ADDR, icr);
             self.pc = self.read_u32(vector) & self.memory_mask;
         }
     }
+}
 
-    fn read_u32(&self, address: u32) -> u32 {
-        (0..4).fold(0, |value, offset| {
-            (value << 8) | self.read(address.wrapping_add(offset)) as u32
-        })
+fn f16_to_f32(value: u16) -> f32 {
+    let sign = u32::from(value & 0x8000) << 16;
+    let exponent = (value >> 10) & 0x1f;
+    let fraction = u32::from(value & 0x03ff);
+    let bits = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let mut significand = fraction;
+            let mut exponent = 113u32;
+            while significand & 0x400 == 0 {
+                significand <<= 1;
+                exponent -= 1;
+            }
+            sign | (exponent << 23) | ((significand & 0x3ff) << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (fraction << 13),
+        _ => sign | ((u32::from(exponent) + 112) << 23) | (fraction << 13),
+    };
+    f32::from_bits(bits)
+}
+
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let fraction = bits & 0x7f_ff_ff;
+    if exponent == 0xff {
+        return if fraction == 0 { sign | 0x7c00 } else { 0x7e00 };
     }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
+        }
+        let significand = fraction | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        let mut rounded = significand >> shift;
+        let remainder = significand & ((1 << shift) - 1);
+        let halfway = 1 << (shift - 1);
+        if remainder > halfway || (remainder == halfway && rounded & 1 != 0) {
+            rounded += 1;
+        }
+        return sign | rounded as u16;
+    }
+    let mut rounded = (fraction >> 13) as u16;
+    let remainder = fraction & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && rounded & 1 != 0) {
+        rounded += 1;
+        if rounded == 0x400 {
+            let next_exponent = half_exponent + 1;
+            if next_exponent >= 0x1f {
+                return sign | 0x7c00;
+            }
+            return sign | ((next_exponent as u16) << 10);
+        }
+    }
+    sign | ((half_exponent as u16) << 10) | rounded
 }
 
 impl Default for Cpu {
@@ -483,6 +1460,104 @@ mod tests {
         cpu.run(2).unwrap();
         assert_eq!(cpu.pc, 0x12);
         assert!(!cpu.running);
+    }
+
+    #[test]
+    fn executes_extended_alu_immediates_and_sets_flags() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.registers[2] = 0xffff;
+        cpu.write_u16(0, ALU_PREFIX | (2 << 8));
+        cpu.write_u16(2, (9 << 12) | 0x0800);
+        cpu.write_u16(4, 1);
+        cpu.write_u16(6, OP_HALT << 11);
+        cpu.run(2).unwrap();
+        assert_eq!(cpu.registers[2], 0);
+        assert!(cpu.flags.zero);
+        assert!(cpu.flags.carry);
+    }
+
+    #[test]
+    fn executes_muldiv_and_preserves_divide_by_zero_behavior() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.registers[0] = 0xfffe;
+        cpu.registers[1] = 0;
+        cpu.write_u16(0, MULDIV_PREFIX);
+        cpu.write_u16(2, (6 << 12) | 1);
+        cpu.step().unwrap();
+        assert_eq!(cpu.registers[0], 0xfffe);
+        assert!(cpu.flags.carry);
+    }
+
+    #[test]
+    fn executes_wide_pair_add_and_cmp() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.registers[0] = 0x1234;
+        cpu.registers[1] = 0xffff;
+        cpu.registers[2] = 0;
+        cpu.registers[3] = 1;
+        cpu.write_u16(0, WIDE_PREFIX);
+        cpu.write_u16(2, 2);
+        cpu.write_u16(4, OP_HALT << 11);
+        cpu.run(2).unwrap();
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0x1235, 0));
+        assert!(!cpu.flags.zero);
+    }
+
+    #[test]
+    fn executes_binary32_float_add() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        let left = 1.5f32.to_bits();
+        let right = 2.25f32.to_bits();
+        cpu.registers[0] = left >> 16;
+        cpu.registers[1] = left & 0xffff;
+        cpu.registers[2] = right >> 16;
+        cpu.registers[3] = right & 0xffff;
+        cpu.write_u16(0, FLOAT_PREFIX);
+        cpu.write_u16(2, 2);
+        cpu.write_u16(4, OP_HALT << 11);
+        cpu.run(2).unwrap();
+        let result = (cpu.registers[0] << 16) | cpu.registers[1];
+        assert_eq!(f32::from_bits(result), 3.75);
+    }
+
+    #[test]
+    fn binary16_conversion_rounds_and_handles_special_values() {
+        assert_eq!(f16_to_f32(f32_to_f16(1.5)), 1.5);
+        assert_eq!(f16_to_f32(f32_to_f16(f32::INFINITY)), f32::INFINITY);
+        assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+        assert_eq!(f32_to_f16(1.0 + f32::EPSILON), 0x3c00);
+    }
+
+    #[test]
+    fn gpu_rect_command_updates_vram_and_present_yields() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_BASE + 1, 7);
+        cpu.write_u16(GPU_BASE + 2, 1);
+        cpu.write_u16(GPU_BASE + 4, 2);
+        cpu.write_u16(GPU_BASE + 6, 2);
+        cpu.write_u16(GPU_BASE + 8, 2);
+        assert_eq!(cpu.gpu_word(2), 1);
+        assert_eq!(cpu.gpu_word(4), 2);
+        cpu.write(GPU_BASE, GPU_RECT);
+        assert_eq!(cpu.memory[(VRAM_START + 641) as usize], 7);
+        assert_eq!(cpu.memory[(VRAM_START + 642) as usize], 7);
+        assert_eq!(cpu.memory[(VRAM_START + 961) as usize], 7);
+        cpu.write(GPU_BASE, GPU_PRESENT);
+        assert!(cpu.frame_yield);
+    }
+
+    #[test]
+    fn console_mmio_reads_and_keyboard_events_are_stateful() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.receive_console_input(b"A");
+        assert_eq!(cpu.read(CONSOLE_STATUS), 3);
+        assert_eq!(cpu.read(CONSOLE_DATA), b'A');
+        assert_eq!(cpu.read(CONSOLE_STATUS), 2);
+        assert!(cpu.frame_yield);
+        cpu.frame_yield = false;
+        cpu.signal_keyboard_event(b'B');
+        assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], b'B');
+        assert_eq!(cpu.read(ICR_ADDR) & 2, 2);
     }
 
     #[test]
