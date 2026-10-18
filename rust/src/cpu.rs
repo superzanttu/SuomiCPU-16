@@ -147,7 +147,7 @@ impl std::error::Error for CpuError {}
 
 pub struct Cpu {
     pub memory: MmapMut,
-    pub registers: [u32; 8],
+    pub registers: [i64; 8],
     pub pc: u32,
     pub sp: u32,
     pub flags: Flags,
@@ -298,14 +298,22 @@ impl Cpu {
 
     fn write_u64_registers(&mut self, register: usize, value: u64) {
         for offset in 0..4 {
-            self.registers[register + offset] = ((value >> (48 - offset * 16)) & 0xffff) as u32;
+            self.registers[register + offset] = ((value >> (48 - offset * 16)) & 0xffff) as i64;
         }
+    }
+
+    fn register_u16(&self, register: usize) -> u16 {
+        self.registers[register] as u16
+    }
+
+    fn register_pair_u32(&self, register: usize) -> u32 {
+        (u32::from(self.register_u16(register)) << 16) | u32::from(self.register_u16(register + 1))
     }
 
     fn read_float_register(&self, register: usize, width: u8) -> f64 {
         if width == 32 {
-            let bits = ((self.registers[register] & 0xffff) << 16)
-                | (self.registers[register + 1] & 0xffff);
+            let bits = ((self.registers[register] as u16 as u32) << 16)
+                | self.registers[register + 1] as u16 as u32;
             f64::from(f32::from_bits(bits))
         } else {
             f64::from_bits(self.read_u64_registers(register))
@@ -319,8 +327,8 @@ impl Cpu {
             } else {
                 (value as f32).to_bits()
             };
-            self.registers[register] = bits >> 16;
-            self.registers[register + 1] = bits & 0xffff;
+            self.registers[register] = i64::from(bits >> 16);
+            self.registers[register + 1] = i64::from(bits & 0xffff);
         } else {
             let bits = if value.is_nan() {
                 0x7ff8_0000_0000_0000
@@ -336,8 +344,8 @@ impl Cpu {
             u64::from(self.registers[register] as u16)
         } else {
             u64::from(
-                ((self.registers[register] & 0xffff) << 16)
-                    | (self.registers[register + 1] & 0xffff),
+                ((self.registers[register] as u16 as u32) << 16)
+                    | self.registers[register + 1] as u16 as u32,
             )
         };
         if !unsigned && bits & (1 << (width - 1)) != 0 {
@@ -350,10 +358,10 @@ impl Cpu {
     fn write_integer_register(&mut self, register: usize, width: u8, value: u64) {
         let masked = value & ((1u64 << width) - 1);
         if width == 16 {
-            self.registers[register] = masked as u32;
+            self.registers[register] = masked as i64;
         } else {
-            self.registers[register] = (masked >> 16) as u32;
-            self.registers[register + 1] = (masked & 0xffff) as u32;
+            self.registers[register] = (masked >> 16) as i64;
+            self.registers[register + 1] = (masked & 0xffff) as i64;
         }
     }
 
@@ -425,33 +433,34 @@ impl Cpu {
             let high = self.read_u16(self.pc) & 0x3fff;
             let low = self.read_u16(self.pc.wrapping_add(2));
             self.registers[destination] =
-                ((u32::from(high) << 16) | u32::from(low)) & self.memory_mask;
+                i64::from(((u32::from(high) << 16) | u32::from(low)) & self.memory_mask);
             self.pc = self.pc.wrapping_add(4) & self.memory_mask;
             return;
         }
         if operation == 8 {
-            let address = self.registers[source];
+            let address = self.registers[source] as u32 & self.memory_mask;
             let low = self.read_u16(address);
             let high = self.read_u16(address.wrapping_add(2)) & 0x3fff;
-            self.registers[destination] = (u32::from(high) << 16) | u32::from(low);
+            self.registers[destination] = i64::from((u32::from(high) << 16) | u32::from(low));
             return;
         }
         if operation == 9 {
-            let address = self.registers[source];
-            let value = self.registers[destination] & self.memory_mask;
+            let address = self.registers[source] as u32 & self.memory_mask;
+            let value = self.registers[destination] as u32 & self.memory_mask;
             self.write_u16(address, value as u16);
             self.write_u16(address.wrapping_add(2), (value >> 16) as u16);
             return;
         }
         if operation == 10 {
-            let value = self.registers[destination] & self.memory_mask;
-            self.registers[destination] = value >> 16;
-            self.registers[source] = value & 0xffff;
+            let value = self.registers[destination] as u32 & self.memory_mask;
+            self.registers[destination] = i64::from(value >> 16);
+            self.registers[source] = i64::from(value & 0xffff);
             return;
         }
         if operation == 11 {
-            self.registers[destination] =
-                ((self.registers[destination] & 0x3fff) << 16) | (self.registers[source] & 0xffff);
+            self.registers[destination] = (((self.registers[destination] as u32 & 0x3fff) << 16)
+                | (self.registers[source] as u16 as u32))
+                as i64;
             return;
         }
         let right = if control & 0x0800 != 0 {
@@ -487,7 +496,7 @@ impl Cpu {
             }
             _ => return,
         };
-        self.registers[destination] = u32::from(result);
+        self.registers[destination] = i64::from(result);
         self.flags.zero = result == 0;
         self.flags.carry = carry;
     }
@@ -504,8 +513,7 @@ impl Cpu {
         {
             return Err(CpuError::InvalidRegisterPair(instruction));
         }
-        let left = ((self.registers[destination] & 0xffff) << 16)
-            | (self.registers[destination + 1] & 0xffff);
+        let left = self.register_pair_u32(destination);
         if operation == 9 {
             let result = left.wrapping_neg();
             self.set_32_flags(result, left != 0, left == 0x8000_0000);
@@ -513,16 +521,11 @@ impl Cpu {
             return Ok(());
         }
         if operation == 10 {
-            self.set_pair(
-                destination,
-                ((self.registers[source] & 0xffff) << 16) | (self.registers[source + 1] & 0xffff),
-            );
+            self.set_pair(destination, self.register_pair_u32(source));
             return Ok(());
         }
         if operation == 11 || operation == 12 {
-            let address = (((self.registers[source] & 0xffff) << 16)
-                | (self.registers[source + 1] & 0xffff))
-                & self.memory_mask;
+            let address = self.register_pair_u32(source) & self.memory_mask;
             if operation == 11 {
                 let value = self.read_u32(address);
                 self.set_pair(destination, value);
@@ -532,8 +535,7 @@ impl Cpu {
             return Ok(());
         }
         if (13..=15).contains(&operation) {
-            let right =
-                ((self.registers[source] & 0xffff) << 16) | (self.registers[source + 1] & 0xffff);
+            let right = self.register_pair_u32(source);
             let result = if operation == 13 {
                 let product = u64::from(left) * u64::from(right);
                 let signed_product = (left as i32 as i64) * (right as i32 as i64);
@@ -576,7 +578,7 @@ impl Cpu {
             let count = if immediate {
                 u32::from(control & 0x1f)
             } else {
-                self.registers[source] & 0x1f
+                (self.registers[source] as u32) & 0x1f
             };
             let carry = if count == 0 {
                 self.flags.carry
@@ -593,8 +595,7 @@ impl Cpu {
                 _ => ((left as i32) >> count) as u32,
             }
         } else {
-            let right =
-                ((self.registers[source] & 0xffff) << 16) | (self.registers[source + 1] & 0xffff);
+            let right = self.register_pair_u32(source);
             match operation {
                 0 => {
                     let (result, carry) = left.overflowing_add(right);
@@ -629,8 +630,8 @@ impl Cpu {
     }
 
     fn set_pair(&mut self, register: usize, value: u32) {
-        self.registers[register] = value >> 16;
-        self.registers[register + 1] = value & 0xffff;
+        self.registers[register] = i64::from(value >> 16);
+        self.registers[register + 1] = i64::from(value & 0xffff);
     }
 
     fn set_32_flags(&mut self, result: u32, carry: bool, overflow: bool) {
@@ -643,7 +644,7 @@ impl Cpu {
     fn execute_shift(&mut self, destination: usize, value: u16, operation: u16, count: u32) {
         if count == 0 {
             self.set_flags(value, self.flags.carry, false);
-            self.registers[destination] = u32::from(value);
+            self.registers[destination] = i64::from(value);
             return;
         }
         let (result, carry) = match operation {
@@ -666,7 +667,7 @@ impl Cpu {
             }
         };
         self.set_flags(result, carry != 0, false);
-        self.registers[destination] = u32::from(result);
+        self.registers[destination] = i64::from(result);
     }
 
     fn set_flags(&mut self, result: u16, carry: bool, overflow: bool) {
@@ -678,10 +679,10 @@ impl Cpu {
 
     fn execute_misc(&mut self, destination: usize, value: u16, selector: u16, control: u16) {
         match selector {
-            0 => self.registers[destination] = u32::from(value.rotate_left(8)),
+            0 => self.registers[destination] = i64::from(value.rotate_left(8)),
             1 => {
                 let result = (value & 0xff) | if value & 0x80 != 0 { 0xff00 } else { 0 };
-                self.registers[destination] = u32::from(result);
+                self.registers[destination] = i64::from(result);
                 self.set_flags(result, self.flags.carry, false);
             }
             2 => self.pc = u32::from(value) & self.memory_mask,
@@ -698,13 +699,14 @@ impl Cpu {
             7 => self.flags.carry = false,
             8 => self.sp = u32::from(value) & self.memory_mask,
             9 => {
-                self.registers[destination] = value.leading_zeros();
+                self.registers[destination] = i64::from(value.leading_zeros());
                 self.flags.zero = value == 0;
             }
-            10 => self.registers[destination] = (self.sp >> 16) & 0x3fff,
+            10 => self.registers[destination] = i64::from((self.sp >> 16) & 0x3fff),
             11 | 12 => {
                 let high_register = ((control >> 9) & 7) as usize;
-                let target = ((self.registers[high_register] & 0x3fff) << 16) | u32::from(value);
+                let target =
+                    ((self.registers[high_register] as u32 & 0x3fff) << 16) | u32::from(value);
                 if selector == 11 {
                     self.push_u32(self.pc);
                 }
@@ -732,7 +734,7 @@ impl Cpu {
             let count = if immediate {
                 u32::from(control & 0xf)
             } else {
-                self.registers[source] & 0xf
+                (self.registers[source] as u32) & 0xf
             };
             self.execute_shift(destination, left, operation, count);
             return;
@@ -740,7 +742,7 @@ impl Cpu {
         if operation == 7 {
             let result = left.wrapping_neg();
             self.set_flags(result, left != 0, left == 0x8000);
-            self.registers[destination] = u32::from(result);
+            self.registers[destination] = i64::from(result);
             return;
         }
         let right = if immediate {
@@ -782,7 +784,7 @@ impl Cpu {
             }
         }
         if operation != 8 && operation != 14 {
-            self.registers[destination] = u32::from(result);
+            self.registers[destination] = i64::from(result);
         }
     }
 
@@ -801,9 +803,15 @@ impl Cpu {
 
         match opcode {
             OP_HALT => self.running = false,
-            OP_LDI => self.registers[rd] = immediate,
-            OP_LD => self.registers[rd] = self.read(self.registers[rs1]) as u32,
-            OP_ST => self.write(self.registers[rs1], self.registers[rd] as u8),
+            OP_LDI => self.registers[rd] = i64::from(immediate),
+            OP_LD => {
+                let address = self.registers[rs1] as u32 & self.memory_mask;
+                self.registers[rd] = i64::from(self.read(address));
+            }
+            OP_ST => {
+                let address = self.registers[rs1] as u32 & self.memory_mask;
+                self.write(address, self.registers[rd] as u8);
+            }
             OP_MOV => self.registers[rd] = self.registers[rs1],
             OP_ADD => {
                 let left = self.registers[rs1];
@@ -811,18 +819,20 @@ impl Cpu {
                 let result = left.wrapping_add(right);
                 self.registers[rd] = result;
                 self.flags.zero = result == 0;
-                self.flags.carry = left as u64 + right as u64 > 0xff;
+                self.flags.carry = result > 0xff;
                 let word = result as u16;
                 self.flags.negative = word & 0x8000 != 0;
-                self.flags.overflow =
-                    (!(left as u16 ^ right as u16) & (left as u16 ^ word) & 0x8000) != 0;
+                self.flags.overflow = ((left ^ result) & (right ^ result) & 0x8000) != 0;
             }
             OP_SUB => {
                 let left = self.registers[rs1];
                 let right = self.registers[rs2];
                 let result = left.wrapping_sub(right);
                 self.registers[rd] = result;
-                self.set_sub_flags(left as u16, right as u16, result as u16);
+                self.flags.zero = result == 0;
+                self.flags.carry = result < 0;
+                self.flags.negative = result as u16 & 0x8000 != 0;
+                self.flags.overflow = ((left ^ right) & (left ^ result) & 0x8000) != 0;
             }
             OP_AND => self.registers[rd] = self.registers[rs1] & self.registers[rs2],
             OP_OR => self.registers[rd] = self.registers[rs1] | self.registers[rs2],
@@ -837,11 +847,17 @@ impl Cpu {
             OP_INC => self.registers[rd] = self.registers[rd].wrapping_add(1),
             OP_DEC => self.registers[rd] = self.registers[rd].wrapping_sub(1),
             OP_CMP => {
-                let left = self.registers[rs1] as u16;
-                let right = self.registers[rs2] as u16;
-                self.set_sub_flags(left, right, left.wrapping_sub(right));
+                let left = self.registers[rs1];
+                let right = self.registers[rs2];
+                let result = left.wrapping_sub(right);
+                self.flags.zero = result == 0;
+                self.flags.carry = result < 0;
+                self.flags.negative = result as u16 & 0x8000 != 0;
+                self.flags.overflow = ((left ^ right) & (left ^ result) & 0x8000) != 0;
             }
-            OP_LDI_H => self.registers[rd] = (immediate << 8) | (self.registers[rd] & 0xff),
+            OP_LDI_H => {
+                self.registers[rd] = (i64::from(immediate) << 8) | (self.registers[rd] & 0xff);
+            }
             OP_EI => {
                 let value = self.read(ICR_ADDR) | 1;
                 self.write(ICR_ADDR, value);
@@ -856,7 +872,7 @@ impl Cpu {
                 self.pc = self.pop_u32() & self.memory_mask;
             }
             OP_PUSH => self.push_u16(self.registers[rd] as u16),
-            OP_POP => self.registers[rd] = self.pop_u16() as u32,
+            OP_POP => self.registers[rd] = i64::from(self.pop_u16()),
             OP_CALL => {
                 self.push_u32(self.pc);
                 self.pc = (instruction & 0x7ff) as u32;
@@ -867,11 +883,17 @@ impl Cpu {
                     self.pc = (instruction & 0x7ff) as u32;
                 }
             }
-            OP_LDW => self.registers[rd] = self.read_u16(self.registers[rs1]) as u32,
-            OP_STW => self.write_u16(self.registers[rs1], self.registers[rd] as u16),
+            OP_LDW => {
+                let address = self.registers[rs1] as u32 & self.memory_mask;
+                self.registers[rd] = i64::from(self.read_u16(address));
+            }
+            OP_STW => {
+                let address = self.registers[rs1] as u32 & self.memory_mask;
+                self.write_u16(address, self.registers[rd] as u16);
+            }
             OP_LDWS => {
                 self.registers[rd] =
-                    self.read_u16(self.sp.wrapping_add(immediate) & self.memory_mask) as u32
+                    i64::from(self.read_u16(self.sp.wrapping_add(immediate) & self.memory_mask))
             }
             OP_STWS => self.write_u16(
                 self.sp.wrapping_add(immediate) & self.memory_mask,
@@ -929,7 +951,7 @@ impl Cpu {
                 let extension = (instruction >> 5) & 7;
                 if extension == 0 {
                     self.registers[rd] = if instruction & 0xff == 0x1c {
-                        self.sp
+                        i64::from(self.sp)
                     } else {
                         (self.registers[rd] & 0xffff) >> 1
                     };
@@ -938,21 +960,21 @@ impl Cpu {
                     let left = f16_to_f32(self.registers[rd] as u16);
                     let right = f16_to_f32(self.registers[source] as u16);
                     match extension {
-                        1 => self.registers[rd] = u32::from(f32_to_f16(left + right)),
-                        2 => self.registers[rd] = u32::from(f32_to_f16(left - right)),
-                        3 => self.registers[rd] = u32::from(f32_to_f16(left * right)),
-                        4 => self.registers[rd] = u32::from(f32_to_f16(left / right)),
+                        1 => self.registers[rd] = i64::from(f32_to_f16(left + right)),
+                        2 => self.registers[rd] = i64::from(f32_to_f16(left - right)),
+                        3 => self.registers[rd] = i64::from(f32_to_f16(left * right)),
+                        4 => self.registers[rd] = i64::from(f32_to_f16(left / right)),
                         5 => {
                             self.flags.zero = left == right;
                             self.flags.carry = left < right;
                         }
                         6 => {
                             self.registers[rd] =
-                                u32::from(f32_to_f16((self.registers[rd] as u16 as i16) as f32))
+                                i64::from(f32_to_f16((self.registers[rd] as u16 as i16) as f32))
                         }
                         7 => {
                             self.registers[rd] =
-                                ((f16_to_f32(self.registers[rd] as u16) as i32) as u32) & 0xffff
+                                i64::from((f16_to_f32(self.registers[rd] as u16) as i32) as u16)
                         }
                         _ => {}
                     }
@@ -1259,13 +1281,6 @@ impl Cpu {
         }
     }
 
-    fn set_sub_flags(&mut self, left: u16, right: u16, result: u16) {
-        self.flags.zero = result == 0;
-        self.flags.carry = left < right;
-        self.flags.negative = result & 0x8000 != 0;
-        self.flags.overflow = ((left ^ right) & (left ^ result) & 0x8000) != 0;
-    }
-
     fn pack_flags(&self) -> u16 {
         u16::from(self.flags.zero)
             | (u16::from(self.flags.carry) << 1)
@@ -1508,16 +1523,39 @@ mod tests {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
         let left = 1.5f32.to_bits();
         let right = 2.25f32.to_bits();
-        cpu.registers[0] = left >> 16;
-        cpu.registers[1] = left & 0xffff;
-        cpu.registers[2] = right >> 16;
-        cpu.registers[3] = right & 0xffff;
+        cpu.registers[0] = i64::from(left >> 16);
+        cpu.registers[1] = i64::from(left & 0xffff);
+        cpu.registers[2] = i64::from(right >> 16);
+        cpu.registers[3] = i64::from(right & 0xffff);
         cpu.write_u16(0, FLOAT_PREFIX);
         cpu.write_u16(2, 2);
         cpu.write_u16(4, OP_HALT << 11);
         cpu.run(2).unwrap();
-        let result = (cpu.registers[0] << 16) | cpu.registers[1];
+        let result = ((cpu.registers[0] as u16 as u32) << 16) | cpu.registers[1] as u16 as u32;
         assert_eq!(f32::from_bits(result), 3.75);
+    }
+
+    #[test]
+    fn classic_subtraction_preserves_signed_register_results() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.registers[1] = 1;
+        cpu.registers[2] = 2;
+        cpu.write_u16(0, (OP_SUB << 11) | (1 << 5) | (2 << 2));
+        cpu.write_u16(2, OP_HALT << 11);
+        cpu.run(2).unwrap();
+        assert_eq!(cpu.registers[0], -1);
+        assert!(cpu.flags.carry);
+        assert!(cpu.flags.negative);
+
+        cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.registers[1] = 1;
+        cpu.registers[2] = 2;
+        cpu.write_u16(0, (OP_CMP << 11) | (1 << 5) | (2 << 2));
+        cpu.write_u16(2, OP_HALT << 11);
+        cpu.run(2).unwrap();
+        assert_eq!(cpu.registers[0], 0);
+        assert!(cpu.flags.carry);
+        assert!(cpu.flags.negative);
     }
 
     #[test]

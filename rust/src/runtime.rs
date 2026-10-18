@@ -1,15 +1,19 @@
 use crate::cpu::Cpu;
 use crate::image::{ImageError, ProgramImage, build_source, load_binary};
-use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
+use macroquad::prelude::{
+    BLACK, Conf, DrawTextureParams, FilterMode, KeyCode, Rect, Texture2D, WHITE, clear_background,
+    draw_texture_ex, get_keys_down, get_keys_pressed, is_key_down, is_key_pressed, next_frame,
+    screen_height, screen_width, set_fullscreen, vec2,
+};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const VRAM_START: usize = 0x50000;
 const SPEED_ADDR: usize = 0x43003;
 const RTC_START: usize = 0x43010;
 const GFX_MODE_ADDR: usize = 0x43014;
-const SCREEN_FPS: u32 = 30;
 const PALETTE: [(u8, u8, u8); 16] = [
     (0, 0, 0),
     (255, 255, 255),
@@ -68,6 +72,55 @@ impl From<std::io::Error> for RuntimeError {
     }
 }
 
+struct Canvas {
+    texture: Texture2D,
+    rgba: Vec<u8>,
+}
+
+impl Canvas {
+    fn new() -> Self {
+        let rgba = vec![0; 640 * 480 * 4];
+        let texture = Texture2D::from_rgba8(640, 480, &rgba);
+        texture.set_filter(FilterMode::Nearest);
+        Self { texture, rgba }
+    }
+
+    async fn present(&mut self, pixels: &[u32], width: usize, height: usize) {
+        self.rgba.fill(0);
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = pixels[y * width + x];
+                let index = (y * 640 + x) * 4;
+                self.rgba[index] = (pixel >> 16) as u8;
+                self.rgba[index + 1] = (pixel >> 8) as u8;
+                self.rgba[index + 2] = pixel as u8;
+                self.rgba[index + 3] = 255;
+            }
+        }
+        self.texture.update_from_bytes(640, 480, &self.rgba);
+
+        let scale = (screen_width() / width as f32).min(screen_height() / height as f32);
+        let destination = vec2(width as f32 * scale, height as f32 * scale);
+        let position = vec2(
+            (screen_width() - destination.x) / 2.0,
+            (screen_height() - destination.y) / 2.0,
+        );
+        clear_background(BLACK);
+        draw_texture_ex(
+            &self.texture,
+            position.x,
+            position.y,
+            WHITE,
+            DrawTextureParams {
+                source: Some(Rect::new(0.0, 0.0, width as f32, height as f32)),
+                dest_size: Some(destination),
+                ..DrawTextureParams::default()
+            },
+        );
+        next_frame().await;
+    }
+}
+
 #[derive(Clone)]
 struct BootModule {
     name: String,
@@ -76,33 +129,32 @@ struct BootModule {
     error: Option<String>,
 }
 
-pub fn run(root: &Path, program: Option<&Path>, fullscreen: bool) -> Result<(), RuntimeError> {
-    if fullscreen {
-        return Err(RuntimeError::Window(
-            "fullscreen mode is not implemented in the Rust runtime yet".to_owned(),
-        ));
+pub fn window_conf() -> Conf {
+    Conf {
+        window_title: "SuomiCPU-16 Emulator (Rust)".to_owned(),
+        window_width: 960,
+        window_height: 720,
+        high_dpi: false,
+        ..Conf::default()
     }
+}
+
+pub async fn run(
+    root: &Path,
+    program: Option<&Path>,
+    fullscreen: bool,
+) -> Result<(), RuntimeError> {
     if !root.join("tools").join("sc16_build_image.py").is_file() {
         return Err(RuntimeError::MissingBuildTools(
             root.join("tools").join("sc16_build_image.py"),
         ));
     }
-    let mut window = Window::new(
-        "SuomiCPU-16 Emulator (Rust)",
-        960,
-        720,
-        WindowOptions {
-            scale: Scale::X1,
-            scale_mode: ScaleMode::AspectRatioStretch,
-            ..WindowOptions::default()
-        },
-    )
-    .map_err(|error| RuntimeError::Window(error.to_string()))?;
-    window.set_target_fps(SCREEN_FPS as usize);
+    set_fullscreen(fullscreen);
 
     let mut cpu = Cpu::new();
     let font = load_font();
     let mut pixels = vec![0u32; 640 * 480];
+    let mut canvas = Canvas::new();
     if let Some(source) = program {
         let image = build_program(root, source)?;
         cpu.load_program(&image.segments, image.entry_point)
@@ -114,23 +166,23 @@ pub fn run(root: &Path, program: Option<&Path>, fullscreen: bool) -> Result<(), 
                 "no runnable C modules were found in modules/".to_owned(),
             ));
         }
-        if !select_and_boot(root, &mut cpu, &mut window, &mut pixels, &font, &modules)? {
+        if !select_and_boot(root, &mut cpu, &mut canvas, &mut pixels, &font, &modules).await? {
             return Ok(());
         }
     }
 
-    let mut old_keys = Vec::new();
+    let mut old_keys = HashSet::new();
     let mut speed_remainder = 0.0;
     let mut last_frame = Instant::now();
-    while window.is_open() && !window.is_key_down(Key::Escape) && cpu.running {
-        let keys = window.get_keys();
+    while !is_key_down(KeyCode::Escape) && cpu.running {
+        let keys = get_keys_down();
         update_keys(&mut cpu, &old_keys, &keys);
         old_keys = keys;
-        for key in window.get_keys_pressed(KeyRepeat::No) {
-            if key == Key::Enter {
+        for key in get_keys_pressed() {
+            if key == KeyCode::Enter {
                 cpu.receive_console_input(b"\n");
                 cpu.signal_keyboard_event(13);
-            } else if key == Key::Backspace {
+            } else if key == KeyCode::Backspace {
                 cpu.receive_console_input(b"\x08");
                 cpu.signal_keyboard_event(8);
             } else if let Some(byte) = key_to_ascii(key) {
@@ -154,9 +206,7 @@ pub fn run(root: &Path, program: Option<&Path>, fullscreen: bool) -> Result<(), 
             .map_err(|error| RuntimeError::Window(error.to_string()))?;
         render_cpu(&cpu, &mut pixels);
         let (width, height) = screen_size(&cpu);
-        window
-            .update_with_buffer(&pixels[..width * height], width, height)
-            .map_err(|error| RuntimeError::Window(error.to_string()))?;
+        canvas.present(&pixels, width, height).await;
     }
     Ok(())
 }
@@ -250,10 +300,10 @@ fn discover_modules(directory: &Path) -> Result<Vec<BootModule>, RuntimeError> {
     Ok(modules)
 }
 
-fn select_and_boot(
+async fn select_and_boot(
     root: &Path,
     cpu: &mut Cpu,
-    window: &mut Window,
+    canvas: &mut Canvas,
     pixels: &mut [u32],
     font: &[[u8; 8]],
     modules: &[BootModule],
@@ -299,24 +349,22 @@ fn select_and_boot(
                 font,
             );
         }
-        window
-            .update_with_buffer(pixels, 640, 480)
-            .map_err(|error| RuntimeError::Window(error.to_string()))?;
-        if !window.is_open() || window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+        canvas.present(pixels, 640, 480).await;
+        if is_key_pressed(KeyCode::Escape) {
             return Ok(false);
         }
-        if window.is_key_pressed(Key::Up, KeyRepeat::Yes) {
+        if is_key_pressed(KeyCode::Up) {
             selected = selected.saturating_sub(1);
-        } else if window.is_key_pressed(Key::Down, KeyRepeat::Yes) {
+        } else if is_key_pressed(KeyCode::Down) {
             selected = (selected + 1).min(modules.len() - 1);
-        } else if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
+        } else if is_key_pressed(KeyCode::Enter) {
             let module = &modules[selected];
             if let Some(error) = &module.error {
                 draw_text(pixels, 640, 32, 440, error, 0xffff6060, font);
-                window
-                    .update_with_buffer(pixels, 640, 480)
-                    .map_err(|error| RuntimeError::Window(error.to_string()))?;
-                std::thread::sleep(Duration::from_secs(2));
+                let error_until = Instant::now() + std::time::Duration::from_secs(2);
+                while Instant::now() < error_until {
+                    canvas.present(pixels, 640, 480).await;
+                }
                 continue;
             }
             let source = module
@@ -328,11 +376,10 @@ fn select_and_boot(
                 .map_err(|error| RuntimeError::Window(error.to_string()))?;
             return Ok(true);
         }
-        std::thread::sleep(Duration::from_millis(16));
     }
 }
 
-fn update_keys(cpu: &mut Cpu, previous: &[Key], current: &[Key]) {
+fn update_keys(cpu: &mut Cpu, previous: &HashSet<KeyCode>, current: &HashSet<KeyCode>) {
     for (key, mask) in key_masks() {
         let was_down = previous.contains(&key);
         let is_down = current.contains(&key);
@@ -345,80 +392,80 @@ fn update_keys(cpu: &mut Cpu, previous: &[Key], current: &[Key]) {
     }
 }
 
-fn key_masks() -> [(Key, u32); 25] {
+fn key_masks() -> [(KeyCode, u32); 25] {
     [
-        (Key::Left, 1),
-        (Key::A, 1),
-        (Key::Right, 2),
-        (Key::D, 2),
-        (Key::Up, 4),
-        (Key::W, 4),
-        (Key::Down, 8),
-        (Key::S, 8),
-        (Key::Space, 16),
-        (Key::Enter, 32),
-        (Key::Tab, 64),
-        (Key::Q, 0x100),
-        (Key::E, 0x200),
-        (Key::LeftShift, 0x400),
-        (Key::RightShift, 0x400),
-        (Key::X, 0x400),
-        (Key::LeftCtrl, 0x800),
-        (Key::RightCtrl, 0x800),
-        (Key::Z, 0x800),
-        (Key::C, 0x1_0000),
-        (Key::J, 0x2_0000),
-        (Key::L, 0x4_0000),
-        (Key::I, 0x8_0000),
-        (Key::K, 0x10_0000),
-        (Key::Period, 0x20_0000),
+        (KeyCode::Left, 1),
+        (KeyCode::A, 1),
+        (KeyCode::Right, 2),
+        (KeyCode::D, 2),
+        (KeyCode::Up, 4),
+        (KeyCode::W, 4),
+        (KeyCode::Down, 8),
+        (KeyCode::S, 8),
+        (KeyCode::Space, 16),
+        (KeyCode::Enter, 32),
+        (KeyCode::Tab, 64),
+        (KeyCode::Q, 0x100),
+        (KeyCode::E, 0x200),
+        (KeyCode::LeftShift, 0x400),
+        (KeyCode::RightShift, 0x400),
+        (KeyCode::X, 0x400),
+        (KeyCode::LeftControl, 0x800),
+        (KeyCode::RightControl, 0x800),
+        (KeyCode::Z, 0x800),
+        (KeyCode::C, 0x1_0000),
+        (KeyCode::J, 0x2_0000),
+        (KeyCode::L, 0x4_0000),
+        (KeyCode::I, 0x8_0000),
+        (KeyCode::K, 0x10_0000),
+        (KeyCode::Period, 0x20_0000),
     ]
 }
 
-fn key_to_ascii(key: Key) -> Option<u8> {
+fn key_to_ascii(key: KeyCode) -> Option<u8> {
     match key {
-        Key::A => Some(b'a'),
-        Key::B => Some(b'b'),
-        Key::C => Some(b'c'),
-        Key::D => Some(b'd'),
-        Key::E => Some(b'e'),
-        Key::F => Some(b'f'),
-        Key::G => Some(b'g'),
-        Key::H => Some(b'h'),
-        Key::I => Some(b'i'),
-        Key::J => Some(b'j'),
-        Key::K => Some(b'k'),
-        Key::L => Some(b'l'),
-        Key::M => Some(b'm'),
-        Key::N => Some(b'n'),
-        Key::O => Some(b'o'),
-        Key::P => Some(b'p'),
-        Key::Q => Some(b'q'),
-        Key::R => Some(b'r'),
-        Key::S => Some(b's'),
-        Key::T => Some(b't'),
-        Key::U => Some(b'u'),
-        Key::V => Some(b'v'),
-        Key::W => Some(b'w'),
-        Key::X => Some(b'x'),
-        Key::Y => Some(b'y'),
-        Key::Z => Some(b'z'),
-        Key::Key0 => Some(b'0'),
-        Key::Key1 => Some(b'1'),
-        Key::Key2 => Some(b'2'),
-        Key::Key3 => Some(b'3'),
-        Key::Key4 => Some(b'4'),
-        Key::Key5 => Some(b'5'),
-        Key::Key6 => Some(b'6'),
-        Key::Key7 => Some(b'7'),
-        Key::Key8 => Some(b'8'),
-        Key::Key9 => Some(b'9'),
-        Key::Space => Some(b' '),
-        Key::Comma => Some(b','),
-        Key::Period => Some(b'.'),
-        Key::Minus => Some(b'-'),
-        Key::Apostrophe => Some(b'\''),
-        Key::Slash => Some(b'/'),
+        KeyCode::A => Some(b'a'),
+        KeyCode::B => Some(b'b'),
+        KeyCode::C => Some(b'c'),
+        KeyCode::D => Some(b'd'),
+        KeyCode::E => Some(b'e'),
+        KeyCode::F => Some(b'f'),
+        KeyCode::G => Some(b'g'),
+        KeyCode::H => Some(b'h'),
+        KeyCode::I => Some(b'i'),
+        KeyCode::J => Some(b'j'),
+        KeyCode::K => Some(b'k'),
+        KeyCode::L => Some(b'l'),
+        KeyCode::M => Some(b'm'),
+        KeyCode::N => Some(b'n'),
+        KeyCode::O => Some(b'o'),
+        KeyCode::P => Some(b'p'),
+        KeyCode::Q => Some(b'q'),
+        KeyCode::R => Some(b'r'),
+        KeyCode::S => Some(b's'),
+        KeyCode::T => Some(b't'),
+        KeyCode::U => Some(b'u'),
+        KeyCode::V => Some(b'v'),
+        KeyCode::W => Some(b'w'),
+        KeyCode::X => Some(b'x'),
+        KeyCode::Y => Some(b'y'),
+        KeyCode::Z => Some(b'z'),
+        KeyCode::Key0 => Some(b'0'),
+        KeyCode::Key1 => Some(b'1'),
+        KeyCode::Key2 => Some(b'2'),
+        KeyCode::Key3 => Some(b'3'),
+        KeyCode::Key4 => Some(b'4'),
+        KeyCode::Key5 => Some(b'5'),
+        KeyCode::Key6 => Some(b'6'),
+        KeyCode::Key7 => Some(b'7'),
+        KeyCode::Key8 => Some(b'8'),
+        KeyCode::Key9 => Some(b'9'),
+        KeyCode::Space => Some(b' '),
+        KeyCode::Comma => Some(b','),
+        KeyCode::Period => Some(b'.'),
+        KeyCode::Minus => Some(b'-'),
+        KeyCode::Apostrophe => Some(b'\''),
+        KeyCode::Slash => Some(b'/'),
         _ => None,
     }
 }

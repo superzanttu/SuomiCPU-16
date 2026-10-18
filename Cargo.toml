@@ -11,6 +11,6 @@ name = "suomicpu16"
 path = "rust/src/main.rs"
 
 [dependencies]
+macroquad = "0.4.16"
 memmap2 = "0.9"
-minifb = "0.28"
 

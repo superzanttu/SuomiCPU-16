@@ -88,6 +88,20 @@ python main.py asteroids.bin
 See the [user guide](user_guide.md) for setup details, controls, and the full
 example catalog.
 
+## Rust emulator port
+
+The Rust port uses Macroquad for graphics and can be compiled for native
+systems or `wasm32-unknown-unknown`:
+
+```console
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown
+```
+
+The browser build is not yet a standalone web release: module discovery and
+source compilation still rely on the host filesystem and the Python assembler
+and C compiler.
+
 <!-- module-gif-gallery:start -->
 ## Module gallery
 

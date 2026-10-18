@@ -1,13 +1,17 @@
 use std::path::{Path, PathBuf};
 
-fn main() {
-    if let Err(error) = run() {
+use suomicpu16::runtime::window_conf;
+
+#[macroquad::main(window_conf)]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("SuomiCPU-16: {error}");
+        #[cfg(not(target_arch = "wasm32"))]
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut program = None;
     let mut fullscreen = false;
     let mut headless = false;
@@ -55,10 +59,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("Program halted after {steps} instructions.");
             return Ok(());
         }
-        return suomicpu16::runtime::run(&root, Some(path), fullscreen).map_err(Into::into);
+        return suomicpu16::runtime::run(&root, Some(path), fullscreen)
+            .await
+            .map_err(Into::into);
     }
     if headless {
         return Err("--headless requires a program file".into());
     }
-    suomicpu16::runtime::run(&root, None, fullscreen).map_err(Into::into)
+    suomicpu16::runtime::run(&root, None, fullscreen)
+        .await
+        .map_err(Into::into)
 }
