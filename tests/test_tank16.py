@@ -102,7 +102,40 @@ class Tank16Tests(unittest.TestCase):
             "  for (i = 0; i < 12; i++) update_tank(0, 2, 0);\n"
             "  results[11 + speed] = tanks[0].direction;\n"
             "}\n", 14)
-        self.assertEqual(results, [22, 0, 0, 8, 101, 0, 0, 0, 0, 24, 1, 14, 12, 12])
+        self.assertEqual(results, [22, 0, 0, 8, 101, 0, 0, 0, 0, 24, 1, 14, 12, 11])
+
+    def test_pause_freezes_round_and_resumes_without_advancing_a_frame(self):
+        results = self.scenario_results(
+            "int i;\n"
+            "start_round(); round_frames = 100;\n"
+            "update_game(KEY_TAB, 0);\n"
+            "results[0] = game_paused; results[1] = round_frames;\n"
+            "for (i = 0; i < 5; i++) update_game(0, 0);\n"
+            "results[2] = game_paused; results[3] = round_frames;\n"
+            "update_game(KEY_TAB, 0);\n"
+            "results[4] = game_paused; results[5] = round_frames;\n"
+            "update_game(0, 0); results[6] = round_frames;\n"
+            "update_game(KEY_TAB, 0); update_game(0, 0);\n"
+            "update_game(KEY_START, 0);\n"
+            "results[7] = game_paused; results[8] = tanks[0].health;\n", 9)
+        self.assertEqual(results, [1, 100, 1, 100, 0, 100, 99, 0, 100])
+
+    def test_pause_overlay_shows_border_and_control_hint(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        scenario = (
+            "int main(void) {\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  gfx_layer_select(LAYER_HUD); gfx_clear(15);\n"
+            "  draw_pause_overlay();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            self.game_source(source_path) + scenario, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(layer_pixel(cpu, 4, 121, 167), 10)
+        self.assertEqual(layer_pixel(cpu, 4, 125, 171), 0)
 
     def test_ammo_and_tank_fires_use_distinct_real_time_lifetimes(self):
         results = self.scenario_results(
@@ -718,8 +751,42 @@ class Tank16Tests(unittest.TestCase):
             value - 65536 if value >= 32768 else value for value in results
         ]
         self.assertEqual(results, [30, -30, 46])
-        self.assertEqual(layer_pixel(cpu, 4, 308, 33), 6)
-        self.assertEqual(layer_pixel(cpu, 4, 332, 54), 2)
+        self.assertEqual(layer_pixel(cpu, 4, 308, 33), 3)
+        self.assertEqual(layer_pixel(cpu, 4, 332, 54), 3)
+
+    def test_minimap_keeps_map_aspect_ratio_and_highlights_players_and_deep_water(self):
+        source_path = GAME_DIR / "main.c"
+        source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1)
+        scenario = (
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  runtime_terrain_columns = 10; runtime_terrain_rows = 8;\n"
+            "  runtime_object_columns = 6; runtime_object_rows = 8;\n"
+            "  runtime_tile_size = 64; runtime_tile_count = 148;\n"
+            "  runtime_palette_count = 225;\n"
+            "  map_infinite = 0; map_columns = 10; map_rows = 8;\n"
+            "  runtime_map_lazy = 0;\n"
+            "  map_data = runtime_map_data; map_obstacles = runtime_map_obstacles;\n"
+            "  for (i = 0; i < 80; i++) {\n"
+            "    runtime_map_data[i] = 1; runtime_map_obstacles[i] = 0;\n"
+            "  }\n"
+            "  runtime_map_data[0] = DEEP_WATER_TILE_ID;\n"
+            "  tanks[0].x = 64; tanks[0].y = 64;\n"
+            "  tanks[1].x = 576; tanks[1].y = 448;\n"
+            "  gfx_layer_select(LAYER_HUD); gfx_clear(0); draw_minimap();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(source + scenario, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(layer_pixel(cpu, 4, 293, 50), 10)
+        self.assertEqual(layer_pixel(cpu, 4, 320, 74), 10)
+        self.assertEqual(layer_pixel(cpu, 4, 295, 33), 4)
+        self.assertEqual(layer_pixel(cpu, 4, 300, 38), 6)
+        self.assertEqual(layer_pixel(cpu, 4, 340, 68), 2)
 
     def test_map_name_is_drawn_beneath_timer_without_extension(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
@@ -818,16 +885,23 @@ class Tank16Tests(unittest.TestCase):
             "  results[8] = tanks[0].health;\n"
             "  update_tank(0, 0, 0); results[9] = tanks[0].health;\n"
             "  results[10] = tanks[0].speed;\n"
+            "  tanks[0].health = 100; tanks[0].x = 224; tanks[0].y = 96;\n"
+            "  tanks[0].speed = 3; tanks[0].throttle = 3;\n"
+            "  tanks[0].direction = 8; tanks[0].turn_tick = 0;\n"
+            "  for (i = 0; i < 3; i++) update_tank(0, 2, 0);\n"
+            "  results[11] = tanks[0].direction;\n"
+            "  update_tank(0, 2, 0); results[12] = tanks[0].direction;\n"
+            "  results[13] = tanks[0].turn_tick;\n"
             "  return 0;\n"
             "}\n"
         )
         cpu = make_cpu(compile_source(
-            "int results[11];\n" + source + scenario, str(source_path)))
+            "int results[14];\n" + source + scenario, str(source_path)))
         while cpu.running:
             cpu.step()
         self.assertEqual(
-            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(11)],
-            [100, 0, 70, 10, 9, 80, 32, 22, 100, 90, 3],
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(14)],
+            [100, 0, 70, 10, 9, 80, 32, 22, 100, 90, 3, 8, 9, 0],
         )
 
     def test_minimap_does_not_load_unloaded_lazy_map_rows(self):
@@ -861,8 +935,8 @@ class Tank16Tests(unittest.TestCase):
             value - 65536 if value >= 32768 else value for value in results
         ]
         self.assertEqual(results, [-239, 255, 0])
-        self.assertEqual(layer_pixel(cpu, 4, 308, 36), 6)
-        self.assertEqual(layer_pixel(cpu, 4, 332, 54), 2)
+        self.assertEqual(layer_pixel(cpu, 4, 308, 36), 0)
+        self.assertEqual(layer_pixel(cpu, 4, 332, 54), 0)
 
     def test_map_bounds_and_camera_clamping_follow_tile_pixel_size(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"

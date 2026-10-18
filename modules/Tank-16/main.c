@@ -50,7 +50,7 @@ void draw_runtime_loading_screen(char *message, int current, int total);
 #define MAP_TILE_PIXEL_SIZE 64
 #define TANK16_HUD_HEIGHT 30
 #define MINIMAP_MAX_WIDTH 96
-#define MINIMAP_MAX_HEIGHT 24
+#define MINIMAP_MAX_HEIGHT 40
 #define MAP_OBJECT_SOLID_CAPACITY 10000
 #define MAX_SHOTS 12
 #define ROUND_FRAMES 9000
@@ -274,6 +274,7 @@ int map_obstacle_density;
 int map_load_error;
 #endif
 int previous_keys;
+int game_paused;
 int tank_sprite_slots[2];
 int hit_flash[2];
 int muzzle_flash[2];
@@ -3154,6 +3155,7 @@ void start_round(void)
     round_frames = ROUND_FRAMES;
     round_delay = 0;
     round_over = 0;
+    game_paused = 0;
     round_winner = -1;
     powerup.life = 0;
     powerup_spawn_timer = POWERUP_SPAWN_DELAY;
@@ -3259,6 +3261,7 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     int terrain_speed_percent;
     int deep_water_samples;
     int steering_speed;
+    int steering_maximum_speed;
 
     if (tanks[player].health <= 0)
         return;
@@ -3342,11 +3345,16 @@ void update_tank(int player, unsigned int keys, unsigned int extra)
     if (turn != 0)
     {
         steering_speed = absolute_value(tanks[player].speed);
-        if (steering_speed > MAX_FORWARD_SPEED)
-            steering_speed = MAX_FORWARD_SPEED;
+        steering_maximum_speed = tanks[player].speed < 0
+                                     ? terrain_max_reverse_speed
+                                     : terrain_max_forward_speed;
+        if (steering_speed > steering_maximum_speed)
+            steering_speed = steering_maximum_speed;
         turn_frames = STATIONARY_TURN_FRAMES +
-                      steering_speed *
-                          (MOVING_TURN_FRAMES - STATIONARY_TURN_FRAMES) / MAX_FORWARD_SPEED;
+                      (steering_speed *
+                           (MOVING_TURN_FRAMES - STATIONARY_TURN_FRAMES) +
+                       steering_maximum_speed / 2) /
+                          steering_maximum_speed;
         tanks[player].turn_tick++;
         if (tanks[player].turn_tick >= turn_frames)
         {
@@ -3944,7 +3952,12 @@ void update_game(unsigned int keys, unsigned int extra)
         return;
     }
 #endif
-    update_burn_site_lifetimes();
+    if ((keys & KEY_TAB) && !(previous_keys & KEY_TAB))
+    {
+        game_paused = !game_paused;
+        previous_keys = (int)keys;
+        return;
+    }
     if ((keys & 32) && !(previous_keys & 32))
     {
         wins[0] = 0;
@@ -3959,6 +3972,12 @@ void update_game(unsigned int keys, unsigned int extra)
         previous_keys = (int)keys;
         return;
     }
+    if (game_paused)
+    {
+        previous_keys = (int)keys;
+        return;
+    }
+    update_burn_site_lifetimes();
     previous_keys = (int)keys;
     update_object_effects();
     update_combat_effects();
@@ -4270,7 +4289,7 @@ void draw_combat_feedback(void)
 
 int minimap_tile_color(int tile)
 {
-    if (tile >= 40 && tile <= 59)
+    if ((tile >= 40 && tile <= 59) || tile == DEEP_WATER_TILE_ID)
         return BLUE;
     if (tile >= 60 && tile <= 69)
         return TRACK_COLOR;
@@ -4387,8 +4406,6 @@ void draw_minimap(void)
     top = 0;
 #endif
 
-    gfx_rect(269, 31, 102, 28, DARK_GRAY);
-    gfx_rect(271, 33, 98, 24, BLACK);
     if (columns <= 0 || rows <= 0)
         return;
 
@@ -4405,6 +4422,8 @@ void draw_minimap(void)
         height = 1;
     x = 320 - width / 2;
     y = 33 + (MINIMAP_MAX_HEIGHT - height) / 2;
+    gfx_rect(x - 2, y - 2, width + 4, height + 4, DARK_GRAY);
+    gfx_rect(x, y, width, height, BLACK);
 
     for (pixel_row = 0; pixel_row < height; pixel_row++)
     {
@@ -4430,11 +4449,15 @@ void draw_minimap(void)
     for (player = 0; player < 2; player++)
     {
         player_column = (int)(
-            ((long)minimap_coordinate(tanks[player].x) - left) *
-            width / columns);
+            ((long)(minimap_coordinate(tanks[player].x) - left) *
+                 width +
+             columns / 2) /
+            columns);
         player_row = (int)(
-            ((long)minimap_coordinate(tanks[player].y) - top) *
-            height / rows);
+            ((long)(minimap_coordinate(tanks[player].y) - top) *
+                 height +
+             rows / 2) /
+            rows);
         if (player_column < 0)
             player_column = 0;
         if (player_column >= width)
@@ -4443,7 +4466,8 @@ void draw_minimap(void)
             player_row = 0;
         if (player_row >= height)
             player_row = height - 1;
-        gfx_rect(x + player_column - 1, y + player_row - 1, 3, 3,
+        gfx_rect(x + player_column - 3, y + player_row - 3, 7, 7, WHITE);
+        gfx_rect(x + player_column - 2, y + player_row - 2, 5, 5,
                  player == 0 ? CYAN : RED);
     }
 }
@@ -4622,6 +4646,18 @@ void draw_round_map_selection(void)
 }
 #endif
 
+void draw_pause_overlay(void)
+{
+    gfx_layer_select(LAYER_HUD);
+    gfx_rect(120, 166, 400, 148, DARK_GRAY);
+    gfx_rect(124, 170, 392, 140, BLACK);
+    gfx_text(278, 184, "TANK-16 PAUSED", YELLOW);
+    gfx_text(254, 208, "PRESS TAB TO RESUME", WHITE);
+    gfx_text(218, 238, "P1: W/S DRIVE  A/D TURN  C FIRE", GREEN);
+    gfx_text(218, 258, "P2: I/K DRIVE  J/L TURN  . FIRE", RED);
+    gfx_text(250, 286, "SPACE RESTARTS MATCH", GRAY);
+}
+
 void draw_game(void)
 {
     WorldCoord camera1_x;
@@ -4682,6 +4718,8 @@ void draw_game(void)
             gfx_text(viewport * 320 + 191, 437, countdown, YELLOW);
         }
     }
+    if (game_paused)
+        draw_pause_overlay();
 }
 
 int main(void)
@@ -4735,6 +4773,7 @@ int main(void)
     wins[0] = 0;
     wins[1] = 0;
     previous_keys = 0;
+    game_paused = 0;
 #ifdef RUNTIME_MAP_LOADING
     effect_random = ((unsigned int)gfx_random() << 8) ^ gfx_random();
 #endif

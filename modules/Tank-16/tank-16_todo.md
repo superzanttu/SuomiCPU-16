@@ -40,6 +40,7 @@
 - [x] Retain three times as many track marks and show forward/reverse throttle in the HUD.
 - [x] Add timed health, speed, and shot-damage power-ups.
 - [x] Add periodic tank movement sounds.
+- [x] Pause the match with Tab and show both players' controls while paused.
 
 ## Driving and battle reactions
 
@@ -50,6 +51,8 @@ forward. Player 2 uses I/K identically. Both throttle keys together leave the
 setting unchanged. Speed approaches the setting gradually. Forward speed is
 capped at 2 pixels/update; reverse at 1 pixel/update. Values use `SPEED_SCALE`
 subpixel units. The HUD shows throttle and REV when reversing.
+Press Tab to pause or resume; the pause panel lists both players' controls.
+Space restarts the match even while paused.
 
 One 32-direction steering step varies with absolute speed: 2 updates at rest,
 3 at half forward speed, and `MOVING_TURN_FRAMES` (4) at full forward speed.
