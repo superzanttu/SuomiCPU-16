@@ -1,37 +1,18 @@
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, GpuLine, GpuTriangle};
 use crate::image::{ImageError, ProgramImage, build_source, load_binary};
 use macroquad::prelude::{
-    BLACK, Conf, DrawTextureParams, FilterMode, KeyCode, Rect, Texture2D, WHITE, clear_background,
-    draw_texture_ex, get_keys_down, get_keys_pressed, is_key_down, is_key_pressed, next_frame,
-    screen_height, screen_width, set_fullscreen, vec2,
+    BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, Rect, Texture2D, WHITE,
+    clear_background, draw_line, draw_texture_ex, draw_triangle, get_keys_down, get_keys_pressed,
+    is_key_down, is_key_pressed, next_frame, screen_height, screen_width, set_fullscreen, vec2,
 };
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const VRAM_START: usize = 0x50000;
 const SPEED_ADDR: usize = 0x43003;
 const RTC_START: usize = 0x43010;
 const GFX_MODE_ADDR: usize = 0x43014;
-const PALETTE: [(u8, u8, u8); 16] = [
-    (0, 0, 0),
-    (255, 255, 255),
-    (255, 48, 48),
-    (48, 220, 64),
-    (64, 96, 255),
-    (255, 224, 0),
-    (0, 224, 224),
-    (224, 64, 224),
-    (255, 144, 0),
-    (150, 150, 150),
-    (80, 80, 80),
-    (128, 0, 0),
-    (255, 128, 192),
-    (150, 100, 50),
-    (46, 30, 22),
-    (0, 0, 0),
-];
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -85,7 +66,15 @@ impl Canvas {
         Self { texture, rgba }
     }
 
-    async fn present(&mut self, pixels: &[u32], width: usize, height: usize) {
+    async fn present(
+        &mut self,
+        pixels: &[u32],
+        width: usize,
+        height: usize,
+        triangles: &[GpuTriangle],
+        lines: &[GpuLine],
+        palette: &[[u8; 3]; 256],
+    ) {
         self.rgba.fill(0);
         for y in 0..height {
             for x in 0..width {
@@ -117,6 +106,30 @@ impl Canvas {
                 ..DrawTextureParams::default()
             },
         );
+        let to_screen =
+            |(x, y): (i32, i32)| vec2(position.x + x as f32 * scale, position.y + y as f32 * scale);
+        for triangle in triangles {
+            let color = palette[triangle.color as usize];
+            let points = triangle.points.map(to_screen);
+            draw_triangle(
+                points[0],
+                points[1],
+                points[2],
+                Color::from_rgba(color[0], color[1], color[2], 255),
+            );
+        }
+        for line in lines {
+            let color = palette[line.color as usize];
+            let (start, end) = (to_screen(line.start), to_screen(line.end));
+            draw_line(
+                start.x,
+                start.y,
+                end.x,
+                end.y,
+                scale,
+                Color::from_rgba(color[0], color[1], color[2], 255),
+            );
+        }
         next_frame().await;
     }
 }
@@ -206,7 +219,16 @@ pub async fn run(
             .map_err(|error| RuntimeError::Window(error.to_string()))?;
         render_cpu(&cpu, &mut pixels);
         let (width, height) = screen_size(&cpu);
-        canvas.present(&pixels, width, height).await;
+        canvas
+            .present(
+                &pixels,
+                width,
+                height,
+                &cpu.gpu_triangles,
+                &cpu.gpu_lines,
+                &cpu.palette,
+            )
+            .await;
     }
     Ok(())
 }
@@ -349,7 +371,9 @@ async fn select_and_boot(
                 font,
             );
         }
-        canvas.present(pixels, 640, 480).await;
+        canvas
+            .present(pixels, 640, 480, &[], &[], &cpu.palette)
+            .await;
         if is_key_pressed(KeyCode::Escape) {
             return Ok(false);
         }
@@ -363,7 +387,9 @@ async fn select_and_boot(
                 draw_text(pixels, 640, 32, 440, error, 0xffff6060, font);
                 let error_until = Instant::now() + std::time::Duration::from_secs(2);
                 while Instant::now() < error_until {
-                    canvas.present(pixels, 640, 480).await;
+                    canvas
+                        .present(pixels, 640, 480, &[], &[], &cpu.palette)
+                        .await;
                 }
                 continue;
             }
@@ -500,32 +526,14 @@ fn screen_size(cpu: &Cpu) -> (usize, usize) {
 
 fn render_cpu(cpu: &Cpu, pixels: &mut [u32]) {
     let (width, height) = screen_size(cpu);
+    let framebuffer = cpu.composited_framebuffer();
     for y in 0..height {
         for x in 0..width {
-            let color = if width == 320 {
-                cpu.memory[VRAM_START + y * width + x]
-            } else {
-                let packed = cpu.memory[VRAM_START + y * (width / 2) + x / 2];
-                if x & 1 == 0 {
-                    packed >> 4
-                } else {
-                    packed & 0xf
-                }
-            };
-            pixels[y * width + x] = palette_color(color);
+            let color = framebuffer[y * width + x];
+            let [red, green, blue] = cpu.palette_color(color);
+            pixels[y * width + x] = rgb(red, green, blue);
         }
     }
-}
-
-fn palette_color(index: u8) -> u32 {
-    let (red, green, blue) = if index < PALETTE.len() as u8 {
-        PALETTE[index as usize]
-    } else if index == 25 {
-        (0, 0, 255)
-    } else {
-        (index, index, index)
-    };
-    rgb(red, green, blue)
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> u32 {

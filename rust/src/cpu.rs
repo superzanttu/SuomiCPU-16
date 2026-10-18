@@ -10,6 +10,13 @@ const RTC_VECTOR_ADDR: u32 = 0x0006;
 const KEYBOARD_ADDR: u32 = 0x43000;
 const KEYS_ADDR: u32 = 0x43004;
 const GPU_BASE: u32 = 0x43020;
+const GPU_MODE_ADDR: u32 = GPU_BASE - 12;
+const GPU_LAYER_SELECT: u32 = GPU_BASE + 16;
+const GPU_LAYER_MASK: u32 = GPU_BASE + 17;
+const GPU_LAYER_TRANSPARENCY: u32 = GPU_BASE + 18;
+const GPU_LAYER_ORDER: u32 = GPU_BASE + 23;
+const GPU_LAYER_COUNT: usize = 5;
+const GPU_PALETTE: u8 = 27;
 const RTC_START: u32 = 0x43010;
 const CONSOLE_DATA: u32 = 0x43200;
 const CONSOLE_STATUS: u32 = 0x43201;
@@ -27,8 +34,19 @@ const GPU_RANDOM: u8 = 9;
 const GPU_POLY: u8 = 10;
 const GPU_TICKS: u8 = 11;
 const GPU_RTC: u8 = 12;
+const GPU_3D: u8 = 22;
 const GPU_SAVE: u8 = 14;
 const GPU_LOAD: u8 = 15;
+const GPU3D_FILL: u16 = 1;
+const GPU3D_WIREFRAME: u16 = 2;
+const GPU3D_SIN_8_8: [i32; 64] = [
+    0, 25, 50, 74, 98, 121, 142, 162, 181, 198, 213, 226, 237, 245, 251, 255, 256, 255, 251, 245,
+    237, 226, 213, 198, 181, 162, 142, 121, 98, 74, 50, 25, 0, -25, -50, -74, -98, -121, -142,
+    -162, -181, -198, -213, -226, -237, -245, -251, -255, -256, -255, -251, -245, -237, -226, -213,
+    -198, -181, -162, -142, -121, -98, -74, -50, -25,
+];
+const GPU3D_MAX_VERTICES: usize = 128;
+const GPU3D_MAX_FACES: usize = 128;
 const FONT_ADDR: usize = 0x4400;
 const OP_HALT: u16 = 0x00;
 const OP_LDI: u16 = 0x01;
@@ -107,6 +125,19 @@ pub struct MemorySegment {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuTriangle {
+    pub points: [(i32, i32); 3],
+    pub color: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuLine {
+    pub start: (i32, i32),
+    pub end: (i32, i32),
+    pub color: u8,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpuError {
     InvalidMemorySize(usize),
@@ -158,7 +189,12 @@ pub struct Cpu {
     pub console_output: Vec<u8>,
     pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
+    pub layers: [Vec<u8>; GPU_LAYER_COUNT],
+    pub palette: [[u8; 3]; 256],
+    pub gpu_triangles: Vec<GpuTriangle>,
+    pub gpu_lines: Vec<GpuLine>,
     memory_mask: u32,
+    layer_mode: u8,
 }
 
 impl Cpu {
@@ -178,7 +214,34 @@ impl Cpu {
             memory[CONSOLE_CONTROL as usize] = 3;
             memory[(GPU_BASE - 12) as usize] = 0;
             memory[(GPU_BASE - 13) as usize] = 2;
+            memory[GPU_LAYER_MASK as usize] = (1 << GPU_LAYER_COUNT) - 1;
+            for layer in 0..GPU_LAYER_COUNT {
+                memory[(GPU_LAYER_ORDER as usize) + layer] = layer as u8;
+            }
         }
+        let mut palette = [[0; 3]; 256];
+        for (index, color) in palette.iter_mut().enumerate() {
+            *color = [index as u8; 3];
+        }
+        const PALETTE_COLORS: [[u8; 3]; 15] = [
+            [0, 0, 0],
+            [255, 255, 255],
+            [255, 48, 48],
+            [48, 220, 64],
+            [64, 96, 255],
+            [255, 224, 0],
+            [0, 224, 224],
+            [224, 64, 224],
+            [255, 144, 0],
+            [150, 150, 150],
+            [80, 80, 80],
+            [128, 0, 0],
+            [255, 128, 192],
+            [150, 100, 50],
+            [46, 30, 22],
+        ];
+        palette[..PALETTE_COLORS.len()].copy_from_slice(&PALETTE_COLORS);
+        palette[25] = [0, 0, 255];
         Ok(Self {
             memory,
             registers: [0; 8],
@@ -192,7 +255,12 @@ impl Cpu {
             console_output: Vec::new(),
             saved_video: None,
             random_state: 0x16c0_ffee,
+            layers: std::array::from_fn(|_| vec![0; 640 * 480]),
+            palette,
+            gpu_triangles: Vec::new(),
+            gpu_lines: Vec::new(),
             memory_mask,
+            layer_mode: 0,
         })
     }
 
@@ -252,6 +320,14 @@ impl Cpu {
         self.memory[index] = value;
         match address {
             GPU_BASE => self.gpu_command(value),
+            GPU_MODE_ADDR => {
+                if self.layer_mode != value {
+                    self.layer_mode = value;
+                    for layer in &mut self.layers {
+                        layer.fill(0);
+                    }
+                }
+            }
             CONSOLE_DATA => {
                 self.console_output.push(value);
                 print!("{}", char::from(value));
@@ -1016,7 +1092,7 @@ impl Cpu {
     pub fn set_key(&mut self, mask: u32, pressed: bool) {
         for offset in 0..3 {
             let address = KEYS_ADDR + offset;
-            let shift = (2 - offset) * 8;
+            let shift = offset * 8;
             let bit = ((mask >> shift) & 0xff) as u8;
             if pressed {
                 self.memory[address as usize] |= bit;
@@ -1033,28 +1109,81 @@ impl Cpu {
     }
 
     fn gpu_source(&self) -> u32 {
-        (u32::from(self.memory[(GPU_BASE + 12) as usize]) << 24)
-            | (u32::from(self.memory[(GPU_BASE + 13) as usize]) << 16)
-            | (u32::from(self.memory[(GPU_BASE + 10) as usize]) << 8)
-            | u32::from(self.memory[(GPU_BASE + 11) as usize])
+        let high = (u32::from(self.memory[(GPU_BASE + 12) as usize]) << 8)
+            | u32::from(self.memory[(GPU_BASE + 13) as usize]);
+        let low = (u32::from(self.memory[(GPU_BASE + 10) as usize]) << 8)
+            | u32::from(self.memory[(GPU_BASE + 11) as usize]);
+        ((high & 0x3fff) << 16) | low
     }
 
     fn screen_size(&self) -> (i32, i32) {
-        if self.memory[(GPU_BASE - 12) as usize] == 1 {
+        if self.memory[GPU_MODE_ADDR as usize] == 1 {
             (640, 480)
         } else {
             (320, 240)
         }
     }
 
+    pub fn composited_framebuffer(&self) -> Vec<u8> {
+        let (width, height) = self.screen_size();
+        let width = width as usize;
+        let height = height as usize;
+        let visible = self.memory[GPU_LAYER_MASK as usize] & ((1 << GPU_LAYER_COUNT) - 1);
+        let mut order = (0..GPU_LAYER_COUNT).collect::<Vec<_>>();
+        order.sort_by_key(|&layer| (self.memory[GPU_LAYER_ORDER as usize + layer], layer));
+        let mut pixels = vec![0; width * height];
+        for layer in order {
+            if visible & (1 << layer) == 0 {
+                continue;
+            }
+            let transparent = self.memory[GPU_LAYER_TRANSPARENCY as usize + layer];
+            for (index, output) in pixels.iter_mut().enumerate() {
+                let color = if layer == 0 {
+                    if width == 320 {
+                        self.memory[VRAM_START as usize + index]
+                    } else {
+                        let packed = self.memory[VRAM_START as usize + index / 2];
+                        if index & 1 == 0 {
+                            packed >> 4
+                        } else {
+                            packed & 0x0f
+                        }
+                    }
+                } else {
+                    self.layers[layer][index]
+                };
+                if color != transparent {
+                    *output = color;
+                }
+            }
+        }
+        pixels
+    }
+
+    pub fn palette_color(&self, index: u8) -> [u8; 3] {
+        self.palette[index as usize]
+    }
+
     fn gpu_pixel(&mut self, x: i32, y: i32, color: u8) {
+        let layer =
+            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        self.gpu_pixel_on_layer(layer, x, y, color);
+    }
+
+    fn gpu_pixel_on_layer(&mut self, layer: usize, x: i32, y: i32, color: u8) {
         let (width, height) = self.screen_size();
         if x < 0 || y < 0 || x >= width || y >= height {
             return;
         }
-        if width == 320 {
+        if width == 320 && layer != 0 {
+            let address = (y * width + x) as usize;
+            self.layers[layer][address] = color;
+        } else if width == 320 {
             let address = VRAM_START + (y * width + x) as u32;
             self.memory[address as usize] = color;
+        } else if layer != 0 {
+            let address = (y * width + x) as usize;
+            self.layers[layer][address] = color & 0x0f;
         } else {
             let address = VRAM_START + (y * (width / 2) + x / 2) as u32;
             let shift = if x & 1 == 0 { 4 } else { 0 };
@@ -1062,6 +1191,138 @@ impl Cpu {
             self.memory[address as usize] =
                 (self.memory[address as usize] & !mask) | ((color & 0xf) << shift);
         }
+    }
+
+    fn gpu_3d(&mut self, source: u32) {
+        self.gpu_triangles.clear();
+        self.gpu_lines.clear();
+        let header_bytes = 10 * 2;
+        if (source as usize).saturating_add(header_bytes) > self.memory.len() {
+            self.set_gpu_result(1);
+            return;
+        }
+        let header = (0..10)
+            .map(|index| self.read_u16(source + index * 2) as i16)
+            .collect::<Vec<_>>();
+        let vertex_count = header[0] as usize;
+        let face_count = header[1] as usize;
+        let angles = [
+            header[2] as u16 as u8,
+            header[3] as u16 as u8,
+            header[4] as u16 as u8,
+        ];
+        let translation = [
+            i32::from(header[5]),
+            i32::from(header[6]),
+            i32::from(header[7]),
+        ];
+        let focal = i32::from(header[8]);
+        let flags = header[9] as u16;
+        let word_count = 10usize
+            .saturating_add(vertex_count.saturating_mul(3))
+            .saturating_add(face_count.saturating_mul(4));
+        if !(3..=GPU3D_MAX_VERTICES).contains(&vertex_count)
+            || !(1..=GPU3D_MAX_FACES).contains(&face_count)
+            || focal <= 0
+            || flags == 0
+            || flags & !(GPU3D_FILL | GPU3D_WIREFRAME) != 0
+            || (source as usize).saturating_add(word_count.saturating_mul(2)) > self.memory.len()
+        {
+            self.set_gpu_result(1);
+            return;
+        }
+
+        let vertex_offset = source + 20;
+        let mut vertices = Vec::with_capacity(vertex_count);
+        for index in 0..vertex_count {
+            let offset = vertex_offset + (index * 3 * 2) as u32;
+            let original = [
+                i32::from(self.read_u16(offset) as i16),
+                i32::from(self.read_u16(offset + 2) as i16),
+                i32::from(self.read_u16(offset + 4) as i16),
+            ];
+            vertices.push(gpu3d_transform(original, angles, translation));
+        }
+
+        let face_offset = vertex_offset + (vertex_count * 3 * 2) as u32;
+        let mut faces = Vec::with_capacity(face_count);
+        for index in 0..face_count {
+            let offset = face_offset + (index * 4 * 2) as u32;
+            let face = [
+                self.read_u16(offset),
+                self.read_u16(offset + 2),
+                self.read_u16(offset + 4),
+            ];
+            let color = self.read_u16(offset + 6) as u8;
+            if face
+                .iter()
+                .any(|&vertex| usize::from(vertex) >= vertex_count)
+            {
+                self.set_gpu_result(2);
+                return;
+            }
+            faces.push((face, color));
+        }
+
+        let (width, height) = self.screen_size();
+        let projected = vertices
+            .iter()
+            .map(|&vertex| {
+                if vertex.2 > 0 {
+                    Some(gpu3d_project(vertex, focal, width, height))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        self.layers[3][..(width * height) as usize].fill(0);
+        let mut painter_order = (0..face_count).collect::<Vec<_>>();
+        painter_order.sort_by_key(|&index| {
+            let face = faces[index].0;
+            -face
+                .iter()
+                .map(|&vertex| vertices[usize::from(vertex)].2)
+                .sum::<i32>()
+        });
+        for index in painter_order {
+            let (face, color) = faces[index];
+            let [a, b, c] = face.map(usize::from);
+            let (Some(a), Some(b), Some(c)) = (projected[a], projected[b], projected[c]) else {
+                continue;
+            };
+            let points = [a, b, c];
+            if flags & GPU3D_FILL != 0 {
+                self.gpu_triangles.push(GpuTriangle { points, color });
+            } else if flags & GPU3D_WIREFRAME != 0 {
+                self.gpu_triangles.push(GpuTriangle { points, color: 0 });
+            }
+            if flags & GPU3D_WIREFRAME != 0 {
+                self.gpu_lines.extend([
+                    GpuLine {
+                        start: a,
+                        end: b,
+                        color,
+                    },
+                    GpuLine {
+                        start: b,
+                        end: c,
+                        color,
+                    },
+                    GpuLine {
+                        start: c,
+                        end: a,
+                        color,
+                    },
+                ]);
+            }
+        }
+        self.set_gpu_result(0);
+    }
+
+    fn set_gpu_result(&mut self, value: u16) {
+        let [high, low] = value.to_be_bytes();
+        self.memory[(GPU_BASE + 14) as usize] = high;
+        self.memory[(GPU_BASE + 15) as usize] = low;
     }
 
     fn gpu_command(&mut self, command: u8) {
@@ -1073,7 +1334,15 @@ impl Cpu {
         match command {
             GPU_CLEAR => {
                 let (width, height) = self.screen_size();
-                if width == 320 {
+                let layer = self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8)
+                    as usize;
+                if layer != 0 {
+                    self.layers[layer][..(width * height) as usize].fill(if width == 320 {
+                        color
+                    } else {
+                        color & 0x0f
+                    });
+                } else if width == 320 {
                     let start = VRAM_START as usize;
                     self.memory[start..start + (width * height) as usize].fill(color);
                 } else {
@@ -1168,6 +1437,15 @@ impl Cpu {
                     0
                 };
             }
+            GPU_PALETTE => {
+                let red = self.gpu_word(2) as u8;
+                let green = self.gpu_word(4) as u8;
+                let blue = self.gpu_word(6) as u8;
+                self.palette[color as usize] = [red, green, blue];
+                self.memory[(GPU_BASE + 14) as usize] = 0;
+                self.memory[(GPU_BASE + 15) as usize] = 0;
+            }
+            GPU_3D => self.gpu_3d(self.gpu_source()),
             GPU_SAVE => {
                 let (width, height) = self.screen_size();
                 let size = if width == 640 {
@@ -1414,6 +1692,41 @@ impl Default for Cpu {
     }
 }
 
+fn gpu3d_sincos(angle: u8) -> (i32, i32) {
+    let index = usize::from((angle >> 2) & 63);
+    (GPU3D_SIN_8_8[index], GPU3D_SIN_8_8[(index + 16) & 63])
+}
+
+fn gpu3d_transform(
+    [mut x, mut y, mut z]: [i32; 3],
+    angles: [u8; 3],
+    translation: [i32; 3],
+) -> (i32, i32, i32) {
+    let (sin_x, cos_x) = gpu3d_sincos(angles[0]);
+    let (sin_y, cos_y) = gpu3d_sincos(angles[1]);
+    let (sin_z, cos_z) = gpu3d_sincos(angles[2]);
+    (y, z) = ((y * cos_x - z * sin_x) >> 8, (y * sin_x + z * cos_x) >> 8);
+    (x, z) = ((x * cos_y + z * sin_y) >> 8, (-x * sin_y + z * cos_y) >> 8);
+    (x, y) = ((x * cos_z - y * sin_z) >> 8, (x * sin_z + y * cos_z) >> 8);
+    (x + translation[0], y + translation[1], z + translation[2])
+}
+
+fn gpu3d_project(
+    (x, y, depth): (i32, i32, i32),
+    focal: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
+    let projected_x = i64::from(x) * i64::from(focal);
+    let projected_y = i64::from(y) * i64::from(focal);
+    let screen_x = i64::from(width / 2) + (projected_x.div_euclid(i64::from(depth)) >> 8);
+    let screen_y = i64::from(height / 2) - (projected_y.div_euclid(i64::from(depth)) >> 8);
+    (
+        screen_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        screen_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,6 +1869,99 @@ mod tests {
         assert_eq!(cpu.registers[0], 0);
         assert!(cpu.flags.carry);
         assert!(cpu.flags.negative);
+    }
+
+    #[test]
+    fn key_masks_use_sc16_little_byte_order() {
+        let mut cpu = Cpu::with_memory_size(1 << 19).unwrap();
+        cpu.set_key(0x20_0405, true);
+        assert_eq!(
+            &cpu.memory[KEYS_ADDR as usize..KEYS_ADDR as usize + 3],
+            &[0x05, 0x04, 0x20]
+        );
+        cpu.set_key(0x20_0405, false);
+        assert_eq!(
+            &cpu.memory[KEYS_ADDR as usize..KEYS_ADDR as usize + 3],
+            &[0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn layered_clear_and_transparency_keep_black_background() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_BASE + 1, 0);
+        cpu.write(GPU_BASE, GPU_CLEAR);
+        cpu.write(GPU_BASE + 1, 4);
+        cpu.write(GPU_BASE, GPU_CLEAR);
+
+        cpu.write(GPU_LAYER_SELECT, 1);
+        cpu.write(GPU_LAYER_TRANSPARENCY + 1, 255);
+        cpu.write(GPU_BASE + 1, 255);
+        cpu.write(GPU_BASE, GPU_CLEAR);
+        cpu.write(GPU_BASE + 1, 2);
+        cpu.write_u16(GPU_BASE + 2, 0);
+        cpu.write_u16(GPU_BASE + 4, 0);
+        cpu.write(GPU_BASE, GPU_PIXEL);
+
+        let framebuffer = cpu.composited_framebuffer();
+        assert_eq!(framebuffer[0], 2);
+        assert_eq!(framebuffer[1], 4);
+        assert_eq!(framebuffer[framebuffer.len() - 1], 4);
+    }
+
+    #[test]
+    fn gpu_palette_command_updates_selected_color() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_BASE + 1, 42);
+        cpu.write_u16(GPU_BASE + 2, 10);
+        cpu.write_u16(GPU_BASE + 4, 20);
+        cpu.write_u16(GPU_BASE + 6, 30);
+        cpu.write(GPU_BASE, GPU_PALETTE);
+        assert_eq!(cpu.palette_color(42), [10, 20, 30]);
+    }
+
+    #[test]
+    fn gpu_3d_projects_scene_triangles_for_macroquad() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let scene = [
+            3,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1000,
+            10000,
+            GPU3D_FILL as i16,
+            -1000,
+            -1000,
+            0,
+            0,
+            1000,
+            0,
+            1000,
+            -1000,
+            0,
+            0,
+            1,
+            2,
+            2,
+        ];
+        for (index, value) in scene.into_iter().enumerate() {
+            cpu.write_u16(0x1000 + (index * 2) as u32, value as u16);
+        }
+        cpu.write(GPU_BASE + 10, 0x10);
+        cpu.write(GPU_BASE + 11, 0);
+        cpu.write(GPU_BASE, GPU_3D);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        assert_eq!(
+            cpu.gpu_triangles,
+            [GpuTriangle {
+                points: [(120, 160), (160, 81), (199, 160)],
+                color: 2,
+            }]
+        );
     }
 
     #[test]
