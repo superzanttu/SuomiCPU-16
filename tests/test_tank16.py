@@ -979,6 +979,7 @@ class Tank16Tests(unittest.TestCase):
                 source.parent / "disks" / "assets", module_disks / "assets")
             cpu.disk = DiskDevice(Path(directory) / "virtual-disks")
             cpu.disk.set_file_root(module_disks)
+            cpu.memory[KEYS_ADDR] = 16
             for _ in range(400):
                 run_frame(cpu)
                 if cpu.frame_yield and cpu.split_cameras:
@@ -1254,6 +1255,140 @@ class Tank16Tests(unittest.TestCase):
         self.assertIn("MAP FILE: maps/B.json", runtime_log)
         self.assertIn(
             "MAP TERRAIN TILE: id=2 source=(2,0) cells=20", runtime_log)
+
+    def test_round_map_selector_loads_the_map_selected_by_the_player(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1
+        )
+        test_source = (
+            "int main(void) {\n"
+            "  runtime_terrain_columns = 10; runtime_terrain_rows = 10;\n"
+            "  runtime_object_columns = 6; runtime_object_rows = 8;\n"
+            "  runtime_tile_size = 64; runtime_tile_count = 148;\n"
+            "  runtime_palette_count = 225;\n"
+            "  begin_round_map_selection();\n"
+            "  results[0] = round_map_path_count;\n"
+            "  results[1] = round_map_selection_active;\n"
+            "  update_round_map_selection(KEY_RIGHT);\n"
+            "  results[2] = round_map_cursor;\n"
+            "  previous_keys = KEY_RIGHT;\n"
+            "  update_round_map_selection(KEY_FIRE);\n"
+            "  results[3] = round_map_selection_active;\n"
+            "  results[4] = map_columns;\n"
+            "  results[5] = map_selected_path[5];\n"
+            "  begin_round_map_selection();\n"
+            "  previous_keys = 0;\n"
+            "  update_round_map_selection(KEY_START);\n"
+            "  results[6] = round_map_selection_active;\n"
+            "  results[7] = map_columns;\n"
+            "  round_over = 1; round_delay = 0;\n"
+            "  update_game(0, 0);\n"
+            "  results[8] = round_map_selection_active;\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            module_disks = Path(directory) / "module" / "disks"
+            maps_dir = module_disks / "maps"
+            maps_dir.mkdir(parents=True)
+            for name, width, height, tile in (
+                    ("A.json", 4, 3, 1), ("B.json", 5, 4, 2)):
+                document = {
+                    "runtime_encoding": "flat-v1",
+                    "width": width,
+                    "height": height,
+                    "tileset": "tiles_terrain.png",
+                    "tiles": [tile] * (width * height),
+                    "obstacles": [],
+                    "objects": [],
+                }
+                (maps_dir / name).write_text(
+                    json.dumps(document), encoding="utf-8")
+            cpu = make_cpu(compile_source(
+                "int results[9];\n" + game_source + test_source,
+                str(source_path)))
+            cpu.disk = DiskDevice(Path(directory) / "virtual-disks")
+            cpu.disk.set_file_root(module_disks)
+            while cpu.running:
+                run_frame(cpu)
+
+        self.assertEqual(
+            [cpu.read_16(GLOBAL_BASE + index * 2) for index in range(6)],
+            [2, 1, 1, 0, 5, ord("B")],
+            cpu.console_device.output.decode("ascii", errors="replace"))
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 6 * 2), 0)
+        self.assertIn(cpu.read_16(GLOBAL_BASE + 7 * 2), (4, 5))
+        self.assertEqual(cpu.read_16(GLOBAL_BASE + 8 * 2), 1)
+
+    def test_round_map_selector_draws_random_button(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1
+        )
+        test_source = (
+            "int main(void) {\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  round_map_path_count = 1;\n"
+            "  round_map_paths[0][0] = 'm'; round_map_paths[0][1] = 'a';\n"
+            "  round_map_paths[0][2] = 'p'; round_map_paths[0][3] = 's';\n"
+            "  round_map_paths[0][4] = '/'; round_map_paths[0][5] = 'A';\n"
+            "  round_map_paths[0][6] = '.'; round_map_paths[0][7] = 'j';\n"
+            "  round_map_paths[0][8] = 's'; round_map_paths[0][9] = 'o';\n"
+            "  round_map_paths[0][10] = 'n'; round_map_paths[0][11] = 0;\n"
+            "  draw_round_map_selection();\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            game_source + test_source, str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(layer_pixel(cpu, 4, 336, 312), 8)
+
+    def test_large_runtime_map_keeps_tanks_inside_vertical_camera_view(self):
+        source_path = ROOT / "modules" / "Tank-16" / "main.c"
+        game_source = self.game_source(source_path).replace(
+            '#include "map_assets.h"', build_runtime_assets_header(), 1
+        )
+        test_source = (
+            "unsigned char object_tile_pixels[4096];\n"
+            "int main(void) {\n"
+            "  int i;\n"
+            "  gfx_mode(GFX_MODE_640_480);\n"
+            "  gfx_layer_reset((1 << LAYER_TILES) | (1 << LAYER_SPRITES) |\n"
+            "                  (1 << LAYER_3D) | (1 << LAYER_HUD));\n"
+            "  gfx_layer_order(LAYER_3D, 2);\n"
+            "  gfx_layer_order(LAYER_SPRITES, 3);\n"
+            "  load_tank_sprites();\n"
+            "  map_columns = 100; map_rows = 100; map_infinite = 0;\n"
+            "  tanks[0].x = 1600; tanks[0].y = 3200;\n"
+            "  tanks[1].x = 4800; tanks[1].y = 3200;\n"
+            "  tanks[0].health = 100; tanks[1].health = 100;\n"
+            "  tanks[0].direction = 8; tanks[1].direction = 24;\n"
+            "  results[0] = tank_camera_y(0);\n"
+            "  for (i = 0; i < 4096; i++) object_tile_pixels[i] = 1;\n"
+            "  gfx_tile_upload(100, object_tile_pixels);\n"
+            "  gfx_split_camera_wide(tank_camera_x(0), tank_camera_y(0),\n"
+            "                        tank_camera_x(1), tank_camera_y(1));\n"
+            "  gfx_layer_select(LAYER_3D);\n"
+            "  gfx_clear(0);\n"
+            "  world_tile(100, 1600, 3200);\n"
+            "  gfx_layer_select(LAYER_SPRITES);\n"
+            "  draw_tank(0); draw_tank(1);\n"
+            "  gfx_present();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        cpu = make_cpu(compile_source(
+            "int results[1];\n" + game_source + test_source,
+            str(source_path)))
+        while cpu.running:
+            cpu.step()
+        self.assertEqual(cpu.read_16(GLOBAL_BASE), 2945)
+        self.assertGreater(sum(bool(value) for value in cpu.gpu_layers[2]), 100)
+        self.assertGreater(sum(bool(value) for value in cpu.gpu_layers[3]), 100)
 
     def test_runtime_assets_exclude_maps_and_disk_maps_include_infinite_world(self):
         game_dir = ROOT / "modules" / "Tank-16"

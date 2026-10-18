@@ -92,6 +92,7 @@ void draw_runtime_loading_screen(char *message, int current, int total);
 #define DEEP_WATER_TILE_ID 90
 #define WATER_DAMAGE_INTERVAL 30
 #define WATER_DAMAGE_AMOUNT 10
+#define ROUND_MAP_PATH_CAPACITY 64
 #define MOVING_TURN_FRAMES 4
 #define STATIONARY_TURN_FRAMES 2
 #define HANDBRAKE_DECELERATION 8
@@ -257,6 +258,13 @@ void reset_battlefield(void);
 #ifdef RUNTIME_MAP_LOADING
 int map_infinite;
 char current_map_path[129];
+char round_map_paths[ROUND_MAP_PATH_CAPACITY][129];
+int round_map_path_count;
+int round_map_cursor;
+int round_map_selection_active;
+int round_map_choice;
+int round_map_choice_ready;
+int round_map_path_limit_reached;
 unsigned long map_seed;
 unsigned char map_terrain_choices[16];
 int map_terrain_choice_count;
@@ -2115,6 +2123,62 @@ int is_runtime_map_path(volatile char *path)
            path[length - 2] == 'o' && path[length - 1] == 'n';
 }
 
+void discover_runtime_map_paths(void)
+{
+    int file_count;
+    int file_index;
+    int listed;
+    int path_index;
+    int path_length;
+
+    round_map_path_count = 0;
+    round_map_path_limit_reached = 0;
+    file_count = disk_list_files(0, map_path_buffer,
+                                 sizeof(map_path_buffer));
+    if (file_count < 0)
+    {
+        printf("MAP LIST ERROR: %d\n", file_count);
+        return;
+    }
+    for (file_index = 0; file_index < file_count; file_index++)
+    {
+        listed = disk_list_files(file_index, map_path_buffer,
+                                 sizeof(map_path_buffer));
+        if (listed < 0)
+        {
+            printf("MAP LIST ERROR: index=%d result=%d\n",
+                   file_index, listed);
+            round_map_path_count = 0;
+            return;
+        }
+        if (!is_runtime_map_path(map_path_buffer))
+            continue;
+        if (round_map_path_count >= ROUND_MAP_PATH_CAPACITY)
+        {
+            round_map_path_limit_reached = 1;
+            continue;
+        }
+        path_length = 0;
+        while (path_length < 128 && map_path_buffer[path_length] != 0)
+        {
+            round_map_paths[round_map_path_count][path_length] =
+                map_path_buffer[path_length];
+            path_length++;
+        }
+        if (path_length >= 128)
+        {
+            round_map_paths[round_map_path_count][0] = 0;
+            printf("MAP LIST ERROR: path exceeds 128 characters\n");
+            continue;
+        }
+        round_map_paths[round_map_path_count][path_length] = 0;
+        round_map_path_count++;
+    }
+    if (round_map_path_limit_reached)
+        printf("MAP LIST: showing first %d maps\n",
+               ROUND_MAP_PATH_CAPACITY);
+}
+
 void use_default_infinite_map(void)
 {
     map_data = 0;
@@ -2139,6 +2203,8 @@ void select_runtime_round_map(void)
     int map_index;
     int target_map;
     int attempt;
+    int attempt_count;
+    int explicit_choice;
     int i;
 
     map_data = 0;
@@ -2146,6 +2212,7 @@ void select_runtime_round_map(void)
     runtime_map_lazy = 0;
     map_object_count = 0;
     map_load_error = 0;
+    map_selected_path[0] = 0;
     runtime_loading_active = 1;
     runtime_loading_stage = "FINDING MAP";
     draw_runtime_loading_screen("FINDING MAP", 0, 0);
@@ -2165,8 +2232,15 @@ void select_runtime_round_map(void)
     }
     if (map_count > 0)
     {
-        chosen_map = effect_noise(map_count);
-        for (attempt = 0; attempt < map_count; attempt++)
+        explicit_choice = round_map_choice_ready;
+        chosen_map = round_map_choice_ready
+                         ? round_map_choice
+                         : effect_noise(map_count);
+        if (chosen_map < 0 || chosen_map >= map_count)
+            chosen_map = effect_noise(map_count);
+        round_map_choice_ready = 0;
+        attempt_count = explicit_choice ? 1 : map_count;
+        for (attempt = 0; attempt < attempt_count; attempt++)
         {
             target_map = (chosen_map + attempt) % map_count;
             map_index = 0;
@@ -2233,6 +2307,7 @@ void select_runtime_round_map(void)
     use_default_infinite_map();
     configure_runtime_tilemap();
     map_load_error = 1;
+    round_map_choice_ready = 0;
     round_map_selection_started++;
     current_map_variant = -1;
     runtime_loading_active = 0;
@@ -3782,8 +3857,93 @@ void update_powerups(void)
         powerup_spawn_timer = 30;
 }
 
+#ifdef RUNTIME_MAP_LOADING
+void begin_round_map_selection(void)
+{
+    discover_runtime_map_paths();
+    round_map_cursor = 0;
+    round_map_selection_active = 1;
+    round_map_choice_ready = 0;
+}
+
+void confirm_round_map_selection(int choose_random)
+{
+    if (choose_random || round_map_path_count == 0)
+    {
+        round_map_choice_ready = 0;
+    }
+    else
+    {
+        round_map_choice = round_map_cursor;
+        round_map_choice_ready = 1;
+    }
+    round_map_selection_active = 0;
+    start_round();
+}
+
+void update_round_map_selection(unsigned int keys)
+{
+    unsigned int mouse_events;
+    int mouse_x;
+    int mouse_y;
+
+    if ((keys & KEY_LEFT) && !(previous_keys & KEY_LEFT) &&
+        round_map_path_count > 0)
+    {
+        round_map_cursor =
+            (round_map_cursor + round_map_path_count - 1) %
+            round_map_path_count;
+    }
+    if ((keys & KEY_RIGHT) && !(previous_keys & KEY_RIGHT) &&
+        round_map_path_count > 0)
+    {
+        round_map_cursor = (round_map_cursor + 1) % round_map_path_count;
+    }
+    if ((keys & KEY_FIRE) && !(previous_keys & KEY_FIRE))
+    {
+        confirm_round_map_selection(0);
+        return;
+    }
+    if ((keys & KEY_START) && !(previous_keys & KEY_START))
+    {
+        confirm_round_map_selection(1);
+        return;
+    }
+    mouse_events = gfx_mouse_events();
+    if (!(mouse_events & MOUSE_LEFT_DOWN))
+        return;
+    mouse_x = gfx_mouse_x();
+    mouse_y = gfx_mouse_y();
+    if (mouse_y >= 218 && mouse_y < 278)
+    {
+        if (mouse_x >= 96 && mouse_x < 176 && round_map_path_count > 0)
+            round_map_cursor =
+                (round_map_cursor + round_map_path_count - 1) %
+                round_map_path_count;
+        else if (mouse_x >= 464 && mouse_x < 544 &&
+                 round_map_path_count > 0)
+            round_map_cursor = (round_map_cursor + 1) % round_map_path_count;
+    }
+    else if (mouse_y >= 312 && mouse_y < 376)
+    {
+        if (mouse_x >= 128 && mouse_x < 304)
+            confirm_round_map_selection(0);
+        else if (mouse_x >= 336 && mouse_x < 512)
+            confirm_round_map_selection(1);
+    }
+}
+#endif
+
 void update_game(unsigned int keys, unsigned int extra)
 {
+#ifdef RUNTIME_MAP_LOADING
+    if (round_map_selection_active)
+    {
+        update_round_map_selection(keys);
+        previous_keys = (int)keys;
+        return;
+    }
+#endif
     update_burn_site_lifetimes();
     if ((keys & 32) && !(previous_keys & 32))
     {
@@ -3791,7 +3951,13 @@ void update_game(unsigned int keys, unsigned int extra)
         wins[1] = 0;
         reset_battlefield();
         round_over = 0;
+#ifdef RUNTIME_MAP_LOADING
+        begin_round_map_selection();
+#else
         start_round();
+#endif
+        previous_keys = (int)keys;
+        return;
     }
     previous_keys = (int)keys;
     update_object_effects();
@@ -3805,7 +3971,11 @@ void update_game(unsigned int keys, unsigned int extra)
         }
         else
         {
+#ifdef RUNTIME_MAP_LOADING
+            begin_round_map_selection();
+#else
             start_round();
+#endif
         }
         return;
     }
@@ -3899,8 +4069,6 @@ WorldCoord tank_camera_y(int player)
                  TANK16_HUD_HEIGHT;
         camera += effect_tick % 3 == 0 ? tanks[player].shake / 4
                                        : -tanks[player].shake / 4;
-        if (camera > -TANK16_HUD_HEIGHT)
-            camera = -TANK16_HUD_HEIGHT;
         return camera;
     }
 }
@@ -4400,6 +4568,60 @@ void draw_hud(void)
 #endif
 }
 
+#ifdef RUNTIME_MAP_LOADING
+void draw_round_map_selection(void)
+{
+    char map_name[25];
+    int source_index;
+    int name_length;
+    int destination_index;
+    int i;
+
+    gfx_layer_select(LAYER_HUD);
+    gfx_clear(15);
+    gfx_rect(0, 0, 640, 480, BLACK);
+    gfx_rect(80, 92, 480, 320, DARK_GRAY);
+    gfx_rect(84, 96, 472, 312, BLACK);
+    gfx_text(266, 128, "CHOOSE MAP", YELLOW);
+    gfx_text(206, 164, "SELECT A MAP FOR THE NEXT ROUND", WHITE);
+
+    gfx_rect(96, 218, 80, 60, DARK_GRAY);
+    gfx_text(132, 243, "<", YELLOW);
+    gfx_rect(184, 218, 272, 60, DARK_GRAY);
+    gfx_rect(188, 222, 264, 52, BLACK);
+    gfx_rect(464, 218, 80, 60, DARK_GRAY);
+    gfx_text(500, 243, ">", YELLOW);
+    if (round_map_path_count > 0)
+    {
+        source_index = 5;
+        while (round_map_paths[round_map_cursor][source_index] != 0 &&
+               round_map_paths[round_map_cursor][source_index] != '.' &&
+               source_index < 127)
+            source_index++;
+        name_length = source_index - 5;
+        if (name_length > 24)
+            name_length = 24;
+        for (i = 0; i < name_length; i++)
+            map_name[i] = round_map_paths[round_map_cursor][i + 5];
+        map_name[name_length] = 0;
+        gfx_text(320 - name_length * 3, 244, map_name, WHITE);
+    }
+    else
+        gfx_text(260, 244, "NO MAPS FOUND", RED);
+
+    gfx_rect(128, 312, 176, 64, GREEN);
+    gfx_rect(132, 316, 168, 56, DARK_GRAY);
+    gfx_text(167, 337, "PLAY SELECTED", WHITE);
+    gfx_rect(336, 312, 176, 64, ORANGE);
+    gfx_rect(340, 316, 168, 56, DARK_GRAY);
+    gfx_text(379, 337, "RANDOM MAP", YELLOW);
+    gfx_text(155, 390, "LEFT/RIGHT CHOOSE   SPACE PLAY   ENTER RANDOM",
+             WHITE);
+    if (round_map_path_limit_reached)
+        gfx_text(221, 401, "LIST LIMITED TO 64 MAPS", ORANGE);
+}
+#endif
+
 void draw_game(void)
 {
     WorldCoord camera1_x;
@@ -4409,6 +4631,13 @@ void draw_game(void)
     int viewport;
     char countdown[6];
 
+#ifdef RUNTIME_MAP_LOADING
+    if (round_map_selection_active)
+    {
+        draw_round_map_selection();
+        return;
+    }
+#endif
     camera1_x = tank_camera_x(0);
     camera1_y = tank_camera_y(0);
     camera2_x = tank_camera_x(1);
@@ -4511,7 +4740,11 @@ int main(void)
 #endif
     tank_sprite_slots[0] = -1;
     tank_sprite_slots[1] = -1;
+#ifdef RUNTIME_MAP_LOADING
+    begin_round_map_selection();
+#else
     start_round();
+#endif
     while (1)
     {
         keys = gfx_keys();
