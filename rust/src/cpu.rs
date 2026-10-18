@@ -34,9 +34,25 @@ const GPU_RANDOM: u8 = 9;
 const GPU_POLY: u8 = 10;
 const GPU_TICKS: u8 = 11;
 const GPU_RTC: u8 = 12;
+const GPU_TILEMAP: u8 = 21;
 const GPU_3D: u8 = 22;
+const GPU_SPRITE_UPLOAD: u8 = 23;
+const GPU_SPRITE_MOVE: u8 = 24;
+const GPU_TILE_UPLOAD: u8 = 25;
+const GPU_TILE_CAMERA: u8 = 26;
 const GPU_SAVE: u8 = 14;
 const GPU_LOAD: u8 = 15;
+const GPU_TILE_SIZE: u8 = 28;
+const GPU_SPLIT_CAMERA: u8 = 29;
+const GPU_TILE_CAMERA_WIDE: u8 = 36;
+const GPU_SPLIT_CAMERA_WIDE: u8 = 37;
+const GPU_TILEMAP_WIDE: u8 = 38;
+const GPU_SPRITE_MOVE_WIDE: u8 = 44;
+const GPU_SPRITE_SLOTS: usize = 64;
+const GPU_TILE_COUNT: usize = 256;
+const GPU_TILE_MAX_SIZE: usize = 64;
+const GPU_TILEMAP_MAX_SIZE: usize = 1024;
+const GPU_SPRITE_MAX_SIZE: i32 = 64;
 const GPU3D_FILL: u16 = 1;
 const GPU3D_WIREFRAME: u16 = 2;
 const GPU3D_SIN_8_8: [i32; 64] = [
@@ -139,6 +155,13 @@ pub struct GpuLine {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct GpuSprite {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpuError {
     InvalidMemorySize(usize),
     MemoryMap(String),
@@ -193,6 +216,15 @@ pub struct Cpu {
     pub palette: [[u8; 3]; 256],
     pub gpu_triangles: Vec<GpuTriangle>,
     pub gpu_lines: Vec<GpuLine>,
+    sprites: [Option<GpuSprite>; GPU_SPRITE_SLOTS],
+    sprite_descriptors: [(i32, i32, u8); GPU_SPRITE_SLOTS],
+    tile_memory: Vec<u8>,
+    tile_pixel_size: usize,
+    tilemap: Vec<u8>,
+    tilemap_width: usize,
+    tilemap_height: usize,
+    tile_camera: (i32, i32),
+    split_cameras: Option<[(i32, i32); 2]>,
     memory_mask: u32,
     layer_mode: u8,
 }
@@ -242,6 +274,13 @@ impl Cpu {
         ];
         palette[..PALETTE_COLORS.len()].copy_from_slice(&PALETTE_COLORS);
         palette[25] = [0, 0, 255];
+        let mut tile_memory = vec![0; GPU_TILE_COUNT * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE];
+        for tile in 1..GPU_TILE_COUNT {
+            for row in 0..16 {
+                let start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE + row * 16;
+                tile_memory[start..start + 16].fill(tile as u8);
+            }
+        }
         Ok(Self {
             memory,
             registers: [0; 8],
@@ -259,6 +298,15 @@ impl Cpu {
             palette,
             gpu_triangles: Vec::new(),
             gpu_lines: Vec::new(),
+            sprites: std::array::from_fn(|_| None),
+            sprite_descriptors: [(0, 0, 0); GPU_SPRITE_SLOTS],
+            tile_memory,
+            tile_pixel_size: 16,
+            tilemap: Vec::new(),
+            tilemap_width: 0,
+            tilemap_height: 0,
+            tile_camera: (0, 0),
+            split_cameras: None,
             memory_mask,
             layer_mode: 0,
         })
@@ -1116,6 +1164,151 @@ impl Cpu {
         ((high & 0x3fff) << 16) | low
     }
 
+    fn gpu_wide_field(&self, low_offset: u32, high_offset: u32) -> i32 {
+        let low = self.gpu_word(low_offset) as u16;
+        let high = self.gpu_word(high_offset) as u16;
+        (u32::from(high).wrapping_shl(16) | u32::from(low)) as i32
+    }
+
+    fn gpu_read_block(&self, source: u32, size: usize) -> Vec<u8> {
+        (0..size)
+            .map(|offset| {
+                self.memory[source.wrapping_add(offset as u32) as usize & self.memory_mask as usize]
+            })
+            .collect()
+    }
+
+    fn gpu_tilemap(&mut self, camera_x: i32, camera_y: i32, map_width: i32, map_height: i32) {
+        if !(1..=GPU_TILEMAP_MAX_SIZE as i32).contains(&map_width)
+            || !(1..=GPU_TILEMAP_MAX_SIZE as i32).contains(&map_height)
+        {
+            self.set_gpu_result(1);
+            return;
+        }
+        self.tilemap_width = map_width as usize;
+        self.tilemap_height = map_height as usize;
+        self.tilemap =
+            self.gpu_read_block(self.gpu_source(), self.tilemap_width * self.tilemap_height);
+        self.tile_camera = (camera_x, camera_y);
+        self.render_tile_layer();
+        self.set_gpu_result(0);
+    }
+
+    fn render_tile_layer(&mut self) {
+        let (screen_width, screen_height) = self.screen_size();
+        let target = &mut self.layers[1];
+        target.fill(0);
+        if self.tilemap.is_empty() {
+            return;
+        }
+        let split_x = screen_width / 2;
+        let views = self.split_cameras.map_or_else(
+            || vec![(self.tile_camera, 0, screen_width)],
+            |cameras| {
+                vec![
+                    (cameras[0], 0, split_x),
+                    (cameras[1], split_x, screen_width),
+                ]
+            },
+        );
+        let tile_size = self.tile_pixel_size as i32;
+        let color_mask = if screen_width == 640 { 0x0f } else { 0xff };
+        for ((camera_x, camera_y), clip_left, clip_right) in views {
+            let first_column = camera_x.div_euclid(tile_size);
+            let first_row = camera_y.div_euclid(tile_size);
+            let last_column = camera_x
+                .saturating_add(clip_right - clip_left - 1)
+                .div_euclid(tile_size);
+            let last_row = camera_y
+                .saturating_add(screen_height - 1)
+                .div_euclid(tile_size);
+            for map_y in first_row.max(0)..=(last_row.min(self.tilemap_height as i32 - 1)) {
+                for map_x in first_column.max(0)..=(last_column.min(self.tilemap_width as i32 - 1))
+                {
+                    let tile =
+                        self.tilemap[map_y as usize * self.tilemap_width + map_x as usize] as usize;
+                    let screen_x = (map_x * tile_size)
+                        .saturating_sub(camera_x)
+                        .saturating_add(clip_left);
+                    let screen_y = (map_y * tile_size).saturating_sub(camera_y);
+                    let source_start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
+                    for tile_y in 0..tile_size {
+                        let y = screen_y + tile_y;
+                        if !(0..screen_height).contains(&y) {
+                            continue;
+                        }
+                        for tile_x in 0..tile_size {
+                            let x = screen_x + tile_x;
+                            if x < clip_left || x >= clip_right || x < 0 || x >= screen_width {
+                                continue;
+                            }
+                            let source_index = source_start
+                                + tile_y as usize * self.tile_pixel_size
+                                + tile_x as usize;
+                            target[(y * screen_width + x) as usize] =
+                                self.tile_memory[source_index] & color_mask;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_sprites(&mut self) {
+        let (screen_width, screen_height) = self.screen_size();
+        let target = &mut self.layers[2];
+        target.fill(0);
+        let split_x = screen_width / 2;
+        let views = self.split_cameras.map_or_else(
+            || vec![((0, 0), 0, screen_width)],
+            |cameras| {
+                vec![
+                    (cameras[0], 0, split_x),
+                    (cameras[1], split_x, screen_width),
+                ]
+            },
+        );
+        let color_mask = if screen_width == 640 { 0x0f } else { 0xff };
+        for (slot, sprite) in self.sprites.iter().enumerate() {
+            let Some(sprite) = sprite else {
+                continue;
+            };
+            let (world_x, world_y, flags) = self.sprite_descriptors[slot];
+            if flags & 1 == 0 {
+                continue;
+            }
+            for ((camera_x, camera_y), clip_left, clip_right) in &views {
+                let screen_x = world_x.saturating_sub(*camera_x).saturating_add(*clip_left);
+                let screen_y = world_y.saturating_sub(*camera_y);
+                let left = screen_x.max(*clip_left).max(0);
+                let right = screen_x
+                    .saturating_add(sprite.width as i32)
+                    .min(*clip_right)
+                    .min(screen_width);
+                let top = screen_y.max(0);
+                let bottom = screen_y
+                    .saturating_add(sprite.height as i32)
+                    .min(screen_height);
+                for y in top..bottom {
+                    let mut source_y = (y - screen_y) as usize;
+                    if flags & 4 != 0 {
+                        source_y = sprite.height - source_y - 1;
+                    }
+                    for x in left..right {
+                        let mut source_x = (x - screen_x) as usize;
+                        if flags & 2 != 0 {
+                            source_x = sprite.width - source_x - 1;
+                        }
+                        let pixel = sprite.pixels[source_y * sprite.width + source_x];
+                        if pixel != 0 {
+                            target[(y * screen_width + x) as usize] = pixel & color_mask;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn screen_size(&self) -> (i32, i32) {
         if self.memory[GPU_MODE_ADDR as usize] == 1 {
             (640, 480)
@@ -1444,6 +1637,89 @@ impl Cpu {
                 self.palette[color as usize] = [red, green, blue];
                 self.memory[(GPU_BASE + 14) as usize] = 0;
                 self.memory[(GPU_BASE + 15) as usize] = 0;
+            }
+            GPU_TILEMAP => self.gpu_tilemap(x, y, w, h),
+            GPU_SPRITE_UPLOAD => {
+                if usize::from(color) >= GPU_SPRITE_SLOTS
+                    || !(1..=GPU_SPRITE_MAX_SIZE).contains(&w)
+                    || !(1..=GPU_SPRITE_MAX_SIZE).contains(&h)
+                {
+                    self.set_gpu_result(1);
+                } else {
+                    let width = w as usize;
+                    let height = h as usize;
+                    let pixels = self.gpu_read_block(self.gpu_source(), width * height);
+                    self.sprites[color as usize] = Some(GpuSprite {
+                        width,
+                        height,
+                        pixels,
+                    });
+                    self.render_sprites();
+                    self.set_gpu_result(0);
+                }
+            }
+            GPU_SPRITE_MOVE => {
+                if usize::from(color) < GPU_SPRITE_SLOTS {
+                    self.sprite_descriptors[color as usize] = (x, y, w as u8 & 7);
+                    self.render_sprites();
+                }
+            }
+            GPU_TILE_UPLOAD => {
+                if usize::from(color) >= GPU_TILE_COUNT {
+                    self.set_gpu_result(1);
+                } else {
+                    let size = self.tile_pixel_size;
+                    let data = self.gpu_read_block(self.gpu_source(), size * size);
+                    let start = color as usize * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
+                    self.tile_memory[start..start + size * size].copy_from_slice(&data);
+                    self.render_tile_layer();
+                    self.set_gpu_result(0);
+                }
+            }
+            GPU_TILE_CAMERA => {
+                self.tile_camera = (x, y);
+                self.split_cameras = None;
+                self.render_tile_layer();
+                self.render_sprites();
+            }
+            GPU_TILE_SIZE => {
+                if !(1..=GPU_TILE_MAX_SIZE as i32).contains(&x) {
+                    self.set_gpu_result(1);
+                } else {
+                    self.tile_pixel_size = x as usize;
+                    self.render_tile_layer();
+                    self.set_gpu_result(0);
+                }
+            }
+            GPU_SPLIT_CAMERA => {
+                self.split_cameras = Some([(x, y), (w, h)]);
+                self.render_tile_layer();
+                self.render_sprites();
+            }
+            GPU_TILE_CAMERA_WIDE => {
+                self.tile_camera = (self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26));
+                self.split_cameras = None;
+                self.render_tile_layer();
+                self.render_sprites();
+            }
+            GPU_SPLIT_CAMERA_WIDE => {
+                self.split_cameras = Some([
+                    (self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26)),
+                    (self.gpu_wide_field(6, 28), self.gpu_wide_field(8, 30)),
+                ]);
+                self.render_tile_layer();
+                self.render_sprites();
+            }
+            GPU_TILEMAP_WIDE => {
+                self.gpu_tilemap(self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26), w, h)
+            }
+            GPU_SPRITE_MOVE_WIDE => {
+                let sprite_x = self.gpu_wide_field(2, 24);
+                let sprite_y = self.gpu_wide_field(4, 26);
+                if usize::from(color) < GPU_SPRITE_SLOTS {
+                    self.sprite_descriptors[color as usize] = (sprite_x, sprite_y, w as u8 & 7);
+                    self.render_sprites();
+                }
             }
             GPU_3D => self.gpu_3d(self.gpu_source()),
             GPU_SAVE => {
@@ -1918,6 +2194,69 @@ mod tests {
         cpu.write_u16(GPU_BASE + 6, 30);
         cpu.write(GPU_BASE, GPU_PALETTE);
         assert_eq!(cpu.palette_color(42), [10, 20, 30]);
+    }
+
+    #[test]
+    fn tile_upload_and_tilemap_render_indexed_pixels() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        for index in 0..256 {
+            cpu.memory[0x1000 + index] = index as u8;
+        }
+        cpu.write_u16(GPU_BASE + 10, 0x1000);
+        cpu.write(GPU_BASE + 1, 1);
+        cpu.write(GPU_BASE, GPU_TILE_UPLOAD);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+
+        cpu.memory[0x2000] = 1;
+        cpu.write_u16(GPU_BASE + 10, 0x2000);
+        cpu.write_u16(GPU_BASE + 2, 0);
+        cpu.write_u16(GPU_BASE + 4, 0);
+        cpu.write_u16(GPU_BASE + 6, 1);
+        cpu.write_u16(GPU_BASE + 8, 1);
+        cpu.write(GPU_BASE, GPU_TILEMAP);
+
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        assert_eq!(cpu.layers[1][0], 0);
+        assert_eq!(cpu.layers[1][15], 15);
+        assert_eq!(cpu.layers[1][320], 16);
+        assert_eq!(cpu.layers[1][15 * 320 + 15], 255);
+        assert_eq!(cpu.layers[1][16], 0);
+    }
+
+    #[test]
+    fn invalid_tilemap_dimensions_return_error_without_replacing_map() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.tilemap = vec![3];
+        cpu.tilemap_width = 1;
+        cpu.tilemap_height = 1;
+        cpu.write_u16(GPU_BASE + 6, 0);
+        cpu.write_u16(GPU_BASE + 8, 1);
+        cpu.write(GPU_BASE, GPU_TILEMAP);
+
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+        assert_eq!(cpu.tilemap, [3]);
+    }
+
+    #[test]
+    fn sprite_upload_and_move_render_transparency_and_horizontal_flip() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.memory[0x1000..0x1004].copy_from_slice(&[1, 0, 2, 3]);
+        cpu.write_u16(GPU_BASE + 10, 0x1000);
+        cpu.write(GPU_BASE + 1, 0);
+        cpu.write_u16(GPU_BASE + 6, 2);
+        cpu.write_u16(GPU_BASE + 8, 2);
+        cpu.write(GPU_BASE, GPU_SPRITE_UPLOAD);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+
+        cpu.write_u16(GPU_BASE + 2, 5);
+        cpu.write_u16(GPU_BASE + 4, 6);
+        cpu.write_u16(GPU_BASE + 6, 3);
+        cpu.write(GPU_BASE, GPU_SPRITE_MOVE);
+
+        let row_start = 6 * 320 + 5;
+        assert_eq!(&cpu.layers[2][row_start..row_start + 2], &[0, 1]);
+        let next_row = row_start + 320;
+        assert_eq!(&cpu.layers[2][next_row..next_row + 2], &[3, 2]);
     }
 
     #[test]
