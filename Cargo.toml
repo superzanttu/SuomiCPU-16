@@ -1,0 +1,12 @@
+[package]
+name = "suomicpu16"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "rust/src/lib.rs"
+
+[[bin]]
+name = "suomicpu16"
+path = "rust/src/main.rs"
+
