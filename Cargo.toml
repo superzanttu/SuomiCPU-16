@@ -10,6 +10,10 @@ path = "rust/src/lib.rs"
 name = "suomicpu16"
 path = "rust/src/main.rs"
 
+[[bin]]
+name = "sc16asm"
+path = "rust/src/bin/sc16asm.rs"
+
 [dependencies]
 macroquad = { version = "0.4.16", features = ["audio"] }
 memmap2 = "0.9"

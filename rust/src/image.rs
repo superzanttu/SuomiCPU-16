@@ -1,6 +1,6 @@
 use crate::{CpuError, MemorySegment};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,6 +58,41 @@ pub fn load_binary(path: &Path) -> Result<ProgramImage, ImageError> {
         entry_point: 0,
         segments: vec![MemorySegment { address: 0, data }],
     })
+}
+
+pub fn write_image(path: &Path, image: &ProgramImage) -> Result<(), ImageError> {
+    if image.entry_point >= MEMORY_SIZE as u32 {
+        return Err(ImageError::InvalidFormat(
+            "entry point is outside SC-16 memory",
+        ));
+    }
+    let segment_count = u32::try_from(image.segments.len())
+        .map_err(|_| ImageError::InvalidFormat("segment count is excessive"))?;
+    let mut total = 0u64;
+    for segment in &image.segments {
+        let end = u64::from(segment.address)
+            .checked_add(segment.data.len() as u64)
+            .ok_or(ImageError::InvalidFormat("segment range overflow"))?;
+        if end > MEMORY_SIZE {
+            return Err(ImageError::InvalidFormat("segment is outside SC-16 memory"));
+        }
+        total = total
+            .checked_add(segment.data.len() as u64)
+            .ok_or(ImageError::InvalidFormat("total image size overflow"))?;
+        if total > MEMORY_SIZE {
+            return Err(ImageError::InvalidFormat("image exceeds memory"));
+        }
+    }
+    let mut file = fs::File::create(path)?;
+    file.write_all(MAGIC)?;
+    file.write_all(&image.entry_point.to_be_bytes())?;
+    file.write_all(&segment_count.to_be_bytes())?;
+    for segment in &image.segments {
+        file.write_all(&segment.address.to_be_bytes())?;
+        file.write_all(&(segment.data.len() as u64).to_be_bytes())?;
+        file.write_all(&segment.data)?;
+    }
+    Ok(())
 }
 
 pub fn build_source(root: &Path, source: &Path, python: &str) -> Result<ProgramImage, ImageError> {
@@ -176,6 +211,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn writes_and_reads_segmented_program_images() {
+        let path = std::env::temp_dir().join(format!("sc16-roundtrip-{}.img", std::process::id()));
+        let image = ProgramImage {
+            entry_point: 0x100,
+            segments: vec![
+                MemorySegment {
+                    address: 0x100,
+                    data: vec![0x12, 0x34],
+                },
+                MemorySegment {
+                    address: 0x20_000,
+                    data: vec![0xab],
+                },
+            ],
+        };
+        write_image(&path, &image).unwrap();
+        assert_eq!(read_image(&path).unwrap(), image);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

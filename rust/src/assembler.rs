@@ -57,25 +57,74 @@ fn parse_number(text: &str, line: usize) -> Result<i64, AssemblyError> {
     } else {
         (false, value)
     };
-    let (base, digits) = if let Some(rest) = unsigned
+    let (base, digits, prefixed) = if let Some(rest) = unsigned
         .strip_prefix("0x")
         .or_else(|| unsigned.strip_prefix("0X"))
     {
-        (16, rest)
+        (16, rest, true)
     } else if let Some(rest) = unsigned
         .strip_prefix("0o")
         .or_else(|| unsigned.strip_prefix("0O"))
     {
-        (8, rest)
+        (8, rest, true)
     } else if let Some(rest) = unsigned
         .strip_prefix("0b")
         .or_else(|| unsigned.strip_prefix("0B"))
     {
-        (2, rest)
+        (2, rest, true)
     } else {
-        (10, unsigned)
+        (10, unsigned, false)
     };
-    let parsed = i64::from_str_radix(digits, base)
+    let digits = if prefixed {
+        digits.strip_prefix('_').unwrap_or(digits)
+    } else {
+        digits
+    };
+    let mut normalized = String::with_capacity(digits.len());
+    let mut previous_was_digit = false;
+    let mut has_digit = false;
+    let mut remaining = digits;
+    while let Some(character) = remaining.chars().next() {
+        remaining = &remaining[character.len_utf8()..];
+        if character == '_' {
+            let next_is_digit = remaining
+                .chars()
+                .next()
+                .and_then(|next| next.to_digit(base))
+                .is_some();
+            if !previous_was_digit || !next_is_digit {
+                return Err(error(
+                    line,
+                    format!("expected a numeric value, got {text:?}"),
+                ));
+            }
+            previous_was_digit = false;
+            continue;
+        }
+        if character.to_digit(base).is_none() {
+            return Err(error(
+                line,
+                format!("expected a numeric value, got {text:?}"),
+            ));
+        }
+        normalized.push(character);
+        previous_was_digit = true;
+        has_digit = true;
+    }
+    if !has_digit
+        || !previous_was_digit
+        || !prefixed
+            && base == 10
+            && normalized.len() > 1
+            && normalized.starts_with('0')
+            && normalized.bytes().any(|digit| digit != b'0')
+    {
+        return Err(error(
+            line,
+            format!("expected a numeric value, got {text:?}"),
+        ));
+    }
+    let parsed = i64::from_str_radix(&normalized, base)
         .map_err(|_| error(line, format!("expected a numeric value, got {text:?}")))?;
     Ok(if negative { -parsed } else { parsed })
 }
@@ -1315,6 +1364,20 @@ mod tests {
     fn sizes_two_operand_shr_as_an_extended_shift_before_resolving_labels() {
         let image = assemble("SHR R0, 3\nnext: JMP next\n", 0).unwrap();
         assert_eq!(image.segments[0].data, b"\xf8\x1f\x18\x03\x58\x04");
+    }
+
+    #[test]
+    fn parses_python_style_numeric_separators_and_rejects_ambiguous_octal() {
+        assert_eq!(
+            assemble("LDI R0, 1_000\n", 0).unwrap().segments[0].data,
+            b"\x08\xe8\x80\x03"
+        );
+        assert_eq!(
+            assemble("LDI R0, 0x_FF\n", 0).unwrap().segments[0].data,
+            b"\x08\xff"
+        );
+        assert!(assemble("LDI R0, 01", 0).is_err());
+        assert!(assemble("LDI R0, 1__0", 0).is_err());
     }
 
     #[test]

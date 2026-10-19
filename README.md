@@ -110,6 +110,13 @@ cargo run -- "modules\Netgame Demo\net_game_demo.c" --net-port 47016
 cargo run -- --headless "modules\DiskEditor\disk_editor.c"
 ```
 
+Assemble an SC-16 source file into a segmented image using the Rust assembler:
+
+```console
+cargo run --bin sc16asm -- examples\commands.asm
+cargo run --bin sc16asm -- examples\commands.asm commands.img
+```
+
 In the Rust BIOS selector, press **D** or **Left/Right** to choose no data disk
 or an existing virtual disk before starting a module. `--disk ID` preselects a
 disk in the BIOS or mounts it when launching a program directly.
