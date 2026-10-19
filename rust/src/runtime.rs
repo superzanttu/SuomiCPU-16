@@ -26,7 +26,6 @@ pub enum RuntimeError {
     Image(ImageError),
     Window(String),
     Io(std::io::Error),
-    MissingBuildTools(PathBuf),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -35,13 +34,6 @@ impl std::fmt::Display for RuntimeError {
             Self::Image(error) => write!(formatter, "{error}"),
             Self::Window(error) => write!(formatter, "window error: {error}"),
             Self::Io(error) => write!(formatter, "{error}"),
-            Self::MissingBuildTools(path) => {
-                write!(
-                    formatter,
-                    "Python image builder not found: {}",
-                    path.display()
-                )
-            }
         }
     }
 }
@@ -296,11 +288,6 @@ pub async fn run_with_devices(
     disk_id: Option<&str>,
     network_port: u16,
 ) -> Result<(), RuntimeError> {
-    if !root.join("tools").join("sc16_build_image.py").is_file() {
-        return Err(RuntimeError::MissingBuildTools(
-            root.join("tools").join("sc16_build_image.py"),
-        ));
-    }
     set_fullscreen(fullscreen);
 
     let mut cpu = Cpu::new();

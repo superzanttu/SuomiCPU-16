@@ -2,7 +2,8 @@
 
 ## 1. Overview
 
-SuomiCPU is a Python emulator for the SC-16, a small, byte-addressed machine with
+SuomiCPU-16's primary emulator is implemented in Rust. The Python emulator is
+retained as a migration reference. SC-16 is a small, byte-addressed machine with
 eight general-purpose registers and a 16-bit instruction format. Assembly source
 files use the `.asm` extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
@@ -20,7 +21,7 @@ the image's memory segments.
 Run a program from the repository root:
 
 ```console
-python main.py examples/example.asm
+cargo run -- examples/example.asm
 ```
 
 On Windows, run the PowerShell launcher with a source or binary path:
@@ -30,8 +31,9 @@ On Windows, run the PowerShell launcher with a source or binary path:
 .\run.ps1 ".\modules\Asteroids\asteroids.c"
 ```
 
-`run.ps1` changes to the repository directory and starts the emulator through
-`main.py`. It requires Python to be available as `python` on `PATH`. At startup,
+`run.ps1` changes to the repository directory and starts the Rust emulator
+through Cargo. It requires Rust and Cargo to be available on `PATH`. C source
+builds still invoke the Python reference compiler. At startup,
 the BIOS lists each subfolder in `modules/` as a module, using the folder name
 as its module name. A folder with one `.c` file loads that file; a folder with
 multiple `.c` files must contain `main.c`, which is loaded instead. The first
@@ -52,34 +54,36 @@ source and generated assembly file sizes, program image size, address span, and
 emulator memory capacity/remaining memory when a program loads. Press F2 in the
 emulator window to hide/show the console, and F11 to toggle fullscreen and
 windowed game display. Start in fullscreen with
-`python main.py --fullscreen` or
+`cargo run -- --fullscreen` or
 `.\run.ps1 -Fullscreen`.
 
 Additional examples are in [`examples/commands.asm`](examples/commands.asm)
 and [`examples/directives.asm`](examples/directives.asm):
 
 ```console
-python main.py examples/commands.asm
-python main.py examples/directives.asm
+cargo run -- examples/commands.asm
+cargo run -- examples/directives.asm
 ```
 
-Compile and immediately run a C source file, or create a flat binary image:
+The Rust emulator can launch `.c` programs, but C compilation still calls the
+Python reference compiler. Until the Rust compiler replacement is complete,
+that path requires Python. The compiler can also be invoked directly:
 
 ```console
-python main.py examples/factorial.c
+cargo run -- examples/factorial.c
 python tools/c_compiler.py examples/factorial.c
 python tools/c_compiler.py examples/factorial.c -S -o examples/factorial.asm
-python main.py examples/factorial.bin
+cargo run -- examples/factorial.bin
 ```
 
-The compiler defaults to an output file with the input name and a `.bin`
-extension. `-S` emits readable SC-16 assembly instead. The emulator accepts
-`.asm`, `.c`, and flat `.bin` inputs.
+The Python compiler defaults to an output file with the input name and a `.bin`
+extension. `-S` emits readable SC-16 assembly instead. The Rust emulator
+accepts `.asm`, `.c`, and flat `.bin` inputs.
 
 The input file argument is optional. Without it, the BIOS compiles and loads a
 selected program from `modules/`; storage disks are only for program data. Use
-`--disk ID` to preselect a data disk in the BIOS. The emulator uses Pygame for
-its window, display, and input.
+`--disk ID` to preselect a data disk in the BIOS. The Rust emulator uses
+Macroquad for its window, display, and input.
 
 ## 3. Assembly source syntax
 
@@ -1073,7 +1077,7 @@ and run one from the repository root:
 
 ```
 python tools/c_compiler.py "modules/Asteroids/asteroids.c" -o asteroids.bin
-python main.py asteroids.bin
+cargo run -- asteroids.bin
 ```
 
 [`examples/factorial.c`](examples/factorial.c) and
@@ -1120,7 +1124,7 @@ instructions per frame.
   split-flap flip clock. Each analog face has its own hand design, Nixie digits
   dim and re-ignite when they change, and flip cards animate each change.
   Press Tab to cycle through the seven faces. Run it with
-  `python main.py modules/AnaClock/anaclock.c`.
+  `cargo run -- modules/AnaClock/anaclock.c`.
 - [`modules/Elite/elitedemo.c`](modules/Elite/elitedemo.c) is a first-person Elite-style
   space-combat prototype around a planet with two orbiting moons, drifting
   asteroids and patrolling enemy fighters that dogfight and shoot back. Flight is
@@ -1128,7 +1132,7 @@ instructions per frame.
   (Up = nose up), Q/E roll, X or Shift thrust, Z or Ctrl reverse, Space fires a
   heat-limited laser. It has regenerating shields, a hull, collisions with every
   body, a 3D radar and a HUD. It needs roughly 100,000 instructions per frame.
-  Run it with `python main.py modules/Elite/elitedemo.c`.
+  Run it with `cargo run -- modules/Elite/elitedemo.c`.
 - [`modules/Lunar Lander/lunarlander.c`](<modules/Lunar Lander/lunarlander.c>) is a Lunar Lander game with
   gravity, inertia, limited fuel, procedural terrain with x2/x3/x5 landing pads,
   exhaust, dust and explosion particles, a starfield with the Earth, a HUD with
@@ -1138,20 +1142,20 @@ instructions per frame.
   the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
   Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
   accuracy bonus) x pad multiplier. Run it with
-  `python main.py "modules/Lunar Lander/lunarlander.c"`.
+  `cargo run -- "modules/Lunar Lander/lunarlander.c"`.
 - [`modules/Paint/paint.c`](modules/Paint/paint.c) is an MS Paint style drawing program driven by the
   mouse: pen, eraser, spray, line, rectangle and filled rectangle with live shape previews,
   four brush sizes and a 16-color palette. Left button draws with the foreground color, right
   button with the background color; double-click a palette color to fill the canvas and
   double-click CLR to clear it. Images cannot be saved. Run it with
-  `python main.py modules/Paint/paint.c`.
+  `cargo run -- modules/Paint/paint.c`.
 - [`modules/Netgame Demo/net_game_demo.c`](<modules/Netgame Demo/net_game_demo.c>) is a LAN demo: start it in up to 8
   emulator instances on one network; each player moves a coloured square (arrows) and Space
   broadcasts a ping ring to all others. Run it with
-  `python main.py "modules/Netgame Demo/net_game_demo.c"`.
+  `cargo run -- "modules/Netgame Demo/net_game_demo.c"`.
 - [`modules/SpaceCave/spacecave.c`](modules/SpaceCave/spacecave.c) (SpaceCave) is an Asteroids-style LAN dogfight
   for up to 8 pilots inside a procedurally generated cave with auto-repairing defence turrets.
-  Start it in one emulator per player (`python main.py modules/SpaceCave/spacecave.c`), type a nickname and
+  Start it in one emulator per player (`cargo run -- modules/SpaceCave/spacecave.c`), type a nickname and
   press Enter. Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard. The
   lowest network slot acts as the authoritative host: clients only send their keys, the host simulates
   and broadcasts ships, bullets, turrets and scores, and the cave is rebuilt from a broadcast seed.
@@ -1243,7 +1247,7 @@ C globals start at 0x80000.
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 
     python tools/c_compiler.py "modules/SC-16 showcase/sc16_showcase.c" -o showcase.bin
-    python main.py showcase.bin
+    cargo run -- showcase.bin
 
 ## Optional JIT acceleration
 

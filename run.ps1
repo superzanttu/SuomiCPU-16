@@ -8,17 +8,18 @@ param (
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location $ScriptDir
 
-# Check if python is available
-if (!(Get-Command python -ErrorAction SilentlyContinue)) {
-    Write-Error "Python is not installed or not in PATH."
+# Check if Cargo is available
+if (!(Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Error "Cargo is not installed or not in PATH."
     exit 1
 }
 
-$PythonArgs = @()
+$RustArgs = @()
 if ($Fullscreen) {
-    $PythonArgs += "--fullscreen"
+    $RustArgs += "--fullscreen"
 }
 if (![string]::IsNullOrWhiteSpace($ProgramFile)) {
-    $PythonArgs += $ProgramFile
+    $RustArgs += $ProgramFile
 }
-python main.py @PythonArgs
+cargo run --quiet --bin suomicpu16 -- @RustArgs
+exit $LASTEXITCODE

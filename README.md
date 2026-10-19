@@ -1,6 +1,8 @@
 # SuomiCPU-16
 
-SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
+SuomiCPU-16 is an emulator for the SC-16, a small, byte-addressed machine. The
+Rust emulator is the primary runtime; Python implementations remain during the
+ongoing migration.
 
 ## Features
 - Full emulation of the SC-16 architecture.
@@ -15,11 +17,10 @@ SuomiCPU-16 is a Python emulator for the SC-16, a small, byte-addressed machine.
   tile/sprite engines, and a fixed-point 3D graphics coprocessor.
 
 ## Getting Started
-Install the Python dependency with `python -m pip install -r requirements.txt`.
-The emulator can then be started on Windows or Linux with:
+Install Rust and Cargo, then start the emulator with:
 
 ```console
-python main.py
+cargo run --bin suomicpu16
 ```
 
 Start SC-16 without arguments to show the BIOS module selector. Select a
@@ -36,26 +37,25 @@ Ctrl+C to copy it; **COPY** copies the selection or the visible screen. The
 console retains 1,000 rows of scrollback, accessible with the mouse wheel.
 Press **F2** in the emulator window to hide/show the console; **F11** toggles
 windowed/fullscreen game display. Start directly in fullscreen with
-`python main.py --fullscreen` or
-`.\run.ps1 -Fullscreen`.
+`cargo run -- --fullscreen` or `.\run.ps1 -Fullscreen`.
 Detailed stage logs are on by default and show which SC-16 component is
 processing each source file, including compiler, assembler, include, and
 memory-loading stages. Use `--quiet` to hide these details.
 
 Run an example directly from the repository root:
 ```console
-python main.py examples/factorial.c
+cargo run -- examples/factorial.c
 ```
 
 For five analog clock styles, a Nixie-tube display, and a flip clock, run:
 ```console
-python main.py examples/anaclock.c
+cargo run -- examples/anaclock.c
 ```
 Press Tab to cycle through the seven clock faces.
 
 For a first-person Elite-style space combat demo, run:
 ```console
-python main.py examples/elitedemo.c
+cargo run -- examples/elitedemo.c
 ```
 Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
 Space. The ship accelerates and drifts with inertia; shields regenerate and the
@@ -73,16 +73,18 @@ On Windows, the PowerShell launcher can run the same programs:
 ```powershell
 .\run.ps1 .\examples\factorial.c
 ```
-It changes to the repository directory and starts the emulator through
-`main.py`. Make sure Python is available as `python` on `PATH`.
+It changes to the repository directory and starts the Rust emulator through
+Cargo. Make sure Rust and Cargo are available on `PATH`.
 
 The emulator accepts assembly (`.asm`), C (`.c`), and flat binary (`.bin`)
-programs. The C compiler is in [`tools/c_compiler.py`](tools/c_compiler.py);
-for example, compile a C file to a binary and run it with:
+programs. Assembly is built natively by Rust. C source builds still invoke the
+Python reference compiler in [`tools/c_compiler.py`](tools/c_compiler.py) until
+the Rust compiler port is complete. To compile a C file explicitly and run the
+result with Rust:
 
 ```console
 python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
-python main.py asteroids.bin
+cargo run -- asteroids.bin
 ```
 
 See the [user guide](user_guide.md) for setup details, controls, and the full
@@ -101,7 +103,7 @@ cargo build --target wasm32-unknown-unknown
 The browser build is not yet a standalone web release: module discovery and
 module file access still rely on the host filesystem. Rust builds `.asm`
 programs with the native Rust assembler; `.c` compilation still uses the
-Python C compiler.
+Python C compiler as a temporary migration dependency.
 
 Run a program with optional persistent data-disk and LAN settings:
 
