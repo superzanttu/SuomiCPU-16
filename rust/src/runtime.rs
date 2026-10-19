@@ -17,6 +17,9 @@ const RTC_START: usize = 0x43010;
 const GFX_MODE_ADDR: usize = 0x43014;
 const SOUND_RATE: u32 = 22_050;
 const SOUND_FPS: u32 = 60;
+const BIOS_VISIBLE_MODULES: usize = 12;
+const BIOS_MODULE_ROW_TOP: usize = 128;
+const BIOS_MODULE_ROW_HEIGHT: usize = 24;
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -504,6 +507,7 @@ async fn select_and_boot(
     disk_id: Option<&str>,
 ) -> Result<bool, RuntimeError> {
     let mut selected = 0usize;
+    let mut scroll_offset = 0usize;
     let disks = cpu.available_disks().map_err(RuntimeError::Window)?;
     let mut selected_disk = match disk_id {
         Some(disk_id) => disks
@@ -516,51 +520,15 @@ async fn select_and_boot(
         None => 0,
     };
     loop {
-        pixels.fill(rgb(8, 12, 24));
-        draw_text(pixels, 640, 32, 26, "SUOMICPU-16 BIOS", 0xffffd000, font);
-        draw_text(
+        draw_bios_selector(
             pixels,
-            640,
-            32,
-            58,
-            "MODULE: UP/DOWN + ENTER     DATA DISK: D / LEFT / RIGHT",
-            0xffb8c7df,
             font,
+            modules,
+            selected,
+            scroll_offset,
+            &disks,
+            selected_disk,
         );
-        let disk_label = if selected_disk == 0 {
-            "DATA DISK: NONE".to_owned()
-        } else {
-            format!("DATA DISK: {}", disks[selected_disk - 1])
-        };
-        draw_text(pixels, 640, 38, 82, &disk_label, 0xffffd000, font);
-        for (index, module) in modules.iter().enumerate() {
-            let y = 110 + index * 24;
-            let selected_row = index == selected;
-            let color = if selected_row { 0xff101020 } else { 0xff080c18 };
-            for row in y..(y + 20).min(470) {
-                for column in 28..612 {
-                    pixels[row * 640 + column] = color;
-                }
-            }
-            draw_text(
-                pixels,
-                640,
-                38,
-                y + 2,
-                &module.name,
-                if selected_row { 0xffffffff } else { 0xffc2cee0 },
-                font,
-            );
-            draw_text(
-                pixels,
-                640,
-                240,
-                y + 2,
-                &module.description,
-                0xff91a1b8,
-                font,
-            );
-        }
         canvas
             .present(pixels, 640, 480, &[], &[], &cpu.palette)
             .await;
@@ -569,8 +537,10 @@ async fn select_and_boot(
         }
         if is_key_pressed(KeyCode::Up) {
             selected = selected.saturating_sub(1);
+            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
         } else if is_key_pressed(KeyCode::Down) {
             selected = (selected + 1).min(modules.len() - 1);
+            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
         } else if is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right) {
             selected_disk = (selected_disk + 1) % (disks.len() + 1);
         } else if is_key_pressed(KeyCode::Left) {
@@ -601,6 +571,130 @@ async fn select_and_boot(
                 .map_err(|error| RuntimeError::Window(error.to_string()))?;
             return Ok(true);
         }
+    }
+}
+
+fn draw_bios_selector(
+    pixels: &mut [u32],
+    font: &[[u8; 8]],
+    modules: &[BootModule],
+    selected: usize,
+    scroll_offset: usize,
+    disks: &[String],
+    selected_disk: usize,
+) {
+    pixels.fill(rgb(7, 10, 20));
+    fill_rect(pixels, 640, 24, 18, 592, 82, rgb(16, 22, 38));
+    fill_rect(pixels, 640, 24, 108, 592, 326, rgb(11, 15, 28));
+    draw_text(pixels, 640, 40, 31, "SUOMICPU-16 BIOS", 0xffffd000, font);
+    draw_text(pixels, 640, 40, 49, "MODULE MANAGER", 0xff90a8c8, font);
+    draw_text(
+        pixels,
+        640,
+        40,
+        79,
+        "UP/DOWN SELECT   ENTER START   ESC EXIT",
+        0xffc2cee0,
+        font,
+    );
+
+    let disk_name = if selected_disk == 0 {
+        "NONE"
+    } else {
+        disks
+            .get(selected_disk - 1)
+            .map(String::as_str)
+            .unwrap_or("NONE")
+    };
+    fill_rect(pixels, 640, 420, 73, 184, 27, rgb(35, 31, 19));
+    draw_text(
+        pixels,
+        640,
+        430,
+        83,
+        &format!("DISK: {disk_name}  < >"),
+        0xffffd000,
+        font,
+    );
+
+    draw_text(pixels, 640, 42, 111, "MODULE", 0xff90a8c8, font);
+    draw_text(pixels, 640, 250, 111, "DESCRIPTION", 0xff90a8c8, font);
+    let first = scroll_offset.min(modules.len().saturating_sub(BIOS_VISIBLE_MODULES));
+    for (row, (index, module)) in modules
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(BIOS_VISIBLE_MODULES)
+        .enumerate()
+    {
+        let y = BIOS_MODULE_ROW_TOP + row * BIOS_MODULE_ROW_HEIGHT;
+        let is_selected = index == selected;
+        let background = if is_selected {
+            rgb(37, 47, 68)
+        } else if row % 2 == 0 {
+            rgb(14, 20, 34)
+        } else {
+            rgb(11, 15, 28)
+        };
+        fill_rect(pixels, 640, 32, y, 576, 22, background);
+        let name_color = if is_selected { 0xffffffff } else { 0xffd0d9e8 };
+        let number = format!("{:02}", index + 1);
+        draw_text(pixels, 640, 42, y + 7, &number, 0xff7185a3, font);
+        draw_text_limited(pixels, 640, (66, y + 7), &module.name, 27, name_color, font);
+        draw_text_limited(
+            pixels,
+            640,
+            (250, y + 7),
+            &module.description,
+            60,
+            if is_selected { 0xffe2e8f2 } else { 0xff9eacc1 },
+            font,
+        );
+    }
+
+    let position = if modules.is_empty() {
+        "NO MODULES FOUND".to_owned()
+    } else {
+        format!("MODULE {:02}/{:02}", selected + 1, modules.len())
+    };
+    draw_text(pixels, 640, 42, 445, &position, 0xff90a8c8, font);
+    draw_text(
+        pixels,
+        640,
+        250,
+        445,
+        "D / LEFT / RIGHT: CHANGE DISK",
+        0xff90a8c8,
+        font,
+    );
+}
+
+fn bios_scroll_offset(selected: usize, current_offset: usize, module_count: usize) -> usize {
+    let max_offset = module_count.saturating_sub(BIOS_VISIBLE_MODULES);
+    let offset = current_offset.min(max_offset);
+    if selected < offset {
+        selected
+    } else if selected >= offset + BIOS_VISIBLE_MODULES {
+        selected + 1 - BIOS_VISIBLE_MODULES
+    } else {
+        offset
+    }
+}
+
+fn fill_rect(
+    pixels: &mut [u32],
+    width: usize,
+    x: usize,
+    y: usize,
+    rect_width: usize,
+    rect_height: usize,
+    color: u32,
+) {
+    let height = pixels.len() / width;
+    for row in y..y.saturating_add(rect_height).min(height) {
+        let start = row * width + x.min(width);
+        let end = row * width + x.saturating_add(rect_width).min(width);
+        pixels[start..end].fill(color);
     }
 }
 
@@ -778,15 +872,37 @@ fn draw_text(
         let glyph_x = x + character_index * 6;
         for (row, bits) in glyph.iter().copied().enumerate().take(7) {
             for column in 0..5 {
-                if bits & (0x80 >> column) != 0 {
-                    let address = (y + row) * width + glyph_x + column;
-                    if let Some(pixel) = pixels.get_mut(address) {
-                        *pixel = color;
-                    }
+                let pixel_x = glyph_x + column;
+                let pixel_y = y + row;
+                if bits & (0x80 >> column) != 0
+                    && pixel_x < width
+                    && let Some(pixel) = pixels.get_mut(pixel_y * width + pixel_x)
+                {
+                    *pixel = color;
                 }
             }
         }
     }
+}
+
+fn draw_text_limited(
+    pixels: &mut [u32],
+    width: usize,
+    (x, y): (usize, usize),
+    text: &str,
+    max_characters: usize,
+    color: u32,
+    font: &[[u8; 8]],
+) {
+    let character_count = text.chars().count();
+    if character_count <= max_characters {
+        draw_text(pixels, width, x, y, text, color, font);
+        return;
+    }
+    let visible_characters = max_characters.saturating_sub(3);
+    let mut clipped = text.chars().take(visible_characters).collect::<String>();
+    clipped.push_str("...");
+    draw_text(pixels, width, x, y, &clipped, color, font);
 }
 
 #[cfg(test)]
@@ -819,6 +935,40 @@ mod tests {
             volume: 100,
         });
         assert_eq!(wav.len(), 44 + (SOUND_RATE as usize));
+    }
+
+    #[test]
+    fn bios_selection_scroll_keeps_every_module_reachable() {
+        let module_count = 37;
+        let mut selected = 0;
+        let mut offset = 0;
+        for next in 1..module_count {
+            selected = next;
+            offset = bios_scroll_offset(selected, offset, module_count);
+            assert!(selected >= offset);
+            assert!(selected < offset + BIOS_VISIBLE_MODULES);
+        }
+        assert_eq!(selected, module_count - 1);
+        assert_eq!(offset + BIOS_VISIBLE_MODULES, module_count);
+
+        for previous in (0..module_count - 1).rev() {
+            selected = previous;
+            offset = bios_scroll_offset(selected, offset, module_count);
+            assert!(selected >= offset);
+            assert!(selected < offset + BIOS_VISIBLE_MODULES);
+        }
+        assert_eq!(selected, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn bios_text_clipping_does_not_wrap_overflow_into_next_row() {
+        let font = vec![[0xf8; 8]; 128];
+        let mut pixels = vec![0; 20];
+        draw_text(&mut pixels, 10, 8, 0, "A", 1, &font);
+        assert_eq!(&pixels[..10], &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(&pixels[10..18], &[0; 8]);
+        assert_eq!(&pixels[18..], &[1, 1]);
     }
 
     #[test]

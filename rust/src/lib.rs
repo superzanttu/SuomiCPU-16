@@ -1,3 +1,4 @@
+pub mod assembler;
 pub mod cpu;
 pub mod disk;
 pub mod image;

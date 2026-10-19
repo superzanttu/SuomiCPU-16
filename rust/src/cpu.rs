@@ -2887,6 +2887,471 @@ mod tests {
     }
 
     #[test]
+    fn classic_integer_and_logic_ops_cover_register_and_value_edges() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        let edges = [0, 1, 0x7f, 0x80, 0xff, 0x100, 0x8000, 0xffff];
+        for opcode in [OP_ADD, OP_SUB, OP_CMP, OP_AND, OP_OR, OP_XOR] {
+            for destination in 0..8 {
+                for left_register in 0..8 {
+                    for right_register in 0..8 {
+                        for left in edges {
+                            for right in edges {
+                                let mut registers =
+                                    std::array::from_fn(|index| (0x50 + 0x11 * index) as i64);
+                                registers[left_register] = left;
+                                registers[right_register] = right;
+                                let actual_left = registers[left_register];
+                                let actual_right = registers[right_register];
+                                cpu.registers = registers;
+                                cpu.flags = Flags {
+                                    zero: true,
+                                    carry: true,
+                                    negative: true,
+                                    overflow: true,
+                                };
+                                cpu.pc = 0;
+                                cpu.running = true;
+                                cpu.write_u16(
+                                    0,
+                                    (opcode << 11)
+                                        | ((destination as u16) << 8)
+                                        | ((left_register as u16) << 5)
+                                        | ((right_register as u16) << 2),
+                                );
+                                cpu.step().unwrap();
+
+                                let result = match opcode {
+                                    OP_ADD => actual_left + actual_right,
+                                    OP_SUB | OP_CMP => actual_left - actual_right,
+                                    OP_AND => actual_left & actual_right,
+                                    OP_OR => actual_left | actual_right,
+                                    OP_XOR => actual_left ^ actual_right,
+                                    _ => unreachable!(),
+                                };
+                                if opcode != OP_CMP {
+                                    registers[destination] = result;
+                                }
+                                assert_eq!(cpu.registers, registers);
+                                match opcode {
+                                    OP_ADD => {
+                                        assert_eq!(cpu.flags.zero, result == 0);
+                                        assert_eq!(cpu.flags.carry, result > 0xff);
+                                    }
+                                    OP_SUB | OP_CMP => {
+                                        assert_eq!(cpu.flags.zero, result == 0);
+                                        assert_eq!(cpu.flags.carry, result < 0);
+                                    }
+                                    _ => assert_eq!(
+                                        cpu.flags,
+                                        Flags {
+                                            zero: true,
+                                            carry: true,
+                                            negative: true,
+                                            overflow: true,
+                                        }
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for destination in 0..8 {
+            for source in 0..8 {
+                for value in edges {
+                    let mut registers = std::array::from_fn(|index| (0x50 + 0x11 * index) as i64);
+                    registers[source] = value;
+                    cpu.registers = registers;
+                    cpu.pc = 0;
+                    cpu.running = true;
+                    cpu.write_u16(
+                        0,
+                        (OP_NOT << 11) | ((destination as u16) << 8) | ((source as u16) << 5),
+                    );
+                    cpu.step().unwrap();
+                    registers[destination] = i64::from(!(value as u16));
+                    assert_eq!(cpu.registers, registers);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn memory_load_store_stack_and_wrap_cases_cover_register_pairs() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        for destination in 0..8 {
+            for address_register in 0..8 {
+                let mut registers = [0; 8];
+                registers[address_register] = 0x1000 + (address_register as i64 * 8);
+                cpu.registers = registers;
+                cpu.pc = 0;
+                cpu.running = true;
+                cpu.write_u16(
+                    0,
+                    (OP_LD << 11) | ((destination as u16) << 8) | ((address_register as u16) << 5),
+                );
+                cpu.write(registers[address_register] as u32, 0xa5);
+                cpu.step().unwrap();
+                registers[destination] = 0xa5;
+                assert_eq!(cpu.registers, registers);
+
+                registers[destination] = 0x1abc;
+                cpu.registers = registers;
+                cpu.pc = 0;
+                cpu.running = true;
+                cpu.write_u16(
+                    0,
+                    (OP_ST << 11) | ((destination as u16) << 8) | ((address_register as u16) << 5),
+                );
+                cpu.step().unwrap();
+                assert_eq!(cpu.read(registers[address_register] as u32), 0xbc);
+
+                registers[address_register] = 0x1100 + (address_register as i64 * 8);
+                cpu.registers = registers;
+                cpu.pc = 0;
+                cpu.running = true;
+                cpu.write_u16(
+                    0,
+                    (OP_LDW << 11) | ((destination as u16) << 8) | ((address_register as u16) << 5),
+                );
+                cpu.write_u16(registers[address_register] as u32, 0x1234);
+                cpu.step().unwrap();
+                registers[destination] = 0x1234;
+                assert_eq!(cpu.registers, registers);
+
+                registers[destination] = 0xbeef;
+                cpu.registers = registers;
+                cpu.pc = 0;
+                cpu.running = true;
+                cpu.write_u16(
+                    0,
+                    (OP_STW << 11) | ((destination as u16) << 8) | ((address_register as u16) << 5),
+                );
+                cpu.step().unwrap();
+                assert_eq!(cpu.read_u16(registers[address_register] as u32), 0xbeef);
+            }
+        }
+
+        cpu.write(0xffff, 0x12);
+        cpu.write(0, 0x34);
+        assert_eq!(cpu.read_u16(0xffff), 0x1234);
+        cpu.write_u16(0xffff, 0x5678);
+        assert_eq!(cpu.read(0xffff), 0x56);
+        assert_eq!(cpu.read(0), 0x78);
+    }
+
+    #[test]
+    fn classic_half_float_ops_cover_each_action_and_register_field() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        for destination in 0..8 {
+            for source in 0..8 {
+                for action in 1..=7 {
+                    let mut registers =
+                        std::array::from_fn(|index| f32_to_f16(index as f32 + 0.5) as i64);
+                    registers[destination] = f32_to_f16(6.0) as i64;
+                    registers[source] = f32_to_f16(1.5) as i64;
+                    cpu.registers = registers;
+                    cpu.flags = Flags::default();
+                    cpu.pc = 0;
+                    cpu.running = true;
+                    cpu.write_u16(
+                        0,
+                        (OP_SHR << 11)
+                            | ((destination as u16) << 8)
+                            | (action << 5)
+                            | ((source as u16) << 2),
+                    );
+                    cpu.step().unwrap();
+
+                    if action <= 4 {
+                        let left = f16_to_f32(registers[destination] as u16);
+                        let right = f16_to_f32(registers[source] as u16);
+                        let value = match action {
+                            1 => left + right,
+                            2 => left - right,
+                            3 => left * right,
+                            _ => left / right,
+                        };
+                        registers[destination] = i64::from(f32_to_f16(value));
+                        assert_eq!(cpu.registers, registers);
+                    } else if action == 5 {
+                        let left = f16_to_f32(registers[destination] as u16);
+                        let right = f16_to_f32(registers[source] as u16);
+                        assert_eq!(cpu.registers, registers);
+                        assert_eq!(cpu.flags.zero, left == right);
+                        assert_eq!(cpu.flags.carry, left < right);
+                    } else if action == 6 {
+                        let signed = (registers[destination] as u16) as i16;
+                        registers[destination] = i64::from(f32_to_f16(f32::from(signed)));
+                        assert_eq!(cpu.registers, registers);
+                    } else {
+                        let value = f16_to_f32(registers[destination] as u16).trunc() as i64;
+                        registers[destination] = value as u16 as i64;
+                        assert_eq!(cpu.registers, registers);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ieee_float_instructions_cover_arithmetic_precision_and_special_values() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        for (width, base, actions) in [(32u8, 0usize, 0u16..=4), (64, 0, 5u16..=9)] {
+            for action in actions {
+                let mut registers = [0i64; 8];
+                if width == 32 {
+                    let left = 6.0f32.to_bits();
+                    let right = 1.5f32.to_bits();
+                    registers[base] = i64::from(left >> 16);
+                    registers[base + 1] = i64::from(left & 0xffff);
+                    registers[base + 2] = i64::from(right >> 16);
+                    registers[base + 3] = i64::from(right & 0xffff);
+                } else {
+                    let left = 6.0f64.to_bits();
+                    let right = 1.5f64.to_bits();
+                    for offset in 0..4 {
+                        registers[offset] = ((left >> (48 - offset * 16)) & 0xffff) as i64;
+                        registers[offset + 4] = ((right >> (48 - offset * 16)) & 0xffff) as i64;
+                    }
+                }
+                cpu.registers = registers;
+                cpu.flags = Flags::default();
+                cpu.pc = 0;
+                cpu.running = true;
+                cpu.write_u16(0, FLOAT_PREFIX);
+                let source = if width == 32 { 2 } else { 4 };
+                cpu.write_u16(2, (action << 11) | source);
+                cpu.step().unwrap();
+                if action % 5 == 4 {
+                    assert!(!cpu.flags.zero);
+                    assert!(!cpu.flags.carry);
+                    assert_eq!(cpu.registers, registers);
+                } else if width == 32 {
+                    let left = 6.0f32;
+                    let right = 1.5f32;
+                    let result = match action {
+                        0 => left + right,
+                        1 => left - right,
+                        2 => left * right,
+                        _ => left / right,
+                    };
+                    let bits = result.to_bits();
+                    assert_eq!(
+                        &cpu.registers[..2],
+                        &[i64::from(bits >> 16), i64::from(bits & 0xffff)]
+                    );
+                } else {
+                    let left = 6.0f64;
+                    let right = 1.5f64;
+                    let result = match action {
+                        5 => left + right,
+                        6 => left - right,
+                        7 => left * right,
+                        _ => left / right,
+                    };
+                    let bits = result.to_bits();
+                    let expected = std::array::from_fn::<_, 4, _>(|offset| {
+                        ((bits >> (48 - offset * 16)) & 0xffff) as i64
+                    });
+                    assert_eq!(&cpu.registers[..4], &expected);
+                }
+            }
+        }
+
+        for (action, value, expected) in [
+            (0u16, f32::INFINITY, 0x7f80_0000u32),
+            (0, f32::NEG_INFINITY, 0xff80_0000),
+            (1, -0.0, 0x8000_0000),
+            (0, f32::from_bits(1), 0x0000_0001),
+        ] {
+            let bits = value.to_bits();
+            cpu.registers[..4].copy_from_slice(&[
+                i64::from(bits >> 16),
+                i64::from(bits & 0xffff),
+                0,
+                0,
+            ]);
+            cpu.pc = 0;
+            cpu.running = true;
+            cpu.write_u16(0, FLOAT_PREFIX);
+            cpu.write_u16(2, action << 11 | 2);
+            cpu.step().unwrap();
+            let actual = ((cpu.registers[0] as u16 as u32) << 16) | cpu.registers[1] as u16 as u32;
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn ieee_float_conversions_cover_integer_widths_precision_changes_and_unary_ops() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        let integer_cases = [
+            (10u16, -12_345i64),
+            (11, 65_530),
+            (12, -1_234_567),
+            (13, 3_456_789),
+            (14, -12_345),
+            (15, 65_530),
+            (16, -1_234_567),
+            (17, 3_456_789),
+        ];
+        for (action, value) in integer_cases {
+            let mut registers = [0i64; 8];
+            let format = (action - 10) % 4;
+            if format < 2 {
+                registers[2] = value;
+            } else {
+                registers[2] = (value as u32 >> 16) as i64;
+                registers[3] = (value as u32 & 0xffff) as i64;
+            }
+            cpu.registers = registers;
+            assert_eq!(
+                cpu.read_integer_register(
+                    2,
+                    if format < 2 { 16 } else { 32 },
+                    format == 1 || format == 3
+                ),
+                value
+            );
+            cpu.execute_float(action, 0, 2);
+            let expected = if action < 14 {
+                (value as f32).to_bits() as u64
+            } else {
+                (value as f64).to_bits()
+            };
+            let width = if action < 14 { 2 } else { 4 };
+            for offset in 0..width {
+                assert_eq!(
+                    cpu.registers[offset],
+                    ((expected >> ((width - offset - 1) * 16)) & 0xffff) as i64,
+                    "integer conversion action {action}"
+                );
+            }
+        }
+
+        let value = 1.0f32 + 2.0f32.powi(-24);
+        let bits = value.to_bits();
+        cpu.registers[..4].copy_from_slice(&[
+            0,
+            0,
+            i64::from(bits >> 16),
+            i64::from(bits & 0xffff),
+        ]);
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.write_u16(0, FLOAT_PREFIX);
+        cpu.write_u16(2, (18 << 11) | 2);
+        cpu.step().unwrap();
+        assert_eq!(cpu.read_u64_registers(0), f64::from(value).to_bits());
+
+        cpu.write_u64_registers(4, (1.0f64 + f64::EPSILON).to_bits());
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.write_u16(0, FLOAT_PREFIX);
+        cpu.write_u16(2, (19 << 11) | 4);
+        cpu.step().unwrap();
+        assert_eq!(
+            ((cpu.registers[0] as u16 as u32) << 16) | cpu.registers[1] as u16 as u32,
+            1.0f32.to_bits()
+        );
+
+        for (action, source, value, expected) in [
+            (20u16, 2usize, 3.25f64, -3.25f64),
+            (21, 4, 3.25, -3.25),
+            (22, 2, 9.0, 3.0),
+            (23, 4, 9.0, 3.0),
+        ] {
+            let mut registers = [0i64; 8];
+            if action == 20 || action == 22 {
+                let bits = (value as f32).to_bits();
+                registers[source] = i64::from(bits >> 16);
+                registers[source + 1] = i64::from(bits & 0xffff);
+            } else {
+                let bits = value.to_bits();
+                for offset in 0..4 {
+                    registers[source + offset] = ((bits >> (48 - offset * 16)) & 0xffff) as i64;
+                }
+            }
+            cpu.registers = registers;
+            cpu.pc = 0;
+            cpu.running = true;
+            cpu.write_u16(0, FLOAT_PREFIX);
+            cpu.write_u16(2, (action << 11) | source as u16);
+            cpu.step().unwrap();
+            if action == 20 || action == 22 {
+                let actual =
+                    ((cpu.registers[0] as u16 as u32) << 16) | cpu.registers[1] as u16 as u32;
+                assert_eq!(actual, (expected as f32).to_bits());
+            } else {
+                assert_eq!(cpu.read_u64_registers(0), expected.to_bits());
+            }
+        }
+
+        for (action, source, value, expected, width) in [
+            (24u16, 2usize, -12.75f64, (-12i16) as u16 as u32, 16u8),
+            (25, 2, -12.75, (-12i16) as u16 as u32, 16),
+            (26, 2, -12.75, (-12i32) as u32, 32),
+            (27, 2, -12.75, (-12i32) as u32, 32),
+            (28, 4, -12.75, (-12i16) as u16 as u32, 16),
+            (29, 4, -12.75, (-12i16) as u16 as u32, 16),
+            (30, 4, -12.75, (-12i32) as u32, 32),
+            (31, 4, -12.75, (-12i32) as u32, 32),
+        ] {
+            let mut registers = [0i64; 8];
+            if source == 2 {
+                let bits = (value as f32).to_bits();
+                registers[source] = i64::from(bits >> 16);
+                registers[source + 1] = i64::from(bits & 0xffff);
+            } else {
+                let bits = value.to_bits();
+                for offset in 0..4 {
+                    registers[source + offset] = ((bits >> (48 - offset * 16)) & 0xffff) as i64;
+                }
+            }
+            cpu.registers = registers;
+            cpu.pc = 0;
+            cpu.running = true;
+            cpu.write_u16(0, FLOAT_PREFIX);
+            cpu.write_u16(2, (action << 11) | source as u16);
+            cpu.step().unwrap();
+            if width == 16 {
+                assert_eq!(cpu.registers[0], i64::from(expected as u16));
+            } else {
+                assert_eq!(
+                    ((cpu.registers[0] as u16 as u32) << 16) | cpu.registers[1] as u16 as u32,
+                    expected
+                );
+            }
+        }
+
+        let nan = f32::INFINITY.to_bits();
+        let negative_nan = f32::NEG_INFINITY.to_bits();
+        cpu.registers[..4].copy_from_slice(&[
+            i64::from(nan >> 16),
+            i64::from(nan & 0xffff),
+            i64::from(negative_nan >> 16),
+            i64::from(negative_nan & 0xffff),
+        ]);
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.write_u16(0, FLOAT_PREFIX);
+        cpu.write_u16(2, 2);
+        cpu.step().unwrap();
+        assert_eq!(cpu.register_pair_u32(0), 0x7fc0_0000);
+
+        cpu.registers[..4].copy_from_slice(&[0x8000, 0, 0, 0]);
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.write_u16(0, FLOAT_PREFIX);
+        cpu.write_u16(2, (4 << 11) | 2);
+        cpu.step().unwrap();
+        assert!(cpu.flags.zero);
+        assert!(!cpu.flags.carry);
+    }
+
+    #[test]
     fn key_masks_use_sc16_little_byte_order() {
         let mut cpu = Cpu::with_memory_size(1 << 19).unwrap();
         cpu.set_key(0x20_0405, true);
