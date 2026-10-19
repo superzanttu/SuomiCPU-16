@@ -71,6 +71,7 @@ pub enum ExpressionKind {
     },
     SizeofType(String),
     SizeofExpression(Box<Expression>),
+    InitializerList(Vec<Expression>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +114,10 @@ pub enum StatementKind {
         update: Option<Expression>,
         body: Box<Statement>,
     },
+    Switch {
+        expression: Expression,
+        cases: Vec<(Option<Expression>, Vec<Statement>)>,
+    },
     Break,
     Continue,
     Goto(String),
@@ -152,6 +157,15 @@ pub enum ExternalDeclaration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationUnit {
     pub declarations: Vec<ExternalDeclaration>,
+}
+
+const NATIVE_GLOBAL_SCALAR: u8 = u8::MAX;
+const NATIVE_GLOBAL_ARRAY: u8 = u8::MAX - 1;
+
+struct NativeGlobal {
+    name: String,
+    data: Vec<u8>,
+    is_array: bool,
 }
 
 pub struct ExpressionParser {
@@ -228,6 +242,7 @@ fn evaluate_integer_constant(expression: &Expression) -> Result<i64, CCompilerEr
                 evaluate_integer_constant(when_false)
             }
         }
+        ExpressionKind::InitializerList(_) => Err(fail()),
         _ => Err(fail()),
     }
 }
@@ -284,13 +299,17 @@ pub fn compile_minimal_program(
         Err(_) => return Ok(None),
     };
     let mut functions = Vec::new();
+    let mut globals: Vec<NativeGlobal> = Vec::new();
     let mut names = HashSet::new();
+    let mut global_names = HashSet::new();
+    let mut prototypes = HashMap::new();
     for declaration in &unit.declarations {
         match declaration {
             ExternalDeclaration::FunctionDefinition(function) => {
                 if function.declaration.return_type.trim() != "int"
                     || function.declaration.variadic
                     || function.declaration.parameters.len() > 3
+                    || global_names.contains(function.declaration.name.as_str())
                     || function
                         .declaration
                         .parameters
@@ -305,6 +324,7 @@ pub fn compile_minimal_program(
             ExternalDeclaration::FunctionPrototype(function) => {
                 if function.return_type.trim() != "int"
                     || function.variadic
+                    || global_names.contains(function.name.as_str())
                     || function.parameters.len() > 3
                     || function
                         .parameters
@@ -313,8 +333,43 @@ pub fn compile_minimal_program(
                 {
                     return Ok(None);
                 }
+                if prototypes
+                    .insert(function.name.as_str(), function.parameters.len())
+                    .is_some_and(|previous| previous != function.parameters.len())
+                {
+                    return Ok(None);
+                }
             }
-            ExternalDeclaration::Global(_) => return Ok(None),
+            ExternalDeclaration::Global(global) => {
+                if global.c_type.trim() != "int"
+                    || prototypes.contains_key(global.name.as_str())
+                    || !global_names.insert(global.name.as_str())
+                    || !names.insert(global.name.as_str())
+                {
+                    return Ok(None);
+                }
+                let is_array = global.array_length.is_some();
+                let element_count = global.array_length.unwrap_or(1);
+                let Some(byte_count) = element_count.checked_mul(2) else {
+                    return Ok(None);
+                };
+                if byte_count > 16 * 1024 * 1024 || is_array && global.initializer.is_some() {
+                    return Ok(None);
+                }
+                let mut data = vec![0; byte_count];
+                if !is_array && let Some(initializer) = &global.initializer {
+                    let Ok(value) = evaluate_integer_constant(initializer) else {
+                        return Ok(None);
+                    };
+                    data[0] = (value as u16 >> 8) as u8;
+                    data[1] = value as u8;
+                }
+                globals.push(NativeGlobal {
+                    name: global.name.clone(),
+                    data,
+                    is_array,
+                });
+            }
         }
     }
     let Some(main) = functions
@@ -324,6 +379,13 @@ pub fn compile_minimal_program(
         return Ok(None);
     };
     if !main.declaration.parameters.is_empty() {
+        return Ok(None);
+    }
+    if functions.iter().any(|function| {
+        prototypes
+            .get(function.declaration.name.as_str())
+            .is_some_and(|arity| *arity != function.declaration.parameters.len())
+    }) {
         return Ok(None);
     }
     let defined_functions: HashMap<String, usize> = functions
@@ -369,6 +431,15 @@ pub fn compile_minimal_program(
         if !collect_native_locals(statements, &mut locals, &mut next_local_register) {
             return Ok(None);
         }
+        for global in &globals {
+            locals
+                .entry(global.name.clone())
+                .or_insert(if global.is_array {
+                    NATIVE_GLOBAL_ARRAY
+                } else {
+                    NATIVE_GLOBAL_SCALAR
+                });
+        }
         assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
         for (index, _) in function.declaration.parameters.iter().enumerate() {
             assembly.push_str(&format!("    LDWS R{}, {}\n", index + 1, 4 + index * 2));
@@ -394,6 +465,19 @@ pub fn compile_minimal_program(
         }
     }
     assembly.push_str(".address 0x80000\n");
+    for global in &globals {
+        assembly.push_str(&format!("__c_global_{}:\n", global.name));
+        for chunk in global.data.chunks(16) {
+            assembly.push_str(".data hex ");
+            for (index, byte) in chunk.iter().enumerate() {
+                if index > 0 {
+                    assembly.push(' ');
+                }
+                assembly.push_str(&format!("0x{byte:02X}"));
+            }
+            assembly.push('\n');
+        }
+    }
     crate::assembler::assemble(&assembly, 0)
         .map(Some)
         .map_err(|error| CCompilerError(format!("{filename}: {error}")))
@@ -451,6 +535,9 @@ fn expression_calls_are_defined(
         ExpressionKind::Member { expression, .. } => {
             expression_calls_are_defined(expression, defined_functions)
         }
+        ExpressionKind::InitializerList(values) => values
+            .iter()
+            .all(|value| expression_calls_are_defined(value, defined_functions)),
         ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => true,
     }
 }
@@ -498,6 +585,15 @@ fn statement_calls_are_defined(
                 && condition.as_ref().is_none_or(expression_is_defined)
                 && update.as_ref().is_none_or(expression_is_defined)
                 && statement_calls_are_defined(body, defined_functions)
+        }
+        StatementKind::Switch { expression, cases } => {
+            expression_is_defined(expression)
+                && cases.iter().all(|(value, statements)| {
+                    value.as_ref().is_none_or(expression_is_defined)
+                        && statements.iter().all(|statement| {
+                            statement_calls_are_defined(statement, defined_functions)
+                        })
+                })
         }
         StatementKind::Break
         | StatementKind::Continue
@@ -563,6 +659,13 @@ fn collect_native_locals(
                     return false;
                 }
             }
+            StatementKind::Switch { cases, .. } => {
+                for (_, statements) in cases {
+                    if !collect_native_locals(statements, locals, next_register) {
+                        return false;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -585,7 +688,13 @@ fn emit_native_expression(
                 }
                 assembly.push_str(&format!("    LDI R{destination}, 0x{value:04X}\n"));
             } else if let Some(source) = locals.get(value) {
-                if *source != destination {
+                if *source == NATIVE_GLOBAL_SCALAR {
+                    assembly.push_str(&format!(
+                        "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
+                    ));
+                } else if *source == NATIVE_GLOBAL_ARRAY {
+                    assembly.push_str(&format!("    LDI30 R{destination}, __c_global_{value}\n"));
+                } else if *source != destination {
                     assembly.push_str(&format!("    MOV R{destination}, R{source}\n"));
                 }
             } else {
@@ -884,6 +993,31 @@ fn emit_native_expression(
             }
             true
         }
+        ExpressionKind::Index { expression, index } => {
+            let ExpressionKind::Atom(name) = &expression.kind else {
+                return false;
+            };
+            if destination == 7
+                || locals.get(name) != Some(&NATIVE_GLOBAL_ARRAY)
+                || !emit_native_expression(
+                    index,
+                    destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                )
+            {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    SHL R{destination}, 1\n\
+                 LDI30 R7, __c_global_{name}\n\
+                 ADD R7, R{destination}\n\
+                 LDW R{destination}, R7\n"
+            ));
+            true
+        }
         _ => false,
     }
 }
@@ -903,12 +1037,71 @@ fn emit_native_assignment(
     else {
         return false;
     };
+    if let ExpressionKind::Index {
+        expression: base,
+        index,
+    } = &target.kind
+    {
+        let ExpressionKind::Atom(name) = &base.kind else {
+            return false;
+        };
+        if locals.get(name) != Some(&NATIVE_GLOBAL_ARRAY) {
+            return false;
+        }
+        let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
+            return false;
+        };
+        if !emit_native_expression(
+            value,
+            value_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return false;
+        }
+        if !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str(&format!(
+            "    SHL R0, 1\n\
+             LDI30 R7, __c_global_{name}\n\
+             ADD R7, R0\n"
+        ));
+        if operator != "=" {
+            let binary_operator = match operator.as_str() {
+                "+=" => "ADD",
+                "-=" => "SUB",
+                "*=" => "MUL",
+                "/=" => "DIVS",
+                "%=" => "MODS",
+                "<<=" => "SHL",
+                ">>=" => "ASR",
+                "&=" => "AND",
+                "|=" => "OR",
+                "^=" => "XOR",
+                _ => return false,
+            };
+            assembly.push_str(&format!(
+                "    LDW R0, R7\n    {binary_operator} R0, R{value_register}\n"
+            ));
+            assembly.push_str("    STW R7, R0\n");
+        } else {
+            assembly.push_str(&format!("    STW R7, R{value_register}\n"));
+        }
+        return true;
+    }
     let ExpressionKind::Atom(name) = &target.kind else {
         return false;
     };
     let Some(&destination) = locals.get(name) else {
         return false;
     };
+    let is_global = matches!(destination, NATIVE_GLOBAL_SCALAR | NATIVE_GLOBAL_ARRAY);
+    if destination == NATIVE_GLOBAL_ARRAY {
+        return false;
+    }
     let binary_operator = match operator.as_str() {
         "=" => None,
         "+=" => Some("ADD"),
@@ -935,6 +1128,20 @@ fn emit_native_assignment(
         assembly,
     ) {
         return false;
+    }
+    if is_global {
+        if let Some(binary_operator) = binary_operator {
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    LDW R0, R7\n\
+                 {binary_operator} R0, R{value_register}\n\
+                 LDI30 R7, __c_global_{name}\n    STW R7, R0\n"
+            ));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    STW R7, R{value_register}\n"
+            ));
+        }
+        return true;
     }
     match binary_operator {
         Some(binary_operator) => assembly.push_str(&format!(
@@ -977,7 +1184,7 @@ fn emit_native_statement(
         StatementKind::Expression(None) => Some(false),
         StatementKind::Expression(Some(expression)) => {
             if emit_native_assignment(expression, &[4, 5, 6, 7], locals, label_counter, assembly)
-                || emit_native_update(expression, locals, assembly)
+                || emit_native_update(expression, locals, label_counter, assembly)
             {
                 Some(false)
             } else {
@@ -1005,6 +1212,9 @@ fn emit_native_statement(
         }
         StatementKind::Continue => {
             let (_, continue_label) = loop_labels.last()?;
+            if continue_label.is_empty() {
+                return None;
+            }
             assembly.push_str(&format!("    JMPX {continue_label}\n"));
             Some(false)
         }
@@ -1131,13 +1341,86 @@ fn emit_native_statement(
             assembly.push_str(&format!("__c_for_{label}_update:\n"));
             if let Some(update) = update
                 && !emit_native_assignment(update, &[4, 5, 6, 7], locals, label_counter, assembly)
-                && !emit_native_update(update, locals, assembly)
+                && !emit_native_update(update, locals, label_counter, assembly)
             {
                 return None;
             }
             assembly.push_str(&format!(
                 "    JMPX __c_for_{label}_begin\n__c_for_{label}_end:\n"
             ));
+            Some(false)
+        }
+        StatementKind::Switch { expression, cases } => {
+            if !emit_native_expression(
+                expression,
+                0,
+                &[4, 5, 6, 7],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            let mut case_labels = Vec::with_capacity(cases.len());
+            let mut default_label = None;
+            let mut case_values = HashSet::new();
+            for (value, _) in cases {
+                let dispatch_label = format!("__c_switch_{}", *label_counter);
+                *label_counter += 1;
+                let body_label = format!("__c_switch_body_{}", *label_counter);
+                *label_counter += 1;
+                if let Some(value) = value {
+                    let Ok(value) = evaluate_integer_constant(value) else {
+                        return None;
+                    };
+                    let value = value as u16;
+                    if !case_values.insert(value) {
+                        return None;
+                    }
+                    case_labels.push((Some(value), dispatch_label, body_label));
+                } else {
+                    if default_label.replace(dispatch_label.clone()).is_some() {
+                        return None;
+                    }
+                    case_labels.push((None, dispatch_label, body_label));
+                }
+            }
+            let end_label = format!("__c_switch_{}_end", *label_counter);
+            *label_counter += 1;
+            assembly.push_str("    PUSH R0\n");
+            for (value, dispatch_label, _) in &case_labels {
+                if let Some(value) = value {
+                    assembly.push_str(&format!(
+                        "    LDWS R6, 0\n    LDI R7, 0x{value:04X}\n\
+                         CMP R6, R7\n    BZX {dispatch_label}\n"
+                    ));
+                }
+            }
+            let fallback = default_label.as_deref().unwrap_or(&end_label);
+            if default_label.is_none() {
+                assembly.push_str("    POP R0\n");
+            }
+            assembly.push_str(&format!("    JMPX {fallback}\n"));
+            for (_, dispatch_label, body_label) in &case_labels {
+                assembly.push_str(&format!(
+                    "{dispatch_label}:\n    POP R0\n    JMPX {body_label}\n"
+                ));
+            }
+            let continue_label = loop_labels
+                .iter()
+                .rev()
+                .find(|(_, label)| !label.is_empty())
+                .map_or("", |(_, label)| label.as_str())
+                .to_owned();
+            loop_labels.push((end_label.clone(), continue_label));
+            for ((_, statements), (_, _, body_label)) in cases.iter().zip(&case_labels) {
+                assembly.push_str(&format!("{body_label}:\n"));
+                for statement in statements {
+                    emit_native_statement(statement, locals, label_counter, loop_labels, assembly)?;
+                }
+            }
+            loop_labels.pop();
+            assembly.push_str(&format!("{end_label}:\n"));
             Some(false)
         }
         _ => None,
@@ -1147,6 +1430,7 @@ fn emit_native_statement(
 fn emit_native_update(
     expression: &Expression,
     locals: &HashMap<String, u8>,
+    label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
     let (operator, expression) = match &expression.kind {
@@ -1160,18 +1444,51 @@ fn emit_native_update(
         } if matches!(operator.as_str(), "++" | "--") => (operator, expression),
         _ => return false,
     };
+    let instruction = match operator.as_str() {
+        "++" => "INC",
+        "--" => "DEC",
+        _ => return false,
+    };
+    if let ExpressionKind::Index {
+        expression: base,
+        index,
+    } = &expression.kind
+    {
+        let ExpressionKind::Atom(name) = &base.kind else {
+            return false;
+        };
+        if locals.get(name) != Some(&NATIVE_GLOBAL_ARRAY)
+            || !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly)
+        {
+            return false;
+        }
+        assembly.push_str(&format!(
+            "    SHL R0, 1\n\
+             LDI30 R7, __c_global_{name}\n\
+             ADD R7, R0\n\
+             LDW R0, R7\n\
+             {instruction} R0\n\
+             STW R7, R0\n"
+        ));
+        return true;
+    }
     let ExpressionKind::Atom(name) = &expression.kind else {
         return false;
     };
     let Some(register) = locals.get(name) else {
         return false;
     };
-    let instruction = match operator.as_str() {
-        "++" => "INC",
-        "--" => "DEC",
-        _ => return false,
-    };
-    assembly.push_str(&format!("    {instruction} R{register}\n"));
+    if matches!(*register, NATIVE_GLOBAL_SCALAR | NATIVE_GLOBAL_ARRAY) {
+        if *register == NATIVE_GLOBAL_ARRAY {
+            return false;
+        }
+        assembly.push_str(&format!(
+            "    LDI30 R7, __c_global_{name}\n    LDW R0, R7\n\
+             {instruction} R0\n    LDI30 R7, __c_global_{name}\n    STW R7, R0\n"
+        ));
+    } else {
+        assembly.push_str(&format!("    {instruction} R{register}\n"));
+    }
     true
 }
 
@@ -1750,13 +2067,47 @@ impl StatementParser {
                 },
             ));
         }
-        if matches!(
-            self.expressions.token().value.as_str(),
-            "switch" | "case" | "default"
-        ) {
+        if self.accept("switch").is_some() {
+            self.expect("(")?;
+            let expression = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            self.expect("{")?;
+            let mut cases = Vec::new();
+            let mut has_default = false;
+            while !self.at("}") && !self.expressions.is_at_end() {
+                let value = if self.accept("case").is_some() {
+                    let value = self.expressions.parse_expression(1)?;
+                    self.expect(":")?;
+                    Some(value)
+                } else if self.accept("default").is_some() {
+                    if has_default {
+                        return Err(self.expressions.fail("duplicate default label"));
+                    }
+                    has_default = true;
+                    self.expect(":")?;
+                    None
+                } else {
+                    return Err(self
+                        .expressions
+                        .fail("expected case or default label in switch"));
+                };
+                let mut statements = Vec::new();
+                while !matches!(
+                    self.expressions.token().value.as_str(),
+                    "case" | "default" | "}"
+                ) && !self.expressions.is_at_end()
+                {
+                    statements.push(self.parse_statement()?);
+                }
+                cases.push((value, statements));
+            }
+            self.expect("}")?;
+            return Ok(self.statement(&start, StatementKind::Switch { expression, cases }));
+        }
+        if matches!(self.expressions.token().value.as_str(), "case" | "default") {
             return Err(self
                 .expressions
-                .fail("switch statements are not supported yet"));
+                .fail("case and default labels must be inside a switch"));
         }
         let expression = self.expressions.parse_expression(0)?;
         self.expect(";")?;
@@ -1792,6 +2143,26 @@ impl StatementParser {
         } else {
             Err(self.expressions.fail(message))
         }
+    }
+
+    fn parse_initializer(&mut self) -> Result<Expression, CCompilerError> {
+        if let Some(open) = self.accept("{") {
+            let mut values = Vec::new();
+            if !self.at("}") {
+                loop {
+                    values.push(self.parse_initializer()?);
+                    if self.accept(",").is_none() || self.at("}") {
+                        break;
+                    }
+                }
+            }
+            self.expect("}")?;
+            return Ok(self.expressions.make(
+                &open,
+                ExpressionKind::InitializerList(values),
+            ));
+        }
+        self.expressions.parse_expression(1)
     }
 
     fn parse_declaration(&mut self) -> Result<Statement, CCompilerError> {
@@ -1830,12 +2201,7 @@ impl StatementParser {
             let name = self.expect_identifier("expected a variable name")?;
             let array_length = self.parse_array_suffix()?;
             let initializer = if self.accept("=").is_some() {
-                if array_length.is_some() && self.at("{") {
-                    return Err(self
-                        .expressions
-                        .fail("array initializer lists are not supported yet"));
-                }
-                Some(self.expressions.parse_expression(1)?)
+                Some(self.parse_initializer()?)
             } else {
                 None
             };
@@ -1931,13 +2297,7 @@ impl TranslationUnitParser {
         while let Some((declarator_type, name)) = next.take() {
             let array_length = self.parse_array_suffix()?;
             let initializer = if self.statements.accept("=").is_some() {
-                if array_length.is_some() && self.statements.at("{") {
-                    return Err(self
-                        .statements
-                        .expressions
-                        .fail("array initializer lists are not supported yet"));
-                }
-                Some(self.statements.expressions.parse_expression(1)?)
+                Some(self.statements.parse_initializer()?)
             } else {
                 None
             };
@@ -2724,6 +3084,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_switch_cases_and_reports_duplicate_default() {
+        let parsed = statement("switch (value) { case 1: value++; default: break; }");
+        assert!(matches!(parsed.kind, StatementKind::Switch { .. }));
+        let error =
+            StatementParser::from_source("switch (value) { default: ; default: ; }", "switch.c")
+                .unwrap()
+                .parse()
+                .unwrap_err();
+        assert_eq!(error.to_string(), "switch.c:1: duplicate default label");
+    }
+
+    #[test]
     fn parses_for_declaration_do_while_and_labels() {
         let parsed = statement("for (int i = 0; i < 4; i++) { work(i); }");
         assert!(matches!(
@@ -2989,6 +3361,86 @@ mod tests {
         cpu.run(32).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 17);
+    }
+
+    #[test]
+    fn compiles_initialized_and_zero_initialized_global_integers() {
+        let image = compile_minimal_program(
+            "int total = 3 * 2; int cleared; int main(void) { total += 4; cleared = total; return cleared; }",
+            "globals.c",
+        )
+        .unwrap()
+        .expect("supported global-integer program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+        assert_eq!(cpu.read_u16(0x80000), 10);
+        assert_eq!(cpu.read_u16(0x80002), 10);
+    }
+
+    #[test]
+    fn local_integer_can_shadow_a_global() {
+        let image = compile_minimal_program(
+            "int value = 10; int main(void) { int value = 3; return value; }",
+            "shadow.c",
+        )
+        .unwrap()
+        .expect("supported shadowing program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 3);
+    }
+
+    #[test]
+    fn compiles_indexed_global_integer_arrays() {
+        let image = compile_minimal_program(
+            "int values[4]; int main(void) { values[1] = 5; values[2] = values[1] + 2; values[1]++; values[2] += values[1]; return values[2]; }",
+            "global-array.c",
+        )
+        .unwrap()
+        .expect("supported global-array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 13);
+        assert_eq!(cpu.read_u16(0x80002), 6);
+        assert_eq!(cpu.read_u16(0x80004), 13);
+    }
+
+    #[test]
+    fn compiles_switch_dispatch_fallthrough_default_and_break() {
+        for (source, expected) in [
+            (
+                "int main(void) { int value = 2; int result = 0; switch (value) { case 1: result = 10; break; case 2: result = 20; case 3: result += 3; break; default: result = 99; } return result; }",
+                23,
+            ),
+            (
+                "int main(void) { int value = 9; switch (value) { case 1: return 10; default: return 42; } return 0; }",
+                42,
+            ),
+            (
+                "int main(void) { int value = 9; switch (value) { case 1: value = 10; } return value; }",
+                9,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "switch.c")
+                .unwrap()
+                .expect("supported switch program");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(256).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
     }
 
     #[test]

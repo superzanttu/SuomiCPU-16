@@ -960,7 +960,7 @@ mod tests {
     #[test]
     fn unsupported_c_program_is_rejected_without_running_python() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let program = root.join("examples").join("factorial.c");
+        let program = root.join("modules").join("AnaClock").join("anaclock.c");
         let error = build_program(&program).unwrap_err();
         assert!(error.to_string().contains("Rust C compiler"));
     }

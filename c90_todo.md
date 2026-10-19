@@ -67,7 +67,10 @@ Passing the Rust build or parser tests does not establish feature parity.
 - [x] Basic translation-unit parsing for scalar globals, arrays, function
   prototypes, variadic prototypes, and function definitions.
 - [x] Implement Rust code generation for multiple integer functions with
-  parameter passing, direct/recursive calls, local `int` variables,
+  parameter passing, direct/recursive calls, local `int` variables, initialized
+  and zero-initialized scalar global integers, zero-initialized global integer
+  arrays, indexed global-array reads/writes, and `switch` dispatch with
+  fallthrough, `case`, `default`, and `break`,
   assignment, arithmetic, bitwise and signed
   comparison, shift, logical and conditional expressions, `if`/`else`,
   nested block locals, `while`, `do`/`while`, basic `for` loops, and loop

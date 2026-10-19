@@ -72,10 +72,12 @@ cargo run -- examples/directives.asm
 ```
 
 The Rust emulator natively compiles a limited subset: multiple `int` functions
-with up to three parameters and local `int` variables, assignments, arithmetic,
-bitwise/shift/logical and signed comparison expressions, conditional
-expressions, nested blocks, `if`/`else`, `while`, `do`/`while`, and basic
-`for` loops with `break` and `continue`, including recursion.
+with up to three parameters, local `int` variables, initialized and zero-
+initialized global `int` variables and arrays, and indexed access to global
+integer arrays. It also supports assignments, arithmetic, bitwise/shift/logical
+and signed comparison expressions, conditional expressions, nested blocks,
+`if`/`else`, `switch`/`case`/`default` with fallthrough, `while`, `do`/`while`,
+and basic `for` loops with `break` and `continue`, including recursion.
 Programs outside this subset are rejected with a Rust compiler diagnostic;
 Python is not invoked. The legacy reference compiler can still be invoked
 directly:

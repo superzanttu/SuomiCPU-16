@@ -80,9 +80,11 @@ Cargo. Make sure Rust and Cargo are available on `PATH`.
 
 The emulator accepts assembly (`.asm`), C (`.c`), and flat binary (`.bin`)
 programs. Assembly is built natively by Rust. The Rust C compiler currently
-handles multiple `int` functions with up to three parameters and local `int`
-variables, assignments, arithmetic/bitwise/shift/logical and signed comparison
-expressions, conditional expressions, `if`/`else`, nested blocks, and
+handles multiple `int` functions with up to three parameters, local `int`
+variables, scalar global integers, and indexed global integer arrays, as well as
+assignments, arithmetic/bitwise/shift/logical and signed comparison
+expressions, conditional expressions, `if`/`else`, `switch` with case fallthrough,
+nested blocks, and
 `while`/`do`/`for` loops with `break` and `continue`, including recursive
 calls. Programs outside this subset are rejected with a Rust compiler
 diagnostic; the emulator no longer invokes Python to build C sources. The
