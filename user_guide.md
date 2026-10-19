@@ -27,22 +27,24 @@ cargo run -- examples/example.asm
 On Windows, run the PowerShell launcher with a source or binary path:
 
 ```powershell
-.\run.ps1 .\examples\factorial.c
-.\run.ps1 ".\modules\Asteroids\asteroids.c"
+.\run.ps1 .\examples\example.asm
 ```
 
 `run.ps1` changes to the repository directory and starts the Rust emulator
 through Cargo. It requires Rust and Cargo to be available on `PATH`. The Rust C
 subset handles `int main(void)` with up to three initialized local `int`
-variables, assignments, arithmetic/bitwise and signed comparison expressions,
-`if`/`else`, and `while`/`for` loops. Other C source builds still use the
-Python reference compiler while the Rust port is in progress. At startup,
+variables, assignments, arithmetic/bitwise/shift/logical and signed comparison
+expressions, conditional expressions, `if`/`else`, and `while`/`for` loops.
+Other C programs are rejected until their required features are ported; C builds
+never fall back to Python. At startup,
 the BIOS lists each subfolder in `modules/` as a module, using the folder name
 as its module name. A folder with one `.c` file loads that file; a folder with
 multiple `.c` files must contain `main.c`, which is loaded instead. The first
 source line is shown as the module description. Folders with no `.c` file or
 with multiple `.c` files but no `main.c` remain selectable and show an error
-when loaded. Use the arrow keys to select a program and press Enter to load it;
+when loaded. C modules whose source is outside the Rust compiler's supported
+subset also show a compiler error when loaded. Use the arrow keys to select a
+program and press Enter to load it;
 hover or click a program to select it and
 double-click to load it. Use the mouse wheel over the module list to scroll;
 indicators show how many modules remain above or below the visible rows. Click
@@ -69,13 +71,15 @@ cargo run -- examples/directives.asm
 ```
 
 The Rust emulator natively compiles a limited subset: `int main(void)` with up
-to three initialized local `int` variables, assignments, arithmetic/bitwise
-and signed comparison expressions, and `if`/`else`, `while`, and basic `for`
-loops. Other C programs still use the Python reference compiler while the Rust
-port is in progress. The reference compiler can also be invoked directly:
+to three initialized local `int` variables, assignments, arithmetic,
+bitwise/shift/logical and signed comparison expressions, conditional
+expressions, and `if`/`else`, `while`, `do`/`while`, and basic `for` loops.
+Programs outside this subset are rejected with a Rust compiler diagnostic;
+Python is not invoked. The legacy reference compiler can still be invoked
+directly:
 
 ```console
-cargo run -- examples/factorial.c
+cargo run -- examples/example.asm
 python tools/c_compiler.py examples/factorial.c
 python tools/c_compiler.py examples/factorial.c -S -o examples/factorial.asm
 cargo run -- examples/factorial.bin

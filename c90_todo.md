@@ -68,9 +68,12 @@ Passing the Rust build or parser tests does not establish feature parity.
   prototypes, variadic prototypes, and function definitions.
 - [x] Implement Rust code generation for `int main(void)` with initialized
   local `int` variables, assignment, arithmetic, bitwise and signed
-  comparison expressions, `if`/`else`, `while`, and basic `for` loops.
+  comparison, shift, logical and conditional expressions, `if`/`else`,
+  `while`, `do`/`while`, and basic `for` loops.
+- [x] Remove the Python compiler invocation from Rust `.c` source and BIOS
+  module build paths; Rust reports unsupported C instead of falling back.
 - [x] Execute focused Rust C compiler integration tests on Windows, including
-  native source builds without invoking Python.
+  native source builds and unsupported-source rejection without Python.
 - [x] Evaluate integer constant expressions for local and global array bounds
   (including C integer bases/suffixes and common arithmetic, comparison,
   logical, and bitwise operators).
@@ -82,18 +85,17 @@ Passing the Rust build or parser tests does not establish feature parity.
   output beyond the limited integer `main` subset.
 - [ ] Migrate the 158 Python C compiler regression tests and add executable
   Rust compiler integration tests.
-- [ ] Replace the Python C compiler in `.c` build and module-launch paths.
+- [ ] Expand Rust compiler support until existing `.c` source and module builds
+  no longer encounter unsupported syntax or semantics.
 - [ ] Port remaining Python emulator, JIT, assembler, utilities, map tools,
   GIF generation, build scripts, and tests to Rust or remove them if obsolete.
-- [ ] Route all supported launch/build paths through Rust and remove Python
-  runtime, package, and tool dependencies after parity gates pass.
 - [ ] Remove Python C compiler dependencies only after all required build,
   runtime, test, and tooling paths are migrated.
 
-The Python C compiler remains the reference implementation and handles `.c`
-programs outside the initial native integer-returning `main` subset. Rust test
-execution is intermittently blocked by Windows Application Control (OS error
-4551). Record runtime test results only when tests have actually executed.
+The Python C compiler remains in the repository as migration reference code,
+but Rust runtime builds do not invoke it. C programs outside the current native
+subset fail with an unsupported-program diagnostic until their features are
+ported. Keep this limitation visible while extending Rust compiler coverage.
 
 ## A — SuomiCPU-16 platform required
 

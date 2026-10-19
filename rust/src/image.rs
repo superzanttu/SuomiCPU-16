@@ -1,9 +1,7 @@
 use crate::{CpuError, MemorySegment};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"SC16IMG1";
 const MEMORY_SIZE: u64 = 1 << 30;
@@ -11,7 +9,7 @@ const MEMORY_SIZE: u64 = 1 << 30;
 #[derive(Debug)]
 pub enum ImageError {
     Io(io::Error),
-    BuildFailed,
+    UnsupportedC(String),
     Assembly(String),
     InvalidFormat(&'static str),
     Cpu(CpuError),
@@ -21,7 +19,10 @@ impl std::fmt::Display for ImageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
-            Self::BuildFailed => write!(formatter, "SC-16 C compiler failed"),
+            Self::UnsupportedC(source) => write!(
+                formatter,
+                "the Rust C compiler does not yet support this C program: {source}"
+            ),
             Self::Assembly(error) => write!(formatter, "SC-16 assembly failed: {error}"),
             Self::InvalidFormat(reason) => write!(formatter, "invalid SC-16 image: {reason}"),
             Self::Cpu(error) => write!(formatter, "{error}"),
@@ -95,7 +96,7 @@ pub fn write_image(path: &Path, image: &ProgramImage) -> Result<(), ImageError> 
     Ok(())
 }
 
-pub fn build_source(root: &Path, source: &Path, python: &str) -> Result<ProgramImage, ImageError> {
+pub fn build_source(source: &Path) -> Result<ProgramImage, ImageError> {
     if source
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("asm"))
@@ -115,35 +116,11 @@ pub fn build_source(root: &Path, source: &Path, python: &str) -> Result<ProgramI
         {
             return Ok(image);
         }
+        return Err(ImageError::UnsupportedC(source.display().to_string()));
     }
-    let temp_path = unique_temp_path();
-    let result = (|| {
-        let helper = root.join("tools").join("sc16_build_image.py");
-        let status = Command::new(python)
-            .arg(helper)
-            .arg(source)
-            .arg(&temp_path)
-            .current_dir(root)
-            .status()?;
-        if !status.success() {
-            return Err(ImageError::BuildFailed);
-        }
-        read_image(&temp_path)
-    })();
-    match fs::remove_file(&temp_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ImageError::Io(error)),
-    }
-    result
-}
-
-fn unique_temp_path() -> PathBuf {
-    let ticks = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!("sc16-image-{}-{ticks}.tmp", std::process::id()))
+    Err(ImageError::InvalidFormat(
+        "source must be Rust-supported C, assembly, or flat binary",
+    ))
 }
 
 pub fn read_image(path: &Path) -> Result<ProgramImage, ImageError> {
@@ -252,7 +229,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("sc16-assembly-source-{}.asm", std::process::id()));
         fs::write(&path, "start: LDI R0, 1\nHALT\n").unwrap();
-        let image = build_source(Path::new("."), &path, "python-must-not-be-called").unwrap();
+        let image = build_source(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(image.entry_point, 0);
         assert_eq!(image.segments[0].data, b"\x08\x01\x00\x00");
@@ -266,7 +243,7 @@ mod tests {
             "int main(void) { int answer = 40; return answer + 2; }\n",
         )
         .unwrap();
-        let image = build_source(Path::new("."), &path, "python-must-not-be-called").unwrap();
+        let image = build_source(&path).unwrap();
         fs::remove_file(path).unwrap();
 
         let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
@@ -275,5 +252,14 @@ mod tests {
         cpu.run(32).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn rejects_unsupported_c_without_starting_a_python_compiler() {
+        let path = std::env::temp_dir().join(format!("sc16-unsupported-{}.c", std::process::id()));
+        fs::write(&path, "int main(void) { return calculate_answer(); }").unwrap();
+        let result = build_source(&path);
+        fs::remove_file(path).unwrap();
+        assert!(matches!(result, Err(ImageError::UnsupportedC(_))));
     }
 }

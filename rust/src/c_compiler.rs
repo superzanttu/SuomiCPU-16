@@ -383,7 +383,7 @@ fn emit_native_expression(
             true
         }
         ExpressionKind::Unary { operator, operand } => {
-            if !matches!(operator.as_str(), "+" | "-" | "~")
+            if !matches!(operator.as_str(), "+" | "-" | "~" | "!")
                 || !emit_native_expression(
                     operand,
                     destination,
@@ -401,9 +401,34 @@ fn emit_native_expression(
                     assembly.push_str(&format!("    NOT R{destination}\n    INC R{destination}\n"))
                 }
                 "~" => assembly.push_str(&format!("    NOT R{destination}\n")),
+                "!" => {
+                    let label = *label_counter;
+                    *label_counter += 1;
+                    assembly.push_str(&format!(
+                        "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                         BZX __c_not_{label}_true\n\
+                         LDI R{destination}, 0\n\
+                         JMPX __c_not_{label}_end\n\
+                         __c_not_{label}_true:\n\
+                         LDI R{destination}, 1\n\
+                         __c_not_{label}_end:\n"
+                    ));
+                }
                 _ => unreachable!(),
             }
             true
+        }
+        ExpressionKind::Cast { c_type, expression }
+            if matches!(c_type.trim(), "int" | "signed" | "unsigned") =>
+        {
+            emit_native_expression(
+                expression,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            )
         }
         ExpressionKind::Binary {
             operator,
@@ -411,7 +436,7 @@ fn emit_native_expression(
             right,
         } if matches!(
             operator.as_str(),
-            "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^"
+            "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>"
         ) =>
         {
             let Some((&right_register, remaining_registers)) = temporary_registers.split_first()
@@ -444,6 +469,8 @@ fn emit_native_expression(
                 "&" => "AND",
                 "|" => "OR",
                 "^" => "XOR",
+                "<<" => "SHL",
+                ">>" => "ASR",
                 _ => unreachable!(),
             };
             assembly.push_str(&format!(
@@ -499,6 +526,103 @@ fn emit_native_expression(
             ));
             true
         }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "&&" | "||") => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_expression(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            let (short_branch, truth_branch) = if operator == "&&" {
+                ("BZX", "BNZX")
+            } else {
+                ("BNZX", "BNZX")
+            };
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                 {short_branch} __c_logic_{label}_short\n"
+            ));
+            if !emit_native_expression(
+                right,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                 {truth_branch} __c_logic_{label}_true\n\
+                 __c_logic_{label}_short:\n\
+                 LDI R{destination}, {}\n\
+                 JMPX __c_logic_{label}_end\n\
+                 __c_logic_{label}_true:\n\
+                 LDI R{destination}, {}\n\
+                 __c_logic_{label}_end:\n",
+                if operator == "&&" { 0 } else { 1 },
+                if operator == "&&" { 1 } else { 0 }
+            ));
+            true
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_expression(
+                condition,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                 BZX __c_cond_{label}_false\n"
+            ));
+            if !emit_native_expression(
+                when_true,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_cond_{label}_end\n__c_cond_{label}_false:\n"
+            ));
+            if !emit_native_expression(
+                when_false,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!("__c_cond_{label}_end:\n"));
+            true
+        }
         _ => false,
     }
 }
@@ -531,6 +655,8 @@ fn emit_native_assignment(
         "*=" => Some("MUL"),
         "/=" => Some("DIVS"),
         "%=" => Some("MODS"),
+        "<<=" => Some("SHL"),
+        ">>=" => Some("ASR"),
         "&=" => Some("AND"),
         "|=" => Some("OR"),
         "^=" => Some("XOR"),
@@ -569,7 +695,9 @@ fn emit_native_statement(
 ) -> Option<bool> {
     match &statement.kind {
         StatementKind::Expression(Some(expression)) => {
-            if emit_native_assignment(expression, &[4, 5, 6, 7], locals, label_counter, assembly) {
+            if emit_native_assignment(expression, &[4, 5, 6, 7], locals, label_counter, assembly)
+                || emit_native_update(expression, locals, assembly)
+            {
                 Some(false)
             } else {
                 None
@@ -639,6 +767,20 @@ fn emit_native_statement(
             emit_native_statement(body, locals, label_counter, assembly)?;
             assembly.push_str(&format!(
                 "    JMPX __c_while_{label}_begin\n__c_while_{label}_end:\n"
+            ));
+            Some(false)
+        }
+        StatementKind::DoWhile { body, condition } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            assembly.push_str(&format!("__c_do_{label}_begin:\n"));
+            emit_native_statement(body, locals, label_counter, assembly)?;
+            if !emit_native_expression(condition, 0, &[4, 5, 6, 7], locals, label_counter, assembly)
+            {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BNZX __c_do_{label}_begin\n"
             ));
             Some(false)
         }
@@ -737,12 +879,16 @@ fn emit_native_update(
     locals: &HashMap<String, u8>,
     assembly: &mut String,
 ) -> bool {
-    let ExpressionKind::Postfix {
-        operator,
-        expression,
-    } = &expression.kind
-    else {
-        return false;
+    let (operator, expression) = match &expression.kind {
+        ExpressionKind::Postfix {
+            operator,
+            expression,
+        }
+        | ExpressionKind::Unary {
+            operator,
+            operand: expression,
+        } if matches!(operator.as_str(), "++" | "--") => (operator, expression),
+        _ => return false,
     };
     let ExpressionKind::Atom(name) = &expression.kind else {
         return false;
@@ -2667,5 +2813,59 @@ mod tests {
         cpu.run(512).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 10);
+    }
+
+    #[test]
+    fn compiles_shift_logical_and_conditional_expressions() {
+        for (source, expected) in [
+            ("int main(void) { return (3 << 2) | (16 >> 2); }", 12),
+            ("int main(void) { return !0 + !5; }", 1),
+            ("int main(void) { return 0 && (1 / 0); }", 0),
+            ("int main(void) { return 1 || (1 / 0); }", 1),
+            ("int main(void) { return 0 ? 12 : 7; }", 7),
+            ("int main(void) { return 4 ? 12 : 7; }", 12),
+        ] {
+            let image = compile_minimal_program(source, "expressions.c")
+                .unwrap()
+                .expect("supported expression program");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_do_while_and_increment_statements() {
+        let image = compile_minimal_program(
+            "int main(void) { int count = 0; do { ++count; } while (count < 4); return count; }",
+            "do-while.c",
+        )
+        .unwrap()
+        .expect("supported do/while program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 4);
+    }
+
+    #[test]
+    fn compiles_shift_assignment_and_signed_right_shift() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = -16; value >>= 2; return value; }",
+            "shift.c",
+        )
+        .unwrap()
+        .expect("supported shift assignment program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0] as u16, 0xfffc);
     }
 }

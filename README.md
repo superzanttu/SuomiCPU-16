@@ -44,18 +44,20 @@ memory-loading stages. Use `--quiet` to hide these details.
 
 Run an example directly from the repository root:
 ```console
-cargo run -- examples/factorial.c
+cargo run -- examples/example.asm
 ```
 
 For five analog clock styles, a Nixie-tube display, and a flip clock, run:
 ```console
-cargo run -- examples/anaclock.c
+python tools/c_compiler.py examples/anaclock.c -o anaclock.bin
+cargo run -- anaclock.bin
 ```
 Press Tab to cycle through the seven clock faces.
 
 For a first-person Elite-style space combat demo, run:
 ```console
-cargo run -- examples/elitedemo.c
+python tools/c_compiler.py examples/elitedemo.c -o elitedemo.bin
+cargo run -- elitedemo.bin
 ```
 Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
 Space. The ship accelerates and drifts with inertia; shields regenerate and the
@@ -71,7 +73,7 @@ the passages and can find a path to you after eating enough treats. Its source i
 
 On Windows, the PowerShell launcher can run the same programs:
 ```powershell
-.\run.ps1 .\examples\factorial.c
+.\run.ps1 .\examples\example.asm
 ```
 It changes to the repository directory and starts the Rust emulator through
 Cargo. Make sure Rust and Cargo are available on `PATH`.
@@ -79,10 +81,12 @@ Cargo. Make sure Rust and Cargo are available on `PATH`.
 The emulator accepts assembly (`.asm`), C (`.c`), and flat binary (`.bin`)
 programs. Assembly is built natively by Rust. The Rust C compiler currently
 handles `int main(void)` with up to three initialized local `int` variables,
-assignments, arithmetic/bitwise and signed comparison expressions, `if`/`else`,
-and `while`/`for` loops. Other C programs still use the Python reference compiler in
-[`tools/c_compiler.py`](tools/c_compiler.py) until the Rust compiler port is
-complete. To compile a C file explicitly and run the result with Rust:
+assignments, arithmetic/bitwise/shift/logical and signed comparison
+expressions, conditional expressions, `if`/`else`, and `while`/`for` loops.
+Programs outside this subset are rejected with a Rust compiler diagnostic; the
+emulator no longer invokes Python to build C sources. The Python compiler remains
+in the repository as migration reference code, not as a runtime fallback. To
+compile a C file explicitly with the legacy tool:
 
 ```console
 python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
@@ -104,9 +108,9 @@ cargo build --target wasm32-unknown-unknown
 
 The browser build is not yet a standalone web release: module discovery and
 module file access still rely on the host filesystem. Rust builds `.asm`
-programs with its native assembler and compiles a narrow subset of `.c` files
-directly; unsupported C programs still use the Python compiler as a temporary
-migration dependency.
+programs with its native assembler and compiles the documented subset of `.c`
+files directly. Unsupported C programs are rejected; there is no Python
+runtime fallback.
 
 Run a program with optional persistent data-disk and LAN settings:
 
