@@ -417,6 +417,10 @@ impl Cpu {
         Ok(())
     }
 
+    pub fn available_disks(&self) -> Result<Vec<String>, String> {
+        self.disk.list_disks()
+    }
+
     pub fn mount_data_disk(&mut self, disk_id: &str) -> Result<(), String> {
         if !self.disk.list_disks()?.iter().any(|id| id == disk_id) {
             return Err(format!("virtual data disk {disk_id:?} does not exist"));
@@ -2309,9 +2313,7 @@ impl Cpu {
                 };
                 self.sound_commands[command.channel as usize] = Some(command);
             }
-            GPU_NET_OPEN..=GPU_NET_INFO => {
-                self.gpu_network(command, color, self.gpu_word(2))
-            }
+            GPU_NET_OPEN..=GPU_NET_INFO => self.gpu_network(command, color, self.gpu_word(2)),
             GPU_PALETTE => {
                 let red = self.gpu_word(2) as u8;
                 let green = self.gpu_word(4) as u8;

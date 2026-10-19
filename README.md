@@ -109,6 +109,10 @@ cargo run -- "modules\Netgame Demo\net_game_demo.c" --net-port 47016
 cargo run -- --headless "modules\DiskEditor\disk_editor.c"
 ```
 
+In the Rust BIOS selector, press **D** or **Left/Right** to choose no data disk
+or an existing virtual disk before starting a module. `--disk ID` preselects a
+disk in the BIOS or mounts it when launching a program directly.
+
 Virtual block disks are stored as JSON files in `disks/`. A program's virtual
 file area is read from the `disks/` folder beside its source file. Networking
 uses UDP broadcast on the selected port in native builds; browser builds do

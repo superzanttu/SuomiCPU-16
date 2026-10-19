@@ -421,6 +421,18 @@ mod tests {
     }
 
     #[test]
+    fn disk_listing_is_sorted_and_ignores_invalid_names() {
+        let root = temp_dir("disk-list");
+        fs::write(root.join("zeta0001.json"), b"{}").unwrap();
+        fs::write(root.join("ALPHA001.json"), b"{}").unwrap();
+        fs::write(root.join("invalid.json"), b"{}").unwrap();
+        fs::write(root.join("TOOLONG99.json"), b"{}").unwrap();
+        let disk = DiskDevice::new(root.clone());
+        assert_eq!(disk.list_disks().unwrap(), ["ALPHA001", "zeta0001"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn virtual_files_are_listed_and_read_with_bounds_and_path_checks() {
         let root = temp_dir("files");
         fs::create_dir_all(root.join("nested")).unwrap();

@@ -315,6 +315,8 @@ pub async fn run_with_devices(
         cpu.load_program(&image.segments, image.entry_point)
             .map_err(|error| RuntimeError::Window(error.to_string()))?;
     } else {
+        cpu.configure_disk(root.join("disks"), root.join("disks"))
+            .map_err(RuntimeError::Window)?;
         let modules = discover_modules(&root.join("modules"))?;
         if modules.is_empty() {
             return Err(RuntimeError::Window(
@@ -502,6 +504,17 @@ async fn select_and_boot(
     disk_id: Option<&str>,
 ) -> Result<bool, RuntimeError> {
     let mut selected = 0usize;
+    let disks = cpu.available_disks().map_err(RuntimeError::Window)?;
+    let mut selected_disk = match disk_id {
+        Some(disk_id) => disks
+            .iter()
+            .position(|disk| disk == disk_id)
+            .map(|index| index + 1)
+            .ok_or_else(|| {
+                RuntimeError::Window(format!("virtual data disk {disk_id:?} does not exist"))
+            })?,
+        None => 0,
+    };
     loop {
         pixels.fill(rgb(8, 12, 24));
         draw_text(pixels, 640, 32, 26, "SUOMICPU-16 BIOS", 0xffffd000, font);
@@ -510,12 +523,18 @@ async fn select_and_boot(
             640,
             32,
             58,
-            "SELECT A MODULE  -  UP/DOWN + ENTER",
+            "MODULE: UP/DOWN + ENTER     DATA DISK: D / LEFT / RIGHT",
             0xffb8c7df,
             font,
         );
+        let disk_label = if selected_disk == 0 {
+            "DATA DISK: NONE".to_owned()
+        } else {
+            format!("DATA DISK: {}", disks[selected_disk - 1])
+        };
+        draw_text(pixels, 640, 38, 82, &disk_label, 0xffffd000, font);
         for (index, module) in modules.iter().enumerate() {
-            let y = 94 + index * 24;
+            let y = 110 + index * 24;
             let selected_row = index == selected;
             let color = if selected_row { 0xff101020 } else { 0xff080c18 };
             for row in y..(y + 20).min(470) {
@@ -552,6 +571,10 @@ async fn select_and_boot(
             selected = selected.saturating_sub(1);
         } else if is_key_pressed(KeyCode::Down) {
             selected = (selected + 1).min(modules.len() - 1);
+        } else if is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right) {
+            selected_disk = (selected_disk + 1) % (disks.len() + 1);
+        } else if is_key_pressed(KeyCode::Left) {
+            selected_disk = (selected_disk + disks.len()) % (disks.len() + 1);
         } else if is_key_pressed(KeyCode::Enter) {
             let module = &modules[selected];
             if let Some(error) = &module.error {
@@ -569,8 +592,9 @@ async fn select_and_boot(
                 .as_ref()
                 .expect("valid boot module has a source");
             configure_disk(cpu, root, source)?;
-            if let Some(disk_id) = disk_id {
-                cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
+            if selected_disk != 0 {
+                cpu.mount_data_disk(&disks[selected_disk - 1])
+                    .map_err(RuntimeError::Window)?;
             }
             let image = build_program(root, source)?;
             cpu.load_program(&image.segments, image.entry_point)
