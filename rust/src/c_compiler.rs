@@ -16,6 +16,1045 @@ impl std::fmt::Display for CCompilerError {
 
 impl std::error::Error for CCompilerError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expression {
+    pub kind: ExpressionKind,
+    pub line: usize,
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressionKind {
+    Atom(String),
+    Unary {
+        operator: String,
+        operand: Box<Expression>,
+    },
+    Binary {
+        operator: String,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
+    Assignment {
+        operator: String,
+        target: Box<Expression>,
+        value: Box<Expression>,
+    },
+    Conditional {
+        condition: Box<Expression>,
+        when_true: Box<Expression>,
+        when_false: Box<Expression>,
+    },
+    Call {
+        function: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
+    Index {
+        expression: Box<Expression>,
+        index: Box<Expression>,
+    },
+    Member {
+        expression: Box<Expression>,
+        operator: String,
+        name: String,
+    },
+    Postfix {
+        operator: String,
+        expression: Box<Expression>,
+    },
+    Cast {
+        c_type: String,
+        expression: Box<Expression>,
+    },
+    SizeofType(String),
+    SizeofExpression(Box<Expression>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    pub c_type: String,
+    pub name: String,
+    pub array_length: Option<usize>,
+    pub initializer: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
+    pub kind: StatementKind,
+    pub line: usize,
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementKind {
+    Compound(Vec<Statement>),
+    Declaration(Vec<Declaration>),
+    Expression(Option<Expression>),
+    Return(Option<Expression>),
+    If {
+        condition: Expression,
+        then_branch: Box<Statement>,
+        else_branch: Option<Box<Statement>>,
+    },
+    While {
+        condition: Expression,
+        body: Box<Statement>,
+    },
+    DoWhile {
+        body: Box<Statement>,
+        condition: Expression,
+    },
+    For {
+        initializer: Option<Box<Statement>>,
+        condition: Option<Expression>,
+        update: Option<Expression>,
+        body: Box<Statement>,
+    },
+    Break,
+    Continue,
+    Goto(String),
+    Label {
+        name: String,
+        statement: Box<Statement>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionParameter {
+    pub c_type: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDeclaration {
+    pub return_type: String,
+    pub name: String,
+    pub parameters: Vec<FunctionParameter>,
+    pub variadic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDefinition {
+    pub declaration: FunctionDeclaration,
+    pub body: Statement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalDeclaration {
+    Global(Declaration),
+    FunctionPrototype(FunctionDeclaration),
+    FunctionDefinition(FunctionDefinition),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationUnit {
+    pub declarations: Vec<ExternalDeclaration>,
+}
+
+pub struct ExpressionParser {
+    tokens: Vec<Token>,
+    position: usize,
+}
+
+pub struct StatementParser {
+    expressions: ExpressionParser,
+}
+
+pub struct TranslationUnitParser {
+    statements: StatementParser,
+}
+
+const ASSIGNMENTS: [&str; 11] = [
+    "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+];
+const TYPE_WORDS: [&str; 12] = [
+    "void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "const",
+    "volatile", "_Bool",
+];
+const STORAGE_WORDS: [&str; 6] = [
+    "auto", "extern", "register", "static", "typedef", "restrict",
+];
+
+fn precedence(operator: &str) -> Option<u8> {
+    Some(match operator {
+        "," => 0,
+        "||" => 1,
+        "&&" => 2,
+        "|" => 3,
+        "^" => 4,
+        "&" => 5,
+        "==" | "!=" => 6,
+        "<" | "<=" | ">" | ">=" => 7,
+        "<<" | ">>" => 8,
+        "+" | "-" => 9,
+        "*" | "/" | "%" => 10,
+        _ => return None,
+    })
+}
+
+impl ExpressionParser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        let tokens = if tokens.is_empty() {
+            vec![Token {
+                value: "<eof>".to_owned(),
+                line: 1,
+                filename: None,
+            }]
+        } else {
+            tokens
+        };
+        Self {
+            tokens,
+            position: 0,
+        }
+    }
+
+    pub fn from_source(source: &str, filename: &str) -> Result<Self, CCompilerError> {
+        Ok(Self::new(lex_raw(source, filename)?))
+    }
+
+    pub fn parse(&mut self) -> Result<Expression, CCompilerError> {
+        self.parse_expression(0)
+    }
+
+    pub fn is_at_end(&self) -> bool {
+        self.token().value == "<eof>"
+    }
+
+    fn token(&self) -> &Token {
+        &self.tokens[self.position.min(self.tokens.len() - 1)]
+    }
+
+    fn advance(&mut self) -> Token {
+        let token = self.token().clone();
+        if token.value != "<eof>" {
+            self.position += 1;
+        }
+        token
+    }
+
+    fn accept(&mut self, value: &str) -> Option<Token> {
+        if self.token().value == value {
+            Some(self.advance())
+        } else {
+            None
+        }
+    }
+
+    fn expect(&mut self, value: &str) -> Result<Token, CCompilerError> {
+        self.accept(value)
+            .ok_or_else(|| self.fail(&format!("expected {value:?}, got {:?}", self.token().value)))
+    }
+
+    fn fail(&self, message: &str) -> CCompilerError {
+        let token = self.token();
+        error(
+            token.filename.as_deref().unwrap_or("<source>"),
+            token.line,
+            message,
+        )
+    }
+
+    fn make(&self, token: &Token, kind: ExpressionKind) -> Expression {
+        Expression {
+            kind,
+            line: token.line,
+            filename: token.filename.clone(),
+        }
+    }
+
+    fn parse_expression(&mut self, minimum: u8) -> Result<Expression, CCompilerError> {
+        let mut left = self.parse_unary()?;
+        loop {
+            let operator = self.token().value.as_str();
+            if ASSIGNMENTS.contains(&operator) && minimum <= 1 {
+                let token = self.advance();
+                if !Self::is_lvalue(&left) {
+                    return Err(error(
+                        token.filename.as_deref().unwrap_or("<source>"),
+                        token.line,
+                        "assignment requires a scalar variable",
+                    ));
+                }
+                let value = self.parse_expression(1)?;
+                left = self.make(
+                    &token,
+                    ExpressionKind::Assignment {
+                        operator: token.value.clone(),
+                        target: Box::new(left),
+                        value: Box::new(value),
+                    },
+                );
+                continue;
+            }
+            if operator == "?" && minimum <= 1 {
+                let token = self.advance();
+                let when_true = self.parse_expression(0)?;
+                self.expect(":")?;
+                let when_false = self.parse_expression(1)?;
+                left = self.make(
+                    &token,
+                    ExpressionKind::Conditional {
+                        condition: Box::new(left),
+                        when_true: Box::new(when_true),
+                        when_false: Box::new(when_false),
+                    },
+                );
+                continue;
+            }
+            let Some(operator_precedence) = precedence(operator) else {
+                break;
+            };
+            if operator_precedence < minimum {
+                break;
+            }
+            let token = self.advance();
+            let right = self.parse_expression(operator_precedence + 1)?;
+            left = self.make(
+                &token,
+                ExpressionKind::Binary {
+                    operator: token.value.clone(),
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            );
+        }
+        Ok(left)
+    }
+
+    fn is_lvalue(expression: &Expression) -> bool {
+        match expression.kind {
+            ExpressionKind::Atom(ref name) => {
+                !name.starts_with("<string:")
+                    && name != "<eof>"
+                    && name != "sizeof"
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_alphabetic() || character == '_')
+            }
+            ExpressionKind::Index { .. } | ExpressionKind::Member { .. } => true,
+            ExpressionKind::Unary { ref operator, .. } => operator == "*",
+            _ => false,
+        }
+    }
+
+    fn parse_type_name(&mut self) -> Result<String, CCompilerError> {
+        if matches!(self.token().value.as_str(), "struct" | "union" | "enum") {
+            return Err(self.fail("record and enum types are not supported here yet"));
+        }
+        let mut words = Vec::new();
+        while TYPE_WORDS.contains(&self.token().value.as_str()) {
+            words.push(self.advance().value);
+        }
+        if !words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+            )
+        }) {
+            return Err(self.fail("expected a type name"));
+        }
+        let mut c_type = words.join(" ");
+        let mut pointer_count = 0;
+        while self.accept("*").is_some() {
+            pointer_count += 1;
+            while matches!(
+                self.token().value.as_str(),
+                "const" | "volatile" | "restrict"
+            ) {
+                self.advance();
+            }
+        }
+        for _ in 0..pointer_count {
+            c_type.push('*');
+        }
+        Ok(c_type)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expression, CCompilerError> {
+        let token = self.token().clone();
+        if self.accept("sizeof").is_some() {
+            if self.token().value == "(" && self.starts_type_name_within_parens() {
+                self.advance();
+                let c_type = self.parse_type_name()?;
+                self.expect(")")?;
+                return Ok(self.make(&token, ExpressionKind::SizeofType(c_type)));
+            }
+            let expression = self.parse_unary()?;
+            return Ok(self.make(
+                &token,
+                ExpressionKind::SizeofExpression(Box::new(expression)),
+            ));
+        }
+        if self.token().value == "(" && self.starts_type_name_within_parens() {
+            self.advance();
+            let c_type = self.parse_type_name()?;
+            self.expect(")")?;
+            let expression = self.parse_unary()?;
+            return Ok(self.make(
+                &token,
+                ExpressionKind::Cast {
+                    c_type,
+                    expression: Box::new(expression),
+                },
+            ));
+        }
+        if matches!(
+            token.value.as_str(),
+            "+" | "-" | "!" | "~" | "&" | "*" | "++" | "--"
+        ) {
+            self.advance();
+            let operand = self.parse_unary()?;
+            if matches!(token.value.as_str(), "++" | "--") && !Self::is_lvalue(&operand) {
+                return Err(error(
+                    token.filename.as_deref().unwrap_or("<source>"),
+                    token.line,
+                    "increment requires a modifiable lvalue",
+                ));
+            }
+            return Ok(self.make(
+                &token,
+                ExpressionKind::Unary {
+                    operator: token.value.clone(),
+                    operand: Box::new(operand),
+                },
+            ));
+        }
+
+        let mut expression = self.parse_primary()?;
+        loop {
+            if let Some(open) = self.accept("[") {
+                let index = self.parse_expression(0)?;
+                self.expect("]")?;
+                expression = self.make(
+                    &open,
+                    ExpressionKind::Index {
+                        expression: Box::new(expression),
+                        index: Box::new(index),
+                    },
+                );
+            } else if let Some(open) = self.accept("(") {
+                if !Self::is_callable(&expression)
+                    && !matches!(
+                        expression.kind,
+                        ExpressionKind::Unary { ref operator, .. } if operator == "*"
+                    )
+                {
+                    return Err(error(
+                        open.filename.as_deref().unwrap_or("<source>"),
+                        open.line,
+                        "only direct function calls are supported",
+                    ));
+                }
+                let mut arguments = Vec::new();
+                if self.token().value != ")" {
+                    loop {
+                        arguments.push(self.parse_expression(1)?);
+                        if self.accept(",").is_none() {
+                            break;
+                        }
+                    }
+                }
+                self.expect(")")?;
+                expression = self.make(
+                    &open,
+                    ExpressionKind::Call {
+                        function: Box::new(expression),
+                        arguments,
+                    },
+                );
+            } else if matches!(self.token().value.as_str(), "++" | "--") {
+                let operator = self.advance();
+                if !Self::is_lvalue(&expression) {
+                    return Err(error(
+                        operator.filename.as_deref().unwrap_or("<source>"),
+                        operator.line,
+                        "increment requires a modifiable lvalue",
+                    ));
+                }
+                expression = self.make(
+                    &operator,
+                    ExpressionKind::Postfix {
+                        operator: operator.value.clone(),
+                        expression: Box::new(expression),
+                    },
+                );
+            } else if matches!(self.token().value.as_str(), "." | "->") {
+                let operator = self.advance();
+                let name = self.advance();
+                if !name
+                    .value
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_alphabetic() || character == '_')
+                {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "expected a member name",
+                    ));
+                }
+                expression = self.make(
+                    &operator,
+                    ExpressionKind::Member {
+                        expression: Box::new(expression),
+                        operator: operator.value.clone(),
+                        name: name.value,
+                    },
+                );
+            } else {
+                break;
+            }
+        }
+        Ok(expression)
+    }
+
+    fn starts_type_name_within_parens(&self) -> bool {
+        self.token().value == "("
+            && TYPE_WORDS.contains(
+                &self
+                    .tokens
+                    .get(self.position + 1)
+                    .map_or("", |token| token.value.as_str()),
+            )
+    }
+
+    fn is_callable(expression: &Expression) -> bool {
+        match &expression.kind {
+            ExpressionKind::Atom(name) => name
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_alphabetic() || character == '_'),
+            ExpressionKind::Index { .. } | ExpressionKind::Member { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<Expression, CCompilerError> {
+        let token = self.advance();
+        if token.value == "(" {
+            let expression = self.parse_expression(0)?;
+            self.expect(")")?;
+            return Ok(expression);
+        }
+        let first = token.value.chars().next();
+        let is_identifier =
+            first.is_some_and(|character| character.is_alphabetic() || character == '_');
+        if is_identifier
+            && (TYPE_WORDS.contains(&token.value.as_str())
+                || STORAGE_WORDS.contains(&token.value.as_str()))
+        {
+            return Err(error(
+                token.filename.as_deref().unwrap_or("<source>"),
+                token.line,
+                &format!("{} is not supported", token.value),
+            ));
+        }
+        if token.value == "<eof>" || matches!(token.value.as_str(), ")" | "]" | "}" | ";" | ",") {
+            return Err(error(
+                token.filename.as_deref().unwrap_or("<source>"),
+                token.line,
+                "expected an expression",
+            ));
+        }
+        Ok(self.make(&token, ExpressionKind::Atom(token.value.clone())))
+    }
+}
+
+impl StatementParser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            expressions: ExpressionParser::new(tokens),
+        }
+    }
+
+    pub fn from_source(source: &str, filename: &str) -> Result<Self, CCompilerError> {
+        Ok(Self::new(lex_raw(source, filename)?))
+    }
+
+    pub fn parse(&mut self) -> Result<Statement, CCompilerError> {
+        let statement = self.parse_statement()?;
+        if !self.expressions.is_at_end() {
+            return Err(self.expressions.fail("unexpected token after statement"));
+        }
+        Ok(statement)
+    }
+
+    fn at(&self, value: &str) -> bool {
+        self.expressions.token().value == value
+    }
+
+    fn expect(&mut self, value: &str) -> Result<Token, CCompilerError> {
+        self.expressions.expect(value)
+    }
+
+    fn accept(&mut self, value: &str) -> Option<Token> {
+        self.expressions.accept(value)
+    }
+
+    fn statement(&self, token: &Token, kind: StatementKind) -> Statement {
+        Statement {
+            kind,
+            line: token.line,
+            filename: token.filename.clone(),
+        }
+    }
+
+    fn parse_statement(&mut self) -> Result<Statement, CCompilerError> {
+        let start = self.expressions.token().clone();
+        if let Some(open) = self.accept("{") {
+            let mut statements = Vec::new();
+            while !self.at("}") && !self.expressions.is_at_end() {
+                statements.push(self.parse_statement()?);
+            }
+            if self.expressions.is_at_end() {
+                return Err(error(
+                    open.filename.as_deref().unwrap_or("<source>"),
+                    open.line,
+                    "unterminated compound statement",
+                ));
+            }
+            self.expect("}")?;
+            return Ok(self.statement(&open, StatementKind::Compound(statements)));
+        }
+        if self.starts_declaration() {
+            return self.parse_declaration();
+        }
+        if self.accept(";").is_some() {
+            return Ok(self.statement(&start, StatementKind::Expression(None)));
+        }
+        if self.accept("return").is_some() {
+            let value = if self.at(";") {
+                None
+            } else {
+                Some(self.expressions.parse_expression(0)?)
+            };
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Return(value)));
+        }
+        if self.accept("if").is_some() {
+            self.expect("(")?;
+            let condition = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            let then_branch = Box::new(self.parse_statement()?);
+            let else_branch = if self.accept("else").is_some() {
+                Some(Box::new(self.parse_statement()?))
+            } else {
+                None
+            };
+            return Ok(self.statement(
+                &start,
+                StatementKind::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                },
+            ));
+        }
+        if self.accept("while").is_some() {
+            self.expect("(")?;
+            let condition = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            let body = Box::new(self.parse_statement()?);
+            return Ok(self.statement(&start, StatementKind::While { condition, body }));
+        }
+        if self.accept("do").is_some() {
+            let body = Box::new(self.parse_statement()?);
+            self.expect("while")?;
+            self.expect("(")?;
+            let condition = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::DoWhile { body, condition }));
+        }
+        if self.accept("for").is_some() {
+            self.expect("(")?;
+            let initializer = if self.at(";") {
+                self.expect(";")?;
+                None
+            } else if self.starts_declaration() {
+                Some(Box::new(self.parse_declaration()?))
+            } else {
+                let expression = self.expressions.parse_expression(0)?;
+                self.expect(";")?;
+                Some(Box::new(self.statement(
+                    &start,
+                    StatementKind::Expression(Some(expression)),
+                )))
+            };
+            let condition = if self.at(";") {
+                None
+            } else {
+                Some(self.expressions.parse_expression(0)?)
+            };
+            self.expect(";")?;
+            let update = if self.at(")") {
+                None
+            } else {
+                Some(self.expressions.parse_expression(0)?)
+            };
+            self.expect(")")?;
+            let body = Box::new(self.parse_statement()?);
+            return Ok(self.statement(
+                &start,
+                StatementKind::For {
+                    initializer,
+                    condition,
+                    update,
+                    body,
+                },
+            ));
+        }
+        if self.accept("break").is_some() {
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Break));
+        }
+        if self.accept("continue").is_some() {
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Continue));
+        }
+        if self.accept("goto").is_some() {
+            let name = self.expect_identifier("expected a label name")?;
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Goto(name.value)));
+        }
+        if self.is_identifier() && self.peek_value(1) == ":" {
+            let name = self.expressions.advance();
+            self.expressions.advance();
+            let statement = Box::new(self.parse_statement()?);
+            return Ok(self.statement(
+                &name,
+                StatementKind::Label {
+                    name: name.value.clone(),
+                    statement,
+                },
+            ));
+        }
+        if matches!(
+            self.expressions.token().value.as_str(),
+            "switch" | "case" | "default"
+        ) {
+            return Err(self
+                .expressions
+                .fail("switch statements are not supported yet"));
+        }
+        let expression = self.expressions.parse_expression(0)?;
+        self.expect(";")?;
+        Ok(self.statement(&start, StatementKind::Expression(Some(expression))))
+    }
+
+    fn starts_declaration(&self) -> bool {
+        TYPE_WORDS.contains(&self.expressions.token().value.as_str())
+            || STORAGE_WORDS.contains(&self.expressions.token().value.as_str())
+    }
+
+    fn is_identifier(&self) -> bool {
+        self.expressions
+            .token()
+            .value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_alphabetic() || character == '_')
+            && !TYPE_WORDS.contains(&self.expressions.token().value.as_str())
+            && !STORAGE_WORDS.contains(&self.expressions.token().value.as_str())
+    }
+
+    fn peek_value(&self, distance: usize) -> &str {
+        self.expressions
+            .tokens
+            .get(self.expressions.position + distance)
+            .map_or("<eof>", |token| token.value.as_str())
+    }
+
+    fn expect_identifier(&mut self, message: &str) -> Result<Token, CCompilerError> {
+        if self.is_identifier() {
+            Ok(self.expressions.advance())
+        } else {
+            Err(self.expressions.fail(message))
+        }
+    }
+
+    fn parse_declaration(&mut self) -> Result<Statement, CCompilerError> {
+        let start = self.expressions.token().clone();
+        while matches!(
+            self.expressions.token().value.as_str(),
+            "static" | "extern" | "register" | "auto" | "const" | "volatile" | "restrict"
+        ) {
+            self.expressions.advance();
+        }
+        let mut type_words = Vec::new();
+        while TYPE_WORDS.contains(&self.expressions.token().value.as_str()) {
+            type_words.push(self.expressions.advance().value);
+        }
+        if !type_words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+            )
+        }) {
+            return Err(self.expressions.fail("expected a declaration type"));
+        }
+        let base_type = type_words.join(" ");
+        let mut declarations = Vec::new();
+        loop {
+            let mut c_type = base_type.clone();
+            while self.accept("*").is_some() {
+                c_type.push('*');
+                while matches!(
+                    self.expressions.token().value.as_str(),
+                    "const" | "volatile" | "restrict"
+                ) {
+                    self.expressions.advance();
+                }
+            }
+            let name = self.expect_identifier("expected a variable name")?;
+            let array_length = if self.accept("[").is_some() {
+                let length_token = self.expressions.advance();
+                let length = length_token.value.parse::<usize>().map_err(|_| {
+                    error(
+                        length_token.filename.as_deref().unwrap_or("<source>"),
+                        length_token.line,
+                        "array length must be a non-negative integer constant",
+                    )
+                })?;
+                self.expect("]")?;
+                Some(length)
+            } else {
+                None
+            };
+            let initializer = if self.accept("=").is_some() {
+                if array_length.is_some() && self.at("{") {
+                    return Err(self
+                        .expressions
+                        .fail("array initializer lists are not supported yet"));
+                }
+                Some(self.expressions.parse_expression(1)?)
+            } else {
+                None
+            };
+            declarations.push(Declaration {
+                c_type,
+                name: name.value,
+                array_length,
+                initializer,
+            });
+            if self.accept(",").is_none() {
+                break;
+            }
+        }
+        self.expect(";")?;
+        Ok(self.statement(&start, StatementKind::Declaration(declarations)))
+    }
+}
+
+impl TranslationUnitParser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            statements: StatementParser::new(tokens),
+        }
+    }
+
+    pub fn from_source(source: &str, filename: &str) -> Result<Self, CCompilerError> {
+        Ok(Self::new(lex_raw(source, filename)?))
+    }
+
+    pub fn parse(&mut self) -> Result<TranslationUnit, CCompilerError> {
+        let mut declarations = Vec::new();
+        while !self.statements.expressions.is_at_end() {
+            declarations.extend(self.parse_external_declaration()?);
+        }
+        Ok(TranslationUnit { declarations })
+    }
+
+    fn parse_external_declaration(&mut self) -> Result<Vec<ExternalDeclaration>, CCompilerError> {
+        let token = self.statements.expressions.token().clone();
+        let (base_type, storage_class) = self.parse_base_type()?;
+        if self.statements.accept(";").is_some() {
+            return Ok(Vec::new());
+        }
+        let (declarator_type, name) = self.parse_declarator(&base_type)?;
+        if self.statements.accept("(").is_some() {
+            let (parameters, variadic) = self.parse_parameters()?;
+            let declaration = FunctionDeclaration {
+                return_type: declarator_type,
+                name: name.value,
+                parameters,
+                variadic,
+            };
+            if self.statements.accept(";").is_some() {
+                return Ok(vec![ExternalDeclaration::FunctionPrototype(declaration)]);
+            }
+            if storage_class.as_deref() == Some("typedef") {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("a function definition cannot use typedef storage class"));
+            }
+            let body = self.statements.parse_statement()?;
+            if !matches!(body.kind, StatementKind::Compound(_)) {
+                return Err(error(
+                    token.filename.as_deref().unwrap_or("<source>"),
+                    token.line,
+                    "expected a function body",
+                ));
+            }
+            return Ok(vec![ExternalDeclaration::FunctionDefinition(
+                FunctionDefinition { declaration, body },
+            )]);
+        }
+
+        let mut globals = Vec::new();
+        let mut next = Some((declarator_type, name));
+        while let Some((declarator_type, name)) = next.take() {
+            let array_length = self.parse_array_suffix()?;
+            let initializer = if self.statements.accept("=").is_some() {
+                if array_length.is_some() && self.statements.at("{") {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("array initializer lists are not supported yet"));
+                }
+                Some(self.statements.expressions.parse_expression(1)?)
+            } else {
+                None
+            };
+            globals.push(ExternalDeclaration::Global(Declaration {
+                c_type: declarator_type.clone(),
+                name: name.value.clone(),
+                array_length,
+                initializer,
+            }));
+            next = if self.statements.accept(",").is_some() {
+                Some(self.parse_declarator(&base_type)?)
+            } else {
+                None
+            };
+        }
+        self.statements.expect(";")?;
+        Ok(globals)
+    }
+
+    fn parse_base_type(&mut self) -> Result<(String, Option<String>), CCompilerError> {
+        let mut storage_class = None;
+        let mut qualifiers = Vec::new();
+        while matches!(
+            self.statements.expressions.token().value.as_str(),
+            "static" | "extern" | "register" | "auto" | "typedef" | "const" | "volatile"
+        ) {
+            let value = self.statements.expressions.advance().value;
+            if matches!(value.as_str(), "const" | "volatile") {
+                qualifiers.push(value);
+            } else if storage_class.replace(value).is_some() {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("multiple storage-class specifiers in declaration"));
+            }
+        }
+        let mut words = Vec::new();
+        while TYPE_WORDS.contains(&self.statements.expressions.token().value.as_str()) {
+            words.push(self.statements.expressions.advance().value);
+        }
+        if !words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+            )
+        }) {
+            return Err(self
+                .statements
+                .expressions
+                .fail("expected a supported declaration type"));
+        }
+        let mut c_type = words.join(" ");
+        if !qualifiers.is_empty() {
+            c_type = format!("{} {c_type}", qualifiers.join(" "));
+        }
+        Ok((c_type, storage_class))
+    }
+
+    fn parse_declarator(&mut self, base_type: &str) -> Result<(String, Token), CCompilerError> {
+        let mut c_type = base_type.to_owned();
+        while self.statements.accept("*").is_some() {
+            c_type.push('*');
+            while matches!(
+                self.statements.expressions.token().value.as_str(),
+                "const" | "volatile"
+            ) {
+                self.statements.expressions.advance();
+            }
+        }
+        let name = self
+            .statements
+            .expect_identifier("expected an external identifier")?;
+        Ok((c_type, name))
+    }
+
+    fn parse_array_suffix(&mut self) -> Result<Option<usize>, CCompilerError> {
+        if self.statements.accept("[").is_none() {
+            return Ok(None);
+        }
+        let token = self.statements.expressions.advance();
+        let digits = token
+            .value
+            .strip_prefix("0x")
+            .or_else(|| token.value.strip_prefix("0X"))
+            .map(|value| usize::from_str_radix(value, 16))
+            .unwrap_or_else(|| token.value.parse::<usize>());
+        let length = digits.map_err(|_| {
+            error(
+                token.filename.as_deref().unwrap_or("<source>"),
+                token.line,
+                "array length must be an integer constant",
+            )
+        })?;
+        self.statements.expect("]")?;
+        Ok(Some(length))
+    }
+
+    fn parse_parameters(&mut self) -> Result<(Vec<FunctionParameter>, bool), CCompilerError> {
+        let mut parameters = Vec::new();
+        let mut variadic = false;
+        if self.statements.accept(")").is_some() {
+            return Ok((parameters, variadic));
+        }
+        if self.statements.at("void") && self.statements.peek_value(1) == ")" {
+            self.statements.expressions.advance();
+            self.statements.expect(")")?;
+            return Ok((parameters, variadic));
+        }
+        loop {
+            if self.statements.at(".") && self.statements.peek_value(1) == "." {
+                self.statements.expressions.advance();
+                self.statements.expressions.advance();
+                self.statements.expect(".")?;
+                variadic = true;
+                break;
+            }
+            let (base_type, storage) = self.parse_base_type()?;
+            if storage.is_some() {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("storage class is not valid for a function parameter"));
+            }
+            let (c_type, name) = if self.statements.at(",") || self.statements.at(")") {
+                (base_type, None)
+            } else {
+                let (c_type, name) = self.parse_declarator(&base_type)?;
+                (c_type, Some(name.value))
+            };
+            parameters.push(FunctionParameter { c_type, name });
+            if self.statements.accept(",").is_none() {
+                break;
+            }
+        }
+        self.statements.expect(")")?;
+        Ok((parameters, variadic))
+    }
+}
+
 const MULTI_OPERATORS: [&str; 22] = [
     "<<=", ">>=", "++", "--", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=",
     "&=", "|=", "^=", "<<", ">>", "##", "->",
@@ -471,6 +1510,343 @@ mod tests {
         assert_eq!(
             lex_raw("int x;\n@", "sample.c").unwrap_err().to_string(),
             "sample.c:2: unsupported character '@'"
+        );
+    }
+
+    fn expression(source: &str) -> Expression {
+        let mut parser = ExpressionParser::from_source(source, "expression.c").unwrap();
+        let expression = parser.parse().unwrap();
+        assert!(parser.is_at_end(), "unparsed token: {:?}", parser.token());
+        expression
+    }
+
+    fn atom(name: &str, line: usize) -> Expression {
+        located_atom(name, line, "expression.c")
+    }
+
+    fn located_atom(name: &str, line: usize, filename: &str) -> Expression {
+        Expression {
+            kind: ExpressionKind::Atom(name.to_owned()),
+            line,
+            filename: Some(filename.to_owned()),
+        }
+    }
+
+    #[test]
+    fn parses_binary_precedence_and_left_associativity() {
+        assert_eq!(
+            expression("a + b * c - d"),
+            Expression {
+                kind: ExpressionKind::Binary {
+                    operator: "-".to_owned(),
+                    left: Box::new(Expression {
+                        kind: ExpressionKind::Binary {
+                            operator: "+".to_owned(),
+                            left: Box::new(atom("a", 1)),
+                            right: Box::new(Expression {
+                                kind: ExpressionKind::Binary {
+                                    operator: "*".to_owned(),
+                                    left: Box::new(atom("b", 1)),
+                                    right: Box::new(atom("c", 1)),
+                                },
+                                line: 1,
+                                filename: Some("expression.c".to_owned()),
+                            }),
+                        },
+                        line: 1,
+                        filename: Some("expression.c".to_owned()),
+                    }),
+                    right: Box::new(atom("d", 1)),
+                },
+                line: 1,
+                filename: Some("expression.c".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_right_associative_assignment_and_conditional_expressions() {
+        let assignment = expression("a = b += c");
+        assert!(matches!(
+            assignment.kind,
+            ExpressionKind::Assignment {
+                operator,
+                value,
+                ..
+            } if operator == "=" && matches!(
+                value.kind,
+                ExpressionKind::Assignment { ref operator, .. } if operator == "+="
+            )
+        ));
+        let conditional = expression("a ? b : c ? d : e");
+        assert!(matches!(
+            conditional.kind,
+            ExpressionKind::Conditional { when_false, .. }
+                if matches!(when_false.kind, ExpressionKind::Conditional { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_calls_indexes_members_and_postfix_operators() {
+        let parsed = expression("object->items[index + 1]++");
+        assert!(matches!(
+            parsed.kind,
+            ExpressionKind::Postfix {
+                operator,
+                expression,
+            } if operator == "++" && matches!(
+                expression.kind,
+                ExpressionKind::Index { ref expression, .. }
+                    if matches!(expression.kind, ExpressionKind::Member { ref operator, .. } if operator == "->")
+            )
+        ));
+        let call = expression("f(a, g(b + 1))");
+        assert!(matches!(
+            call.kind,
+            ExpressionKind::Call { arguments, .. } if arguments.len() == 2
+        ));
+    }
+
+    #[test]
+    fn parses_simple_casts_and_sizeof_type_names() {
+        assert!(matches!(
+            expression("(unsigned long *)pointer").kind,
+            ExpressionKind::Cast { c_type, .. } if c_type == "unsigned long*"
+        ));
+        assert!(matches!(
+            expression("sizeof(unsigned char*)").kind,
+            ExpressionKind::SizeofType(c_type) if c_type == "unsigned char*"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_assignment_targets_and_indirect_calls() {
+        assert_eq!(
+            ExpressionParser::from_source("1 = value", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: assignment requires a scalar variable"
+        );
+        assert_eq!(
+            ExpressionParser::from_source("(a + b)(c)", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: only direct function calls are supported"
+        );
+    }
+
+    fn statement(source: &str) -> Statement {
+        StatementParser::from_source(source, "statement.c")
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn parses_compound_block_with_local_declarations_and_returns() {
+        assert_eq!(
+            statement("{ unsigned int count = 3, *pointer; return count; }"),
+            Statement {
+                kind: StatementKind::Compound(vec![
+                    Statement {
+                        kind: StatementKind::Declaration(vec![
+                            Declaration {
+                                c_type: "unsigned int".to_owned(),
+                                name: "count".to_owned(),
+                                array_length: None,
+                                initializer: Some(located_atom("3", 1, "statement.c")),
+                            },
+                            Declaration {
+                                c_type: "unsigned int*".to_owned(),
+                                name: "pointer".to_owned(),
+                                array_length: None,
+                                initializer: None,
+                            },
+                        ]),
+                        line: 1,
+                        filename: Some("statement.c".to_owned()),
+                    },
+                    Statement {
+                        kind: StatementKind::Return(Some(located_atom("count", 1, "statement.c",))),
+                        line: 1,
+                        filename: Some("statement.c".to_owned()),
+                    },
+                ]),
+                line: 1,
+                filename: Some("statement.c".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_if_else_and_nested_loop_control() {
+        let parsed = statement("if (ready) { while (active) { break; } } else { continue; }");
+        assert!(matches!(
+            parsed.kind,
+            StatementKind::If {
+                then_branch,
+                else_branch: Some(_),
+                ..
+            } if matches!(
+                then_branch.kind,
+                StatementKind::Compound(ref statements)
+                    if matches!(
+                        statements[0].kind,
+                        StatementKind::While { ref body, .. }
+                            if matches!(
+                                body.kind,
+                                StatementKind::Compound(ref nested)
+                                    if matches!(nested[0].kind, StatementKind::Break)
+                            )
+                    )
+            )
+        ));
+    }
+
+    #[test]
+    fn parses_for_declaration_do_while_and_labels() {
+        let parsed = statement("for (int i = 0; i < 4; i++) { work(i); }");
+        assert!(matches!(
+            parsed.kind,
+            StatementKind::For {
+                initializer: Some(initializer),
+                condition: Some(_),
+                update: Some(_),
+                body,
+            } if matches!(initializer.kind, StatementKind::Declaration(_))
+                && matches!(body.kind, StatementKind::Compound(_))
+        ));
+
+        assert!(matches!(
+            statement("again: do { tick(); } while (pending);").kind,
+            StatementKind::Label { name, statement }
+                if name == "again" && matches!(statement.kind, StatementKind::DoWhile { .. })
+        ));
+    }
+
+    #[test]
+    fn reports_malformed_control_statements_and_unterminated_blocks() {
+        assert_eq!(
+            StatementParser::from_source("if ready return 1;", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: expected \"(\", got \"ready\""
+        );
+        assert_eq!(
+            StatementParser::from_source("{ return 0;", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: unterminated compound statement"
+        );
+    }
+
+    fn translation_unit(source: &str) -> TranslationUnit {
+        TranslationUnitParser::from_source(source, "unit.c")
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn parses_global_declarations_and_function_prototypes() {
+        assert_eq!(
+            translation_unit("unsigned int counter = 3; char *message; int sum(int, int);"),
+            TranslationUnit {
+                declarations: vec![
+                    ExternalDeclaration::Global(Declaration {
+                        c_type: "unsigned int".to_owned(),
+                        name: "counter".to_owned(),
+                        array_length: None,
+                        initializer: Some(located_atom("3", 1, "unit.c")),
+                    }),
+                    ExternalDeclaration::Global(Declaration {
+                        c_type: "char*".to_owned(),
+                        name: "message".to_owned(),
+                        array_length: None,
+                        initializer: None,
+                    }),
+                    ExternalDeclaration::FunctionPrototype(FunctionDeclaration {
+                        return_type: "int".to_owned(),
+                        name: "sum".to_owned(),
+                        parameters: vec![
+                            FunctionParameter {
+                                c_type: "int".to_owned(),
+                                name: None,
+                            },
+                            FunctionParameter {
+                                c_type: "int".to_owned(),
+                                name: None,
+                            },
+                        ],
+                        variadic: false,
+                    }),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_function_definitions_and_variadic_signatures() {
+        let unit = translation_unit(
+            "int log_value(const char *format, ...); \
+             int add(int left, int right) { return left + right; }",
+        );
+        assert!(matches!(
+            &unit.declarations[0],
+            ExternalDeclaration::FunctionPrototype(function)
+                if function.name == "log_value"
+                    && function.variadic
+                    && function.parameters.len() == 1
+                    && function.parameters[0].c_type == "const char*"
+                    && function.parameters[0].name.as_deref() == Some("format")
+        ));
+        assert!(matches!(
+            &unit.declarations[1],
+            ExternalDeclaration::FunctionDefinition(definition)
+                if definition.declaration.name == "add"
+                    && definition.declaration.parameters.len() == 2
+                    && matches!(definition.body.kind, StatementKind::Compound(_))
+        ));
+    }
+
+    #[test]
+    fn parses_multiple_external_declarators_and_arrays() {
+        let unit = translation_unit(
+            "static int first, second[12]; long *pointer, value; int main(void) { return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[..3],
+            [
+                ExternalDeclaration::Global(Declaration { name: first, .. }),
+                ExternalDeclaration::Global(Declaration { name: second, array_length: Some(12), .. }),
+                ExternalDeclaration::Global(Declaration { name: pointer, c_type, .. }),
+            ] if first == "first" && second == "second" && pointer == "pointer" && c_type == "long*"
+        ));
+        assert!(matches!(
+            unit.declarations.last(),
+            Some(ExternalDeclaration::FunctionDefinition(definition))
+                if definition.declaration.name == "main"
+        ));
+    }
+
+    #[test]
+    fn reports_unsupported_function_pointer_declarators_without_accepting_them() {
+        let error = TranslationUnitParser::from_source("int (*callback)(int);", "bad.c")
+            .unwrap()
+            .parse()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("bad.c:1: expected an external identifier")
         );
     }
 }

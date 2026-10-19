@@ -45,6 +45,37 @@ an ABI choice as delivered.
 - Repository regression tests do not substitute for an independent C90
   conformance suite.
 
+## Rust compiler migration status
+
+The C compiler is being ported from Python to Rust separately from the C90
+conformance roadmap. Passing the Rust build or parser tests does not establish
+feature parity or C90 conformance.
+
+- [x] Source-located tokenization and literal/operator recognition in
+  `rust/src/c_compiler.rs`.
+- [x] Expression parser for operators, assignments, conditional expressions,
+  calls, indexing, member access, casts, and `sizeof`.
+- [x] Statement parser for basic declarations, compound blocks, control flow,
+  and labels.
+- [x] Basic translation-unit parsing for scalar globals, arrays, function
+  prototypes, variadic prototypes, and function definitions.
+- [ ] Full C90 declarators, typedefs, records, enums, linkage, and initializer
+  semantics at translation-unit scope.
+- [ ] C90 preprocessor and include/header compatibility.
+- [ ] Type checking, diagnostics, and target ABI semantics.
+- [ ] SC-16 assembly generation, runtime library linking, and image output.
+- [ ] Migrate the 158 Python C compiler regression tests and add executable
+  Rust compiler integration tests.
+- [ ] Route Rust `.c` builds through the Rust compiler after parity gates pass.
+- [ ] Remove Python C compiler dependencies only after all required build,
+  runtime, test, and tooling paths are migrated.
+
+The Python C compiler remains the reference implementation and Rust `.c`
+builds still use Python. Rust parser tests have executed once (17 passed, with two fixture filename
+expectations corrected); subsequent test launches have intermittently been
+blocked by Windows Application Control (OS error 4551). Record runtime test
+results only when tests have actually executed.
+
 ## A — SuomiCPU-16 platform required
 
 These tasks define and verify the target-specific representations and
