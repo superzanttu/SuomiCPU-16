@@ -222,7 +222,7 @@ class BIOSBootTests(unittest.TestCase):
     def test_start_without_program_runs_bios_selected_image(self):
         image = AssemblyImage((MemorySegment(0, b"\x00\x01"),), 0)
         selection = bios.BIOSSelection(Path("modules/sample.c"), image, "DATA0001")
-        with patch("sys.argv", ["main.py"]):
+        with patch("sys.argv", ["suomicpu16"]):
             with patch("src.SuomiCPU.SuomiCompute16") as cpu_class:
                 cpu = cpu_class.return_value
                 with patch("src.SuomiCPU.ConsoleWindow"):
@@ -241,7 +241,7 @@ class BIOSBootTests(unittest.TestCase):
     def test_reset_after_program_returns_to_bios_without_relaunching_program(self):
         image = object()
         selection = bios.BIOSSelection(Path("modules/sample.c"), image, None)
-        with patch("sys.argv", ["main.py"]):
+        with patch("sys.argv", ["suomicpu16"]):
             with patch("src.SuomiCPU.SuomiCompute16") as cpu_class:
                 cpu = cpu_class.return_value
                 cpu.run.side_effect = lambda: setattr(cpu, "bios_reset_requested", True)

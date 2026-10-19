@@ -54,6 +54,8 @@ language features, and do not mistake migration completion for C90 conformance.
 Passing the Rust build or parser tests does not establish feature parity.
 
 - [x] Make Rust the default Windows launcher and README quick-start runtime.
+- [x] Remove the obsolete Python `main.py` wrapper and unused
+  `src/SuomiCPU_backup.py`; migrated examples/tests no longer refer to them.
 - [x] Remove the eager Python image-builder requirement from Rust emulator
   startup; BIOS and native `.asm`/`.bin` launches no longer require it.
 - [x] Source-located tokenization and literal/operator recognition in

@@ -18,7 +18,7 @@
 // ################
 //
 // Up to 8 players on the local network (start the emulator once per player):
-//     python main.py examples/spacecave.c
+//     cargo run -- examples/spacecave.c
 //
 // Controls: Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard.
 // Menu: type a nickname (A-Z, 0-9, space), Left/Right picks the mode, Enter joins, Tab shows the controls.
