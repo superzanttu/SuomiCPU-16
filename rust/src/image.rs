@@ -21,7 +21,7 @@ impl std::fmt::Display for ImageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
-            Self::BuildFailed => write!(formatter, "Python SC-16 build tool failed"),
+            Self::BuildFailed => write!(formatter, "Python SC-16 C compiler failed"),
             Self::Assembly(error) => write!(formatter, "SC-16 assembly failed: {error}"),
             Self::InvalidFormat(reason) => write!(formatter, "invalid SC-16 image: {reason}"),
             Self::Cpu(error) => write!(formatter, "{error}"),

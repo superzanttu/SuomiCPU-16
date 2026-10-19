@@ -99,8 +99,9 @@ cargo build --target wasm32-unknown-unknown
 ```
 
 The browser build is not yet a standalone web release: module discovery and
-source compilation still rely on the host filesystem and the Python assembler
-and C compiler.
+module file access still rely on the host filesystem. Rust builds `.asm`
+programs with the native Rust assembler; `.c` compilation still uses the
+Python C compiler.
 
 Run a program with optional persistent data-disk and LAN settings:
 

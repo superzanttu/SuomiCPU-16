@@ -178,22 +178,11 @@ fn parse_strings(mut text: &str, line: usize) -> Result<Vec<u8>, AssemblyError> 
                 break;
             }
             if character == '\\' {
-                let escaped = text
-                    .chars()
-                    .next()
-                    .ok_or_else(|| error(line, "unterminated string in .data"))?;
-                text = &text[escaped.len_utf8()..];
-                value.push(match escaped {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    '\\' => '\\',
-                    '\'' => '\'',
-                    '"' => '"',
-                    other => {
-                        return Err(error(line, format!("unsupported string escape \\{other}")));
-                    }
-                });
+                let (escaped, rest) = parse_escape(text, line)?;
+                text = rest;
+                if let Some(escaped) = escaped {
+                    value.push(escaped);
+                }
             } else {
                 value.push(character);
             }
@@ -203,8 +192,11 @@ fn parse_strings(mut text: &str, line: usize) -> Result<Vec<u8>, AssemblyError> 
         }
         found = true;
         result.extend_from_slice(value.as_bytes());
-        let rest = text.trim_start();
-        if !rest.is_empty() && !rest.starts_with(',') && !rest.starts_with(['\'', '"']) {
+        if text
+            .chars()
+            .next()
+            .is_some_and(|character| !character.is_whitespace() && character != ',')
+        {
             return Err(error(line, "expected a separator between strings"));
         }
     }
@@ -213,6 +205,73 @@ fn parse_strings(mut text: &str, line: usize) -> Result<Vec<u8>, AssemblyError> 
     } else {
         Err(error(line, ".data string requires at least one string"))
     }
+}
+
+fn parse_escape(text: &str, line: usize) -> Result<(Option<char>, &str), AssemblyError> {
+    let Some(escape) = text.chars().next() else {
+        return Err(error(line, "unterminated string in .data"));
+    };
+    let remainder = &text[escape.len_utf8()..];
+    let simple = match escape {
+        'a' => Some('\u{7}'),
+        'b' => Some('\u{8}'),
+        'f' => Some('\u{c}'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\u{b}'),
+        '\\' => Some('\\'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        '\n' => return Ok((None, remainder)),
+        _ => None,
+    };
+    if let Some(character) = simple {
+        return Ok((Some(character), remainder));
+    }
+    if escape == 'x' || escape == 'u' || escape == 'U' {
+        let digits_count = match escape {
+            'x' => 2,
+            'u' => 4,
+            _ => 8,
+        };
+        if remainder.len() < digits_count || !remainder.is_char_boundary(digits_count) {
+            return Err(error(
+                line,
+                format!("invalid \\{escape} escape in .data string"),
+            ));
+        }
+        let digits = &remainder[..digits_count];
+        let value = u32::from_str_radix(digits, 16)
+            .map_err(|_| error(line, format!("invalid \\{escape} escape in .data string")))?;
+        let character = char::from_u32(value)
+            .ok_or_else(|| error(line, "invalid Unicode code point in .data string"))?;
+        return Ok((Some(character), &remainder[digits_count..]));
+    }
+    if ('0'..='7').contains(&escape) {
+        let mut digits = String::from(escape);
+        let mut rest = remainder;
+        while digits.len() < 3 {
+            let Some(next) = rest.chars().next() else {
+                break;
+            };
+            if !('0'..='7').contains(&next) {
+                break;
+            }
+            digits.push(next);
+            rest = &rest[next.len_utf8()..];
+        }
+        let value = u32::from_str_radix(&digits, 8)
+            .map_err(|_| error(line, "invalid octal escape in .data string"))?;
+        return Ok((
+            Some(
+                char::from_u32(value)
+                    .ok_or_else(|| error(line, "invalid Unicode code point in .data string"))?,
+            ),
+            rest,
+        ));
+    }
+    Ok((Some('\\'), text))
 }
 
 fn label_delimiter(text: &str) -> Option<usize> {
@@ -687,12 +746,12 @@ fn extended_instruction(
         "SBC" => Some(6),
         "NEG" => Some(7),
         "TEST" => Some(8),
-        "ADD" | "ADD!" => Some(9),
-        "SUB" | "SUB!" => Some(10),
-        "AND" | "AND!" => Some(11),
-        "OR" | "OR!" => Some(12),
-        "XOR" | "XOR!" => Some(13),
-        "CMP" | "CMP!" => Some(14),
+        "ADD" => Some(9),
+        "SUB" => Some(10),
+        "AND" => Some(11),
+        "OR" => Some(12),
+        "XOR" => Some(13),
+        "CMP" => Some(14),
         _ => None,
     };
     if let Some(operation) = alu_operation
@@ -1019,6 +1078,7 @@ fn instruction_size(text: &str, line: usize) -> Result<u32, AssemblyError> {
             }
         }
         "LDP" | "STP" | "SPLIT30" | "JOIN30" => 4,
+        "SHR" if operands.len() == 2 => 4,
         "SHL" | "LSR" | "ASR" | "ROL" | "ROR" | "ADC" | "SBC" | "NEG" | "TEST" => {
             if matches!(mnemonic.as_str(), "ADC" | "SBC" | "TEST")
                 && operands.get(1).is_some_and(|operand| !is_register(operand))
@@ -1052,7 +1112,7 @@ fn instruction_size(text: &str, line: usize) -> Result<u32, AssemblyError> {
     Ok(size)
 }
 
-pub fn assemble(source: &str, origin: u32) -> Result<ProgramImage, AssemblyError> {
+fn assemble_expanded(source: &str, origin: u32) -> Result<ProgramImage, AssemblyError> {
     if origin >= MEMORY_SIZE {
         return Err(AssemblyError(format!(
             "invalid assembly origin {origin:#x}"
@@ -1193,6 +1253,28 @@ pub fn assemble(source: &str, origin: u32) -> Result<ProgramImage, AssemblyError
     })
 }
 
+pub fn assemble_with_base_directory(
+    source: &str,
+    origin: u32,
+    base_directory: &Path,
+) -> Result<ProgramImage, AssemblyError> {
+    if origin >= MEMORY_SIZE {
+        return Err(AssemblyError(format!(
+            "invalid assembly origin {origin:#x}"
+        )));
+    }
+    let mut include_stack = Vec::new();
+    let expanded = expand_includes(source, base_directory, &mut include_stack)?;
+    assemble_expanded(&expanded, origin)
+}
+
+pub fn assemble(source: &str, origin: u32) -> Result<ProgramImage, AssemblyError> {
+    let directory = std::env::current_dir().map_err(|io_error| {
+        AssemblyError(format!("cannot resolve current directory: {io_error}"))
+    })?;
+    assemble_with_base_directory(source, origin, &directory)
+}
+
 pub fn assemble_file(path: &Path, origin: u32) -> Result<ProgramImage, AssemblyError> {
     let canonical_path = path
         .canonicalize()
@@ -1213,7 +1295,7 @@ pub fn assemble_file(path: &Path, origin: u32) -> Result<ProgramImage, AssemblyE
     .map_err(|assembly_error| {
         AssemblyError(format!("{}: {assembly_error}", canonical_path.display()))
     })?;
-    assemble(&expanded, origin).map_err(|assembly_error| {
+    assemble_expanded(&expanded, origin).map_err(|assembly_error| {
         AssemblyError(format!("{}: {assembly_error}", canonical_path.display()))
     })
 }
@@ -1227,6 +1309,12 @@ mod tests {
         let image = assemble("JMP finish\nLDI R1, 315\nfinish: HALT\n", 0).unwrap();
         assert_eq!(image.entry_point, 0);
         assert_eq!(image.segments[0].data, b"\x58\x06\x09\x3b\x81\x01\x00\x00");
+    }
+
+    #[test]
+    fn sizes_two_operand_shr_as_an_extended_shift_before_resolving_labels() {
+        let image = assemble("SHR R0, 3\nnext: JMP next\n", 0).unwrap();
+        assert_eq!(image.segments[0].data, b"\xf8\x1f\x18\x03\x58\x04");
     }
 
     #[test]
@@ -1258,6 +1346,13 @@ mod tests {
         assert_eq!(
             assemble(".data string \"ä\"", 0).unwrap().segments[0].data,
             "ä".as_bytes()
+        );
+        assert_eq!(
+            assemble(".data string \"\\x41\\101\\u00e4\\U0001F642\"", 0)
+                .unwrap()
+                .segments[0]
+                .data,
+            "AAä🙂".as_bytes()
         );
         assert_eq!(
             assemble(".data string \"key:value\"; ignored", 0)
@@ -1294,6 +1389,9 @@ mod tests {
         );
         assert!(assemble("LDI R0, missing", 0).is_err());
         assert!(assemble("NOP R0", 0).is_err());
+        assert!(assemble(".data string \"\\x\"", 0).is_err());
+        assert!(assemble(".data string \"a\"\"b\"", 0).is_err());
+        assert!(assemble(".data string \"a\"b", 0).is_err());
         assert!(assemble("HALT", MEMORY_SIZE).is_err());
     }
 
@@ -1308,6 +1406,57 @@ mod tests {
                 .map(|segment| segment.data.len())
                 .sum::<usize>(),
             632
+        );
+    }
+
+    #[test]
+    fn assembles_the_directive_example_into_five_sparse_segments() {
+        let image = assemble(include_str!("../../examples/directives.asm"), 0).unwrap();
+        assert_eq!(image.entry_point, 0x100);
+        assert_eq!(
+            image
+                .segments
+                .iter()
+                .map(|segment| (segment.address, segment.data.len()))
+                .collect::<Vec<_>>(),
+            [(0x100, 8), (0x200, 3), (0x210, 2), (0x220, 2), (0x230, 13)]
+        );
+        assert_eq!(
+            image
+                .segments
+                .iter()
+                .map(|segment| (segment.address, segment.data.as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                (0x100, &b"\x08\x20\x59\x06\x00\x00\x00\x00"[..]),
+                (0x200, &b"\x53\x43\xff"[..]),
+                (0x210, &b"\x53\xff"[..]),
+                (0x220, &b"\x53\x43"[..]),
+                (0x230, &b"SC-16 ready!\n"[..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_python_reference_examples_and_bitmap_font() {
+        let example = assemble(include_str!("../../examples/example.asm"), 0).unwrap();
+        assert_eq!(example.entry_point, 0);
+        assert_eq!(example.segments.len(), 1);
+        assert_eq!(example.segments[0].data.len(), 94);
+        assert_eq!(&example.segments[0].data[..2], b"\x08\x0a");
+        assert_eq!(&example.segments[0].data[92..], b"\x00\x00");
+
+        let font = assemble(include_str!("../../fonts/font5x7.asm"), 0).unwrap();
+        let font_segment = font
+            .segments
+            .iter()
+            .find(|segment| segment.address == 0x4400)
+            .unwrap();
+        assert_eq!(font_segment.data.len(), 101 * 8);
+        assert_eq!(&font_segment.data[..8], &[0; 8]);
+        assert_eq!(
+            &font_segment.data[8..16],
+            &[0x20, 0x20, 0x20, 0x20, 0x20, 0, 0x20, 0]
         );
     }
 
@@ -1346,6 +1495,25 @@ mod tests {
                 .to_string()
                 .contains("circular .include")
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn expands_in_memory_includes_from_the_supplied_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "sc16-assembler-memory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("fragment.asm"), "HALT\n").unwrap();
+        let image =
+            assemble_with_base_directory(".include \"fragment.asm\"", 0x10, &directory).unwrap();
+        assert_eq!(image.entry_point, 0x10);
+        assert_eq!(image.segments[0].data, b"\x00\x00");
         fs::remove_dir_all(directory).unwrap();
     }
 }
