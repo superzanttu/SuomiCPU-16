@@ -33,9 +33,10 @@ On Windows, run the PowerShell launcher with a source or binary path:
 
 `run.ps1` changes to the repository directory and starts the Rust emulator
 through Cargo. It requires Rust and Cargo to be available on `PATH`. The Rust C
-subset handles a straight-line `int main(void)` with up to three initialized
-local `int` variables and basic arithmetic/bitwise return expressions; other C
-source builds still use the Python reference compiler. At startup,
+subset handles `int main(void)` with up to three initialized local `int`
+variables, assignments, arithmetic/bitwise and signed comparison expressions,
+`if`/`else`, and `while`/`for` loops. Other C source builds still use the
+Python reference compiler while the Rust port is in progress. At startup,
 the BIOS lists each subfolder in `modules/` as a module, using the folder name
 as its module name. A folder with one `.c` file loads that file; a folder with
 multiple `.c` files must contain `main.c`, which is loaded instead. The first
@@ -67,12 +68,11 @@ cargo run -- examples/commands.asm
 cargo run -- examples/directives.asm
 ```
 
-The Rust emulator natively compiles a limited subset: a straight-line
-`int main(void)` with up to three initialized local `int` variables and a
-return expression using basic arithmetic and bitwise operators. Other C
-programs still call the Python reference compiler, which remains necessary
-until the Rust compiler replacement is complete. The reference compiler can
-also be invoked directly:
+The Rust emulator natively compiles a limited subset: `int main(void)` with up
+to three initialized local `int` variables, assignments, arithmetic/bitwise
+and signed comparison expressions, and `if`/`else`, `while`, and basic `for`
+loops. Other C programs still use the Python reference compiler while the Rust
+port is in progress. The reference compiler can also be invoked directly:
 
 ```console
 cargo run -- examples/factorial.c

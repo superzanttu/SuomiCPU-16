@@ -78,9 +78,9 @@ Cargo. Make sure Rust and Cargo are available on `PATH`.
 
 The emulator accepts assembly (`.asm`), C (`.c`), and flat binary (`.bin`)
 programs. Assembly is built natively by Rust. The Rust C compiler currently
-handles a straight-line `int main(void)` with up to three initialized local
-`int` variables and basic arithmetic/bitwise return expressions. Other C
-programs still use the Python reference compiler in
+handles `int main(void)` with up to three initialized local `int` variables,
+assignments, arithmetic/bitwise and signed comparison expressions, `if`/`else`,
+and `while`/`for` loops. Other C programs still use the Python reference compiler in
 [`tools/c_compiler.py`](tools/c_compiler.py) until the Rust compiler port is
 complete. To compile a C file explicitly and run the result with Rust:
 

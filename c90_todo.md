@@ -66,10 +66,9 @@ Passing the Rust build or parser tests does not establish feature parity.
   and labels.
 - [x] Basic translation-unit parsing for scalar globals, arrays, function
   prototypes, variadic prototypes, and function definitions.
-- [x] Implement Rust code generation and image building for `int main(void)`
-  with initialized local `int` variables and arithmetic/bitwise return
-  expressions; unsupported programs continue through the Python reference
-  compiler.
+- [x] Implement Rust code generation for `int main(void)` with initialized
+  local `int` variables, assignment, arithmetic, bitwise and signed
+  comparison expressions, `if`/`else`, `while`, and basic `for` loops.
 - [x] Execute focused Rust C compiler integration tests on Windows, including
   native source builds without invoking Python.
 - [x] Evaluate integer constant expressions for local and global array bounds

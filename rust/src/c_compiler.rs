@@ -309,8 +309,9 @@ pub fn compile_minimal_program(
     );
     let mut locals = HashMap::new();
     let mut next_local_register = 1u8;
+    let mut label_counter = 0usize;
     let mut returned = false;
-    for (statement_index, statement) in statements.iter().enumerate() {
+    for statement in statements {
         match &statement.kind {
             StatementKind::Declaration(declarations) if !returned => {
                 for declaration in declarations {
@@ -328,6 +329,7 @@ pub fn compile_minimal_program(
                         next_local_register,
                         &[4, 5, 6, 7],
                         &locals,
+                        &mut label_counter,
                         &mut assembly,
                     ) {
                         return Ok(None);
@@ -336,21 +338,21 @@ pub fn compile_minimal_program(
                     next_local_register += 1;
                 }
             }
-            StatementKind::Return(Some(expression))
-                if !returned && statement_index + 1 == statements.len() =>
-            {
-                if !emit_native_expression(expression, 0, &[4, 5, 6, 7], &locals, &mut assembly) {
+            _ if !returned => {
+                let Some(statement_returns) =
+                    emit_native_statement(statement, &locals, &mut label_counter, &mut assembly)
+                else {
                     return Ok(None);
-                }
-                returned = true;
+                };
+                returned = statement_returns;
             }
-            _ => return Ok(None),
+            _ => {}
         }
     }
     if !returned {
         return Ok(None);
     }
-    assembly.push_str("    RET\n.address 0x80000\n");
+    assembly.push_str(".address 0x80000\n");
     crate::assembler::assemble(&assembly, 0)
         .map(Some)
         .map_err(|error| CCompilerError(format!("{filename}: {error}")))
@@ -361,6 +363,7 @@ fn emit_native_expression(
     destination: u8,
     temporary_registers: &[u8],
     locals: &HashMap<String, u8>,
+    label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
     match &expression.kind {
@@ -386,6 +389,7 @@ fn emit_native_expression(
                     destination,
                     temporary_registers,
                     locals,
+                    label_counter,
                     assembly,
                 )
             {
@@ -405,26 +409,38 @@ fn emit_native_expression(
             operator,
             left,
             right,
-        } if matches!(operator.as_str(), "+" | "-" | "*" | "&" | "|" | "^") => {
+        } if matches!(
+            operator.as_str(),
+            "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^"
+        ) =>
+        {
             let Some((&right_register, remaining_registers)) = temporary_registers.split_first()
             else {
                 return false;
             };
-            if !emit_native_expression(left, destination, temporary_registers, locals, assembly)
-                || !emit_native_expression(
-                    right,
-                    right_register,
-                    remaining_registers,
-                    locals,
-                    assembly,
-                )
-            {
+            if !emit_native_expression(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) || !emit_native_expression(
+                right,
+                right_register,
+                remaining_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
                 return false;
             }
             let instruction = match operator.as_str() {
                 "+" => "ADD",
                 "-" => "SUB",
                 "*" => "MUL",
+                "/" => "DIVS",
+                "%" => "MODS",
                 "&" => "AND",
                 "|" => "OR",
                 "^" => "XOR",
@@ -435,8 +451,312 @@ fn emit_native_expression(
             ));
             true
         }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") => {
+            let Some((&right_register, remaining_registers)) = temporary_registers.split_first()
+            else {
+                return false;
+            };
+            if !emit_native_expression(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) || !emit_native_expression(
+                right,
+                right_register,
+                remaining_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            let label = *label_counter;
+            *label_counter += 1;
+            let (branch, truth_label, end_label) = match operator.as_str() {
+                "==" => ("BZX", "true", "end"),
+                "!=" => ("BNZX", "true", "end"),
+                "<" => ("BLTX", "true", "end"),
+                "<=" => ("BLEX", "true", "end"),
+                ">" => ("BGTX", "true", "end"),
+                ">=" => ("BGEX", "true", "end"),
+                _ => unreachable!(),
+            };
+            assembly.push_str(&format!(
+                "    CMP R{destination}, R{right_register}\n\
+                 {branch} __c_cmp_{label}_{truth_label}\n\
+                 LDI R{destination}, 0\n\
+                 JMPX __c_cmp_{label}_{end_label}\n\
+                 __c_cmp_{label}_{truth_label}:\n\
+                 LDI R{destination}, 1\n\
+                 __c_cmp_{label}_{end_label}:\n"
+            ));
+            true
+        }
         _ => false,
     }
+}
+
+fn emit_native_assignment(
+    expression: &Expression,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, u8>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let ExpressionKind::Assignment {
+        operator,
+        target,
+        value,
+    } = &expression.kind
+    else {
+        return false;
+    };
+    let ExpressionKind::Atom(name) = &target.kind else {
+        return false;
+    };
+    let Some(&destination) = locals.get(name) else {
+        return false;
+    };
+    let binary_operator = match operator.as_str() {
+        "=" => None,
+        "+=" => Some("ADD"),
+        "-=" => Some("SUB"),
+        "*=" => Some("MUL"),
+        "/=" => Some("DIVS"),
+        "%=" => Some("MODS"),
+        "&=" => Some("AND"),
+        "|=" => Some("OR"),
+        "^=" => Some("XOR"),
+        _ => return false,
+    };
+    let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
+        return false;
+    };
+    if !emit_native_expression(
+        value,
+        value_register,
+        remaining_registers,
+        locals,
+        label_counter,
+        assembly,
+    ) {
+        return false;
+    }
+    match binary_operator {
+        Some(binary_operator) => assembly.push_str(&format!(
+            "    {binary_operator} R{destination}, R{value_register}\n"
+        )),
+        None if destination != value_register => {
+            assembly.push_str(&format!("    MOV R{destination}, R{value_register}\n"))
+        }
+        None => {}
+    }
+    true
+}
+
+fn emit_native_statement(
+    statement: &Statement,
+    locals: &HashMap<String, u8>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<bool> {
+    match &statement.kind {
+        StatementKind::Expression(Some(expression)) => {
+            if emit_native_assignment(expression, &[4, 5, 6, 7], locals, label_counter, assembly) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        StatementKind::Return(Some(expression)) => {
+            if !emit_native_expression(
+                expression,
+                0,
+                &[4, 5, 6, 7],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str("    RET\n");
+            Some(true)
+        }
+        StatementKind::Compound(statements) => {
+            let mut branch_returns = false;
+            for statement in statements {
+                if branch_returns {
+                    break;
+                }
+                branch_returns = emit_native_statement(statement, locals, label_counter, assembly)?;
+            }
+            Some(branch_returns)
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_expression(condition, 0, &[4, 5, 6, 7], locals, label_counter, assembly)
+            {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BNZX __c_if_{label}_then\n"
+            ));
+            let else_returns = if let Some(else_branch) = else_branch {
+                let returns = emit_native_statement(else_branch, locals, label_counter, assembly)?;
+                assembly.push_str(&format!("    JMPX __c_if_{label}_end\n"));
+                returns
+            } else {
+                false
+            };
+            assembly.push_str(&format!("__c_if_{label}_then:\n"));
+            let then_returns = emit_native_statement(then_branch, locals, label_counter, assembly)?;
+            assembly.push_str(&format!("__c_if_{label}_end:\n"));
+            Some(else_branch.is_some() && else_returns && then_returns)
+        }
+        StatementKind::While { condition, body } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            assembly.push_str(&format!("__c_while_{label}_begin:\n"));
+            if !emit_native_expression(condition, 0, &[4, 5, 6, 7], locals, label_counter, assembly)
+            {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_while_{label}_end\n"
+            ));
+            emit_native_statement(body, locals, label_counter, assembly)?;
+            assembly.push_str(&format!(
+                "    JMPX __c_while_{label}_begin\n__c_while_{label}_end:\n"
+            ));
+            Some(false)
+        }
+        StatementKind::For {
+            initializer,
+            condition: Some(condition),
+            update,
+            body,
+        } => {
+            let mut loop_locals = locals.clone();
+            if let Some(initializer) = initializer {
+                match &initializer.kind {
+                    StatementKind::Declaration(declarations) => {
+                        for declaration in declarations {
+                            let next_register = loop_locals
+                                .values()
+                                .copied()
+                                .max()
+                                .unwrap_or(0)
+                                .saturating_add(1);
+                            if declaration.c_type.trim() != "int"
+                                || declaration.array_length.is_some()
+                                || declaration.initializer.is_none()
+                                || loop_locals.contains_key(&declaration.name)
+                                || next_register > 3
+                            {
+                                return None;
+                            }
+                            if !emit_native_expression(
+                                declaration.initializer.as_ref()?,
+                                next_register,
+                                &[4, 5, 6, 7],
+                                &loop_locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                            loop_locals.insert(declaration.name.clone(), next_register);
+                        }
+                    }
+                    StatementKind::Expression(Some(expression)) => {
+                        if !emit_native_assignment(
+                            expression,
+                            &[4, 5, 6, 7],
+                            &loop_locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            let label = *label_counter;
+            *label_counter += 1;
+            assembly.push_str(&format!("__c_for_{label}_begin:\n"));
+            if !emit_native_expression(
+                condition,
+                0,
+                &[4, 5, 6, 7],
+                &loop_locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_for_{label}_end\n"
+            ));
+            emit_native_statement(body, &loop_locals, label_counter, assembly)?;
+            if let Some(update) = update
+                && !emit_native_assignment(
+                    update,
+                    &[4, 5, 6, 7],
+                    &loop_locals,
+                    label_counter,
+                    assembly,
+                )
+                && !emit_native_update(update, &loop_locals, assembly)
+            {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_for_{label}_begin\n__c_for_{label}_end:\n"
+            ));
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn emit_native_update(
+    expression: &Expression,
+    locals: &HashMap<String, u8>,
+    assembly: &mut String,
+) -> bool {
+    let ExpressionKind::Postfix {
+        operator,
+        expression,
+    } = &expression.kind
+    else {
+        return false;
+    };
+    let ExpressionKind::Atom(name) = &expression.kind else {
+        return false;
+    };
+    let Some(register) = locals.get(name) else {
+        return false;
+    };
+    let instruction = match operator.as_str() {
+        "++" => "INC",
+        "--" => "DEC",
+        _ => return false,
+    };
+    assembly.push_str(&format!("    {instruction} R{register}\n"));
+    true
 }
 
 pub struct StatementParser {
@@ -2210,8 +2530,8 @@ mod tests {
     fn leaves_nontrivial_c_programs_for_the_full_compiler() {
         assert!(
             compile_minimal_program(
-                "int main(void) { int result = 7; result = result + 1; return result; }",
-                "needs-full-compiler.c",
+                "int main(void) { return helper(); }",
+                "needs-full-compiler.c"
             )
             .unwrap()
             .is_none()
@@ -2261,5 +2581,91 @@ mod tests {
         cpu.run(32).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 0xf3);
+    }
+
+    #[test]
+    fn compiles_local_assignments_and_signed_division() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = 20; value -= 2; value /= 3; return value * 10 + 20 % 3; }",
+            "assignment.c",
+        )
+        .unwrap()
+        .expect("supported assignment program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 62);
+    }
+
+    #[test]
+    fn compiles_signed_integer_comparisons() {
+        for (source, expected) in [
+            ("int main(void) { return 3 == 3; }", 1),
+            ("int main(void) { return 3 != 3; }", 0),
+            ("int main(void) { return -3 < 2; }", 1),
+            ("int main(void) { return 2 <= -3; }", 0),
+            ("int main(void) { return 4 > 3; }", 1),
+            ("int main(void) { return 4 >= 5; }", 0),
+        ] {
+            let image = compile_minimal_program(source, "comparison.c")
+                .unwrap()
+                .expect("supported comparison program");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(64).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_if_else_return_paths() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = -2; if (value < 0) return 11; else return 22; }",
+            "if-else.c",
+        )
+        .unwrap()
+        .expect("supported if/else program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 11);
+    }
+
+    #[test]
+    fn compiles_while_loops_with_local_updates() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = 1; while (value < 6) { value += 1; } return value; }",
+            "while.c",
+        )
+        .unwrap()
+        .expect("supported while-loop program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 6);
+    }
+
+    #[test]
+    fn compiles_for_loops_with_scoped_integer_counters() {
+        let image = compile_minimal_program(
+            "int main(void) { int sum = 0; for (int i = 0; i < 5; i++) { sum += i; } return sum; }",
+            "for.c",
+        )
+        .unwrap()
+        .expect("supported for-loop program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
     }
 }
