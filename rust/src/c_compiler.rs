@@ -1,5 +1,5 @@
 use crate::image::ProgramImage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
@@ -283,19 +283,64 @@ pub fn compile_minimal_program(
         Ok(unit) => unit,
         Err(_) => return Ok(None),
     };
-    let [ExternalDeclaration::FunctionDefinition(function)] = unit.declarations.as_slice() else {
+    let mut functions = Vec::new();
+    let mut names = HashSet::new();
+    for declaration in &unit.declarations {
+        match declaration {
+            ExternalDeclaration::FunctionDefinition(function) => {
+                if function.declaration.return_type.trim() != "int"
+                    || function.declaration.variadic
+                    || function.declaration.parameters.len() > 3
+                    || function
+                        .declaration
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.c_type.trim() != "int")
+                    || !names.insert(function.declaration.name.as_str())
+                {
+                    return Ok(None);
+                }
+                functions.push(function);
+            }
+            ExternalDeclaration::FunctionPrototype(function) => {
+                if function.return_type.trim() != "int"
+                    || function.variadic
+                    || function.parameters.len() > 3
+                    || function
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.c_type.trim() != "int")
+                {
+                    return Ok(None);
+                }
+            }
+            ExternalDeclaration::Global(_) => return Ok(None),
+        }
+    }
+    let Some(main) = functions
+        .iter()
+        .find(|function| function.declaration.name == "main")
+    else {
         return Ok(None);
     };
-    if function.declaration.name != "main"
-        || function.declaration.return_type.trim() != "int"
-        || !function.declaration.parameters.is_empty()
-        || function.declaration.variadic
+    if !main.declaration.parameters.is_empty() {
+        return Ok(None);
+    }
+    let defined_functions: HashMap<String, usize> = functions
+        .iter()
+        .map(|function| {
+            (
+                function.declaration.name.clone(),
+                function.declaration.parameters.len(),
+            )
+        })
+        .collect();
+    if functions
+        .iter()
+        .any(|function| !statement_calls_are_defined(&function.body, &defined_functions))
     {
         return Ok(None);
     }
-    let StatementKind::Compound(statements) = &function.body.kind else {
-        return Ok(None);
-    };
     let mut assembly = String::from(
         ".address 0\n\
          __c_entry:\n\
@@ -304,58 +349,224 @@ pub fn compile_minimal_program(
          __c_boot:\n\
          \x20\x20\x20\x20CALLX __c_function_main\n\
          \x20\x20\x20\x20HALT\n\
-         .address 0x4800\n\
-         __c_function_main:\n",
+         .address 0x4800\n",
     );
-    let mut locals = HashMap::new();
-    let mut next_local_register = 1u8;
     let mut label_counter = 0usize;
-    let mut returned = false;
-    for statement in statements {
-        match &statement.kind {
-            StatementKind::Declaration(declarations) if !returned => {
-                for declaration in declarations {
-                    if declaration.c_type.trim() != "int"
-                        || declaration.array_length.is_some()
-                        || declaration.initializer.is_none()
-                        || locals.contains_key(&declaration.name)
-                        || next_local_register > 3
-                    {
-                        return Ok(None);
-                    }
-                    let initializer = declaration.initializer.as_ref().unwrap();
-                    if !emit_native_expression(
-                        initializer,
-                        next_local_register,
-                        &[4, 5, 6, 7],
-                        &locals,
-                        &mut label_counter,
-                        &mut assembly,
-                    ) {
-                        return Ok(None);
-                    }
-                    locals.insert(declaration.name.clone(), next_local_register);
-                    next_local_register += 1;
-                }
+    for function in functions {
+        let StatementKind::Compound(statements) = &function.body.kind else {
+            return Ok(None);
+        };
+        let mut locals = HashMap::new();
+        for (index, parameter) in function.declaration.parameters.iter().enumerate() {
+            let Some(name) = &parameter.name else {
+                return Ok(None);
+            };
+            if locals.insert(name.clone(), index as u8 + 1).is_some() {
+                return Ok(None);
             }
-            _ if !returned => {
-                let Some(statement_returns) =
-                    emit_native_statement(statement, &locals, &mut label_counter, &mut assembly)
-                else {
+        }
+        let mut next_local_register = function.declaration.parameters.len() as u8 + 1;
+        if !collect_native_locals(statements, &mut locals, &mut next_local_register) {
+            return Ok(None);
+        }
+        assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
+        for (index, _) in function.declaration.parameters.iter().enumerate() {
+            assembly.push_str(&format!("    LDWS R{}, {}\n", index + 1, 4 + index * 2));
+        }
+        let mut loop_labels = Vec::new();
+        let mut returned = false;
+        for statement in statements {
+            if !returned {
+                let Some(statement_returns) = emit_native_statement(
+                    statement,
+                    &locals,
+                    &mut label_counter,
+                    &mut loop_labels,
+                    &mut assembly,
+                ) else {
                     return Ok(None);
                 };
                 returned = statement_returns;
             }
-            _ => {}
         }
-    }
-    if !returned {
-        return Ok(None);
+        if !returned {
+            return Ok(None);
+        }
     }
     assembly.push_str(".address 0x80000\n");
     crate::assembler::assemble(&assembly, 0)
         .map(Some)
         .map_err(|error| CCompilerError(format!("{filename}: {error}")))
+}
+
+fn expression_calls_are_defined(
+    expression: &Expression,
+    defined_functions: &HashMap<String, usize>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            matches!(&function.kind, ExpressionKind::Atom(name) if defined_functions.get(name) == Some(&arguments.len()))
+                && expression_calls_are_defined(function, defined_functions)
+                && arguments
+                    .iter()
+                    .all(|argument| expression_calls_are_defined(argument, defined_functions))
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            expression_calls_are_defined(operand, defined_functions)
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Assignment {
+            target: left,
+            value: right,
+            ..
+        }
+        | ExpressionKind::Index {
+            expression: left,
+            index: right,
+        } => {
+            expression_calls_are_defined(left, defined_functions)
+                && expression_calls_are_defined(right, defined_functions)
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            expression_calls_are_defined(condition, defined_functions)
+                && expression_calls_are_defined(when_true, defined_functions)
+                && expression_calls_are_defined(when_false, defined_functions)
+        }
+        ExpressionKind::Member { expression, .. } => {
+            expression_calls_are_defined(expression, defined_functions)
+        }
+        ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => true,
+    }
+}
+
+fn statement_calls_are_defined(
+    statement: &Statement,
+    defined_functions: &HashMap<String, usize>,
+) -> bool {
+    let expression_is_defined =
+        |expression: &Expression| expression_calls_are_defined(expression, defined_functions);
+    match &statement.kind {
+        StatementKind::Compound(statements) => statements
+            .iter()
+            .all(|statement| statement_calls_are_defined(statement, defined_functions)),
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .filter_map(|declaration| declaration.initializer.as_ref())
+            .all(expression_is_defined),
+        StatementKind::Expression(expression) | StatementKind::Return(expression) => {
+            expression.as_ref().is_none_or(expression_is_defined)
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expression_is_defined(condition)
+                && statement_calls_are_defined(then_branch, defined_functions)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(|branch| statement_calls_are_defined(branch, defined_functions))
+        }
+        StatementKind::While { condition, body } | StatementKind::DoWhile { condition, body } => {
+            expression_is_defined(condition) && statement_calls_are_defined(body, defined_functions)
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => {
+            initializer
+                .as_ref()
+                .is_none_or(|statement| statement_calls_are_defined(statement, defined_functions))
+                && condition.as_ref().is_none_or(expression_is_defined)
+                && update.as_ref().is_none_or(expression_is_defined)
+                && statement_calls_are_defined(body, defined_functions)
+        }
+        StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_)
+        | StatementKind::Label { .. } => true,
+    }
+}
+
+fn collect_native_locals(
+    statements: &[Statement],
+    locals: &mut HashMap<String, u8>,
+    next_register: &mut u8,
+) -> bool {
+    for statement in statements {
+        match &statement.kind {
+            StatementKind::Declaration(declarations) => {
+                for declaration in declarations {
+                    if declaration.c_type.trim() != "int"
+                        || declaration.array_length.is_some()
+                        || locals.contains_key(&declaration.name)
+                        || *next_register > 3
+                    {
+                        return false;
+                    }
+                    locals.insert(declaration.name.clone(), *next_register);
+                    *next_register += 1;
+                }
+            }
+            StatementKind::Compound(statements) => {
+                if !collect_native_locals(statements, locals, next_register) {
+                    return false;
+                }
+            }
+            StatementKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                if !collect_native_locals(std::slice::from_ref(then_branch), locals, next_register)
+                    || else_branch.as_ref().is_some_and(|branch| {
+                        !collect_native_locals(std::slice::from_ref(branch), locals, next_register)
+                    })
+                {
+                    return false;
+                }
+            }
+            StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::For { body, .. } => {
+                if !collect_native_locals(std::slice::from_ref(body), locals, next_register) {
+                    return false;
+                }
+                if let StatementKind::For {
+                    initializer: Some(initializer),
+                    ..
+                } = &statement.kind
+                    && !collect_native_locals(
+                        std::slice::from_ref(initializer),
+                        locals,
+                        next_register,
+                    )
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 fn emit_native_expression(
@@ -450,7 +661,11 @@ fn emit_native_expression(
                 locals,
                 label_counter,
                 assembly,
-            ) || !emit_native_expression(
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!("    PUSH R{destination}\n"));
+            if !emit_native_expression(
                 right,
                 right_register,
                 remaining_registers,
@@ -460,6 +675,7 @@ fn emit_native_expression(
             ) {
                 return false;
             }
+            assembly.push_str(&format!("    POP R{destination}\n"));
             let instruction = match operator.as_str() {
                 "+" => "ADD",
                 "-" => "SUB",
@@ -494,7 +710,11 @@ fn emit_native_expression(
                 locals,
                 label_counter,
                 assembly,
-            ) || !emit_native_expression(
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!("    PUSH R{destination}\n"));
+            if !emit_native_expression(
                 right,
                 right_register,
                 remaining_registers,
@@ -504,6 +724,7 @@ fn emit_native_expression(
             ) {
                 return false;
             }
+            assembly.push_str(&format!("    POP R{destination}\n"));
             let label = *label_counter;
             *label_counter += 1;
             let (branch, truth_label, end_label) = match operator.as_str() {
@@ -623,6 +844,46 @@ fn emit_native_expression(
             assembly.push_str(&format!("__c_cond_{label}_end:\n"));
             true
         }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return false;
+            };
+            if arguments.len() > 3 {
+                return false;
+            }
+            for register in 1..=6 {
+                assembly.push_str(&format!("    PUSH R{register}\n"));
+            }
+            for (index, argument) in arguments.iter().enumerate() {
+                if !emit_native_expression(
+                    argument,
+                    4 + index as u8,
+                    &temporary_registers[index.min(temporary_registers.len())..],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+            }
+            for index in (0..arguments.len()).rev() {
+                assembly.push_str(&format!("    PUSH R{}\n", 4 + index));
+            }
+            assembly.push_str(&format!("    CALLX __c_function_{name}\n"));
+            if !arguments.is_empty() {
+                assembly.push_str(&format!("    ADJSP {}\n", arguments.len() * 2));
+            }
+            for register in (1..=6).rev() {
+                assembly.push_str(&format!("    POP R{register}\n"));
+            }
+            if destination != 0 {
+                assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -691,9 +952,29 @@ fn emit_native_statement(
     statement: &Statement,
     locals: &HashMap<String, u8>,
     label_counter: &mut usize,
+    loop_labels: &mut Vec<(String, String)>,
     assembly: &mut String,
 ) -> Option<bool> {
     match &statement.kind {
+        StatementKind::Declaration(declarations) => {
+            for declaration in declarations {
+                if let Some(initializer) = &declaration.initializer {
+                    let destination = *locals.get(&declaration.name)?;
+                    if !emit_native_expression(
+                        initializer,
+                        destination,
+                        &[4, 5, 6, 7],
+                        locals,
+                        label_counter,
+                        assembly,
+                    ) {
+                        return None;
+                    }
+                }
+            }
+            Some(false)
+        }
+        StatementKind::Expression(None) => Some(false),
         StatementKind::Expression(Some(expression)) => {
             if emit_native_assignment(expression, &[4, 5, 6, 7], locals, label_counter, assembly)
                 || emit_native_update(expression, locals, assembly)
@@ -717,13 +998,24 @@ fn emit_native_statement(
             assembly.push_str("    RET\n");
             Some(true)
         }
+        StatementKind::Break => {
+            let (break_label, _) = loop_labels.last()?;
+            assembly.push_str(&format!("    JMPX {break_label}\n"));
+            Some(false)
+        }
+        StatementKind::Continue => {
+            let (_, continue_label) = loop_labels.last()?;
+            assembly.push_str(&format!("    JMPX {continue_label}\n"));
+            Some(false)
+        }
         StatementKind::Compound(statements) => {
             let mut branch_returns = false;
             for statement in statements {
                 if branch_returns {
                     break;
                 }
-                branch_returns = emit_native_statement(statement, locals, label_counter, assembly)?;
+                branch_returns =
+                    emit_native_statement(statement, locals, label_counter, loop_labels, assembly)?;
             }
             Some(branch_returns)
         }
@@ -738,18 +1030,25 @@ fn emit_native_statement(
             {
                 return None;
             }
-            assembly.push_str(&format!(
-                "    LDI R7, 0\n    CMP R0, R7\n    BNZX __c_if_{label}_then\n"
-            ));
+            assembly.push_str("    LDI R7, 0\n    CMP R0, R7\n");
             let else_returns = if let Some(else_branch) = else_branch {
-                let returns = emit_native_statement(else_branch, locals, label_counter, assembly)?;
+                assembly.push_str(&format!("    BNZX __c_if_{label}_then\n"));
+                let returns = emit_native_statement(
+                    else_branch,
+                    locals,
+                    label_counter,
+                    loop_labels,
+                    assembly,
+                )?;
                 assembly.push_str(&format!("    JMPX __c_if_{label}_end\n"));
                 returns
             } else {
+                assembly.push_str(&format!("    BZX __c_if_{label}_end\n"));
                 false
             };
             assembly.push_str(&format!("__c_if_{label}_then:\n"));
-            let then_returns = emit_native_statement(then_branch, locals, label_counter, assembly)?;
+            let then_returns =
+                emit_native_statement(then_branch, locals, label_counter, loop_labels, assembly)?;
             assembly.push_str(&format!("__c_if_{label}_end:\n"));
             Some(else_branch.is_some() && else_returns && then_returns)
         }
@@ -764,7 +1063,12 @@ fn emit_native_statement(
             assembly.push_str(&format!(
                 "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_while_{label}_end\n"
             ));
-            emit_native_statement(body, locals, label_counter, assembly)?;
+            loop_labels.push((
+                format!("__c_while_{label}_end"),
+                format!("__c_while_{label}_begin"),
+            ));
+            emit_native_statement(body, locals, label_counter, loop_labels, assembly)?;
+            loop_labels.pop();
             assembly.push_str(&format!(
                 "    JMPX __c_while_{label}_begin\n__c_while_{label}_end:\n"
             ));
@@ -774,7 +1078,13 @@ fn emit_native_statement(
             let label = *label_counter;
             *label_counter += 1;
             assembly.push_str(&format!("__c_do_{label}_begin:\n"));
-            emit_native_statement(body, locals, label_counter, assembly)?;
+            loop_labels.push((
+                format!("__c_do_{label}_end"),
+                format!("__c_do_{label}_condition"),
+            ));
+            emit_native_statement(body, locals, label_counter, loop_labels, assembly)?;
+            loop_labels.pop();
+            assembly.push_str(&format!("__c_do_{label}_condition:\n"));
             if !emit_native_expression(condition, 0, &[4, 5, 6, 7], locals, label_counter, assembly)
             {
                 return None;
@@ -782,86 +1092,46 @@ fn emit_native_statement(
             assembly.push_str(&format!(
                 "    LDI R7, 0\n    CMP R0, R7\n    BNZX __c_do_{label}_begin\n"
             ));
+            assembly.push_str(&format!("__c_do_{label}_end:\n"));
             Some(false)
         }
         StatementKind::For {
             initializer,
-            condition: Some(condition),
+            condition,
             update,
             body,
         } => {
-            let mut loop_locals = locals.clone();
             if let Some(initializer) = initializer {
-                match &initializer.kind {
-                    StatementKind::Declaration(declarations) => {
-                        for declaration in declarations {
-                            let next_register = loop_locals
-                                .values()
-                                .copied()
-                                .max()
-                                .unwrap_or(0)
-                                .saturating_add(1);
-                            if declaration.c_type.trim() != "int"
-                                || declaration.array_length.is_some()
-                                || declaration.initializer.is_none()
-                                || loop_locals.contains_key(&declaration.name)
-                                || next_register > 3
-                            {
-                                return None;
-                            }
-                            if !emit_native_expression(
-                                declaration.initializer.as_ref()?,
-                                next_register,
-                                &[4, 5, 6, 7],
-                                &loop_locals,
-                                label_counter,
-                                assembly,
-                            ) {
-                                return None;
-                            }
-                            loop_locals.insert(declaration.name.clone(), next_register);
-                        }
-                    }
-                    StatementKind::Expression(Some(expression)) => {
-                        if !emit_native_assignment(
-                            expression,
-                            &[4, 5, 6, 7],
-                            &loop_locals,
-                            label_counter,
-                            assembly,
-                        ) {
-                            return None;
-                        }
-                    }
-                    _ => return None,
-                }
+                emit_native_statement(initializer, locals, label_counter, loop_labels, assembly)?;
             }
             let label = *label_counter;
             *label_counter += 1;
             assembly.push_str(&format!("__c_for_{label}_begin:\n"));
-            if !emit_native_expression(
-                condition,
-                0,
-                &[4, 5, 6, 7],
-                &loop_locals,
-                label_counter,
-                assembly,
-            ) {
-                return None;
-            }
-            assembly.push_str(&format!(
-                "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_for_{label}_end\n"
-            ));
-            emit_native_statement(body, &loop_locals, label_counter, assembly)?;
-            if let Some(update) = update
-                && !emit_native_assignment(
-                    update,
+            if let Some(condition) = condition {
+                if !emit_native_expression(
+                    condition,
+                    0,
                     &[4, 5, 6, 7],
-                    &loop_locals,
+                    locals,
                     label_counter,
                     assembly,
-                )
-                && !emit_native_update(update, &loop_locals, assembly)
+                ) {
+                    return None;
+                }
+                assembly.push_str(&format!(
+                    "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_for_{label}_end\n"
+                ));
+            }
+            loop_labels.push((
+                format!("__c_for_{label}_end"),
+                format!("__c_for_{label}_update"),
+            ));
+            emit_native_statement(body, locals, label_counter, loop_labels, assembly)?;
+            loop_labels.pop();
+            assembly.push_str(&format!("__c_for_{label}_update:\n"));
+            if let Some(update) = update
+                && !emit_native_assignment(update, &[4, 5, 6, 7], locals, label_counter, assembly)
+                && !emit_native_update(update, locals, assembly)
             {
                 return None;
             }
@@ -2684,6 +2954,14 @@ mod tests {
         );
         assert!(
             compile_minimal_program(
+                "int helper(int value) { return value; } int main(void) { return helper(); }",
+                "needs-full-compiler.c",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            compile_minimal_program(
                 "int main(void) { int values[2] = 1; return values[0]; }",
                 "needs-full-compiler.c",
             )
@@ -2854,6 +3132,22 @@ mod tests {
     }
 
     #[test]
+    fn compiles_local_declarations_in_nested_blocks() {
+        let image = compile_minimal_program(
+            "int main(void) { int sum = 0; { int value = 6; sum = value + 4; } return sum; }",
+            "block-locals.c",
+        )
+        .unwrap()
+        .expect("supported nested block locals");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+    }
+
+    #[test]
     fn compiles_shift_assignment_and_signed_right_shift() {
         let image = compile_minimal_program(
             "int main(void) { int value = -16; value >>= 2; return value; }",
@@ -2867,5 +3161,37 @@ mod tests {
         cpu.run(64).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0] as u16, 0xfffc);
+    }
+
+    #[test]
+    fn compiles_break_and_continue_in_for_loops() {
+        let image = compile_minimal_program(
+            "int main(void) { int sum = 0; for (int i = 0; i < 10; i++) { if (i == 3) continue; if (i == 7) break; sum += i; } return sum; }",
+            "loop-control.c",
+        )
+        .unwrap()
+        .expect("supported loop-control program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 18, "registers: {:?}", cpu.registers);
+    }
+
+    #[test]
+    fn compiles_multiple_integer_functions_and_recursive_calls() {
+        let source = "int factorial(int n) { if (n <= 1) return 1; return n * factorial(n - 1); } \
+                      int add(int left, int right) { return left + right; } \
+                      int main(void) { return add(factorial(5), 2); }";
+        let image = compile_minimal_program(source, "functions.c")
+            .unwrap()
+            .expect("supported recursive multi-function program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 122);
     }
 }

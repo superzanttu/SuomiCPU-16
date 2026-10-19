@@ -240,7 +240,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sc16-native-c-{}.c", std::process::id()));
         fs::write(
             &path,
-            "int main(void) { int answer = 40; return answer + 2; }\n",
+            "int add(int left, int right) { return left + right; } \
+             int main(void) { return add(40, 2); }\n",
         )
         .unwrap();
         let image = build_source(&path).unwrap();

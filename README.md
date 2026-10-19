@@ -80,13 +80,14 @@ Cargo. Make sure Rust and Cargo are available on `PATH`.
 
 The emulator accepts assembly (`.asm`), C (`.c`), and flat binary (`.bin`)
 programs. Assembly is built natively by Rust. The Rust C compiler currently
-handles `int main(void)` with up to three initialized local `int` variables,
-assignments, arithmetic/bitwise/shift/logical and signed comparison
-expressions, conditional expressions, `if`/`else`, and `while`/`for` loops.
-Programs outside this subset are rejected with a Rust compiler diagnostic; the
-emulator no longer invokes Python to build C sources. The Python compiler remains
-in the repository as migration reference code, not as a runtime fallback. To
-compile a C file explicitly with the legacy tool:
+handles multiple `int` functions with up to three parameters and local `int`
+variables, assignments, arithmetic/bitwise/shift/logical and signed comparison
+expressions, conditional expressions, `if`/`else`, nested blocks, and
+`while`/`do`/`for` loops with `break` and `continue`, including recursive
+calls. Programs outside this subset are rejected with a Rust compiler
+diagnostic; the emulator no longer invokes Python to build C sources. The
+Python compiler remains in the repository as migration reference code, not as
+a runtime fallback. To compile a C file explicitly with the legacy tool:
 
 ```console
 python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
@@ -119,11 +120,12 @@ cargo run -- "modules\Netgame Demo\net_game_demo.c" --net-port 47016
 cargo run -- --headless "modules\DiskEditor\disk_editor.c"
 ```
 
-Assemble an SC-16 source file into a segmented image using the Rust assembler:
+Build an SC-16 source file into a segmented image using the Rust tools:
 
 ```console
-cargo run --bin sc16asm -- examples\commands.asm
-cargo run --bin sc16asm -- examples\commands.asm commands.img
+cargo run --bin sc16build -- examples\commands.asm
+cargo run --bin sc16build -- examples\example.asm example.sc16img
+cargo run --bin sc16build -- input.bin output.sc16img
 ```
 
 In the Rust BIOS selector, press **D** or **Left/Right** to choose no data disk

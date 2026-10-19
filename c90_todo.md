@@ -66,12 +66,17 @@ Passing the Rust build or parser tests does not establish feature parity.
   and labels.
 - [x] Basic translation-unit parsing for scalar globals, arrays, function
   prototypes, variadic prototypes, and function definitions.
-- [x] Implement Rust code generation for `int main(void)` with initialized
-  local `int` variables, assignment, arithmetic, bitwise and signed
+- [x] Implement Rust code generation for multiple integer functions with
+  parameter passing, direct/recursive calls, local `int` variables,
+  assignment, arithmetic, bitwise and signed
   comparison, shift, logical and conditional expressions, `if`/`else`,
-  `while`, `do`/`while`, and basic `for` loops.
+  nested block locals, `while`, `do`/`while`, basic `for` loops, and loop
+  `break`/`continue`; extend the same integer backend to multiple functions,
+  parameter passing, ordinary calls, and recursion.
 - [x] Remove the Python compiler invocation from Rust `.c` source and BIOS
   module build paths; Rust reports unsupported C instead of falling back.
+- [x] Replace `tools/sc16_build_image.py` with the Rust `sc16build` CLI for
+  assembling `.asm`, compiling the supported `.c` subset, and wrapping `.bin`.
 - [x] Execute focused Rust C compiler integration tests on Windows, including
   native source builds and unsupported-source rejection without Python.
 - [x] Evaluate integer constant expressions for local and global array bounds
@@ -82,7 +87,7 @@ Passing the Rust build or parser tests does not establish feature parity.
 - [ ] C90 preprocessor and include/header compatibility.
 - [ ] Type checking, diagnostics, and target ABI semantics.
 - [ ] Complete SC-16 assembly generation, runtime library linking, and image
-  output beyond the limited integer `main` subset.
+  output beyond the current integer-function subset.
 - [ ] Migrate the 158 Python C compiler regression tests and add executable
   Rust compiler integration tests.
 - [ ] Expand Rust compiler support until existing `.c` source and module builds
@@ -96,6 +101,8 @@ The Python C compiler remains in the repository as migration reference code,
 but Rust runtime builds do not invoke it. C programs outside the current native
 subset fail with an unsupported-program diagnostic until their features are
 ported. Keep this limitation visible while extending Rust compiler coverage.
+There are 42 tracked Python source files remaining across the emulator,
+compiler, assembler, tools, and tests; Python removal is not complete.
 
 ## A — SuomiCPU-16 platform required
 

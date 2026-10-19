@@ -14,6 +14,10 @@ path = "rust/src/main.rs"
 name = "sc16asm"
 path = "rust/src/bin/sc16asm.rs"
 
+[[bin]]
+name = "sc16build"
+path = "rust/src/bin/sc16build.rs"
+
 [dependencies]
 macroquad = { version = "0.4.16", features = ["audio"] }
 memmap2 = "0.9"
