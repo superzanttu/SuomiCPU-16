@@ -77,10 +77,12 @@ It changes to the repository directory and starts the Rust emulator through
 Cargo. Make sure Rust and Cargo are available on `PATH`.
 
 The emulator accepts assembly (`.asm`), C (`.c`), and flat binary (`.bin`)
-programs. Assembly is built natively by Rust. C source builds still invoke the
-Python reference compiler in [`tools/c_compiler.py`](tools/c_compiler.py) until
-the Rust compiler port is complete. To compile a C file explicitly and run the
-result with Rust:
+programs. Assembly is built natively by Rust. The Rust C compiler currently
+handles a straight-line `int main(void)` with up to three initialized local
+`int` variables and basic arithmetic/bitwise return expressions. Other C
+programs still use the Python reference compiler in
+[`tools/c_compiler.py`](tools/c_compiler.py) until the Rust compiler port is
+complete. To compile a C file explicitly and run the result with Rust:
 
 ```console
 python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
@@ -102,8 +104,9 @@ cargo build --target wasm32-unknown-unknown
 
 The browser build is not yet a standalone web release: module discovery and
 module file access still rely on the host filesystem. Rust builds `.asm`
-programs with the native Rust assembler; `.c` compilation still uses the
-Python C compiler as a temporary migration dependency.
+programs with its native assembler and compiles a narrow subset of `.c` files
+directly; unsupported C programs still use the Python compiler as a temporary
+migration dependency.
 
 Run a program with optional persistent data-disk and LAN settings:
 

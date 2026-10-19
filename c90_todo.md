@@ -66,6 +66,12 @@ Passing the Rust build or parser tests does not establish feature parity.
   and labels.
 - [x] Basic translation-unit parsing for scalar globals, arrays, function
   prototypes, variadic prototypes, and function definitions.
+- [x] Implement Rust code generation and image building for `int main(void)`
+  with initialized local `int` variables and arithmetic/bitwise return
+  expressions; unsupported programs continue through the Python reference
+  compiler.
+- [x] Execute focused Rust C compiler integration tests on Windows, including
+  native source builds without invoking Python.
 - [x] Evaluate integer constant expressions for local and global array bounds
   (including C integer bases/suffixes and common arithmetic, comparison,
   logical, and bitwise operators).
@@ -73,7 +79,8 @@ Passing the Rust build or parser tests does not establish feature parity.
   semantics at translation-unit scope.
 - [ ] C90 preprocessor and include/header compatibility.
 - [ ] Type checking, diagnostics, and target ABI semantics.
-- [ ] SC-16 assembly generation, runtime library linking, and image output.
+- [ ] Complete SC-16 assembly generation, runtime library linking, and image
+  output beyond the limited integer `main` subset.
 - [ ] Migrate the 158 Python C compiler regression tests and add executable
   Rust compiler integration tests.
 - [ ] Replace the Python C compiler in `.c` build and module-launch paths.
@@ -84,10 +91,10 @@ Passing the Rust build or parser tests does not establish feature parity.
 - [ ] Remove Python C compiler dependencies only after all required build,
   runtime, test, and tooling paths are migrated.
 
-The Python C compiler remains the reference implementation and Rust `.c`
-builds still use Python. Rust parser test execution is intermittently blocked
-by Windows Application Control (OS error 4551). Record runtime test results
-only when tests have actually executed.
+The Python C compiler remains the reference implementation and handles `.c`
+programs outside the initial native integer-returning `main` subset. Rust test
+execution is intermittently blocked by Windows Application Control (OS error
+4551). Record runtime test results only when tests have actually executed.
 
 ## A — SuomiCPU-16 platform required
 

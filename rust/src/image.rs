@@ -21,7 +21,7 @@ impl std::fmt::Display for ImageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
-            Self::BuildFailed => write!(formatter, "Python SC-16 C compiler failed"),
+            Self::BuildFailed => write!(formatter, "SC-16 C compiler failed"),
             Self::Assembly(error) => write!(formatter, "SC-16 assembly failed: {error}"),
             Self::InvalidFormat(reason) => write!(formatter, "invalid SC-16 image: {reason}"),
             Self::Cpu(error) => write!(formatter, "{error}"),
@@ -102,6 +102,19 @@ pub fn build_source(root: &Path, source: &Path, python: &str) -> Result<ProgramI
     {
         return crate::assembler::assemble_file(source, 0)
             .map_err(|error| ImageError::Assembly(error.to_string()));
+    }
+    if source
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("c"))
+    {
+        let source_text = fs::read_to_string(source)?;
+        let source_text = source_text.strip_prefix('\u{feff}').unwrap_or(&source_text);
+        if let Some(image) =
+            crate::c_compiler::compile_minimal_program(source_text, &source.to_string_lossy())
+                .map_err(|error| ImageError::Assembly(error.to_string()))?
+        {
+            return Ok(image);
+        }
     }
     let temp_path = unique_temp_path();
     let result = (|| {
@@ -243,5 +256,24 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert_eq!(image.entry_point, 0);
         assert_eq!(image.segments[0].data, b"\x08\x01\x00\x00");
+    }
+
+    #[test]
+    fn builds_rust_supported_c_sources_without_invoking_python() {
+        let path = std::env::temp_dir().join(format!("sc16-native-c-{}.c", std::process::id()));
+        fs::write(
+            &path,
+            "int main(void) { int answer = 40; return answer + 2; }\n",
+        )
+        .unwrap();
+        let image = build_source(Path::new("."), &path, "python-must-not-be-called").unwrap();
+        fs::remove_file(path).unwrap();
+
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 42);
     }
 }

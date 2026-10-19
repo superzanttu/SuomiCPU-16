@@ -1,3 +1,6 @@
+use crate::image::ProgramImage;
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
     pub value: String,
@@ -266,6 +269,174 @@ fn parse_integer_constant(token: &str) -> Option<i64> {
         i64::from_str_radix(number, base).ok()?
     };
     (value <= i64::from(u32::MAX)).then_some(value)
+}
+
+pub fn compile_minimal_program(
+    source: &str,
+    filename: &str,
+) -> Result<Option<ProgramImage>, CCompilerError> {
+    let mut parser = match TranslationUnitParser::from_source(source, filename) {
+        Ok(parser) => parser,
+        Err(_) => return Ok(None),
+    };
+    let unit = match parser.parse() {
+        Ok(unit) => unit,
+        Err(_) => return Ok(None),
+    };
+    let [ExternalDeclaration::FunctionDefinition(function)] = unit.declarations.as_slice() else {
+        return Ok(None);
+    };
+    if function.declaration.name != "main"
+        || function.declaration.return_type.trim() != "int"
+        || !function.declaration.parameters.is_empty()
+        || function.declaration.variadic
+    {
+        return Ok(None);
+    }
+    let StatementKind::Compound(statements) = &function.body.kind else {
+        return Ok(None);
+    };
+    let mut assembly = String::from(
+        ".address 0\n\
+         __c_entry:\n\
+         \x20\x20\x20\x20JMP __c_boot\n\
+         .address 10\n\
+         __c_boot:\n\
+         \x20\x20\x20\x20CALLX __c_function_main\n\
+         \x20\x20\x20\x20HALT\n\
+         .address 0x4800\n\
+         __c_function_main:\n",
+    );
+    let mut locals = HashMap::new();
+    let mut next_local_register = 1u8;
+    let mut returned = false;
+    for (statement_index, statement) in statements.iter().enumerate() {
+        match &statement.kind {
+            StatementKind::Declaration(declarations) if !returned => {
+                for declaration in declarations {
+                    if declaration.c_type.trim() != "int"
+                        || declaration.array_length.is_some()
+                        || declaration.initializer.is_none()
+                        || locals.contains_key(&declaration.name)
+                        || next_local_register > 3
+                    {
+                        return Ok(None);
+                    }
+                    let initializer = declaration.initializer.as_ref().unwrap();
+                    if !emit_native_expression(
+                        initializer,
+                        next_local_register,
+                        &[4, 5, 6, 7],
+                        &locals,
+                        &mut assembly,
+                    ) {
+                        return Ok(None);
+                    }
+                    locals.insert(declaration.name.clone(), next_local_register);
+                    next_local_register += 1;
+                }
+            }
+            StatementKind::Return(Some(expression))
+                if !returned && statement_index + 1 == statements.len() =>
+            {
+                if !emit_native_expression(expression, 0, &[4, 5, 6, 7], &locals, &mut assembly) {
+                    return Ok(None);
+                }
+                returned = true;
+            }
+            _ => return Ok(None),
+        }
+    }
+    if !returned {
+        return Ok(None);
+    }
+    assembly.push_str("    RET\n.address 0x80000\n");
+    crate::assembler::assemble(&assembly, 0)
+        .map(Some)
+        .map_err(|error| CCompilerError(format!("{filename}: {error}")))
+}
+
+fn emit_native_expression(
+    expression: &Expression,
+    destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, u8>,
+    assembly: &mut String,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(value) => {
+            if let Some(value) = parse_integer_constant(value) {
+                if !(0..=0xffff).contains(&value) {
+                    return false;
+                }
+                assembly.push_str(&format!("    LDI R{destination}, 0x{value:04X}\n"));
+            } else if let Some(source) = locals.get(value) {
+                if *source != destination {
+                    assembly.push_str(&format!("    MOV R{destination}, R{source}\n"));
+                }
+            } else {
+                return false;
+            }
+            true
+        }
+        ExpressionKind::Unary { operator, operand } => {
+            if !matches!(operator.as_str(), "+" | "-" | "~")
+                || !emit_native_expression(
+                    operand,
+                    destination,
+                    temporary_registers,
+                    locals,
+                    assembly,
+                )
+            {
+                return false;
+            }
+            match operator.as_str() {
+                "+" => {}
+                "-" => {
+                    assembly.push_str(&format!("    NOT R{destination}\n    INC R{destination}\n"))
+                }
+                "~" => assembly.push_str(&format!("    NOT R{destination}\n")),
+                _ => unreachable!(),
+            }
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "&" | "|" | "^") => {
+            let Some((&right_register, remaining_registers)) = temporary_registers.split_first()
+            else {
+                return false;
+            };
+            if !emit_native_expression(left, destination, temporary_registers, locals, assembly)
+                || !emit_native_expression(
+                    right,
+                    right_register,
+                    remaining_registers,
+                    locals,
+                    assembly,
+                )
+            {
+                return false;
+            }
+            let instruction = match operator.as_str() {
+                "+" => "ADD",
+                "-" => "SUB",
+                "*" => "MUL",
+                "&" => "AND",
+                "|" => "OR",
+                "^" => "XOR",
+                _ => unreachable!(),
+            };
+            assembly.push_str(&format!(
+                "    {instruction} R{destination}, R{right_register}\n"
+            ));
+            true
+        }
+        _ => false,
+    }
 }
 
 pub struct StatementParser {
@@ -2019,5 +2190,76 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.to_string(), expected, "source: {source}");
         }
+    }
+
+    #[test]
+    fn compiles_and_executes_minimal_integer_main_in_rust() {
+        let image = compile_minimal_program("int main(void) { return 2 + 3 * 4; }", "minimal.c")
+            .unwrap()
+            .expect("supported minimal program");
+        assert_eq!(image.entry_point, 0);
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 14);
+    }
+
+    #[test]
+    fn leaves_nontrivial_c_programs_for_the_full_compiler() {
+        assert!(
+            compile_minimal_program(
+                "int main(void) { int result = 7; result = result + 1; return result; }",
+                "needs-full-compiler.c",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            compile_minimal_program(
+                "int main(void) { int values[2] = 1; return values[0]; }",
+                "needs-full-compiler.c",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            compile_minimal_program("int main(void) { return 70000; }", "needs-full-compiler.c",)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compiles_local_integers_and_runtime_expressions() {
+        let image = compile_minimal_program(
+            "int main(void) { int left = 7; int right = 5; return left + right * 2; }",
+            "locals.c",
+        )
+        .unwrap()
+        .expect("supported local-integer program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 17);
+    }
+
+    #[test]
+    fn compiles_initialized_locals_with_unary_and_bitwise_operations() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = 0x0f; return ~(value ^ 0x03) & 0xff; }",
+            "bitwise.c",
+        )
+        .unwrap()
+        .expect("supported bitwise program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0xf3);
     }
 }
