@@ -1,5 +1,9 @@
 use memmap2::MmapMut;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
+
+use crate::disk::DiskDevice;
+use crate::net::{DEFAULT_PORT, NetNode};
 
 pub const MEMORY_SIZE: usize = 1 << 30;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
@@ -18,9 +22,12 @@ const GPU_LAYER_ORDER: u32 = GPU_BASE + 23;
 const GPU_LAYER_COUNT: usize = 5;
 const GPU_PALETTE: u8 = 27;
 const RTC_START: u32 = 0x43010;
+const DISK_BASE: u32 = 0x43100;
+const DISK_STATUS: u32 = DISK_BASE + 16;
 const CONSOLE_DATA: u32 = 0x43200;
 const CONSOLE_STATUS: u32 = 0x43201;
 const CONSOLE_CONTROL: u32 = 0x43202;
+const RAM_START: u32 = 0x40000;
 const VRAM_START: u32 = 0x50000;
 const GPU_CLEAR: u8 = 1;
 const GPU_PIXEL: u8 = 2;
@@ -35,6 +42,12 @@ const GPU_POLY: u8 = 10;
 const GPU_TICKS: u8 = 11;
 const GPU_RTC: u8 = 12;
 const GPU_SOUND: u8 = 13;
+const GPU_NET_OPEN: u8 = 16;
+const GPU_NET_CLOSE: u8 = 17;
+const GPU_NET_SEND: u8 = 18;
+const GPU_NET_RECV: u8 = 19;
+const GPU_NET_INFO: u8 = 20;
+const GPU_WORLD_EMITTERS: u8 = 34;
 const GPU_TILEMAP: u8 = 21;
 const GPU_3D: u8 = 22;
 const GPU_SPRITE_UPLOAD: u8 = 23;
@@ -57,6 +70,7 @@ const GPU_WORLD_TILE_WIDE: u8 = 39;
 const GPU_WORLD_AMMO_WIDE: u8 = 40;
 const GPU_WORLD_RECT_WIDE: u8 = 41;
 const GPU_WORLD_PARTICLE_WIDE: u8 = 42;
+const GPU_WORLD_EMITTERS_WIDE: u8 = 43;
 const GPU_SPRITE_MOVE_WIDE: u8 = 44;
 const GPU_MASK_OVERLAP_WIDE: u8 = 45;
 const GPU_SPRITE_SLOTS: usize = 64;
@@ -64,6 +78,8 @@ const GPU_TILE_COUNT: usize = 256;
 const GPU_TILE_MAX_SIZE: usize = 64;
 const GPU_TILEMAP_MAX_SIZE: usize = 1024;
 const GPU_SPRITE_MAX_SIZE: i32 = 64;
+const DISK_BLOCK_SIZE: usize = 256;
+const DISK_MAX_FILE_READ_SIZE: usize = 4096;
 const GPU3D_FILL: u16 = 1;
 const GPU3D_WIREFRAME: u16 = 2;
 const GPU3D_SIN_8_8: [i32; 64] = [
@@ -237,6 +253,9 @@ pub struct Cpu {
     pub gpu_triangles: Vec<GpuTriangle>,
     pub gpu_lines: Vec<GpuLine>,
     sound_commands: [Option<GpuSoundCommand>; 4],
+    disk: DiskDevice,
+    network: Option<NetNode>,
+    network_port: u16,
     sprites: [Option<GpuSprite>; GPU_SPRITE_SLOTS],
     sprite_descriptors: [(i32, i32, u8); GPU_SPRITE_SLOTS],
     tile_memory: Vec<u8>,
@@ -320,6 +339,9 @@ impl Cpu {
             gpu_triangles: Vec::new(),
             gpu_lines: Vec::new(),
             sound_commands: [None; 4],
+            disk: DiskDevice::new(PathBuf::from("disks")),
+            network: None,
+            network_port: DEFAULT_PORT,
             sprites: std::array::from_fn(|_| None),
             sprite_descriptors: [(0, 0, 0); GPU_SPRITE_SLOTS],
             tile_memory,
@@ -384,12 +406,244 @@ impl Cpu {
         }
     }
 
+    pub fn configure_disk(
+        &mut self,
+        storage_dir: PathBuf,
+        module_file_root: PathBuf,
+    ) -> Result<(), String> {
+        let mut disk = DiskDevice::new(storage_dir);
+        disk.set_file_root(module_file_root)?;
+        self.disk = disk;
+        Ok(())
+    }
+
+    pub fn mount_data_disk(&mut self, disk_id: &str) -> Result<(), String> {
+        if !self.disk.list_disks()?.iter().any(|id| id == disk_id) {
+            return Err(format!("virtual data disk {disk_id:?} does not exist"));
+        }
+        self.disk.load_disk(disk_id)?;
+        self.memory[DISK_STATUS as usize] = 0;
+        Ok(())
+    }
+
+    pub fn set_network_port(&mut self, port: u16) {
+        self.network_port = port;
+    }
+
+    fn disk_register_u16(&self, offset: usize) -> u16 {
+        u16::from_be_bytes([
+            self.memory[DISK_BASE as usize + offset],
+            self.memory[DISK_BASE as usize + offset + 1],
+        ])
+    }
+
+    fn disk_register_u32(&self, offset: usize) -> u32 {
+        u32::from_be_bytes([
+            self.memory[DISK_BASE as usize + offset],
+            self.memory[DISK_BASE as usize + offset + 1],
+            self.memory[DISK_BASE as usize + offset + 2],
+            self.memory[DISK_BASE as usize + offset + 3],
+        ])
+    }
+
+    fn disk_write_result(&mut self, result: u16) {
+        let [high, low] = result.to_be_bytes();
+        self.memory[DISK_BASE as usize + 14] = high;
+        self.memory[DISK_BASE as usize + 15] = low;
+    }
+
+    fn disk_control(&mut self, command: u8) {
+        self.memory[DISK_STATUS as usize] = 0;
+        if let Err(error) = self.disk_control_inner(command) {
+            self.memory[DISK_STATUS as usize] = 1;
+            eprintln!("ERROR: Disk operation failed: {error}");
+        }
+    }
+
+    fn disk_control_inner(&mut self, command: u8) -> Result<(), String> {
+        if command & 0x01 != 0 {
+            let id_bytes = &self.memory[DISK_BASE as usize + 1..DISK_BASE as usize + 9];
+            let disk_id = std::str::from_utf8(id_bytes)
+                .map_err(|_| "disk ID must be ASCII".to_owned())?
+                .to_owned();
+            self.disk.load_disk(&disk_id)?;
+            self.disk_write_result(u16::from(self.disk.is_protected(&disk_id)?));
+        }
+        if command & 0x20 != 0 {
+            let protected = self.disk_register_u16(10) != 0;
+            self.disk.set_protected(protected)?;
+            self.disk_write_result(u16::from(protected));
+        }
+        if command & 0x02 != 0 {
+            self.disk.unload_disk()?;
+        }
+        if command & 0x04 != 0 {
+            let pointer = self.disk_register_u16(10);
+            let offset = usize::from(self.disk_register_u16(12));
+            let address = RAM_START as usize + offset;
+            let block = self.disk.read_block(pointer)?;
+            for (index, byte) in block.into_iter().enumerate() {
+                self.memory[(address + index) & self.memory_mask as usize] = byte;
+            }
+        }
+        if command & 0x10 != 0 {
+            let index = usize::from(self.disk_register_u16(10));
+            let offset = usize::from(self.disk_register_u16(12));
+            let disks = self.disk.list_disks()?;
+            self.disk_write_result(disks.len().min(u16::MAX as usize) as u16);
+            let name = disks.get(index).map(String::as_str).unwrap_or("");
+            let base = (RAM_START as usize + offset) & self.memory_mask as usize;
+            for (position, byte) in name.bytes().chain([0]).enumerate() {
+                self.memory[(base + position) & self.memory_mask as usize] = byte;
+            }
+            let protected = if name.is_empty() {
+                0
+            } else {
+                u8::from(self.disk.is_protected(name)?)
+            };
+            self.memory[(base + 9) & self.memory_mask as usize] = protected;
+        }
+        if command & 0x80 != 0 {
+            let index = usize::from(self.disk_register_u16(10));
+            let buffer_address = self.disk_register_u32(26) as usize;
+            let capacity = usize::from(self.disk_register_u16(30));
+            let files = self.disk.list_files()?;
+            self.disk_write_result(files.len().min(u16::MAX as usize) as u16);
+            let name = files.get(index).map(String::as_str).unwrap_or("");
+            let encoded = name.as_bytes();
+            let length = encoded.len() + 1;
+            if length > capacity
+                || buffer_address
+                    .checked_add(length)
+                    .is_none_or(|end| end > self.memory.len())
+            {
+                return Err("virtual file name buffer is too small".to_owned());
+            }
+            self.memory[buffer_address..buffer_address + encoded.len()].copy_from_slice(encoded);
+            self.memory[buffer_address + encoded.len()] = 0;
+        }
+        if command & 0x40 != 0 {
+            let path_address = self.disk_register_u32(22) as usize;
+            let buffer_address = self.disk_register_u32(26) as usize;
+            let file_offset = self.disk_register_u32(18);
+            let length = usize::from(self.disk_register_u16(30)).min(DISK_MAX_FILE_READ_SIZE);
+            let _buffer_end = buffer_address
+                .checked_add(length)
+                .filter(|end| *end <= self.memory.len())
+                .ok_or_else(|| "virtual file address is outside memory".to_owned())?;
+            let mut path_bytes = Vec::new();
+            let mut terminated = false;
+            for offset in 0..=128usize {
+                let address = path_address
+                    .checked_add(offset)
+                    .filter(|address| *address < self.memory.len())
+                    .ok_or_else(|| "virtual file path exceeds memory".to_owned())?;
+                let byte = self.memory[address];
+                if byte == 0 {
+                    terminated = true;
+                    break;
+                }
+                path_bytes.push(byte);
+            }
+            if !terminated {
+                return Err("virtual file path is not null-terminated".to_owned());
+            }
+            let path = std::str::from_utf8(&path_bytes)
+                .map_err(|_| "virtual file path must be ASCII".to_owned())?;
+            if !path.is_ascii() {
+                return Err("virtual file path must be ASCII".to_owned());
+            }
+            let (data, file_size) = self.disk.read_file(path, file_offset, length)?;
+            self.memory[buffer_address..buffer_address + data.len()].copy_from_slice(&data);
+            self.disk_write_result(data.len().min(u16::MAX as usize) as u16);
+            self.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36]
+                .copy_from_slice(&file_size.to_be_bytes());
+        }
+        if command & 0x08 != 0 {
+            let pointer = self.disk_register_u16(10);
+            let offset = usize::from(self.disk_register_u16(12));
+            let base = RAM_START as usize + offset;
+            let data = (0..DISK_BLOCK_SIZE)
+                .map(|index| self.memory[(base + index) & self.memory_mask as usize])
+                .collect::<Vec<_>>();
+            self.disk.write_block(pointer, &data)?;
+        }
+        Ok(())
+    }
+
+    fn gpu_network(&mut self, command: u8, query: u8, argument: i16) {
+        if self.network.is_none() {
+            self.network = Some(NetNode::new(self.network_port));
+        }
+        let mut node = self.network.take().expect("network node initialized");
+        node.poll();
+        let source = self.gpu_source();
+        match command {
+            GPU_NET_OPEN => {
+                let mut title = Vec::with_capacity(16);
+                for offset in 0..16u32 {
+                    let byte = self.memory
+                        [source.wrapping_add(offset) as usize & self.memory_mask as usize];
+                    if byte == 0 {
+                        break;
+                    }
+                    title.push(byte);
+                }
+                match node.open(&title) {
+                    Ok(opened) => self.set_gpu_result(u16::from(opened)),
+                    Err(error) => {
+                        eprintln!("ERROR: Network open failed: {error}");
+                        self.set_gpu_result(0);
+                    }
+                }
+            }
+            GPU_NET_CLOSE => node.close(),
+            GPU_NET_SEND => {
+                let length = usize::try_from(argument.max(0)).unwrap_or_default().min(48);
+                let data = (0..length)
+                    .map(|offset| {
+                        self.memory[source.wrapping_add(offset as u32) as usize
+                            & self.memory_mask as usize]
+                    })
+                    .collect::<Vec<_>>();
+                self.set_gpu_result(u16::from(node.send(&data)));
+            }
+            GPU_NET_RECV => {
+                if let Some((_, data)) = node.receive() {
+                    for (offset, byte) in data.iter().copied().enumerate() {
+                        self.memory[source.wrapping_add(offset as u32) as usize
+                            & self.memory_mask as usize] = byte;
+                    }
+                    self.set_gpu_result(data.len() as u16);
+                } else {
+                    self.set_gpu_result(0);
+                }
+            }
+            GPU_NET_INFO => {
+                let value = match query {
+                    0 => node.players(),
+                    1 => node.slot() as u16,
+                    2 => u16::from(argument >= 0 && node.active(argument as u16)),
+                    3 => u16::from(node.is_full()),
+                    4 => node.last_sender(),
+                    5 => u16::from(node.ready()),
+                    6 => u16::from(node.is_open()),
+                    _ => 0,
+                };
+                self.set_gpu_result(value);
+            }
+            _ => {}
+        }
+        self.network = Some(node);
+    }
+
     pub fn write(&mut self, address: u32, value: u8) {
         let address = address & self.memory_mask;
         let index = address as usize;
         self.memory[index] = value;
         match address {
             GPU_BASE => self.gpu_command(value),
+            DISK_BASE => self.disk_control(value),
             GPU_MODE_ADDR => {
                 if self.layer_mode != value {
                     self.layer_mode = value;
@@ -1563,6 +1817,167 @@ impl Cpu {
         self.set_gpu_result(0);
     }
 
+    fn gpu_world_mask(&mut self, pixels: &[u8], width: usize, height: usize, x: i32, y: i32) {
+        let layer =
+            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let origin_x = x.saturating_sub((width / 2) as i32);
+        let origin_y = y.saturating_sub((height / 2) as i32);
+        for (left, top, right, bottom, dx, dy, stride) in
+            self.gpu_world_views(origin_x, origin_y, width as i32, height as i32)
+        {
+            for world_y in top..bottom {
+                let source_y = (world_y - i64::from(origin_y)) as usize;
+                for world_x in left..right {
+                    let source_x = (world_x - i64::from(origin_x)) as usize;
+                    let pixel = pixels[source_y * width + source_x];
+                    if pixel != 0 {
+                        let color = if matches!(pixel, 1 | 10 | 11) { 10 } else { 12 };
+                        let screen_x = world_x + dx;
+                        let screen_y = world_y + dy;
+                        self.layers[layer][(screen_y * stride + screen_x) as usize] = color;
+                    }
+                }
+            }
+        }
+    }
+
+    fn gpu_world_emitters(&mut self, wide: bool, source: u32, count: i32, tick: i32) {
+        let layer =
+            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let record_size = if wide { 12usize } else { 8 };
+        if layer == 0 || count < 0 {
+            self.set_gpu_result(1);
+            return;
+        }
+        let length = match (count as usize).checked_mul(record_size) {
+            Some(length) => length,
+            None => {
+                self.set_gpu_result(1);
+                return;
+            }
+        };
+        let Some(end) = (source as usize).checked_add(length) else {
+            self.set_gpu_result(1);
+            return;
+        };
+        if end > self.memory.len() {
+            self.set_gpu_result(1);
+            return;
+        }
+        let read_i16 = |address: usize| {
+            i16::from_be_bytes([self.memory[address], self.memory[address + 1]]) as i32
+        };
+        let read_i32 = |address: usize| {
+            i32::from_be_bytes([
+                self.memory[address],
+                self.memory[address + 1],
+                self.memory[address + 2],
+                self.memory[address + 3],
+            ])
+        };
+        let records = (0..count as usize)
+            .map(|index| {
+                let address = source as usize + index * record_size;
+                if wide {
+                    (
+                        read_i32(address),
+                        read_i32(address + 4),
+                        read_i16(address + 8),
+                        read_i16(address + 10),
+                    )
+                } else {
+                    (
+                        read_i16(address),
+                        read_i16(address + 2),
+                        read_i16(address + 4),
+                        read_i16(address + 6),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut drawn_sites = HashSet::new();
+        let mut smoke_cells = HashSet::new();
+        for (index, (x, y, life, mask)) in records.into_iter().enumerate() {
+            if life <= 0
+                || self
+                    .gpu_world_views(x.saturating_sub(24), y.saturating_sub(56), 48, 80)
+                    .is_empty()
+                || !drawn_sites.insert((x, y, mask))
+            {
+                continue;
+            }
+            let wreck = if mask >= 0 {
+                match self.collision_mask(mask as u16) {
+                    Some((width, height, pixels)) => {
+                        self.gpu_world_mask(&pixels, width, height, x, y);
+                        true
+                    }
+                    None => {
+                        self.set_gpu_result(1);
+                        return;
+                    }
+                }
+            } else {
+                false
+            };
+            self.gpu_world_disc(x, y.saturating_add(2), if wreck { 10 } else { 4 }, 10, 12);
+            self.gpu_world_disc(
+                x,
+                y,
+                if wreck { 3 } else { 1 },
+                if (tick + index as i32).rem_euclid(6) < 3 {
+                    8
+                } else {
+                    5
+                },
+                16,
+            );
+            let cell = (x.div_euclid(16), y.div_euclid(16));
+            if !smoke_cells.insert(cell) {
+                continue;
+            }
+            for particle in 0..if wreck { 8 } else { 4 } {
+                let seed =
+                    (index as i64 * 137 + particle * 71 + i64::from(x) * 13 + i64::from(y) * 7)
+                        .rem_euclid(0x1_0000) as i32;
+                let age = (tick + seed).rem_euclid(36);
+                let drift = seed.rem_euclid(7) - 3;
+                let px = x
+                    .saturating_add(seed.rem_euclid(9) - 4)
+                    .saturating_add((drift * age).div_euclid(24));
+                let py = y.saturating_sub(age * (if wreck { 2 } else { 1 }) / 3);
+                if age < 16 {
+                    let radius = ((if wreck { 5 } else { 3 }) - age / 5).max(1);
+                    self.gpu_world_disc(
+                        px,
+                        py,
+                        radius,
+                        if age < 5 {
+                            5
+                        } else if age < 11 {
+                            8
+                        } else {
+                            11
+                        },
+                        16,
+                    );
+                    if age < 5 {
+                        self.gpu_world_disc(px, py, 1, 1, 12);
+                    }
+                } else {
+                    self.gpu_world_disc(
+                        px,
+                        py,
+                        2 + age / 8,
+                        if age < 26 { 10 } else { 9 },
+                        ((36 - age) / 2).max(1),
+                    );
+                }
+            }
+        }
+        self.set_gpu_result(0);
+    }
+
     fn screen_size(&self) -> (i32, i32) {
         if self.memory[GPU_MODE_ADDR as usize] == 1 {
             (640, 480)
@@ -1894,6 +2309,9 @@ impl Cpu {
                 };
                 self.sound_commands[command.channel as usize] = Some(command);
             }
+            GPU_NET_OPEN..=GPU_NET_INFO => {
+                self.gpu_network(command, color, self.gpu_word(2))
+            }
             GPU_PALETTE => {
                 let red = self.gpu_word(2) as u8;
                 let green = self.gpu_word(4) as u8;
@@ -1992,6 +2410,7 @@ impl Cpu {
             GPU_WORLD_AMMO => self.gpu_world_ammo(x, y),
             GPU_WORLD_RECT => self.gpu_world_rect(x, y, w, h, color),
             GPU_WORLD_PARTICLE => self.gpu_world_disc(x, y, w, color, h),
+            GPU_WORLD_EMITTERS => self.gpu_world_emitters(false, self.gpu_source(), x, y),
             GPU_SPRITE_MOVE_WIDE => {
                 let sprite_x = self.gpu_wide_field(2, 24);
                 let sprite_y = self.gpu_wide_field(4, 26);
@@ -2038,6 +2457,7 @@ impl Cpu {
                 color,
                 h,
             ),
+            GPU_WORLD_EMITTERS_WIDE => self.gpu_world_emitters(true, self.gpu_source(), x, y),
             GPU_3D => self.gpu_3d(self.gpu_source()),
             GPU_SAVE => {
                 let (width, height) = self.screen_size();
@@ -2713,6 +3133,172 @@ mod tests {
         cpu.write_u16(GPU_BASE + 6, 33);
         cpu.write(GPU_BASE, GPU_WORLD_PARTICLE);
         assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+    }
+
+    #[test]
+    fn world_emitters_draw_fire_smoke_and_uploaded_wreck_masks() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_LAYER_SELECT, 2);
+        cpu.memory[0x1000..0x1008].copy_from_slice(&[0, 100, 0, 100, 0, 1, 0xff, 0xff]);
+        cpu.write_u16(GPU_BASE + 10, 0x1000);
+        cpu.write_u16(GPU_BASE + 2, 1);
+        cpu.write_u16(GPU_BASE + 4, 0);
+        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        assert!(cpu.layers[2][100 * 320 + 100] != 0);
+
+        let tile_mask = GPU_SPRITE_SLOTS as u16;
+        cpu.tile_memory[..16 * 16].fill(1);
+        cpu.memory[0x1010..0x1018].copy_from_slice(&[0, 120, 0, 120, 0, 1, 0, tile_mask as u8]);
+        cpu.write_u16(GPU_BASE + 10, 0x1010);
+        cpu.write_u16(GPU_BASE + 2, 1);
+        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        assert_eq!(cpu.layers[2][112 * 320 + 112], 10);
+    }
+
+    #[test]
+    fn world_emitter_commands_reject_invalid_buffers_and_layers() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write_u16(GPU_BASE + 10, 0xffff);
+        cpu.write_u16(GPU_BASE + 2, 2);
+        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+
+        cpu.write(GPU_LAYER_SELECT, 0);
+        cpu.write_u16(GPU_BASE + 10, 0);
+        cpu.write_u16(GPU_BASE + 2, 0);
+        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+    }
+
+    #[test]
+    fn wide_world_emitters_use_camera_adjusted_32_bit_coordinates() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_LAYER_SELECT, 2);
+        cpu.write_u16(GPU_BASE + 2, 69_990u32 as u16);
+        cpu.write_u16(GPU_BASE + 24, 1);
+        cpu.write_u16(GPU_BASE + 4, 90);
+        cpu.write_u16(GPU_BASE + 26, 0);
+        cpu.write(GPU_BASE, GPU_TILE_CAMERA_WIDE);
+        assert_eq!(cpu.tile_camera, (69_990, 90));
+        cpu.memory[0x2000..0x200c]
+            .copy_from_slice(&[0, 1, 0x11, 0x70, 0, 0, 0, 100, 0, 1, 0xff, 0xff]);
+        cpu.write_u16(GPU_BASE + 10, 0x2000);
+        cpu.write_u16(GPU_BASE + 2, 1);
+        cpu.write_u16(GPU_BASE + 4, 0);
+        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS_WIDE);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        assert!(cpu.layers[2][10 * 320 + 10] != 0);
+    }
+
+    #[test]
+    fn disk_mmio_loads_persists_reads_and_enforces_write_protection() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-cpu-disk-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let module_files = root.join("module");
+        std::fs::create_dir_all(&module_files).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.configure_disk(root.join("disks"), module_files.clone())
+            .unwrap();
+        cpu.memory[DISK_BASE as usize + 1..DISK_BASE as usize + 9].copy_from_slice(b"TEST0001");
+        cpu.write(DISK_BASE, 1);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+
+        cpu.write_u16(DISK_BASE + 10, 7);
+        cpu.write_u16(DISK_BASE + 12, 0x20);
+        let block_start = RAM_START as usize + 0x20;
+        for index in 0..DISK_BLOCK_SIZE {
+            cpu.memory[block_start + index] = index as u8;
+        }
+        cpu.write(DISK_BASE, 8);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+
+        cpu.write_u16(DISK_BASE + 12, 0x300);
+        cpu.memory[RAM_START as usize + 0x300..RAM_START as usize + 0x400].fill(0);
+        cpu.write(DISK_BASE, 4);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(
+            &cpu.memory[RAM_START as usize + 0x300..RAM_START as usize + 0x400],
+            &(0..256).map(|value| value as u8).collect::<Vec<_>>()
+        );
+
+        cpu.write_u16(DISK_BASE + 10, 1);
+        cpu.write(DISK_BASE, 0x20);
+        cpu.write(DISK_BASE, 8);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+
+        cpu.write(DISK_BASE, 2);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert!(root.join("disks").join("TEST0001.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_mmio_reads_virtual_files_and_lists_module_disk_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-cpu-files-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("module")).unwrap();
+        std::fs::write(root.join("module").join("hello.txt"), b"hello world").unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.configure_disk(root.join("disks"), root.join("module"))
+            .unwrap();
+        cpu.memory[0x1000..0x100a].copy_from_slice(b"hello.txt\0");
+        cpu.write_u32(DISK_BASE + 18, 6);
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u32(DISK_BASE + 26, 0x1100);
+        cpu.write_u16(DISK_BASE + 30, 4);
+        cpu.write(DISK_BASE, 0x40);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(cpu.disk_register_u16(14), 4);
+        assert_eq!(&cpu.memory[0x1100..0x1104], b"worl");
+        assert_eq!(cpu.disk_register_u32(32), 11);
+
+        cpu.write_u16(DISK_BASE + 10, 0);
+        cpu.write_u32(DISK_BASE + 26, 0x1200);
+        cpu.write_u16(DISK_BASE + 30, 32);
+        cpu.write(DISK_BASE, 0x80);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(&cpu.memory[0x1200..0x120a], b"hello.txt\0");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_network_commands_open_query_send_and_close_peer() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.set_network_port(0);
+        cpu.memory[0x1000..0x1005].copy_from_slice(b"game\0");
+        cpu.write_u16(GPU_BASE + 10, 0x1000);
+        cpu.write(GPU_BASE, GPU_NET_OPEN);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+
+        cpu.write(GPU_BASE + 1, 0);
+        cpu.write(GPU_BASE, GPU_NET_INFO);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+        cpu.write(GPU_BASE + 1, 1);
+        cpu.write(GPU_BASE, GPU_NET_INFO);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+
+        cpu.memory[0x1100..0x1104].copy_from_slice(b"data");
+        cpu.write_u16(GPU_BASE + 10, 0x1100);
+        cpu.write_u16(GPU_BASE + 2, 4);
+        cpu.write(GPU_BASE, GPU_NET_SEND);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
+
+        cpu.write(GPU_BASE, GPU_NET_CLOSE);
+        cpu.write(GPU_BASE + 1, 6);
+        cpu.write(GPU_BASE, GPU_NET_INFO);
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
     }
 
     #[test]

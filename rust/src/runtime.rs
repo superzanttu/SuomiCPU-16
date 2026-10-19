@@ -1,5 +1,6 @@
 use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle};
 use crate::image::{ImageError, ProgramImage, build_source, load_binary};
+use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, Rect, Texture2D, WHITE,
@@ -282,6 +283,16 @@ pub async fn run(
     program: Option<&Path>,
     fullscreen: bool,
 ) -> Result<(), RuntimeError> {
+    run_with_devices(root, program, fullscreen, None, DEFAULT_PORT).await
+}
+
+pub async fn run_with_devices(
+    root: &Path,
+    program: Option<&Path>,
+    fullscreen: bool,
+    disk_id: Option<&str>,
+    network_port: u16,
+) -> Result<(), RuntimeError> {
     if !root.join("tools").join("sc16_build_image.py").is_file() {
         return Err(RuntimeError::MissingBuildTools(
             root.join("tools").join("sc16_build_image.py"),
@@ -290,11 +301,16 @@ pub async fn run(
     set_fullscreen(fullscreen);
 
     let mut cpu = Cpu::new();
+    cpu.set_network_port(network_port);
     let font = load_font();
     let mut pixels = vec![0u32; 640 * 480];
     let mut canvas = Canvas::new();
     let mut audio = AudioEngine::new();
     if let Some(source) = program {
+        configure_disk(&mut cpu, root, source)?;
+        if let Some(disk_id) = disk_id {
+            cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
+        }
         let image = build_program(root, source)?;
         cpu.load_program(&image.segments, image.entry_point)
             .map_err(|error| RuntimeError::Window(error.to_string()))?;
@@ -305,7 +321,17 @@ pub async fn run(
                 "no runnable C modules were found in modules/".to_owned(),
             ));
         }
-        if !select_and_boot(root, &mut cpu, &mut canvas, &mut pixels, &font, &modules).await? {
+        if !select_and_boot(
+            root,
+            &mut cpu,
+            &mut canvas,
+            &mut pixels,
+            &font,
+            &modules,
+            disk_id,
+        )
+        .await?
+        {
             return Ok(());
         }
     }
@@ -363,7 +389,22 @@ pub async fn run(
 }
 
 pub fn run_headless(root: &Path, program: &Path, budget: usize) -> Result<usize, RuntimeError> {
+    run_headless_with_devices(root, program, budget, None, DEFAULT_PORT)
+}
+
+pub fn run_headless_with_devices(
+    root: &Path,
+    program: &Path,
+    budget: usize,
+    disk_id: Option<&str>,
+    network_port: u16,
+) -> Result<usize, RuntimeError> {
     let mut cpu = Cpu::new();
+    cpu.set_network_port(network_port);
+    configure_disk(&mut cpu, root, program)?;
+    if let Some(disk_id) = disk_id {
+        cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
+    }
     let image = build_program(root, program)?;
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| RuntimeError::Window(error.to_string()))?;
@@ -458,6 +499,7 @@ async fn select_and_boot(
     pixels: &mut [u32],
     font: &[[u8; 8]],
     modules: &[BootModule],
+    disk_id: Option<&str>,
 ) -> Result<bool, RuntimeError> {
     let mut selected = 0usize;
     loop {
@@ -526,12 +568,25 @@ async fn select_and_boot(
                 .source
                 .as_ref()
                 .expect("valid boot module has a source");
+            configure_disk(cpu, root, source)?;
+            if let Some(disk_id) = disk_id {
+                cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
+            }
             let image = build_program(root, source)?;
             cpu.load_program(&image.segments, image.entry_point)
                 .map_err(|error| RuntimeError::Window(error.to_string()))?;
             return Ok(true);
         }
     }
+}
+
+fn configure_disk(cpu: &mut Cpu, root: &Path, source: &Path) -> Result<(), RuntimeError> {
+    let module_disk = source
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("disks");
+    cpu.configure_disk(root.join("disks"), module_disk)
+        .map_err(RuntimeError::Window)
 }
 
 fn update_keys(cpu: &mut Cpu, previous: &HashSet<KeyCode>, current: &HashSet<KeyCode>) {

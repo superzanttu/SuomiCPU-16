@@ -15,23 +15,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut program = None;
     let mut fullscreen = false;
     let mut headless = false;
-    let arguments = std::env::args_os().skip(1);
-    for argument in arguments {
+    let mut disk_id = None;
+    let mut network_port = suomicpu16::net::DEFAULT_PORT;
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
         if argument == "--help" || argument == "-h" {
-            println!("Usage: suomicpu16 [--fullscreen] [PROGRAM.asm|PROGRAM.c|PROGRAM.bin]");
-            println!("       suomicpu16 --headless PROGRAM.asm|PROGRAM.c|PROGRAM.bin");
+            println!(
+                "Usage: suomicpu16 [--fullscreen] [--disk ID] [--net-port PORT] [PROGRAM.asm|PROGRAM.c|PROGRAM.bin]"
+            );
+            println!(
+                "       suomicpu16 --headless [--disk ID] [--net-port PORT] PROGRAM.asm|PROGRAM.c|PROGRAM.bin"
+            );
             println!("Without a program, open the BIOS module selector.");
             return Ok(());
         } else if argument == "--fullscreen" {
             fullscreen = true;
         } else if argument == "--headless" {
             headless = true;
-        } else if argument == "--disk" || argument == "--net-port" {
-            return Err(format!(
-                "{} is not available in the Rust runtime yet",
-                argument.to_string_lossy()
-            )
-            .into());
+        } else if argument == "--disk" {
+            let value = arguments
+                .next()
+                .ok_or("--disk requires an 8-character disk ID")?;
+            disk_id = Some(value.into_string().map_err(|_| "disk ID must be ASCII")?);
+        } else if argument == "--net-port" {
+            let value = arguments
+                .next()
+                .ok_or("--net-port requires a UDP port number")?;
+            let value = value.into_string().map_err(|_| "UDP port must be ASCII")?;
+            network_port = value
+                .parse::<u16>()
+                .map_err(|_| format!("invalid UDP port: {value}"))?;
         } else if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option: {}", argument.to_string_lossy()).into());
         } else if program.is_some() {
@@ -55,18 +68,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let path = Path::new(&path);
         if headless {
-            let steps = suomicpu16::runtime::run_headless(&root, path, 50_000_000)?;
+            let steps = suomicpu16::runtime::run_headless_with_devices(
+                &root,
+                path,
+                50_000_000,
+                disk_id.as_deref(),
+                network_port,
+            )?;
             println!("Program halted after {steps} instructions.");
             return Ok(());
         }
-        return suomicpu16::runtime::run(&root, Some(path), fullscreen)
-            .await
-            .map_err(Into::into);
+        return suomicpu16::runtime::run_with_devices(
+            &root,
+            Some(path),
+            fullscreen,
+            disk_id.as_deref(),
+            network_port,
+        )
+        .await
+        .map_err(Into::into);
     }
     if headless {
         return Err("--headless requires a program file".into());
     }
-    suomicpu16::runtime::run(&root, None, fullscreen)
+    suomicpu16::runtime::run_with_devices(&root, None, fullscreen, disk_id.as_deref(), network_port)
         .await
         .map_err(Into::into)
 }

@@ -102,6 +102,19 @@ The browser build is not yet a standalone web release: module discovery and
 source compilation still rely on the host filesystem and the Python assembler
 and C compiler.
 
+Run a program with optional persistent data-disk and LAN settings:
+
+```console
+cargo run -- "modules\Netgame Demo\net_game_demo.c" --net-port 47016
+cargo run -- --headless "modules\DiskEditor\disk_editor.c"
+```
+
+Virtual block disks are stored as JSON files in `disks/`. A program's virtual
+file area is read from the `disks/` folder beside its source file. Networking
+uses UDP broadcast on the selected port in native builds; browser builds do
+not provide UDP networking. Use `--disk DISK0001` to mount an existing
+`disks/DISK0001.json` for a run.
+
 <!-- module-gif-gallery:start -->
 ## Module gallery
 
