@@ -156,6 +156,118 @@ pub struct ExpressionParser {
     position: usize,
 }
 
+fn evaluate_integer_constant(expression: &Expression) -> Result<i64, CCompilerError> {
+    let fail = || {
+        error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "expected an integer constant expression",
+        )
+    };
+    match &expression.kind {
+        ExpressionKind::Atom(value) => parse_integer_constant(value).ok_or_else(fail),
+        ExpressionKind::Unary { operator, operand } => {
+            let value = evaluate_integer_constant(operand)?;
+            match operator.as_str() {
+                "+" => Ok(value),
+                "-" => value.checked_neg().ok_or_else(fail),
+                "!" => Ok(i64::from(value == 0)),
+                "~" => Ok((!(value as u32)) as i32 as i64),
+                _ => Err(fail()),
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left = evaluate_integer_constant(left)?;
+            if operator == "&&" && left == 0 {
+                return Ok(0);
+            }
+            if operator == "||" && left != 0 {
+                return Ok(1);
+            }
+            let right = evaluate_integer_constant(right)?;
+            let result = match operator.as_str() {
+                "||" => i64::from(right != 0),
+                "&&" => i64::from(right != 0),
+                "|" => (left as u32 | right as u32) as i32 as i64,
+                "^" => (left as u32 ^ right as u32) as i32 as i64,
+                "&" => (left as u32 & right as u32) as i32 as i64,
+                "==" => i64::from(left == right),
+                "!=" => i64::from(left != right),
+                "<" => i64::from(left < right),
+                "<=" => i64::from(left <= right),
+                ">" => i64::from(left > right),
+                ">=" => i64::from(left >= right),
+                "<<" if (0..32).contains(&right) => {
+                    ((left as u32).wrapping_shl(right as u32)) as i32 as i64
+                }
+                ">>" if (0..32).contains(&right) => ((left as i32) >> (right as u32)) as i64,
+                "+" => left.checked_add(right).ok_or_else(fail)?,
+                "-" => left.checked_sub(right).ok_or_else(fail)?,
+                "*" => left.checked_mul(right).ok_or_else(fail)?,
+                "/" if right != 0 => left.checked_div(right).ok_or_else(fail)?,
+                "%" if right != 0 => left.checked_rem(right).ok_or_else(fail)?,
+                _ => return Err(fail()),
+            };
+            Ok(result)
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            if evaluate_integer_constant(condition)? != 0 {
+                evaluate_integer_constant(when_true)
+            } else {
+                evaluate_integer_constant(when_false)
+            }
+        }
+        _ => Err(fail()),
+    }
+}
+
+fn parse_integer_constant(token: &str) -> Option<i64> {
+    let suffix_start = token.find(['u', 'U', 'l', 'L']).unwrap_or(token.len());
+    let digits = &token[..suffix_start];
+    let suffix = &token[suffix_start..];
+    if !suffix
+        .chars()
+        .all(|character| matches!(character, 'u' | 'U' | 'l' | 'L'))
+        || suffix.len() > 2
+        || suffix
+            .chars()
+            .filter(|character| matches!(character, 'u' | 'U'))
+            .count()
+            > 1
+        || suffix
+            .chars()
+            .filter(|character| matches!(character, 'l' | 'L'))
+            .count()
+            > 1
+    {
+        return None;
+    }
+    let (base, number) = if let Some(number) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, number)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+    let value = if number.is_empty() && base == 8 {
+        0
+    } else {
+        i64::from_str_radix(number, base).ok()?
+    };
+    (value <= i64::from(u32::MAX)).then_some(value)
+}
+
 pub struct StatementParser {
     expressions: ExpressionParser,
 }
@@ -809,20 +921,7 @@ impl StatementParser {
                 }
             }
             let name = self.expect_identifier("expected a variable name")?;
-            let array_length = if self.accept("[").is_some() {
-                let length_token = self.expressions.advance();
-                let length = length_token.value.parse::<usize>().map_err(|_| {
-                    error(
-                        length_token.filename.as_deref().unwrap_or("<source>"),
-                        length_token.line,
-                        "array length must be a non-negative integer constant",
-                    )
-                })?;
-                self.expect("]")?;
-                Some(length)
-            } else {
-                None
-            };
+            let array_length = self.parse_array_suffix()?;
             let initializer = if self.accept("=").is_some() {
                 if array_length.is_some() && self.at("{") {
                     return Err(self
@@ -845,6 +944,22 @@ impl StatementParser {
         }
         self.expect(";")?;
         Ok(self.statement(&start, StatementKind::Declaration(declarations)))
+    }
+
+    fn parse_array_suffix(&mut self) -> Result<Option<usize>, CCompilerError> {
+        if self.accept("[").is_none() {
+            return Ok(None);
+        }
+        let expression = self.expressions.parse_expression(0)?;
+        self.expect("]")?;
+        let value = evaluate_integer_constant(&expression)?;
+        usize::try_from(value).map(Some).map_err(|_| {
+            error(
+                expression.filename.as_deref().unwrap_or("<source>"),
+                expression.line,
+                "array length must be a non-negative integer constant",
+            )
+        })
     }
 }
 
@@ -995,22 +1110,16 @@ impl TranslationUnitParser {
         if self.statements.accept("[").is_none() {
             return Ok(None);
         }
-        let token = self.statements.expressions.advance();
-        let digits = token
-            .value
-            .strip_prefix("0x")
-            .or_else(|| token.value.strip_prefix("0X"))
-            .map(|value| usize::from_str_radix(value, 16))
-            .unwrap_or_else(|| token.value.parse::<usize>());
-        let length = digits.map_err(|_| {
-            error(
-                token.filename.as_deref().unwrap_or("<source>"),
-                token.line,
-                "array length must be an integer constant",
-            )
-        })?;
+        let expression = self.statements.expressions.parse_expression(0)?;
         self.statements.expect("]")?;
-        Ok(Some(length))
+        let length = evaluate_integer_constant(&expression)?;
+        usize::try_from(length).map(Some).map_err(|_| {
+            error(
+                expression.filename.as_deref().unwrap_or("<source>"),
+                expression.line,
+                "array length must be a non-negative integer constant",
+            )
+        })
     }
 
     fn parse_parameters(&mut self) -> Result<(Vec<FunctionParameter>, bool), CCompilerError> {
@@ -1848,5 +1957,67 @@ mod tests {
                 .to_string()
                 .starts_with("bad.c:1: expected an external identifier")
         );
+    }
+
+    #[test]
+    fn evaluates_integer_constant_expressions_for_array_bounds() {
+        let unit = translation_unit(
+            "int table[2 + 3 * 4]; unsigned char bytes[0x10U]; \
+             int main(void) { int local[(1 << 3) - 2]; return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[..2],
+            [
+                ExternalDeclaration::Global(Declaration {
+                    name: first,
+                    array_length: Some(14),
+                    ..
+                }),
+                ExternalDeclaration::Global(Declaration {
+                    name: second,
+                    array_length: Some(16),
+                    ..
+                }),
+            ] if first == "table" && second == "bytes"
+        ));
+        let ExternalDeclaration::FunctionDefinition(main) = &unit.declarations[2] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &main.body.kind else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].array_length == Some(6)
+        ));
+    }
+
+    #[test]
+    fn rejects_nonconstant_or_invalid_array_bounds() {
+        for (source, expected) in [
+            (
+                "int values[size];",
+                "bounds.c:1: expected an integer constant expression",
+            ),
+            (
+                "int values[4 / 0];",
+                "bounds.c:1: expected an integer constant expression",
+            ),
+            (
+                "int values[-1];",
+                "bounds.c:1: array length must be a non-negative integer constant",
+            ),
+            (
+                "int values[09];",
+                "bounds.c:1: expected an integer constant expression",
+            ),
+        ] {
+            let error = TranslationUnitParser::from_source(source, "bounds.c")
+                .unwrap()
+                .parse()
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected, "source: {source}");
+        }
     }
 }

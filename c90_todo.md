@@ -59,6 +59,9 @@ feature parity or C90 conformance.
   and labels.
 - [x] Basic translation-unit parsing for scalar globals, arrays, function
   prototypes, variadic prototypes, and function definitions.
+- [x] Evaluate integer constant expressions for local and global array bounds
+  (including C integer bases/suffixes and common arithmetic, comparison,
+  logical, and bitwise operators).
 - [ ] Full C90 declarators, typedefs, records, enums, linkage, and initializer
   semantics at translation-unit scope.
 - [ ] C90 preprocessor and include/header compatibility.
