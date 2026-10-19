@@ -1,5 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+*.rs text eol=lf
+*.gitattributes text eol=lf
+*.gitignore text eol=lf
 
 # Tank-16 runtime maps use fixed byte offsets; never convert line endings
 modules/Tank-16/disks/maps/*.json -text

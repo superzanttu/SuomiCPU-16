@@ -12,6 +12,7 @@ const MEMORY_SIZE: u64 = 1 << 30;
 pub enum ImageError {
     Io(io::Error),
     BuildFailed,
+    Assembly(String),
     InvalidFormat(&'static str),
     Cpu(CpuError),
 }
@@ -21,6 +22,7 @@ impl std::fmt::Display for ImageError {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
             Self::BuildFailed => write!(formatter, "Python SC-16 build tool failed"),
+            Self::Assembly(error) => write!(formatter, "SC-16 assembly failed: {error}"),
             Self::InvalidFormat(reason) => write!(formatter, "invalid SC-16 image: {reason}"),
             Self::Cpu(error) => write!(formatter, "{error}"),
         }
@@ -59,6 +61,13 @@ pub fn load_binary(path: &Path) -> Result<ProgramImage, ImageError> {
 }
 
 pub fn build_source(root: &Path, source: &Path, python: &str) -> Result<ProgramImage, ImageError> {
+    if source
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("asm"))
+    {
+        return crate::assembler::assemble_file(source, 0)
+            .map_err(|error| ImageError::Assembly(error.to_string()));
+    }
     let temp_path = unique_temp_path();
     let result = (|| {
         let helper = root.join("tools").join("sc16_build_image.py");
@@ -167,5 +176,16 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn builds_assembly_sources_without_invoking_python() {
+        let path =
+            std::env::temp_dir().join(format!("sc16-assembly-source-{}.asm", std::process::id()));
+        fs::write(&path, "start: LDI R0, 1\nHALT\n").unwrap();
+        let image = build_source(Path::new("."), &path, "python-must-not-be-called").unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(image.entry_point, 0);
+        assert_eq!(image.segments[0].data, b"\x08\x01\x00\x00");
     }
 }

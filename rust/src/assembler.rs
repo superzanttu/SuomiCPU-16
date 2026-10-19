@@ -1,6 +1,8 @@
 use crate::MemorySegment;
 use crate::image::ProgramImage;
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 const MEMORY_SIZE: u32 = 1 << 30;
 
@@ -232,6 +234,578 @@ fn label_delimiter(text: &str) -> Option<usize> {
     None
 }
 
+fn expand_includes(
+    source: &str,
+    base_directory: &Path,
+    include_stack: &mut Vec<PathBuf>,
+) -> Result<String, AssemblyError> {
+    let mut expanded = Vec::new();
+    for (index, source_line) in source.lines().enumerate() {
+        let line = index + 1;
+        let directive = strip_comment(source_line).trim();
+        if !directive.to_ascii_lowercase().starts_with(".include") {
+            expanded.push(source_line.to_owned());
+            continue;
+        }
+        let Some((name, path_text)) = directive.split_once(char::is_whitespace) else {
+            return Err(error(line, ".include expects one quoted file path"));
+        };
+        if !name.eq_ignore_ascii_case(".include") {
+            return Err(error(line, ".include expects one quoted file path"));
+        }
+        let path_text = path_text.trim();
+        let Some(quote @ ('\'' | '"')) = path_text.chars().next() else {
+            return Err(error(line, ".include expects one quoted file path"));
+        };
+        if path_text.len() < 2 || !path_text.ends_with(quote) {
+            return Err(error(line, ".include expects one quoted file path"));
+        }
+        let include_name = &path_text[quote.len_utf8()..path_text.len() - quote.len_utf8()];
+        if include_name.is_empty() {
+            return Err(error(
+                line,
+                ".include expects one non-empty quoted file path",
+            ));
+        }
+        let mut include_path = base_directory.join(include_name);
+        if !include_path.is_file() {
+            let file_name = Path::new(include_name).file_name();
+            let mut ancestor = Some(base_directory);
+            for _ in 0..5 {
+                let Some(current) = ancestor else { break };
+                let found = ["lib", "fonts"]
+                    .iter()
+                    .filter_map(|folder| file_name.map(|name| current.join(folder).join(name)))
+                    .find(|candidate| candidate.is_file());
+                if let Some(found) = found {
+                    include_path = found;
+                    break;
+                }
+                ancestor = current.parent();
+            }
+        }
+        let resolved = include_path.canonicalize().map_err(|io_error| {
+            error(
+                line,
+                format!("cannot include {}: {io_error}", include_path.display()),
+            )
+        })?;
+        if include_stack.contains(&resolved) {
+            let mut cycle: Vec<String> = include_stack
+                .iter()
+                .map(|item| item.display().to_string())
+                .collect();
+            cycle.push(resolved.display().to_string());
+            return Err(error(
+                line,
+                format!("circular .include detected: {}", cycle.join(" -> ")),
+            ));
+        }
+        let included = fs::read_to_string(&resolved).map_err(|io_error| {
+            error(
+                line,
+                format!("cannot include {}: {io_error}", resolved.display()),
+            )
+        })?;
+        let included = included.trim_start_matches('\u{feff}');
+        include_stack.push(resolved.clone());
+        let result = expand_includes(
+            included,
+            resolved.parent().unwrap_or(base_directory),
+            include_stack,
+        );
+        include_stack.pop();
+        expanded.push(result?);
+    }
+    Ok(expanded.join("\n"))
+}
+
+fn is_register(text: &str) -> bool {
+    let text = text.trim();
+    text.len() == 2
+        && matches!(text.as_bytes()[0], b'R' | b'r')
+        && matches!(text.as_bytes()[1], b'0'..=b'7')
+}
+
+fn extended_instruction(
+    mnemonic: &str,
+    operands: &[&str],
+    line: usize,
+    labels: &BTreeMap<String, u32>,
+) -> Result<Option<Vec<u16>>, AssemblyError> {
+    let (opcode, arguments) = match mnemonic {
+        "JMPX" => (Some(0), 1),
+        "CALLX" => (Some(1), 1),
+        "BZX" => (Some(2), 1),
+        "BCX" => (Some(3), 1),
+        _ => (None, 0),
+    };
+    if let Some(operation) = opcode {
+        if operands.len() != arguments {
+            return Err(error(
+                line,
+                format!("{mnemonic} expects one address or label"),
+            ));
+        }
+        let target = labels.get(operands[0]).map_or_else(
+            || parse_number(operands[0], line),
+            |value| Ok(i64::from(*value)),
+        )?;
+        if !(0..i64::from(MEMORY_SIZE)).contains(&target) {
+            return Err(error(
+                line,
+                format!("{mnemonic} target is outside available memory"),
+            ));
+        }
+        return Ok(Some(vec![
+            0xf83e | (operation << 9),
+            ((target as u32 >> 16) & 0x3fff) as u16,
+            target as u16,
+        ]));
+    }
+
+    let branch = match mnemonic {
+        "BNZX" | "BNZ" => Some(0),
+        "BNCX" | "BNC" => Some(1),
+        "BNX" | "BN" => Some(2),
+        "BNNX" | "BNN" => Some(3),
+        "BVX" | "BV" => Some(4),
+        "BNVX" | "BNV" => Some(5),
+        "BLTX" | "BLT" => Some(6),
+        "BGEX" | "BGE" => Some(7),
+        "BGTX" | "BGT" => Some(8),
+        "BLEX" | "BLE" => Some(9),
+        "BHIX" | "BHI" => Some(10),
+        "BLSX" | "BLS" => Some(11),
+        _ => None,
+    };
+    if let Some(condition) = branch {
+        if operands.len() != 1 {
+            return Err(error(
+                line,
+                format!("{mnemonic} expects one address or label"),
+            ));
+        }
+        let target = labels.get(operands[0]).map_or_else(
+            || parse_number(operands[0], line),
+            |value| Ok(i64::from(*value)),
+        )?;
+        if !(0..i64::from(MEMORY_SIZE)).contains(&target) {
+            return Err(error(
+                line,
+                format!("{mnemonic} target is outside available memory"),
+            ));
+        }
+        return Ok(Some(vec![
+            0xf80d | (condition << 7),
+            ((target as u32 >> 16) & 0x3fff) as u16,
+            target as u16,
+        ]));
+    }
+
+    let wide = match mnemonic {
+        "ADD32" => Some(0),
+        "SUB32" => Some(1),
+        "CMP32" => Some(2),
+        "AND32" => Some(3),
+        "OR32" => Some(4),
+        "XOR32" => Some(5),
+        "SHL32" => Some(6),
+        "LSR32" => Some(7),
+        "ASR32" => Some(8),
+        "NEG32" => Some(9),
+        "MOV32" => Some(10),
+        "LD32" => Some(11),
+        "ST32" => Some(12),
+        "MUL32" => Some(13),
+        "DIV32" | "DIV32S" => Some(14),
+        "MOD32" | "MOD32S" => Some(15),
+        _ => None,
+    };
+    if let Some(operation) = wide {
+        let unary = mnemonic == "NEG32";
+        if operands.len() != if unary { 1 } else { 2 } {
+            return Err(error(
+                line,
+                format!(
+                    "{mnemonic} expects {} operand(s)",
+                    if unary { 1 } else { 2 }
+                ),
+            ));
+        }
+        let destination = register(operands[0], line)?;
+        if destination & 1 != 0 {
+            return Err(error(
+                line,
+                format!("{mnemonic} destination must be an even register"),
+            ));
+        }
+        let mut control = operation << 12;
+        let source = if unary {
+            0
+        } else if matches!(mnemonic, "LD32" | "ST32") {
+            let address = register(operands[1], line)?;
+            if address & 1 != 0 {
+                return Err(error(
+                    line,
+                    format!("{mnemonic} address must be an even register"),
+                ));
+            }
+            address
+        } else if matches!(mnemonic, "SHL32" | "LSR32" | "ASR32") && !is_register(operands[1]) {
+            let shift = parse_number(operands[1], line)?;
+            if !(0..=31).contains(&shift) {
+                return Err(error(
+                    line,
+                    format!("{mnemonic} shift count must be between 0 and 31"),
+                ));
+            }
+            control |= 0x0800;
+            shift as u16
+        } else {
+            let source = register(operands[1], line)?;
+            if !matches!(mnemonic, "SHL32" | "LSR32" | "ASR32") && source & 1 != 0 {
+                return Err(error(
+                    line,
+                    format!("{mnemonic} source must be an even register"),
+                ));
+            }
+            if matches!(mnemonic, "DIV32S" | "MOD32S") {
+                control |= 0x0800;
+            }
+            source
+        };
+        return Ok(Some(vec![0xf81a | (destination << 8), control | source]));
+    }
+
+    let muldiv = match mnemonic {
+        "MUL" => Some(0),
+        "MULHU" => Some(1),
+        "MULHS" => Some(2),
+        "DIV" => Some(3),
+        "DIVS" => Some(4),
+        "MOD" => Some(5),
+        "MODS" => Some(6),
+        "LDI19" | "LDI30" | "LDA" => Some(7),
+        "LDP" => Some(8),
+        "STP" => Some(9),
+        "SPLIT30" => Some(10),
+        "JOIN30" => Some(11),
+        _ => None,
+    };
+    if let Some(operation) = muldiv {
+        if operands.len() != 2 {
+            return Err(error(
+                line,
+                format!("{mnemonic} expects a register and a register or immediate"),
+            ));
+        }
+        let destination = register(operands[0], line)?;
+        let first = 0xf81e | (destination << 8);
+        let control = operation << 12;
+        if operation == 7 {
+            let target = labels.get(operands[1]).map_or_else(
+                || parse_number(operands[1], line),
+                |value| Ok(i64::from(*value)),
+            )?;
+            if !(0..i64::from(MEMORY_SIZE)).contains(&target) {
+                return Err(error(
+                    line,
+                    format!("{mnemonic} address is outside available memory"),
+                ));
+            }
+            return Ok(Some(vec![
+                first,
+                control,
+                ((target as u32 >> 16) & 0x3fff) as u16,
+                target as u16,
+            ]));
+        }
+        if matches!(mnemonic, "LDP" | "STP" | "SPLIT30" | "JOIN30") {
+            if !is_register(operands[1]) {
+                return Err(error(line, format!("{mnemonic} expects two registers")));
+            }
+            return Ok(Some(vec![first, control | register(operands[1], line)?]));
+        }
+        if is_register(operands[1]) {
+            return Ok(Some(vec![first, control | register(operands[1], line)?]));
+        }
+        let immediate = parse_number(operands[1], line)?;
+        if !(-0x8000..=0xffff).contains(&immediate) {
+            return Err(error(
+                line,
+                format!("{mnemonic} immediate must fit in 16 bits"),
+            ));
+        }
+        return Ok(Some(vec![first, control | 0x0800, immediate as u16]));
+    }
+
+    let float = match mnemonic {
+        "F32ADD" => Some(0),
+        "F32SUB" => Some(1),
+        "F32MUL" => Some(2),
+        "F32DIV" => Some(3),
+        "F32CMP" => Some(4),
+        "F64ADD" => Some(5),
+        "F64SUB" => Some(6),
+        "F64MUL" => Some(7),
+        "F64DIV" => Some(8),
+        "F64CMP" => Some(9),
+        "I16TOF32" => Some(10),
+        "U16TOF32" => Some(11),
+        "I32TOF32" => Some(12),
+        "U32TOF32" => Some(13),
+        "I16TOF64" => Some(14),
+        "U16TOF64" => Some(15),
+        "I32TOF64" => Some(16),
+        "U32TOF64" => Some(17),
+        "F32TOF64" => Some(18),
+        "F64TOF32" => Some(19),
+        "F32NEG" => Some(20),
+        "F64NEG" => Some(21),
+        "F32SQRT" => Some(22),
+        "F64SQRT" => Some(23),
+        "F32TOI16" => Some(24),
+        "F32TOU16" => Some(25),
+        "F32TOI32" => Some(26),
+        "F32TOU32" => Some(27),
+        "F64TOI16" => Some(28),
+        "F64TOU16" => Some(29),
+        "F64TOI32" => Some(30),
+        "F64TOU32" => Some(31),
+        _ => None,
+    };
+    if let Some(action) = float {
+        let unary = (20..=23).contains(&action);
+        if operands.len() != if unary { 1 } else { 2 } {
+            return Err(error(
+                line,
+                format!(
+                    "{mnemonic} expects {} operand(s)",
+                    if unary { 1 } else { 2 }
+                ),
+            ));
+        }
+        let destination = register(operands[0], line)?;
+        let source = if unary {
+            destination
+        } else {
+            register(operands[1], line)?
+        };
+        let pair = |value: u16, binary64: bool| -> Result<(), AssemblyError> {
+            if value & 1 != 0 || binary64 && !matches!(value, 0 | 4) {
+                return Err(error(
+                    line,
+                    format!(
+                        "{mnemonic} register must be {}",
+                        if binary64 {
+                            "R0 or R4"
+                        } else {
+                            "an even register"
+                        }
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        if action <= 9 || unary {
+            let binary64 = (5..=9).contains(&action) || matches!(action, 21 | 23);
+            pair(destination, binary64)?;
+            pair(source, binary64)?;
+        } else if (10..=17).contains(&action) {
+            let binary64 = action >= 14;
+            pair(destination, binary64)?;
+            if matches!(action, 12 | 13 | 16 | 17) {
+                pair(source, false)?;
+            }
+        } else if action == 18 {
+            pair(destination, true)?;
+            pair(source, false)?;
+        } else if action == 19 {
+            pair(destination, false)?;
+            pair(source, true)?;
+        } else {
+            let binary64 = action >= 28;
+            pair(source, binary64)?;
+            if matches!(action, 26 | 27 | 30 | 31) {
+                pair(destination, false)?;
+            }
+        }
+        return Ok(Some(vec![
+            0xf81b | (destination << 8),
+            (action << 11) | source,
+        ]));
+    }
+
+    let classic_extension = match mnemonic {
+        "MOVSP" => Some((0, false)),
+        "FADD" => Some((1, true)),
+        "FSUB" => Some((2, true)),
+        "FMUL" => Some((3, true)),
+        "FDIV" => Some((4, true)),
+        "FCMP" => Some((5, true)),
+        "ITOF" => Some((6, false)),
+        "FTOI" => Some((7, false)),
+        _ => None,
+    };
+    if let Some((operation, binary)) = classic_extension {
+        if binary && operands.len() != 2 || !binary && operands.len() != 1 {
+            return Err(error(
+                line,
+                format!(
+                    "{mnemonic} expects {} operand(s)",
+                    if binary { 2 } else { 1 }
+                ),
+            ));
+        }
+        let destination = register(operands[0], line)?;
+        let word = if mnemonic == "MOVSP" {
+            (0x1f << 11) | (destination << 8) | (7 << 2)
+        } else if matches!(mnemonic, "ITOF" | "FTOI") {
+            (0x1f << 11) | (operation << 5) | (destination << 8)
+        } else {
+            (0x1f << 11)
+                | (destination << 8)
+                | (operation << 5)
+                | (register(operands[1], line)? << 2)
+        };
+        return Ok(Some(vec![word]));
+    }
+
+    let (alu_name, operands) = if mnemonic == "SHR" && operands.len() == 2 {
+        ("LSR", operands)
+    } else {
+        (mnemonic, operands)
+    };
+    let alu_operation = match alu_name {
+        "SHL" => Some(0),
+        "LSR" => Some(1),
+        "ASR" => Some(2),
+        "ROL" => Some(3),
+        "ROR" => Some(4),
+        "ADC" => Some(5),
+        "SBC" => Some(6),
+        "NEG" => Some(7),
+        "TEST" => Some(8),
+        "ADD" | "ADD!" => Some(9),
+        "SUB" | "SUB!" => Some(10),
+        "AND" | "AND!" => Some(11),
+        "OR" | "OR!" => Some(12),
+        "XOR" | "XOR!" => Some(13),
+        "CMP" | "CMP!" => Some(14),
+        _ => None,
+    };
+    if let Some(operation) = alu_operation
+        && (matches!(
+            alu_name,
+            "SHL" | "LSR" | "ASR" | "ROL" | "ROR" | "ADC" | "SBC" | "NEG" | "TEST"
+        ) || operands.len() == 2 && !is_register(operands[1]))
+    {
+        if operands.len() != if alu_name == "NEG" { 1 } else { 2 } {
+            return Err(error(
+                line,
+                format!(
+                    "{alu_name} expects {} operand(s)",
+                    if alu_name == "NEG" { 1 } else { 2 }
+                ),
+            ));
+        }
+        let destination = register(operands[0], line)?;
+        let mut control = operation << 12;
+        let mut words = vec![0xf81f | (destination << 8)];
+        if alu_name == "NEG" {
+            words.push(control);
+        } else if matches!(
+            alu_name,
+            "SWAP"
+                | "SEXT"
+                | "JMPR"
+                | "CALLR"
+                | "PUSHF"
+                | "POPF"
+                | "SETC"
+                | "CLC"
+                | "SETSP"
+                | "CLZ"
+                | "MOVSPH"
+                | "CALLRP"
+                | "JMPRP"
+                | "SETSPH"
+        ) {
+            return Err(error(line, "invalid ALU instruction"));
+        } else if is_register(operands[1]) {
+            words.push(control | register(operands[1], line)?);
+        } else {
+            let immediate = parse_number(operands[1], line)?;
+            if matches!(alu_name, "SHL" | "LSR" | "ASR" | "ROL" | "ROR") {
+                if !(0..=15).contains(&immediate) {
+                    return Err(error(
+                        line,
+                        format!("{alu_name} shift count must be between 0 and 15"),
+                    ));
+                }
+                words.push(control | 0x0800 | immediate as u16);
+            } else {
+                if !(-0x8000..=0xffff).contains(&immediate) {
+                    return Err(error(
+                        line,
+                        format!("{alu_name} immediate must fit in 16 bits"),
+                    ));
+                }
+                control |= 0x0800;
+                words.push(control);
+                words.push(immediate as u16);
+            }
+        }
+        return Ok(Some(words));
+    }
+
+    let misc = match mnemonic {
+        "SWAP" => Some(0),
+        "SEXT" => Some(1),
+        "JMPR" => Some(2),
+        "CALLR" => Some(3),
+        "PUSHF" => Some(4),
+        "POPF" => Some(5),
+        "SETC" => Some(6),
+        "CLC" => Some(7),
+        "SETSP" => Some(8),
+        "CLZ" => Some(9),
+        "MOVSPH" => Some(10),
+        "CALLRP" => Some(11),
+        "JMPRP" => Some(12),
+        "SETSPH" => Some(13),
+        _ => None,
+    };
+    if let Some(operation) = misc {
+        let pair_call = matches!(mnemonic, "CALLRP" | "JMPRP");
+        let expected = if pair_call {
+            2
+        } else if matches!(mnemonic, "PUSHF" | "POPF" | "SETC" | "CLC") {
+            0
+        } else {
+            1
+        };
+        if operands.len() != expected {
+            return Err(error(
+                line,
+                format!("{mnemonic} expects {expected} operand(s)"),
+            ));
+        }
+        let destination = if expected == 0 {
+            0
+        } else {
+            register(operands[0], line)?
+        };
+        let mut control = (15 << 12) | operation;
+        if pair_call {
+            control |= register(operands[1], line)? << 9;
+        }
+        return Ok(Some(vec![0xf81f | (destination << 8), control]));
+    }
+    Ok(None)
+}
+
 fn instruction(
     text: &str,
     line: usize,
@@ -242,6 +816,9 @@ fn instruction(
         .map_or((text, ""), |(name, args)| (name, args));
     let mnemonic = mnemonic.to_ascii_uppercase();
     let operands = split_operands(operands);
+    if let Some(words) = extended_instruction(&mnemonic, &operands, line, labels)? {
+        return Ok(words);
+    }
     let opcode = match mnemonic.as_str() {
         "HALT" => 0x00,
         "LDI" => 0x01,
@@ -416,6 +993,65 @@ fn instruction(
     }
 }
 
+fn instruction_size(text: &str, line: usize) -> Result<u32, AssemblyError> {
+    let (mnemonic, arguments) = text
+        .split_once(char::is_whitespace)
+        .map_or((text, ""), |(name, args)| (name, args));
+    let mnemonic = mnemonic.to_ascii_uppercase();
+    let operands = split_operands(arguments);
+    let size = match mnemonic.as_str() {
+        "JMPX" | "CALLX" | "BZX" | "BCX" | "BNZX" | "BNCX" | "BNX" | "BNNX" | "BVX" | "BNVX"
+        | "BLTX" | "BGEX" | "BGTX" | "BLEX" | "BHIX" | "BLSX" | "BNZ" | "BNC" | "BN" | "BNN"
+        | "BV" | "BNV" | "BLT" | "BGE" | "BGT" | "BLE" | "BHI" | "BLS" => 6,
+        "LDI19" | "LDI30" | "LDA" => 8,
+        "F32ADD" | "F32SUB" | "F32MUL" | "F32DIV" | "F32CMP" | "F64ADD" | "F64SUB" | "F64MUL"
+        | "F64DIV" | "F64CMP" | "I16TOF32" | "U16TOF32" | "I32TOF32" | "U32TOF32" | "I16TOF64"
+        | "U16TOF64" | "I32TOF64" | "U32TOF64" | "F32TOF64" | "F64TOF32" | "F32NEG" | "F64NEG"
+        | "F32SQRT" | "F64SQRT" | "F32TOI16" | "F32TOU16" | "F32TOI32" | "F32TOU32"
+        | "F64TOI16" | "F64TOU16" | "F64TOI32" | "F64TOU32" | "ADD32" | "SUB32" | "CMP32"
+        | "AND32" | "OR32" | "XOR32" | "SHL32" | "LSR32" | "ASR32" | "NEG32" | "MOV32" | "LD32"
+        | "ST32" | "MUL32" | "DIV32" | "DIV32S" | "MOD32" | "MOD32S" => 4,
+        "MUL" | "MULHU" | "MULHS" | "DIV" | "DIVS" | "MOD" | "MODS" => {
+            if operands.get(1).is_some_and(|operand| !is_register(operand)) {
+                6
+            } else {
+                4
+            }
+        }
+        "LDP" | "STP" | "SPLIT30" | "JOIN30" => 4,
+        "SHL" | "LSR" | "ASR" | "ROL" | "ROR" | "ADC" | "SBC" | "NEG" | "TEST" => {
+            if matches!(mnemonic.as_str(), "ADC" | "SBC" | "TEST")
+                && operands.get(1).is_some_and(|operand| !is_register(operand))
+            {
+                6
+            } else {
+                4
+            }
+        }
+        "SWAP" | "SEXT" | "JMPR" | "CALLR" | "PUSHF" | "POPF" | "SETC" | "CLC" | "SETSP"
+        | "CLZ" | "MOVSPH" | "CALLRP" | "JMPRP" | "SETSPH" => 4,
+        "ADD" | "SUB" | "AND" | "OR" | "XOR" | "CMP" => {
+            if operands.len() == 2 && !is_register(operands[1]) {
+                6
+            } else {
+                2
+            }
+        }
+        "LDI" => {
+            if operands.len() != 2 {
+                return Err(error(line, "LDI expects a register and an immediate"));
+            }
+            let value = parse_number(operands[1], line)?;
+            if !(0..=0xffff).contains(&value) {
+                return Err(error(line, "LDI immediate must be between 0 and 65535"));
+            }
+            if value > 0xff { 4 } else { 2 }
+        }
+        _ => 2,
+    };
+    Ok(size)
+}
+
 pub fn assemble(source: &str, origin: u32) -> Result<ProgramImage, AssemblyError> {
     if origin >= MEMORY_SIZE {
         return Err(AssemblyError(format!(
@@ -497,20 +1133,7 @@ pub fn assemble(source: &str, origin: u32) -> Result<ProgramImage, AssemblyError
                 .checked_add(bytes.len() as u32)
                 .ok_or_else(|| error(line, "assembled program exceeds available memory"))?;
         } else {
-            let size = if text.to_ascii_uppercase().starts_with("LDI ") {
-                let (_, args) = text.split_once(char::is_whitespace).unwrap();
-                let operands = split_operands(args);
-                if operands.len() != 2 {
-                    return Err(error(line, "LDI expects a register and an immediate"));
-                }
-                let value = parse_number(operands[1], line)?;
-                if !(0..=0xffff).contains(&value) {
-                    return Err(error(line, "LDI immediate must be between 0 and 65535"));
-                }
-                if value > 0xff { 4 } else { 2 }
-            } else {
-                2
-            };
+            let size = instruction_size(&text, line)?;
             statements.push(Statement {
                 line,
                 text,
@@ -570,6 +1193,31 @@ pub fn assemble(source: &str, origin: u32) -> Result<ProgramImage, AssemblyError
     })
 }
 
+pub fn assemble_file(path: &Path, origin: u32) -> Result<ProgramImage, AssemblyError> {
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|io_error| AssemblyError(format!("cannot read {}: {io_error}", path.display())))?;
+    let source = fs::read_to_string(&canonical_path).map_err(|io_error| {
+        AssemblyError(format!(
+            "cannot read {}: {io_error}",
+            canonical_path.display()
+        ))
+    })?;
+    let source = source.trim_start_matches('\u{feff}');
+    let mut include_stack = vec![canonical_path.clone()];
+    let expanded = expand_includes(
+        source,
+        canonical_path.parent().unwrap_or(Path::new(".")),
+        &mut include_stack,
+    )
+    .map_err(|assembly_error| {
+        AssemblyError(format!("{}: {assembly_error}", canonical_path.display()))
+    })?;
+    assemble(&expanded, origin).map_err(|assembly_error| {
+        AssemblyError(format!("{}: {assembly_error}", canonical_path.display()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,8 +1267,8 @@ mod tests {
             b"key:value"
         );
         assert_eq!(
-            assemble(".data hex 0b1", 0).unwrap().segments[0].data,
-            &[0x0b]
+            assemble(".data bin 0b1", 0).unwrap().segments[0].data,
+            &[0x01]
         );
     }
 
@@ -647,5 +1295,57 @@ mod tests {
         assert!(assemble("LDI R0, missing", 0).is_err());
         assert!(assemble("NOP R0", 0).is_err());
         assert!(assemble("HALT", MEMORY_SIZE).is_err());
+    }
+
+    #[test]
+    fn assembles_the_full_command_tour_with_extended_instruction_sizes() {
+        let image = assemble(include_str!("../../examples/commands.asm"), 0).unwrap();
+        assert_eq!(image.entry_point, 0x80);
+        assert_eq!(
+            image
+                .segments
+                .iter()
+                .map(|segment| segment.data.len())
+                .sum::<usize>(),
+            632
+        );
+    }
+
+    #[test]
+    fn expands_nested_includes_and_reports_cycles() {
+        let directory = std::env::temp_dir().join(format!(
+            "sc16-assembler-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(directory.join("parts")).unwrap();
+        fs::write(directory.join("parts").join("leaf.asm"), "INC R1\n").unwrap();
+        fs::write(
+            directory.join("parts").join("middle.asm"),
+            ".include \"leaf.asm\"\nINC R2\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("main.asm"),
+            ".include \"parts/middle.asm\"\nHALT\n",
+        )
+        .unwrap();
+        let image = assemble_file(&directory.join("main.asm"), 0).unwrap();
+        assert_eq!(image.segments[0].data, b"\x69\x00\x6a\x00\x00\x00");
+        fs::write(
+            directory.join("parts").join("leaf.asm"),
+            ".include \"../main.asm\"\n",
+        )
+        .unwrap();
+        assert!(
+            assemble_file(&directory.join("main.asm"), 0)
+                .unwrap_err()
+                .to_string()
+                .contains("circular .include")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

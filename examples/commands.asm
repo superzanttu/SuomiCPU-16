@@ -66,6 +66,38 @@ jump_target:
     FCMP R2, R3
     ITOF R2
     FTOI R2
+    F32ADD R0, R2
+    F32SUB R0, R2
+    F32MUL R0, R2
+    F32DIV R0, R2
+    F32CMP R0, R2
+    F64ADD R0, R4
+    F64SUB R0, R4
+    F64MUL R0, R4
+    F64DIV R0, R4
+    F64CMP R0, R4
+    I16TOF32 R0, R2
+    U16TOF32 R0, R2
+    I32TOF32 R0, R2
+    U32TOF32 R0, R2
+    I16TOF64 R0, R2
+    U16TOF64 R0, R2
+    I32TOF64 R0, R2
+    U32TOF64 R0, R2
+    F32TOF64 R0, R2
+    F64TOF32 R2, R0
+    F32NEG R2
+    F64NEG R0
+    F32SQRT R2
+    F64SQRT R0
+    F32TOI16 R1, R2
+    F32TOU16 R1, R2
+    F32TOI32 R2, R0
+    F32TOU32 R2, R0
+    F64TOI16 R1, R0
+    F64TOU16 R1, R0
+    F64TOI32 R2, R4
+    F64TOU32 R2, R4
     MUL R2, R3             ; Integer multiply/divide group (register or immediate source)
     MULHU R2, R3
     MULHS R2, R3
