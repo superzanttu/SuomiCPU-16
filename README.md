@@ -2,7 +2,8 @@
 
 SuomiCPU-16 is an emulator for the SC-16, a small, byte-addressed machine. The
 Rust emulator is the primary runtime; Python implementations remain during the
-ongoing migration.
+ongoing migration. See the [Python-to-Rust migration inventory](docs/py2rust.md)
+for file status and the dependency-ordered plan.
 
 ## Features
 - Full emulation of the SC-16 architecture.
