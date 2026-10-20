@@ -1,6 +1,6 @@
 ; Reusable SC-8 graphics routines.
 ; Pixel colors are palette indices; zero is transparent for GFX_SPRITE.
-; See user_guide.md for calling conventions and register clobbers.
+; See docs/user_guide.md for calling conventions and register clobbers.
 .address 0x0400
 
 GFX_PLOT:

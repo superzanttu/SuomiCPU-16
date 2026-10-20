@@ -72,15 +72,28 @@ cargo run -- examples/directives.asm
 ```
 
 The Rust emulator natively compiles a limited subset: multiple `int` functions
-with up to three parameters, local `int` variables, initialized and zero-
-initialized global `int` variables and arrays, and indexed access to global
-integer arrays. It also supports assignments, arithmetic, bitwise/shift/logical
-and signed comparison expressions, conditional expressions, nested blocks,
-`if`/`else`, `switch`/`case`/`default` with fallthrough, `while`, `do`/`while`,
-and basic `for` loops with `break` and `continue`, including recursion.
+and `void` helper functions with up to three parameters, local `int` variables,
+initialized and zero-initialized global `int` variables and arrays, brace-
+initialized integer globals and arrays, and indexed access to global integer
+arrays. Translation-unit enum constants and enum-typed integer declarations
+and scalar integer typedef aliases are also supported. It also supports
+object-like `#define` macros and `#undef`, assignments, arithmetic,
+bitwise/shift/logical and
+prefix/postfix increment and decrement, signed comparison, conditional, and
+comma expressions, nested blocks,
+`if`/`else`,
+`switch`/`case`/`default` with fallthrough, `goto` labels, `while`, `do`/`while`,
+basic integer `sizeof`, and `for` loops with `break` and `continue`, including
+recursion.
 Programs outside this subset are rejected with a Rust compiler diagnostic;
-Python is not invoked. The legacy reference compiler can still be invoked
-directly:
+Python is not invoked. Only object-like macros and `#undef` are preprocessed;
+`#if`/`#elif` integer constant expressions and `#ifdef`/`#ifndef` conditional
+branches are supported. Backslash-newline source continuations are spliced
+before preprocessing and tokenizing. Quoted includes search beside the
+including source; angle-bracket includes search the repository `lib` directory.
+Function-like macros support argument substitution, stringification, and token
+pasting; variadic macros remain unsupported. The legacy reference compiler can
+still be invoked directly:
 
 ```console
 cargo run -- examples/example.asm
@@ -402,7 +415,7 @@ canonical quiet NaN.
 These are assembler/emulator instructions; the C compiler has not yet been
 updated to emit them. In compiled C, `float`, `double`, and `long double`
 currently remain binary16 values stored in two bytes. See
-[`docs/c90_target_abi.md`](docs/c90_target_abi.md) for the selected future C ABI
+[`c90_target_abi.md`](c90_target_abi.md) for the selected future C ABI
 and the remaining compiler/backend work.
 
 ### Extended ALU, miscellaneous and conditional-branch instructions
@@ -640,7 +653,7 @@ will compile or have identical behavior on SC-16.
 
 The ABI choices targeted for full conformance, including type representations,
 pointer encoding, aggregate layout, and function-call conventions, are recorded
-in [`docs/c90_target_abi.md`](docs/c90_target_abi.md). The document describes
+in [`c90_target_abi.md`](c90_target_abi.md). The document describes
 the intended target and does not imply that the current compiler implements
 those choices completely.
 

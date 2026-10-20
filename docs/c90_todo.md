@@ -17,7 +17,7 @@ full C90 compatibility**. Tasks may depend on items in another category.
 **The compiler is not currently a fully conforming C90 implementation.** Keep
 that disclaimer in [`user_guide.md`](user_guide.md) until the release gates at
 the end of this document pass. The ABI target is recorded in
-[`docs/c90_target_abi.md`](docs/c90_target_abi.md); it contains intended
+[`c90_target_abi.md`](c90_target_abi.md); it contains intended
 choices as well as existing behavior, so verify implementation before treating
 an ABI choice as delivered.
 
@@ -66,16 +66,16 @@ Passing the Rust build or parser tests does not establish feature parity.
   and labels.
 - [x] Basic translation-unit parsing for scalar globals, arrays, function
   prototypes, variadic prototypes, and function definitions.
-- [x] Implement Rust code generation for multiple integer functions with
-  parameter passing, direct/recursive calls, local `int` variables, initialized
-  and zero-initialized scalar global integers, zero-initialized global integer
-  arrays, indexed global-array reads/writes, and `switch` dispatch with
-  fallthrough, `case`, `default`, and `break`,
-  assignment, arithmetic, bitwise and signed
-  comparison, shift, logical and conditional expressions, `if`/`else`,
-  nested block locals, `while`, `do`/`while`, basic `for` loops, and loop
-  `break`/`continue`; extend the same integer backend to multiple functions,
-  parameter passing, ordinary calls, and recursion.
+- [x] Implement Rust code generation for multiple integer functions and
+  `void` helpers with parameter passing, direct/recursive calls, local `int`
+  variables and scalar initializers, initialized and zero-initialized scalar
+  global integers, brace-initialized global integer arrays, and indexed global-
+  array reads and writes; integer assignment, arithmetic, bitwise, shift,
+  logical, comparison, conditional, comma, increment/decrement, and `sizeof`
+  expressions; `if`/`else`,
+  `switch`/`case`/`default`
+  with fallthrough, function-scoped `goto` labels, nested blocks, `while`,
+  `do`/`while`, basic `for` loops, and loop `break`/`continue`.
 - [x] Remove the Python compiler invocation from Rust `.c` source and BIOS
   module build paths; Rust reports unsupported C instead of falling back.
 - [x] Replace `tools/sc16_build_image.py` with the Rust `sc16build` CLI for
@@ -85,6 +85,21 @@ Passing the Rust build or parser tests does not establish feature parity.
 - [x] Evaluate integer constant expressions for local and global array bounds
   (including C integer bases/suffixes and common arithmetic, comparison,
   logical, and bitwise operators).
+- [x] Parse translation-unit enum declarations, evaluate enumerator constant
+  expressions, and compile enum constants in supported integer expressions.
+- [x] Resolve scalar integer `typedef` aliases in translation-unit declarations,
+  local declarations, function signatures, casts, and `sizeof`.
+- [x] Expand nested object-like `#define` macros, process `#undef`, and handle
+  `#if`/`#elif` integer expressions and `#ifdef`/`#ifndef` conditional branches
+  in Rust.
+- [x] Resolve quoted includes beside the source and angle-bracket includes
+  under `lib/`, including nested includes, shared macro definitions, and
+  include guards.
+- [x] Expand fixed-parameter function-like macros with argument substitution,
+  stringification, and token pasting, including the fixed-width integer macros
+  in `<stdint.h>`.
+- [x] Splice backslash-newline continuations before preprocessing while
+  preserving physical source line numbers after continued lines.
 - [ ] Full C90 declarators, typedefs, records, enums, linkage, and initializer
   semantics at translation-unit scope.
 - [ ] C90 preprocessor and include/header compatibility.
@@ -132,7 +147,7 @@ or correct runtime helpers cannot meet the ABI requirements.
   - [x] Select and document IEEE-754 binary32 `float`, binary64 `double` and
     `long double`, their sizes, byte order, alignment, literal conversion,
     rounding, subnormals, signed zero, infinities, NaNs, and exception policy
-    in `docs/c90_target_abi.md`.
+    in `c90_target_abi.md`.
   - [x] Implement this model consistently in compiler types, object layout,
     literal conversion, and the execution backend.
   - [x] Update `float.h` limits and type sizes only with the implementation
@@ -169,7 +184,7 @@ or correct runtime helpers cannot meet the ABI requirements.
     and aggregate calling conventions.
   - Exercise relevant C-visible memory, control-flow, and floating-point
     behavior across assembler, emulator, and JIT.
-  - Update `docs/c90_target_abi.md` only from verified behavior.
+  - Update `c90_target_abi.md` only from verified behavior.
   - **Depends on:** A3, B2 (`c90-indirect-calls`), C1
     (`c90-pointer-qualifiers`), C3 (`c90-bitfield-codegen`), B4
     (`c90-linkage-storage`), and B5 (`c90-initializers`).
@@ -287,7 +302,7 @@ required before claiming full C90 compatibility.
     boundary crossing, unnamed fields, and zero-width fields.
   - Define interactions with `sizeof`, unions, record padding, and
     `offsetof` constraints.
-  - Document implementation-defined choices in `docs/c90_target_abi.md` and
+  - Document implementation-defined choices in `c90_target_abi.md` and
     add layout tests.
 
 ### C3. Implement bit-field accesses

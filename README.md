@@ -11,7 +11,7 @@ ongoing migration.
   standard-library support (`setjmp.h` and `signal.h` are not implemented),
   plus a target-specific C99 `<stdint.h>` header
   (not a fully conforming C90 implementation; see the
-  [user guide](user_guide.md#9-ansi-c90-compiler)).
+  [user guide](docs/user_guide.md#9-ansi-c90-compiler)).
 - Memory-mapped console, BIOS data-disk selection, JSON-backed virtual disks,
   module-sandboxed file reads, a layered GPU with 640x480x4-bit VRAM, hardware
   tile/sprite engines, and a fixed-point 3D graphics coprocessor.
@@ -80,23 +80,33 @@ Cargo. Make sure Rust and Cargo are available on `PATH`.
 
 The emulator accepts assembly (`.asm`), C (`.c`), and flat binary (`.bin`)
 programs. Assembly is built natively by Rust. The Rust C compiler currently
-handles multiple `int` functions with up to three parameters, local `int`
-variables, scalar global integers, and indexed global integer arrays, as well as
-assignments, arithmetic/bitwise/shift/logical and signed comparison
-expressions, conditional expressions, `if`/`else`, `switch` with case fallthrough,
-nested blocks, and
-`while`/`do`/`for` loops with `break` and `continue`, including recursive
-calls. Programs outside this subset are rejected with a Rust compiler
-diagnostic; the emulator no longer invokes Python to build C sources. The
-Python compiler remains in the repository as migration reference code, not as
-a runtime fallback. To compile a C file explicitly with the legacy tool:
+handles multiple `int` functions and `void` helpers with up to three parameters,
+local `int` variables, scalar global integers, and indexed global integer
+arrays, brace initializers for integer globals and arrays, assignments,
+scalar integer typedef aliases, translation-unit enum constants and enum-typed
+integer declarations,
+object-like `#define` macros and `#undef`, prefix/postfix increment and
+decrement, arithmetic/bitwise/shift/logical and
+signed comparison expressions, conditional and comma expressions, `if`/`else`,
+`switch` with case fallthrough, `goto` labels, nested
+blocks, basic integer `sizeof`, and `while`/`do`/`for` loops with `break` and
+`continue`, including recursive calls. Programs outside this subset are rejected
+with a Rust compiler diagnostic; the emulator no longer invokes Python to build
+C sources. The Python compiler remains in the repository as migration reference
+code, not as a runtime fallback. Object-like macros, `#undef`, and
+`#if`/`#elif`/`#ifdef`/`#ifndef` conditional branches are preprocessed.
+Quoted includes search beside the including source; angle-bracket includes
+search the repository `lib` directory. Function-like macros support argument
+substitution, stringification, and token pasting; backslash-newline source
+continuations are also supported. Variadic macros are not implemented in Rust
+yet. To compile a C file explicitly with the legacy tool:
 
 ```console
 python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
 cargo run -- asteroids.bin
 ```
 
-See the [user guide](user_guide.md) for setup details, controls, and the full
+See the [user guide](docs/user_guide.md) for setup details, controls, and the full
 example catalog.
 
 ## Rust emulator port

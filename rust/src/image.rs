@@ -10,6 +10,7 @@ const MEMORY_SIZE: u64 = 1 << 30;
 pub enum ImageError {
     Io(io::Error),
     UnsupportedC(String),
+    CCompiler(String),
     Assembly(String),
     InvalidFormat(&'static str),
     Cpu(CpuError),
@@ -23,6 +24,7 @@ impl std::fmt::Display for ImageError {
                 formatter,
                 "the Rust C compiler does not yet support this C program: {source}"
             ),
+            Self::CCompiler(error) => write!(formatter, "Rust C compiler error: {error}"),
             Self::Assembly(error) => write!(formatter, "SC-16 assembly failed: {error}"),
             Self::InvalidFormat(reason) => write!(formatter, "invalid SC-16 image: {reason}"),
             Self::Cpu(error) => write!(formatter, "{error}"),
@@ -112,7 +114,7 @@ pub fn build_source(source: &Path) -> Result<ProgramImage, ImageError> {
         let source_text = source_text.strip_prefix('\u{feff}').unwrap_or(&source_text);
         if let Some(image) =
             crate::c_compiler::compile_minimal_program(source_text, &source.to_string_lossy())
-                .map_err(|error| ImageError::Assembly(error.to_string()))?
+                .map_err(|error| ImageError::CCompiler(error.to_string()))?
         {
             return Ok(image);
         }
@@ -262,5 +264,16 @@ mod tests {
         let result = build_source(&path);
         fs::remove_file(path).unwrap();
         assert!(matches!(result, Err(ImageError::UnsupportedC(_))));
+    }
+
+    #[test]
+    fn reports_c_parse_errors_as_compiler_diagnostics() {
+        let path = std::env::temp_dir().join(format!("sc16-invalid-c-{}.c", std::process::id()));
+        fs::write(&path, "int main(void) { return ;").unwrap();
+        let result = build_source(&path);
+        fs::remove_file(&path).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Rust C compiler error:"));
+        assert!(error.contains("unterminated compound statement"));
     }
 }
