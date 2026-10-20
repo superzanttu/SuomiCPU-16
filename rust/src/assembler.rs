@@ -1403,6 +1403,80 @@ mod tests {
     }
 
     #[test]
+    fn encodes_signed_stack_offsets_and_branch_address_boundaries() {
+        for offset in -128i16..=127 {
+            let image = assemble(&format!("ADJSP {offset}"), 0).unwrap();
+            let instruction =
+                (lookup(BASE_OPCODES, "ADJSP").unwrap() << 11) | (offset as u16 & 0xff);
+            assert_eq!(
+                image.segments[0].data,
+                instruction.to_be_bytes(),
+                "ADJSP {offset}"
+            );
+        }
+
+        for mnemonic in ["JMP", "CALL", "BZ", "BC"] {
+            let opcode = lookup(BASE_OPCODES, mnemonic).unwrap();
+            for target in [0, 1, 0xff, 0x100, 0x400, 0x7fe, 0x7ff] {
+                let image = assemble(&format!("{mnemonic} {target}"), 0).unwrap();
+                assert_eq!(
+                    image.segments[0].data,
+                    ((opcode << 11) | target).to_be_bytes(),
+                    "{mnemonic} {target:#x}"
+                );
+            }
+        }
+
+        for (mnemonic, operation) in [("JMPX", 0), ("CALLX", 1), ("BZX", 2), ("BCX", 3)] {
+            for target in [0, 1, 0xffff, 0x10000, 0x12345, MEMORY_SIZE - 1] {
+                let image = assemble(&format!("{mnemonic} {target}"), 0).unwrap();
+                assert_eq!(image.segments[0].data.len(), 6);
+                assert_eq!(
+                    u16::from_be_bytes([image.segments[0].data[0], image.segments[0].data[1]]),
+                    FAR_CONTROL_PREFIX | (operation << 9)
+                );
+                assert_eq!(
+                    u16::from_be_bytes([image.segments[0].data[2], image.segments[0].data[3]]),
+                    (target >> 16) as u16
+                );
+                assert_eq!(
+                    u16::from_be_bytes([image.segments[0].data[4], image.segments[0].data[5]]),
+                    target as u16
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_register_immediate_and_branch_boundary_violations() {
+        for source in [
+            "ADJSP 128",
+            "ADJSP -129",
+            "LDI R0, -1",
+            "LDI R0, 65536",
+            "LDI_H R0, 256",
+            "LDWS R0, 256",
+            "STWS R0, -1",
+            "JMP 0x800",
+            "CALL -1",
+            "BZ 0x800",
+            "BC -1",
+            "JZ R0, 256",
+            "JZ R8, 0",
+            "JMPX 0x40000000",
+            "CALLX -1",
+            "BZX 0x40000000",
+            "F32ADD R0, R1",
+            "F64ADD R0, R2",
+        ] {
+            assert!(
+                assemble(source, 0).is_err(),
+                "expected invalid assembly to fail: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_malformed_data_labels_operands_and_addresses() {
         for source in [
             ".data",

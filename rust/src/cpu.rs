@@ -2622,6 +2622,9 @@ impl Cpu {
 
     fn check_interrupts(&mut self) {
         let icr = self.read(ICR_ADDR);
+        if icr & 1 == 0 {
+            return;
+        }
         let vector = if icr & 2 != 0 {
             Some(KEY_VECTOR_ADDR)
         } else if icr & 8 != 0 {
@@ -4141,6 +4144,95 @@ mod tests {
         assert_eq!(cpu.read_u16(cpu.sp), 0);
         assert_eq!(cpu.read_u32(cpu.sp + 2), 2);
         assert_eq!(cpu.read(ICR_ADDR), 0);
+    }
+
+    #[test]
+    fn interrupt_priority_and_rti_restore_flags_pc_and_stack_for_both_sources() {
+        for pending in [2u8, 8, 10] {
+            let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+            cpu.write_u16(0, OP_EI << 11);
+            cpu.write_u32_for_test(KEY_VECTOR_ADDR, 0x300);
+            cpu.write_u32_for_test(RTC_VECTOR_ADDR, 0x400);
+            cpu.write_u16(0x300, OP_RTI << 11);
+            cpu.write_u16(0x400, OP_RTI << 11);
+            cpu.flags = Flags {
+                zero: true,
+                carry: false,
+                negative: true,
+                overflow: true,
+            };
+            cpu.write(ICR_ADDR, pending);
+
+            cpu.step().unwrap();
+            let handler = if pending & 2 != 0 { 0x300 } else { 0x400 };
+            assert_eq!(cpu.pc, handler);
+            assert_eq!(cpu.read_u16(cpu.sp), 0b1101);
+            assert_eq!(cpu.read_u32(cpu.sp + 2), 2);
+            assert_eq!(cpu.read(ICR_ADDR), 0);
+
+            cpu.step().unwrap();
+            assert_eq!(cpu.pc, 2);
+            assert_eq!(cpu.sp, cpu.memory_mask);
+            assert_eq!(
+                cpu.flags,
+                Flags {
+                    zero: true,
+                    carry: false,
+                    negative: true,
+                    overflow: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_interrupts_leave_pending_sources_untouched() {
+        let mut cpu = cpu_with_program(&[(OP_INC << 11) | (3 << 8)]);
+        cpu.registers[3] = 7;
+        cpu.write(ICR_ADDR, 0x0a);
+        cpu.step().unwrap();
+        assert_eq!(cpu.registers[3], 8);
+        assert_eq!(cpu.pc, 2);
+        assert_eq!(cpu.read(ICR_ADDR), 0x0a);
+    }
+
+    #[test]
+    fn ieee_float_comparisons_and_conversions_cover_nan_zero_and_range_edges() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_u16(0, FLOAT_PREFIX);
+        cpu.write_u16(2, (4 << 11) | 2);
+
+        cpu.write_float_register(0, 32, f64::NAN);
+        cpu.write_float_register(2, 32, 1.0);
+        cpu.step().unwrap();
+        assert!(!cpu.flags.zero);
+        assert!(!cpu.flags.carry);
+
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.write_u16(2, (4 << 11) | 2);
+        cpu.write_float_register(0, 32, -0.0);
+        cpu.write_float_register(2, 32, 0.0);
+        cpu.step().unwrap();
+        assert!(cpu.flags.zero);
+        assert!(!cpu.flags.carry);
+
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.write_u16(2, (3 << 11) | 2);
+        cpu.write_float_register(0, 32, 1.0);
+        cpu.write_float_register(2, 32, 0.0);
+        cpu.step().unwrap();
+        assert_eq!(cpu.register_pair_u32(0), f32::INFINITY.to_bits());
+
+        cpu.registers = [0; 8];
+        cpu.write_float_register(2, 32, -1.0);
+        cpu.execute_float(27, 0, 2);
+        assert_eq!(cpu.register_pair_u32(0), u32::MAX);
+        cpu.registers = [0; 8];
+        cpu.write_float_register(2, 32, f64::NAN);
+        cpu.execute_float(26, 0, 2);
+        assert_eq!(cpu.register_pair_u32(0), 0);
     }
 
     #[test]

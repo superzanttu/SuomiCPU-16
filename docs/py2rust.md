@@ -148,9 +148,14 @@ considered migration.
         operations with Rust unit tests.
   - [x] Cover extended ALU and 32-bit instruction behavior in assembled Rust
         programs (see the extended-opcode task above).
-  - [ ] Compare remaining exhaustive Python assembler encoding/invalid-operand,
-        interrupt-ordering, and float edge cases against Rust before retiring
-        the Python suite.
+  - [x] Exercise signed stack offsets, short/far branch boundaries, and invalid
+        register/immediate/address inputs with Rust assembler tests.
+  - [x] Verify interrupt priority, disabled-pending behavior, and RTI state
+        restoration for keyboard and RTC sources.
+  - [x] Cover IEEE float NaN/signed-zero comparisons, division by zero, and
+        integer-conversion range edges in Rust.
+  - [ ] Compare remaining exhaustive Python float register-pair combinations
+        and classic half-float edge cases before retiring the Python suite.
 - [ ] **Port [tests/test_net.py](../tests/test_net.py)** — networking coverage.
   - Coverage to preserve: end-to-end coverage through the Rust networking path.
 - [ ] **Port [tests/test_spacecave.py](../tests/test_spacecave.py)** — network/game coverage.
