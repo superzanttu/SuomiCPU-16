@@ -130,8 +130,11 @@ considered migration.
   - Why they remain: pause timing, Pygame fullscreen/window management,
     console-window toggling, halt-window lifetime, and display pacing are
     tied to the legacy Python event loop.
-- [ ] **Port [tests/test_extended_opcodes.py](../tests/test_extended_opcodes.py)** — ISA/graphics coverage.
-  - Coverage to preserve: confirm Rust CPU coverage and move any remaining graphics cases.
+- [x] **Port [tests/test_extended_opcodes.py](../tests/test_extended_opcodes.py)** — ISA coverage.
+  - Rust assembled-program tests cover shifts/rotates, carry-chain arithmetic,
+    32-bit operations and pair validation, stack-pointer control, full-width
+    addresses, memory wrapping, signed/unsigned branches, register calls/
+    jumps, flag-stack operations, and miscellaneous ALU instructions.
 - [ ] **Port [tests/test_gpu_games.py](../tests/test_gpu_games.py)** — game/GPU coverage.
   - Coverage to preserve: game-level GPU behavior through Rust CPU/runtime integration tests.
 - [ ] **Port [tests/test_hertta3d.py](../tests/test_hertta3d.py)** — game/render coverage.
@@ -194,10 +197,10 @@ point and its required tests pass.
    - [ ] Retire the Python emulator and then remove its now-unused support modules.
 
 - [ ] **Migrate Python test harnesses and integration coverage.**
-   - [ ] Replace `tests/gfx_harness.py` with Rust test helpers and convert
-     emulator-dependent tests (`test_display`, `test_extended_opcodes`,
-     `test_gpu_games`, `test_hertta3d`, `test_net`,
-     `test_spacecave`, `test_storage_bios`, and `test_tank16`) to Rust coverage.
+   - [ ] Replace `tests/gfx_harness.py` with Rust test helpers and convert the
+     remaining emulator-dependent tests (`test_display`, `test_gpu_games`,
+     `test_hertta3d`, `test_net`, `test_spacecave`, `test_storage_bios`, and
+     `test_tank16`) to Rust coverage.
    - [ ] Move assembler/compiler/BIOS cases into their relevant
      Rust test modules; keep tests for behaviors until they are ported or
      explicitly retired.

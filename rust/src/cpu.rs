@@ -2756,6 +2756,16 @@ mod tests {
         cpu
     }
 
+    fn run_assembly(source: &str) -> Cpu {
+        let image = crate::assembler::assemble(source, 0).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2000).unwrap();
+        assert!(!cpu.running, "program did not halt");
+        cpu
+    }
+
     #[test]
     fn executes_load_add_compare_and_halt() {
         let mut cpu = cpu_with_program(&[
@@ -2978,6 +2988,194 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn assembled_extended_opcode_programs_cover_shifts_arithmetic_and_misc() {
+        let cpu = run_assembly(
+            "LDI R0, 1\nSHL R0, 4\nLDI R1, 0x8000\nLSR R1, 3\n\
+             LDI R2, 0x8000\nASR R2, 3\nLDI R3, 0x8001\nROL R3, 1\n\
+             LDI R4, 0x8001\nROR R4, 1\nLDI R5, 2\nLDI R6, 1\nSHL R6, R5\nHALT",
+        );
+        assert_eq!(&cpu.registers[..7], &[16, 0x1000, 0xf000, 3, 0xc000, 2, 4]);
+
+        let cpu = run_assembly(
+            "LDI R0, 0xFFFF\nLDI R1, 1\nADD R0, R1\nLDI R2, 0\nLDI R3, 0\n\
+             ADC R2, R3\nHALT",
+        );
+        assert_eq!((cpu.registers[0] as u16, cpu.registers[2]), (0, 1));
+
+        let cpu = run_assembly(
+            "LDI R0, 0\nLDI R1, 1\nSUB R0, R1\nLDI R2, 5\nLDI R3, 0\n\
+             SBC R2, R3\nHALT",
+        );
+        assert_eq!(cpu.registers[2], 4);
+
+        let cpu = run_assembly(
+            "LDI R0, 1\nNEG R0\nLDI R1, 0x1234\nSWAP R1\nLDI R2, 0x80\n\
+             SEXT R2\nLDI R4, 1\nCLZ R4\nHALT",
+        );
+        assert_eq!(
+            (
+                cpu.registers[0],
+                cpu.registers[1],
+                cpu.registers[2],
+                cpu.registers[4]
+            ),
+            (0xffff, 0x3412, 0xff80, 15)
+        );
+
+        let cpu = run_assembly(
+            "LDI R0, 100\nADD R0, 1000\nLDI R1, 0xFFFF\nAND R1, 0x0F0F\n\
+             LDI R2, 5\nSUB R2, 2\nHALT",
+        );
+        assert_eq!(
+            (cpu.registers[0], cpu.registers[1], cpu.registers[2]),
+            (1100, 0x0f0f, 3)
+        );
+
+        let cpu = run_assembly("LDI R0, 0xF0\nTEST R0, 0x0F\nHALT");
+        assert_eq!(cpu.registers[0], 0xf0);
+        assert!(cpu.flags.zero);
+    }
+
+    #[test]
+    fn assembled_wide_opcode_programs_cover_arithmetic_memory_and_flags() {
+        let cpu = run_assembly(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\nLDI R2, 0\nLDI R3, 1\n\
+             ADD32 R0, R2\nLDI R4, 0x8000\nLDI R5, 0\nNEG32 R4\n\
+             LDI R6, 0\nLDI R7, 3\nSHL32 R6, 1\nHALT",
+        );
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0, 0));
+        assert_eq!((cpu.registers[4], cpu.registers[5]), (0x8000, 0));
+        assert_eq!((cpu.registers[6], cpu.registers[7]), (0, 6));
+
+        let cpu = run_assembly("LDI R0, 1\nLDI R1, 0\nLDI R2, 1\nLDI R3, 0\nCMP32 R0, R2\nHALT");
+        assert!(cpu.flags.zero);
+
+        let cpu = run_assembly(
+            "LDI R0, 0x7FFF\nLDI R1, 0xFFFF\nLDI R2, 0\nLDI R3, 1\n\
+             ADD32 R0, R2\nHALT",
+        );
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0x8000, 0));
+        assert_eq!(
+            (cpu.flags.negative, cpu.flags.overflow, cpu.flags.carry),
+            (true, true, false)
+        );
+
+        let cpu = run_assembly(
+            "LDI R0, 0\nLDI R1, 10\nLDI R2, 0\nLDI R3, 3\nSUB32 R0, R2\n\
+             MOV32 R4, R0\nAND32 R0, R2\nOR32 R0, R2\nXOR32 R0, R2\n\
+             LDI R6, 0x8000\nLDI R7, 0\nASR32 R6, 1\nHALT",
+        );
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0, 0));
+        assert_eq!((cpu.registers[4], cpu.registers[5]), (0, 7));
+        assert_eq!((cpu.registers[6], cpu.registers[7]), (0xc000, 0));
+        assert!(cpu.flags.negative);
+
+        for source in [
+            "ADD32 R1, R2",
+            "ADD32 R0, R3",
+            "NEG32 R3",
+            "SHL32 R0, 32",
+            "LD32 R0, R3",
+            "ST32 R0, R1",
+        ] {
+            assert!(
+                crate::assembler::assemble(source, 0).is_err(),
+                "expected invalid pair instruction to be rejected: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn assembled_wide_opcodes_cover_signed_math_and_wrapping_memory() {
+        let cpu = run_assembly(
+            "LDI R0, 0\nLDI R1, 100\nLDI R2, 0\nLDI R3, 9\nMUL32 R0, R2\n\
+             LDI R4, 0\nLDI R5, 10\nDIV32 R0, R4\nHALT",
+        );
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0, 90));
+
+        let cpu = run_assembly(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFF9C\nLDI R2, 0\nLDI R3, 7\n\
+             DIV32S R0, R2\nHALT",
+        );
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0xffff, 0xfff2));
+
+        let cpu = run_assembly(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFF9C\nLDI R2, 0\nLDI R3, 7\n\
+             MOD32S R0, R2\nHALT",
+        );
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0xffff, 0xfffe));
+
+        let cpu = run_assembly(
+            "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\nLDI R2, 0x1234\nLDI R3, 0x5678\n\
+             ST32 R2, R0\nLD32 R4, R0\nHALT",
+        );
+        assert_eq!((cpu.registers[4], cpu.registers[5]), (0x1234, 0x5678));
+        assert_eq!(&cpu.memory[..3], &[0x34, 0x56, 0x78]);
+        assert_eq!(cpu.memory[cpu.memory_mask as usize], 0x12);
+
+        let cpu = run_assembly(
+            "LDI30 R0, 0x12345678\nLDI30 R1, 0x3FFFFFFD\nSTP R0, R1\n\
+             LDP R2, R1\nHALT",
+        );
+        assert_eq!(cpu.registers[2], 0x12345678);
+        assert_eq!(
+            &cpu.memory[cpu.memory_mask as usize - 1..=cpu.memory_mask as usize],
+            &[0x78, 0x12]
+        );
+        assert_eq!(cpu.memory[0], 0x34);
+    }
+
+    #[test]
+    fn assembled_extended_opcodes_cover_stack_pointer_control_and_branches() {
+        let cpu = run_assembly("MOVSPH R0\nHALT");
+        assert_eq!(cpu.registers[0], i64::from(cpu.memory_mask >> 16));
+
+        let cpu = run_assembly(
+            "LDI R1, 0x1234\nSETSP R1\nSETC\nLDI R0, 0xFFFF\nSETSPH R0\n\
+             MOVSP R1\nMOVSPH R2\nHALT",
+        );
+        assert_eq!(cpu.sp, 0x3fff_1234);
+        assert_eq!((cpu.registers[1], cpu.registers[2]), (0x3fff_1234, 0x3fff));
+        assert!(cpu.flags.carry);
+
+        let cpu = run_assembly("LDA R0, 0x51234\nHALT");
+        assert_eq!(cpu.registers[0], 0x51234);
+
+        let template = "LDI R0, {a}\nLDI R1, {b}\nCMP R0, R1\n{branch} yes\n\
+                        LDI R7, 0\nHALT\nyes: LDI R7, 1\nHALT\n";
+        for (branch, left, right, taken) in [
+            ("BLT", 0xffff, 1, 1),
+            ("BLT", 1, 0xffff, 0),
+            ("BGE", 5, 5, 1),
+            ("BGT", 5, 5, 0),
+            ("BLE", 5, 5, 1),
+            ("BHI", 0xffff, 1, 1),
+            ("BHI", 1, 0xffff, 0),
+            ("BLS", 1, 0xffff, 1),
+            ("BLT", 0x7fff, 0x8000, 0),
+        ] {
+            let source = template
+                .replace("{a}", &left.to_string())
+                .replace("{b}", &right.to_string())
+                .replace("{branch}", branch);
+            assert_eq!(
+                run_assembly(&source).registers[7],
+                taken,
+                "{branch} with {left:#06x}, {right:#06x}"
+            );
+        }
+
+        let cpu = run_assembly("LDA R1, target\nJMPR R1\nLDI R0, 1\nHALT\ntarget: LDI R0, 7\nHALT");
+        assert_eq!(cpu.registers[0], 7);
+
+        let cpu = run_assembly("LDA R1, fn\nCALLR R1\nHALT\nfn: LDI R0, 9\nRET");
+        assert_eq!(cpu.registers[0], 9);
+
+        let cpu = run_assembly("SETC\nPUSHF\nCLC\nPOPF\nHALT");
+        assert!(cpu.flags.carry);
     }
 
     #[test]
