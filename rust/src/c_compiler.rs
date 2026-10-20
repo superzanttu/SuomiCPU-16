@@ -3512,13 +3512,18 @@ fn float_end(source: &str, start: usize) -> Option<usize> {
     Some(position)
 }
 
-fn decode_quoted(value: &str) -> Result<String, &'static str> {
+enum QuotedCharacter {
+    Character(char),
+    Byte(u8),
+}
+
+fn decode_quoted(value: &str) -> Result<Vec<QuotedCharacter>, &'static str> {
     let characters: Vec<char> = value.chars().collect();
-    let mut decoded = String::with_capacity(value.len());
+    let mut decoded = Vec::with_capacity(characters.len());
     let mut position = 0;
     while position < characters.len() {
         if characters[position] != '\\' {
-            decoded.push(characters[position]);
+            decoded.push(QuotedCharacter::Character(characters[position]));
             position += 1;
             continue;
         }
@@ -3545,25 +3550,45 @@ fn decode_quoted(value: &str) -> Result<String, &'static str> {
             continue;
         }
         if let Some(character) = simple {
-            decoded.push(character);
+            decoded.push(QuotedCharacter::Character(character));
             continue;
         }
 
         let radix = match escape {
-            'x' => Some((16, 2)),
-            'u' => Some((16, 4)),
-            'U' => Some((16, 8)),
+            'x' => Some(16),
+            'u' => Some(16),
+            'U' => Some(16),
             _ => None,
         };
-        if let Some((radix, width)) = radix {
+        if let Some(radix) = radix {
+            let width = match escape {
+                'x' => characters[position..]
+                    .iter()
+                    .take_while(|character| character.is_ascii_hexdigit())
+                    .count(),
+                'u' => 4,
+                'U' => 8,
+                _ => unreachable!(),
+            };
             let end = position + width;
             let Some(digits) = characters.get(position..end) else {
                 return Err("invalid string literal");
             };
+            if width == 0 {
+                return Err("invalid string literal");
+            }
             let digits: String = digits.iter().collect();
             let value =
                 u32::from_str_radix(&digits, radix).map_err(|_| "invalid string literal")?;
-            decoded.push(char::from_u32(value).ok_or("invalid string literal")?);
+            if escape == 'x' {
+                decoded.push(QuotedCharacter::Byte(
+                    u8::try_from(value).map_err(|_| "invalid string literal")?,
+                ));
+            } else {
+                decoded.push(QuotedCharacter::Character(
+                    char::from_u32(value).ok_or("invalid string literal")?,
+                ));
+            }
             position = end;
             continue;
         }
@@ -3581,12 +3606,14 @@ fn decode_quoted(value: &str) -> Result<String, &'static str> {
                     break;
                 }
             }
-            decoded.push(char::from_u32(value).ok_or("invalid string literal")?);
+            decoded.push(QuotedCharacter::Byte(
+                u8::try_from(value).map_err(|_| "invalid string literal")?,
+            ));
             continue;
         }
 
-        decoded.push('\\');
-        decoded.push(escape);
+        decoded.push(QuotedCharacter::Character('\\'));
+        decoded.push(QuotedCharacter::Character(escape));
     }
     Ok(decoded)
 }
@@ -4515,16 +4542,30 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                     let decoded = decode_quoted(&source[content_start..content_end])
                         .map_err(|message| error(&token_filename, start_line, message))?;
                     let value = if quote == '"' {
+                        let mut bytes = Vec::new();
+                        for character in decoded {
+                            match character {
+                                QuotedCharacter::Character(character) => {
+                                    let mut encoded = [0; 4];
+                                    bytes.extend_from_slice(
+                                        character.encode_utf8(&mut encoded).as_bytes(),
+                                    );
+                                }
+                                QuotedCharacter::Byte(byte) => bytes.push(byte),
+                            }
+                        }
                         format!(
                             "<string:{}>",
-                            decoded
-                                .as_bytes()
+                            bytes
                                 .iter()
                                 .map(|byte| format!("{byte:02x}"))
                                 .collect::<String>()
                         )
-                    } else if decoded.chars().count() == 1 {
-                        (decoded.chars().next().expect("one character") as u32).to_string()
+                    } else if decoded.len() == 1 {
+                        match decoded[0] {
+                            QuotedCharacter::Character(character) => (character as u32).to_string(),
+                            QuotedCharacter::Byte(byte) => byte.to_string(),
+                        }
                     } else {
                         return Err(error(
                             &token_filename,
@@ -4992,6 +5033,10 @@ mod tests {
         assert_eq!(
             values(r#""A\n\u03bb" '\x41' '\101'"#),
             ["<string:410acebb>", "65", "65", "<eof>"]
+        );
+        assert_eq!(
+            values(r#""\xff\101\u03bb""#),
+            ["<string:ff41cebb>", "<eof>"]
         );
     }
 
@@ -5755,6 +5800,29 @@ mod tests {
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 208);
         assert_eq!(&cpu.memory[0x80000..0x80004], b"Cat\0");
+    }
+
+    #[test]
+    fn compiles_escaped_exact_fit_and_zero_filled_string_arrays() {
+        let image = compile_minimal_program(
+            r#"char exact[2] = "\377A"; char padded[4] = "hi";
+               int main(void) {
+                   unsigned char local[2] = "\x80\0";
+                   return exact[1] + local[0] + local[1] + padded[2]
+                       + padded[3] + sizeof(local);
+               }"#,
+            "escaped-string-arrays.c",
+        )
+        .unwrap()
+        .expect("supported escaped and exact-fit character arrays");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 195);
+        assert_eq!(&cpu.memory[0x80000..0x80002], &[0xff, b'A']);
+        assert_eq!(&cpu.memory[0x80002..0x80006], b"hi\0\0");
     }
 
     #[test]

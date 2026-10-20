@@ -129,7 +129,8 @@ considered migration.
         including brace initialization, nested indexing expressions, and
         stack-frame restoration across helper calls.
   - [x] Compile fitting string-literal initializers for global and automatic
-        character arrays, including the terminating NUL when space is available.
+        character arrays, including escaped byte values, exact-fit arrays, and
+        zero-filled trailing capacity.
 - [x] **Port console-device state/MMIO coverage from [tests/test_console_device.py](../tests/test_console_device.py) to Rust.**
   - Rust tests cover FIFO/echo control, poll yielding, input bounds/overrun,
     fixed text rows, scrollback, wrapping, and history reset.
