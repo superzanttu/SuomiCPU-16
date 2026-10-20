@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT: u16 = 47_016;
-const MAX_PLAYERS: u8 = 8;
-const MAX_PAYLOAD: usize = 48;
+pub const MAX_PLAYERS: u8 = 8;
+pub const MAX_PAYLOAD: usize = 48;
 #[cfg(not(target_arch = "wasm32"))]
 const HEADER_SIZE: usize = 26;
 #[cfg(not(target_arch = "wasm32"))]
@@ -141,7 +141,7 @@ impl NetNode {
     }
 
     pub fn send(&mut self, payload: &[u8]) -> bool {
-        if self.slot.is_none() || payload.is_empty() || payload.len() > MAX_PAYLOAD {
+        if self.slot.is_none() || payload.len() > MAX_PAYLOAD {
             return false;
         }
         self.send_packet(DATA, payload);
@@ -385,5 +385,41 @@ mod tests {
         assert_eq!(sender, 3);
         assert_eq!(message.len(), MAX_PAYLOAD);
         assert_eq!(node.last_sender(), 3);
+    }
+
+    #[test]
+    fn empty_payloads_are_valid_and_oversized_payloads_are_rejected() {
+        let mut node = NetNode::new(DEFAULT_PORT);
+        let mut title = [0; 16];
+        title[..4].copy_from_slice(b"game");
+        node.title = Some(title);
+        node.slot = Some(0);
+
+        assert!(node.send(&[]));
+        assert!(node.send(&[0; MAX_PAYLOAD]));
+        assert!(!node.send(&[0; MAX_PAYLOAD + 1]));
+
+        let now = Instant::now();
+        node.handle_packet(&packet(DATA, 1, &title, 10, &[]), now);
+        node.handle_packet(&packet(DATA, 1, &title, 10, &[7; MAX_PAYLOAD + 1]), now);
+        assert_eq!(node.receive(), Some((1, Vec::new())));
+        assert_eq!(node.receive(), Some((1, vec![7; MAX_PAYLOAD])));
+    }
+
+    #[test]
+    fn network_packets_from_other_titles_and_invalid_slots_are_ignored() {
+        let mut node = NetNode::new(DEFAULT_PORT);
+        let mut title = [0; 16];
+        title[..4].copy_from_slice(b"game");
+        node.title = Some(title);
+        node.slot = Some(0);
+        let other_title = *b"another-game-000";
+        let now = Instant::now();
+
+        node.handle_packet(&packet(DATA, 1, &other_title, 10, b"wrong game"), now);
+        node.handle_packet(&packet(DATA, MAX_PLAYERS, &title, 11, b"invalid slot"), now);
+        node.handle_packet(&packet(BYE, 1, &title, 12, b""), now);
+        assert!(node.peers.is_empty());
+        assert!(node.inbox.is_empty());
     }
 }
