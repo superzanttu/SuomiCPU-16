@@ -209,6 +209,17 @@ impl NetNode {
 
     fn send_packet(&self, kind: u8, payload: &[u8]) {
         #[cfg(not(target_arch = "wasm32"))]
+        self.send_packet_to(
+            kind,
+            payload,
+            (std::net::Ipv4Addr::BROADCAST, self.port).into(),
+        );
+        #[cfg(target_arch = "wasm32")]
+        let _ = (kind, payload);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn send_packet_to(&self, kind: u8, payload: &[u8], destination: std::net::SocketAddr) {
         if let (Some(socket), Some(title)) = (&self.socket, self.title) {
             let mut packet = Vec::with_capacity(HEADER_SIZE + payload.len());
             packet.extend_from_slice(b"SC16");
@@ -217,10 +228,8 @@ impl NetNode {
             packet.extend_from_slice(&title);
             packet.extend_from_slice(&self.instance_id.to_be_bytes());
             packet.extend_from_slice(payload);
-            let _ = socket.send_to(&packet, (std::net::Ipv4Addr::BROADCAST, self.port));
+            let _ = socket.send_to(&packet, destination);
         }
-        #[cfg(target_arch = "wasm32")]
-        let _ = (kind, payload);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -419,6 +428,132 @@ mod tests {
         first.handle_packet(&packet(BYE, 1, &title, 2, b""), now);
         assert_eq!(first.players(), 1);
         assert!(!first.active(1));
+    }
+
+    #[test]
+    fn udp_transport_delivers_handshake_data_and_departure() {
+        let mut first = NetNode::new(0);
+        let mut second = NetNode::new(0);
+        let title = *b"udp-transport-01";
+        first.open(&title).unwrap();
+        second.open(&title).unwrap();
+        first.instance_id = 1;
+        second.instance_id = 2;
+        let first_port = first.socket.as_ref().unwrap().local_addr().unwrap().port();
+        let second_port = second.socket.as_ref().unwrap().local_addr().unwrap().port();
+        let first_addr = (std::net::Ipv4Addr::LOCALHOST, first_port).into();
+        let second_addr = (std::net::Ipv4Addr::LOCALHOST, second_port).into();
+
+        second.send_packet_to(HELLO, &[0], first_addr);
+        first.poll();
+        first.send_packet_to(HELLO, &[0], second_addr);
+        second.poll();
+        assert_eq!(second.slot(), 1);
+        second.send_packet_to(HELLO, &[0], first_addr);
+        first.poll();
+        assert!(first.active(1));
+
+        second.send_packet_to(DATA, b"udp payload", first_addr);
+        first.poll();
+        assert_eq!(first.receive(), Some((1, b"udp payload".to_vec())));
+
+        second.send_packet_to(BYE, &[], first_addr);
+        first.poll();
+        assert_eq!(first.players(), 1);
+        assert!(!first.active(1));
+    }
+
+    #[test]
+    fn poll_removes_peers_after_timeout() {
+        let mut node = NetNode::new(DEFAULT_PORT);
+        node.title = Some(*b"timeout-test-000");
+        node.slot = Some(0);
+        node.peers.insert(
+            10,
+            Peer {
+                slot: 1,
+                last_seen: Instant::now() - PEER_TIMEOUT - Duration::from_millis(1),
+                settled: true,
+            },
+        );
+
+        node.poll();
+
+        assert_eq!(node.players(), 1);
+        assert!(!node.active(1));
+    }
+
+    #[test]
+    fn established_full_group_ignores_additional_peers() {
+        let mut node = NetNode::new(DEFAULT_PORT);
+        let title = *b"full-group-test!";
+        let now = Instant::now();
+        node.title = Some(title);
+        node.slot = Some(0);
+        node.joined_at = now - JOIN_TIME - Duration::from_millis(1);
+        for slot in 1..MAX_PLAYERS {
+            node.peers.insert(
+                u32::from(slot) + 10,
+                Peer {
+                    slot,
+                    last_seen: now,
+                    settled: true,
+                },
+            );
+        }
+
+        node.handle_packet(&packet(DATA, 7, &title, 99, b"late peer"), now);
+
+        assert_eq!(node.players(), u16::from(MAX_PLAYERS));
+        assert!(!node.full);
+        assert!(!node.peers.contains_key(&99));
+        assert!(node.inbox.is_empty());
+    }
+
+    #[test]
+    fn joining_node_leaves_when_group_is_full() {
+        let mut node = NetNode::new(DEFAULT_PORT);
+        let title = *b"full-group-test!";
+        let now = Instant::now();
+        node.title = Some(title);
+        node.slot = Some(0);
+        node.joined_at = now;
+        for slot in 1..MAX_PLAYERS {
+            node.peers.insert(
+                u32::from(slot) + 10,
+                Peer {
+                    slot,
+                    last_seen: now,
+                    settled: true,
+                },
+            );
+        }
+
+        node.handle_packet(&packet(HELLO, 7, &title, 99, &[0]), now);
+
+        assert!(node.is_full());
+        assert!(!node.is_open());
+        assert_eq!(node.slot(), -1);
+        assert!(node.peers.is_empty());
+    }
+
+    #[test]
+    fn inbox_drops_messages_after_reaching_its_limit() {
+        let mut node = NetNode::new(DEFAULT_PORT);
+        let title = *b"inbox-limit-0001";
+        let now = Instant::now();
+        node.title = Some(title);
+        node.slot = Some(0);
+
+        for index in 0..=INBOX_LIMIT {
+            node.handle_packet(&packet(DATA, 1, &title, 10, &[index as u8]), now);
+        }
+
+        assert_eq!(node.inbox.len(), INBOX_LIMIT);
+        for index in 0..INBOX_LIMIT {
+            assert_eq!(node.receive(), Some((1, vec![index as u8])));
+        }
+        assert_eq!(node.receive(), None);
     }
 
     #[test]

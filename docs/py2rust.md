@@ -189,7 +189,10 @@ considered migration.
 - [ ] **Port [tests/test_net.py](../tests/test_net.py)** — networking coverage.
   - [x] Simulate a two-node join, slot arbitration, title-matched payload
         exchange, and peer departure through the Rust packet handler.
-  - Coverage remaining: end-to-end UDP transport and timeout behavior.
+  - [x] Exercise HELLO, DATA, and BYE delivery over loopback UDP sockets, and
+        verify stale peers are removed after the timeout.
+  - [x] Verify the eight-player capacity, join rejection when full, and bounded
+        inbound message queue in Rust.
 - [ ] **Port [tests/test_spacecave.py](../tests/test_spacecave.py)** — network/game coverage.
   - Coverage to preserve: Spacecave integration through the Rust CPU and transport.
 - [x] **Port [tests/test_storage_bios.py](../tests/test_storage_bios.py)** — storage/BIOS storage behavior.
@@ -217,6 +220,8 @@ point and its required tests pass.
      `tools/assembler.py`.
    - [ ] Reproduce the remaining useful `src/program_loader.py` behavior. Its
      Tank-16 dynamic-asset path now delegates to the Rust `sc16tank` CLI.
+   - [x] Exercise supported Rust C source loading through the headless runtime
+     with a compiled program that executes and halts.
    - [x] Add Rust discovery/orchestration in `sc16build smoke-modules`.
      C translation remains delegated to the retained Python compiler.
    - [ ] Gate deletion of `tools/c_compiler.py`, `tools/assembler.py`, and
@@ -242,6 +247,8 @@ point and its required tests pass.
      `src/lib_disk.py`, `src/isa.py`, and `tools/sc16net.py` with the Rust
      CPU/runtime/device implementations. The optional Python Numba JIT has
      been removed; the Rust CPU is the primary execution engine.
+   - [x] Exercise retained assembler programs through the Rust headless
+     runtime, including explicit instruction-budget exhaustion reporting.
    - [ ] Retire the Python Tk terminal, console logging, and emulator
      integration alongside the Python emulator. Rust already provides console
      MMIO buffers and text/scrollback state.

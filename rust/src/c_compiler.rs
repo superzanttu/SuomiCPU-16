@@ -173,13 +173,19 @@ enum NativeLocation {
     Register(u8),
     Constant(i64),
     GlobalScalar,
-    GlobalArray(usize),
+    GlobalArray {
+        length: usize,
+        element_size: usize,
+        element_signed: bool,
+    },
 }
 
 struct NativeGlobal {
     name: String,
     data: Vec<u8>,
     is_array: bool,
+    element_size: usize,
+    element_signed: bool,
 }
 
 pub struct ExpressionParser {
@@ -378,7 +384,13 @@ pub fn compile_minimal_program(
                 }
             }
             ExternalDeclaration::Global(global) => {
-                if global.c_type.trim() != "int"
+                let (element_size, element_signed) = match global.c_type.trim() {
+                    "int" => (2, false),
+                    "unsigned char" => (1, false),
+                    "char" | "signed char" => (1, true),
+                    _ => return Ok(None),
+                };
+                if (element_size == 1 && global.array_length.is_none())
                     || prototypes.contains_key(global.name.as_str())
                     || !global_names.insert(global.name.as_str())
                     || !names.insert(global.name.as_str())
@@ -387,7 +399,7 @@ pub fn compile_minimal_program(
                 }
                 let is_array = global.array_length.is_some();
                 let element_count = global.array_length.unwrap_or(1);
-                let Some(byte_count) = element_count.checked_mul(2) else {
+                let Some(byte_count) = element_count.checked_mul(element_size) else {
                     return Ok(None);
                 };
                 let Some(total_data_size) = static_data_size.checked_add(byte_count) else {
@@ -422,15 +434,21 @@ pub fn compile_minimal_program(
                         else {
                             return Ok(None);
                         };
-                        let value = value as u16;
-                        data[index * 2] = (value >> 8) as u8;
-                        data[index * 2 + 1] = value as u8;
+                        if element_size == 1 {
+                            data[index] = value as u8;
+                        } else {
+                            let value = value as u16;
+                            data[index * 2] = (value >> 8) as u8;
+                            data[index * 2 + 1] = value as u8;
+                        }
                     }
                 }
                 globals.push(NativeGlobal {
                     name: global.name.clone(),
                     data,
                     is_array,
+                    element_size,
+                    element_signed,
                 });
             }
         }
@@ -522,7 +540,11 @@ pub fn compile_minimal_program(
             locals
                 .entry(global.name.clone())
                 .or_insert(if global.is_array {
-                    NativeLocation::GlobalArray(global.data.len() / 2)
+                    NativeLocation::GlobalArray {
+                        length: global.data.len() / global.element_size,
+                        element_size: global.element_size,
+                        element_signed: global.element_signed,
+                    }
                 } else {
                     NativeLocation::GlobalScalar
                 });
@@ -859,7 +881,11 @@ fn native_sizeof_expression(
     match &expression.kind {
         ExpressionKind::Atom(value) if parse_integer_constant(value).is_some() => Some(2),
         ExpressionKind::Atom(name) => match locals.get(name) {
-            Some(NativeLocation::GlobalArray(length)) => u16::try_from(length.checked_mul(2)?).ok(),
+            Some(NativeLocation::GlobalArray {
+                length,
+                element_size,
+                ..
+            }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
             Some(_) => Some(2),
             None => None,
         },
@@ -867,7 +893,12 @@ fn native_sizeof_expression(
             let ExpressionKind::Atom(name) = &expression.kind else {
                 return None;
             };
-            matches!(locals.get(name), Some(NativeLocation::GlobalArray(_))).then_some(2)
+            match locals.get(name) {
+                Some(NativeLocation::GlobalArray { element_size, .. }) => {
+                    u16::try_from(*element_size).ok()
+                }
+                _ => None,
+            }
         }
         ExpressionKind::Unary { operator, operand }
             if matches!(operator.as_str(), "+" | "-" | "~" | "!") =>
@@ -960,7 +991,7 @@ fn emit_native_expression(
                     NativeLocation::GlobalScalar => assembly.push_str(&format!(
                         "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
                     )),
-                    NativeLocation::GlobalArray(_) => return false,
+                    NativeLocation::GlobalArray { .. } => return false,
                     NativeLocation::Register(source) if *source != destination => {
                         assembly.push_str(&format!("    MOV R{destination}, R{source}\n"));
                     }
@@ -1345,8 +1376,15 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &expression.kind else {
                 return false;
             };
+            let Some(NativeLocation::GlobalArray {
+                element_size,
+                element_signed,
+                ..
+            }) = locals.get(name)
+            else {
+                return false;
+            };
             if destination == 7
-                || !matches!(locals.get(name), Some(NativeLocation::GlobalArray(_)))
                 || !emit_native_expression(
                     index,
                     destination,
@@ -1358,12 +1396,20 @@ fn emit_native_expression(
             {
                 return false;
             }
+            if *element_size == 2 {
+                assembly.push_str(&format!("    SHL R{destination}, 1\n"));
+            }
             assembly.push_str(&format!(
-                "    SHL R{destination}, 1\n\
-                 LDI30 R7, __c_global_{name}\n\
+                "    LDI30 R7, __c_global_{name}\n\
                  ADD R7, R{destination}\n\
-                 LDW R{destination}, R7\n"
+                 {} R{destination}, R7\n",
+                if *element_size == 1 { "LD" } else { "LDW" }
             ));
+            if *element_signed {
+                assembly.push_str(&format!(
+                    "    SHL R{destination}, 8\n    ASR R{destination}, 8\n"
+                ));
+            }
             true
         }
         _ => false,
@@ -1461,9 +1507,19 @@ fn emit_native_assignment(
         let ExpressionKind::Atom(name) = &base.kind else {
             return false;
         };
-        if !matches!(locals.get(name), Some(NativeLocation::GlobalArray(_))) {
+        let Some(NativeLocation::GlobalArray {
+            element_size,
+            element_signed,
+            ..
+        }) = locals.get(name)
+        else {
             return false;
-        }
+        };
+        let (load, store) = if *element_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
         let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
             return false;
         };
@@ -1480,9 +1536,11 @@ fn emit_native_assignment(
         if !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly) {
             return false;
         }
+        if *element_size == 2 {
+            assembly.push_str("    SHL R0, 1\n");
+        }
         assembly.push_str(&format!(
-            "    SHL R0, 1\n\
-             LDI30 R7, __c_global_{name}\n\
+            "    LDI30 R7, __c_global_{name}\n\
              ADD R7, R0\n"
         ));
         if operator != "=" {
@@ -1499,12 +1557,14 @@ fn emit_native_assignment(
                 "^=" => "XOR",
                 _ => return false,
             };
-            assembly.push_str(&format!(
-                "    LDW R0, R7\n    {binary_operator} R0, R{value_register}\n"
-            ));
-            assembly.push_str("    STW R7, R0\n");
+            assembly.push_str(&format!("    {load} R0, R7\n"));
+            if *element_signed {
+                assembly.push_str("    SHL R0, 8\n    ASR R0, 8\n");
+            }
+            assembly.push_str(&format!("    {binary_operator} R0, R{value_register}\n"));
+            assembly.push_str(&format!("    {store} R7, R0\n"));
         } else {
-            assembly.push_str(&format!("    STW R7, R{value_register}\n"));
+            assembly.push_str(&format!("    {store} R7, R{value_register}\n"));
         }
         return true;
     }
@@ -1518,7 +1578,7 @@ fn emit_native_assignment(
         NativeLocation::Register(register) => (*register, false),
         NativeLocation::Constant(_) => return false,
         NativeLocation::GlobalScalar => (0, true),
-        NativeLocation::GlobalArray(_) => return false,
+        NativeLocation::GlobalArray { .. } => return false,
     };
     let binary_operator = match operator.as_str() {
         "=" => None,
@@ -1985,19 +2045,35 @@ fn emit_native_update(
         let ExpressionKind::Atom(name) = &base.kind else {
             return false;
         };
-        if !matches!(locals.get(name), Some(NativeLocation::GlobalArray(_)))
-            || !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly)
-        {
+        let Some(NativeLocation::GlobalArray {
+            element_size,
+            element_signed,
+            ..
+        }) = locals.get(name)
+        else {
+            return false;
+        };
+        if !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly) {
             return false;
         }
+        let (load, store) = if *element_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        if *element_size == 2 {
+            assembly.push_str("    SHL R0, 1\n");
+        }
         assembly.push_str(&format!(
-            "    SHL R0, 1\n\
-             LDI30 R7, __c_global_{name}\n\
+            "    LDI30 R7, __c_global_{name}\n\
              ADD R7, R0\n\
-             LDW R0, R7\n\
-             {instruction} R0\n\
-             STW R7, R0\n"
+             {load} R0, R7\n\
+             {instruction} R0\n"
         ));
+        if *element_signed {
+            assembly.push_str("    SHL R0, 8\n    ASR R0, 8\n");
+        }
+        assembly.push_str(&format!("    {store} R7, R0\n"));
         return true;
     }
     let ExpressionKind::Atom(name) = &expression.kind else {
@@ -2014,7 +2090,7 @@ fn emit_native_update(
         NativeLocation::Register(register) => {
             assembly.push_str(&format!("    {instruction} R{register}\n"));
         }
-        NativeLocation::Constant(_) | NativeLocation::GlobalArray(_) => return false,
+        NativeLocation::Constant(_) | NativeLocation::GlobalArray { .. } => return false,
     }
     true
 }
@@ -5387,6 +5463,43 @@ mod tests {
         assert_eq!(cpu.registers[0], 13);
         assert_eq!(cpu.read_u16(0x80002), 6);
         assert_eq!(cpu.read_u16(0x80004), 13);
+    }
+
+    #[test]
+    fn compiles_indexed_unsigned_char_global_arrays() {
+        let image = compile_minimal_program(
+            "unsigned char values[4] = { 1, 255, 3 }; \
+             int main(void) { values[1] += 2; values[2]++; values[3] = values[1]; \
+                 return sizeof(values) + values[0] + values[1] + values[2] + values[3]; }",
+            "byte-array.c",
+        )
+        .unwrap()
+        .expect("supported unsigned-char array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 11);
+        assert_eq!(&cpu.memory[0x80000..0x80004], &[1, 1, 4, 1]);
+    }
+
+    #[test]
+    fn compiles_signed_char_global_array_loads_and_compound_assignments() {
+        let image = compile_minimal_program(
+            "char values[2] = { 255, 4 }; \
+             int main(void) { values[0] /= 2; return values[0] + values[1]; }",
+            "signed-byte-array.c",
+        )
+        .unwrap()
+        .expect("supported signed-char array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 4);
+        assert_eq!(&cpu.memory[0x80000..0x80002], &[0, 4]);
     }
 
     #[test]

@@ -70,9 +70,11 @@ Passing the Rust build or parser tests does not establish feature parity.
   `void` helpers with parameter passing, direct/recursive calls, local `int`
   variables and scalar initializers, initialized and zero-initialized scalar
   global integers, brace-initialized global integer arrays, and indexed global-
-  array reads and writes; integer assignment, arithmetic, bitwise, shift,
-  logical, comparison, conditional, comma, increment/decrement, and `sizeof`
-  expressions; `if`/`else`,
+  array reads and writes. Fixed-size global `char`, `signed char`, and
+  `unsigned char` arrays support byte-accurate initialization, indexing,
+  assignment, increment, compound assignment, and `sizeof`. Integer assignment,
+  arithmetic, bitwise, shift, logical, comparison, conditional, comma,
+  increment/decrement, and `sizeof` expressions; `if`/`else`,
   `switch`/`case`/`default`
   with fallthrough, function-scoped `goto` labels, nested blocks, `while`,
   `do`/`while`, basic `for` loops, and loop `break`/`continue`.

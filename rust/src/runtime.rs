@@ -1842,19 +1842,46 @@ mod tests {
     }
 
     #[test]
-    fn retained_assembler_builds_commands_and_directive_examples() {
+    fn headless_runtime_executes_retained_assembler_examples() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for name in ["commands.asm", "directives.asm", "example.asm"] {
             let program = root.join("examples").join(name);
-            let image = load_program(&program).unwrap();
-            let mut cpu = Cpu::new();
-            cpu.load_program(&image.segments, image.entry_point)
-                .unwrap();
-            let count = cpu.run(50_000).unwrap();
-            assert!(
-                !cpu.running,
-                "{name} did not halt after {count} instructions"
-            );
+            let count = run_headless(root, &program, 50_000).unwrap_or_else(|error| {
+                panic!("{name} failed through the headless runtime: {error}")
+            });
+            assert!(count > 0, "{name} executed no instructions");
         }
+    }
+
+    #[test]
+    fn headless_runtime_reports_instruction_budget_exhaustion() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let program = root.join("examples").join("commands.asm");
+
+        let error = run_headless(root, &program, 1).unwrap_err();
+
+        assert!(error.to_string().contains("instruction budget exhausted"));
+    }
+
+    #[test]
+    fn headless_runtime_loads_and_executes_supported_c_source() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = std::env::temp_dir().join(format!(
+            "sc16-headless-c-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(directory.join("disks")).unwrap();
+        let source = directory.join("minimal.c");
+        fs::write(&source, "int main(void) { return 6 * 7; }\n").unwrap();
+
+        let result = run_headless(root, &source, 64);
+        fs::remove_dir_all(&directory).unwrap();
+
+        let executed = result.expect("supported C source should run headlessly");
+        assert!(executed > 0);
     }
 }
