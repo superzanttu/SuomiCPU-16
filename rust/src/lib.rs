@@ -6,5 +6,6 @@ pub mod image;
 pub mod isa;
 pub mod net;
 pub mod runtime;
+pub mod tank_maps;
 
 pub use cpu::{ADDRESS_MASK, Cpu, CpuError, Flags, MEMORY_SIZE, MemorySegment};

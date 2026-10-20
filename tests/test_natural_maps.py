@@ -1,15 +1,24 @@
+import json
 import runpy
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 GAME_DIR = ROOT / "modules" / "Tank-16"
-if str(GAME_DIR) not in sys.path:
-    sys.path.insert(0, str(GAME_DIR))
-
-from generate_natural_maps import MAPS, generate_maps
+MAPS = (
+    "ARCHIPEL",
+    "RIVER-01",
+    "LAKESIDE",
+    "DELTA-01",
+    "COAST-01",
+    "ISLANDS",
+    "FJORD-01",
+    "MARSH-01",
+    "HIGHLND",
+    "ESTUARY",
+)
 
 
 EDITOR_PATH = GAME_DIR / "map_editor.py"
@@ -19,7 +28,7 @@ class NaturalMapTests(unittest.TestCase):
     def test_generated_maps_are_installed_in_runtime_folder(self):
         editor = runpy.run_path(str(EDITOR_PATH))
         runtime_dir = GAME_DIR / "disks" / "maps"
-        for name, _, _ in MAPS:
+        for name in MAPS:
             runtime_path = runtime_dir / f"{name}.json"
             self.assertTrue(runtime_path.is_file())
             self.assertEqual(editor["load_map"](runtime_path)["name"], name)
@@ -28,12 +37,27 @@ class NaturalMapTests(unittest.TestCase):
         editor = runpy.run_path(str(EDITOR_PATH))
         with tempfile.TemporaryDirectory() as directory:
             runtime_dir = Path(directory) / "disks" / "maps"
-            generated = generate_maps(runtime_dir)
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "run",
+                    "--quiet",
+                    "--bin",
+                    "sc16maps",
+                    "--",
+                    "--maps-dir",
+                    str(runtime_dir),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
-            self.assertEqual(len(generated), 10)
+            self.assertEqual(len(json.loads(result.stdout)["maps"]), 10)
             self.assertEqual(len(list(runtime_dir.glob("*.json"))), 10)
             terrain_layouts = set()
-            for name, _, _ in MAPS:
+            for name in MAPS:
                 runtime_path = runtime_dir / f"{name}.json"
                 map_data = editor["load_map"](runtime_path)
                 self.assertEqual(map_data["name"], name)
