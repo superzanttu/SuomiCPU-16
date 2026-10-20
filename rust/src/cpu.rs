@@ -1,7 +1,8 @@
 use memmap2::MmapMut;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::console::ConsoleDevice;
 use crate::disk::DiskDevice;
 use crate::net::{DEFAULT_PORT, NetNode};
 
@@ -244,8 +245,7 @@ pub struct Cpu {
     pub running: bool,
     pub frame_yield: bool,
     pub frame_count: u16,
-    pub console_input: VecDeque<u8>,
-    pub console_output: Vec<u8>,
+    pub console: ConsoleDevice,
     pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
     pub layers: [Vec<u8>; GPU_LAYER_COUNT],
@@ -330,8 +330,7 @@ impl Cpu {
             running: true,
             frame_yield: false,
             frame_count: 0,
-            console_input: VecDeque::new(),
-            console_output: Vec::new(),
+            console: ConsoleDevice::new(),
             saved_video: None,
             random_state: 0x16c0_ffee,
             layers: std::array::from_fn(|_| vec![0; 640 * 480]),
@@ -388,20 +387,19 @@ impl Cpu {
         let address = address & self.memory_mask;
         match address {
             CONSOLE_DATA => {
-                let value = self.console_input.pop_front().unwrap_or(0);
+                let value = self.console.read_data();
                 if self.memory[CONSOLE_CONTROL as usize] & 1 != 0 && value != 0 {
-                    self.console_output.push(value);
                     print!("{}", char::from(value));
                 }
                 value
             }
             CONSOLE_STATUS => {
-                if self.console_input.is_empty() && self.running {
+                if self.console.receive_buffer().is_empty() && self.running {
                     self.frame_yield = true;
                 }
-                u8::from(!self.console_input.is_empty()) | 2
+                self.console.status()
             }
-            CONSOLE_CONTROL => self.memory[address as usize] & 3,
+            CONSOLE_CONTROL => self.console.control(),
             _ => self.memory[address as usize],
         }
     }
@@ -657,13 +655,17 @@ impl Cpu {
                 }
             }
             CONSOLE_DATA => {
-                self.console_output.push(value);
+                self.console.write_data(value);
                 print!("{}", char::from(value));
                 if value == b'\n' {
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             }
-            CONSOLE_CONTROL => self.memory[index] = value & 3,
+            CONSOLE_STATUS if value & 0x04 != 0 => self.console.clear_overrun(),
+            CONSOLE_CONTROL => {
+                self.console.set_control(value);
+                self.memory[index] = self.console.control();
+            }
             _ => {}
         }
     }
@@ -1408,7 +1410,7 @@ impl Cpu {
     }
 
     pub fn receive_console_input(&mut self, bytes: &[u8]) {
-        self.console_input.extend(bytes.iter().copied());
+        self.console.receive(bytes);
     }
 
     pub fn signal_keyboard_event(&mut self, keycode: u8) {
@@ -3850,6 +3852,23 @@ mod tests {
         cpu.signal_keyboard_event(b'B');
         assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], b'B');
         assert_eq!(cpu.read(ICR_ADDR) & 2, 2);
+    }
+
+    #[test]
+    fn console_mmio_bounds_input_and_clears_overrun_status() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.receive_console_input(&vec![b'x'; crate::console::RX_CAPACITY + 1]);
+        assert_eq!(cpu.read(CONSOLE_STATUS), 7);
+        cpu.write(CONSOLE_STATUS, 0x04);
+        assert_eq!(cpu.read(CONSOLE_STATUS), 3);
+
+        cpu.write(CONSOLE_CONTROL, 0x02);
+        for _ in 0..crate::console::RX_CAPACITY {
+            cpu.read(CONSOLE_DATA);
+        }
+        cpu.receive_console_input(b"B");
+        assert_eq!(cpu.read(CONSOLE_DATA), b'B');
+        assert!(cpu.console.output().is_empty());
     }
 
     #[test]

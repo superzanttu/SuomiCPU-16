@@ -385,7 +385,7 @@ fn update_rtc(cpu: &mut Cpu, timestamp: u64) {
 
 fn capture_frame(cpu: &Cpu, text_mode: bool) -> Vec<u8> {
     if text_mode {
-        return render_console(&cpu.console_output);
+        return render_console(cpu.console.output());
     }
     let framebuffer = cpu.composited_framebuffer();
     let source_width = if cpu.memory[0x43014] == 1 {

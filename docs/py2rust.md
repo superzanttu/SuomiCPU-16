@@ -33,7 +33,7 @@ Status meanings:
 |---|---|---|
 | [`src/SuomiCPU.py`](../src/SuomiCPU.py) | Rust exists — Python consumers remain | Rust's CPU, GUI runtime, BIOS selector, and program launcher exist, but Python tests and tools still instantiate the Python emulator. Switch those consumers to Rust and verify module/runtime parity before retiring this compatibility implementation. |
 | [`src/bios.py`](../src/bios.py) | Rust exists — Python consumers remain | Rust implements module discovery, BIOS selection, and booting. Python BIOS tests and `src/SuomiCPU.py` still use this module. |
-| [`src/console_device.py`](../src/console_device.py) | Blocking — incomplete port | Rust has console MMIO input/output, but not the Python device's complete terminal window, scrollback, bounded buffers, and logging behavior. Port or explicitly retire those behaviors and move tests off Python first. |
+| [`src/console_device.py`](../src/console_device.py) | Rust exists — Python consumers remain | Rust now implements bounded MMIO input/output buffers, control/overrun status, the 80x25 text grid, and 1,000-row scrollback. The Python emulator still uses this class; its Tk window, file logging, and Python-only host lifecycle controls remain to be retired with that emulator. |
 | [`src/isa.py`](../src/isa.py) | Rust exists — Python consumers remain | ISA metadata is available in Rust, but the Python assembler and emulator still import Python definitions. Remove it with those consumers after encoding/execution parity is covered. |
 | [`src/lib_disk.py`](../src/lib_disk.py) | Rust exists — Python consumers remain | Rust disk behavior and parity tests exist, but the Python emulator, Tank-16 loader, and Python tests still import this implementation. |
 | [`src/program_loader.py`](../src/program_loader.py) | Rust exists — Python consumers remain | Tank-16 runtime compilation now routes through `sc16tank build-runtime`; the Python loader still serves the Python emulator and other Python callers. Retire it with those consumers. |
@@ -96,7 +96,7 @@ considered migration.
 | [`tests/test_assembler_coverage.py`](../tests/test_assembler_coverage.py) | Test/helper — retain for coverage | Additional Python assembler cases; port any cases not covered by `rust/src/assembler.rs` tests. |
 | [`tests/test_bios.py`](../tests/test_bios.py) | Test/helper — retain for coverage | Python BIOS discovery, selection, and boot behaviors; ensure Rust runtime tests cover the same cases. |
 | [`tests/test_c_compiler.py`](../tests/test_c_compiler.py) | Test/helper — retain for coverage | Python compiler behavior; move supported-language and diagnostic cases to Rust tests as the Rust compiler replaces it. |
-| [`tests/test_console_device.py`](../tests/test_console_device.py) | Test/helper — retain for coverage | Console buffers, terminal presentation, and device behavior; port or intentionally drop coverage tied only to the Python terminal. |
+| [`tests/test_console_device.py`](../tests/test_console_device.py) | Test/helper — retain for coverage | Python emulator and Tk console-window integration remain; Rust unit tests now cover console MMIO buffering, bounds, text rendering state, and scrollback. |
 | [`tests/test_display.py`](../tests/test_display.py) | Test/helper — retain for coverage | Pygame display rendering and emulator integration; replace with Rust runtime/frame tests. |
 | [`tests/test_extended_opcodes.py`](../tests/test_extended_opcodes.py) | Test/helper — retain for coverage | Extended ISA execution and graphics behavior; confirm Rust CPU coverage, then move remaining graphics cases to Rust. |
 | [`tests/test_finland_map.py`](../tests/test_finland_map.py) | Test/helper — retain for coverage | Finland map/GIS generator and asset output; port generator checks or retain a clearly documented Python authoring-tool test. |
@@ -143,7 +143,10 @@ point and its required tests pass.
    - Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,
      `src/lib_disk.py`, `src/isa.py`, `src/sc16_jit.py`, and
      `tools/sc16net.py` with the Rust CPU/runtime/device implementations.
-   - Fill behavior gaps and move BIOS, console, storage, ISA, graphics, and
+   - Rust now provides the console MMIO buffers and text/scrollback state.
+     Retire the Python Tk terminal, console logging, and emulator integration
+     alongside the Python emulator.
+   - Fill remaining behavior gaps and move BIOS, storage, ISA, graphics, and
      networking regressions into Rust tests.
    - Switch launch scripts, build commands, and user documentation to Rust;
      verify supported games and BIOS modules without Python.
