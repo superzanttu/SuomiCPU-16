@@ -388,6 +388,40 @@ mod tests {
     }
 
     #[test]
+    fn simulated_two_node_handshake_assigns_slots_and_routes_game_payloads() {
+        let mut first = NetNode::new(DEFAULT_PORT);
+        let mut second = NetNode::new(DEFAULT_PORT);
+        let mut title = [0; 16];
+        title[..4].copy_from_slice(b"game");
+        let now = Instant::now();
+
+        first.title = Some(title);
+        first.slot = Some(0);
+        first.instance_id = 1;
+        first.joined_at = now - JOIN_TIME;
+        second.title = Some(title);
+        second.slot = Some(0);
+        second.instance_id = 2;
+        second.joined_at = now - JOIN_TIME;
+
+        second.handle_packet(&packet(HELLO, 0, &title, 1, &[1]), now);
+        assert_eq!(second.slot(), 1);
+        first.handle_packet(&packet(HELLO, 1, &title, 2, &[1]), now);
+        assert_eq!(first.slot(), 0);
+        assert!(first.active(1));
+        assert!(second.active(0));
+
+        first.handle_packet(&packet(DATA, 1, &title, 2, b"player-two"), now);
+        second.handle_packet(&packet(DATA, 0, &title, 1, b"player-one"), now);
+        assert_eq!(first.receive(), Some((1, b"player-two".to_vec())));
+        assert_eq!(second.receive(), Some((0, b"player-one".to_vec())));
+
+        first.handle_packet(&packet(BYE, 1, &title, 2, b""), now);
+        assert_eq!(first.players(), 1);
+        assert!(!first.active(1));
+    }
+
+    #[test]
     fn empty_payloads_are_valid_and_oversized_payloads_are_rejected() {
         let mut node = NetNode::new(DEFAULT_PORT);
         let mut title = [0; 16];

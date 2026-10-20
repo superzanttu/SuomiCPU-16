@@ -161,7 +161,10 @@ considered migration.
         a Rust runtime integration test.
   - Coverage remaining: game-level behavior through Rust CPU/runtime tests.
 - [ ] **Port [tests/test_hertta3d.py](../tests/test_hertta3d.py)** — game/render coverage.
-  - Coverage to preserve: Hertta3D execution and rendering through Rust.
+  - [x] Verify that a submitted 3D scene produces projected fill and wireframe
+        primitives for the Rust window renderer.
+  - Coverage remaining: Hertta3D game execution and gameplay-frame rendering
+    through Rust.
 - [x] **Port [tests/test_isa_opcodes.py](../tests/test_isa_opcodes.py)** — ISA coverage.
   - [x] Verify all 32 base opcode slots, shared-extension aliases, and mnemonic
         lookup tables in Rust.
@@ -184,7 +187,9 @@ considered migration.
   - Python's extra exhaustive test loops remain useful to its accepted
     assembler/emulator implementations but no longer block Rust ISA parity.
 - [ ] **Port [tests/test_net.py](../tests/test_net.py)** — networking coverage.
-  - Coverage to preserve: end-to-end coverage through the Rust networking path.
+  - [x] Simulate a two-node join, slot arbitration, title-matched payload
+        exchange, and peer departure through the Rust packet handler.
+  - Coverage remaining: end-to-end UDP transport and timeout behavior.
 - [ ] **Port [tests/test_spacecave.py](../tests/test_spacecave.py)** — network/game coverage.
   - Coverage to preserve: Spacecave integration through the Rust CPU and transport.
 - [x] **Port [tests/test_storage_bios.py](../tests/test_storage_bios.py)** — storage/BIOS storage behavior.

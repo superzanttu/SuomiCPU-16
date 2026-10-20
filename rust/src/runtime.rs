@@ -1601,6 +1601,38 @@ mod tests {
     }
 
     #[test]
+    fn game_frame_submits_projected_3d_fill_and_wireframe_geometry() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.memory[0x43014] = 1;
+        let scene = [
+            3, 1, 0, 0, 0, 0, 0, 1000, 10000, 3, -1000, -1000, 0, 0, 1000, 0, 1000, -1000, 0, 0, 1,
+            2, 2,
+        ];
+        for (index, value) in scene.into_iter().enumerate() {
+            cpu.write_u16(0x1000 + (index * 2) as u32, value as u16);
+        }
+        cpu.write_u16(0x4302a, 0x1000);
+        cpu.write(0x43020, 22);
+
+        assert_eq!(
+            cpu.gpu_triangles,
+            [GpuTriangle {
+                points: [(280, 280), (320, 201), (359, 280)],
+                color: 2,
+            }]
+        );
+        assert_eq!(cpu.gpu_lines.len(), 3);
+        assert_eq!(
+            cpu.gpu_lines[0],
+            GpuLine {
+                start: (280, 280),
+                end: (320, 201),
+                color: 2,
+            }
+        );
+    }
+
+    #[test]
     fn sound_synthesis_produces_valid_pcm_wav_with_requested_duration() {
         let wav = synthesize_sound(GpuSoundCommand {
             channel: 0,
