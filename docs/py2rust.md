@@ -122,8 +122,14 @@ considered migration.
 - [ ] **Retire Python-specific console tests from [tests/test_console_device.py](../tests/test_console_device.py).**
   - Why they remain: Tk window controls/clipboard/scrolling, Python host
     lifecycle messages, and file logging still belong to the legacy emulator.
-- [ ] **Port [tests/test_display.py](../tests/test_display.py)** — display coverage.
-  - Coverage to preserve: Pygame display rendering and emulator integration through Rust runtime/frame tests.
+- [x] **Port shared display logic from [tests/test_display.py](../tests/test_display.py) to Rust.**
+  - Rust tests now cover held-key mapping/releases, frame-budget accumulation,
+    screen dimensions, palette conversion, and indexed/paletted framebuffer
+    rendering.
+- [ ] **Port or retire Python GUI-loop tests from [tests/test_display.py](../tests/test_display.py).**
+  - Why they remain: pause timing, Pygame fullscreen/window management,
+    console-window toggling, halt-window lifetime, and display pacing are
+    tied to the legacy Python event loop.
 - [ ] **Port [tests/test_extended_opcodes.py](../tests/test_extended_opcodes.py)** — ISA/graphics coverage.
   - Coverage to preserve: confirm Rust CPU coverage and move any remaining graphics cases.
 - [ ] **Port [tests/test_gpu_games.py](../tests/test_gpu_games.py)** — game/GPU coverage.

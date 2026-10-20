@@ -970,6 +970,63 @@ mod tests {
     }
 
     #[test]
+    fn display_key_mappings_update_all_sc16_key_bytes_and_release_cleanly() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let mut previous = HashSet::new();
+        let current = HashSet::from([
+            KeyCode::A,
+            KeyCode::Tab,
+            KeyCode::Q,
+            KeyCode::X,
+            KeyCode::C,
+            KeyCode::Period,
+        ]);
+        update_keys(&mut cpu, &previous, &current);
+        assert_eq!(&cpu.memory[0x43004..0x43007], &[0x41, 0x05, 0x21]);
+
+        previous = current;
+        let current = HashSet::from([KeyCode::D, KeyCode::E, KeyCode::Z, KeyCode::J]);
+        update_keys(&mut cpu, &previous, &current);
+        assert_eq!(&cpu.memory[0x43004..0x43007], &[0x02, 0x0a, 0x02]);
+    }
+
+    #[test]
+    fn display_rate_budget_accumulates_fractional_frames_without_negative_work() {
+        let mut remainder = 0.0;
+        assert_eq!(rate_budget(10.0, 0.05, &mut remainder), 0);
+        assert_eq!(rate_budget(10.0, 0.05, &mut remainder), 1);
+        assert_eq!(rate_budget(10.0, -1.0, &mut remainder), 0);
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn display_renderer_maps_vram_palette_and_resolution_to_rgb_pixels() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.memory[0x50000] = 1;
+        cpu.memory[0x50001] = 25;
+        cpu.palette[1] = [255, 255, 255];
+        cpu.palette[2] = [0, 0, 255];
+        cpu.palette[25] = [0, 0, 255];
+        let mut pixels = vec![0; 640 * 480];
+
+        render_cpu(&cpu, &mut pixels);
+        assert_eq!(pixels[0], 0x00ff_ffff);
+        assert_eq!(pixels[1], 0x0000_00ff);
+        assert_eq!(pixels.len(), 640 * 480);
+
+        cpu.memory[GFX_MODE_ADDR] = 1;
+        cpu.memory[0x50000] = 0x12;
+        let mut high_resolution_pixels = vec![0; 640 * 480];
+        render_cpu(&cpu, &mut high_resolution_pixels);
+        assert_eq!(high_resolution_pixels[0], 0x00ff_ffff);
+        assert_eq!(high_resolution_pixels[1], 0x0000_00ff);
+        assert_eq!(screen_size(&cpu), (640, 480));
+
+        cpu.memory[GFX_MODE_ADDR] = 0;
+        assert_eq!(screen_size(&cpu), (320, 240));
+    }
+
+    #[test]
     fn sound_synthesis_produces_valid_pcm_wav_with_requested_duration() {
         let wav = synthesize_sound(GpuSoundCommand {
             channel: 0,
