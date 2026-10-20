@@ -3340,6 +3340,122 @@ mod tests {
                 }
             }
         }
+
+        for (action, left, right, expected) in [
+            (3u16, 60_000.0f32, 2.0f32, 0x7c00u16),
+            (3, f32::INFINITY, 0.0, 0x7e00),
+            (4, 2.0, 0.0, 0x7c00),
+            (4, -2.0, 0.0, 0xfc00),
+            (4, 0.0, 0.0, 0x7e00),
+            (2, -0.0, 0.0, 0x8000),
+        ] {
+            cpu.registers[0] = i64::from(f32_to_f16(left));
+            cpu.registers[1] = i64::from(f32_to_f16(right));
+            cpu.pc = 0;
+            cpu.running = true;
+            cpu.write_u16(0, (OP_SHR << 11) | (action << 5) | (1 << 2));
+            cpu.step().unwrap();
+            assert_eq!(cpu.registers[0], i64::from(expected));
+        }
+
+        cpu.registers[0] = i64::from(f32_to_f16(f32::NAN));
+        cpu.registers[1] = i64::from(f32_to_f16(1.0));
+        cpu.flags = Flags::default();
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.write_u16(0, (OP_SHR << 11) | (5 << 5) | (1 << 2));
+        cpu.step().unwrap();
+        assert!(!cpu.flags.zero);
+        assert!(!cpu.flags.carry);
+
+        cpu.registers[0] = i64::from(f32_to_f16(-0.0));
+        cpu.registers[1] = i64::from(f32_to_f16(0.0));
+        cpu.flags = Flags::default();
+        cpu.pc = 0;
+        cpu.running = true;
+        cpu.step().unwrap();
+        assert!(cpu.flags.zero);
+        assert!(!cpu.flags.carry);
+    }
+
+    #[test]
+    fn ieee_float_binary_operations_cover_every_valid_register_pair() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        for destination in [0usize, 2, 4, 6] {
+            for source in [0usize, 2, 4, 6] {
+                for action in 0..=4u16 {
+                    let left = 6.0f32;
+                    let right = if destination == source { left } else { 1.5 };
+                    cpu.registers = [0; 8];
+                    cpu.write_float_register(destination, 32, f64::from(left));
+                    cpu.write_float_register(source, 32, f64::from(right));
+                    cpu.flags = Flags::default();
+                    cpu.pc = 0;
+                    cpu.running = true;
+                    cpu.write_u16(
+                        0,
+                        (OP_SHR << 11) | ((destination as u16) << 8) | FLOAT_PREFIX,
+                    );
+                    cpu.write_u16(2, (action << 11) | source as u16);
+                    cpu.step().unwrap();
+
+                    if action == 4 {
+                        assert_eq!(cpu.flags.zero, left == right);
+                        assert_eq!(cpu.flags.carry, left < right);
+                    } else {
+                        let expected = match action {
+                            0 => left + right,
+                            1 => left - right,
+                            2 => left * right,
+                            _ => left / right,
+                        };
+                        assert_eq!(
+                            cpu.read_float_register(destination, 32) as f32,
+                            expected,
+                            "F32 action {action}, R{destination}, R{source}"
+                        );
+                    }
+                }
+            }
+        }
+
+        for destination in [0usize, 4] {
+            for source in [0usize, 4] {
+                for action in 5..=9u16 {
+                    let left = 6.0f64;
+                    let right = if destination == source { left } else { 1.5 };
+                    cpu.registers = [0; 8];
+                    cpu.write_float_register(destination, 64, left);
+                    cpu.write_float_register(source, 64, right);
+                    cpu.flags = Flags::default();
+                    cpu.pc = 0;
+                    cpu.running = true;
+                    cpu.write_u16(
+                        0,
+                        (OP_SHR << 11) | ((destination as u16) << 8) | FLOAT_PREFIX,
+                    );
+                    cpu.write_u16(2, (action << 11) | source as u16);
+                    cpu.step().unwrap();
+
+                    if action == 9 {
+                        assert_eq!(cpu.flags.zero, left == right);
+                        assert_eq!(cpu.flags.carry, left < right);
+                    } else {
+                        let expected = match action {
+                            5 => left + right,
+                            6 => left - right,
+                            7 => left * right,
+                            _ => left / right,
+                        };
+                        assert_eq!(
+                            cpu.read_float_register(destination, 64),
+                            expected,
+                            "F64 action {action}, R{destination}, R{source}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

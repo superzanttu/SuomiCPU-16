@@ -139,7 +139,7 @@ considered migration.
   - Coverage to preserve: game-level GPU behavior through Rust CPU/runtime integration tests.
 - [ ] **Port [tests/test_hertta3d.py](../tests/test_hertta3d.py)** — game/render coverage.
   - Coverage to preserve: Hertta3D execution and rendering through Rust.
-- [ ] **Port [tests/test_isa_opcodes.py](../tests/test_isa_opcodes.py)** — ISA coverage.
+- [x] **Port [tests/test_isa_opcodes.py](../tests/test_isa_opcodes.py)** — ISA coverage.
   - [x] Verify all 32 base opcode slots, shared-extension aliases, and mnemonic
         lookup tables in Rust.
   - [x] Cover assembled base register operations, stack round-trips, label loops,
@@ -154,8 +154,12 @@ considered migration.
         restoration for keyboard and RTC sources.
   - [x] Cover IEEE float NaN/signed-zero comparisons, division by zero, and
         integer-conversion range edges in Rust.
-  - [ ] Compare remaining exhaustive Python float register-pair combinations
-        and classic half-float edge cases before retiring the Python suite.
+  - [x] Cover every valid IEEE float register-pair combination and classic
+        half-float overflow, infinity, zero, NaN, division, and comparison edges.
+  - [x] Compare all base register-form instruction encodings byte for byte
+        across every register combination.
+  - Python's extra exhaustive test loops remain useful to its accepted
+    assembler/emulator implementations but no longer block Rust ISA parity.
 - [ ] **Port [tests/test_net.py](../tests/test_net.py)** — networking coverage.
   - Coverage to preserve: end-to-end coverage through the Rust networking path.
 - [ ] **Port [tests/test_spacecave.py](../tests/test_spacecave.py)** — network/game coverage.

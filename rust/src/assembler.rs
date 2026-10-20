@@ -1382,6 +1382,60 @@ mod tests {
     }
 
     #[test]
+    fn encodes_base_register_forms_for_every_register_combination() {
+        for destination in 0..8u16 {
+            for source in 0..8u16 {
+                for mnemonic in ["MOV", "LD", "LDW"] {
+                    let opcode = lookup(BASE_OPCODES, mnemonic).unwrap();
+                    let image =
+                        assemble(&format!("{mnemonic} R{destination}, R{source}"), 0).unwrap();
+                    let expected = (opcode << 11) | (destination << 8) | (source << 5);
+                    assert_eq!(
+                        image.segments[0].data,
+                        expected.to_be_bytes(),
+                        "{mnemonic} R{destination}, R{source}"
+                    );
+                }
+
+                for mnemonic in ["ST", "STW"] {
+                    let opcode = lookup(BASE_OPCODES, mnemonic).unwrap();
+                    let image =
+                        assemble(&format!("{mnemonic} R{destination}, R{source}"), 0).unwrap();
+                    let expected = (opcode << 11) | (source << 8) | (destination << 5);
+                    assert_eq!(
+                        image.segments[0].data,
+                        expected.to_be_bytes(),
+                        "{mnemonic} R{destination}, R{source}"
+                    );
+                }
+
+                for mnemonic in ["ADD", "SUB", "AND", "OR", "XOR", "CMP"] {
+                    let opcode = lookup(BASE_OPCODES, mnemonic).unwrap();
+                    let image =
+                        assemble(&format!("{mnemonic} R{destination}, R{source}"), 0).unwrap();
+                    let expected =
+                        (opcode << 11) | (destination << 8) | (destination << 5) | (source << 2);
+                    assert_eq!(
+                        image.segments[0].data,
+                        expected.to_be_bytes(),
+                        "{mnemonic} R{destination}, R{source}"
+                    );
+                }
+
+                let image = assemble(&format!("NOT R{destination}, R{source}"), 0).unwrap();
+                let expected = (lookup(BASE_OPCODES, "NOT").unwrap() << 11)
+                    | (destination << 8)
+                    | (source << 5);
+                assert_eq!(
+                    image.segments[0].data,
+                    expected.to_be_bytes(),
+                    "NOT R{destination}, R{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validates_memory_boundaries_and_entry_point_defaults() {
         assert_eq!(assemble("", 0).unwrap().entry_point, 0);
         assert_eq!(assemble("", 0x40).unwrap().entry_point, 0x40);
