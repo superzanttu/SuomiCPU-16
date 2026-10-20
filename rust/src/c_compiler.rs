@@ -224,6 +224,32 @@ struct NativeGlobal {
     element_signed: bool,
 }
 
+const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 2] = [
+    ("lib_cgfx.asm", include_str!("../../lib/lib_cgfx.asm")),
+    ("lib_text.asm", include_str!("../../lib/lib_text.asm")),
+];
+
+fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
+    NATIVE_ASSEMBLY_LIBRARIES
+        .iter()
+        .find(|(_, source)| {
+            source.lines().any(|line| {
+                line.trim()
+                    .strip_suffix(':')
+                    .is_some_and(|label| label == symbol)
+            })
+        })
+        .map(|(name, _)| *name)
+}
+
+fn native_argument_is_pointer(function: &str, index: usize) -> bool {
+    function == "gfx_text" && index == 2
+}
+
+fn is_native_word_type(c_type: &str) -> bool {
+    matches!(c_type.trim(), "int" | "unsigned int")
+}
+
 pub struct ExpressionParser {
     tokens: Vec<Token>,
     position: usize,
@@ -319,6 +345,137 @@ fn scalar_initializer(expression: &Expression) -> Option<&Expression> {
     }
 }
 
+fn collect_string_literals_expression(expression: &Expression, literals: &mut HashSet<String>) {
+    match &expression.kind {
+        ExpressionKind::Atom(value) if decode_string_token(value).is_some() => {
+            literals.insert(value.clone());
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            collect_string_literals_expression(operand, literals);
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Assignment {
+            target: left,
+            value: right,
+            ..
+        } => {
+            collect_string_literals_expression(left, literals);
+            collect_string_literals_expression(right, literals);
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            collect_string_literals_expression(condition, literals);
+            collect_string_literals_expression(when_true, literals);
+            collect_string_literals_expression(when_false, literals);
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            collect_string_literals_expression(function, literals);
+            for argument in arguments {
+                collect_string_literals_expression(argument, literals);
+            }
+        }
+        ExpressionKind::Index { expression, index } => {
+            collect_string_literals_expression(expression, literals);
+            collect_string_literals_expression(index, literals);
+        }
+        ExpressionKind::Member { expression, .. } => {
+            collect_string_literals_expression(expression, literals);
+        }
+        ExpressionKind::InitializerList(values) => {
+            for value in values {
+                collect_string_literals_expression(value, literals);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_string_literals_statement(statement: &Statement, literals: &mut HashSet<String>) {
+    match &statement.kind {
+        StatementKind::Compound(statements) => {
+            for statement in statements {
+                collect_string_literals_statement(statement, literals);
+            }
+        }
+        StatementKind::Declaration(declarations) => {
+            for declaration in declarations {
+                if let Some(initializer) = &declaration.initializer {
+                    collect_string_literals_expression(initializer, literals);
+                }
+            }
+        }
+        StatementKind::Expression(Some(expression)) | StatementKind::Return(Some(expression)) => {
+            collect_string_literals_expression(expression, literals);
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_string_literals_expression(condition, literals);
+            collect_string_literals_statement(then_branch, literals);
+            if let Some(else_branch) = else_branch {
+                collect_string_literals_statement(else_branch, literals);
+            }
+        }
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            collect_string_literals_expression(condition, literals);
+            collect_string_literals_statement(body, literals);
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(initializer) = initializer {
+                collect_string_literals_statement(initializer, literals);
+            }
+            if let Some(condition) = condition {
+                collect_string_literals_expression(condition, literals);
+            }
+            if let Some(update) = update {
+                collect_string_literals_expression(update, literals);
+            }
+            collect_string_literals_statement(body, literals);
+        }
+        StatementKind::Switch { expression, cases } => {
+            collect_string_literals_expression(expression, literals);
+            for (value, statements) in cases {
+                if let Some(value) = value {
+                    collect_string_literals_expression(value, literals);
+                }
+                for statement in statements {
+                    collect_string_literals_statement(statement, literals);
+                }
+            }
+        }
+        StatementKind::Label { statement, .. } => {
+            collect_string_literals_statement(statement, literals);
+        }
+        StatementKind::Expression(None)
+        | StatementKind::Return(None)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => {}
+    }
+}
+
 fn parse_integer_constant(token: &str) -> Option<i64> {
     let suffix_start = token.find(['u', 'U', 'l', 'L']).unwrap_or(token.len());
     let digits = &token[..suffix_start];
@@ -373,15 +530,17 @@ pub fn compile_minimal_program(
     for declaration in &unit.declarations {
         match declaration {
             ExternalDeclaration::FunctionDefinition(function) => {
-                if !matches!(function.declaration.return_type.trim(), "int" | "void")
-                    || function.declaration.variadic
+                if !matches!(
+                    function.declaration.return_type.trim(),
+                    "int" | "unsigned int" | "void"
+                ) || function.declaration.variadic
                     || function.declaration.parameters.len() > 3
                     || global_names.contains(function.declaration.name.as_str())
                     || function
                         .declaration
                         .parameters
                         .iter()
-                        .any(|parameter| parameter.c_type.trim() != "int")
+                        .any(|parameter| !is_native_word_type(&parameter.c_type))
                     || !names.insert(function.declaration.name.as_str())
                 {
                     return Ok(None);
@@ -389,14 +548,17 @@ pub fn compile_minimal_program(
                 functions.push(function);
             }
             ExternalDeclaration::FunctionPrototype(function) => {
-                if !matches!(function.return_type.trim(), "int" | "void")
+                let is_library_function = native_library_for_symbol(&function.name).is_some();
+                if (!matches!(function.return_type.trim(), "int" | "void" | "unsigned int")
+                    && !is_library_function)
                     || function.variadic
                     || global_names.contains(function.name.as_str())
-                    || function.parameters.len() > 3
-                    || function
-                        .parameters
-                        .iter()
-                        .any(|parameter| parameter.c_type.trim() != "int")
+                    || function.parameters.len() > if is_library_function { 8 } else { 3 }
+                    || (!is_library_function
+                        && function
+                            .parameters
+                            .iter()
+                            .any(|parameter| !is_native_word_type(&parameter.c_type)))
                 {
                     return Ok(None);
                 }
@@ -421,7 +583,7 @@ pub fn compile_minimal_program(
             }
             ExternalDeclaration::Global(global) => {
                 let (element_size, element_signed) = match global.c_type.trim() {
-                    "int" => (2, false),
+                    "int" | "unsigned int" => (2, false),
                     "unsigned char" => (1, false),
                     "char" | "signed char" => (1, true),
                     _ => return Ok(None),
@@ -530,7 +692,7 @@ pub fn compile_minimal_program(
     }) {
         return Ok(None);
     }
-    let defined_functions: HashMap<String, (usize, bool)> = functions
+    let mut defined_functions: HashMap<String, (usize, bool)> = functions
         .iter()
         .map(|function| {
             (
@@ -542,11 +704,24 @@ pub fn compile_minimal_program(
             )
         })
         .collect();
+    for (name, (arity, returns_void)) in &prototypes {
+        if native_library_for_symbol(name).is_some() {
+            defined_functions.insert((*name).to_owned(), (*arity, *returns_void));
+        }
+    }
     if functions
         .iter()
         .any(|function| !statement_calls_are_defined(&function.body, &defined_functions))
     {
         return Ok(None);
+    }
+    let linked_libraries: HashSet<&str> = prototypes
+        .keys()
+        .filter_map(|name| native_library_for_symbol(name))
+        .collect();
+    let mut string_literals = HashSet::new();
+    for function in &functions {
+        collect_string_literals_statement(&function.body, &mut string_literals);
     }
     let mut assembly = String::from(
         ".address 0\n\
@@ -555,9 +730,15 @@ pub fn compile_minimal_program(
          .address 10\n\
          __c_boot:\n\
          \x20\x20\x20\x20CALLX __c_function_main\n\
-         \x20\x20\x20\x20HALT\n\
-         .address 0x4800\n",
+         \x20\x20\x20\x20HALT\n",
     );
+    for (library_name, library_source) in NATIVE_ASSEMBLY_LIBRARIES {
+        if linked_libraries.contains(library_name) {
+            assembly.push_str(library_source);
+            assembly.push('\n');
+        }
+    }
+    assembly.push_str(".address 0x4800\n");
     let mut label_counter = 0usize;
     for function in functions {
         let StatementKind::Compound(statements) = &function.body.kind else {
@@ -661,6 +842,28 @@ pub fn compile_minimal_program(
     for global in &globals {
         assembly.push_str(&format!("__c_global_{}:\n", global.name));
         for chunk in global.data.chunks(16) {
+            assembly.push_str(".data hex ");
+            for (index, byte) in chunk.iter().enumerate() {
+                if index > 0 {
+                    assembly.push(' ');
+                }
+                assembly.push_str(&format!("0x{byte:02X}"));
+            }
+            assembly.push('\n');
+        }
+    }
+    let mut string_literals = string_literals.into_iter().collect::<Vec<_>>();
+    string_literals.sort();
+    for literal in string_literals {
+        let Some(label) = native_string_label(&literal) else {
+            continue;
+        };
+        let Some(mut bytes) = decode_string_token(&literal) else {
+            continue;
+        };
+        bytes.push(0);
+        assembly.push_str(&format!("{label}:\n"));
+        for chunk in bytes.chunks(16) {
             assembly.push_str(".data hex ");
             for (index, byte) in chunk.iter().enumerate() {
                 if index > 0 {
@@ -824,7 +1027,7 @@ fn collect_native_locals(
                     }
                     if let Some(length) = declaration.array_length {
                         let (element_size, element_signed) = match declaration.c_type.trim() {
-                            "int" => (2, false),
+                            "int" | "unsigned int" => (2, false),
                             "unsigned char" => (1, false),
                             "char" | "signed char" => (1, true),
                             _ => return false,
@@ -853,7 +1056,7 @@ fn collect_native_locals(
                         if reserve_frame_register && *next_register == 3 {
                             *next_register += 1;
                         }
-                        if declaration.c_type.trim() != "int" || *next_register > 3 {
+                        if !is_native_word_type(&declaration.c_type) || *next_register > 3 {
                             return false;
                         }
                         locals.insert(
@@ -1268,6 +1471,14 @@ fn decode_string_token(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+fn native_string_label(value: &str) -> Option<String> {
+    decode_string_token(value)?;
+    Some(format!(
+        "__c_string_{}",
+        value.strip_prefix("<string:")?.strip_suffix('>')?
+    ))
+}
+
 fn emit_native_stack_adjustment(frame_size: usize, allocate: bool, assembly: &mut String) {
     let mut remaining = frame_size;
     while remaining > 0 {
@@ -1293,6 +1504,8 @@ fn emit_native_expression(
                     return false;
                 }
                 assembly.push_str(&format!("    LDI R{destination}, 0x{value:04X}\n"));
+            } else if let Some(label) = native_string_label(value) {
+                assembly.push_str(&format!("    LDI30 R{destination}, {label}\n"));
             } else if let Some(location) = locals.get(value) {
                 match location {
                     NativeLocation::Constant(value) => {
@@ -1633,30 +1846,62 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &function.kind else {
                 return false;
             };
-            if arguments.len() > 3 {
+            let library_function = native_library_for_symbol(name).is_some();
+            if arguments.len() > if library_function { 8 } else { 3 } {
                 return false;
             }
             for register in 1..=6 {
                 assembly.push_str(&format!("    PUSH R{register}\n"));
             }
-            for (index, argument) in arguments.iter().enumerate() {
-                if !emit_native_expression(
-                    argument,
-                    4 + index as u8,
-                    &temporary_registers[index.min(temporary_registers.len())..],
-                    locals,
-                    label_counter,
-                    assembly,
-                ) {
-                    return false;
+            let mut argument_bytes = 0;
+            if library_function {
+                for (index, argument) in arguments.iter().enumerate().rev() {
+                    if !emit_native_expression(
+                        argument,
+                        4,
+                        &[5, 6, 7],
+                        locals,
+                        label_counter,
+                        assembly,
+                    ) {
+                        return false;
+                    }
+                    if native_argument_is_pointer(name, index) {
+                        assembly.push_str("    MOV R5, R4\n    LDI R6, 16\n    SHR R5, R6\n");
+                        assembly.push_str("    PUSH R5\n");
+                        argument_bytes += 2;
+                    }
+                    assembly.push_str("    PUSH R4\n");
+                    argument_bytes += 2;
                 }
+            } else {
+                for (index, argument) in arguments.iter().enumerate() {
+                    if !emit_native_expression(
+                        argument,
+                        4 + index as u8,
+                        &temporary_registers[index.min(temporary_registers.len())..],
+                        locals,
+                        label_counter,
+                        assembly,
+                    ) {
+                        return false;
+                    }
+                }
+                for index in (0..arguments.len()).rev() {
+                    assembly.push_str(&format!("    PUSH R{}\n", 4 + index));
+                }
+                argument_bytes = arguments.len() * 2;
             }
-            for index in (0..arguments.len()).rev() {
-                assembly.push_str(&format!("    PUSH R{}\n", 4 + index));
-            }
-            assembly.push_str(&format!("    CALLX __c_function_{name}\n"));
-            if !arguments.is_empty() {
-                assembly.push_str(&format!("    ADJSP {}\n", arguments.len() * 2));
+            assembly.push_str(&format!(
+                "    CALLX {}\n",
+                if library_function {
+                    name.clone()
+                } else {
+                    format!("__c_function_{name}")
+                }
+            ));
+            if argument_bytes != 0 {
+                assembly.push_str(&format!("    ADJSP {argument_bytes}\n"));
             }
             for register in (1..=6).rev() {
                 assembly.push_str(&format!("    POP R{register}\n"));
@@ -3768,10 +4013,14 @@ fn float_end(source: &str, start: usize) -> Option<usize> {
 
     let mut is_float = false;
     if bytes.get(position) == Some(&b'.') {
-        is_float = true;
         position += 1;
+        let fractional_start = position;
         while bytes.get(position).is_some_and(u8::is_ascii_digit) {
             position += 1;
+        }
+        is_float = digits_before > 0 || position > fractional_start;
+        if !is_float {
+            return None;
         }
     } else if digits_before == 0 {
         return None;
@@ -4871,6 +5120,18 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                             "character constants must contain one character",
                         ));
                     };
+                    if quote == '"'
+                        && let Some(previous) = tokens.last_mut()
+                        && previous.value.starts_with("<string:")
+                        && previous.value.ends_with('>')
+                    {
+                        previous.value.pop();
+                        previous
+                            .value
+                            .push_str(value.strip_prefix("<string:").unwrap_or_default());
+                        closed = true;
+                        break;
+                    }
                     tokens.push(Token {
                         value,
                         line: start_line,
@@ -5329,12 +5590,25 @@ mod tests {
     #[test]
     fn encodes_string_and_character_literals_as_compiler_tokens() {
         assert_eq!(
-            values(r#""A\n\u03bb" '\x41' '\101'"#),
-            ["<string:410acebb>", "65", "65", "<eof>"]
+            values(r#""A\n\u03bb" "B" '\x41' '\101' item.field"#),
+            [
+                "<string:410acebb42>",
+                "65",
+                "65",
+                "item",
+                ".",
+                "field",
+                "<eof>"
+            ]
         );
         assert_eq!(
             values(r#""\xff\101\u03bb""#),
             ["<string:ff41cebb>", "<eof>"]
+        );
+        assert_eq!(values(".5 1. 1e-2"), [".5", "1.", "1e-2", "<eof>"]);
+        assert_eq!(
+            values("city[i].ladder"),
+            ["city", "[", "i", "]", ".", "ladder", "<eof>"]
         );
     }
 
@@ -6124,6 +6398,25 @@ mod tests {
     }
 
     #[test]
+    fn compiles_unsigned_word_globals_locals_and_function_parameters() {
+        let image = compile_minimal_program(
+            "unsigned int score = 23; \
+             unsigned int identity(unsigned int value) { return value; } \
+             int main(void) { unsigned int local; local = identity(score); return local; }",
+            "unsigned-word.c",
+        )
+        .unwrap()
+        .expect("supported unsigned-word program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 23);
+        assert_eq!(cpu.read_u16(0x80000), 23);
+    }
+
+    #[test]
     fn local_integer_can_shadow_a_global() {
         let image = compile_minimal_program(
             "int value = 10; int main(void) { int value = 3; return value; }",
@@ -6352,6 +6645,42 @@ mod tests {
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 25);
         assert_eq!(&cpu.memory[0x80000..0x80006], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn links_and_executes_native_graphics_library_calls() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             int main(void) { gfx_rect(1, 2, 2, 2, 7); return 0; }",
+            "native-gfx-call.c",
+        )
+        .unwrap()
+        .expect("supported native graphics call");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.memory[0x50000 + 2 * 320 + 1], 7);
+        assert_eq!(cpu.memory[0x50000 + 3 * 320 + 2], 7);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn stores_nul_terminated_string_literals_for_native_graphics_calls() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             int main(void) { gfx_text(0, 0, \"Hi\", 1); return 0; }",
+            "native-gfx-string.c",
+        )
+        .unwrap()
+        .expect("supported string argument to graphics builtin");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(8192).unwrap();
+        assert!(!cpu.running);
+        assert!(cpu.memory.windows(3).any(|bytes| bytes == b"Hi\0"));
     }
 
     #[test]

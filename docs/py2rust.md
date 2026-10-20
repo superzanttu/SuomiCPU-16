@@ -18,8 +18,10 @@ Status meanings:
 
 - **Blocking — incomplete port:** required behavior does not yet have a
   verified Rust replacement.
-- **Rust exists — Python consumers remain:** equivalent Rust functionality is
-  present, but Python runtime/build/test code still depends on this file.
+- **Rust port complete — Python consumers remain:** Rust functionality and
+  focused Rust regression coverage exist, but Python runtime/build/test code
+  still depends on this file. This is not a deletion or default-workflow
+  cutover.
 - **Python tooling — not ported:** optional or content-authoring functionality
   still runs only in Python.
 - **Test/helper — retain for coverage:** test code, not shipped runtime code;
@@ -29,18 +31,33 @@ Status meanings:
 
 ## Runtime and shared source
 
-- [ ] **Migrate [src/SuomiCPU.py](../src/SuomiCPU.py)** — Rust exists; Python consumers remain.
-  - Why it remains: Python tests and tools still instantiate the Python emulator. Switch those consumers to Rust and verify module/runtime parity before retiring this compatibility implementation.
-- [ ] **Migrate [src/bios.py](../src/bios.py)** — Rust exists; Python consumers remain.
-  - Why it remains: Python BIOS tests and `src/SuomiCPU.py` still use the module; Rust already implements module discovery, BIOS selection, and booting.
-- [ ] **Migrate [src/console_device.py](../src/console_device.py)** — Rust exists; Python consumers remain.
-  - Why it remains: the Python emulator still uses this class for its Tk window, file logging, and host lifecycle controls, even though Rust now covers console MMIO, text-grid, and scrollback state.
-- [ ] **Migrate [src/isa.py](../src/isa.py)** — Rust exists; Python consumers remain.
-  - Why it remains: the Python assembler and emulator still import Python ISA definitions. Remove them with those consumers after parity is covered.
-- [ ] **Migrate [src/lib_disk.py](../src/lib_disk.py)** — Rust exists; Python consumers remain.
-  - Why it remains: the Python emulator, Tank-16 loader, and Python tests still import this implementation.
-- [ ] **Migrate [src/program_loader.py](../src/program_loader.py)** — Rust exists; Python consumers remain.
-  - Why it remains: the Python loader still serves the Python emulator and other Python callers; Tank-16 runtime compilation already routes through `sc16tank build-runtime`.
+- [x] **Port [src/SuomiCPU.py](../src/SuomiCPU.py) behavior to Rust** in
+  `rust/src/cpu.rs` and `rust/src/runtime.rs`. CPU execution, interrupts,
+  devices, headless runtime, and BIOS launch behavior have Rust regression
+  coverage. The Python emulator remains until its callers and launch workflow
+  are switched and the Tk/host lifecycle is retired.
+- [x] **Port [src/bios.py](../src/bios.py) behavior to Rust** in
+  `rust/src/runtime.rs`. Module discovery, BIOS selection/input, disk mounting,
+  and program launch are covered by Rust runtime tests. Python BIOS tests and
+  the Python emulator still import the old implementation.
+- [x] **Port [src/console_device.py](../src/console_device.py) device behavior
+  to Rust** in `rust/src/console.rs` and `rust/src/cpu.rs`. Rust covers console
+  MMIO, FIFO bounds, control bits, text rows, scrollback, and reset semantics.
+  The legacy Tk window, host logging, and lifecycle controls are not part of
+  the Rust device port and remain a cutover item.
+- [x] **Port [src/isa.py](../src/isa.py) definitions to Rust** in
+  `rust/src/isa.rs`. Opcode tables, aliases, extensions, and exhaustive
+  register-form encodings have Rust tests. Keep the Python definitions until
+  the accepted Python assembler no longer imports them.
+- [x] **Port [src/lib_disk.py](../src/lib_disk.py) disk behavior to Rust** in
+  `rust/src/disk.rs` and `rust/src/cpu.rs`. Persistent blocks, write protection,
+  file listing/reads, path validation, and disk MMIO are covered. Python
+  emulator, loader, and tests still depend on the Python module.
+- [x] **Port [src/program_loader.py](../src/program_loader.py) loading behavior
+  to Rust** in `rust/src/image.rs` and `rust/src/runtime.rs`. Rust supports
+  binary, segmented image, assembly, and its supported C-source loading paths;
+  Tank-16 runtime generation uses `sc16tank build-runtime`. The Python loader
+  remains used by legacy Python callers and is not yet removed.
 - [ ] **Remove [src/__init__.py](../src/__init__.py)** — package marker.
   - Why it remains: Python test/tool imports still use `src` as a package.
 
@@ -136,6 +153,15 @@ considered migration.
         whose size cannot be inferred.
   - [x] Compile row-major global and automatic multidimensional arrays with
         nested brace initializers, reads, writes, and inferred total storage.
+  - [x] Parse typedef-based `struct` and `union` declarations, including
+        primitive/typedef members and fixed-size member arrays. Record layout,
+        initialization, and member code generation remain incomplete.
+  - [x] Tokenize member-access dots without treating `.field` as a floating
+        constant, and concatenate adjacent string-literal tokens.
+  - [x] Link and execute calls to native graphics assembly builtins; `gfx_rect`
+        is covered end-to-end through the Rust CPU and GPU memory interface.
+  - [x] Compile unsigned 16-bit globals, automatic variables, function
+        parameters, and return values; bit patterns use the SC-16 word size.
 - [x] **Port console-device state/MMIO coverage from [tests/test_console_device.py](../tests/test_console_device.py) to Rust.**
   - Rust tests cover FIFO/echo control, poll yielding, input bounds/overrun,
     fixed text rows, scrollback, wrapping, and history reset.
@@ -234,7 +260,16 @@ point and its required tests pass.
    - [x] Exercise supported Rust C source loading through the headless runtime
      with a compiled program that executes and halts.
    - [x] Add Rust discovery/orchestration in `sc16build smoke-modules`.
-     C translation remains delegated to the retained Python compiler.
+     This aggregate smoke command still delegates C translation to the
+     retained Python compiler; it is not evidence of Rust compiler parity.
+   - [ ] Keep the Rust-only module-build sweep as the parity gate. The latest
+     direct Rust compiler sweep still fails all 16 selected non-Tank-16 BIOS
+     C modules; Tank-16 uses its specialized Rust runtime builder and is not
+     part of that sweep. Unsupported compiler/runtime features remain, including
+     record layout/member code generation, standard-library calls, and broader
+     game-specific C semantics. Unsigned 16-bit word support now covers globals,
+     locals, function parameters, and returns, but does not yet make a selected
+     module build pass.
    - [ ] Gate deletion of `tools/c_compiler.py`, `tools/assembler.py`, and
      `src/program_loader.py` on builds of selected real module programs and
      migrated regression tests.
@@ -254,10 +289,13 @@ point and its required tests pass.
      generation, and 100x100 tilemap upload are covered by Rust tests.
 
 - [ ] **Close Rust emulator/device parity and switch the default workflows.**
-   - [ ] Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,
-     `src/lib_disk.py`, `src/isa.py`, and `tools/sc16net.py` with the Rust
-     CPU/runtime/device implementations. The optional Python Numba JIT has
+   - [x] Port and test the emulator, BIOS, console device, ISA, disk, and
+     program-loading behavior from the six `src/` modules listed above in the
+     Rust CPU/runtime/device/image modules. The optional Python Numba JIT has
      been removed; the Rust CPU is the primary execution engine.
+   - [ ] Port and test the remaining behavior in `tools/sc16net.py`; switch
+     all Python consumers to Rust before retiring the corresponding Python
+     compatibility modules.
    - [x] Exercise retained assembler programs through the Rust headless
      runtime, including explicit instruction-budget exhaustion reporting.
    - [ ] Retire the Python Tk terminal, console logging, and emulator
