@@ -22,6 +22,10 @@ path = "rust/src/bin/sc16build.rs"
 name = "sc16maps"
 path = "rust/src/bin/sc16maps.rs"
 
+[[bin]]
+name = "sc16sprites"
+path = "rust/src/bin/sc16sprites.rs"
+
 [dependencies]
 macroquad = { version = "0.4.16", features = ["audio"] }
 memmap2 = "0.9"

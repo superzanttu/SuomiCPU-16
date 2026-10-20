@@ -18,7 +18,7 @@
 - [x] Convert terrain and object PNG atlases into a JSON manifest and per-tile JSON pixel files, then upload only map/game-used tiles from disk on demand.
 - [x] Use 64×64 cells in `gfx/tiles_objects.png` and `gfx/tiles_terrain.png` as the source sprite/tile size.
 - [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.
-- [x] Provide `sprite_viewer.py` to inspect 64×64 cells, atlas coordinates, and row-major IDs.
+- [x] Provide the Rust `sc16sprites` viewer to inspect 64×64 cells, atlas coordinates, and row-major IDs.
 - [x] Provide `gfx/tiles_template.png` as a transparent, numbered 64×64-cell atlas template.
 - [x] Precalculate 32 tank sprite rotations and projectile directions.
 - [x] Show both players' health and the game timer and win count in the HUD.
@@ -146,7 +146,7 @@ smoke particles without allocating one guest particle pool per old fire.
 
 ## 64x64 atlas cells
 
-Run `sprite_viewer.py` to view either atlas. Use Tab to switch atlases, +/- to zoom, and click a cell to print its atlas name, ID, and coordinates. IDs are numbered from zero, left-to-right and then top-to-bottom within the selected atlas. The viewer pads incomplete edge cells for display.
+Run `cargo run --release --bin sc16sprites` from the repository root to view either atlas. Use Tab to switch atlases, +/- to zoom, and click a cell to print its atlas name, ID, and coordinates. IDs are numbered from zero, left-to-right and then top-to-bottom within the selected atlas. Incomplete edge cells are included in the displayed grid.
 
 The Python helpers `sprite_id_at(image, x, y)`, `sprite_bounds(image, sprite_id)`, and `extract_sprite(image, sprite_id)` map between coordinates, IDs, and 64×64 images. The ID is the source cell index; C code still has to upload the selected pixel data to the GPU's tile or sprite slot.
 
