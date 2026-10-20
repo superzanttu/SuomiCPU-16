@@ -1,4 +1,12 @@
 use image::{Rgba, RgbaImage};
+use imageproc::{
+    drawing::{
+        draw_filled_circle_mut, draw_filled_ellipse_mut, draw_filled_rect_mut,
+        draw_hollow_circle_mut, draw_line_segment_mut, draw_polygon_mut,
+    },
+    point::Point,
+    rect::Rect,
+};
 use std::path::{Path, PathBuf};
 
 pub const TILE_SIZE: u32 = 64;
@@ -9,108 +17,150 @@ fn color(rgb: [u8; 3]) -> Rgba<u8> {
     Rgba([rgb[0], rgb[1], rgb[2], 255])
 }
 
-fn set(image: &mut RgbaImage, x: i32, y: i32, value: Rgba<u8>) {
-    if x >= 0 && y >= 0 && x < image.width() as i32 && y < image.height() as i32 {
-        image.put_pixel(x as u32, y as u32, value);
-    }
+fn circle(image: &mut RgbaImage, cx: i32, cy: i32, radius: i32, value: Rgba<u8>) {
+    draw_filled_circle_mut(image, (cx, cy), radius, value);
 }
 
-fn circle(image: &mut RgbaImage, cx: i32, cy: i32, radius: i32, value: Rgba<u8>) {
-    for y in -radius..=radius {
-        for x in -radius..=radius {
-            if x * x + y * y <= radius * radius {
-                set(image, cx + x, cy + y, value);
-            }
-        }
+fn circle_outline(
+    image: &mut RgbaImage,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    width: i32,
+    value: Rgba<u8>,
+) {
+    for ring in (radius - width + 1).max(0)..=radius {
+        draw_hollow_circle_mut(image, (cx, cy), ring, value);
     }
 }
 
 fn line(image: &mut RgbaImage, start: (i32, i32), end: (i32, i32), width: i32, value: Rgba<u8>) {
-    let (mut x, mut y) = start;
-    let dx = (end.0 - x).abs();
-    let sx = if x < end.0 { 1 } else { -1 };
-    let dy = -(end.1 - y).abs();
-    let sy = if y < end.1 { 1 } else { -1 };
-    let mut error = dx + dy;
-    loop {
-        circle(image, x, y, width.max(1) / 2, value);
-        if (x, y) == end {
-            break;
-        }
-        let twice = 2 * error;
-        if twice >= dy {
-            error += dy;
-            x += sx;
-        }
-        if twice <= dx {
-            error += dx;
-            y += sy;
-        }
-    }
-}
-
-fn polygon(image: &mut RgbaImage, points: &[(i32, i32)], value: Rgba<u8>) {
-    if points.len() < 3 {
+    if start.1 == end.1 {
+        let top = start.1 - (width - 1) / 2;
+        rect(
+            image,
+            start.0.min(end.0),
+            top,
+            (start.0 - end.0).abs() + 1,
+            width,
+            value,
+        );
         return;
     }
-    let min_y = points.iter().map(|point| point.1).min().unwrap().max(0);
-    let max_y = points
-        .iter()
-        .map(|point| point.1)
-        .max()
-        .unwrap()
-        .min(image.height() as i32 - 1);
-    for y in min_y..=max_y {
-        let mut intersections = Vec::new();
-        for index in 0..points.len() {
-            let (x0, y0) = points[index];
-            let (x1, y1) = points[(index + 1) % points.len()];
-            if (y0 <= y && y1 > y) || (y1 <= y && y0 > y) {
-                intersections
-                    .push(x0 + ((y - y0) as i64 * (x1 - x0) as i64 / (y1 - y0) as i64) as i32);
-            }
-        }
-        intersections.sort_unstable();
-        for pair in intersections.chunks(2).filter(|pair| pair.len() == 2) {
-            for x in pair[0].max(0)..=pair[1].min(image.width() as i32 - 1) {
-                set(image, x, y, value);
-            }
-        }
-    }
-}
-
-fn outline_polygon(image: &mut RgbaImage, points: &[(i32, i32)], fill: Rgba<u8>) {
-    let outline = color([28, 34, 35]);
-    polygon(image, points, outline);
-    let inner: Vec<_> = points.iter().map(|(x, y)| (*x, *y)).collect();
-    polygon(image, &inner, fill);
-    for index in 0..points.len() {
-        line(
+    if start.0 == end.0 {
+        let left = start.0 - (width - 1) / 2;
+        rect(
             image,
-            points[index],
-            points[(index + 1) % points.len()],
-            2,
-            outline,
+            left,
+            start.1.min(end.1),
+            width,
+            (start.1 - end.1).abs() + 1,
+            value,
+        );
+        return;
+    }
+    let dx = (end.0 - start.0) as f64;
+    let dy = (end.1 - start.1) as f64;
+    if width <= 1 {
+        draw_line_segment_mut(
+            image,
+            (start.0 as f32, start.1 as f32),
+            (end.0 as f32, end.1 as f32),
+            value,
+        );
+        return;
+    }
+    let steps = dx.abs().max(dy.abs()).ceil() as usize;
+    for step in 0..=steps {
+        let fraction = if steps == 0 {
+            0.0
+        } else {
+            step as f64 / steps as f64
+        };
+        circle(
+            image,
+            (f64::from(start.0) + dx * fraction).round() as i32,
+            (f64::from(start.1) + dy * fraction).round() as i32,
+            width / 2,
+            value,
         );
     }
 }
 
-fn rect(image: &mut RgbaImage, x: i32, y: i32, width: i32, height: i32, fill: Rgba<u8>) {
-    for py in y.max(0)..(y + height).min(image.height() as i32) {
-        for px in x.max(0)..(x + width).min(image.width() as i32) {
-            set(image, px, py, fill);
-        }
+fn arc(
+    image: &mut RgbaImage,
+    center: (i32, i32),
+    radii: (i32, i32),
+    start: f64,
+    end: f64,
+    width: i32,
+    value: Rgba<u8>,
+) {
+    let steps = ((end - start).abs() * radii.0.max(radii.1) as f64).ceil() as usize;
+    let point = |step: usize| {
+        let angle = start + (end - start) * step as f64 / steps as f64;
+        (
+            center.0 + (radii.0 as f64 * angle.cos()).round() as i32,
+            center.1 + (radii.1 as f64 * angle.sin()).round() as i32,
+        )
+    };
+    for step in 0..steps {
+        line(image, point(step), point(step + 1), width, value);
     }
 }
 
-fn ellipse(image: &mut RgbaImage, cx: i32, cy: i32, rx: i32, ry: i32, fill: Rgba<u8>) {
-    for y in -ry..=ry {
-        for x in -rx..=rx {
-            if x * x * ry * ry + y * y * rx * rx <= rx * rx * ry * ry {
-                set(image, cx + x, cy + y, fill);
-            }
-        }
+fn polygon(image: &mut RgbaImage, points: &[(i32, i32)], value: Rgba<u8>) {
+    let points: Vec<_> = points.iter().map(|(x, y)| Point::new(*x, *y)).collect();
+    draw_polygon_mut(image, &points, value);
+}
+
+fn outline_polygon(image: &mut RgbaImage, points: &[(i32, i32)], fill: Rgba<u8>) {
+    polygon(image, points, fill);
+}
+
+fn rect(image: &mut RgbaImage, x: i32, y: i32, width: i32, height: i32, fill: Rgba<u8>) {
+    draw_filled_rect_mut(
+        image,
+        Rect::at(x, y).of_size(width as u32, height as u32),
+        fill,
+    );
+}
+
+fn rounded_rect(
+    image: &mut RgbaImage,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    radius: i32,
+    fill: Rgba<u8>,
+) {
+    let radius = radius.min(width / 2).min(height / 2).max(0);
+    rect(image, x + radius, y, width - 2 * radius, height, fill);
+    rect(image, x, y + radius, width, height - 2 * radius, fill);
+    for center in [
+        (x + radius, y + radius),
+        (x + width - radius - 1, y + radius),
+        (x + radius, y + height - radius - 1),
+        (x + width - radius - 1, y + height - radius - 1),
+    ] {
+        circle(image, center.0, center.1, radius, fill);
     }
+}
+
+fn outlined_rect(image: &mut RgbaImage, x: i32, y: i32, width: i32, height: i32, fill: Rgba<u8>) {
+    rounded_rect(image, x, y, width, height, 4, color([28, 34, 35]));
+    rounded_rect(image, x + 2, y + 2, width - 4, height - 4, 3, fill);
+}
+
+fn ellipse_rect(image: &mut RgbaImage, x: i32, y: i32, width: i32, height: i32, fill: Rgba<u8>) {
+    draw_filled_ellipse_mut(
+        image,
+        (x + width / 2, y + height / 2),
+        width / 2,
+        height / 2,
+        fill,
+    );
 }
 
 fn wall(image: &mut RgbaImage, style: usize) {
@@ -149,6 +199,13 @@ fn wall(image: &mut RgbaImage, style: usize) {
                     color([65, 73, 72]),
                 );
             }
+            line(
+                image,
+                (x + 2, y + height - 4),
+                (x + width - 2, y + height - 4),
+                2,
+                color([65, 73, 72]),
+            );
         } else {
             line(
                 image,
@@ -166,6 +223,13 @@ fn wall(image: &mut RgbaImage, style: usize) {
                     color([65, 73, 72]),
                 );
             }
+            line(
+                image,
+                (x + width - 4, y + 2),
+                (x + width - 4, y + height - 2),
+                2,
+                color([65, 73, 72]),
+            );
         }
     }
 }
@@ -199,8 +263,8 @@ fn building(image: &mut RgbaImage, style: usize) {
         rect(image, x, y, width, height, color([28, 34, 35]));
         rect(
             image,
-            x + 2,
-            y + 2,
+            x + 1,
+            y + 1,
             width - 3,
             height - 3,
             color([104, 111, 108]),
@@ -242,10 +306,14 @@ fn building(image: &mut RgbaImage, style: usize) {
         }
     }
     if style == 4 || style == 7 {
-        rect(image, 24, 24, 16, 16, color([28, 34, 35]));
-        rect(image, 26, 26, 12, 12, color([120, 139, 143]));
-        line(image, (28, 28), (36, 28), 2, color([190, 201, 190]));
-        line(image, (28, 34), (36, 34), 2, color([190, 201, 190]));
+        if style == 4 {
+            outlined_rect(image, 24, 24, 16, 16, color([120, 139, 143]));
+            line(image, (28, 28), (36, 28), 2, color([190, 201, 190]));
+            line(image, (28, 34), (36, 34), 2, color([190, 201, 190]));
+        } else {
+            outlined_rect(image, 23, 45, 18, 18, color([113, 72, 42]));
+            circle(image, 36, 53, 1, color([238, 178, 44]));
+        }
     }
 }
 
@@ -261,14 +329,15 @@ fn powerup(image: &mut RgbaImage, style: usize) {
     circle(image, 32, 33, 23, color([28, 34, 35]));
     circle(image, 32, 31, 19, color(fills[style]));
     circle(image, 25, 23, 5, color([245, 238, 206]));
+    circle_outline(image, 32, 31, 15, 2, color([232, 219, 172]));
     match style {
         0 => {
             rect(image, 27, 19, 10, 25, color([248, 248, 225]));
             rect(image, 19, 27, 26, 9, color([248, 248, 225]));
         }
         1 => {
-            rect(image, 18, 19, 28, 27, color([28, 34, 35]));
-            rect(image, 21, 22, 22, 21, color([238, 178, 44]));
+            outlined_rect(image, 17, 18, 30, 29, color([238, 178, 44]));
+            line(image, (22, 24), (41, 24), 2, color([232, 219, 172]));
             for x in [24, 31, 38] {
                 rect(image, x, 29, 4, 13, color([197, 57, 48]));
             }
@@ -278,11 +347,22 @@ fn powerup(image: &mut RgbaImage, style: usize) {
             &[(36, 14), (23, 31), (31, 31), (27, 47), (43, 26), (34, 26)],
             color([232, 219, 172]),
         ),
-        3 => outline_polygon(
-            image,
-            &[(32, 13), (41, 18), (39, 34), (32, 42), (25, 34), (23, 18)],
-            color([107, 194, 225]),
-        ),
+        3 => {
+            arc(
+                image,
+                (32, 32),
+                (14, 16),
+                0.2,
+                3.0,
+                5,
+                color([232, 219, 172]),
+            );
+            outline_polygon(
+                image,
+                &[(32, 13), (41, 18), (39, 34), (32, 42), (25, 34), (23, 18)],
+                color([107, 194, 225]),
+            );
+        }
         4 => {
             for x in [23, 32, 41] {
                 line(image, (x, 42), (x, 22), 3, color([232, 219, 172]));
@@ -330,6 +410,15 @@ fn mine(image: &mut RgbaImage, style: usize) {
         color([190, 201, 190]),
     );
     circle(image, 32, 34, (radius / 5).max(2), color([197, 57, 48]));
+    for x in (32 - radius + 4..32 + radius - 2).step_by(7) {
+        line(
+            image,
+            (x, 34 - radius + 3),
+            (x, 34 - radius + 6),
+            2,
+            color([28, 34, 35]),
+        );
+    }
 }
 
 fn rock(image: &mut RgbaImage, style: usize) {
@@ -402,12 +491,24 @@ fn rock(image: &mut RgbaImage, style: usize) {
         3,
         color([65, 73, 72]),
     );
+    for (x, y) in [(25, 37), (37, 42), (31, 28)] {
+        rect(image, x, y, 3, 2, color([65, 73, 72]));
+    }
+    if style == 4 || style == 5 {
+        let shadow: Vec<_> = shapes[style]
+            .iter()
+            .skip(2)
+            .take(3)
+            .map(|(x, y)| (x + 2, y + 3))
+            .collect();
+        polygon(image, &shadow, color([65, 73, 72]));
+    }
 }
 
 fn tree(image: &mut RgbaImage, style: usize) {
     let dark = color([34, 83, 48]);
     if style == 0 {
-        ellipse(image, 32, 35, 16, 19, color([28, 34, 35]));
+        ellipse_rect(image, 16, 16, 32, 39, color([28, 34, 35]));
         for (y, half) in [(16, 3), (25, 10), (35, 15), (45, 11), (53, 5)] {
             polygon(
                 image,
@@ -431,15 +532,17 @@ fn tree(image: &mut RgbaImage, style: usize) {
         ([57, 121, 56], [123, 173, 72], [37, 80, 43]),
     ];
     let (dark, light, shadow) = palettes[(style - 1) % palettes.len()];
-    ellipse(image, 31, 34, 14, 20, color([28, 34, 35]));
-    ellipse(image, 32, 31, 13, 18, color(dark));
-    ellipse(image, 29, 24, 8, 10, color(light));
+    ellipse_rect(image, 21, 18, 23, 31, color(shadow));
+    ellipse_rect(image, 17, 13, 26, 35, color(dark));
+    ellipse_rect(image, 21, 16, 17, 20, color(light));
     for (dx, dy, radius) in [(-8, -2, 8), (8, -4, 9), (-7, 10, 8), (7, 12, 7)] {
         circle(image, 32 + dx, 32 + dy, radius + 1, color([28, 34, 35]));
         circle(image, 32 + dx, 31 + dy, radius, color(dark));
         circle(image, 29 + dx, 28 + dy, (radius / 3).max(2), color(light));
     }
-    ellipse(image, 42, 31, 8, 14, color(shadow));
+    if style == 2 {
+        line(image, (23, 33), (25, 43), 2, color([235, 230, 198]));
+    }
     rect(image, 29, 48, 6, 9, color([113, 72, 42]));
 }
 
@@ -483,16 +586,10 @@ fn forest(image: &mut RgbaImage, style: usize) {
         ([34, 124, 65], [89, 169, 88], [25, 72, 47]),
     ];
     let (base, highlight, shade) = palettes[style % palettes.len()];
-    ellipse(image, 32, 33, 29, 28, color([28, 58, 36]));
-    ellipse(image, 32, 32, 26, 25, color([45, 104, 57]));
+    ellipse_rect(image, 3, 5, 58, 56, color([28, 58, 36]));
+    ellipse_rect(image, 6, 7, 52, 50, color([38, 92, 48]));
     for (index, &(x, y)) in layouts[style].iter().enumerate() {
-        let radius = if style == 9 {
-            9
-        } else if style == 4 {
-            13
-        } else {
-            12
-        };
+        let radius = if style == 9 { 9 } else { 13 };
         circle(image, x, y + 2, radius + 2, color([21, 45, 30]));
         circle(image, x, y, radius + 1, color(shade));
         circle(image, x, y - 1, radius, color(base));

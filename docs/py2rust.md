@@ -9,11 +9,10 @@ grow support against real module builds.
 
 ## Current inventory
 
-There are 39 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
-Generated natural maps and the Tank-16 sprite viewer have already been moved to
-Rust and their Python implementations removed. A Rust equivalent alone is not
-enough to delete a Python file while a Python runtime, build path, test, or
-documented workflow still imports or invokes it.
+There are 35 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
+Generated maps, Tank-16 atlas tools, map loading, and the graphical map editor
+now use Rust implementations. Python remains in the emulator and developer
+tests while those larger migrations continue.
 
 Status meanings:
 
@@ -37,7 +36,7 @@ Status meanings:
 | [`src/console_device.py`](../src/console_device.py) | Blocking — incomplete port | Rust has console MMIO input/output, but not the Python device's complete terminal window, scrollback, bounded buffers, and logging behavior. Port or explicitly retire those behaviors and move tests off Python first. |
 | [`src/isa.py`](../src/isa.py) | Rust exists — Python consumers remain | ISA metadata is available in Rust, but the Python assembler and emulator still import Python definitions. Remove it with those consumers after encoding/execution parity is covered. |
 | [`src/lib_disk.py`](../src/lib_disk.py) | Rust exists — Python consumers remain | Rust disk behavior and parity tests exist, but the Python emulator, Tank-16 loader, and Python tests still import this implementation. |
-| [`src/program_loader.py`](../src/program_loader.py) | Blocking — incomplete port | Rust dispatches assembly, C, binary, and data-file loading, but the Python loader also builds Tank-16's dynamic runtime graphics/assets path. Port and route that workflow through Rust before removal. |
+| [`src/program_loader.py`](../src/program_loader.py) | Rust exists — Python consumers remain | Tank-16 runtime compilation now routes through `sc16tank build-runtime`; the Python loader still serves the Python emulator and other Python callers. Retire it with those consumers. |
 | [`src/sc16_jit.py`](../src/sc16_jit.py) | Rust exists — Python consumer remains | The Rust CPU replaces the need for this Numba execution backend, but `src/SuomiCPU.py` still optionally imports it. Remove it when the Python emulator is retired and the Rust CPU parity suite is sufficient. |
 | [`src/__init__.py`](../src/__init__.py) | Package marker | Python test/tool imports still use `src` as a package. Remove after those imports disappear. |
 
@@ -56,10 +55,30 @@ Status meanings:
 
 | Python file | Status | Why it cannot be deleted yet |
 |---|---|---|
-| [`modules/Tank-16/tank16_map_loader.py`](../modules/Tank-16/tank16_map_loader.py) | Blocking — incomplete port | Rust now handles map validation, runtime map encoding, asset conversion, and compatible-map discovery. Tank-16's build path still cannot compile its real C source with the Rust C compiler, so the Python build dependency remains. |
-| [`modules/Tank-16/map_editor.py`](../modules/Tank-16/map_editor.py) | Rust exists — Python consumers remain | Rust has map validation/load/save/serialization and a basic graphical editor. The Python editor still provides richer editing workflows and its tests remain the active coverage; migrate those consumers and editor features before removal. |
-| [`modules/Tank-16/generate_finland_map.py`](../modules/Tank-16/generate_finland_map.py) | Python tooling — not ported | The Finland map and atlas generator performs GIS projection/rasterization and Pygame drawing; it also imports `map_editor.py`. Port the data-processing and atlas-generation workflow, or explicitly classify it as a retained offline Python authoring tool. |
-| [`modules/Tank-16/generate_object_tileset.py`](../modules/Tank-16/generate_object_tileset.py) | Rust exists — Python consumer remains | Rust now provides `sc16objects` to generate the procedural 6-by-8 object atlas. Keep the Python implementation until generated-art parity is checked and the documented asset workflow uses the Rust command. |
+Rust Tank-16 tools currently available:
+
+```powershell
+cargo run --bin sc16tank -- validate-map modules\Tank-16\disks\maps\FINLAND.json
+cargo run --bin sc16tank -- load-map modules\Tank-16\disks\maps\FINLAND.json
+cargo run --bin sc16tank -- save-map modules\Tank-16\disks\maps\FINLAND.json --output-dir modules\Tank-16\disks\maps
+cargo run --bin sc16tank -- build-runtime --output tank16.sc16img
+cargo run --bin sc16tank -- build-map modules\Tank-16\disks\maps\PERUS-1.json
+cargo run --bin sc16tank -- generate-finland-map --countries countries.geojson --lakes lakes.geojson --roads roads.geojson --preview finland-preview.png --output modules\Tank-16\disks\maps\FINLAND.json
+cargo run --bin sc16tank -- extend-atlas
+cargo run --bin sc16objects
+cargo run --bin sc16mapedit -- --map modules\Tank-16\disks\maps\FINLAND.json
+cargo run --bin sc16mapedit -- --name ARENA --width 10 --height 8
+```
+
+The Finland generator accepts optional `--railways`, `--cities`, and `--size`
+arguments. Its tests use local synthetic GeoJSON and do not require network
+access. `sc16tank` also provides Rust-backed map loading/saving, runtime
+encoding, asset inspection, and C-header generation. The Rust editor opens an
+existing map with `--map`, or creates one with `--name`, `--width`, and
+`--height`; Ctrl+S saves it. Static builds with round-map variants still
+encounter a pre-existing C90 declaration-order diagnostic in the retained C
+compiler. The default dynamic Tank-16 build path and the static single-map
+build have both compiled successfully.
 
 ## Python tests and test helpers
 
@@ -84,13 +103,13 @@ considered migration.
 | [`tests/test_hertta3d.py`](../tests/test_hertta3d.py) | Test/helper — retain for coverage | Hertta3D game integration through the Python harness; port equivalent execution/render checks to Rust. |
 | [`tests/test_isa_opcodes.py`](../tests/test_isa_opcodes.py) | Test/helper — retain for coverage | Exhaustive Python assembler/CPU opcode combinations; migrate uncovered combinations to Rust assembler and CPU tests. |
 | [`tests/test_jit_core.py`](../tests/test_jit_core.py) | Test/helper — retain for coverage | Checks Numba JIT equivalence against the Python interpreter. Replace with Rust CPU differential/parity tests; the JIT itself is superseded. |
-| [`tests/test_map_editor.py`](../tests/test_map_editor.py) | Test/helper — retain for coverage | Map validation, serialization, and editor behaviors; port these contracts to the Rust map/editor implementation. |
+| [`tests/test_map_editor.py`](../tests/test_map_editor.py) | Test/helper — retain for coverage | Exercises Rust CLI map loading, validation, saving, and the editor entry point. Rust unit tests cover map mutation and serialization contracts. |
 | [`tests/test_module_gif_generator.py`](../tests/test_module_gif_generator.py) | Test/helper — retain for coverage | Optional Python gallery capture/GIF output; port with the generator or remove alongside an explicit gallery-workflow decision. |
-| [`tests/test_natural_maps.py`](../tests/test_natural_maps.py) | Test/helper — retain for coverage | Runs the Rust generator but still uses the Python map editor to validate output. Move runtime-map validation assertions to Rust before removing this cross-language test. |
+| [`tests/test_natural_maps.py`](../tests/test_natural_maps.py) | Test/helper — retain for coverage | Runs the Rust generator and validates generated maps through the Rust CLI. |
 | [`tests/test_net.py`](../tests/test_net.py) | Test/helper — retain for coverage | Python transport and emulator networking integration; retain/port end-to-end coverage using the Rust networking path. |
 | [`tests/test_spacecave.py`](../tests/test_spacecave.py) | Test/helper — retain for coverage | Spacecave network/game integration through Python CPU and transport; replace with Rust integration coverage. |
 | [`tests/test_storage_bios.py`](../tests/test_storage_bios.py) | Test/helper — retain for coverage | Python disk and BIOS integration, including behaviors that need parity checks against Rust storage/runtime. |
-| [`tests/test_tank16.py`](../tests/test_tank16.py) | Test/helper — retain for coverage | Tank-16 loader, map, graphics, and gameplay integration through Python; replace after Rust's Tank-16 build/runtime path is complete. |
+| [`tests/test_tank16.py`](../tests/test_tank16.py) | Test/helper — retain for coverage | Tank-16 gameplay integration still uses the Python emulator/compiler, but map and asset operations now run through Rust CLI commands. |
 
 ## Ordered migration tasks
 
@@ -102,21 +121,21 @@ point and its required tests pass.
    - Complete the C subset required by the repository's runnable modules in
      `rust/src/c_compiler.rs`; use the Rust assembler rather than
      `tools/assembler.py`.
-   - Reproduce the remaining useful `src/program_loader.py` behavior, including
-     Tank-16's specialized dynamic-asset build path from
-     `modules/Tank-16/tank16_map_loader.py`.
+   - Reproduce the remaining useful `src/program_loader.py` behavior. Its
+     Tank-16 dynamic-asset path now delegates to the Rust `sc16tank` CLI.
    - Replace `tools/smoke_compile_modules.py` with a Rust smoke-build workflow.
    - Gate deletion of `tools/c_compiler.py`, `tools/assembler.py`, and
      `src/program_loader.py` on builds of selected real module programs and
      migrated regression tests.
 
 2. **Port and route the Tank-16 map/asset workflow through Rust.**
-   - Implement map validation/load/save/serialization to cover the contracts in
-     `modules/Tank-16/map_editor.py` and `tests/test_map_editor.py`.
-   - Port the object tileset generator and the Finland GIS/map/atlas generator,
-     or document a deliberate boundary for retaining offline authoring tools.
-   - Remove Python's Tank-16 build and editor dependencies only after generated
-     assets/maps are readable by the Rust game path and parity tests pass.
+   - Rust now owns map data validation, editing, runtime encoding, asset
+     generation, and the graphical editor.
+   - Use `sc16objects` for object-atlas generation; small rasterization
+     differences from the former Python art are acceptable. Finland generation
+     and atlas-extension tests now exercise the Rust CLI.
+   - Keep C compilation in Python as an explicit migration-boundary exception;
+     Tank-16 map/asset callers and tests now use Rust.
 
 3. **Close Rust emulator/device parity and switch the default workflows.**
    - Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,
@@ -141,11 +160,8 @@ point and its required tests pass.
 5. **Resolve optional authoring and gallery utilities.**
    - Port `tools/generate_module_gifs.py` to capture frames from the Rust
      runtime, or remove/replace the optional gallery generation workflow.
-   - Decide and document whether all asset-authoring tools must be Rust. If yes,
-     port `map_editor.py`, `generate_finland_map.py`, and
-     `generate_object_tileset.py`; otherwise keep them as an explicitly scoped
-     Python-only content pipeline rather than presenting the migration as
-     Python-free.
+   - Decide and document whether the remaining Python developer utilities are
+     required in the Rust-only workflow.
 
 ## Completion criteria
 

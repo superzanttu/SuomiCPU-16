@@ -40,6 +40,7 @@ path = "rust/src/bin/sc16objects.rs"
 
 [dependencies]
 image = { version = "0.24.9", default-features = false, features = ["png"] }
+imageproc = { version = "0.23.1", default-features = false }
 macroquad = { version = "0.4.16", features = ["audio"] }
 memmap2 = "0.9"
 serde_json = "1"

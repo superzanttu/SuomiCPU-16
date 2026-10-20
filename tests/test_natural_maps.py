@@ -1,5 +1,4 @@
 import json
-import runpy
 import subprocess
 import tempfile
 import unittest
@@ -21,20 +20,27 @@ MAPS = (
 )
 
 
-EDITOR_PATH = GAME_DIR / "map_editor.py"
-
-
 class NaturalMapTests(unittest.TestCase):
+    def load_map(self, path):
+        result = subprocess.run(
+            ["cargo", "run", "--quiet", "--bin", "sc16tank", "--",
+             "load-map", str(path)],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        return json.loads(result.stdout)
+
     def test_generated_maps_are_installed_in_runtime_folder(self):
-        editor = runpy.run_path(str(EDITOR_PATH))
         runtime_dir = GAME_DIR / "disks" / "maps"
         for name in MAPS:
             runtime_path = runtime_dir / f"{name}.json"
             self.assertTrue(runtime_path.is_file())
-            self.assertEqual(editor["load_map"](runtime_path)["name"], name)
+            self.assertEqual(self.load_map(runtime_path)["name"], name)
 
     def test_generates_ten_distinct_runtime_ready_natural_maps(self):
-        editor = runpy.run_path(str(EDITOR_PATH))
         with tempfile.TemporaryDirectory() as directory:
             runtime_dir = Path(directory) / "disks" / "maps"
             result = subprocess.run(
@@ -52,6 +58,7 @@ class NaturalMapTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
 
             self.assertEqual(len(json.loads(result.stdout)["maps"]), 10)
@@ -59,7 +66,7 @@ class NaturalMapTests(unittest.TestCase):
             terrain_layouts = set()
             for name in MAPS:
                 runtime_path = runtime_dir / f"{name}.json"
-                map_data = editor["load_map"](runtime_path)
+                map_data = self.load_map(runtime_path)
                 self.assertEqual(map_data["name"], name)
                 self.assertEqual((map_data["width"], map_data["height"]),
                                  (48, 32))

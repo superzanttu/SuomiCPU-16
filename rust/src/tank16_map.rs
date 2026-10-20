@@ -1166,9 +1166,101 @@ pub fn compile_runtime_tank16(game_dir: &Path) -> Result<crate::image::ProgramIm
     }
     let header = runtime_assets_header(game_dir)?;
     let source = source.replacen(include, &header, 1);
-    crate::c_compiler::compile_minimal_program(&source, &source_path.to_string_lossy())
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Rust C compiler does not support the Tank-16 source yet".to_owned())
+    compile_with_python_c_compiler(&source, game_dir)
+}
+
+fn compile_with_python_c_compiler(
+    source: &str,
+    game_dir: &Path,
+) -> Result<crate::image::ProgramImage, String> {
+    use std::process::{Command, Output};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let compiler = manifest.join("tools/c_compiler.py");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("cannot create temporary source name: {error}"))?
+        .as_nanos();
+    let temporary_dir =
+        std::env::temp_dir().join(format!("sc16-tank16-{}-{timestamp}", std::process::id()));
+    fs::create_dir(&temporary_dir)
+        .map_err(|error| format!("cannot create temporary build folder: {error}"))?;
+    let temporary_source = game_dir.join(format!(".sc16-main-{timestamp}.c"));
+    let output_binary = temporary_dir.join("main.bin");
+    let mut source_created = false;
+    let result = (|| {
+        use std::io::Write;
+        let mut source_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_source)
+            .map_err(|error| format!("cannot create temporary Tank-16 source: {error}"))?;
+        source_created = true;
+        source_file
+            .write_all(source.as_bytes())
+            .map_err(|error| format!("cannot write temporary Tank-16 source: {error}"))?;
+        let invoke = |program: &str, prefix: &[&str]| -> std::io::Result<Output> {
+            let mut command = Command::new(program);
+            command.args(prefix).arg(&compiler).arg(&temporary_source);
+            command
+                .arg("--output")
+                .arg(&output_binary)
+                .arg("--quiet")
+                .current_dir(manifest)
+                .output()
+        };
+        let mut output = None;
+        for (program, prefix) in [
+            ("python", &[][..]),
+            ("python3", &[][..]),
+            ("py", &["-3"][..]),
+        ] {
+            match invoke(program, prefix) {
+                Ok(result) => {
+                    output = Some(result);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot start retained Python C compiler with {program}: {error}"
+                    ));
+                }
+            }
+        }
+        let output = output.ok_or_else(|| {
+            "cannot start retained Python C compiler: none of python, python3, or py -3 is available"
+                .to_owned()
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "retained Python C compiler failed ({}): {}{}",
+                output.status,
+                stderr.trim(),
+                if stdout.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", stdout.trim())
+                }
+            ));
+        }
+        crate::image::load_binary(&output_binary).map_err(|error| error.to_string())
+    })();
+    let source_cleanup = if source_created {
+        fs::remove_file(&temporary_source)
+    } else {
+        Ok(())
+    };
+    let cleanup = fs::remove_dir_all(&temporary_dir);
+    match (result, source_cleanup, cleanup) {
+        (Ok(image), Ok(()), Ok(())) => Ok(image),
+        (Err(error), _, _) => Err(error),
+        (Ok(_), Err(error), _) => Err(format!("cannot clean temporary source: {error}")),
+        (Ok(_), Ok(()), Err(error)) => Err(format!("cannot clean temporary build folder: {error}")),
+    }
 }
 
 pub fn discover_round_maps(game_dir: &Path, selected_path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1186,6 +1278,16 @@ pub fn discover_round_maps(game_dir: &Path, selected_path: &Path) -> Result<Vec<
             .path();
         if path.extension().is_none_or(|extension| extension != "json")
             || path.canonicalize().ok() == selected_path.canonicalize().ok()
+        {
+            continue;
+        }
+        let candidate_json = fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read map {}: {error}", path.display()))?;
+        let candidate_document: Value = serde_json::from_str(&candidate_json)
+            .map_err(|error| format!("cannot parse map {}: {error}", path.display()))?;
+        if candidate_document["width"].as_u64().is_none()
+            || candidate_document["height"].as_u64().is_none()
+            || candidate_document["tileset"].as_str().is_none()
         {
             continue;
         }
@@ -1242,6 +1344,408 @@ pub fn object_tile_coordinates(map: &Value) -> Result<Vec<[usize; 2]>, String> {
     Ok(coordinates.into_keys().map(|(y, x)| [x, y]).collect())
 }
 
+fn format_c_values(values: &[i64], width: usize) -> String {
+    values
+        .chunks(width)
+        .map(|row| {
+            format!(
+                "    {}",
+                row.iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n")
+}
+
+fn map_tile_ids(map: &Value, terrain_columns: usize) -> Result<Vec<i64>, String> {
+    let mut ids = Vec::new();
+    for row in map["tiles"]
+        .as_array()
+        .ok_or_else(|| "map terrain layer is invalid".to_owned())?
+    {
+        for tile in row
+            .as_array()
+            .ok_or_else(|| "map terrain row is invalid".to_owned())?
+        {
+            let pair = tile
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| "map terrain tile is invalid".to_owned())?;
+            let x = integer(&pair[0], "terrain tile x")?;
+            let y = integer(&pair[1], "terrain tile y")?;
+            ids.push((y * terrain_columns + x) as i64);
+        }
+    }
+    Ok(ids)
+}
+
+fn map_object_cells(map: &Value) -> Result<Vec<(usize, usize, Value)>, String> {
+    let mut objects = Vec::new();
+    for (y, row) in map["objects"]
+        .as_array()
+        .ok_or_else(|| "map object layer is invalid".to_owned())?
+        .iter()
+        .enumerate()
+    {
+        for (x, cell) in row
+            .as_array()
+            .ok_or_else(|| "map object row is invalid".to_owned())?
+            .iter()
+            .enumerate()
+        {
+            if !cell.is_null() {
+                objects.push((x, y, cell.clone()));
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn object_tile_id(
+    cell: &Value,
+    ids: &HashMap<[usize; 2], i64>,
+    layer: &str,
+) -> Result<i64, String> {
+    let tile = if layer == "objects" {
+        &cell["tile"]
+    } else {
+        cell
+    };
+    let pair = tile
+        .as_array()
+        .filter(|pair| pair.len() == 2)
+        .ok_or_else(|| format!("{layer} tile is invalid"))?;
+    let coordinate = [
+        integer(&pair[0], "object tile x")?,
+        integer(&pair[1], "object tile y")?,
+    ];
+    ids.get(&coordinate)
+        .copied()
+        .ok_or_else(|| format!("{layer} tile is not in the selected map atlas"))
+}
+
+fn object_field_arrays(
+    objects: &[(usize, usize, Value)],
+    ids: &HashMap<[usize; 2], i64>,
+    object_columns: usize,
+) -> Result<BTreeMap<&'static str, Vec<i64>>, String> {
+    let mut fields = BTreeMap::from([
+        ("x", Vec::new()),
+        ("y", Vec::new()),
+        ("tile", Vec::new()),
+        ("source_tile", Vec::new()),
+        ("hp", Vec::new()),
+        ("removal", Vec::new()),
+    ]);
+    for (x, y, cell) in objects {
+        let tile = cell["tile"]
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| "map object tile is invalid".to_owned())?;
+        let tile_x = integer(&tile[0], "object tile x")?;
+        let tile_y = integer(&tile[1], "object tile y")?;
+        let hp = cell["hp_change"]
+            .as_i64()
+            .ok_or_else(|| "map object hp_change is invalid".to_owned())?;
+        let removal = cell["removal"]
+            .as_str()
+            .ok_or_else(|| "map object removal is invalid".to_owned())?;
+        let removal_code = REMOVAL_TYPES
+            .iter()
+            .position(|value| *value == removal)
+            .ok_or_else(|| "map object removal is unsupported".to_owned())?;
+        fields.get_mut("x").unwrap().push(*x as i64);
+        fields.get_mut("y").unwrap().push(*y as i64);
+        fields
+            .get_mut("tile")
+            .unwrap()
+            .push(object_tile_id(cell, ids, "objects")?);
+        fields
+            .get_mut("source_tile")
+            .unwrap()
+            .push((tile_y * object_columns + tile_x) as i64);
+        fields.get_mut("hp").unwrap().push(hp);
+        fields.get_mut("removal").unwrap().push(removal_code as i64);
+    }
+    Ok(fields)
+}
+
+pub fn build_map_header(
+    game_dir: &Path,
+    map_path: &Path,
+    round_map_paths: &[PathBuf],
+) -> Result<String, String> {
+    build_map_header_with_tile_size(
+        game_dir,
+        map_path,
+        round_map_paths,
+        map_tile_pixel_size(game_dir)?,
+    )
+}
+
+pub fn build_map_header_with_tile_size(
+    game_dir: &Path,
+    map_path: &Path,
+    round_map_paths: &[PathBuf],
+    tile_size: u32,
+) -> Result<String, String> {
+    let map_data = load_map(game_dir, map_path)?;
+    let assets = load_map_assets(game_dir, map_path, tile_size)?;
+    let terrain_columns = assets.terrain.columns;
+    let terrain_count = terrain_columns * assets.terrain.rows;
+    let coordinates = object_tile_coordinates(&map_data)?;
+    let mut object_ids = HashMap::new();
+    for (index, coordinate) in coordinates.iter().enumerate() {
+        object_ids.insert(*coordinate, (terrain_count + index) as i64);
+    }
+    let mut maps = vec![map_data];
+    for round_map_path in round_map_paths {
+        let round_map = load_map(game_dir, round_map_path)?;
+        if round_map["width"] != maps[0]["width"]
+            || round_map["height"] != maps[0]["height"]
+            || round_map["tileset"] != maps[0]["tileset"]
+        {
+            return Err(format!(
+                "round map {} must match the selected map dimensions and terrain tileset",
+                round_map_path.display()
+            ));
+        }
+        if !object_tile_coordinates(&round_map)?
+            .iter()
+            .all(|coordinate| object_ids.contains_key(coordinate))
+        {
+            return Err(format!(
+                "round map {} uses object tiles not included by the selected map",
+                round_map_path.display()
+            ));
+        }
+        maps.push(round_map);
+    }
+    let map_values = map_tile_ids(&maps[0], terrain_columns)?;
+    let mut map_data_header = String::new();
+    if map_values.len() <= 32768 {
+        map_data_header.push_str(&format!(
+            "unsigned char map_data[MAP_CELLS] = {{\n{}\n}};\n",
+            format_c_values(&map_values, 16)
+        ));
+    } else {
+        for (page, values) in map_values.chunks(32768).enumerate() {
+            map_data_header.push_str(&format!(
+                "unsigned char map_data_{page}[{}] = {{\n{}\n}};\n",
+                values.len(),
+                format_c_values(values, 16)
+            ));
+        }
+        map_data_header.push_str("#define map_data map_data_0\n");
+    }
+    let selected_tile_indices = (0..terrain_count)
+        .chain(coordinates.iter().map(|coordinate| {
+            terrain_count + coordinate[1] * assets.objects.columns + coordinate[0]
+        }))
+        .collect::<Vec<_>>();
+    let tile_arrays = selected_tile_indices
+        .iter()
+        .map(|index| {
+            format!(
+                "    {{\n     {}\n    }}",
+                format_c_values(
+                    &assets.tiles[*index]
+                        .iter()
+                        .map(|value| i64::from(*value))
+                        .collect::<Vec<_>>(),
+                    16
+                )
+                .replace("\n", "\n     ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let upload_tiles = (0..selected_tile_indices.len())
+        .map(|index| format!("    gfx_tile_upload({index}, terrain_tiles[{index}]);"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let terrain_count_i64 = terrain_count as i64;
+    let terrain_ids = coordinates
+        .iter()
+        .enumerate()
+        .map(|(index, coordinate)| (*coordinate, terrain_count_i64 + index as i64))
+        .collect::<HashMap<_, _>>();
+    let width = integer(&maps[0]["width"], "map width")?;
+    let height = integer(&maps[0]["height"], "map height")?;
+    let mut obstacle_tiles = Vec::with_capacity(width * height);
+    for row in maps[0]["obstacles"].as_array().unwrap() {
+        for cell in row.as_array().unwrap() {
+            obstacle_tiles.push(if cell.is_null() {
+                0
+            } else {
+                object_tile_id(cell, &terrain_ids, "obstacle")?
+            });
+        }
+    }
+    let objects = map_object_cells(&maps[0])?;
+    let variant_objects = maps
+        .iter()
+        .map(map_object_cells)
+        .collect::<Result<Vec<_>, _>>()?;
+    let capacity = variant_objects
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut layer_header = format!(
+        "#define MAP_VARIANT_COUNT {}\n#define MAP_OBJECT_COUNT {}\n#define MAP_OBJECT_CAPACITY {capacity}\n#define POWERUP_HEALTH_TILE {}\n#define POWERUP_DAMAGE_TILE {}\n#define POWERUP_SPEED_TILE {}\n#define OBJECT_FIXED 0\n#define OBJECT_EXPLOSION 1\n#define OBJECT_DISAPPEAR 2\n",
+        maps.len(),
+        objects.len(),
+        object_ids[&[3, 2]],
+        object_ids[&[4, 2]],
+        object_ids[&[5, 2]]
+    );
+    if obstacle_tiles.len() <= 32768 {
+        layer_header.push_str(&format!(
+            "unsigned char map_obstacles[MAP_CELLS] = {{\n{}\n}};\n",
+            format_c_values(&obstacle_tiles, 16)
+        ));
+    } else if obstacle_tiles.iter().all(|value| *value == 0) {
+        layer_header.push_str("#define MAP_OBSTACLES_EMPTY 1\n");
+    } else {
+        let page_rows = 32;
+        let page_capacity = page_rows * width;
+        for page in 0..height.div_ceil(page_rows) {
+            let start = page * page_capacity;
+            let mut values =
+                obstacle_tiles[start..(start + page_capacity).min(obstacle_tiles.len())].to_vec();
+            values.resize(page_capacity, 0);
+            layer_header.push_str(&format!(
+                "unsigned char map_obstacles_{page}[{page_capacity}] = {{\n{}\n}};\n",
+                format_c_values(&values, 16)
+            ));
+        }
+    }
+    let fields_by_map = variant_objects
+        .iter()
+        .map(|objects| object_field_arrays(objects, &terrain_ids, assets.objects.columns))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = fields_by_map
+        .first()
+        .ok_or_else(|| "map variants are empty".to_owned())?;
+    for (name, values) in fields {
+        layer_header.push_str(&format!(
+            "int map_object_{name}[MAP_OBJECT_CAPACITY] = {{\n{}\n}};\n",
+            format_c_values(if values.is_empty() { &[0] } else { values }, 16)
+        ));
+    }
+    if maps.len() > 1 {
+        let variant_map_values = maps
+            .iter()
+            .map(|map| map_tile_ids(map, terrain_columns))
+            .collect::<Result<Vec<_>, _>>()?;
+        let variant_obstacles = maps
+            .iter()
+            .map(|map| {
+                map["obstacles"]
+                    .as_array()
+                    .ok_or_else(|| "map obstacle layer is invalid".to_owned())?
+                    .iter()
+                    .flat_map(|row| row.as_array().unwrap())
+                    .map(|cell| {
+                        if cell.is_null() {
+                            Ok(0)
+                        } else {
+                            object_tile_id(cell, &terrain_ids, "obstacle")
+                        }
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        layer_header.push_str(&format!(
+            "unsigned char map_variant_data[MAP_VARIANT_COUNT][MAP_CELLS] = {{\n{}\n}};\n",
+            variant_map_values
+                .iter()
+                .map(|values| format!(
+                    "    {{{}}}",
+                    format_c_values(values, 16).replace("\n", "\n     ")
+                ))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        ));
+        layer_header.push_str(&format!(
+            "unsigned char map_variant_obstacles[MAP_VARIANT_COUNT][MAP_CELLS] = {{\n{}\n}};\n",
+            variant_obstacles
+                .iter()
+                .map(|values| format!(
+                    "    {{{}}}",
+                    format_c_values(values, 16).replace("\n", "\n     ")
+                ))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        ));
+        layer_header.push_str(&format!(
+            "int map_variant_object_count[MAP_VARIANT_COUNT] = {{{}}};\n",
+            variant_objects
+                .iter()
+                .map(Vec::len)
+                .map(|count| count.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        for name in fields.keys() {
+            let variant_rows = fields_by_map
+                .iter()
+                .map(|fields| {
+                    let mut values = fields[name].clone();
+                    values.resize(capacity, 0);
+                    format!(
+                        "    {{{}}}",
+                        format_c_values(&values, 16).replace("\n", "\n     ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",\n");
+            layer_header.push_str(&format!(
+                "int map_variant_object_{name}[MAP_VARIANT_COUNT][MAP_OBJECT_CAPACITY] = {{\n{variant_rows}\n}};\n"
+            ));
+        }
+    }
+    let palette_values = assets
+        .palette
+        .iter()
+        .map(|color| format!("    {{{}, {}, {}}}", color[0], color[1], color[2]))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    Ok(format!(
+        "#define MAP_COLUMNS {width}\n#define MAP_ROWS {height}\n#define MAP_CELLS (MAP_COLUMNS * MAP_ROWS)\n#define MAP_TERRAIN_TILE_COUNT {terrain_count}\n#define TILE_COUNT {}\n#define TILE_PIXEL_COUNT {}\n#define MAP_PALETTE_COUNT {}\n#define MAP_PALETTE_BASE 32\n#define MAP_TILESET_FILENAME \"{}\"\nunsigned char map_palette[MAP_PALETTE_COUNT][3] = {{\n{palette_values}\n}};\nunsigned char terrain_tiles[TILE_COUNT][TILE_PIXEL_COUNT] = {{\n{tile_arrays}\n}};\nvoid upload_terrain_tiles(void) {{\n{upload_tiles}\n}}\n{map_data_header}{layer_header}",
+        selected_tile_indices.len(),
+        tile_size * tile_size,
+        assets.palette.len(),
+        maps[0]["tileset"].as_str().unwrap()
+    ))
+}
+
+pub fn compile_map_file(
+    game_dir: &Path,
+    map_path: &Path,
+    randomize_rounds: bool,
+) -> Result<crate::image::ProgramImage, String> {
+    let source_path = game_dir.join("main.c");
+    let source = fs::read_to_string(&source_path)
+        .map_err(|error| format!("cannot read {}: {error}", source_path.display()))?;
+    let include = "#include \"map_assets.h\"";
+    if source.matches(include).count() != 1 {
+        return Err("Tank-16 main.c must include map_assets.h exactly once".to_owned());
+    }
+    let round_maps = if randomize_rounds {
+        discover_round_maps(game_dir, map_path)?
+    } else {
+        Vec::new()
+    };
+    let header = build_map_header(game_dir, map_path, &round_maps)?;
+    compile_with_python_c_compiler(&source.replacen(include, &header, 1), game_dir)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -1264,6 +1768,87 @@ mod tests {
         assert!(new_map("TOO-LONG-9", 2, 3).is_err());
         assert!(new_map("BAD NAME", 2, 3).is_err());
         assert!(new_map("OK", 1025, 1).is_err());
+    }
+
+    #[test]
+    fn edits_and_round_trips_terrain_obstacle_and_object_layers() {
+        let game_dir = default_game_dir();
+        let terrain = tileset_dimensions(&game_dir.join("gfx/tiles_terrain.png"), false).unwrap();
+        let objects = tileset_dimensions(&game_dir.join("gfx/tiles_objects.png"), true).unwrap();
+        let mut map = new_map("LAYERS", 3, 2).unwrap();
+        set_map_tile(&mut map, 2, 1, 3, 2, terrain).unwrap();
+        set_layer_tile(
+            &mut map,
+            LayerTileEdit {
+                layer: "obstacles",
+                x: 0,
+                y: 1,
+                tile: Some([2, 3]),
+                hp_change: -25,
+                removal: "explosion",
+            },
+            objects,
+        )
+        .unwrap();
+        set_layer_tile(
+            &mut map,
+            LayerTileEdit {
+                layer: "objects",
+                x: 1,
+                y: 1,
+                tile: Some([1, 2]),
+                hp_change: 35,
+                removal: "disappear",
+            },
+            objects,
+        )
+        .unwrap();
+        let output_dir =
+            std::env::temp_dir().join(format!("sc16-map-layers-{}", std::process::id()));
+        let saved = save_map(&game_dir, &map, &output_dir).unwrap();
+        let loaded = load_map(&game_dir, &saved).unwrap();
+        assert_eq!(loaded["tiles"][1][2], json!([3, 2]));
+        assert_eq!(loaded["obstacles"][1][0], json!([2, 3]));
+        assert_eq!(loaded["objects"][1][1]["tile"], json!([1, 2]));
+        assert_eq!(loaded["objects"][1][1]["hp_change"], 35);
+        assert_eq!(loaded["objects"][1][1]["removal"], "disappear");
+        fs::remove_dir_all(output_dir).unwrap();
+    }
+
+    #[test]
+    fn static_map_header_contains_layer_and_tile_metadata() {
+        let game_dir = default_game_dir();
+        let map_path = game_dir.join("disks/maps/PERUS-1.json");
+        let header = build_map_header(&game_dir, &map_path, &[]).unwrap();
+        assert!(header.contains("#define MAP_COLUMNS 10"));
+        assert!(header.contains("#define MAP_ROWS 8"));
+        assert!(header.contains("#define MAP_VARIANT_COUNT 1"));
+        assert!(header.contains("unsigned char map_data[MAP_CELLS]"));
+        assert!(header.contains("unsigned char map_obstacles[MAP_CELLS]"));
+        assert!(header.contains("int map_object_source_tile[MAP_OBJECT_CAPACITY]"));
+        assert!(header.contains("void upload_terrain_tiles(void)"));
+    }
+
+    #[test]
+    fn round_map_discovery_skips_infinite_world_data() {
+        let game_dir = default_game_dir();
+        let selected = game_dir.join("disks/maps/PERUS-1.json");
+        let rounds = discover_round_maps(&game_dir, &selected).unwrap();
+        assert!(!rounds.is_empty());
+        assert!(
+            rounds
+                .iter()
+                .all(|path| path.file_name().is_none_or(|name| name != "INFINITE.json"))
+        );
+        for path in &rounds {
+            let candidate = load_map(&game_dir, path).unwrap();
+            assert_eq!(candidate["width"], 10);
+            assert_eq!(candidate["height"], 8);
+        }
+        let header = build_map_header(&game_dir, &selected, &rounds[..1]).unwrap();
+        assert!(header.contains("#define MAP_VARIANT_COUNT 2"));
+        assert!(header.contains("map_variant_data[MAP_VARIANT_COUNT][MAP_CELLS]"));
+        assert!(header.contains("map_variant_object_source_tile"));
     }
 
     #[test]

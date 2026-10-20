@@ -35,27 +35,6 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let game_dir = default_game_dir();
-    let terrain_path = game_dir.join("gfx/tiles_terrain.png");
-    let objects_path = game_dir.join("gfx/tiles_objects.png");
-    let terrain = load_texture(
-        terrain_path
-            .to_str()
-            .ok_or("terrain atlas path is not valid text")?,
-    )
-    .await
-    .map_err(|error| format!("cannot load terrain atlas: {error}"))?;
-    let objects = load_texture(
-        objects_path
-            .to_str()
-            .ok_or("object atlas path is not valid text")?,
-    )
-    .await
-    .map_err(|error| format!("cannot load object atlas: {error}"))?;
-    terrain.set_filter(FilterMode::Nearest);
-    objects.set_filter(FilterMode::Nearest);
-    let terrain_dimensions = tileset_dimensions(&terrain_path, false)?;
-    let object_dimensions = tileset_dimensions(&objects_path, true)?;
-
     let mut args = std::env::args_os().skip(1);
     let mut input_path = None;
     let mut width = 10usize;
@@ -66,6 +45,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "Usage: sc16mapedit [--map <map.json>] [--name NAME] [--width N] [--height N]"
             );
+            println!("Open a map with --map, or create one with --name, --width and --height.");
             println!("Paint terrain and object layers; Ctrl+S saves into Tank-16 disks/maps.");
             return Ok(());
         }
@@ -89,13 +69,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         new_map(&name, width, height)?
     };
+    let terrain_path = game_dir
+        .join("gfx")
+        .join(map["tileset"].as_str().ok_or("map tileset must be text")?);
+    let objects_path = game_dir.join("gfx").join(
+        map["objects_tileset"]
+            .as_str()
+            .ok_or("map object tileset must be text")?,
+    );
+    let terrain = load_texture(
+        terrain_path
+            .to_str()
+            .ok_or("terrain atlas path is not valid text")?,
+    )
+    .await
+    .map_err(|error| format!("cannot load terrain atlas: {error}"))?;
+    let objects = load_texture(
+        objects_path
+            .to_str()
+            .ok_or("object atlas path is not valid text")?,
+    )
+    .await
+    .map_err(|error| format!("cannot load object atlas: {error}"))?;
+    terrain.set_filter(FilterMode::Nearest);
+    objects.set_filter(FilterMode::Nearest);
+    let terrain_dimensions = tileset_dimensions(&terrain_path, false)?;
+    let object_dimensions = tileset_dimensions(&objects_path, true)?;
     let maps_dir = game_dir.join("disks/maps");
     let mut layer = EditLayer::Terrain;
     let mut selected_terrain = [0usize, 0usize];
     let mut selected_object = [0usize, 0usize];
+    let mut object_hp_change = -25i64;
+    let mut object_removal = "explosion";
     let mut palette_offset = 0usize;
+    let mut zoom = 1.0f32;
+    let mut pan_x = 0.0f32;
+    let mut pan_y = 0.0f32;
     let mut status =
-        "G/O/B: select layer | left click: paint | right click: erase | Ctrl+S: save | Esc: quit"
+        "G/O/B layer | click paint | right-click erase | 1/2/3 removal | PgUp/PgDn HP | Ctrl+S save"
             .to_owned();
     loop {
         if is_key_pressed(KeyCode::Escape) {
@@ -111,10 +122,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             layer = EditLayer::Obstacles;
             palette_offset = 0;
         }
-        if is_key_pressed(KeyCode::Up) {
+        if is_key_down(KeyCode::LeftControl) && is_key_pressed(KeyCode::Up) {
             palette_offset = palette_offset.saturating_sub(6);
-        }
-        if is_key_pressed(KeyCode::Down) {
+        } else if is_key_down(KeyCode::LeftControl) && is_key_pressed(KeyCode::Down) {
             palette_offset = (palette_offset + 6).min(
                 palette_dimensions(layer, terrain_dimensions, object_dimensions)
                     .columns
@@ -123,6 +133,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .saturating_sub(1),
             );
+        } else if is_key_pressed(KeyCode::Up) {
+            pan_y += 24.0;
+        } else if is_key_pressed(KeyCode::Down) {
+            pan_y -= 24.0;
+        } else if is_key_pressed(KeyCode::Left) {
+            pan_x += 24.0;
+        } else if is_key_pressed(KeyCode::Right) {
+            pan_x -= 24.0;
+        }
+        if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) {
+            zoom = (zoom * 1.2).min(8.0);
+        } else if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract) {
+            zoom = (zoom / 1.2).max(0.25);
+        } else if is_key_pressed(KeyCode::Home) {
+            zoom = 1.0;
+            pan_x = 0.0;
+            pan_y = 0.0;
+        }
+        if is_key_pressed(KeyCode::Key1) {
+            object_removal = "fixed";
+        } else if is_key_pressed(KeyCode::Key2) {
+            object_removal = "explosion";
+        } else if is_key_pressed(KeyCode::Key3) {
+            object_removal = "disappear";
+        }
+        if is_key_pressed(KeyCode::PageUp) {
+            object_hp_change = (object_hp_change + 5).min(100);
+        } else if is_key_pressed(KeyCode::PageDown) {
+            object_hp_change = (object_hp_change - 5).max(-100);
         }
         if is_key_down(KeyCode::LeftControl) && is_key_pressed(KeyCode::S) {
             match save_map(&game_dir, &map, &maps_dir) {
@@ -132,13 +171,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let map_width = map["width"].as_u64().unwrap() as usize;
         let map_height = map["height"].as_u64().unwrap() as usize;
-        let canvas_x = SIDEBAR_WIDTH;
-        let canvas_y = HEADER_HEIGHT;
+        let canvas_x = SIDEBAR_WIDTH + pan_x;
+        let canvas_y = HEADER_HEIGHT + pan_y;
         let canvas_width = screen_width() - canvas_x - 16.0;
         let canvas_height = screen_height() - canvas_y - FOOTER_HEIGHT - 12.0;
         let cell_size = (canvas_width / map_width as f32)
             .min(canvas_height / map_height as f32)
-            .max(1.0);
+            .max(1.0)
+            * zoom;
         let (mouse_x, mouse_y) = mouse_position();
         if mouse_x >= canvas_x
             && mouse_y >= canvas_y
@@ -164,8 +204,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             x,
                             y,
                             tile: Some(selected_object),
-                            hp_change: -25,
-                            removal: "explosion",
+                            hp_change: object_hp_change,
+                            removal: object_removal,
                         },
                         object_dimensions,
                     ),
@@ -176,8 +216,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             x,
                             y,
                             tile: Some(selected_object),
-                            hp_change: -25,
-                            removal: "explosion",
+                            hp_change: object_hp_change,
+                            removal: object_removal,
                         },
                         object_dimensions,
                     ),
@@ -223,6 +263,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cell_size,
             canvas_x,
             canvas_y,
+            object_hp_change,
+            object_removal,
             &status,
         );
         next_frame().await;
@@ -288,15 +330,21 @@ fn draw_editor(
     cell_size: f32,
     canvas_x: f32,
     canvas_y: f32,
+    object_hp_change: i64,
+    object_removal: &str,
     status: &str,
 ) {
     clear_background(Color::from_rgba(26, 29, 33, 255));
     let width = map["width"].as_u64().unwrap() as usize;
     let height = map["height"].as_u64().unwrap() as usize;
     let rows = map["tiles"].as_array().unwrap();
-    for y in 0..height {
+    let start_x = ((-canvas_x / cell_size).floor() as isize).max(0) as usize;
+    let start_y = ((-canvas_y / cell_size).floor() as isize).max(0) as usize;
+    let end_x = (((screen_width() - canvas_x) / cell_size).ceil() as usize).min(width);
+    let end_y = (((screen_height() - canvas_y) / cell_size).ceil() as usize).min(height);
+    for y in start_y..end_y {
         let cells = rows[y].as_array().unwrap();
-        for x in 0..width {
+        for x in start_x..end_x {
             let pair = cells[x].as_array().unwrap();
             let tile = [
                 pair[0].as_u64().unwrap() as usize,
@@ -389,7 +437,9 @@ fn draw_editor(
         }
     }
     draw_text(
-        "Palette: click | Up/Down scroll",
+        format!(
+            "Ctrl+Up/Down palette | +/- zoom | PgUp/PgDn HP {object_hp_change} | removal {object_removal}"
+        ),
         8.0,
         screen_height() - 62.0,
         14.0,

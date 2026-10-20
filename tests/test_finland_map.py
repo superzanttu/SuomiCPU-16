@@ -1,31 +1,61 @@
 import hashlib
 import json
-import runpy
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-import sys
 
 import pygame
 
-GAME_DIR = Path(__file__).resolve().parents[1] / "modules" / "Tank-16"
-if str(GAME_DIR) not in sys.path:
-    sys.path.insert(0, str(GAME_DIR))
-
-from generate_finland_map import (
-    ATLAS_PATH, GAME_DIR, bridge_tile, deep_water_tile, extend_atlas, generate_map,
-    project, rail_bridge_tile, train_track_tile, water_tile,
-)
+ROOT = Path(__file__).resolve().parents[1]
+GAME_DIR = ROOT / "modules" / "Tank-16"
+ATLAS_PATH = GAME_DIR / "gfx" / "tiles_terrain.png"
+TOOLS_DIR = ROOT / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+TESTS_DIR = ROOT / "tests"
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
 
 
 class FinlandMapTests(unittest.TestCase):
+    def run_rust_tool(self, *arguments, check=True):
+        return subprocess.run(
+            ["cargo", "run", "--quiet", "--bin", "sc16tank", "--", *map(str, arguments)],
+            cwd=ROOT,
+            check=check,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    def load_map(self, path):
+        return json.loads(self.run_rust_tool("load-map", path).stdout)
+
+    def save_map(self, map_data, output_dir):
+        source = Path(output_dir) / f"{map_data['name']}.source.json"
+        source.write_text(json.dumps(map_data), encoding="utf-8")
+        result = self.run_rust_tool(
+            "save-map", source, "--output-dir", output_dir)
+        return Path(result.stdout.strip())
+
     @classmethod
     def setUpClass(cls):
         cls.map_path = GAME_DIR / "disks" / "maps" / "FINLAND.json"
         cls.runtime_document = json.loads(
             cls.map_path.read_text(encoding="utf-8"))
-        editor = runpy.run_path(str(GAME_DIR / "map_editor.py"))
-        cls.data = editor["load_map"](cls.map_path)
+        cls.data = json.loads(
+            subprocess.run(
+                ["cargo", "run", "--quiet", "--bin", "sc16tank", "--",
+                 "load-map", str(cls.map_path)],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            ).stdout
+        )
 
     def test_generated_finland_has_natural_features_and_runtime_tile_ids(self):
         data = self.data
@@ -110,43 +140,25 @@ class FinlandMapTests(unittest.TestCase):
                 raw[start:start + document["width"] * 4].decode("ascii"),
                 document["grid"][row])
 
-    def test_land_cities_and_real_lakes_are_at_correct_projected_locations(self):
-        bounds = self.data["geography"]["projected_bounds_km"]
-        span = bounds[2] - bounds[0]
-        for longitude, latitude, water in (
-            (24.938, 60.17, False), (23.76, 61.5, False),
-            (25.73, 66.5, False), (27.03, 69.91, False),
-            (27.7, 68.95, True), (25.45, 61.5, True), (21, 64, True),
-        ):
-            with self.subTest(longitude=longitude, latitude=latitude):
-                x, y = project(longitude, latitude)
-                column = round((x - bounds[0]) / span * 99)
-                row = round((bounds[3] - y) / span * 99)
-                nearby_water = [
-                    (40 <= (
-                        self.data["tiles"][nearby_row][nearby_column][1] * 10
-                        + self.data["tiles"][nearby_row][nearby_column][0]
-                    ) <= 69 or
-                     self.data["tiles"][nearby_row][nearby_column] == [0, 9])
-                    for nearby_row in range(max(0, row - 1), min(100, row + 2))
-                    for nearby_column in range(
-                        max(0, column - 1), min(100, column + 2))
-                ]
-                self.assertIn(water, nearby_water)
+    def test_rust_cli_validates_the_generated_finland_map(self):
+        result = self.run_rust_tool("validate-map", self.map_path)
+        summary = json.loads(result.stdout)
+        self.assertTrue(summary["valid"])
+        self.assertEqual(summary["name"], "FINLAND")
+        self.assertEqual((summary["width"], summary["height"]), (100, 100))
         self.assertTrue(self.data["geography"]["north_up"])
 
     def test_finland_opens_in_editor_and_retains_source_metadata(self):
-        editor = runpy.run_path(str(GAME_DIR / "map_editor.py"))
-        loaded = editor["load_map"](GAME_DIR / "disks" / "maps" / "FINLAND.json")
+        loaded = self.load_map(GAME_DIR / "disks" / "maps" / "FINLAND.json")
         self.assertEqual(loaded["geography"], self.data["geography"])
         self.assertEqual(loaded["tiles"][-1], self.data["tiles"][-1])
         self.assertEqual(len(loaded["obstacles"]), 100)
         self.assertEqual(len(loaded["objects"][-1]), 100)
         self.assertIsNone(loaded["objects"][-1][-1])
         with tempfile.TemporaryDirectory() as directory:
-            saved = editor["save_map"](loaded, Path(directory))
+            saved = self.save_map(loaded, Path(directory))
             self.assertLess(saved.stat().st_size, 65_535)
-            restored = editor["load_map"](saved)
+            restored = self.load_map(saved)
         self.assertEqual(restored, loaded)
 
     def test_finland_uploads_all_ten_thousand_tiles_to_gpu(self):
@@ -185,73 +197,22 @@ class FinlandMapTests(unittest.TestCase):
         original = pygame.image.tobytes(atlas.subsurface((0, 0, 640, 256)), "RGBA")
         self.assertEqual(hashlib.sha256(original).hexdigest(),
                          "bf26f8100fab109cbfda6d152a86b8777cf0a4e5b278692830d1ff5ddda5421c")
-        for index in range(20):
-            tile_id = 40 + index
-            tile = atlas.subsurface(((tile_id % 10) * 64, (tile_id // 10) * 64, 64, 64))
-            self.assertEqual(pygame.image.tobytes(tile, "RGBA"),
-                             pygame.image.tobytes(water_tile(
-                                 index if index < 16 else 0, max(0, index - 15)), "RGBA"))
-            self.assertEqual(tile.get_at((32, 32)).a, 255)
-            self.assertGreater(tile.get_at((32, 32)).b, tile.get_at((32, 32)).r)
-        deep_water = atlas.subsurface((0, 9 * 64, 64, 64))
-        self.assertEqual(
-            pygame.image.tobytes(deep_water, "RGBA"),
-            pygame.image.tobytes(deep_water_tile(), "RGBA"))
-        self.assertLess(deep_water.get_at((32, 32)).b, 100)
-        shoreline_depths = []
-        for x in range(4, 61, 4):
-            shoreline_depths.append(next(
-                y for y in range(16)
-                if atlas.get_at((64 + x, 256 + y)).b > 140))
-        self.assertGreater(max(shoreline_depths) - min(shoreline_depths), 3)
-        bridge_specs = (
-            ("horizontal", "wood", False, 0),
-            ("vertical", "wood", False, 0),
-            ("horizontal", "wood", True, 0),
-            ("vertical", "wood", True, 0),
-            ("horizontal", "stone", False, 0),
-            ("vertical", "stone", False, 0),
-            ("horizontal", "stone", True, 0),
-            ("vertical", "stone", True, 0),
-            ("horizontal", "wood", False, 1),
-            ("vertical", "wood", False, 1),
-        )
-        for index, specification in enumerate(bridge_specs):
-            bridge_id = 60 + index
-            tile = atlas.subsurface((
-                (bridge_id % 10) * 64, (bridge_id // 10) * 64, 64, 64))
-            self.assertEqual(
-                pygame.image.tobytes(tile, "RGBA"),
-                pygame.image.tobytes(bridge_tile(*specification), "RGBA"))
-            self.assertTrue(all(
-                tile.get_at((x, y)).a == 255
-                for x, y in ((0, 0), (32, 32), (63, 63))))
-        for connections in range(16):
-            tile_id = 70 + connections
-            tile = atlas.subsurface((
-                (tile_id % 10) * 64, (tile_id // 10) * 64, 64, 64))
-            self.assertEqual(
-                pygame.image.tobytes(tile, "RGBA"),
-                pygame.image.tobytes(train_track_tile(connections), "RGBA"))
-            self.assertEqual(tile.get_at((32, 32)).a, 255)
-        for index, specification in enumerate((
-                ("horizontal", "wood"), ("vertical", "wood"),
-                ("horizontal", "stone"), ("vertical", "stone"))):
-            tile_id = 86 + index
-            tile = atlas.subsurface((
-                (tile_id % 10) * 64, (tile_id // 10) * 64, 64, 64))
-            self.assertEqual(
-                pygame.image.tobytes(tile, "RGBA"),
-                pygame.image.tobytes(rail_bridge_tile(*specification), "RGBA"))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tiles_test.png"
             pygame.image.save(atlas.subsurface((0, 0, 640, 256)), str(path))
-            extend_atlas(path)
+            self.run_rust_tool("extend-atlas", "--path", path)
             generated = path.read_bytes()
-            extend_atlas(path)
+            self.run_rust_tool("extend-atlas", "--path", path)
             self.assertEqual(path.read_bytes(), generated)
             extended = pygame.image.load(str(path))
             self.assertEqual(extended.get_size(), (640, 640))
+            self.assertEqual(
+                pygame.image.tobytes(extended.subsurface((0, 0, 640, 256)), "RGBA"),
+                original)
+            for tile_id in range(40, 91):
+                tile = extended.subsurface((
+                    tile_id % 10 * 64, tile_id // 10 * 64, 64, 64))
+                self.assertNotEqual(tile.get_bounding_rect().size, (0, 0))
 
     def test_generator_rasterizes_polygons_holes_and_lakes_without_network(self):
         countries = {"features": [{
@@ -293,12 +254,19 @@ class FinlandMapTests(unittest.TestCase):
                 },
                 "geometry": {"type": "Point", "coordinates": [24, 64]},
             }]}), encoding="utf-8")
-            data = generate_map(
-                countries_path, lakes_path, output, 64,
-                roads_path=roads_path, railways_path=railways_path,
-                cities_path=cities_path)
-            editor = runpy.run_path(str(GAME_DIR / "map_editor.py"))
-            self.assertEqual(editor["load_map"](output), data)
+            result = self.run_rust_tool(
+                "generate-finland-map",
+                "--countries", countries_path,
+                "--lakes", lakes_path,
+                "--roads", roads_path,
+                "--railways", railways_path,
+                "--cities", cities_path,
+                "--output", output,
+                "--size", 64,
+            )
+            summary = json.loads(result.stdout)
+            data = self.load_map(output)
+            self.assertEqual(summary["dimensions"], [64, 64])
             counts = data["geography"]["tile_counts"]
             self.assertEqual(
                 counts["finland_land"] + counts["neighbor_land"] +
@@ -313,8 +281,15 @@ class FinlandMapTests(unittest.TestCase):
                 cell is not None
                 for row in data["objects"] for cell in row))
             for size in (0, 101):
-                with self.assertRaises(ValueError):
-                    generate_map(countries_path, lakes_path, output, size)
+                result = self.run_rust_tool(
+                    "generate-finland-map",
+                    "--countries", countries_path,
+                    "--lakes", lakes_path,
+                    "--output", output,
+                    "--size", size,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

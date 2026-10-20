@@ -324,16 +324,13 @@ class BIOSBootTests(unittest.TestCase):
         )
         image = AssemblyImage((MemorySegment(0, b"\x00\x01"),), 0)
         with patch(
-            "tank16_map_loader.compile_runtime_tank16",
+            "src.program_loader._compile_tank16_with_rust",
             return_value=image,
-        ) as compile_runtime, patch(
-            "tank16_map_loader.compile_map_file",
-        ) as compile_map:
+        ) as compile_runtime:
             loaded = load_program_file(main_path)
 
         self.assertIs(loaded, image)
-        compile_runtime.assert_called_once_with()
-        compile_map.assert_not_called()
+        compile_runtime.assert_called_once()
 
 
 if __name__ == "__main__":

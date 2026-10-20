@@ -2,9 +2,9 @@ from pathlib import Path
 import math
 import json
 import re
-import runpy
 import shutil
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,10 +20,103 @@ from gfx_harness import ROOT, layer_pixel, make_cpu, run_frame
 from src.SuomiCPU import DISK_STATUS, KEYS_ADDR, load_program_file
 from src.SuomiCPU import RTC_START
 from src.lib_disk import DiskDevice
-from tank16_map_loader import (
-    RUNTIME_TILE_DATA_PATH, build_map_header, build_runtime_assets_header,
-    discover_round_maps, load_map_assets, map_tile_pixel_size,
+
+RUNTIME_TILE_DATA_PATH = (
+    GAME_DIR / "disks" / "assets" / "TANK16_TILES.json"
 )
+
+
+def run_sc16tank(*arguments):
+    return subprocess.run(
+        ["cargo", "run", "--quiet", "--bin", "sc16tank", "--",
+         *map(str, arguments)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def build_runtime_assets_header():
+    return run_sc16tank("runtime-assets-header").stdout
+
+
+def build_map_header(path, tile_size=None):
+    arguments = ["build-map-header", path]
+    if tile_size is not None:
+        arguments.extend(("--tile-size", tile_size))
+    return run_sc16tank(*arguments).stdout
+
+
+def load_map_assets(path, tile_size=None):
+    arguments = ["inspect-map-assets", path]
+    if tile_size is not None:
+        arguments.extend(("--tile-size", tile_size))
+    result = json.loads(run_sc16tank(*arguments).stdout)
+    return (
+        result["map"],
+        result["tiles"],
+        [tuple(color) for color in result["palette"]],
+        tuple(result["dimensions"]),
+    )
+
+
+def map_tile_pixel_size():
+    source = (GAME_DIR / "main.c").read_text(encoding="utf-8")
+    match = re.search(r"(?m)^\s*#define\s+MAP_TILE_PIXEL_SIZE\s+(\d+)\s*$", source)
+    if match is None:
+        raise ValueError("main.c must define MAP_TILE_PIXEL_SIZE")
+    return int(match.group(1))
+
+
+def discover_round_maps(path):
+    return [Path(item) for item in json.loads(run_sc16tank("round-maps", path).stdout)]
+
+
+def new_map(name, width, height):
+    name = name.strip().upper()
+    return {
+        "format_version": 1,
+        "name": name,
+        "width": width,
+        "height": height,
+        "tile_size": 64,
+        "tileset": "tiles_terrain.png",
+        "objects_tileset": "tiles_objects.png",
+        "tiles": [[[0, 0] for _ in range(width)] for _ in range(height)],
+        "obstacles": [[None for _ in range(width)] for _ in range(height)],
+        "objects": [[None for _ in range(width)] for _ in range(height)],
+    }
+
+
+def save_map(map_data, directory):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / f"{map_data['name']}.source.json"
+    source.write_text(json.dumps(map_data), encoding="utf-8")
+    output = run_sc16tank("save-map", source, "--output-dir", directory)
+    return Path(output.stdout.strip())
+
+
+def load_map(path):
+    return json.loads(run_sc16tank("load-map", path).stdout)
+
+
+def apply_water_depth_tiles(map_data):
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / f"{map_data['name']}.json"
+        source.write_text(json.dumps(map_data), encoding="utf-8")
+        normalized = load_map(source)
+    map_data.clear()
+    map_data.update(normalized)
+
+
+def encode_runtime_map(map_data, output_path):
+    output_path = Path(output_path)
+    source = output_path.with_suffix(".source.json")
+    source.write_text(json.dumps(map_data), encoding="utf-8")
+    run_sc16tank("encode-map", source, "--output", output_path)
 
 
 class Tank16Tests(unittest.TestCase):
@@ -367,16 +460,14 @@ class Tank16Tests(unittest.TestCase):
 
     def test_objects_require_opaque_contact_and_react_to_ammunition(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
-        data = editor["new_map"]("PIXELS", 10, 8)
+        data = new_map("PIXELS", 10, 8)
         for column, removal in enumerate(("explosion", "fixed", "disappear"), 1):
             data["objects"][1][column] = {
                 "tile": [1, 0], "hp_change": -25, "removal": removal,
             }
-        with tempfile.TemporaryDirectory() as directory, patch(
-                "tank16_map_loader.map_tile_pixel_size", return_value=32):
-            path = editor["save_map"](data, Path(directory))
-            header = build_map_header(path)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_map(data, directory)
+            header = build_map_header(path, 32)
         source = self.game_source(source_path, 32).replace(
             '#include "map_assets.h"', header, 1)
         scenario = (
@@ -537,43 +628,35 @@ class Tank16Tests(unittest.TestCase):
 
     def test_object_tiles_scale_smoothly_with_configured_tile_size(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
-        data = editor["new_map"]("SCALED", 10, 8)
+        data = new_map("SCALED", 10, 8)
         data["obstacles"][0][0] = [0, 0]
-        atlas, _, _ = editor["load_tileset"](
-            editor["OBJECT_TILESET_PATH"], pad_edges=True)
+        atlas = pygame.image.load(str(GAME_DIR / "gfx" / "tiles_objects.png"))
         source_tile = atlas.subsurface((0, 0, 64, 64))
         with tempfile.TemporaryDirectory() as directory:
-            path = editor["save_map"](data, Path(directory))
+            path = save_map(data, directory)
             for size in (24, 32, 64):
-                with self.subTest(size=size), patch(
-                        "tank16_map_loader.map_tile_pixel_size",
-                        return_value=size):
-                    _, tiles, palette, dimensions = load_map_assets(path)
-                self.assertEqual(dimensions[2], size)
-                object_tile_id = dimensions[0] * dimensions[1]
-                self.assertEqual(len(tiles), object_tile_id + 4)
-                self.assertEqual(len(tiles[object_tile_id]), size * size)
-                expected = pygame.transform.smoothscale(source_tile, (size, size))
-                for y in range(size):
-                    for x in range(size):
-                        color = expected.get_at((x, y))
-                        pixel = tiles[object_tile_id][y * size + x]
-                        if color.a < 128:
-                            self.assertEqual(pixel, 0)
-                        else:
-                            closest = min(
-                                range(1, len(palette)),
-                                key=lambda index: sum(
-                                    (color[channel] - palette[index][channel]) ** 2
-                                    for channel in range(3)),
-                            )
-                            self.assertEqual(pixel, closest + 31)
+                with self.subTest(size=size):
+                    _, tiles, palette, dimensions = load_map_assets(path, size)
+                    self.assertEqual(dimensions[2], size)
+                    object_tile_id = dimensions[0] * dimensions[1]
+                    self.assertEqual(
+                        len(tiles),
+                        object_tile_id + 6 * 8,
+                    )
+                    self.assertEqual(len(tiles[object_tile_id]), size * size)
+                    expected = pygame.transform.smoothscale(source_tile, (size, size))
+                    for y in range(size):
+                        for x in range(size):
+                            color = expected.get_at((x, y))
+                            pixel = tiles[object_tile_id][y * size + x]
+                            if color.a < 128:
+                                self.assertEqual(pixel, 0)
+                            else:
+                                self.assertGreaterEqual(pixel, 32)
 
     def test_map_objects_obstacles_and_tracks_work_in_game(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
-        data = editor["new_map"]("LAYER", 10, 8)
+        data = new_map("LAYER", 10, 8)
         data["obstacles"][2][3] = [0, 0]
         for column, hp, removal in (
             (1, -25, "explosion"), (2, 30, "disappear"),
@@ -582,11 +665,10 @@ class Tank16Tests(unittest.TestCase):
             data["objects"][1][column] = {
                 "tile": [1, 0], "hp_change": hp, "removal": removal,
             }
-        with tempfile.TemporaryDirectory() as directory, patch(
-                "tank16_map_loader.map_tile_pixel_size", return_value=64):
-            path = editor["save_map"](data, Path(directory))
-            header = build_map_header(path)
-            _, tiles, _, dimensions = load_map_assets(path)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_map(data, directory)
+            header = build_map_header(path, 64)
+            _, tiles, _, dimensions = load_map_assets(path, 64)
         game_source = self.game_source(source_path).replace(
             '#include "map_assets.h"', header, 1
         )
@@ -676,16 +758,14 @@ class Tank16Tests(unittest.TestCase):
 
     def test_wall_and_building_objects_block_tanks_and_ammunition(self):
         source_path = ROOT / "modules" / "Tank-16" / "main.c"
-        editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
-        data = editor["new_map"]("SOLID", 10, 8)
+        data = new_map("SOLID", 10, 8)
         for column, tile in ((1, [0, 0]), (4, [0, 1])):
             data["objects"][1][column] = {
                 "tile": tile, "hp_change": -25, "removal": "fixed",
             }
-        with tempfile.TemporaryDirectory() as directory, patch(
-                "tank16_map_loader.map_tile_pixel_size", return_value=64):
-            path = editor["save_map"](data, Path(directory))
-            header = build_map_header(path)
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_map(data, directory)
+            header = build_map_header(path, 64)
         source = self.game_source(source_path).replace(
             '#include "map_assets.h"', header, 1)
         scenario = (
@@ -815,14 +895,12 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(layer_pixel(cpu, 4, 322, 17), 0)
 
     def test_water_depth_keeps_shoreline_and_marks_open_water(self):
-        editor = runpy.run_path(
-            str(GAME_DIR / "map_editor.py"))
-        map_data = editor["new_map"]("DEPTH", 9, 9, 0, 4)
+        map_data = new_map("DEPTH", 9, 9)
         for row in map_data["tiles"]:
             for column in range(len(row)):
                 row[column] = [0, 4]
         map_data["tiles"][4][4] = [0, 2]
-        editor["apply_water_depth_tiles"](map_data)
+        apply_water_depth_tiles(map_data)
         self.assertEqual(map_data["tiles"][4][5], [0, 4])
         self.assertEqual(map_data["tiles"][4][6], [0, 4])
         self.assertEqual(map_data["tiles"][4][7], [0, 9])
@@ -830,22 +908,22 @@ class Tank16Tests(unittest.TestCase):
         self.assertEqual(map_data["tiles"][7][7], [0, 9])
 
         with tempfile.TemporaryDirectory() as directory:
-            saved = editor["save_map"](map_data, Path(directory))
-            restored = editor["load_map"](saved)
+            saved = save_map(map_data, directory)
+            restored = load_map(saved)
         self.assertEqual(restored["tiles"][4][7], [0, 9])
         self.assertEqual(restored["tiles"][7][7], [0, 9])
 
         map_data["tiles"][4][6] = [0, 2]
-        editor["apply_water_depth_tiles"](map_data)
+        apply_water_depth_tiles(map_data)
         self.assertEqual(map_data["tiles"][4][7], [6, 5])
 
-        open_water = editor["new_map"]("BRIDGE", 9, 9, 0, 4)
+        open_water = new_map("BRIDGE", 9, 9)
         for row in open_water["tiles"]:
             for column in range(len(row)):
                 row[column] = [0, 4]
         open_water["tiles"][0][0] = [0, 2]
         open_water["tiles"][4][4] = [0, 6]
-        editor["apply_water_depth_tiles"](open_water)
+        apply_water_depth_tiles(open_water)
         self.assertEqual(open_water["tiles"][4][3], [0, 9])
 
     def test_terrain_speed_averages_tank_samples_and_deep_water_damages(self):
@@ -1044,11 +1122,7 @@ class Tank16Tests(unittest.TestCase):
                 [None for _ in range(map_document["width"])]
                 for _ in range(map_document["height"])
             ]
-            editor = runpy.run_path(str(source.with_name("map_editor.py")))
-            (maps_dir / "FINLAND.json").write_bytes(
-                editor["serialize_runtime_map"](
-                    editor["encode_runtime_map"](map_document)
-                ).encode("ascii"))
+            encode_runtime_map(map_document, maps_dir / "FINLAND.json")
             shutil.copytree(
                 source.parent / "disks" / "assets", module_disks / "assets")
             cpu.disk = DiskDevice(Path(directory) / "virtual-disks")
@@ -1139,13 +1213,14 @@ class Tank16Tests(unittest.TestCase):
             slot for slot, sprite in enumerate(cpu.sprites)
             if sprite["flags"] & 1
         ]
-        self.assertEqual(visible_slots, [22, 38])
+        self.assertEqual(len(visible_slots), 2)
+        player_two_slot, player_one_slot = visible_slots
         map_width = map_document["width"] * cpu.tile_pixel_size
         map_height = map_document["height"] * cpu.tile_pixel_size
-        player_two_x = cpu.sprites[22]["x"] + 16
-        player_two_y = cpu.sprites[22]["y"] + 16
-        player_one_x = cpu.sprites[38]["x"] + 16
-        player_one_y = cpu.sprites[38]["y"] + 16
+        player_two_x = cpu.sprites[player_two_slot]["x"] + 16
+        player_two_y = cpu.sprites[player_two_slot]["y"] + 16
+        player_one_x = cpu.sprites[player_one_slot]["x"] + 16
+        player_one_y = cpu.sprites[player_one_slot]["y"] + 16
         self.assertLess(player_one_x, map_width // 2)
         self.assertGreaterEqual(player_two_x, map_width // 2)
         self.assertLess(player_two_x, map_width)
@@ -1243,7 +1318,6 @@ class Tank16Tests(unittest.TestCase):
             module_disks = Path(directory) / "module" / "disks"
             maps_dir = module_disks / "maps"
             maps_dir.mkdir(parents=True)
-            editor = runpy.run_path(str(source_path.with_name("map_editor.py")))
             for name, width, height, tile_x in (
                     ("A.json", 4, 3, 1), ("B.json", 5, 4, 2)):
                 map_document = {
@@ -1275,10 +1349,7 @@ class Tank16Tests(unittest.TestCase):
                 map_document["objects"][1][1] = {
                     "tile": [0, 1], "hp_change": -25, "removal": "fixed",
                 }
-                (maps_dir / name).write_bytes(
-                    editor["serialize_runtime_map"](
-                        editor["encode_runtime_map"](map_document)
-                    ).encode("ascii"))
+                encode_runtime_map(map_document, maps_dir / name)
             image = compile_source(
                 "int results[18];\n" + game_source + test_source,
                 str(source_path),

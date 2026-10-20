@@ -1,6 +1,8 @@
 from collections.abc import Callable
 from pathlib import Path
-import sys
+import struct
+import subprocess
+import tempfile
 
 from tools.assembler import (
     AssemblyError,
@@ -9,6 +11,66 @@ from tools.assembler import (
     assemble_file,
 )
 from tools.c_compiler import CCompilerError
+
+_IMAGE_MAGIC = b"SC16IMG1"
+
+
+def _compile_tank16_with_rust(
+    logger: Callable[[str], None], memory_capacity: int
+) -> AssemblyImage:
+    repository_root = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory(prefix="sc16-tank16-") as directory:
+        output = Path(directory) / "tank16.sc16img"
+        result = subprocess.run(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "--bin",
+                "sc16tank",
+                "--",
+                "build-runtime",
+                "--output",
+                str(output),
+            ],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            details = result.stderr.strip() or result.stdout.strip()
+            raise CCompilerError(
+                f"Rust Tank-16 build failed with exit code "
+                f"{result.returncode}: {details}"
+            )
+        data = output.read_bytes()
+    if len(data) < 16 or data[:8] != _IMAGE_MAGIC:
+        raise CCompilerError("Rust Tank-16 build returned an invalid SC-16 image")
+    entry_point, segment_count = struct.unpack_from(">II", data, 8)
+    offset = 16
+    segments = []
+    total_size = 0
+    for _ in range(segment_count):
+        if len(data) - offset < 12:
+            raise CCompilerError("Rust Tank-16 image has a truncated segment header")
+        address, segment_size = struct.unpack_from(">IQ", data, offset)
+        offset += 12
+        if segment_size > len(data) - offset:
+            raise CCompilerError("Rust Tank-16 image has a truncated segment")
+        segment_end = address + segment_size
+        total_size += segment_size
+        if segment_end > memory_capacity or total_size > memory_capacity:
+            raise CCompilerError("Rust Tank-16 image exceeds SC-16 memory")
+        segments.append(MemorySegment(address, data[offset:offset + segment_size]))
+        offset += segment_size
+    if offset != len(data):
+        raise CCompilerError("Rust Tank-16 image has trailing data")
+    if entry_point >= memory_capacity:
+        raise CCompilerError("Rust Tank-16 image entry point exceeds SC-16 memory")
+    if result.stdout.strip():
+        logger(result.stdout.strip())
+    return AssemblyImage(tuple(segments), entry_point)
 
 
 def load_program_file(
@@ -27,11 +89,6 @@ def load_program_file(
                 / "modules" / "Tank-16" / "main.c"
             )
             if program_path.resolve() == tank16_main:
-                tank16_dir = tank16_main.parent
-                if str(tank16_dir) not in sys.path:
-                    sys.path.insert(0, str(tank16_dir))
-                from tank16_map_loader import compile_runtime_tank16
-
                 report(
                     "Compiling Tank-16 with shared graphics assets; "
                     "map layouts are loaded dynamically at runtime"
@@ -45,10 +102,10 @@ def load_program_file(
                         "[SC-16 program loader] Building graphics assets and "
                         "compiling runtime image"
                     )
-                if verbose:
-                    image = compile_runtime_tank16(logger=report)
-                else:
-                    image = compile_runtime_tank16()
+                image = _compile_tank16_with_rust(
+                    report if verbose else (lambda message: None),
+                    memory_capacity,
+                )
                 report("Tank-16 source and graphics assets compiled into SC-16 image")
             else:
                 report(f"Compiling C source: {program_path.name}")
