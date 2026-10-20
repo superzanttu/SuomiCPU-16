@@ -1289,6 +1289,99 @@ mod tests {
     }
 
     #[test]
+    fn preserves_python_assembler_encoding_and_sparse_address_regressions() {
+        let image = assemble("JMP finish\nLDI R1, 315\nfinish: HALT\n", 0).unwrap();
+        assert_eq!(image.entry_point, 0);
+        assert_eq!(image.segments[0].data, b"\x58\x06\x09\x3b\x81\x01\x00\x00");
+
+        let image = assemble(
+            ".address 0x100\nstart: JMP end\n.address 0x20\nend: HALT\n",
+            0,
+        )
+        .unwrap();
+        assert_eq!(image.entry_point, 0x100);
+        assert_eq!(
+            image
+                .segments
+                .iter()
+                .map(|segment| (segment.address, segment.data.as_slice()))
+                .collect::<Vec<_>>(),
+            [(0x20, &[0x00, 0x00][..]), (0x100, &[0x58, 0x20][..])]
+        );
+
+        let image = assemble(".address 0x30000\n.data hex 19", 0).unwrap();
+        assert_eq!(image.segments[0].address, 0x30000);
+        assert_eq!(image.segments[0].data, [0x19]);
+
+        let image = assemble("LDA R2, 0x3F51234\nHALT", 0).unwrap();
+        assert_eq!(
+            image.segments[0].data,
+            b"\xfa\x1e\x70\x00\x03\xf5\x12\x34\x00\x00"
+        );
+        assert_eq!(
+            assemble("LDI30 R2, 0x3F51234\nHALT", 0).unwrap().segments[0].data,
+            image.segments[0].data
+        );
+
+        let image = assemble(
+            ".data hex 0x41, 42\n.data oct 101 102\n.data bin 01000011, 01000100\n.data string \"Hi\\n\"\n",
+            0,
+        )
+        .unwrap();
+        assert_eq!(image.segments[0].data, b"ABABCDHi\n");
+
+        assert_eq!(
+            assemble("ST R0, R1", 0).unwrap().segments[0].data,
+            b"\x19\x00"
+        );
+        let image = assemble(
+            "CALL routine\nHALT\n.address 0x400\nroutine: RET\nbranch: BZ routine\n",
+            0,
+        )
+        .unwrap();
+        let segments = image
+            .segments
+            .iter()
+            .map(|segment| (segment.address, segment.data.as_slice()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(segments[&0], b"\xb4\x00\x00\x00");
+        assert_eq!(segments[&0x400], b"\xb8\x00\xc4\x00");
+
+        let image = assemble("JMPX 0x12345\nCALLX 0x12345\nBZX 0x12345\nBCX 0x12345\n", 0).unwrap();
+        assert_eq!(
+            image.segments[0].data,
+            b"\xf8\x3e\x00\x01\x23\x45"
+                .iter()
+                .chain(b"\xfa\x3e\x00\x01\x23\x45")
+                .chain(b"\xfc\x3e\x00\x01\x23\x45")
+                .chain(b"\xfe\x3e\x00\x01\x23\x45")
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            assemble("BNZX 0x12345\nBLTX 0x23456\n", 0)
+                .unwrap()
+                .segments[0]
+                .data,
+            b"\xf8\x0d\x00\x01\x23\x45\xfb\x0d\x00\x02\x34\x56"
+        );
+        assert_eq!(
+            assemble("CALLRP R0, R1\nJMPRP R2, R3", 0).unwrap().segments[0].data,
+            b"\xf8\x1f\xf2\x0b\xfa\x1f\xf6\x0c"
+        );
+        assert_eq!(
+            assemble(
+                "LDW R2, R3\nSTW R2, R3\nLDWS R2, 4\nSTWS R2, 4\nADJSP -2\nBC 0x100\nSHR R3\n",
+                0,
+            )
+            .unwrap()
+            .segments[0]
+                .data,
+            b"\xca\x60\xd3\x40\xda\x04\xe2\x04\xe8\xfe\xf1\x00\xfb\x00"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_inputs_and_output_overlaps() {
         assert!(
             assemble("INC R8", 0)

@@ -98,8 +98,11 @@ considered migration.
   - Why it remains: current Python test imports need it until the Python test suite is retired.
 - [ ] **Replace [tests/gfx_harness.py](../tests/gfx_harness.py)** — shared test helper.
   - Coverage to preserve: Pygame/Python-emulator graphics and game integration; use a Rust runtime harness or captured Rust frames.
-- [ ] **Port [tests/test_assembler.py](../tests/test_assembler.py)** — assembler coverage.
-  - Coverage to preserve: assembler encoding and behavior checks in Rust assembler tests.
+- [x] **Mirror core [tests/test_assembler.py](../tests/test_assembler.py) regressions in Rust.**
+  - Rust assembler tests now cover the Python encoding, sparse-address, data,
+    control-flow, and stack-instruction regressions. The Python test remains
+    intentionally because the Python assembler is an accepted migration
+    exception and still needs its own regression coverage.
 - [ ] **Port [tests/test_assembler_coverage.py](../tests/test_assembler_coverage.py)** — assembler coverage.
   - Coverage to preserve: Python assembler cases not yet covered by `rust/src/assembler.rs`.
 - [ ] **Port [tests/test_bios.py](../tests/test_bios.py)** — BIOS/runtime coverage.
