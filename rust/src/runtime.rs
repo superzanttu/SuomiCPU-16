@@ -1,5 +1,5 @@
 use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle};
-use crate::image::{ImageError, ProgramImage, build_source, load_binary};
+use crate::image::{ImageError, load_program};
 use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
@@ -301,7 +301,7 @@ pub async fn run_with_devices(
         if let Some(disk_id) = disk_id {
             cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
         }
-        let image = build_program(source)?;
+        let image = load_program(source).map_err(RuntimeError::from)?;
         cpu.load_program(&image.segments, image.entry_point)
             .map_err(|error| RuntimeError::Window(error.to_string()))?;
     } else {
@@ -397,7 +397,7 @@ pub fn run_headless_with_devices(
     if let Some(disk_id) = disk_id {
         cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
     }
-    let image = build_program(program)?;
+    let image = load_program(program)?;
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| RuntimeError::Window(error.to_string()))?;
     let executed = cpu
@@ -409,16 +409,6 @@ pub fn run_headless_with_devices(
         )));
     }
     Ok(executed)
-}
-
-fn build_program(source: &Path) -> Result<ProgramImage, RuntimeError> {
-    if source
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("bin"))
-    {
-        return load_binary(source).map_err(RuntimeError::from);
-    }
-    build_source(source).map_err(RuntimeError::from)
 }
 
 fn discover_modules(directory: &Path) -> Result<Vec<BootModule>, RuntimeError> {
@@ -552,7 +542,7 @@ async fn select_and_boot(
                 cpu.mount_data_disk(&disks[selected_disk - 1])
                     .map_err(RuntimeError::Window)?;
             }
-            let image = build_program(source)?;
+            let image = load_program(source).map_err(RuntimeError::from)?;
             cpu.load_program(&image.segments, image.entry_point)
                 .map_err(|error| RuntimeError::Window(error.to_string()))?;
             return Ok(true);
@@ -961,7 +951,7 @@ mod tests {
     fn unsupported_c_program_is_rejected_without_running_python() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let program = root.join("modules").join("AnaClock").join("anaclock.c");
-        let error = build_program(&program).unwrap_err();
+        let error = load_program(&program).unwrap_err();
         assert!(error.to_string().contains("Rust C compiler"));
     }
 
@@ -970,7 +960,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for name in ["commands.asm", "directives.asm", "example.asm"] {
             let program = root.join("examples").join(name);
-            let image = build_program(&program).unwrap();
+            let image = load_program(&program).unwrap();
             let mut cpu = Cpu::new();
             cpu.load_program(&image.segments, image.entry_point)
                 .unwrap();

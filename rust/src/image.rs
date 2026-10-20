@@ -63,6 +63,19 @@ pub fn load_binary(path: &Path) -> Result<ProgramImage, ImageError> {
     })
 }
 
+pub fn load_program(path: &Path) -> Result<ProgramImage, ImageError> {
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("bin")) {
+        return load_binary(path);
+    }
+    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
+        return Err(ImageError::InvalidFormat(
+            "JSON files are data; load them through the disk API",
+        ));
+    }
+    build_source(path)
+}
+
 pub fn write_image(path: &Path, image: &ProgramImage) -> Result<(), ImageError> {
     if image.entry_point >= MEMORY_SIZE as u32 {
         return Err(ImageError::InvalidFormat(
@@ -121,7 +134,7 @@ pub fn build_source(source: &Path) -> Result<ProgramImage, ImageError> {
         return Err(ImageError::UnsupportedC(source.display().to_string()));
     }
     Err(ImageError::InvalidFormat(
-        "source must be Rust-supported C, assembly, or flat binary",
+        "source must be assembly or Rust-supported C",
     ))
 }
 
@@ -235,6 +248,29 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert_eq!(image.entry_point, 0);
         assert_eq!(image.segments[0].data, b"\x08\x01\x00\x00");
+    }
+
+    #[test]
+    fn loads_binary_programs_and_rejects_json_data_files() {
+        let binary_path =
+            std::env::temp_dir().join(format!("sc16-binary-{}.bin", std::process::id()));
+        fs::write(&binary_path, [0x12, 0x34, 0x56]).unwrap();
+        let image = load_program(&binary_path).unwrap();
+        fs::remove_file(binary_path).unwrap();
+        assert_eq!(image.entry_point, 0);
+        assert_eq!(
+            image.segments,
+            [MemorySegment {
+                address: 0,
+                data: vec![0x12, 0x34, 0x56],
+            }]
+        );
+
+        let json_path = std::env::temp_dir().join(format!("sc16-data-{}.json", std::process::id()));
+        fs::write(&json_path, b"{}").unwrap();
+        let error = load_program(&json_path).unwrap_err().to_string();
+        fs::remove_file(json_path).unwrap();
+        assert!(error.contains("JSON files are data; load them through the disk API"));
     }
 
     #[test]

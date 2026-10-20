@@ -33,14 +33,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if output.exists() && source == output.canonicalize()? {
         return Err("output path must not overwrite the source".into());
     }
-    let image = if source
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("bin"))
-    {
-        suomicpu16::image::load_binary(&source)?
-    } else {
-        suomicpu16::image::build_source(&source)?
-    };
+    let image = suomicpu16::image::load_program(&source)?;
     suomicpu16::image::write_image(&output, &image)?;
     println!(
         "Built {} bytes in {} segment(s), entry point {:#x} -> {}",
