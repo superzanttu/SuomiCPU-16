@@ -4,8 +4,8 @@ use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, Rect, Texture2D,
-    WHITE, clear_background, draw_line, draw_texture_ex, draw_triangle, get_keys_down,
-    get_keys_pressed, is_key_down, is_key_pressed, is_mouse_button_pressed,
+    WHITE, clear_background, draw_line, draw_texture_ex, draw_triangle, get_char_pressed,
+    get_keys_down, get_keys_pressed, is_key_down, is_key_pressed, is_mouse_button_pressed,
     is_mouse_button_released, mouse_position, mouse_wheel, next_frame, screen_height, screen_width,
     set_fullscreen, vec2,
 };
@@ -389,11 +389,10 @@ pub async fn run_with_devices(
                 } else if key == KeyCode::Backspace {
                     cpu.receive_console_input(b"\x08");
                     cpu.signal_keyboard_event(8);
-                } else if let Some(byte) = key_to_ascii(key, shifted) {
-                    cpu.receive_console_input(&[byte]);
-                    cpu.signal_keyboard_event(byte);
                 }
             }
+            let typed_characters = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
+            receive_typed_text(&mut cpu, typed_characters);
             update_rtc(&mut cpu);
             cpu.begin_frame();
             if !paused {
@@ -1005,7 +1004,7 @@ fn update_keys(
         let is_down = current.contains(&key);
         if was_down != is_down {
             cpu.set_key(mask, is_down);
-            if is_down {
+            if is_down && key != KeyCode::Enter {
                 cpu.signal_keyboard_event(key_to_ascii(key, shifted).unwrap_or(0));
             }
         }
@@ -1235,6 +1234,13 @@ fn update_mouse(
     }
 }
 
+fn receive_typed_text(cpu: &mut Cpu, characters: impl IntoIterator<Item = char>) {
+    let text = characters.into_iter().collect::<String>();
+    if !text.is_empty() {
+        cpu.receive_console_input(text.as_bytes());
+    }
+}
+
 fn apply_runtime_control(
     key: KeyCode,
     paused: &mut bool,
@@ -1449,6 +1455,20 @@ mod tests {
     }
 
     #[test]
+    fn display_text_input_preserves_unicode_characters_for_console_mmio() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        receive_typed_text(&mut cpu, ['k', 'ä', '!', '🙂']);
+        assert_eq!(
+            cpu.console
+                .receive_buffer()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            "kä!🙂".as_bytes()
+        );
+    }
+
+    #[test]
     fn display_rate_budget_accumulates_fractional_frames_without_negative_work() {
         let mut remainder = 0.0;
         assert_eq!(rate_budget(10.0, 0.05, &mut remainder), 0);
@@ -1554,6 +1574,30 @@ mod tests {
 
         cpu.memory[GFX_MODE_ADDR] = 0;
         assert_eq!(screen_size(&cpu), (320, 240));
+    }
+
+    #[test]
+    fn game_frame_integrates_gpu_mmio_layer_compositing_and_palette_rendering() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.memory[0x50000] = 2;
+        cpu.memory[0x50001] = 2;
+        cpu.palette[2] = [12, 34, 56];
+        cpu.palette[3] = [78, 90, 123];
+
+        cpu.write(0x43030, 1);
+        cpu.write_u16(0x43022, 1);
+        cpu.write_u16(0x43024, 0);
+        cpu.write(0x43021, 3);
+        cpu.write(0x43020, 2);
+
+        let mut pixels = vec![0; 640 * 480];
+        render_cpu(&cpu, &mut pixels);
+        assert_eq!(pixels[0], rgb(12, 34, 56));
+        assert_eq!(pixels[1], rgb(78, 90, 123));
+
+        cpu.write(0x43031, 1);
+        render_cpu(&cpu, &mut pixels);
+        assert_eq!(pixels[1], rgb(12, 34, 56));
     }
 
     #[test]

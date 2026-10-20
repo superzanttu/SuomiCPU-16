@@ -144,6 +144,9 @@ considered migration.
         controls as guest keyboard input.
   - [x] Preserve shifted ASCII text input for letters, digits, and supported
         punctuation.
+  - [x] Use the window's typed-character queue for console input, preserving
+        UTF-8 text and keyboard layouts instead of deriving console text from
+        physical key codes.
   - [x] Forward logical mouse coordinates, left/right click and double-click
         events, and signed per-frame wheel deltas through Rust mouse MMIO.
   - Why remaining tests are Python-specific: pause timing, separate console
@@ -154,7 +157,9 @@ considered migration.
     addresses, memory wrapping, signed/unsigned branches, register calls/
     jumps, flag-stack operations, and miscellaneous ALU instructions.
 - [ ] **Port [tests/test_gpu_games.py](../tests/test_gpu_games.py)** — game/GPU coverage.
-  - Coverage to preserve: game-level GPU behavior through Rust CPU/runtime integration tests.
+  - [x] Verify the MMIO-to-layer-compositor-to-palette-framebuffer path through
+        a Rust runtime integration test.
+  - Coverage remaining: game-level behavior through Rust CPU/runtime tests.
 - [ ] **Port [tests/test_hertta3d.py](../tests/test_hertta3d.py)** — game/render coverage.
   - Coverage to preserve: Hertta3D execution and rendering through Rust.
 - [x] **Port [tests/test_isa_opcodes.py](../tests/test_isa_opcodes.py)** — ISA coverage.
