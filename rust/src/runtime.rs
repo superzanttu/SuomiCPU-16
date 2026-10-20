@@ -5,8 +5,9 @@ use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, Rect, Texture2D,
     WHITE, clear_background, draw_line, draw_texture_ex, draw_triangle, get_keys_down,
-    get_keys_pressed, is_key_down, is_key_pressed, is_mouse_button_pressed, mouse_position,
-    mouse_wheel, next_frame, screen_height, screen_width, set_fullscreen, vec2,
+    get_keys_pressed, is_key_down, is_key_pressed, is_mouse_button_pressed,
+    is_mouse_button_released, mouse_position, mouse_wheel, next_frame, screen_height, screen_width,
+    set_fullscreen, vec2,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -271,6 +272,12 @@ enum BiosMouseAction {
     NextDisk,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeControl {
+    PauseToggled(bool),
+    FullscreenToggled(bool),
+}
+
 pub fn window_conf() -> Conf {
     Conf {
         window_title: "SuomiCPU-16 Emulator (Rust)".to_owned(),
@@ -334,6 +341,9 @@ pub async fn run_with_devices(
     let mut old_keys = HashSet::new();
     let mut speed_remainder = 0.0;
     let mut last_frame = Instant::now();
+    let runtime_started = Instant::now();
+    let mut paused = false;
+    let mut fullscreen = fullscreen;
     while !is_key_down(KeyCode::Escape) {
         let pressed_keys = get_keys_pressed();
         if halted_window_should_close(cpu.running, !pressed_keys.is_empty()) {
@@ -341,41 +351,76 @@ pub async fn run_with_devices(
         }
         if cpu.running {
             let keys = get_keys_down();
-            update_keys(&mut cpu, &old_keys, &keys);
+            let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
+            update_keys(&mut cpu, &old_keys, &keys, shifted);
             old_keys = keys;
+            let (width, height) = screen_size(&cpu);
+            let logical_mouse = screen_to_logical_clamped(
+                mouse_position(),
+                (screen_width(), screen_height()),
+                (width, height),
+            );
+            let wheel_delta = mouse_wheel().1.round() as i16;
+            update_mouse(
+                &mut cpu,
+                logical_mouse,
+                wheel_delta,
+                [
+                    is_mouse_button_pressed(MouseButton::Left),
+                    is_mouse_button_pressed(MouseButton::Right),
+                ],
+                [
+                    is_mouse_button_released(MouseButton::Left),
+                    is_mouse_button_released(MouseButton::Right),
+                ],
+                runtime_started.elapsed().as_millis() as u64,
+            );
             for key in pressed_keys {
+                if let Some(control) = apply_runtime_control(key, &mut paused, &mut fullscreen) {
+                    last_frame = Instant::now();
+                    if let RuntimeControl::FullscreenToggled(fullscreen) = control {
+                        set_fullscreen(fullscreen);
+                    }
+                    continue;
+                }
                 if key == KeyCode::Enter {
                     cpu.receive_console_input(b"\n");
                     cpu.signal_keyboard_event(13);
                 } else if key == KeyCode::Backspace {
                     cpu.receive_console_input(b"\x08");
                     cpu.signal_keyboard_event(8);
-                } else if let Some(byte) = key_to_ascii(key) {
+                } else if let Some(byte) = key_to_ascii(key, shifted) {
                     cpu.receive_console_input(&[byte]);
                     cpu.signal_keyboard_event(byte);
                 }
             }
             update_rtc(&mut cpu);
             cpu.begin_frame();
-            let elapsed = last_frame.elapsed().as_secs_f64();
-            last_frame = Instant::now();
-            let mode = cpu.memory[SPEED_ADDR];
-            let budget = match mode {
-                0 => rate_budget(10.0, elapsed, &mut speed_remainder),
-                1 => rate_budget(100.0, elapsed, &mut speed_remainder),
-                2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
-                3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
-                _ => 300_000,
-            };
-            cpu.run(budget)
-                .map_err(|error| RuntimeError::Window(error.to_string()))?;
-            for command in cpu.take_sound_commands() {
-                audio.apply(command).await?;
+            if !paused {
+                let elapsed = last_frame.elapsed().as_secs_f64();
+                last_frame = Instant::now();
+                let mode = cpu.memory[SPEED_ADDR];
+                let budget = match mode {
+                    0 => rate_budget(10.0, elapsed, &mut speed_remainder),
+                    1 => rate_budget(100.0, elapsed, &mut speed_remainder),
+                    2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
+                    3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
+                    _ => 300_000,
+                };
+                cpu.run(budget)
+                    .map_err(|error| RuntimeError::Window(error.to_string()))?;
+                for command in cpu.take_sound_commands() {
+                    audio.apply(command).await?;
+                }
+                cpu.end_mouse_frame();
+            } else {
+                cpu.end_mouse_frame();
+                last_frame = Instant::now();
             }
         }
         render_cpu(&cpu, &mut pixels);
         let (width, height) = screen_size(&cpu);
-        if !cpu.running {
+        if !cpu.running || paused {
             fill_rect(
                 &mut pixels,
                 width,
@@ -385,11 +430,16 @@ pub async fn run_with_devices(
                 18,
                 rgb(10, 14, 24),
             );
+            let status = if paused {
+                "PAUSED - F10 TO RESUME"
+            } else {
+                "PROGRAM HALTED - PRESS ANY KEY TO CLOSE"
+            };
             draw_text_limited(
                 &mut pixels,
                 width,
                 (4, height.saturating_sub(13)),
-                "PROGRAM HALTED - PRESS ANY KEY TO CLOSE",
+                status,
                 width / 6,
                 0xffff_d000,
                 &font,
@@ -873,6 +923,26 @@ fn screen_to_logical(
     Some((logical_x as usize, logical_y as usize))
 }
 
+fn screen_to_logical_clamped(
+    position: (f32, f32),
+    screen_size: (f32, f32),
+    logical_size: (usize, usize),
+) -> Option<(usize, usize)> {
+    if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 || logical_size.0 == 0 || logical_size.1 == 0 {
+        return None;
+    }
+    let scale = (screen_size.0 / logical_size.0 as f32).min(screen_size.1 / logical_size.1 as f32);
+    let left = (screen_size.0 - logical_size.0 as f32 * scale) / 2.0;
+    let top = (screen_size.1 - logical_size.1 as f32 * scale) / 2.0;
+    let max_x = left + (logical_size.0 as f32 - 0.001) * scale;
+    let max_y = top + (logical_size.1 as f32 - 0.001) * scale;
+    screen_to_logical(
+        (position.0.clamp(left, max_x), position.1.clamp(top, max_y)),
+        screen_size,
+        logical_size,
+    )
+}
+
 fn bios_mouse_action(
     position: (f32, f32),
     screen_size: (f32, f32),
@@ -924,14 +994,19 @@ fn configure_disk(cpu: &mut Cpu, root: &Path, source: &Path) -> Result<(), Runti
         .map_err(RuntimeError::Window)
 }
 
-fn update_keys(cpu: &mut Cpu, previous: &HashSet<KeyCode>, current: &HashSet<KeyCode>) {
+fn update_keys(
+    cpu: &mut Cpu,
+    previous: &HashSet<KeyCode>,
+    current: &HashSet<KeyCode>,
+    shifted: bool,
+) {
     for (key, mask) in key_masks() {
         let was_down = previous.contains(&key);
         let is_down = current.contains(&key);
         if was_down != is_down {
             cpu.set_key(mask, is_down);
             if is_down {
-                cpu.signal_keyboard_event(key_to_ascii(key).unwrap_or(0));
+                cpu.signal_keyboard_event(key_to_ascii(key, shifted).unwrap_or(0));
             }
         }
     }
@@ -967,52 +1042,147 @@ fn key_masks() -> [(KeyCode, u32); 25] {
     ]
 }
 
-fn key_to_ascii(key: KeyCode) -> Option<u8> {
-    match key {
-        KeyCode::A => Some(b'a'),
-        KeyCode::B => Some(b'b'),
-        KeyCode::C => Some(b'c'),
-        KeyCode::D => Some(b'd'),
-        KeyCode::E => Some(b'e'),
-        KeyCode::F => Some(b'f'),
-        KeyCode::G => Some(b'g'),
-        KeyCode::H => Some(b'h'),
-        KeyCode::I => Some(b'i'),
-        KeyCode::J => Some(b'j'),
-        KeyCode::K => Some(b'k'),
-        KeyCode::L => Some(b'l'),
-        KeyCode::M => Some(b'm'),
-        KeyCode::N => Some(b'n'),
-        KeyCode::O => Some(b'o'),
-        KeyCode::P => Some(b'p'),
-        KeyCode::Q => Some(b'q'),
-        KeyCode::R => Some(b'r'),
-        KeyCode::S => Some(b's'),
-        KeyCode::T => Some(b't'),
-        KeyCode::U => Some(b'u'),
-        KeyCode::V => Some(b'v'),
-        KeyCode::W => Some(b'w'),
-        KeyCode::X => Some(b'x'),
-        KeyCode::Y => Some(b'y'),
-        KeyCode::Z => Some(b'z'),
-        KeyCode::Key0 => Some(b'0'),
-        KeyCode::Key1 => Some(b'1'),
-        KeyCode::Key2 => Some(b'2'),
-        KeyCode::Key3 => Some(b'3'),
-        KeyCode::Key4 => Some(b'4'),
-        KeyCode::Key5 => Some(b'5'),
-        KeyCode::Key6 => Some(b'6'),
-        KeyCode::Key7 => Some(b'7'),
-        KeyCode::Key8 => Some(b'8'),
-        KeyCode::Key9 => Some(b'9'),
-        KeyCode::Space => Some(b' '),
-        KeyCode::Comma => Some(b','),
-        KeyCode::Period => Some(b'.'),
-        KeyCode::Minus => Some(b'-'),
-        KeyCode::Apostrophe => Some(b'\''),
-        KeyCode::Slash => Some(b'/'),
-        _ => None,
-    }
+fn key_to_ascii(key: KeyCode, shifted: bool) -> Option<u8> {
+    let byte = match key {
+        KeyCode::A => b'a',
+        KeyCode::B => b'b',
+        KeyCode::C => b'c',
+        KeyCode::D => b'd',
+        KeyCode::E => b'e',
+        KeyCode::F => b'f',
+        KeyCode::G => b'g',
+        KeyCode::H => b'h',
+        KeyCode::I => b'i',
+        KeyCode::J => b'j',
+        KeyCode::K => b'k',
+        KeyCode::L => b'l',
+        KeyCode::M => b'm',
+        KeyCode::N => b'n',
+        KeyCode::O => b'o',
+        KeyCode::P => b'p',
+        KeyCode::Q => b'q',
+        KeyCode::R => b'r',
+        KeyCode::S => b's',
+        KeyCode::T => b't',
+        KeyCode::U => b'u',
+        KeyCode::V => b'v',
+        KeyCode::W => b'w',
+        KeyCode::X => b'x',
+        KeyCode::Y => b'y',
+        KeyCode::Z => b'z',
+        KeyCode::Key0 => {
+            if shifted {
+                b')'
+            } else {
+                b'0'
+            }
+        }
+        KeyCode::Key1 => {
+            if shifted {
+                b'!'
+            } else {
+                b'1'
+            }
+        }
+        KeyCode::Key2 => {
+            if shifted {
+                b'@'
+            } else {
+                b'2'
+            }
+        }
+        KeyCode::Key3 => {
+            if shifted {
+                b'#'
+            } else {
+                b'3'
+            }
+        }
+        KeyCode::Key4 => {
+            if shifted {
+                b'$'
+            } else {
+                b'4'
+            }
+        }
+        KeyCode::Key5 => {
+            if shifted {
+                b'%'
+            } else {
+                b'5'
+            }
+        }
+        KeyCode::Key6 => {
+            if shifted {
+                b'^'
+            } else {
+                b'6'
+            }
+        }
+        KeyCode::Key7 => {
+            if shifted {
+                b'&'
+            } else {
+                b'7'
+            }
+        }
+        KeyCode::Key8 => {
+            if shifted {
+                b'*'
+            } else {
+                b'8'
+            }
+        }
+        KeyCode::Key9 => {
+            if shifted {
+                b'('
+            } else {
+                b'9'
+            }
+        }
+        KeyCode::Space => b' ',
+        KeyCode::Comma => {
+            if shifted {
+                b'<'
+            } else {
+                b','
+            }
+        }
+        KeyCode::Period => {
+            if shifted {
+                b'>'
+            } else {
+                b'.'
+            }
+        }
+        KeyCode::Minus => {
+            if shifted {
+                b'_'
+            } else {
+                b'-'
+            }
+        }
+        KeyCode::Apostrophe => {
+            if shifted {
+                b'"'
+            } else {
+                b'\''
+            }
+        }
+        KeyCode::Slash => {
+            if shifted {
+                b'?'
+            } else {
+                b'/'
+            }
+        }
+        _ => return None,
+    };
+    Some(if shifted && byte.is_ascii_lowercase() {
+        byte.to_ascii_uppercase()
+    } else {
+        byte
+    })
 }
 
 fn update_rtc(cpu: &mut Cpu) {
@@ -1037,6 +1207,50 @@ fn rate_budget(rate: f64, elapsed: f64, remainder: &mut f64) -> usize {
 
 fn halted_window_should_close(cpu_running: bool, has_keypress: bool) -> bool {
     !cpu_running && has_keypress
+}
+
+fn update_mouse(
+    cpu: &mut Cpu,
+    position: Option<(usize, usize)>,
+    wheel_delta: i16,
+    pressed: [bool; 2],
+    released: [bool; 2],
+    now_ms: u64,
+) {
+    if wheel_delta != 0 {
+        cpu.set_mouse_wheel(wheel_delta);
+    }
+    let Some((x, y)) = position else {
+        return;
+    };
+    let (x, y) = (x as u16, y as u16);
+    cpu.set_mouse_position(x, y);
+    for button in 0..2 {
+        if pressed[button] {
+            cpu.mouse_button(button, true, x, y, now_ms);
+        }
+        if released[button] {
+            cpu.mouse_button(button, false, x, y, now_ms);
+        }
+    }
+}
+
+fn apply_runtime_control(
+    key: KeyCode,
+    paused: &mut bool,
+    fullscreen: &mut bool,
+) -> Option<RuntimeControl> {
+    match key {
+        KeyCode::F10 => {
+            *paused = !*paused;
+            Some(RuntimeControl::PauseToggled(*paused))
+        }
+        KeyCode::F11 => {
+            *fullscreen = !*fullscreen;
+            Some(RuntimeControl::FullscreenToggled(*fullscreen))
+        }
+        _ => None,
+    }
 }
 
 fn screen_size(cpu: &Cpu) -> (usize, usize) {
@@ -1206,13 +1420,32 @@ mod tests {
             KeyCode::C,
             KeyCode::Period,
         ]);
-        update_keys(&mut cpu, &previous, &current);
+        update_keys(&mut cpu, &previous, &current, false);
         assert_eq!(&cpu.memory[0x43004..0x43007], &[0x41, 0x05, 0x21]);
 
         previous = current;
         let current = HashSet::from([KeyCode::D, KeyCode::E, KeyCode::Z, KeyCode::J]);
-        update_keys(&mut cpu, &previous, &current);
+        update_keys(&mut cpu, &previous, &current, false);
         assert_eq!(&cpu.memory[0x43004..0x43007], &[0x02, 0x0a, 0x02]);
+    }
+
+    #[test]
+    fn display_text_input_maps_shifted_letters_digits_and_punctuation() {
+        for (key, unshifted, shifted) in [
+            (KeyCode::A, b'a', b'A'),
+            (KeyCode::Key1, b'1', b'!'),
+            (KeyCode::Key0, b'0', b')'),
+            (KeyCode::Comma, b',', b'<'),
+            (KeyCode::Period, b'.', b'>'),
+            (KeyCode::Minus, b'-', b'_'),
+            (KeyCode::Apostrophe, b'\'', b'"'),
+            (KeyCode::Slash, b'/', b'?'),
+        ] {
+            assert_eq!(key_to_ascii(key, false), Some(unshifted));
+            assert_eq!(key_to_ascii(key, true), Some(shifted));
+        }
+        assert_eq!(key_to_ascii(KeyCode::Space, true), Some(b' '));
+        assert_eq!(key_to_ascii(KeyCode::F10, false), None);
     }
 
     #[test]
@@ -1229,6 +1462,71 @@ mod tests {
         assert!(!halted_window_should_close(false, false));
         assert!(halted_window_should_close(false, true));
         assert!(!halted_window_should_close(true, true));
+    }
+
+    #[test]
+    fn runtime_pause_and_fullscreen_controls_toggle_independently() {
+        let (mut paused, mut fullscreen) = (false, false);
+        assert_eq!(
+            apply_runtime_control(KeyCode::F10, &mut paused, &mut fullscreen),
+            Some(RuntimeControl::PauseToggled(true))
+        );
+        assert!(paused);
+        assert!(!fullscreen);
+        assert_eq!(
+            apply_runtime_control(KeyCode::F11, &mut paused, &mut fullscreen),
+            Some(RuntimeControl::FullscreenToggled(true))
+        );
+        assert_eq!(
+            apply_runtime_control(KeyCode::F10, &mut paused, &mut fullscreen),
+            Some(RuntimeControl::PauseToggled(false))
+        );
+        assert!(!paused);
+        assert!(fullscreen);
+        assert_eq!(
+            apply_runtime_control(KeyCode::A, &mut paused, &mut fullscreen),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_mouse_input_updates_cpu_registers_and_latches_click_events() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        update_mouse(
+            &mut cpu,
+            Some((40, 30)),
+            -1,
+            [true, false],
+            [false, false],
+            1000,
+        );
+        assert_eq!(cpu.read_u16(0x43008), 40);
+        assert_eq!(cpu.read_u16(0x4300a), 30);
+        assert_eq!(cpu.memory[0x4300c], 1);
+        assert_eq!(cpu.read_u16(0x4300e), u16::MAX);
+
+        update_mouse(
+            &mut cpu,
+            Some((41, 30)),
+            0,
+            [false, false],
+            [true, false],
+            1050,
+        );
+        update_mouse(
+            &mut cpu,
+            Some((41, 30)),
+            2,
+            [true, false],
+            [false, false],
+            1200,
+        );
+        assert_eq!(cpu.memory[0x4300c], 1);
+        assert_eq!(cpu.read(0x4300d), 1 | 4 | 16);
+        assert_eq!(cpu.read(0x4300d), 0);
+        assert_eq!(cpu.read_u16(0x4300e), 1);
+        cpu.end_mouse_frame();
+        assert_eq!(cpu.read_u16(0x4300e), 0);
     }
 
     #[test]
@@ -1356,6 +1654,22 @@ mod tests {
         assert_eq!(
             screen_to_logical((480.0, 360.0), (960.0, 720.0), (640, 480)),
             Some((320, 240))
+        );
+    }
+
+    #[test]
+    fn guest_mouse_coordinates_clamp_letterbox_and_outside_positions_to_edges() {
+        assert_eq!(
+            screen_to_logical_clamped((-10.0, -10.0), (1920.0, 1080.0), (320, 240)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            screen_to_logical_clamped((1920.0, 1080.0), (1920.0, 1080.0), (320, 240)),
+            Some((319, 239))
+        );
+        assert_eq!(
+            screen_to_logical_clamped((100.0, 540.0), (1920.0, 1080.0), (320, 240)),
+            Some((0, 120))
         );
     }
 

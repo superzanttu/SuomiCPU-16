@@ -14,6 +14,8 @@ const KEY_VECTOR_ADDR: u32 = 0x0002;
 const RTC_VECTOR_ADDR: u32 = 0x0006;
 const KEYBOARD_ADDR: u32 = 0x43000;
 const KEYS_ADDR: u32 = 0x43004;
+const MOUSE_ADDR: u32 = 0x43008;
+const MOUSE_EVENTS_ADDR: u32 = MOUSE_ADDR + 5;
 const GPU_BASE: u32 = 0x43020;
 const GPU_MODE_ADDR: u32 = GPU_BASE - 12;
 const GPU_LAYER_SELECT: u32 = GPU_BASE + 16;
@@ -256,6 +258,8 @@ pub struct Cpu {
     disk: DiskDevice,
     network: Option<NetNode>,
     network_port: u16,
+    last_mouse_click: [Option<(u64, u16, u16)>; 2],
+    mouse_wheel_delta: i16,
     sprites: [Option<GpuSprite>; GPU_SPRITE_SLOTS],
     sprite_descriptors: [(i32, i32, u8); GPU_SPRITE_SLOTS],
     tile_memory: Vec<u8>,
@@ -341,6 +345,8 @@ impl Cpu {
             disk: DiskDevice::new(PathBuf::from("disks")),
             network: None,
             network_port: DEFAULT_PORT,
+            last_mouse_click: [None; 2],
+            mouse_wheel_delta: 0,
             sprites: std::array::from_fn(|_| None),
             sprite_descriptors: [(0, 0, 0); GPU_SPRITE_SLOTS],
             tile_memory,
@@ -400,6 +406,11 @@ impl Cpu {
                 self.console.status()
             }
             CONSOLE_CONTROL => self.console.control(),
+            MOUSE_EVENTS_ADDR => {
+                let events = self.memory[address as usize];
+                self.memory[address as usize] = 0;
+                events
+            }
             _ => self.memory[address as usize],
         }
     }
@@ -1430,6 +1441,59 @@ impl Cpu {
                 self.memory[address as usize] &= !bit;
             }
         }
+    }
+
+    pub fn set_mouse_position(&mut self, x: u16, y: u16) {
+        let (width, height) = if self.memory[GPU_MODE_ADDR as usize] == 1 {
+            (640, 480)
+        } else {
+            (320, 240)
+        };
+        let x = x.min(width - 1);
+        let y = y.min(height - 1);
+        let [x_high, x_low] = x.to_be_bytes();
+        let [y_high, y_low] = y.to_be_bytes();
+        self.memory[MOUSE_ADDR as usize..MOUSE_ADDR as usize + 4]
+            .copy_from_slice(&[x_high, x_low, y_high, y_low]);
+    }
+
+    pub fn mouse_button(&mut self, button: usize, down: bool, x: u16, y: u16, now_ms: u64) {
+        if button > 1 {
+            return;
+        }
+        let held_index = MOUSE_ADDR as usize + 4;
+        let event_index = held_index + 1;
+        let bit = 1 << button;
+        if !down {
+            self.memory[held_index] &= !bit;
+            self.memory[event_index] |= bit << 4;
+            return;
+        }
+        self.memory[held_index] |= bit;
+        self.memory[event_index] |= bit;
+        let is_double_click =
+            self.last_mouse_click[button].is_some_and(|(previous_ms, previous_x, previous_y)| {
+                now_ms.saturating_sub(previous_ms) <= 400
+                    && x.abs_diff(previous_x) <= 4
+                    && y.abs_diff(previous_y) <= 4
+            });
+        if is_double_click {
+            self.memory[event_index] |= bit << 2;
+            self.last_mouse_click[button] = None;
+        } else {
+            self.last_mouse_click[button] = Some((now_ms, x, y));
+        }
+    }
+
+    pub fn set_mouse_wheel(&mut self, delta: i16) {
+        self.mouse_wheel_delta = self.mouse_wheel_delta.saturating_add(delta);
+        self.memory[MOUSE_ADDR as usize + 6..MOUSE_ADDR as usize + 8]
+            .copy_from_slice(&self.mouse_wheel_delta.to_be_bytes());
+    }
+
+    pub fn end_mouse_frame(&mut self) {
+        self.mouse_wheel_delta = 0;
+        self.memory[MOUSE_ADDR as usize + 6..MOUSE_ADDR as usize + 8].fill(0);
     }
 
     pub fn take_sound_commands(&mut self) -> Vec<GpuSoundCommand> {

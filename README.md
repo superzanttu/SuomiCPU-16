@@ -37,7 +37,8 @@ window with **REBOOT**, **RESET** (return to BIOS), **COPY**, and
 Ctrl+C to copy it; **COPY** copies the selection or the visible screen. The
 console retains 1,000 rows of scrollback, accessible with the mouse wheel.
 Press **F2** in the emulator window to hide/show the console; **F11** toggles
-windowed/fullscreen game display. Start directly in fullscreen with
+windowed/fullscreen game display, and **F10** pauses or resumes the emulator.
+Start directly in fullscreen with
 `cargo run -- --fullscreen` or `.\run.ps1 -Fullscreen`.
 Detailed stage logs are on by default and show which SC-16 component is
 processing each source file, including compiler, assembler, include, and

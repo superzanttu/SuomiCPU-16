@@ -140,8 +140,14 @@ considered migration.
         in Rust for the supported logical canvas size.
   - [x] Keep the last frame visible after HALT until a keypress, matching the
         legacy window lifetime.
+  - [x] Toggle pause with F10 and fullscreen with F11 without consuming those
+        controls as guest keyboard input.
+  - [x] Preserve shifted ASCII text input for letters, digits, and supported
+        punctuation.
+  - [x] Forward logical mouse coordinates, left/right click and double-click
+        events, and signed per-frame wheel deltas through Rust mouse MMIO.
   - Why remaining tests are Python-specific: pause timing, separate console
-    window management, and Pygame display pacing.
+    window management, and Pygame-specific display pacing.
 - [x] **Port [tests/test_extended_opcodes.py](../tests/test_extended_opcodes.py)** — ISA coverage.
   - Rust assembled-program tests cover shifts/rotates, carry-chain arithmetic,
     32-bit operations and pair validation, stack-pointer control, full-width
