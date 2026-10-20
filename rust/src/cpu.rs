@@ -3864,6 +3864,7 @@ mod tests {
         assert_eq!(cpu.read(CONSOLE_STATUS), 3);
         assert_eq!(cpu.read(CONSOLE_DATA), b'A');
         assert_eq!(cpu.read(CONSOLE_STATUS), 2);
+        assert_eq!(cpu.console.output(), b"A");
         assert!(cpu.frame_yield);
         cpu.frame_yield = false;
         cpu.signal_keyboard_event(b'B');
@@ -3885,7 +3886,7 @@ mod tests {
         }
         cpu.receive_console_input(b"B");
         assert_eq!(cpu.read(CONSOLE_DATA), b'B');
-        assert!(cpu.console.output().is_empty());
+        assert_eq!(cpu.console.output(), b"");
     }
 
     #[test]

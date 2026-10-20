@@ -116,8 +116,12 @@ considered migration.
     disk mounting, emulator startup, and reset-to-BIOS behavior.
 - [ ] **Port [tests/test_c_compiler.py](../tests/test_c_compiler.py)** — compiler coverage.
   - Coverage to preserve: supported-language behavior and diagnostics as the Rust compiler replaces Python.
-- [ ] **Port [tests/test_console_device.py](../tests/test_console_device.py)** — console coverage.
-  - Coverage to preserve: Python emulator and Tk console-window integration; Rust already tests MMIO buffering, bounds, text rendering state, and scrollback.
+- [x] **Port console-device state/MMIO coverage from [tests/test_console_device.py](../tests/test_console_device.py) to Rust.**
+  - Rust tests cover FIFO/echo control, poll yielding, input bounds/overrun,
+    fixed text rows, scrollback, wrapping, and history reset.
+- [ ] **Retire Python-specific console tests from [tests/test_console_device.py](../tests/test_console_device.py).**
+  - Why they remain: Tk window controls/clipboard/scrolling, Python host
+    lifecycle messages, and file logging still belong to the legacy emulator.
 - [ ] **Port [tests/test_display.py](../tests/test_display.py)** — display coverage.
   - Coverage to preserve: Pygame display rendering and emulator integration through Rust runtime/frame tests.
 - [ ] **Port [tests/test_extended_opcodes.py](../tests/test_extended_opcodes.py)** — ISA/graphics coverage.
