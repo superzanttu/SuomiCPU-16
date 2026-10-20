@@ -108,8 +108,12 @@ considered migration.
     directives, labels, operands, numeric forms, comments, and UTF-8 BOM/
     include error handling. The Python suite remains for the accepted Python
     assembler's own behavioral coverage.
-- [ ] **Port [tests/test_bios.py](../tests/test_bios.py)** — BIOS/runtime coverage.
-  - Coverage to preserve: BIOS discovery, selection, and boot behaviors in Rust runtime tests.
+- [x] **Mirror BIOS module discovery from [tests/test_bios.py](../tests/test_bios.py) in Rust.**
+  - Rust tests now cover module sorting, C source selection, empty/multiple
+    source errors, descriptions, UTF-8 BOM files, and missing directories.
+- [ ] **Port the remaining BIOS UI/boot tests from [tests/test_bios.py](../tests/test_bios.py).**
+  - Coverage to preserve: interactive selection, mouse/keyboard navigation,
+    disk mounting, emulator startup, and reset-to-BIOS behavior.
 - [ ] **Port [tests/test_c_compiler.py](../tests/test_c_compiler.py)** — compiler coverage.
   - Coverage to preserve: supported-language behavior and diagnostics as the Rust compiler replaces Python.
 - [ ] **Port [tests/test_console_device.py](../tests/test_console_device.py)** — console coverage.

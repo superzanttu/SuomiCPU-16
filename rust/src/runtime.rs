@@ -456,13 +456,33 @@ fn discover_modules(directory: &Path) -> Result<Vec<BootModule>, RuntimeError> {
                 }
             }
         };
-        let description = source
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|contents| contents.lines().next().map(str::to_owned))
-            .map(|line| line.trim_start_matches('/').trim().to_owned())
-            .filter(|line| !line.is_empty())
-            .unwrap_or_else(|| error.clone().unwrap_or_else(|| "No description".to_owned()));
+        let description = if let Some(path) = &source {
+            let contents = fs::read_to_string(path)?;
+            let line = contents
+                .trim_start_matches('\u{feff}')
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim();
+            let description = if let Some(line) = line.strip_prefix("//") {
+                line.trim().to_owned()
+            } else if let Some(line) = line.strip_prefix("/*") {
+                line.strip_suffix("*/")
+                    .unwrap_or(line)
+                    .trim_start_matches('*')
+                    .trim()
+                    .to_owned()
+            } else {
+                line.to_owned()
+            };
+            if description.is_empty() {
+                "No description".to_owned()
+            } else {
+                description
+            }
+        } else {
+            error.clone().unwrap_or_else(|| "No description".to_owned())
+        };
         modules.push(BootModule {
             name,
             description,
@@ -884,6 +904,70 @@ fn draw_text_limited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bios_module_discovery_sorts_selects_main_and_reads_descriptions() {
+        let directory = std::env::temp_dir().join(format!(
+            "sc16-bios-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let modules = directory.join("modules");
+        fs::create_dir_all(modules.join("Alpha")).unwrap();
+        fs::create_dir_all(modules.join("broken")).unwrap();
+        fs::create_dir_all(modules.join("empty")).unwrap();
+        fs::create_dir_all(modules.join("valid")).unwrap();
+        fs::write(modules.join("ignored.c"), "not a module").unwrap();
+        fs::write(modules.join("Alpha").join("alpha.c"), "// Alpha program\n").unwrap();
+        fs::write(modules.join("broken").join("first.c"), "// First\n").unwrap();
+        fs::write(modules.join("broken").join("second.C"), "// Second\n").unwrap();
+        fs::write(
+            modules.join("valid").join("main.C"),
+            "\u{feff}/* Main program */\nint main(void) { return 0; }\n",
+        )
+        .unwrap();
+        fs::write(modules.join("valid").join("helper.c"), "// Helper\n").unwrap();
+
+        let found = discover_modules(&modules).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|module| module.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "broken", "empty", "valid"]
+        );
+        assert_eq!(found[0].description, "Alpha program");
+        assert_eq!(
+            found[0].source.as_deref(),
+            Some(modules.join("Alpha").join("alpha.c").as_path())
+        );
+        assert_eq!(
+            found[1].error.as_deref(),
+            Some("Multiple .c files found; expected main.c.")
+        );
+        assert_eq!(
+            found[2].error.as_deref(),
+            Some("No .c files found in module folder.")
+        );
+        assert_eq!(found[3].description, "Main program",);
+        assert_eq!(
+            found[3].source.as_deref(),
+            Some(modules.join("valid").join("main.C").as_path())
+        );
+        assert!(found[3].error.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bios_module_discovery_reports_missing_module_directory() {
+        let missing = std::env::temp_dir()
+            .join(format!("sc16-bios-missing-{}", std::process::id()))
+            .join("modules");
+        assert!(discover_modules(&missing).is_err());
+    }
 
     #[test]
     fn sound_synthesis_produces_valid_pcm_wav_with_requested_duration() {
