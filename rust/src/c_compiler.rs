@@ -178,6 +178,12 @@ enum NativeLocation {
         element_size: usize,
         element_signed: bool,
     },
+    StackArray {
+        offset: usize,
+        length: usize,
+        element_size: usize,
+        element_signed: bool,
+    },
 }
 
 struct NativeGlobal {
@@ -411,35 +417,44 @@ pub fn compile_minimal_program(
                 static_data_size = total_data_size;
                 let mut data = vec![0; byte_count];
                 if let Some(initializer) = &global.initializer {
-                    let values = if is_array {
-                        let ExpressionKind::InitializerList(values) = &initializer.kind else {
-                            return Ok(None);
-                        };
-                        if values.len() > element_count {
+                    if let ExpressionKind::Atom(value) = &initializer.kind
+                        && let Some(bytes) = decode_string_token(value)
+                    {
+                        if !is_array || element_size != 1 || bytes.len() > element_count {
                             return Ok(None);
                         }
-                        values
-                            .iter()
-                            .map(scalar_initializer)
-                            .collect::<Option<Vec<_>>>()
+                        data[..bytes.len()].copy_from_slice(&bytes);
                     } else {
-                        scalar_initializer(initializer).map(|value| vec![value])
-                    };
-                    let Some(values) = values else {
-                        return Ok(None);
-                    };
-                    for (index, expression) in values.into_iter().enumerate() {
-                        let Ok(value) =
-                            evaluate_integer_constant_with_names(expression, &unit.enumerators)
-                        else {
+                        let values = if is_array {
+                            let ExpressionKind::InitializerList(values) = &initializer.kind else {
+                                return Ok(None);
+                            };
+                            if values.len() > element_count {
+                                return Ok(None);
+                            }
+                            values
+                                .iter()
+                                .map(scalar_initializer)
+                                .collect::<Option<Vec<_>>>()
+                        } else {
+                            scalar_initializer(initializer).map(|value| vec![value])
+                        };
+                        let Some(values) = values else {
                             return Ok(None);
                         };
-                        if element_size == 1 {
-                            data[index] = value as u8;
-                        } else {
-                            let value = value as u16;
-                            data[index * 2] = (value >> 8) as u8;
-                            data[index * 2 + 1] = value as u8;
+                        for (index, expression) in values.into_iter().enumerate() {
+                            let Ok(value) =
+                                evaluate_integer_constant_with_names(expression, &unit.enumerators)
+                            else {
+                                return Ok(None);
+                            };
+                            if element_size == 1 {
+                                data[index] = value as u8;
+                            } else {
+                                let value = value as u16;
+                                data[index * 2] = (value >> 8) as u8;
+                                data[index * 2 + 1] = value as u8;
+                            }
                         }
                     }
                 }
@@ -520,6 +535,10 @@ pub fn compile_minimal_program(
         {
             return Ok(None);
         }
+        let has_local_array = statement_has_local_array(&function.body);
+        if has_local_array && function.declaration.parameters.len() > 2 {
+            return Ok(None);
+        }
         let mut locals = HashMap::new();
         for (index, parameter) in function.declaration.parameters.iter().enumerate() {
             let Some(name) = &parameter.name else {
@@ -533,7 +552,14 @@ pub fn compile_minimal_program(
             }
         }
         let mut next_local_register = function.declaration.parameters.len() as u8 + 1;
-        if !collect_native_locals(statements, &mut locals, &mut next_local_register) {
+        let mut frame_size = 0;
+        if !collect_native_locals(
+            statements,
+            &mut locals,
+            &mut next_local_register,
+            &mut frame_size,
+            has_local_array,
+        ) {
             return Ok(None);
         }
         for global in &globals {
@@ -558,6 +584,10 @@ pub fn compile_minimal_program(
         for (index, _) in function.declaration.parameters.iter().enumerate() {
             assembly.push_str(&format!("    LDWS R{}, {}\n", index + 1, 4 + index * 2));
         }
+        emit_native_stack_adjustment(frame_size, true, &mut assembly);
+        if has_local_array {
+            assembly.push_str("    MOVSP R3\n");
+        }
         let returns_void = function.declaration.return_type.trim() == "void";
         let mut loop_labels = Vec::new();
         let mut returned = false;
@@ -579,11 +609,17 @@ pub fn compile_minimal_program(
         }
         if !returned {
             if returns_void {
-                assembly.push_str("    RET\n");
+                assembly.push_str(&format!(
+                    "    JMPX __c_return_{}\n",
+                    function.declaration.name
+                ));
             } else {
                 return Ok(None);
             }
         }
+        assembly.push_str(&format!("__c_return_{}:\n", function.declaration.name));
+        emit_native_stack_adjustment(frame_size, false, &mut assembly);
+        assembly.push_str("    RET\n");
     }
     assembly.push_str(".address 0x80000\n");
     for global in &globals {
@@ -740,27 +776,65 @@ fn collect_native_locals(
     statements: &[Statement],
     locals: &mut HashMap<String, NativeLocation>,
     next_register: &mut u8,
+    frame_size: &mut usize,
+    reserve_frame_register: bool,
 ) -> bool {
     for statement in statements {
         match &statement.kind {
             StatementKind::Declaration(declarations) => {
                 for declaration in declarations {
-                    if declaration.c_type.trim() != "int"
-                        || declaration.array_length.is_some()
-                        || locals.contains_key(&declaration.name)
-                        || *next_register > 3
-                    {
+                    if locals.contains_key(&declaration.name) {
                         return false;
                     }
-                    locals.insert(
-                        declaration.name.clone(),
-                        NativeLocation::Register(*next_register),
-                    );
-                    *next_register += 1;
+                    if let Some(length) = declaration.array_length {
+                        let (element_size, element_signed) = match declaration.c_type.trim() {
+                            "int" => (2, false),
+                            "unsigned char" => (1, false),
+                            "char" | "signed char" => (1, true),
+                            _ => return false,
+                        };
+                        let Some(byte_count) = length.checked_mul(element_size) else {
+                            return false;
+                        };
+                        let Some(new_frame_size) = frame_size.checked_add(byte_count) else {
+                            return false;
+                        };
+                        if length == 0 || new_frame_size > 65_535 {
+                            return false;
+                        }
+                        locals.insert(
+                            declaration.name.clone(),
+                            NativeLocation::StackArray {
+                                offset: *frame_size,
+                                length,
+                                element_size,
+                                element_signed,
+                            },
+                        );
+                        *frame_size = new_frame_size;
+                    } else {
+                        if reserve_frame_register && *next_register == 3 {
+                            *next_register += 1;
+                        }
+                        if declaration.c_type.trim() != "int" || *next_register > 3 {
+                            return false;
+                        }
+                        locals.insert(
+                            declaration.name.clone(),
+                            NativeLocation::Register(*next_register),
+                        );
+                        *next_register += 1;
+                    }
                 }
             }
             StatementKind::Compound(statements) => {
-                if !collect_native_locals(statements, locals, next_register) {
+                if !collect_native_locals(
+                    statements,
+                    locals,
+                    next_register,
+                    frame_size,
+                    reserve_frame_register,
+                ) {
                     return false;
                 }
             }
@@ -769,18 +843,34 @@ fn collect_native_locals(
                 else_branch,
                 ..
             } => {
-                if !collect_native_locals(std::slice::from_ref(then_branch), locals, next_register)
-                    || else_branch.as_ref().is_some_and(|branch| {
-                        !collect_native_locals(std::slice::from_ref(branch), locals, next_register)
-                    })
-                {
+                if !collect_native_locals(
+                    std::slice::from_ref(then_branch),
+                    locals,
+                    next_register,
+                    frame_size,
+                    reserve_frame_register,
+                ) || else_branch.as_ref().is_some_and(|branch| {
+                    !collect_native_locals(
+                        std::slice::from_ref(branch),
+                        locals,
+                        next_register,
+                        frame_size,
+                        reserve_frame_register,
+                    )
+                }) {
                     return false;
                 }
             }
             StatementKind::While { body, .. }
             | StatementKind::DoWhile { body, .. }
             | StatementKind::For { body, .. } => {
-                if !collect_native_locals(std::slice::from_ref(body), locals, next_register) {
+                if !collect_native_locals(
+                    std::slice::from_ref(body),
+                    locals,
+                    next_register,
+                    frame_size,
+                    reserve_frame_register,
+                ) {
                     return false;
                 }
                 if let StatementKind::For {
@@ -791,6 +881,8 @@ fn collect_native_locals(
                         std::slice::from_ref(initializer),
                         locals,
                         next_register,
+                        frame_size,
+                        reserve_frame_register,
                     )
                 {
                     return false;
@@ -798,7 +890,13 @@ fn collect_native_locals(
             }
             StatementKind::Switch { cases, .. } => {
                 for (_, statements) in cases {
-                    if !collect_native_locals(statements, locals, next_register) {
+                    if !collect_native_locals(
+                        statements,
+                        locals,
+                        next_register,
+                        frame_size,
+                        reserve_frame_register,
+                    ) {
                         return false;
                     }
                 }
@@ -808,6 +906,8 @@ fn collect_native_locals(
                     std::slice::from_ref(statement),
                     locals,
                     next_register,
+                    frame_size,
+                    reserve_frame_register,
                 ) =>
             {
                 return false;
@@ -816,6 +916,41 @@ fn collect_native_locals(
         }
     }
     true
+}
+
+fn statement_has_local_array(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .any(|declaration| declaration.array_length.is_some()),
+        StatementKind::Compound(statements) => statements.iter().any(statement_has_local_array),
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_has_local_array(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| statement_has_local_array(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_has_local_array(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .is_some_and(|initializer| statement_has_local_array(initializer))
+                || statement_has_local_array(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|(_, statements)| statements.iter().any(statement_has_local_array)),
+        StatementKind::Label { statement, .. } => statement_has_local_array(statement),
+        _ => false,
+    }
 }
 
 fn collect_native_labels(
@@ -886,6 +1021,11 @@ fn native_sizeof_expression(
                 element_size,
                 ..
             }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
+            Some(NativeLocation::StackArray {
+                length,
+                element_size,
+                ..
+            }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
             Some(_) => Some(2),
             None => None,
         },
@@ -895,6 +1035,9 @@ fn native_sizeof_expression(
             };
             match locals.get(name) {
                 Some(NativeLocation::GlobalArray { element_size, .. }) => {
+                    u16::try_from(*element_size).ok()
+                }
+                Some(NativeLocation::StackArray { element_size, .. }) => {
                     u16::try_from(*element_size).ok()
                 }
                 _ => None,
@@ -965,6 +1108,69 @@ fn native_statement_termination(statement: &Statement) -> Option<bool> {
     }
 }
 
+fn emit_native_array_address(
+    name: &str,
+    index_register: u8,
+    locals: &HashMap<String, NativeLocation>,
+    assembly: &mut String,
+) -> Option<(usize, bool)> {
+    let (element_size, element_signed) = match locals.get(name)? {
+        NativeLocation::GlobalArray {
+            element_size,
+            element_signed,
+            ..
+        } => {
+            assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+            (*element_size, *element_signed)
+        }
+        NativeLocation::StackArray {
+            offset,
+            element_size,
+            element_signed,
+            ..
+        } => {
+            assembly.push_str("    MOV R7, R3\n");
+            if *offset > 0 {
+                assembly.push_str(&format!("    ADD R7, {offset}\n"));
+            }
+            (*element_size, *element_signed)
+        }
+        _ => return None,
+    };
+    if element_size == 2 {
+        assembly.push_str(&format!("    SHL R{index_register}, 1\n"));
+    }
+    assembly.push_str(&format!("    ADD R7, R{index_register}\n"));
+    Some((element_size, element_signed))
+}
+
+fn decode_string_token(value: &str) -> Option<Vec<u8>> {
+    let hex = value.strip_prefix("<string:")?.strip_suffix('>')?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            if pair.len() != 2 {
+                return None;
+            }
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect()
+}
+
+fn emit_native_stack_adjustment(frame_size: usize, allocate: bool, assembly: &mut String) {
+    let mut remaining = frame_size;
+    while remaining > 0 {
+        let adjustment = remaining.min(127) as i32;
+        let adjustment = if allocate { -adjustment } else { adjustment };
+        assembly.push_str(&format!("    ADJSP {adjustment}\n"));
+        remaining -= adjustment.unsigned_abs() as usize;
+    }
+}
+
 fn emit_native_expression(
     expression: &Expression,
     destination: u8,
@@ -991,7 +1197,9 @@ fn emit_native_expression(
                     NativeLocation::GlobalScalar => assembly.push_str(&format!(
                         "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
                     )),
-                    NativeLocation::GlobalArray { .. } => return false,
+                    NativeLocation::GlobalArray { .. } | NativeLocation::StackArray { .. } => {
+                        return false;
+                    }
                     NativeLocation::Register(source) if *source != destination => {
                         assembly.push_str(&format!("    MOV R{destination}, R{source}\n"));
                     }
@@ -1376,14 +1584,6 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &expression.kind else {
                 return false;
             };
-            let Some(NativeLocation::GlobalArray {
-                element_size,
-                element_signed,
-                ..
-            }) = locals.get(name)
-            else {
-                return false;
-            };
             if destination == 7
                 || !emit_native_expression(
                     index,
@@ -1396,16 +1596,16 @@ fn emit_native_expression(
             {
                 return false;
             }
-            if *element_size == 2 {
-                assembly.push_str(&format!("    SHL R{destination}, 1\n"));
-            }
+            let Some((element_size, element_signed)) =
+                emit_native_array_address(name, destination, locals, assembly)
+            else {
+                return false;
+            };
             assembly.push_str(&format!(
-                "    LDI30 R7, __c_global_{name}\n\
-                 ADD R7, R{destination}\n\
-                 {} R{destination}, R7\n",
-                if *element_size == 1 { "LD" } else { "LDW" }
+                "    {} R{destination}, R7\n",
+                if element_size == 1 { "LD" } else { "LDW" }
             ));
-            if *element_signed {
+            if element_signed {
                 assembly.push_str(&format!(
                     "    SHL R{destination}, 8\n    ASR R{destination}, 8\n"
                 ));
@@ -1507,19 +1707,6 @@ fn emit_native_assignment(
         let ExpressionKind::Atom(name) = &base.kind else {
             return false;
         };
-        let Some(NativeLocation::GlobalArray {
-            element_size,
-            element_signed,
-            ..
-        }) = locals.get(name)
-        else {
-            return false;
-        };
-        let (load, store) = if *element_size == 1 {
-            ("LD", "ST")
-        } else {
-            ("LDW", "STW")
-        };
         let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
             return false;
         };
@@ -1536,13 +1723,16 @@ fn emit_native_assignment(
         if !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly) {
             return false;
         }
-        if *element_size == 2 {
-            assembly.push_str("    SHL R0, 1\n");
-        }
-        assembly.push_str(&format!(
-            "    LDI30 R7, __c_global_{name}\n\
-             ADD R7, R0\n"
-        ));
+        let Some((element_size, element_signed)) =
+            emit_native_array_address(name, 0, locals, assembly)
+        else {
+            return false;
+        };
+        let (load, store) = if element_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
         if operator != "=" {
             let binary_operator = match operator.as_str() {
                 "+=" => "ADD",
@@ -1558,7 +1748,7 @@ fn emit_native_assignment(
                 _ => return false,
             };
             assembly.push_str(&format!("    {load} R0, R7\n"));
-            if *element_signed {
+            if element_signed {
                 assembly.push_str("    SHL R0, 8\n    ASR R0, 8\n");
             }
             assembly.push_str(&format!("    {binary_operator} R0, R{value_register}\n"));
@@ -1578,7 +1768,7 @@ fn emit_native_assignment(
         NativeLocation::Register(register) => (*register, false),
         NativeLocation::Constant(_) => return false,
         NativeLocation::GlobalScalar => (0, true),
-        NativeLocation::GlobalArray { .. } => return false,
+        NativeLocation::GlobalArray { .. } | NativeLocation::StackArray { .. } => return false,
     };
     let binary_operator = match operator.as_str() {
         "=" => None,
@@ -1645,7 +1835,61 @@ fn emit_native_statement(
     match &statement.kind {
         StatementKind::Declaration(declarations) => {
             for declaration in declarations {
-                if let Some(initializer) = &declaration.initializer {
+                if let Some(NativeLocation::StackArray {
+                    length,
+                    element_size,
+                    ..
+                }) = locals.get(&declaration.name)
+                {
+                    if let Some(initializer) = &declaration.initializer {
+                        if let ExpressionKind::Atom(string_token) = &initializer.kind
+                            && let Some(bytes) = decode_string_token(string_token)
+                        {
+                            if *element_size != 1 || bytes.len() > *length || *length > 512 {
+                                return None;
+                            }
+                            for index in 0..*length {
+                                assembly.push_str(&format!(
+                                    "    LDI R4, {}\n",
+                                    bytes.get(index).copied().unwrap_or(0)
+                                ));
+                                assembly.push_str(&format!("    LDI R0, {index}\n"));
+                                emit_native_array_address(&declaration.name, 0, locals, assembly)?;
+                                assembly.push_str("    ST R7, R4\n");
+                            }
+                        } else {
+                            let ExpressionKind::InitializerList(values) = &initializer.kind else {
+                                return None;
+                            };
+                            if values.len() > *length || *length > 512 {
+                                return None;
+                            }
+                            for index in 0..*length {
+                                if let Some(value) = values.get(index).and_then(scalar_initializer)
+                                {
+                                    if !emit_native_expression(
+                                        value,
+                                        4,
+                                        &[5, 6, 7],
+                                        locals,
+                                        label_counter,
+                                        assembly,
+                                    ) {
+                                        return None;
+                                    }
+                                } else {
+                                    assembly.push_str("    LDI R4, 0\n");
+                                }
+                                assembly.push_str(&format!("    LDI R0, {index}\n"));
+                                emit_native_array_address(&declaration.name, 0, locals, assembly)?;
+                                assembly.push_str(&format!(
+                                    "    {} R7, R4\n",
+                                    if *element_size == 1 { "ST" } else { "STW" }
+                                ));
+                            }
+                        }
+                    }
+                } else if let Some(initializer) = &declaration.initializer {
                     let initializer = scalar_initializer(initializer)?;
                     let NativeLocation::Register(destination) = locals.get(&declaration.name)?
                     else {
@@ -1694,11 +1938,11 @@ fn emit_native_statement(
             ) {
                 return None;
             }
-            assembly.push_str("    RET\n");
+            assembly.push_str(&format!("    JMPX __c_return_{function_name}\n"));
             Some(true)
         }
         StatementKind::Return(None) if returns_void => {
-            assembly.push_str("    RET\n");
+            assembly.push_str(&format!("    JMPX __c_return_{function_name}\n"));
             Some(true)
         }
         StatementKind::Break => {
@@ -2045,34 +2289,24 @@ fn emit_native_update(
         let ExpressionKind::Atom(name) = &base.kind else {
             return false;
         };
-        let Some(NativeLocation::GlobalArray {
-            element_size,
-            element_signed,
-            ..
-        }) = locals.get(name)
-        else {
-            return false;
-        };
         if !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly) {
             return false;
         }
-        let (load, store) = if *element_size == 1 {
+        let Some((element_size, element_signed)) =
+            emit_native_array_address(name, 0, locals, assembly)
+        else {
+            return false;
+        };
+        let (load, store) = if element_size == 1 {
             ("LD", "ST")
         } else {
             ("LDW", "STW")
         };
-        if *element_size == 2 {
-            assembly.push_str("    SHL R0, 1\n");
-        }
-        assembly.push_str(&format!(
-            "    LDI30 R7, __c_global_{name}\n\
-             ADD R7, R0\n\
-             {load} R0, R7\n\
-             {instruction} R0\n"
-        ));
-        if *element_signed {
+        assembly.push_str(&format!("    {load} R0, R7\n"));
+        if element_signed {
             assembly.push_str("    SHL R0, 8\n    ASR R0, 8\n");
         }
+        assembly.push_str(&format!("    {instruction} R0\n"));
         assembly.push_str(&format!("    {store} R7, R0\n"));
         return true;
     }
@@ -2090,7 +2324,9 @@ fn emit_native_update(
         NativeLocation::Register(register) => {
             assembly.push_str(&format!("    {instruction} R{register}\n"));
         }
-        NativeLocation::Constant(_) | NativeLocation::GlobalArray { .. } => return false,
+        NativeLocation::Constant(_)
+        | NativeLocation::GlobalArray { .. }
+        | NativeLocation::StackArray { .. } => return false,
     }
     true
 }
@@ -5500,6 +5736,78 @@ mod tests {
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 4);
         assert_eq!(&cpu.memory[0x80000..0x80002], &[0, 4]);
+    }
+
+    #[test]
+    fn compiles_global_and_local_character_string_initializers() {
+        let image = compile_minimal_program(
+            "char title[4] = \"Cat\"; \
+             int main(void) { char local[4] = \"dog\"; \
+                 return title[1] + local[2] + sizeof(title) + sizeof(local); }",
+            "string-arrays.c",
+        )
+        .unwrap()
+        .expect("supported character array string initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 208);
+        assert_eq!(&cpu.memory[0x80000..0x80004], b"Cat\0");
+    }
+
+    #[test]
+    fn rejects_string_initializers_that_do_not_fit_character_arrays() {
+        for source in [
+            "char text[2] = \"cat\"; int main(void) { return 0; }",
+            "int values[4] = \"cat\"; int main(void) { return 0; }",
+        ] {
+            assert!(
+                compile_minimal_program(source, "too-small-string.c")
+                    .unwrap()
+                    .is_none(),
+                "source unexpectedly compiled: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_initialized_local_integer_arrays_with_stack_frames() {
+        let image = compile_minimal_program(
+            "int helper(int value) { int items[3]; items[0] = value; items[1] = 5; \
+                 return items[0] + items[1]; } \
+             int main(void) { int values[4] = { 2, 3 }; values[1]++; \
+                 values[2] = helper(values[0] + values[1]); \
+                 return sizeof(values) + values[2]; }",
+            "local-array.c",
+        )
+        .unwrap()
+        .expect("supported local integer array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 19);
+    }
+
+    #[test]
+    fn compiles_initialized_local_char_arrays_with_byte_indexing() {
+        let image = compile_minimal_program(
+            "int main(void) { unsigned char values[4] = { 1, 255, 3 }; \
+                 values[1] += 2; values[2]++; \
+                 return sizeof(values) + values[0] + values[1] + values[2]; }",
+            "local-byte-array.c",
+        )
+        .unwrap()
+        .expect("supported local byte array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
     }
 
     #[test]
