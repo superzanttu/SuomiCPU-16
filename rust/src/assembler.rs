@@ -1382,6 +1382,87 @@ mod tests {
     }
 
     #[test]
+    fn validates_memory_boundaries_and_entry_point_defaults() {
+        assert_eq!(assemble("", 0).unwrap().entry_point, 0);
+        assert_eq!(assemble("", 0x40).unwrap().entry_point, 0x40);
+        assert_eq!(
+            assemble(".address 5\n.data hex 1", 0).unwrap().entry_point,
+            5
+        );
+        assert_eq!(assemble(".data hex 1\nHALT", 0).unwrap().entry_point, 1);
+        assert_eq!(assemble("HALT", 0x30).unwrap().segments[0].address, 0x30);
+
+        let final_byte =
+            assemble(&format!(".address {}\n.data hex 7", MEMORY_SIZE - 1), 0).unwrap();
+        assert_eq!(final_byte.segments[0].address, MEMORY_SIZE - 1);
+        assert!(assemble("HALT", MEMORY_SIZE).is_err());
+        assert!(assemble(&format!(".address {}\nHALT", MEMORY_SIZE - 1), 0).is_err());
+        assert!(assemble(&format!(".address {}\n.data hex 1 2", MEMORY_SIZE - 1), 0).is_err());
+        assert!(assemble(&format!(".address {}\nJMPX 0", MEMORY_SIZE - 2), 0).is_err());
+        assert!(assemble(".address 0\nHALT\n.address 1\nHALT", 0).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_data_labels_operands_and_addresses() {
+        for source in [
+            ".data",
+            ".data hex",
+            ".data xyz 1",
+            ".data hex 100",
+            ".data hex zz",
+            ".data oct 8",
+            ".data bin 2",
+            ".data string",
+            ".data string abc",
+            ".data string \"abc",
+            ".data string \"a\"\"b\"",
+            ".data string \"\\x\"",
+            ".data string ,",
+            ".data hex ,",
+            ".address",
+            ".address x",
+            ".address 0x40000000",
+            ".address -1",
+            ".addressx 1",
+            ".address 1 2",
+            "a:\na:",
+            "1a: HALT",
+            "a b: HALT",
+            "HALT: x",
+            "LDI R0",
+            "LDI R0, 1, 2",
+            "JMPX",
+            "JMPX 1, 2",
+            "HALT 1",
+            "RET 1",
+            "JMP nowhere",
+            "JZ R0, nowhere",
+            "LDA R0, nowhere",
+            "LDI R0, -1",
+            "LDI R0, 0x10000",
+            "LDA R0, 0x40000000",
+        ] {
+            assert!(
+                assemble(source, 0).is_err(),
+                "expected invalid assembly to fail: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn assembles_comments_whitespace_and_common_numeric_forms() {
+        let image = assemble(
+            "  ; full line comment\n# hash comment\nLDI R0, 0x10 ; inline\nLDI R1, 0b11\nLDI R2, 0o7\nLDI R3, 12\n\tHALT # trailing\n",
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            image.segments[0].data,
+            b"\x08\x10\x09\x03\x0a\x07\x0b\x0c\x00\x00"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_inputs_and_output_overlaps() {
         assert!(
             assemble("INC R8", 0)
@@ -1508,6 +1589,40 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("circular .include")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn expands_utf8_bom_includes_and_preserves_file_error_context() {
+        let directory = std::env::temp_dir().join(format!(
+            "sc16-assembler-bom-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("fragment.asm"), "\u{feff}INC R1\n").unwrap();
+        fs::write(
+            directory.join("main.asm"),
+            "\u{feff}.include \"fragment.asm\"\nHALT\n",
+        )
+        .unwrap();
+        let image = assemble_file(&directory.join("main.asm"), 0).unwrap();
+        assert_eq!(image.segments[0].data, b"\x69\x00\x00\x00");
+        assert!(
+            assemble_with_base_directory(".include \"missing.asm\"", 0, &directory,)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot include")
+        );
+        assert!(
+            assemble_file(&directory.join("missing.asm"), 0)
+                .unwrap_err()
+                .to_string()
+                .contains("missing.asm")
         );
         fs::remove_dir_all(directory).unwrap();
     }

@@ -103,8 +103,11 @@ considered migration.
     control-flow, and stack-instruction regressions. The Python test remains
     intentionally because the Python assembler is an accepted migration
     exception and still needs its own regression coverage.
-- [ ] **Port [tests/test_assembler_coverage.py](../tests/test_assembler_coverage.py)** — assembler coverage.
-  - Coverage to preserve: Python assembler cases not yet covered by `rust/src/assembler.rs`.
+- [x] **Mirror shared [tests/test_assembler_coverage.py](../tests/test_assembler_coverage.py) cases in Rust.**
+  - Rust tests cover memory boundaries, entry-point defaults, malformed
+    directives, labels, operands, numeric forms, comments, and UTF-8 BOM/
+    include error handling. The Python suite remains for the accepted Python
+    assembler's own behavioral coverage.
 - [ ] **Port [tests/test_bios.py](../tests/test_bios.py)** — BIOS/runtime coverage.
   - Coverage to preserve: BIOS discovery, selection, and boot behaviors in Rust runtime tests.
 - [ ] **Port [tests/test_c_compiler.py](../tests/test_c_compiler.py)** — compiler coverage.
