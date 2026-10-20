@@ -278,6 +278,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn base_opcode_table_covers_all_slots_and_declares_shared_extensions() {
+        let mut opcode_values = BASE_OPCODES
+            .iter()
+            .filter_map(|(name, value)| {
+                (!matches!(
+                    *name,
+                    "LDA"
+                        | "MOVSP"
+                        | "FADD"
+                        | "FSUB"
+                        | "FMUL"
+                        | "FDIV"
+                        | "FCMP"
+                        | "ITOF"
+                        | "FTOI"
+                        | "JMPX"
+                        | "CALLX"
+                        | "BZX"
+                        | "BCX"
+                        | "NOP"
+                ))
+                .then_some(*value)
+            })
+            .collect::<Vec<_>>();
+        opcode_values.sort_unstable();
+        opcode_values.dedup();
+        assert_eq!(opcode_values, (0..32).collect::<Vec<_>>());
+
+        let shared_extensions = BASE_OPCODES
+            .iter()
+            .filter_map(|(name, value)| (*value == OP_SHR).then_some(*name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shared_extensions,
+            [
+                "SHR", "MOVSP", "FADD", "FSUB", "FMUL", "FDIV", "FCMP", "ITOF", "FTOI", "JMPX",
+                "CALLX", "BZX", "BCX"
+            ]
+        );
+    }
+
+    #[test]
     fn aliases_and_extension_mnemonics_resolve_to_the_expected_opcode() {
         assert_eq!(lookup(BASE_OPCODES, "NOP"), Some(OP_MOV));
         assert_eq!(lookup(BASE_OPCODES, "LDA"), Some(OP_LDI));

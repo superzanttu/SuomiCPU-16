@@ -2899,6 +2899,49 @@ mod tests {
     }
 
     #[test]
+    fn assembled_base_opcodes_cover_register_moves_and_stack_round_trips() {
+        let cpu = run_assembly("LDI R0, 0x12\nMOV R1, R0\nINC R1\nDEC R1\nHALT");
+        assert_eq!((cpu.registers[0], cpu.registers[1]), (0x12, 0x12));
+
+        let mut source = String::new();
+        for register in 0..8 {
+            source.push_str(&format!("LDI R{register}, {}\n", register + 10));
+        }
+        for register in 0..8 {
+            source.push_str(&format!("PUSH R{register}\n"));
+        }
+        for register in (0..8).rev() {
+            source.push_str(&format!("POP R{register}\n"));
+        }
+        source.push_str("HALT\n");
+        let cpu = run_assembly(&source);
+        assert_eq!(
+            cpu.registers,
+            std::array::from_fn(|register| register as i64 + 10)
+        );
+        assert_eq!(cpu.sp, cpu.memory_mask);
+    }
+
+    #[test]
+    fn assembled_base_opcodes_cover_label_loops_calls_and_stack_relative_memory() {
+        let cpu = run_assembly(
+            "LDI R0, 5\nLDI R1, 0\nloop: JZ R0, done\nINC R1\nDEC R0\nJMP loop\n\
+             done: LDI R2, 5\nCMP R1, R2\nBZ equal\nLDI R3, 1\nHALT\n\
+             equal: LDI R3, 2\nLDI R4, 0\nLDI R5, 0x1000\nSETSP R5\n\
+             LDI R6, 0xBEEF\nSTWS R6, 2\nLDWS R7, 2\nHALT",
+        );
+        assert_eq!(cpu.registers[3], 2);
+        assert_eq!(cpu.registers[7], 0xbeef);
+        assert_eq!(cpu.sp, 0x1000);
+
+        let cpu = run_assembly(
+            "LDI R0, 3\nLDI R1, 5\nCMP R0, R1\nBC less\nLDI R2, 1\nHALT\n\
+             less: CALL sub\nHALT\nsub: LDI R2, 9\nRET",
+        );
+        assert_eq!(cpu.registers[2], 9);
+    }
+
+    #[test]
     fn classic_integer_and_logic_ops_cover_register_and_value_edges() {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
         let edges = [0, 1, 0x7f, 0x80, 0xff, 0x100, 0x8000, 0xffff];

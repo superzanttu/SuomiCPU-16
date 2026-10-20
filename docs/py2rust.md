@@ -140,7 +140,17 @@ considered migration.
 - [ ] **Port [tests/test_hertta3d.py](../tests/test_hertta3d.py)** — game/render coverage.
   - Coverage to preserve: Hertta3D execution and rendering through Rust.
 - [ ] **Port [tests/test_isa_opcodes.py](../tests/test_isa_opcodes.py)** — ISA coverage.
-  - Coverage to preserve: migrate uncovered assembler/CPU opcode combinations to Rust.
+  - [x] Verify all 32 base opcode slots, shared-extension aliases, and mnemonic
+        lookup tables in Rust.
+  - [x] Cover assembled base register operations, stack round-trips, label loops,
+        calls, branches, and stack-relative memory in Rust.
+  - [x] Cover classic CPU arithmetic/logic, memory boundaries, and float
+        operations with Rust unit tests.
+  - [x] Cover extended ALU and 32-bit instruction behavior in assembled Rust
+        programs (see the extended-opcode task above).
+  - [ ] Compare remaining exhaustive Python assembler encoding/invalid-operand,
+        interrupt-ordering, and float edge cases against Rust before retiring
+        the Python suite.
 - [ ] **Port [tests/test_net.py](../tests/test_net.py)** — networking coverage.
   - Coverage to preserve: end-to-end coverage through the Rust networking path.
 - [ ] **Port [tests/test_spacecave.py](../tests/test_spacecave.py)** — network/game coverage.
