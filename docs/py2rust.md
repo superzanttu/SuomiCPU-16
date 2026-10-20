@@ -29,24 +29,31 @@ Status meanings:
 
 ## Runtime and shared source
 
-| Python file | Status | Why it cannot be deleted yet |
-|---|---|---|
-| [`src/SuomiCPU.py`](../src/SuomiCPU.py) | Rust exists — Python consumers remain | Rust's CPU, GUI runtime, BIOS selector, and program launcher exist, but Python tests and tools still instantiate the Python emulator. Switch those consumers to Rust and verify module/runtime parity before retiring this compatibility implementation. |
-| [`src/bios.py`](../src/bios.py) | Rust exists — Python consumers remain | Rust implements module discovery, BIOS selection, and booting. Python BIOS tests and `src/SuomiCPU.py` still use this module. |
-| [`src/console_device.py`](../src/console_device.py) | Rust exists — Python consumers remain | Rust now implements bounded MMIO input/output buffers, control/overrun status, the 80x25 text grid, and 1,000-row scrollback. The Python emulator still uses this class; its Tk window, file logging, and Python-only host lifecycle controls remain to be retired with that emulator. |
-| [`src/isa.py`](../src/isa.py) | Rust exists — Python consumers remain | ISA metadata is available in Rust, but the Python assembler and emulator still import Python definitions. Remove it with those consumers after encoding/execution parity is covered. |
-| [`src/lib_disk.py`](../src/lib_disk.py) | Rust exists — Python consumers remain | Rust disk behavior and parity tests exist, but the Python emulator, Tank-16 loader, and Python tests still import this implementation. |
-| [`src/program_loader.py`](../src/program_loader.py) | Rust exists — Python consumers remain | Tank-16 runtime compilation now routes through `sc16tank build-runtime`; the Python loader still serves the Python emulator and other Python callers. Retire it with those consumers. |
-| [`src/__init__.py`](../src/__init__.py) | Package marker | Python test/tool imports still use `src` as a package. Remove after those imports disappear. |
+- [ ] **Migrate [src/SuomiCPU.py](../src/SuomiCPU.py)** — Rust exists; Python consumers remain.
+  - Why it remains: Python tests and tools still instantiate the Python emulator. Switch those consumers to Rust and verify module/runtime parity before retiring this compatibility implementation.
+- [ ] **Migrate [src/bios.py](../src/bios.py)** — Rust exists; Python consumers remain.
+  - Why it remains: Python BIOS tests and `src/SuomiCPU.py` still use the module; Rust already implements module discovery, BIOS selection, and booting.
+- [ ] **Migrate [src/console_device.py](../src/console_device.py)** — Rust exists; Python consumers remain.
+  - Why it remains: the Python emulator still uses this class for its Tk window, file logging, and host lifecycle controls, even though Rust now covers console MMIO, text-grid, and scrollback state.
+- [ ] **Migrate [src/isa.py](../src/isa.py)** — Rust exists; Python consumers remain.
+  - Why it remains: the Python assembler and emulator still import Python ISA definitions. Remove them with those consumers after parity is covered.
+- [ ] **Migrate [src/lib_disk.py](../src/lib_disk.py)** — Rust exists; Python consumers remain.
+  - Why it remains: the Python emulator, Tank-16 loader, and Python tests still import this implementation.
+- [ ] **Migrate [src/program_loader.py](../src/program_loader.py)** — Rust exists; Python consumers remain.
+  - Why it remains: the Python loader still serves the Python emulator and other Python callers; Tank-16 runtime compilation already routes through `sc16tank build-runtime`.
+- [ ] **Remove [src/__init__.py](../src/__init__.py)** — package marker.
+  - Why it remains: Python test/tool imports still use `src` as a package.
 
 ## Build, network, and developer tools
 
-| Python file | Status | Why it cannot be deleted yet |
-|---|---|---|
-| [`tools/assembler.py`](../tools/assembler.py) | Rust exists — Python consumers remain | The Rust assembler is implemented, but the Python C compiler, emulator, smoke tool, and tests still use this module. Migrate those callers before removal. |
-| [`tools/c_compiler.py`](../tools/c_compiler.py) | Blocking — incomplete port | A Rust C compiler exists, but it does not yet build all module programs. The Python loader, Tank-16 asset builder, tests, and developer tools depend on the Python compiler. Port the needed module subset and verify real module builds before switching callers. |
-| [`tools/sc16net.py`](../tools/sc16net.py) | Rust exists — Python consumer remains | Rust networking behavior is implemented and tested; the Python emulator and network tests still import this transport. Switch integration tests and retire the Python emulator before deletion. |
-| [`tools/__init__.py`](../tools/__init__.py) | Package marker | Python tool imports and tests still use `tools` as a package. Remove after those consumers are migrated. |
+- [ ] **Migrate [tools/assembler.py](../tools/assembler.py)** — Rust exists; Python consumers remain.
+  - Why it remains: the Python C compiler, emulator, smoke tool, and tests still use this module. Migrate those callers before removal.
+- [ ] **Port [tools/c_compiler.py](../tools/c_compiler.py)** — blocking; Rust port is incomplete.
+  - Why it remains: Rust does not yet build all module programs, and the Python loader, Tank-16 asset builder, tests, and developer tools still depend on it.
+- [ ] **Migrate [tools/sc16net.py](../tools/sc16net.py)** — Rust exists; Python consumer remains.
+  - Why it remains: the Python emulator and network tests still import this transport. Switch integration tests and retire the emulator before deletion.
+- [ ] **Remove [tools/__init__.py](../tools/__init__.py)** — package marker.
+  - Why it remains: Python tool imports and tests still use `tools` as a package.
 
 Rust Tank-16 tools currently available:
 
@@ -87,24 +94,38 @@ until their behavioral coverage is represented by Rust tests or an intentional
 acceptance-test workflow; deleting tests merely to reach zero `.py` files is not
 considered migration.
 
-| Python file | Status | Coverage/reason to retain |
-|---|---|---|
-| [`tests/__init__.py`](../tests/__init__.py) | Package marker | Needed by current Python test imports; remove with the remaining Python test suite. |
-| [`tests/gfx_harness.py`](../tests/gfx_harness.py) | Test/helper — retain for coverage | Shared Pygame/Python-emulator harness used by graphics and game integration tests. Replace with a Rust runtime test harness or captured Rust frames before removal. |
-| [`tests/test_assembler.py`](../tests/test_assembler.py) | Test/helper — retain for coverage | Assembler encoding and behavior checks; preserve them in Rust assembler tests before removal. |
-| [`tests/test_assembler_coverage.py`](../tests/test_assembler_coverage.py) | Test/helper — retain for coverage | Additional Python assembler cases; port any cases not covered by `rust/src/assembler.rs` tests. |
-| [`tests/test_bios.py`](../tests/test_bios.py) | Test/helper — retain for coverage | Python BIOS discovery, selection, and boot behaviors; ensure Rust runtime tests cover the same cases. |
-| [`tests/test_c_compiler.py`](../tests/test_c_compiler.py) | Test/helper — retain for coverage | Python compiler behavior; move supported-language and diagnostic cases to Rust tests as the Rust compiler replaces it. |
-| [`tests/test_console_device.py`](../tests/test_console_device.py) | Test/helper — retain for coverage | Python emulator and Tk console-window integration remain; Rust unit tests now cover console MMIO buffering, bounds, text rendering state, and scrollback. |
-| [`tests/test_display.py`](../tests/test_display.py) | Test/helper — retain for coverage | Pygame display rendering and emulator integration; replace with Rust runtime/frame tests. |
-| [`tests/test_extended_opcodes.py`](../tests/test_extended_opcodes.py) | Test/helper — retain for coverage | Extended ISA execution and graphics behavior; confirm Rust CPU coverage, then move remaining graphics cases to Rust. |
-| [`tests/test_gpu_games.py`](../tests/test_gpu_games.py) | Test/helper — retain for coverage | Game-level GPU behavior through the Python emulator; replace with Rust CPU/runtime integration tests. |
-| [`tests/test_hertta3d.py`](../tests/test_hertta3d.py) | Test/helper — retain for coverage | Hertta3D game integration through the Python harness; port equivalent execution/render checks to Rust. |
-| [`tests/test_isa_opcodes.py`](../tests/test_isa_opcodes.py) | Test/helper — retain for coverage | Exhaustive Python assembler/CPU opcode combinations; migrate uncovered combinations to Rust assembler and CPU tests. |
-| [`tests/test_net.py`](../tests/test_net.py) | Test/helper — retain for coverage | Python transport and emulator networking integration; retain/port end-to-end coverage using the Rust networking path. |
-| [`tests/test_spacecave.py`](../tests/test_spacecave.py) | Test/helper — retain for coverage | Spacecave network/game integration through Python CPU and transport; replace with Rust integration coverage. |
-| [`tests/test_storage_bios.py`](../tests/test_storage_bios.py) | Test/helper — retain for coverage | Python disk and BIOS integration, including behaviors that need parity checks against Rust storage/runtime. |
-| [`tests/test_tank16.py`](../tests/test_tank16.py) | Test/helper — retain for coverage | Tank-16 gameplay integration still uses the Python emulator/compiler, but map and asset operations now run through Rust CLI commands. |
+- [ ] **Remove [tests/__init__.py](../tests/__init__.py)** — package marker.
+  - Why it remains: current Python test imports need it until the Python test suite is retired.
+- [ ] **Replace [tests/gfx_harness.py](../tests/gfx_harness.py)** — shared test helper.
+  - Coverage to preserve: Pygame/Python-emulator graphics and game integration; use a Rust runtime harness or captured Rust frames.
+- [ ] **Port [tests/test_assembler.py](../tests/test_assembler.py)** — assembler coverage.
+  - Coverage to preserve: assembler encoding and behavior checks in Rust assembler tests.
+- [ ] **Port [tests/test_assembler_coverage.py](../tests/test_assembler_coverage.py)** — assembler coverage.
+  - Coverage to preserve: Python assembler cases not yet covered by `rust/src/assembler.rs`.
+- [ ] **Port [tests/test_bios.py](../tests/test_bios.py)** — BIOS/runtime coverage.
+  - Coverage to preserve: BIOS discovery, selection, and boot behaviors in Rust runtime tests.
+- [ ] **Port [tests/test_c_compiler.py](../tests/test_c_compiler.py)** — compiler coverage.
+  - Coverage to preserve: supported-language behavior and diagnostics as the Rust compiler replaces Python.
+- [ ] **Port [tests/test_console_device.py](../tests/test_console_device.py)** — console coverage.
+  - Coverage to preserve: Python emulator and Tk console-window integration; Rust already tests MMIO buffering, bounds, text rendering state, and scrollback.
+- [ ] **Port [tests/test_display.py](../tests/test_display.py)** — display coverage.
+  - Coverage to preserve: Pygame display rendering and emulator integration through Rust runtime/frame tests.
+- [ ] **Port [tests/test_extended_opcodes.py](../tests/test_extended_opcodes.py)** — ISA/graphics coverage.
+  - Coverage to preserve: confirm Rust CPU coverage and move any remaining graphics cases.
+- [ ] **Port [tests/test_gpu_games.py](../tests/test_gpu_games.py)** — game/GPU coverage.
+  - Coverage to preserve: game-level GPU behavior through Rust CPU/runtime integration tests.
+- [ ] **Port [tests/test_hertta3d.py](../tests/test_hertta3d.py)** — game/render coverage.
+  - Coverage to preserve: Hertta3D execution and rendering through Rust.
+- [ ] **Port [tests/test_isa_opcodes.py](../tests/test_isa_opcodes.py)** — ISA coverage.
+  - Coverage to preserve: migrate uncovered assembler/CPU opcode combinations to Rust.
+- [ ] **Port [tests/test_net.py](../tests/test_net.py)** — networking coverage.
+  - Coverage to preserve: end-to-end coverage through the Rust networking path.
+- [ ] **Port [tests/test_spacecave.py](../tests/test_spacecave.py)** — network/game coverage.
+  - Coverage to preserve: Spacecave integration through the Rust CPU and transport.
+- [ ] **Port [tests/test_storage_bios.py](../tests/test_storage_bios.py)** — storage/BIOS coverage.
+  - Coverage to preserve: parity behaviors through Rust storage and runtime.
+- [ ] **Port [tests/test_tank16.py](../tests/test_tank16.py)** — Tank-16 gameplay coverage.
+  - Coverage to preserve: gameplay currently uses the Python emulator/compiler; map and asset operations already use Rust CLI commands.
 
 ## Ordered migration tasks
 
@@ -112,20 +133,19 @@ Complete tasks in order unless a task is explicitly independent. Do not remove a
 Python implementation until the Rust replacement is used by the actual entry
 point and its required tests pass.
 
-1. **Finish Rust module compilation and program loading.**
-   - Complete the C subset required by the repository's runnable modules in
+- [ ] **Finish Rust module compilation and program loading.**
+   - [ ] Complete the C subset required by the repository's runnable modules in
      `rust/src/c_compiler.rs`; use the Rust assembler rather than
      `tools/assembler.py`.
-   - Reproduce the remaining useful `src/program_loader.py` behavior. Its
+   - [ ] Reproduce the remaining useful `src/program_loader.py` behavior. Its
      Tank-16 dynamic-asset path now delegates to the Rust `sc16tank` CLI.
-   - `sc16build smoke-modules` now discovers modules and orchestrates this
-     build check; C translation remains delegated to the retained Python
-     compiler.
-   - Gate deletion of `tools/c_compiler.py`, `tools/assembler.py`, and
+   - [x] Add Rust discovery/orchestration in `sc16build smoke-modules`.
+     C translation remains delegated to the retained Python compiler.
+   - [ ] Gate deletion of `tools/c_compiler.py`, `tools/assembler.py`, and
      `src/program_loader.py` on builds of selected real module programs and
      migrated regression tests.
 
-2. **Port and route the Tank-16 map/asset workflow through Rust.**
+- [x] **Port and route the Tank-16 map/asset workflow through Rust.**
    - Rust now owns map data validation, editing, runtime encoding, asset
      generation, and the graphical editor.
    - Use `sc16objects` for object-atlas generation; small rasterization
@@ -139,45 +159,45 @@ point and its required tests pass.
    - Finland map metadata/encoding, validation, atlas extension, GeoJSON
      generation, and 100x100 tilemap upload are covered by Rust tests.
 
-3. **Close Rust emulator/device parity and switch the default workflows.**
-   - Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,
+- [ ] **Close Rust emulator/device parity and switch the default workflows.**
+   - [ ] Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,
      `src/lib_disk.py`, `src/isa.py`, and `tools/sc16net.py` with the Rust
      CPU/runtime/device implementations. The optional Python Numba JIT has
      been removed; the Rust CPU is the primary execution engine.
-   - Rust now provides the console MMIO buffers and text/scrollback state.
-     Retire the Python Tk terminal, console logging, and emulator integration
-     alongside the Python emulator.
-   - Fill remaining behavior gaps and move BIOS, storage, ISA, graphics, and
+   - [ ] Retire the Python Tk terminal, console logging, and emulator
+     integration alongside the Python emulator. Rust already provides console
+     MMIO buffers and text/scrollback state.
+   - [ ] Fill remaining behavior gaps and move BIOS, storage, ISA, graphics, and
      networking regressions into Rust tests.
-   - Switch launch scripts, build commands, and user documentation to Rust;
+   - [ ] Switch launch scripts, build commands, and user documentation to Rust;
      verify supported games and BIOS modules without Python.
-   - Retire the Python emulator and then remove its now-unused support modules.
+   - [ ] Retire the Python emulator and then remove its now-unused support modules.
 
-4. **Migrate Python test harnesses and integration coverage.**
-   - Replace `tests/gfx_harness.py` with Rust test helpers and convert
+- [ ] **Migrate Python test harnesses and integration coverage.**
+   - [ ] Replace `tests/gfx_harness.py` with Rust test helpers and convert
      emulator-dependent tests (`test_display`, `test_extended_opcodes`,
      `test_gpu_games`, `test_hertta3d`, `test_net`,
      `test_spacecave`, `test_storage_bios`, and `test_tank16`) to Rust coverage.
-   - Move assembler/compiler/BIOS and map validation cases into their relevant
+   - [ ] Move assembler/compiler/BIOS cases into their relevant
      Rust test modules; keep tests for behaviors until they are ported or
      explicitly retired.
-   - Remove the Python test package markers when no Python tests remain.
+   - [ ] Remove the Python test package markers when no Python tests remain.
 
-5. **Resolve optional authoring and gallery utilities.**
-   - The README gallery generator now runs the Rust CPU and writes GIFs in
-     Rust; it uses the retained Python C compiler only for source translation.
-   - Decide and document whether the remaining Python developer utilities are
+- [ ] **Resolve optional authoring and gallery utilities.**
+   - [x] Port the README gallery generator to Rust; source translation uses
+     the retained Python C compiler.
+   - [ ] Decide and document whether the remaining Python developer utilities are
      required in the Rust-only workflow.
 
 ## Completion criteria
 
-- All supported emulator, BIOS, compiler, networking, storage, and module
+- [ ] All supported emulator, BIOS, compiler, networking, storage, and module
   workflows use Rust.
-- Required Python runtime/build entry points and their Python-only dependencies
+- [ ] Required Python runtime/build entry points and their Python-only dependencies
   have been removed; optional authoring tools have an explicit disposition.
-- Rust tests cover the retained behavior, including module build and Tank-16
+- [ ] Rust tests cover the retained behavior, including module build and Tank-16
   runtime map/assets.
-- Documentation and examples no longer direct users to removed Python
+- [ ] Documentation and examples no longer direct users to removed Python
   commands.
-- The remaining Python-file inventory is empty, or every intentionally retained
+- [ ] The remaining Python-file inventory is empty, or every intentionally retained
   file is explicitly called out as an accepted exception.
