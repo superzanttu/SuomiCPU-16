@@ -134,6 +134,8 @@ considered migration.
   - [x] Infer one-dimensional global and automatic array bounds from brace
         initializers and character string literals; reject incomplete arrays
         whose size cannot be inferred.
+  - [x] Compile row-major global and automatic multidimensional arrays with
+        nested brace initializers, reads, writes, and inferred total storage.
 - [x] **Port console-device state/MMIO coverage from [tests/test_console_device.py](../tests/test_console_device.py) to Rust.**
   - Rust tests cover FIFO/echo control, poll yielding, input bounds/overrun,
     fixed text rows, scrollback, wrapping, and history reset.

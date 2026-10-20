@@ -70,7 +70,8 @@ Passing the Rust build or parser tests does not establish feature parity.
   `void` helpers with parameter passing, direct/recursive calls, local `int`
   variables and scalar initializers, fixed-size automatic `int`, `char`,
   `signed char`, and `unsigned char` arrays with stack frames, byte-accurate
-  indexing, brace initialization, and fitting character-string initialization
+  indexing, including row-major multidimensional indexing and nested brace
+  initialization, and fitting character-string initialization
   for global and automatic arrays, initialized and zero-initialized scalar
   global integers, brace-initialized global integer arrays, and indexed global-
   array reads and writes. Fixed-size global `char`, `signed char`, and

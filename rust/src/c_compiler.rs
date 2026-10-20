@@ -81,6 +81,7 @@ pub struct Declaration {
     pub c_type: String,
     pub name: String,
     pub array_length: Option<usize>,
+    pub array_dimensions: Vec<usize>,
     pub initializer: Option<Expression>,
 }
 
@@ -95,6 +96,18 @@ fn infer_incomplete_array_length(c_type: &str, initializer: &Expression) -> Opti
             decode_string_token(value)?.len().checked_add(1)
         }
         _ => None,
+    }
+}
+
+fn flatten_initializer_values(expression: &Expression) -> Option<Vec<&Expression>> {
+    match &expression.kind {
+        ExpressionKind::InitializerList(values) => {
+            values.iter().try_fold(Vec::new(), |mut flattened, value| {
+                flattened.extend(flatten_initializer_values(value)?);
+                Some(flattened)
+            })
+        }
+        _ => Some(vec![scalar_initializer(expression)?]),
     }
 }
 
@@ -182,19 +195,21 @@ pub struct TranslationUnit {
     pub enumerators: HashMap<String, i64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum NativeLocation {
     Register(u8),
     Constant(i64),
     GlobalScalar,
     GlobalArray {
         length: usize,
+        dimensions: Vec<usize>,
         element_size: usize,
         element_signed: bool,
     },
     StackArray {
         offset: usize,
         length: usize,
+        dimensions: Vec<usize>,
         element_size: usize,
         element_signed: bool,
     },
@@ -204,6 +219,7 @@ struct NativeGlobal {
     name: String,
     data: Vec<u8>,
     is_array: bool,
+    array_dimensions: Vec<usize>,
     element_size: usize,
     element_signed: bool,
 }
@@ -434,22 +450,26 @@ pub fn compile_minimal_program(
                     if let ExpressionKind::Atom(value) = &initializer.kind
                         && let Some(bytes) = decode_string_token(value)
                     {
-                        if !is_array || element_size != 1 || bytes.len() > element_count {
+                        if !is_array
+                            || global.array_dimensions.len() != 1
+                            || element_size != 1
+                            || bytes.len() > element_count
+                        {
                             return Ok(None);
                         }
                         data[..bytes.len()].copy_from_slice(&bytes);
                     } else {
                         let values = if is_array {
-                            let ExpressionKind::InitializerList(values) = &initializer.kind else {
+                            if !matches!(&initializer.kind, ExpressionKind::InitializerList(_)) {
+                                return Ok(None);
+                            }
+                            let Some(values) = flatten_initializer_values(initializer) else {
                                 return Ok(None);
                             };
                             if values.len() > element_count {
                                 return Ok(None);
                             }
-                            values
-                                .iter()
-                                .map(scalar_initializer)
-                                .collect::<Option<Vec<_>>>()
+                            Some(values)
                         } else {
                             scalar_initializer(initializer).map(|value| vec![value])
                         };
@@ -476,6 +496,7 @@ pub fn compile_minimal_program(
                     name: global.name.clone(),
                     data,
                     is_array,
+                    array_dimensions: global.array_dimensions.clone(),
                     element_size,
                     element_signed,
                 });
@@ -582,6 +603,7 @@ pub fn compile_minimal_program(
                 .or_insert(if global.is_array {
                     NativeLocation::GlobalArray {
                         length: global.data.len() / global.element_size,
+                        dimensions: global.array_dimensions.clone(),
                         element_size: global.element_size,
                         element_signed: global.element_signed,
                     }
@@ -821,6 +843,7 @@ fn collect_native_locals(
                             NativeLocation::StackArray {
                                 offset: *frame_size,
                                 length,
+                                dimensions: declaration.array_dimensions.clone(),
                                 element_size,
                                 element_signed,
                             },
@@ -1156,6 +1179,76 @@ fn emit_native_array_address(
     }
     assembly.push_str(&format!("    ADD R7, R{index_register}\n"));
     Some((element_size, element_signed))
+}
+
+fn collect_native_array_indices<'a>(
+    expression: &'a Expression,
+    indices: &mut Vec<&'a Expression>,
+) -> Option<&'a str> {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => Some(name),
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let name = collect_native_array_indices(base, indices)?;
+            indices.push(index);
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+fn emit_native_array_element_address(
+    base: &Expression,
+    index: &Expression,
+    index_destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<(usize, bool)> {
+    let mut indices = Vec::new();
+    let name = collect_native_array_indices(base, &mut indices)?;
+    indices.push(index);
+    let dimensions = match locals.get(name)? {
+        NativeLocation::GlobalArray { dimensions, .. }
+        | NativeLocation::StackArray { dimensions, .. } => dimensions,
+        _ => return None,
+    };
+    if indices.len() != dimensions.len() || indices.is_empty() {
+        return None;
+    }
+    if !emit_native_expression(
+        indices[0],
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    ) {
+        return None;
+    }
+    for (index, dimension) in indices.iter().enumerate().skip(1) {
+        let (&index_register, remaining_registers) = temporary_registers.split_first()?;
+        assembly.push_str(&format!("    PUSH R{index_destination}\n"));
+        if !emit_native_expression(
+            dimension,
+            index_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return None;
+        }
+        assembly.push_str(&format!(
+            "    POP R{index_destination}\n    LDI R7, {}\n\
+             MUL R{index_destination}, R7\n    ADD R{index_destination}, R{index_register}\n",
+            dimensions[index]
+        ));
+    }
+    emit_native_array_address(name, index_destination, locals, assembly)
 }
 
 fn decode_string_token(value: &str) -> Option<Vec<u8>> {
@@ -1594,25 +1687,22 @@ fn emit_native_expression(
                 assembly,
             )
         }
-        ExpressionKind::Index { expression, index } => {
-            let ExpressionKind::Atom(name) = &expression.kind else {
-                return false;
-            };
-            if destination == 7
-                || !emit_native_expression(
-                    index,
-                    destination,
-                    temporary_registers,
-                    locals,
-                    label_counter,
-                    assembly,
-                )
-            {
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            if destination == 7 {
                 return false;
             }
-            let Some((element_size, element_signed)) =
-                emit_native_array_address(name, destination, locals, assembly)
-            else {
+            let Some((element_size, element_signed)) = emit_native_array_element_address(
+                base,
+                index,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) else {
                 return false;
             };
             assembly.push_str(&format!(
@@ -1718,9 +1808,6 @@ fn emit_native_assignment(
         index,
     } = &target.kind
     {
-        let ExpressionKind::Atom(name) = &base.kind else {
-            return false;
-        };
         let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
             return false;
         };
@@ -1734,12 +1821,15 @@ fn emit_native_assignment(
         ) {
             return false;
         }
-        if !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly) {
-            return false;
-        }
-        let Some((element_size, element_signed)) =
-            emit_native_array_address(name, 0, locals, assembly)
-        else {
+        let Some((element_size, element_signed)) = emit_native_array_element_address(
+            base,
+            index,
+            0,
+            &[5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+        ) else {
             return false;
         };
         let (load, store) = if element_size == 1 {
@@ -1859,7 +1949,11 @@ fn emit_native_statement(
                         if let ExpressionKind::Atom(string_token) = &initializer.kind
                             && let Some(bytes) = decode_string_token(string_token)
                         {
-                            if *element_size != 1 || bytes.len() > *length || *length > 512 {
+                            if declaration.array_dimensions.len() != 1
+                                || *element_size != 1
+                                || bytes.len() > *length
+                                || *length > 512
+                            {
                                 return None;
                             }
                             for index in 0..*length {
@@ -1872,15 +1966,15 @@ fn emit_native_statement(
                                 assembly.push_str("    ST R7, R4\n");
                             }
                         } else {
-                            let ExpressionKind::InitializerList(values) = &initializer.kind else {
+                            if !matches!(&initializer.kind, ExpressionKind::InitializerList(_)) {
                                 return None;
-                            };
+                            }
+                            let values = flatten_initializer_values(initializer)?;
                             if values.len() > *length || *length > 512 {
                                 return None;
                             }
                             for index in 0..*length {
-                                if let Some(value) = values.get(index).and_then(scalar_initializer)
-                                {
+                                if let Some(value) = values.get(index) {
                                     if !emit_native_expression(
                                         value,
                                         4,
@@ -2300,15 +2394,15 @@ fn emit_native_update(
         index,
     } = &expression.kind
     {
-        let ExpressionKind::Atom(name) = &base.kind else {
-            return false;
-        };
-        if !emit_native_expression(index, 0, &[5, 6, 7], locals, label_counter, assembly) {
-            return false;
-        }
-        let Some((element_size, element_signed)) =
-            emit_native_array_address(name, 0, locals, assembly)
-        else {
+        let Some((element_size, element_signed)) = emit_native_array_element_address(
+            base,
+            index,
+            0,
+            &[5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+        ) else {
             return false;
         };
         let (load, store) = if element_size == 1 {
@@ -2353,6 +2447,7 @@ pub struct StatementParser {
 pub struct TranslationUnitParser {
     statements: StatementParser,
     enumerators: HashMap<String, i64>,
+    anonymous_record_counter: usize,
 }
 
 const ASSIGNMENTS: [&str; 11] = [
@@ -3056,7 +3151,11 @@ impl StatementParser {
         ) {
             self.expressions.advance();
         }
-        let base_type = if self.accept("enum").is_some() {
+        let base_type = if matches!(self.expressions.token().value.as_str(), "struct" | "union") {
+            let kind = self.expressions.advance().value;
+            let tag = self.expect_identifier("expected a record tag")?;
+            format!("{kind} {}", tag.value)
+        } else if self.accept("enum").is_some() {
             self.expect_identifier("expected an enum tag")?;
             "int".to_owned()
         } else if let Some(alias) = self
@@ -3095,13 +3194,18 @@ impl StatementParser {
                 }
             }
             let name = self.expect_identifier("expected a variable name")?;
-            let array_length = self.parse_array_suffix()?;
+            let mut array_dimensions = self.parse_array_dimensions()?;
             let initializer = if self.accept("=").is_some() {
                 Some(self.parse_initializer()?)
             } else {
                 None
             };
-            let array_length = if array_length == Some(INCOMPLETE_ARRAY_LENGTH) {
+            if array_dimensions.first() == Some(&INCOMPLETE_ARRAY_LENGTH) {
+                if array_dimensions.len() != 1 {
+                    return Err(self.expressions.fail(
+                        "incomplete outer arrays with additional dimensions are not supported",
+                    ));
+                }
                 let Some(length) = initializer
                     .as_ref()
                     .and_then(|initializer| infer_incomplete_array_length(&c_type, initializer))
@@ -3119,14 +3223,23 @@ impl StatementParser {
                         "array size must be greater than zero",
                     ));
                 }
-                Some(length)
+                array_dimensions[0] = length;
+            }
+            let array_length = if array_dimensions.is_empty() {
+                None
             } else {
-                array_length
+                Some(
+                    array_dimensions
+                        .iter()
+                        .try_fold(1usize, |size, dimension| size.checked_mul(*dimension))
+                        .ok_or_else(|| self.expressions.fail("array size is too large"))?,
+                )
             };
             declarations.push(Declaration {
                 c_type,
                 name: name.value,
                 array_length,
+                array_dimensions,
                 initializer,
             });
             if self.accept(",").is_none() {
@@ -3137,23 +3250,25 @@ impl StatementParser {
         Ok(self.statement(&start, StatementKind::Declaration(declarations)))
     }
 
-    fn parse_array_suffix(&mut self) -> Result<Option<usize>, CCompilerError> {
-        if self.accept("[").is_none() {
-            return Ok(None);
+    fn parse_array_dimensions(&mut self) -> Result<Vec<usize>, CCompilerError> {
+        let mut dimensions = Vec::new();
+        while self.accept("[").is_some() {
+            if self.accept("]").is_some() {
+                dimensions.push(INCOMPLETE_ARRAY_LENGTH);
+                continue;
+            }
+            let expression = self.expressions.parse_expression(0)?;
+            self.expect("]")?;
+            let value = evaluate_integer_constant_with_names(&expression, &self.enum_values)?;
+            dimensions.push(usize::try_from(value).map_err(|_| {
+                error(
+                    expression.filename.as_deref().unwrap_or("<source>"),
+                    expression.line,
+                    "array length must be a non-negative integer constant",
+                )
+            })?);
         }
-        if self.accept("]").is_some() {
-            return Ok(Some(INCOMPLETE_ARRAY_LENGTH));
-        }
-        let expression = self.expressions.parse_expression(0)?;
-        self.expect("]")?;
-        let value = evaluate_integer_constant_with_names(&expression, &self.enum_values)?;
-        usize::try_from(value).map(Some).map_err(|_| {
-            error(
-                expression.filename.as_deref().unwrap_or("<source>"),
-                expression.line,
-                "array length must be a non-negative integer constant",
-            )
-        })
+        Ok(dimensions)
     }
 }
 
@@ -3162,6 +3277,7 @@ impl TranslationUnitParser {
         Self {
             statements: StatementParser::new(tokens),
             enumerators: HashMap::new(),
+            anonymous_record_counter: 0,
         }
     }
 
@@ -3222,13 +3338,20 @@ impl TranslationUnitParser {
         let mut globals = Vec::new();
         let mut next = Some((declarator_type, name));
         while let Some((declarator_type, name)) = next.take() {
-            let array_length = self.parse_array_suffix()?;
+            let mut array_dimensions = self.parse_array_dimensions()?;
             let initializer = if self.statements.accept("=").is_some() {
                 Some(self.statements.parse_initializer()?)
             } else {
                 None
             };
-            let array_length = if array_length == Some(INCOMPLETE_ARRAY_LENGTH) {
+            if array_dimensions.first() == Some(&INCOMPLETE_ARRAY_LENGTH) {
+                if array_dimensions.len() != 1 {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "incomplete outer arrays with additional dimensions are not supported",
+                    ));
+                }
                 let Some(length) = initializer.as_ref().and_then(|initializer| {
                     infer_incomplete_array_length(&declarator_type, initializer)
                 }) else {
@@ -3245,9 +3368,23 @@ impl TranslationUnitParser {
                         "array size must be greater than zero",
                     ));
                 }
-                Some(length)
+                array_dimensions[0] = length;
+            }
+            let array_length = if array_dimensions.is_empty() {
+                None
             } else {
-                array_length
+                Some(
+                    array_dimensions
+                        .iter()
+                        .try_fold(1usize, |size, dimension| size.checked_mul(*dimension))
+                        .ok_or_else(|| {
+                            error(
+                                name.filename.as_deref().unwrap_or("<source>"),
+                                name.line,
+                                "array size is too large",
+                            )
+                        })?,
+                )
             };
             if is_typedef {
                 if array_length.is_some() || initializer.is_some() {
@@ -3288,6 +3425,7 @@ impl TranslationUnitParser {
                     c_type: declarator_type.clone(),
                     name: name.value.clone(),
                     array_length,
+                    array_dimensions,
                     initializer,
                 }));
             }
@@ -3327,6 +3465,44 @@ impl TranslationUnitParser {
             };
             return Ok((c_type, storage_class));
         }
+        if matches!(
+            self.statements.expressions.token().value.as_str(),
+            "struct" | "union"
+        ) {
+            let kind = self.statements.expressions.advance().value;
+            let tag = if self.statements.at("{") {
+                None
+            } else {
+                Some(
+                    self.statements
+                        .expect_identifier("expected a record tag or body")?
+                        .value,
+                )
+            };
+            let record_name = if let Some(tag) = tag {
+                tag
+            } else {
+                self.anonymous_record_counter += 1;
+                format!("__anonymous_{}", self.anonymous_record_counter)
+            };
+            if self.statements.accept("{").is_some() {
+                self.parse_record_members()?;
+            } else if record_name.starts_with("__anonymous_") {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("expected a record tag or body"));
+            }
+            let c_type = format!("{kind} {record_name}");
+            return Ok((
+                if qualifiers.is_empty() {
+                    c_type
+                } else {
+                    format!("{} {c_type}", qualifiers.join(" "))
+                },
+                storage_class,
+            ));
+        }
         if let Some(alias) = self
             .statements
             .expressions
@@ -3362,6 +3538,63 @@ impl TranslationUnitParser {
             c_type = format!("{} {c_type}", qualifiers.join(" "));
         }
         Ok((c_type, storage_class))
+    }
+
+    fn parse_record_members(&mut self) -> Result<(), CCompilerError> {
+        while !self.statements.at("}") {
+            if self.statements.expressions.is_at_end() {
+                return Err(self.statements.expressions.fail("unterminated record body"));
+            }
+            let member_type = if self.statements.accept("enum").is_some() {
+                self.parse_enum_specifier()?;
+                "int".to_owned()
+            } else if let Some(alias) = self
+                .statements
+                .expressions
+                .typedefs
+                .get(&self.statements.expressions.token().value)
+                .cloned()
+            {
+                self.statements.expressions.advance();
+                alias
+            } else {
+                let mut words = Vec::new();
+                while TYPE_WORDS.contains(&self.statements.expressions.token().value.as_str()) {
+                    words.push(self.statements.expressions.advance().value);
+                }
+                if !words.iter().any(|word| {
+                    matches!(
+                        word.as_str(),
+                        "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+                    )
+                }) {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("expected a supported record member type"));
+                }
+                words.join(" ")
+            };
+            loop {
+                while self.statements.accept("*").is_some() {}
+                self.statements
+                    .expect_identifier("expected a record member name")?;
+                self.statements.parse_array_dimensions()?;
+                if self.statements.accept(":").is_some() {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("record bit-fields are not supported"));
+                }
+                if self.statements.accept(",").is_none() {
+                    break;
+                }
+            }
+            self.statements.expect(";")?;
+            let _ = &member_type;
+        }
+        self.statements.expect("}")?;
+        Ok(())
     }
 
     fn parse_enum_specifier(&mut self) -> Result<(), CCompilerError> {
@@ -3452,23 +3685,25 @@ impl TranslationUnitParser {
         Ok((c_type, name))
     }
 
-    fn parse_array_suffix(&mut self) -> Result<Option<usize>, CCompilerError> {
-        if self.statements.accept("[").is_none() {
-            return Ok(None);
+    fn parse_array_dimensions(&mut self) -> Result<Vec<usize>, CCompilerError> {
+        let mut dimensions = Vec::new();
+        while self.statements.accept("[").is_some() {
+            if self.statements.accept("]").is_some() {
+                dimensions.push(INCOMPLETE_ARRAY_LENGTH);
+                continue;
+            }
+            let expression = self.statements.expressions.parse_expression(0)?;
+            self.statements.expect("]")?;
+            let length = evaluate_integer_constant_with_names(&expression, &self.enumerators)?;
+            dimensions.push(usize::try_from(length).map_err(|_| {
+                error(
+                    expression.filename.as_deref().unwrap_or("<source>"),
+                    expression.line,
+                    "array length must be a non-negative integer constant",
+                )
+            })?);
         }
-        if self.statements.accept("]").is_some() {
-            return Ok(Some(INCOMPLETE_ARRAY_LENGTH));
-        }
-        let expression = self.statements.expressions.parse_expression(0)?;
-        self.statements.expect("]")?;
-        let length = evaluate_integer_constant_with_names(&expression, &self.enumerators)?;
-        usize::try_from(length).map(Some).map_err(|_| {
-            error(
-                expression.filename.as_deref().unwrap_or("<source>"),
-                expression.line,
-                "array length must be a non-negative integer constant",
-            )
-        })
+        Ok(dimensions)
     }
 
     fn parse_parameters(&mut self) -> Result<(Vec<FunctionParameter>, bool), CCompilerError> {
@@ -5290,12 +5525,14 @@ mod tests {
                                 c_type: "unsigned int".to_owned(),
                                 name: "count".to_owned(),
                                 array_length: None,
+                                array_dimensions: Vec::new(),
                                 initializer: Some(located_atom("3", 1, "statement.c")),
                             },
                             Declaration {
                                 c_type: "unsigned int*".to_owned(),
                                 name: "pointer".to_owned(),
                                 array_length: None,
+                                array_dimensions: Vec::new(),
                                 initializer: None,
                             },
                         ]),
@@ -5409,12 +5646,14 @@ mod tests {
                         c_type: "unsigned int".to_owned(),
                         name: "counter".to_owned(),
                         array_length: None,
+                        array_dimensions: Vec::new(),
                         initializer: Some(located_atom("3", 1, "unit.c")),
                     }),
                     ExternalDeclaration::Global(Declaration {
                         c_type: "char*".to_owned(),
                         name: "message".to_owned(),
                         array_length: None,
+                        array_dimensions: Vec::new(),
                         initializer: None,
                     }),
                     ExternalDeclaration::FunctionPrototype(FunctionDeclaration {
@@ -5474,6 +5713,39 @@ mod tests {
                 if function.declaration.return_type == "int"
                     && function.declaration.parameters[0].c_type == "int"
                     && function.declaration.name == "identity"
+        ));
+    }
+
+    #[test]
+    fn parses_struct_typedefs_and_record_typed_objects() {
+        let unit = translation_unit(
+            "typedef struct { int x; int y; unsigned char flags[4]; } Vec2; \
+             typedef struct Building { Vec2 position; int inventory; } Building; \
+             Building city[3]; \
+             int main(void) { Building local; return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[..],
+            [ExternalDeclaration::Global(Declaration {
+                c_type,
+                name,
+                array_length: Some(3),
+                ..
+            }), ExternalDeclaration::FunctionDefinition(function)]
+                if c_type == "struct Building"
+                    && name == "city"
+                    && function.declaration.name == "main"
+        ));
+        let ExternalDeclaration::FunctionDefinition(function) = &unit.declarations[1] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &function.body.kind else {
+            panic!("expected function body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].c_type == "struct Building"
         ));
     }
 
@@ -5552,6 +5824,33 @@ mod tests {
             unit.declarations.last(),
             Some(ExternalDeclaration::FunctionDefinition(definition))
                 if definition.declaration.name == "main"
+        ));
+    }
+
+    #[test]
+    fn parses_multidimensional_array_declarators() {
+        let unit = translation_unit(
+            "unsigned char map[15][20]; int main(void) { int values[2][3]; return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[0],
+            ExternalDeclaration::Global(Declaration {
+                array_length: Some(300),
+                array_dimensions,
+                ..
+            }) if array_dimensions == &[15, 20]
+        ));
+        let ExternalDeclaration::FunctionDefinition(main) = &unit.declarations[1] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &main.body.kind else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].array_length == Some(6)
+                    && declarations[0].array_dimensions == [2, 3]
         ));
     }
 
@@ -6033,6 +6332,26 @@ mod tests {
         assert_eq!(cpu.registers[0], 273);
         assert_eq!(&cpu.memory[0x80000..0x80003], &[1, 255, 3]);
         assert_eq!(&cpu.memory[0x80003..0x80006], b"SC\0");
+    }
+
+    #[test]
+    fn compiles_global_and_local_two_dimensional_arrays() {
+        let image = compile_minimal_program(
+            "unsigned char map[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } }; \
+             int main(void) { int values[2][3] = { { 7, 8 }, { 9 } }; \
+                 values[1][2] = map[1][1] + values[0][1]; \
+                 return sizeof(map) + map[1][2] + values[1][2]; }",
+            "two-dimensional-arrays.c",
+        )
+        .unwrap()
+        .expect("supported two-dimensional arrays");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 25);
+        assert_eq!(&cpu.memory[0x80000..0x80006], &[1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
