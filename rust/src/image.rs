@@ -258,6 +258,24 @@ mod tests {
     }
 
     #[test]
+    fn builds_and_runs_factorial_example_with_the_rust_compiler() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join("factorial.c");
+        let image = build_source(&path).unwrap();
+        assert_eq!(image.entry_point, 0);
+        assert!(!image.segments.is_empty());
+
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+        assert_eq!(cpu.read_u16(0x80000), 123);
+    }
+
+    #[test]
     fn rejects_unsupported_c_without_starting_a_python_compiler() {
         let path = std::env::temp_dir().join(format!("sc16-unsupported-{}.c", std::process::id()));
         fs::write(&path, "int main(void) { return calculate_answer(); }").unwrap();

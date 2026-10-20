@@ -1,5 +1,12 @@
 use crate::MemorySegment;
 use crate::image::ProgramImage;
+use crate::isa::{
+    ALU_IMMEDIATE_FLAG, ALU_MISC_OPERATION, ALU_OPERATIONS, ALU_PREFIX, BASE_OPCODES,
+    CLASSIC_EXTENSIONS, FAR_BRANCH_PREFIX, FAR_CONTROL_OPERATIONS, FAR_CONTROL_PREFIX,
+    FLOAT_OPERATIONS, FLOAT_PREFIX, MISC_OPERATIONS, MULDIV_IMMEDIATE_FLAG, MULDIV_OPERATIONS,
+    MULDIV_PREFIX, OP_LDI_H, OP_SHR, WIDE_IMMEDIATE_FLAG, WIDE_OPERATIONS, WIDE_PREFIX,
+    branch_condition, lookup,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -441,13 +448,8 @@ fn extended_instruction(
     line: usize,
     labels: &BTreeMap<String, u32>,
 ) -> Result<Option<Vec<u16>>, AssemblyError> {
-    let (opcode, arguments) = match mnemonic {
-        "JMPX" => (Some(0), 1),
-        "CALLX" => (Some(1), 1),
-        "BZX" => (Some(2), 1),
-        "BCX" => (Some(3), 1),
-        _ => (None, 0),
-    };
+    let opcode = lookup(FAR_CONTROL_OPERATIONS, mnemonic);
+    let arguments = 1;
     if let Some(operation) = opcode {
         if operands.len() != arguments {
             return Err(error(
@@ -466,27 +468,13 @@ fn extended_instruction(
             ));
         }
         return Ok(Some(vec![
-            0xf83e | (operation << 9),
+            FAR_CONTROL_PREFIX | (operation << 9),
             ((target as u32 >> 16) & 0x3fff) as u16,
             target as u16,
         ]));
     }
 
-    let branch = match mnemonic {
-        "BNZX" | "BNZ" => Some(0),
-        "BNCX" | "BNC" => Some(1),
-        "BNX" | "BN" => Some(2),
-        "BNNX" | "BNN" => Some(3),
-        "BVX" | "BV" => Some(4),
-        "BNVX" | "BNV" => Some(5),
-        "BLTX" | "BLT" => Some(6),
-        "BGEX" | "BGE" => Some(7),
-        "BGTX" | "BGT" => Some(8),
-        "BLEX" | "BLE" => Some(9),
-        "BHIX" | "BHI" => Some(10),
-        "BLSX" | "BLS" => Some(11),
-        _ => None,
-    };
+    let branch = branch_condition(mnemonic);
     if let Some(condition) = branch {
         if operands.len() != 1 {
             return Err(error(
@@ -505,31 +493,13 @@ fn extended_instruction(
             ));
         }
         return Ok(Some(vec![
-            0xf80d | (condition << 7),
+            FAR_BRANCH_PREFIX | (condition << 7),
             ((target as u32 >> 16) & 0x3fff) as u16,
             target as u16,
         ]));
     }
 
-    let wide = match mnemonic {
-        "ADD32" => Some(0),
-        "SUB32" => Some(1),
-        "CMP32" => Some(2),
-        "AND32" => Some(3),
-        "OR32" => Some(4),
-        "XOR32" => Some(5),
-        "SHL32" => Some(6),
-        "LSR32" => Some(7),
-        "ASR32" => Some(8),
-        "NEG32" => Some(9),
-        "MOV32" => Some(10),
-        "LD32" => Some(11),
-        "ST32" => Some(12),
-        "MUL32" => Some(13),
-        "DIV32" | "DIV32S" => Some(14),
-        "MOD32" | "MOD32S" => Some(15),
-        _ => None,
-    };
+    let wide = lookup(WIDE_OPERATIONS, mnemonic);
     if let Some(operation) = wide {
         let unary = mnemonic == "NEG32";
         if operands.len() != if unary { 1 } else { 2 } {
@@ -568,7 +538,7 @@ fn extended_instruction(
                     format!("{mnemonic} shift count must be between 0 and 31"),
                 ));
             }
-            control |= 0x0800;
+            control |= WIDE_IMMEDIATE_FLAG;
             shift as u16
         } else {
             let source = register(operands[1], line)?;
@@ -579,28 +549,17 @@ fn extended_instruction(
                 ));
             }
             if matches!(mnemonic, "DIV32S" | "MOD32S") {
-                control |= 0x0800;
+                control |= WIDE_IMMEDIATE_FLAG;
             }
             source
         };
-        return Ok(Some(vec![0xf81a | (destination << 8), control | source]));
+        return Ok(Some(vec![
+            0xf800 | (destination << 8) | WIDE_PREFIX,
+            control | source,
+        ]));
     }
 
-    let muldiv = match mnemonic {
-        "MUL" => Some(0),
-        "MULHU" => Some(1),
-        "MULHS" => Some(2),
-        "DIV" => Some(3),
-        "DIVS" => Some(4),
-        "MOD" => Some(5),
-        "MODS" => Some(6),
-        "LDI19" | "LDI30" | "LDA" => Some(7),
-        "LDP" => Some(8),
-        "STP" => Some(9),
-        "SPLIT30" => Some(10),
-        "JOIN30" => Some(11),
-        _ => None,
-    };
+    let muldiv = lookup(MULDIV_OPERATIONS, mnemonic).or_else(|| (mnemonic == "LDA").then_some(7));
     if let Some(operation) = muldiv {
         if operands.len() != 2 {
             return Err(error(
@@ -609,7 +568,7 @@ fn extended_instruction(
             ));
         }
         let destination = register(operands[0], line)?;
-        let first = 0xf81e | (destination << 8);
+        let first = 0xf800 | (destination << 8) | MULDIV_PREFIX;
         let control = operation << 12;
         if operation == 7 {
             let target = labels.get(operands[1]).map_or_else(
@@ -645,44 +604,14 @@ fn extended_instruction(
                 format!("{mnemonic} immediate must fit in 16 bits"),
             ));
         }
-        return Ok(Some(vec![first, control | 0x0800, immediate as u16]));
+        return Ok(Some(vec![
+            first,
+            control | MULDIV_IMMEDIATE_FLAG,
+            immediate as u16,
+        ]));
     }
 
-    let float = match mnemonic {
-        "F32ADD" => Some(0),
-        "F32SUB" => Some(1),
-        "F32MUL" => Some(2),
-        "F32DIV" => Some(3),
-        "F32CMP" => Some(4),
-        "F64ADD" => Some(5),
-        "F64SUB" => Some(6),
-        "F64MUL" => Some(7),
-        "F64DIV" => Some(8),
-        "F64CMP" => Some(9),
-        "I16TOF32" => Some(10),
-        "U16TOF32" => Some(11),
-        "I32TOF32" => Some(12),
-        "U32TOF32" => Some(13),
-        "I16TOF64" => Some(14),
-        "U16TOF64" => Some(15),
-        "I32TOF64" => Some(16),
-        "U32TOF64" => Some(17),
-        "F32TOF64" => Some(18),
-        "F64TOF32" => Some(19),
-        "F32NEG" => Some(20),
-        "F64NEG" => Some(21),
-        "F32SQRT" => Some(22),
-        "F64SQRT" => Some(23),
-        "F32TOI16" => Some(24),
-        "F32TOU16" => Some(25),
-        "F32TOI32" => Some(26),
-        "F32TOU32" => Some(27),
-        "F64TOI16" => Some(28),
-        "F64TOU16" => Some(29),
-        "F64TOI32" => Some(30),
-        "F64TOU32" => Some(31),
-        _ => None,
-    };
+    let float = lookup(FLOAT_OPERATIONS, mnemonic);
     if let Some(action) = float {
         let unary = (20..=23).contains(&action);
         if operands.len() != if unary { 1 } else { 2 } {
@@ -740,22 +669,14 @@ fn extended_instruction(
             }
         }
         return Ok(Some(vec![
-            0xf81b | (destination << 8),
+            0xf800 | (destination << 8) | FLOAT_PREFIX,
             (action << 11) | source,
         ]));
     }
 
-    let classic_extension = match mnemonic {
-        "MOVSP" => Some((0, false)),
-        "FADD" => Some((1, true)),
-        "FSUB" => Some((2, true)),
-        "FMUL" => Some((3, true)),
-        "FDIV" => Some((4, true)),
-        "FCMP" => Some((5, true)),
-        "ITOF" => Some((6, false)),
-        "FTOI" => Some((7, false)),
-        _ => None,
-    };
+    let classic_extension = CLASSIC_EXTENSIONS
+        .iter()
+        .find_map(|(name, value)| (*name == mnemonic).then_some(*value));
     if let Some((operation, binary)) = classic_extension {
         if binary && operands.len() != 2 || !binary && operands.len() != 1 {
             return Err(error(
@@ -768,11 +689,11 @@ fn extended_instruction(
         }
         let destination = register(operands[0], line)?;
         let word = if mnemonic == "MOVSP" {
-            (0x1f << 11) | (destination << 8) | (7 << 2)
+            (OP_SHR << 11) | (destination << 8) | (7 << 2)
         } else if matches!(mnemonic, "ITOF" | "FTOI") {
-            (0x1f << 11) | (operation << 5) | (destination << 8)
+            (OP_SHR << 11) | (operation << 5) | (destination << 8)
         } else {
-            (0x1f << 11)
+            (OP_SHR << 11)
                 | (destination << 8)
                 | (operation << 5)
                 | (register(operands[1], line)? << 2)
@@ -785,24 +706,7 @@ fn extended_instruction(
     } else {
         (mnemonic, operands)
     };
-    let alu_operation = match alu_name {
-        "SHL" => Some(0),
-        "LSR" => Some(1),
-        "ASR" => Some(2),
-        "ROL" => Some(3),
-        "ROR" => Some(4),
-        "ADC" => Some(5),
-        "SBC" => Some(6),
-        "NEG" => Some(7),
-        "TEST" => Some(8),
-        "ADD" => Some(9),
-        "SUB" => Some(10),
-        "AND" => Some(11),
-        "OR" => Some(12),
-        "XOR" => Some(13),
-        "CMP" => Some(14),
-        _ => None,
-    };
+    let alu_operation = lookup(ALU_OPERATIONS, alu_name);
     if let Some(operation) = alu_operation
         && (matches!(
             alu_name,
@@ -820,7 +724,7 @@ fn extended_instruction(
         }
         let destination = register(operands[0], line)?;
         let mut control = operation << 12;
-        let mut words = vec![0xf81f | (destination << 8)];
+        let mut words = vec![0xf800 | (destination << 8) | ALU_PREFIX];
         if alu_name == "NEG" {
             words.push(control);
         } else if matches!(
@@ -852,7 +756,7 @@ fn extended_instruction(
                         format!("{alu_name} shift count must be between 0 and 15"),
                     ));
                 }
-                words.push(control | 0x0800 | immediate as u16);
+                words.push(control | ALU_IMMEDIATE_FLAG | immediate as u16);
             } else {
                 if !(-0x8000..=0xffff).contains(&immediate) {
                     return Err(error(
@@ -860,7 +764,7 @@ fn extended_instruction(
                         format!("{alu_name} immediate must fit in 16 bits"),
                     ));
                 }
-                control |= 0x0800;
+                control |= ALU_IMMEDIATE_FLAG;
                 words.push(control);
                 words.push(immediate as u16);
             }
@@ -868,23 +772,7 @@ fn extended_instruction(
         return Ok(Some(words));
     }
 
-    let misc = match mnemonic {
-        "SWAP" => Some(0),
-        "SEXT" => Some(1),
-        "JMPR" => Some(2),
-        "CALLR" => Some(3),
-        "PUSHF" => Some(4),
-        "POPF" => Some(5),
-        "SETC" => Some(6),
-        "CLC" => Some(7),
-        "SETSP" => Some(8),
-        "CLZ" => Some(9),
-        "MOVSPH" => Some(10),
-        "CALLRP" => Some(11),
-        "JMPRP" => Some(12),
-        "SETSPH" => Some(13),
-        _ => None,
-    };
+    let misc = lookup(MISC_OPERATIONS, mnemonic);
     if let Some(operation) = misc {
         let pair_call = matches!(mnemonic, "CALLRP" | "JMPRP");
         let expected = if pair_call {
@@ -905,11 +793,14 @@ fn extended_instruction(
         } else {
             register(operands[0], line)?
         };
-        let mut control = (15 << 12) | operation;
+        let mut control = (ALU_MISC_OPERATION << 12) | operation;
         if pair_call {
             control |= register(operands[1], line)? << 9;
         }
-        return Ok(Some(vec![0xf81f | (destination << 8), control]));
+        return Ok(Some(vec![
+            0xf800 | (destination << 8) | ALU_PREFIX,
+            control,
+        ]));
     }
     Ok(None)
 }
@@ -927,42 +818,9 @@ fn instruction(
     if let Some(words) = extended_instruction(&mnemonic, &operands, line, labels)? {
         return Ok(words);
     }
-    let opcode = match mnemonic.as_str() {
-        "HALT" => 0x00,
-        "LDI" => 0x01,
-        "LD" => 0x02,
-        "ST" => 0x03,
-        "MOV" => 0x04,
-        "ADD" => 0x05,
-        "SUB" => 0x06,
-        "AND" => 0x07,
-        "OR" => 0x08,
-        "XOR" => 0x09,
-        "NOT" => 0x0a,
-        "JMP" => 0x0b,
-        "JZ" => 0x0c,
-        "INC" => 0x0d,
-        "DEC" => 0x0e,
-        "CMP" => 0x0f,
-        "LDI_H" => 0x10,
-        "EI" => 0x11,
-        "DI" => 0x12,
-        "RTI" => 0x13,
-        "PUSH" => 0x14,
-        "POP" => 0x15,
-        "CALL" => 0x16,
-        "RET" => 0x17,
-        "BZ" => 0x18,
-        "LDW" => 0x19,
-        "STW" => 0x1a,
-        "LDWS" => 0x1b,
-        "STWS" => 0x1c,
-        "ADJSP" => 0x1d,
-        "BC" => 0x1e,
-        "SHR" => 0x1f,
-        "NOP" => 0x04,
-        _ => return Err(error(line, format!("unknown instruction {mnemonic:?}"))),
-    };
+    let opcode = lookup(BASE_OPCODES, &mnemonic)
+        .filter(|opcode| *opcode != OP_SHR || mnemonic == "SHR")
+        .ok_or_else(|| error(line, format!("unknown instruction {mnemonic:?}")))?;
     let bad_count = |expected: &str| error(line, format!("{mnemonic} expects {expected}"));
     let imm = |text: &str, maximum: i64| -> Result<u16, AssemblyError> {
         let value = parse_number(text, line)?;
@@ -1008,7 +866,7 @@ fn instruction(
             let value = imm(operands[1], 0xffff)?;
             let mut words = vec![(opcode << 11) | (rd << 8) | (value & 0xff)];
             if value > 0xff {
-                words.push((0x10 << 11) | (rd << 8) | (value >> 8));
+                words.push((OP_LDI_H << 11) | (rd << 8) | (value >> 8));
             }
             Ok(words)
         }

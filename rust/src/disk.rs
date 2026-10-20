@@ -421,6 +421,27 @@ mod tests {
     }
 
     #[test]
+    fn invalid_disk_images_are_rejected_without_replacing_the_mounted_disk() {
+        let root = temp_dir("disk-invalid");
+        fs::write(root.join("BADJSON1.json"), b"[]").unwrap();
+        fs::write(root.join("BADBLOCK.json"), br#"{"1":"short"}"#).unwrap();
+        fs::write(
+            root.join("BADRANGE.json"),
+            format!(r#"{{"65536":"{}"}}"#, "x".repeat(BLOCK_SIZE)),
+        )
+        .unwrap();
+
+        let mut disk = DiskDevice::new(root.clone());
+        disk.load_disk("GOOD0001").unwrap();
+        for disk_id in ["BADJSON1", "BADBLOCK", "BADRANGE", "../evil"] {
+            assert!(disk.load_disk(disk_id).is_err(), "{disk_id}");
+            assert_eq!(disk.current_disk(), Some("GOOD0001"));
+        }
+        assert!(disk.read_block(0).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn disk_listing_is_sorted_and_ignores_invalid_names() {
         let root = temp_dir("disk-list");
         fs::write(root.join("zeta0001.json"), b"{}").unwrap();
@@ -444,7 +465,44 @@ mod tests {
             disk.read_file("nested/hello.txt", 1, 3).unwrap(),
             (b"orl".to_vec(), 6)
         );
-        assert!(disk.read_file("../secret", 0, 1).is_err());
+        assert_eq!(
+            disk.read_file("nested/hello.txt", 99, 16).unwrap(),
+            (Vec::new(), 6)
+        );
+        for invalid_path in [
+            "",
+            "../secret",
+            "nested/../hello.txt",
+            "nested//hello.txt",
+            "nested\\hello.txt",
+            "/nested/hello.txt",
+            "nested/hello world.txt",
+        ] {
+            assert!(
+                disk.read_file(invalid_path, 0, 1).is_err(),
+                "{invalid_path:?}"
+            );
+        }
+        assert!(
+            disk.read_file("nested/hello.txt", 0, MAX_FILE_READ_SIZE + 1)
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_listing_skips_names_outside_the_virtual_file_path_format() {
+        let root = temp_dir("files-invalid");
+        fs::write(root.join("valid.txt"), b"valid").unwrap();
+        fs::write(root.join("not valid.txt"), b"invalid").unwrap();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested").join("also_valid.json"), b"valid").unwrap();
+        let mut disk = DiskDevice::new(root.join("store"));
+        disk.set_file_root(root.clone()).unwrap();
+        assert_eq!(
+            disk.list_files().unwrap(),
+            ["nested/also_valid.json", "valid.txt"]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
