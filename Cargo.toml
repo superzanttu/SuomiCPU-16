@@ -38,8 +38,13 @@ path = "rust/src/bin/sc16tank.rs"
 name = "sc16objects"
 path = "rust/src/bin/sc16objects.rs"
 
+[[bin]]
+name = "sc16gallery"
+path = "rust/src/bin/sc16gallery.rs"
+
 [dependencies]
-image = { version = "0.24.9", default-features = false, features = ["png"] }
+gif = "0.13"
+image = { version = "0.24.9", default-features = false, features = ["gif", "png"] }
 imageproc = { version = "0.23.1", default-features = false }
 macroquad = { version = "0.4.16", features = ["audio"] }
 memmap2 = "0.9"

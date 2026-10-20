@@ -9,7 +9,7 @@ grow support against real module builds.
 
 ## Current inventory
 
-There are 35 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
+There are 32 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
 Generated maps, Tank-16 atlas tools, map loading, and the graphical map editor
 now use Rust implementations. Python remains in the emulator and developer
 tests while those larger migrations continue.
@@ -47,14 +47,8 @@ Status meanings:
 | [`tools/assembler.py`](../tools/assembler.py) | Rust exists — Python consumers remain | The Rust assembler is implemented, but the Python C compiler, emulator, smoke tool, and tests still use this module. Migrate those callers before removal. |
 | [`tools/c_compiler.py`](../tools/c_compiler.py) | Blocking — incomplete port | A Rust C compiler exists, but it does not yet build all module programs. The Python loader, Tank-16 asset builder, tests, and developer tools depend on the Python compiler. Port the needed module subset and verify real module builds before switching callers. |
 | [`tools/sc16net.py`](../tools/sc16net.py) | Rust exists — Python consumer remains | Rust networking behavior is implemented and tested; the Python emulator and network tests still import this transport. Switch integration tests and retire the Python emulator before deletion. |
-| [`tools/smoke_compile_modules.py`](../tools/smoke_compile_modules.py) | Blocking — Python build path | It compiles BIOS modules through the Python BIOS/program loader. Replace it with a Rust smoke-build command that reports per-module results before removing this useful validation workflow. |
-| [`tools/generate_module_gifs.py`](../tools/generate_module_gifs.py) | Python tooling — not ported | It runs the Python emulator and captures frames for the README gallery. Either port the capture workflow to a Rust runtime/frame-export interface or deliberately replace/remove this optional generator and update its documentation. |
 | [`tools/__init__.py`](../tools/__init__.py) | Package marker | Python tool imports and tests still use `tools` as a package. Remove after those consumers are migrated. |
 
-## Tank-16 source and asset tools
-
-| Python file | Status | Why it cannot be deleted yet |
-|---|---|---|
 Rust Tank-16 tools currently available:
 
 ```powershell
@@ -68,6 +62,13 @@ cargo run --bin sc16tank -- extend-atlas
 cargo run --bin sc16objects
 cargo run --bin sc16mapedit -- --map modules\Tank-16\disks\maps\FINLAND.json
 cargo run --bin sc16mapedit -- --name ARENA --width 10 --height 8
+```
+
+Compile every bootable BIOS module with the Rust smoke-build orchestrator
+(the explicitly retained Python C compiler performs the C translation):
+
+```powershell
+cargo run --bin sc16build -- smoke-modules
 ```
 
 The Finland generator accepts optional `--railways`, `--cities`, and `--size`
@@ -104,7 +105,6 @@ considered migration.
 | [`tests/test_isa_opcodes.py`](../tests/test_isa_opcodes.py) | Test/helper — retain for coverage | Exhaustive Python assembler/CPU opcode combinations; migrate uncovered combinations to Rust assembler and CPU tests. |
 | [`tests/test_jit_core.py`](../tests/test_jit_core.py) | Test/helper — retain for coverage | Checks Numba JIT equivalence against the Python interpreter. Replace with Rust CPU differential/parity tests; the JIT itself is superseded. |
 | [`tests/test_map_editor.py`](../tests/test_map_editor.py) | Test/helper — retain for coverage | Exercises Rust CLI map loading, validation, saving, and the editor entry point. Rust unit tests cover map mutation and serialization contracts. |
-| [`tests/test_module_gif_generator.py`](../tests/test_module_gif_generator.py) | Test/helper — retain for coverage | Optional Python gallery capture/GIF output; port with the generator or remove alongside an explicit gallery-workflow decision. |
 | [`tests/test_natural_maps.py`](../tests/test_natural_maps.py) | Test/helper — retain for coverage | Runs the Rust generator and validates generated maps through the Rust CLI. |
 | [`tests/test_net.py`](../tests/test_net.py) | Test/helper — retain for coverage | Python transport and emulator networking integration; retain/port end-to-end coverage using the Rust networking path. |
 | [`tests/test_spacecave.py`](../tests/test_spacecave.py) | Test/helper — retain for coverage | Spacecave network/game integration through Python CPU and transport; replace with Rust integration coverage. |
@@ -123,7 +123,9 @@ point and its required tests pass.
      `tools/assembler.py`.
    - Reproduce the remaining useful `src/program_loader.py` behavior. Its
      Tank-16 dynamic-asset path now delegates to the Rust `sc16tank` CLI.
-   - Replace `tools/smoke_compile_modules.py` with a Rust smoke-build workflow.
+   - `sc16build smoke-modules` now discovers modules and orchestrates this
+     build check; C translation remains delegated to the retained Python
+     compiler.
    - Gate deletion of `tools/c_compiler.py`, `tools/assembler.py`, and
      `src/program_loader.py` on builds of selected real module programs and
      migrated regression tests.
@@ -158,8 +160,8 @@ point and its required tests pass.
    - Remove the Python test package markers when no Python tests remain.
 
 5. **Resolve optional authoring and gallery utilities.**
-   - Port `tools/generate_module_gifs.py` to capture frames from the Rust
-     runtime, or remove/replace the optional gallery generation workflow.
+   - The README gallery generator now runs the Rust CPU and writes GIFs in
+     Rust; it uses the retained Python C compiler only for source translation.
    - Decide and document whether the remaining Python developer utilities are
      required in the Rust-only workflow.
 

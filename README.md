@@ -177,10 +177,12 @@ Each animation captures a module running in the SC-16 emulator.
 
 Regenerate the animations for every module folder with a runnable C entry point:
 ```console
-python tools/generate_module_gifs.py
+cargo run --bin sc16gallery
 ```
 Each generated GIF loops continuously with a 15-second cycle by default.
-The source module runs for 10 seconds during capture. Use
+The Rust CPU runs the source module for 10 simulated seconds during capture.
+The retained Python C compiler translates C sources; frame execution and GIF
+generation use Rust. Use
 `--run-seconds` to change the capture window and `--gif-seconds` to set the
-total GIF duration; `--fps` and `--capture-fps` adjust sampling. The script
+total GIF duration; `--fps` and `--capture-fps` adjust sampling. The command
 discovers modules from `modules/` each time it runs and updates this gallery.
