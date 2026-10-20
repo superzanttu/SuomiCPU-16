@@ -131,6 +131,9 @@ considered migration.
   - [x] Compile fitting string-literal initializers for global and automatic
         character arrays, including escaped byte values, exact-fit arrays, and
         zero-filled trailing capacity.
+  - [x] Infer one-dimensional global and automatic array bounds from brace
+        initializers and character string literals; reject incomplete arrays
+        whose size cannot be inferred.
 - [x] **Port console-device state/MMIO coverage from [tests/test_console_device.py](../tests/test_console_device.py) to Rust.**
   - Rust tests cover FIFO/echo control, poll yielding, input bounds/overrun,
     fixed text rows, scrollback, wrapping, and history reset.

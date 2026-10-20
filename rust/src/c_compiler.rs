@@ -84,6 +84,20 @@ pub struct Declaration {
     pub initializer: Option<Expression>,
 }
 
+const INCOMPLETE_ARRAY_LENGTH: usize = usize::MAX;
+
+fn infer_incomplete_array_length(c_type: &str, initializer: &Expression) -> Option<usize> {
+    match &initializer.kind {
+        ExpressionKind::InitializerList(values) => Some(values.len()),
+        ExpressionKind::Atom(value)
+            if matches!(c_type.trim(), "char" | "signed char" | "unsigned char") =>
+        {
+            decode_string_token(value)?.len().checked_add(1)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub kind: StatementKind,
@@ -3087,6 +3101,28 @@ impl StatementParser {
             } else {
                 None
             };
+            let array_length = if array_length == Some(INCOMPLETE_ARRAY_LENGTH) {
+                let Some(length) = initializer
+                    .as_ref()
+                    .and_then(|initializer| infer_incomplete_array_length(&c_type, initializer))
+                else {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "incomplete array requires an initializer that determines its size",
+                    ));
+                };
+                if length == 0 {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "array size must be greater than zero",
+                    ));
+                }
+                Some(length)
+            } else {
+                array_length
+            };
             declarations.push(Declaration {
                 c_type,
                 name: name.value,
@@ -3104,6 +3140,9 @@ impl StatementParser {
     fn parse_array_suffix(&mut self) -> Result<Option<usize>, CCompilerError> {
         if self.accept("[").is_none() {
             return Ok(None);
+        }
+        if self.accept("]").is_some() {
+            return Ok(Some(INCOMPLETE_ARRAY_LENGTH));
         }
         let expression = self.expressions.parse_expression(0)?;
         self.expect("]")?;
@@ -3188,6 +3227,27 @@ impl TranslationUnitParser {
                 Some(self.statements.parse_initializer()?)
             } else {
                 None
+            };
+            let array_length = if array_length == Some(INCOMPLETE_ARRAY_LENGTH) {
+                let Some(length) = initializer.as_ref().and_then(|initializer| {
+                    infer_incomplete_array_length(&declarator_type, initializer)
+                }) else {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "incomplete array requires an initializer that determines its size",
+                    ));
+                };
+                if length == 0 {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "array size must be greater than zero",
+                    ));
+                }
+                Some(length)
+            } else {
+                array_length
             };
             if is_typedef {
                 if array_length.is_some() || initializer.is_some() {
@@ -3395,6 +3455,9 @@ impl TranslationUnitParser {
     fn parse_array_suffix(&mut self) -> Result<Option<usize>, CCompilerError> {
         if self.statements.accept("[").is_none() {
             return Ok(None);
+        }
+        if self.statements.accept("]").is_some() {
+            return Ok(Some(INCOMPLETE_ARRAY_LENGTH));
         }
         let expression = self.statements.expressions.parse_expression(0)?;
         self.statements.expect("]")?;
@@ -5493,6 +5556,55 @@ mod tests {
     }
 
     #[test]
+    fn infers_array_bounds_from_initializers() {
+        let unit = translation_unit(
+            r#"unsigned char bytes[] = { 1, 2, 3 }; char title[] = "SC";
+               int main(void) { int local[] = { 4, 5 }; return 0; }"#,
+        );
+        assert!(matches!(
+            &unit.declarations[..2],
+            [
+                ExternalDeclaration::Global(Declaration {
+                    array_length: Some(3),
+                    ..
+                }),
+                ExternalDeclaration::Global(Declaration {
+                    array_length: Some(3),
+                    ..
+                })
+            ]
+        ));
+        let ExternalDeclaration::FunctionDefinition(main) = &unit.declarations[2] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &main.body.kind else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].array_length == Some(2)
+        ));
+    }
+
+    #[test]
+    fn rejects_incomplete_arrays_without_inferable_initializers() {
+        for source in [
+            "int values[]; int main(void) { return 0; }",
+            "int main(void) { int values[]; return 0; }",
+            "int values[] = 1; int main(void) { return 0; }",
+        ] {
+            assert!(
+                TranslationUnitParser::from_source(source, "incomplete-array.c")
+                    .unwrap()
+                    .parse()
+                    .is_err(),
+                "source unexpectedly parsed: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn reports_unsupported_function_pointer_declarators_without_accepting_them() {
         let error = TranslationUnitParser::from_source("int (*callback)(int);", "bad.c")
             .unwrap()
@@ -5897,6 +6009,30 @@ mod tests {
         assert_eq!(cpu.read_u16(0x80004), 3);
         assert_eq!(cpu.read_u16(0x80006), 9);
         assert_eq!(cpu.read_u16(0x80008), 0);
+    }
+
+    #[test]
+    fn compiles_global_and_local_arrays_with_inferred_bounds() {
+        let image = compile_minimal_program(
+            r##"unsigned char values[] = { 1, 255, 3 }; char title[] = "SC";
+                int main(void) {
+                    int local[] = { 4, 5 };
+                    char text[] = "ok";
+                    return sizeof(values) + values[1] + sizeof(title) + title[2]
+                        + sizeof(local) + local[1] + sizeof(text) + text[2];
+                }"##,
+            "inferred-array-bounds.c",
+        )
+        .unwrap()
+        .expect("supported inferred array bounds");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 273);
+        assert_eq!(&cpu.memory[0x80000..0x80003], &[1, 255, 3]);
+        assert_eq!(&cpu.memory[0x80003..0x80006], b"SC\0");
     }
 
     #[test]
