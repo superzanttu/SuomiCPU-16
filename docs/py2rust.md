@@ -114,8 +114,15 @@ considered migration.
 - [ ] **Port the remaining BIOS UI/boot tests from [tests/test_bios.py](../tests/test_bios.py).**
   - [x] Verify keyboard module-selection bounds, scroll reachability, disk
         selection cycling, disk mounting, and module-discovery errors in Rust.
-  - [ ] Port mouse selection/double-click behavior, interactive error display,
-        and full emulator startup/reset-to-BIOS workflows.
+  - [x] Add mouse module selection and disk cycling with fullscreen
+        aspect-ratio coordinate mapping in Rust.
+  - [x] Launch the selected module on a same-row mouse double-click within the
+        legacy 400 ms interval.
+  - [x] Scroll the module list with the mouse wheel while keeping the selected
+        module visible.
+  - [x] Keep module/boot errors visible in the BIOS selector, and show the
+        empty-module state instead of exiting during startup.
+  - [ ] Port full emulator startup/reset-to-BIOS workflows.
 - [ ] **Port [tests/test_c_compiler.py](../tests/test_c_compiler.py)** — compiler coverage.
   - Coverage to preserve: supported-language behavior and diagnostics as the Rust compiler replaces Python.
 - [x] **Port console-device state/MMIO coverage from [tests/test_console_device.py](../tests/test_console_device.py) to Rust.**
@@ -129,9 +136,12 @@ considered migration.
     screen dimensions, palette conversion, and indexed/paletted framebuffer
     rendering.
 - [ ] **Port or retire Python GUI-loop tests from [tests/test_display.py](../tests/test_display.py).**
-  - Why they remain: pause timing, Pygame fullscreen/window management,
-    console-window toggling, halt-window lifetime, and display pacing are
-    tied to the legacy Python event loop.
+  - [x] Verify fullscreen pointer coordinate mapping and letterbox rejection
+        in Rust for the supported logical canvas size.
+  - [x] Keep the last frame visible after HALT until a keypress, matching the
+        legacy window lifetime.
+  - Why remaining tests are Python-specific: pause timing, separate console
+    window management, and Pygame display pacing.
 - [x] **Port [tests/test_extended_opcodes.py](../tests/test_extended_opcodes.py)** — ISA coverage.
   - Rust assembled-program tests cover shifts/rotates, carry-chain arithmetic,
     32-bit operations and pair validation, stack-pointer control, full-width

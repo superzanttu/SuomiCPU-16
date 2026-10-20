@@ -3,9 +3,10 @@ use crate::image::{ImageError, load_program};
 use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
-    BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, Rect, Texture2D, WHITE,
-    clear_background, draw_line, draw_texture_ex, draw_triangle, get_keys_down, get_keys_pressed,
-    is_key_down, is_key_pressed, next_frame, screen_height, screen_width, set_fullscreen, vec2,
+    BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, Rect, Texture2D,
+    WHITE, clear_background, draw_line, draw_texture_ex, draw_triangle, get_keys_down,
+    get_keys_pressed, is_key_down, is_key_pressed, is_mouse_button_pressed, mouse_position,
+    mouse_wheel, next_frame, screen_height, screen_width, set_fullscreen, vec2,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -263,6 +264,13 @@ struct BootModule {
     error: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BiosMouseAction {
+    SelectModule(usize),
+    PreviousDisk,
+    NextDisk,
+}
+
 pub fn window_conf() -> Conf {
     Conf {
         window_title: "SuomiCPU-16 Emulator (Rust)".to_owned(),
@@ -308,11 +316,6 @@ pub async fn run_with_devices(
         cpu.configure_disk(root.join("disks"), root.join("disks"))
             .map_err(RuntimeError::Window)?;
         let modules = discover_modules(&root.join("modules"))?;
-        if modules.is_empty() {
-            return Err(RuntimeError::Window(
-                "no runnable C modules were found in modules/".to_owned(),
-            ));
-        }
         if !select_and_boot(
             root,
             &mut cpu,
@@ -331,41 +334,67 @@ pub async fn run_with_devices(
     let mut old_keys = HashSet::new();
     let mut speed_remainder = 0.0;
     let mut last_frame = Instant::now();
-    while !is_key_down(KeyCode::Escape) && cpu.running {
-        let keys = get_keys_down();
-        update_keys(&mut cpu, &old_keys, &keys);
-        old_keys = keys;
-        for key in get_keys_pressed() {
-            if key == KeyCode::Enter {
-                cpu.receive_console_input(b"\n");
-                cpu.signal_keyboard_event(13);
-            } else if key == KeyCode::Backspace {
-                cpu.receive_console_input(b"\x08");
-                cpu.signal_keyboard_event(8);
-            } else if let Some(byte) = key_to_ascii(key) {
-                cpu.receive_console_input(&[byte]);
-                cpu.signal_keyboard_event(byte);
-            }
+    while !is_key_down(KeyCode::Escape) {
+        let pressed_keys = get_keys_pressed();
+        if halted_window_should_close(cpu.running, !pressed_keys.is_empty()) {
+            break;
         }
-        update_rtc(&mut cpu);
-        cpu.begin_frame();
-        let elapsed = last_frame.elapsed().as_secs_f64();
-        last_frame = Instant::now();
-        let mode = cpu.memory[SPEED_ADDR];
-        let budget = match mode {
-            0 => rate_budget(10.0, elapsed, &mut speed_remainder),
-            1 => rate_budget(100.0, elapsed, &mut speed_remainder),
-            2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
-            3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
-            _ => 300_000,
-        };
-        cpu.run(budget)
-            .map_err(|error| RuntimeError::Window(error.to_string()))?;
-        for command in cpu.take_sound_commands() {
-            audio.apply(command).await?;
+        if cpu.running {
+            let keys = get_keys_down();
+            update_keys(&mut cpu, &old_keys, &keys);
+            old_keys = keys;
+            for key in pressed_keys {
+                if key == KeyCode::Enter {
+                    cpu.receive_console_input(b"\n");
+                    cpu.signal_keyboard_event(13);
+                } else if key == KeyCode::Backspace {
+                    cpu.receive_console_input(b"\x08");
+                    cpu.signal_keyboard_event(8);
+                } else if let Some(byte) = key_to_ascii(key) {
+                    cpu.receive_console_input(&[byte]);
+                    cpu.signal_keyboard_event(byte);
+                }
+            }
+            update_rtc(&mut cpu);
+            cpu.begin_frame();
+            let elapsed = last_frame.elapsed().as_secs_f64();
+            last_frame = Instant::now();
+            let mode = cpu.memory[SPEED_ADDR];
+            let budget = match mode {
+                0 => rate_budget(10.0, elapsed, &mut speed_remainder),
+                1 => rate_budget(100.0, elapsed, &mut speed_remainder),
+                2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
+                3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
+                _ => 300_000,
+            };
+            cpu.run(budget)
+                .map_err(|error| RuntimeError::Window(error.to_string()))?;
+            for command in cpu.take_sound_commands() {
+                audio.apply(command).await?;
+            }
         }
         render_cpu(&cpu, &mut pixels);
         let (width, height) = screen_size(&cpu);
+        if !cpu.running {
+            fill_rect(
+                &mut pixels,
+                width,
+                0,
+                height.saturating_sub(18),
+                width,
+                18,
+                rgb(10, 14, 24),
+            );
+            draw_text_limited(
+                &mut pixels,
+                width,
+                (4, height.saturating_sub(13)),
+                "PROGRAM HALTED - PRESS ANY KEY TO CLOSE",
+                width / 6,
+                0xffff_d000,
+                &font,
+            );
+        }
         canvas
             .present(
                 &pixels,
@@ -504,6 +533,8 @@ async fn select_and_boot(
 ) -> Result<bool, RuntimeError> {
     let mut selected = 0usize;
     let mut scroll_offset = 0usize;
+    let mut last_clicked_module = None;
+    let mut message = None;
     let disks = cpu.available_disks().map_err(RuntimeError::Window)?;
     let mut selected_disk = match disk_id {
         Some(disk_id) => disks
@@ -520,51 +551,116 @@ async fn select_and_boot(
             pixels,
             font,
             modules,
-            selected,
-            scroll_offset,
+            (selected, scroll_offset),
             &disks,
             selected_disk,
+            message.as_deref(),
         );
         canvas
             .present(pixels, 640, 480, &[], &[], &cpu.palette)
             .await;
-        if is_key_pressed(KeyCode::Escape) {
-            return Ok(false);
+        let wheel_delta = mouse_wheel().1;
+        if wheel_delta != 0.0
+            && let Some((x, y)) = screen_to_logical(
+                mouse_position(),
+                (screen_width(), screen_height()),
+                (640, 480),
+            )
+            && (32..608).contains(&x)
+            && (BIOS_MODULE_ROW_TOP
+                ..BIOS_MODULE_ROW_TOP + BIOS_VISIBLE_MODULES * BIOS_MODULE_ROW_HEIGHT)
+                .contains(&y)
+        {
+            (selected, scroll_offset) = bios_scroll_modules(
+                selected,
+                scroll_offset,
+                -(wheel_delta.signum() as isize) * 3,
+                modules.len(),
+            );
+            last_clicked_module = None;
+            message = None;
+            continue;
         }
-        if is_key_pressed(KeyCode::Up) {
-            selected = bios_move_selection(selected, -1, modules.len());
-            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
-        } else if is_key_pressed(KeyCode::Down) {
-            selected = bios_move_selection(selected, 1, modules.len());
-            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
-        } else if is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right) {
-            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, true);
-        } else if is_key_pressed(KeyCode::Left) {
-            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, false);
-        } else if is_key_pressed(KeyCode::Enter) {
-            let module = &modules[selected];
-            if let Some(error) = &module.error {
-                draw_text(pixels, 640, 32, 440, error, 0xffff6060, font);
-                let error_until = Instant::now() + std::time::Duration::from_secs(2);
-                while Instant::now() < error_until {
-                    canvas
-                        .present(pixels, 640, 480, &[], &[], &cpu.palette)
-                        .await;
+        let mut launch_selected = false;
+        if is_mouse_button_pressed(MouseButton::Left)
+            && let Some(action) = bios_mouse_action(
+                mouse_position(),
+                (screen_width(), screen_height()),
+                modules.len(),
+                scroll_offset,
+            )
+        {
+            match action {
+                BiosMouseAction::SelectModule(index) => {
+                    selected = index;
+                    scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
+                    launch_selected =
+                        bios_register_module_click(&mut last_clicked_module, index, Instant::now());
+                    message = None;
                 }
+                BiosMouseAction::PreviousDisk => {
+                    selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, false);
+                    last_clicked_module = None;
+                    message = None;
+                }
+                BiosMouseAction::NextDisk => {
+                    selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, true);
+                    last_clicked_module = None;
+                    message = None;
+                }
+            }
+            if !launch_selected {
                 continue;
             }
-            let source = module
-                .source
-                .as_ref()
-                .expect("valid boot module has a source");
-            configure_disk(cpu, root, source)?;
-            if selected_disk != 0 {
-                cpu.mount_data_disk(&disks[selected_disk - 1])
-                    .map_err(RuntimeError::Window)?;
+        }
+        if !launch_selected && is_key_pressed(KeyCode::Escape) {
+            return Ok(false);
+        } else if !launch_selected && is_key_pressed(KeyCode::Up) {
+            selected = bios_move_selection(selected, -1, modules.len());
+            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
+            message = None;
+        } else if !launch_selected && is_key_pressed(KeyCode::Down) {
+            selected = bios_move_selection(selected, 1, modules.len());
+            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
+            message = None;
+        } else if !launch_selected && (is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right))
+        {
+            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, true);
+            message = None;
+        } else if !launch_selected && is_key_pressed(KeyCode::Left) {
+            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, false);
+            message = None;
+        } else if !launch_selected && !modules.is_empty() && is_key_pressed(KeyCode::Enter) {
+            launch_selected = true;
+        }
+        if launch_selected {
+            let Some(module) = modules.get(selected) else {
+                continue;
+            };
+            if let Some(error) = &module.error {
+                message = Some(format!("{}: {error}", module.name));
+                last_clicked_module = None;
+                continue;
             }
-            let image = load_program(source).map_err(RuntimeError::from)?;
-            cpu.load_program(&image.segments, image.entry_point)
-                .map_err(|error| RuntimeError::Window(error.to_string()))?;
+            let Some(source) = module.source.as_ref() else {
+                message = Some(format!("{}: no source file found", module.name));
+                continue;
+            };
+            let boot_result = (|| {
+                configure_disk(cpu, root, source)?;
+                if selected_disk != 0 {
+                    cpu.mount_data_disk(&disks[selected_disk - 1])
+                        .map_err(RuntimeError::Window)?;
+                }
+                let image = load_program(source)?;
+                cpu.load_program(&image.segments, image.entry_point)
+                    .map_err(|error| RuntimeError::Window(error.to_string()))?;
+                Ok::<(), RuntimeError>(())
+            })();
+            if let Err(error) = boot_result {
+                message = Some(format!("{}: {error}", module.name));
+                continue;
+            }
             return Ok(true);
         }
     }
@@ -574,10 +670,10 @@ fn draw_bios_selector(
     pixels: &mut [u32],
     font: &[[u8; 8]],
     modules: &[BootModule],
-    selected: usize,
-    scroll_offset: usize,
+    (selected, scroll_offset): (usize, usize),
     disks: &[String],
     selected_disk: usize,
+    message: Option<&str>,
 ) {
     pixels.fill(rgb(7, 10, 20));
     fill_rect(pixels, 640, 24, 18, 592, 82, rgb(16, 22, 38));
@@ -663,6 +759,9 @@ fn draw_bios_selector(
         0xff90a8c8,
         font,
     );
+    if let Some(message) = message {
+        draw_text_limited(pixels, 640, (32, 465), message, 96, 0xffff6060, font);
+    }
 }
 
 fn bios_scroll_offset(selected: usize, current_offset: usize, module_count: usize) -> usize {
@@ -675,6 +774,34 @@ fn bios_scroll_offset(selected: usize, current_offset: usize, module_count: usiz
     } else {
         offset
     }
+}
+
+fn bios_scroll_modules(
+    selected: usize,
+    current_offset: usize,
+    direction: isize,
+    module_count: usize,
+) -> (usize, usize) {
+    if module_count == 0 {
+        return (0, 0);
+    }
+    let max_offset = module_count.saturating_sub(BIOS_VISIBLE_MODULES);
+    let current_offset = current_offset.min(max_offset);
+    let offset = if direction < 0 {
+        current_offset.saturating_sub(direction.unsigned_abs())
+    } else {
+        current_offset
+            .saturating_add(direction as usize)
+            .min(max_offset)
+    };
+    let selected = if selected < offset {
+        offset
+    } else if selected >= offset + BIOS_VISIBLE_MODULES {
+        (offset + BIOS_VISIBLE_MODULES).min(module_count) - 1
+    } else {
+        selected.min(module_count - 1)
+    };
+    (selected, offset)
 }
 
 fn bios_move_selection(selected: usize, direction: isize, module_count: usize) -> usize {
@@ -704,6 +831,71 @@ fn bios_cycle_disk(selected: usize, choice_count: usize, forward: bool) -> usize
     } else {
         selected - 1
     }
+}
+
+fn bios_register_module_click(
+    last_clicked_module: &mut Option<(usize, Instant)>,
+    module_index: usize,
+    now: Instant,
+) -> bool {
+    let is_double_click = last_clicked_module.is_some_and(|(previous_index, previous_time)| {
+        previous_index == module_index
+            && now.duration_since(previous_time) <= std::time::Duration::from_millis(400)
+    });
+    *last_clicked_module = if is_double_click {
+        None
+    } else {
+        Some((module_index, now))
+    };
+    is_double_click
+}
+
+fn screen_to_logical(
+    position: (f32, f32),
+    screen_size: (f32, f32),
+    logical_size: (usize, usize),
+) -> Option<(usize, usize)> {
+    if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 || logical_size.0 == 0 || logical_size.1 == 0 {
+        return None;
+    }
+    let scale = (screen_size.0 / logical_size.0 as f32).min(screen_size.1 / logical_size.1 as f32);
+    let left = (screen_size.0 - logical_size.0 as f32 * scale) / 2.0;
+    let top = (screen_size.1 - logical_size.1 as f32 * scale) / 2.0;
+    let logical_x = (position.0 - left) / scale;
+    let logical_y = (position.1 - top) / scale;
+    if logical_x < 0.0
+        || logical_y < 0.0
+        || logical_x >= logical_size.0 as f32
+        || logical_y >= logical_size.1 as f32
+    {
+        return None;
+    }
+    Some((logical_x as usize, logical_y as usize))
+}
+
+fn bios_mouse_action(
+    position: (f32, f32),
+    screen_size: (f32, f32),
+    module_count: usize,
+    scroll_offset: usize,
+) -> Option<BiosMouseAction> {
+    let (x, y) = screen_to_logical(position, screen_size, (640, 480))?;
+    if (420..604).contains(&x) && (73..100).contains(&y) {
+        return Some(if x < 512 {
+            BiosMouseAction::PreviousDisk
+        } else {
+            BiosMouseAction::NextDisk
+        });
+    }
+    if !(32..608).contains(&x) || y < BIOS_MODULE_ROW_TOP {
+        return None;
+    }
+    let row = (y - BIOS_MODULE_ROW_TOP) / BIOS_MODULE_ROW_HEIGHT;
+    if row >= BIOS_VISIBLE_MODULES {
+        return None;
+    }
+    let index = scroll_offset.saturating_add(row);
+    (index < module_count).then_some(BiosMouseAction::SelectModule(index))
 }
 
 fn fill_rect(
@@ -841,6 +1033,10 @@ fn rate_budget(rate: f64, elapsed: f64, remainder: &mut f64) -> usize {
     let result = exact.floor() as usize;
     *remainder = exact - result as f64;
     result
+}
+
+fn halted_window_should_close(cpu_running: bool, has_keypress: bool) -> bool {
+    !cpu_running && has_keypress
 }
 
 fn screen_size(cpu: &Cpu) -> (usize, usize) {
@@ -1029,6 +1225,13 @@ mod tests {
     }
 
     #[test]
+    fn halted_display_waits_for_a_keypress_without_closing_a_running_cpu() {
+        assert!(!halted_window_should_close(false, false));
+        assert!(halted_window_should_close(false, true));
+        assert!(!halted_window_should_close(true, true));
+    }
+
+    #[test]
     fn display_renderer_maps_vram_palette_and_resolution_to_rgb_pixels() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.memory[0x50000] = 1;
@@ -1108,6 +1311,15 @@ mod tests {
     }
 
     #[test]
+    fn bios_wheel_scroll_moves_three_rows_and_keeps_selection_visible() {
+        assert_eq!(bios_scroll_modules(0, 0, 3, 40), (3, 3));
+        assert_eq!(bios_scroll_modules(3, 3, -3, 40), (3, 0));
+        assert_eq!(bios_scroll_modules(0, 0, 99, 40), (28, 28));
+        assert_eq!(bios_scroll_modules(2, 0, 3, 4), (2, 0));
+        assert_eq!(bios_scroll_modules(0, 0, 3, 0), (0, 0));
+    }
+
+    #[test]
     fn bios_keyboard_selection_clamps_and_disk_selection_wraps() {
         assert_eq!(bios_move_selection(0, -1, 5), 0);
         assert_eq!(bios_move_selection(0, 1, 5), 1);
@@ -1124,6 +1336,85 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_pointer_coordinates_preserve_aspect_ratio_and_reject_bars() {
+        assert_eq!(
+            screen_to_logical((240.0, 0.0), (1920.0, 1080.0), (640, 480)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            screen_to_logical((100.0, 0.0), (1920.0, 1080.0), (640, 480)),
+            None
+        );
+        assert_eq!(
+            screen_to_logical((960.0, 540.0), (1920.0, 1080.0), (640, 480)),
+            Some((320, 240))
+        );
+        assert_eq!(
+            screen_to_logical((1679.9, 1079.9), (1920.0, 1080.0), (640, 480)),
+            Some((639, 479))
+        );
+        assert_eq!(
+            screen_to_logical((480.0, 360.0), (960.0, 720.0), (640, 480)),
+            Some((320, 240))
+        );
+    }
+
+    #[test]
+    fn bios_mouse_selects_visible_modules_and_cycles_data_disk() {
+        assert_eq!(
+            bios_mouse_action((150.0, 140.0), (640.0, 480.0), 20, 2),
+            Some(BiosMouseAction::SelectModule(2))
+        );
+        assert_eq!(
+            bios_mouse_action((150.0, 164.0), (640.0, 480.0), 20, 2),
+            Some(BiosMouseAction::SelectModule(3))
+        );
+        assert_eq!(
+            bios_mouse_action((500.0, 80.0), (640.0, 480.0), 20, 0),
+            Some(BiosMouseAction::PreviousDisk)
+        );
+        assert_eq!(
+            bios_mouse_action((550.0, 80.0), (640.0, 480.0), 20, 0),
+            Some(BiosMouseAction::NextDisk)
+        );
+        assert_eq!(
+            bios_mouse_action((10.0, 140.0), (640.0, 480.0), 20, 0),
+            None
+        );
+        assert_eq!(
+            bios_mouse_action((150.0, 420.0), (640.0, 480.0), 20, 0),
+            None
+        );
+        assert_eq!(
+            bios_mouse_action((150.0, 140.0), (640.0, 480.0), 2, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn bios_module_double_click_requires_same_module_within_400_milliseconds() {
+        let start = Instant::now();
+        let mut last_click = None;
+        assert!(!bios_register_module_click(&mut last_click, 2, start));
+        assert!(bios_register_module_click(
+            &mut last_click,
+            2,
+            start + std::time::Duration::from_millis(400)
+        ));
+
+        assert!(!bios_register_module_click(
+            &mut last_click,
+            2,
+            start + std::time::Duration::from_millis(401)
+        ));
+        assert!(!bios_register_module_click(
+            &mut last_click,
+            3,
+            start + std::time::Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
     fn bios_text_clipping_does_not_wrap_overflow_into_next_row() {
         let font = vec![[0xf8; 8]; 128];
         let mut pixels = vec![0; 20];
@@ -1131,6 +1422,25 @@ mod tests {
         assert_eq!(&pixels[..10], &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1]);
         assert_eq!(&pixels[10..18], &[0; 8]);
         assert_eq!(&pixels[18..], &[1, 1]);
+    }
+
+    #[test]
+    fn bios_selector_renders_empty_state_and_persistent_error_message() {
+        let font = vec![[0xf8; 8]; 128];
+        let mut pixels = vec![0; 640 * 480];
+        draw_bios_selector(&mut pixels, &font, &[], (0, 0), &[], 0, None);
+        assert_eq!(pixels[0], rgb(7, 10, 20));
+
+        draw_bios_selector(
+            &mut pixels,
+            &font,
+            &[],
+            (0, 0),
+            &[],
+            0,
+            Some("broken: compiler rejected module"),
+        );
+        assert!(pixels.contains(&0xffff_6060));
     }
 
     #[test]
