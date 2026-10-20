@@ -56,10 +56,10 @@ Status meanings:
 
 | Python file | Status | Why it cannot be deleted yet |
 |---|---|---|
-| [`modules/Tank-16/tank16_map_loader.py`](../modules/Tank-16/tank16_map_loader.py) | Blocking — active build dependency | It prepares Tank-16's map/graphics assets and invokes the Python C compiler. The Rust program loader does not yet reproduce this specialized build path. Port it and connect it to the Rust build/runtime before removing it. |
-| [`modules/Tank-16/map_editor.py`](../modules/Tank-16/map_editor.py) | Python tooling — not ported | The interactive Pygame map editor validates, loads, saves, and encodes maps. The Rust natural-map generator writes runtime maps, but there is no Rust editor or complete replacement for the editor's validation/load/save workflow. |
+| [`modules/Tank-16/tank16_map_loader.py`](../modules/Tank-16/tank16_map_loader.py) | Blocking — incomplete port | Rust now handles map validation, runtime map encoding, asset conversion, and compatible-map discovery. Tank-16's build path still cannot compile its real C source with the Rust C compiler, so the Python build dependency remains. |
+| [`modules/Tank-16/map_editor.py`](../modules/Tank-16/map_editor.py) | Rust exists — Python consumers remain | Rust has map validation/load/save/serialization and a basic graphical editor. The Python editor still provides richer editing workflows and its tests remain the active coverage; migrate those consumers and editor features before removal. |
 | [`modules/Tank-16/generate_finland_map.py`](../modules/Tank-16/generate_finland_map.py) | Python tooling — not ported | The Finland map and atlas generator performs GIS projection/rasterization and Pygame drawing; it also imports `map_editor.py`. Port the data-processing and atlas-generation workflow, or explicitly classify it as a retained offline Python authoring tool. |
-| [`modules/Tank-16/generate_object_tileset.py`](../modules/Tank-16/generate_object_tileset.py) | Python tooling — not ported | This procedural Pygame tileset generator is an offline asset-generation tool. The checked-in PNG is usable without Python at runtime, but full Python removal requires a Rust generator or an explicit decision that generated assets are maintained another way. |
+| [`modules/Tank-16/generate_object_tileset.py`](../modules/Tank-16/generate_object_tileset.py) | Rust exists — Python consumer remains | Rust now provides `sc16objects` to generate the procedural 6-by-8 object atlas. Keep the Python implementation until generated-art parity is checked and the documented asset workflow uses the Rust command. |
 
 ## Python tests and test helpers
 

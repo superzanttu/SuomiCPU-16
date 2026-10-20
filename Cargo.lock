@@ -454,6 +454,7 @@ dependencies = [
 name = "suomicpu16"
 version = "0.1.0"
 dependencies = [
+ "image",
  "macroquad",
  "memmap2",
  "serde_json",

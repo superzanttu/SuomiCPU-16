@@ -123,6 +123,13 @@ pub fn build_source(source: &Path) -> Result<ProgramImage, ImageError> {
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("c"))
     {
+        let tank16_main = crate::tank16_map::default_game_dir().join("main.c");
+        if source.canonicalize().ok() == tank16_main.canonicalize().ok() {
+            return crate::tank16_map::compile_runtime_tank16(
+                &crate::tank16_map::default_game_dir(),
+            )
+            .map_err(ImageError::CCompiler);
+        }
         let source_text = fs::read_to_string(source)?;
         let source_text = source_text.strip_prefix('\u{feff}').unwrap_or(&source_text);
         if let Some(image) =

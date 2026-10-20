@@ -7,6 +7,8 @@ pub mod isa;
 pub mod net;
 pub mod runtime;
 pub mod sprite_viewer;
+pub mod tank16_assets;
+pub mod tank16_map;
 pub mod tank_maps;
 
 pub use cpu::{ADDRESS_MASK, Cpu, CpuError, Flags, MEMORY_SIZE, MemorySegment};
