@@ -4120,6 +4120,111 @@ mod tests {
     }
 
     #[test]
+    fn disk_mmio_reads_large_module_files_in_chunks_and_lists_only_module_files() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-cpu-file-chunks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let module_files = root.join("modules").join("tank16").join("disks");
+        let other_files = root.join("modules").join("other").join("disks");
+        std::fs::create_dir_all(module_files.join("maps")).unwrap();
+        std::fs::create_dir_all(&other_files).unwrap();
+        let payload = (0u8..=255).cycle().take(76_800).collect::<Vec<u8>>();
+        std::fs::write(module_files.join("maps").join("world.json"), &payload).unwrap();
+        std::fs::write(module_files.join("index.txt"), b"index").unwrap();
+        std::fs::write(other_files.join("secret.json"), b"secret").unwrap();
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.configure_disk(root.join("disks"), module_files)
+            .unwrap();
+        cpu.memory[0x1000..0x1010].copy_from_slice(b"maps/world.json\0");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u32(DISK_BASE + 26, 0x2000);
+        cpu.write_u16(DISK_BASE + 30, 4096);
+
+        for offset in [0, 4096, 65_530, 72_704, 76_800] {
+            cpu.write_u32(DISK_BASE + 18, offset);
+            cpu.write(DISK_BASE, 0x40);
+            let expected = &payload[offset as usize..(offset as usize + 4096).min(payload.len())];
+            assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+            assert_eq!(
+                cpu.disk_register_u16(14) as usize,
+                expected.len(),
+                "file offset {offset}"
+            );
+            assert_eq!(
+                cpu.disk_register_u32(32),
+                payload.len() as u32,
+                "reported file length at offset {offset}"
+            );
+            assert_eq!(
+                &cpu.memory[0x2000..0x2000 + expected.len()],
+                expected,
+                "file bytes at offset {offset}"
+            );
+        }
+
+        cpu.write_u16(DISK_BASE + 10, 0);
+        cpu.write_u32(DISK_BASE + 26, 0x3000);
+        cpu.write_u16(DISK_BASE + 30, 32);
+        cpu.write(DISK_BASE, 0x80);
+        assert_eq!(cpu.disk_register_u16(14), 2);
+        assert_eq!(&cpu.memory[0x3000..0x300a], b"index.txt\0");
+
+        cpu.write_u16(DISK_BASE + 10, 1);
+        cpu.write(DISK_BASE, 0x80);
+        assert_eq!(&cpu.memory[0x3000..0x3010], b"maps/world.json\0");
+
+        cpu.memory[0x1000..0x100a].copy_from_slice(b"../secret\0");
+        cpu.write(DISK_BASE, 0x40);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mounting_data_disks_preserves_the_loaded_program_and_rejects_missing_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-cpu-data-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage = root.join("disks");
+        let mut disk = DiskDevice::new(storage.clone());
+        disk.load_disk("DATA0001").unwrap();
+        disk.write_block(0, &[0xa5; DISK_BLOCK_SIZE]).unwrap();
+
+        let module_files = root.join("module");
+        std::fs::create_dir_all(&module_files).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.configure_disk(storage, module_files).unwrap();
+        cpu.pc = 0x1234;
+        cpu.memory[0x1234] = 0x5a;
+        assert_eq!(cpu.available_disks().unwrap(), ["DATA0001"]);
+        assert!(cpu.mount_data_disk("MISSING1").is_err());
+        cpu.mount_data_disk("DATA0001").unwrap();
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(cpu.pc, 0x1234);
+        assert_eq!(cpu.memory[0x1234], 0x5a);
+
+        cpu.write_u16(DISK_BASE + 10, 0);
+        cpu.write_u16(DISK_BASE + 12, 0);
+        cpu.write(DISK_BASE, 0x04);
+        let ram_start = RAM_START as usize;
+        assert_eq!(
+            cpu.memory[ram_start..ram_start + DISK_BLOCK_SIZE],
+            [0xa5; DISK_BLOCK_SIZE]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn gpu_network_commands_open_query_send_and_close_peer() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.set_network_port(0);

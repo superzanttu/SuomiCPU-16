@@ -532,15 +532,15 @@ async fn select_and_boot(
             return Ok(false);
         }
         if is_key_pressed(KeyCode::Up) {
-            selected = selected.saturating_sub(1);
+            selected = bios_move_selection(selected, -1, modules.len());
             scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
         } else if is_key_pressed(KeyCode::Down) {
-            selected = (selected + 1).min(modules.len() - 1);
+            selected = bios_move_selection(selected, 1, modules.len());
             scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
         } else if is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right) {
-            selected_disk = (selected_disk + 1) % (disks.len() + 1);
+            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, true);
         } else if is_key_pressed(KeyCode::Left) {
-            selected_disk = (selected_disk + disks.len()) % (disks.len() + 1);
+            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, false);
         } else if is_key_pressed(KeyCode::Enter) {
             let module = &modules[selected];
             if let Some(error) = &module.error {
@@ -674,6 +674,35 @@ fn bios_scroll_offset(selected: usize, current_offset: usize, module_count: usiz
         selected + 1 - BIOS_VISIBLE_MODULES
     } else {
         offset
+    }
+}
+
+fn bios_move_selection(selected: usize, direction: isize, module_count: usize) -> usize {
+    if module_count == 0 {
+        return 0;
+    }
+    match direction.cmp(&0) {
+        std::cmp::Ordering::Less => selected.min(module_count - 1).saturating_sub(1),
+        std::cmp::Ordering::Equal => selected.min(module_count - 1),
+        std::cmp::Ordering::Greater => selected.saturating_add(1).min(module_count - 1),
+    }
+}
+
+fn bios_cycle_disk(selected: usize, choice_count: usize, forward: bool) -> usize {
+    if choice_count == 0 {
+        return 0;
+    }
+    let selected = selected % choice_count;
+    if forward {
+        if selected + 1 == choice_count {
+            0
+        } else {
+            selected + 1
+        }
+    } else if selected == 0 {
+        choice_count - 1
+    } else {
+        selected - 1
     }
 }
 
@@ -1076,6 +1105,22 @@ mod tests {
         }
         assert_eq!(selected, 0);
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn bios_keyboard_selection_clamps_and_disk_selection_wraps() {
+        assert_eq!(bios_move_selection(0, -1, 5), 0);
+        assert_eq!(bios_move_selection(0, 1, 5), 1);
+        assert_eq!(bios_move_selection(4, 1, 5), 4);
+        assert_eq!(bios_move_selection(4, -1, 5), 3);
+        assert_eq!(bios_move_selection(99, 0, 5), 4);
+        assert_eq!(bios_move_selection(99, 1, 0), 0);
+
+        assert_eq!(bios_cycle_disk(0, 3, false), 2);
+        assert_eq!(bios_cycle_disk(0, 3, true), 1);
+        assert_eq!(bios_cycle_disk(2, 3, true), 0);
+        assert_eq!(bios_cycle_disk(2, 3, false), 1);
+        assert_eq!(bios_cycle_disk(99, 0, true), 0);
     }
 
     #[test]

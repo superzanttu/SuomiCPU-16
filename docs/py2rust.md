@@ -112,8 +112,10 @@ considered migration.
   - Rust tests now cover module sorting, C source selection, empty/multiple
     source errors, descriptions, UTF-8 BOM files, and missing directories.
 - [ ] **Port the remaining BIOS UI/boot tests from [tests/test_bios.py](../tests/test_bios.py).**
-  - Coverage to preserve: interactive selection, mouse/keyboard navigation,
-    disk mounting, emulator startup, and reset-to-BIOS behavior.
+  - [x] Verify keyboard module-selection bounds, scroll reachability, disk
+        selection cycling, disk mounting, and module-discovery errors in Rust.
+  - [ ] Port mouse selection/double-click behavior, interactive error display,
+        and full emulator startup/reset-to-BIOS workflows.
 - [ ] **Port [tests/test_c_compiler.py](../tests/test_c_compiler.py)** — compiler coverage.
   - Coverage to preserve: supported-language behavior and diagnostics as the Rust compiler replaces Python.
 - [x] **Port console-device state/MMIO coverage from [tests/test_console_device.py](../tests/test_console_device.py) to Rust.**
@@ -164,8 +166,16 @@ considered migration.
   - Coverage to preserve: end-to-end coverage through the Rust networking path.
 - [ ] **Port [tests/test_spacecave.py](../tests/test_spacecave.py)** — network/game coverage.
   - Coverage to preserve: Spacecave integration through the Rust CPU and transport.
-- [ ] **Port [tests/test_storage_bios.py](../tests/test_storage_bios.py)** — storage/BIOS coverage.
-  - Coverage to preserve: parity behaviors through Rust storage and runtime.
+- [x] **Port [tests/test_storage_bios.py](../tests/test_storage_bios.py)** — storage/BIOS storage behavior.
+  - [x] Verify virtual disk block persistence, default blocks, write protection,
+        and invalid disk identifiers in Rust.
+  - [x] Verify module-file API chunk reads, file-size reporting, sorted listing,
+        module-folder isolation, and traversal rejection through disk MMIO.
+  - [x] Verify mounting an existing data disk preserves the loaded program and
+        rejects missing disk identifiers.
+  - Rust reports disk-command errors through the MMIO status register and
+    standard error; Python host-console integration remains with the legacy
+    emulator until that host is retired.
 - [ ] **Port [tests/test_tank16.py](../tests/test_tank16.py)** — Tank-16 gameplay coverage.
   - Coverage to preserve: gameplay currently uses the Python emulator/compiler; map and asset operations already use Rust CLI commands.
 
