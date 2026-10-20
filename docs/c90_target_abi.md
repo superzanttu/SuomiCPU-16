@@ -71,9 +71,10 @@ square root. A float value occupies an even pair of registers; a double or
 long-double value occupies R0-R3 or R4-R7, most-significant word first.
 Assembler mnemonics use the `F32`/`F64` prefixes (`F32ADD`, `F64CMP`,
 `I32TOF64`, `F64TOI32`, etc.) and reject register groups that cross these
-boundaries. The Numba JIT hands these instructions to the same emulator
-implementation, so both execution paths share the IEEE conversion and
-rounding behavior. Float-to-integer conversion truncates toward zero. The
+boundaries. The Rust CPU implements these instructions directly, and the
+retained Python compatibility emulator uses its interpreter for the same IEEE
+conversion and rounding behavior. Float-to-integer conversion truncates toward
+zero. The
 instruction returns zero for non-finite input and the low destination bits for
 finite values outside the destination range; C code must not rely on this
 extension where C90 leaves the conversion result undefined.
@@ -182,7 +183,7 @@ following pass:
 1. Compile-time and runtime ABI tests verify widths, ranges, endianness,
    alignment, aggregate offsets, pointer encoding, and all scalar/aggregate
    calling conventions.
-2. Emulator, JIT, and assembler execute identical tests for every C-visible
+2. Rust CPU, compatibility emulator, and assembler execute identical tests for every C-visible
    memory, control-flow, and floating-point opcode. Calls and returns,
    including indirect calls, preserve all 30 PC bits; interrupt frames contain
    the four-byte PC and two-byte flags value.

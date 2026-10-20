@@ -11,7 +11,7 @@ from src.SuomiCPU import (
     GPU_BASE, INSTRUCTIONS_PER_FRAME, KEYS_ADDR, SPEED_FAST, SPEED_MAX,
     GFX_MODE_640_480, GFX_MODE_ADDR, MOUSE_ADDR, SCREEN_WIDTH, SPEED_ADDR,
     GPU_LAYER_ORDER, GPU_LAYER_SELECT, VRAM_SIZE, VRAM_START, VSYNC_ADDR, SuomiCompute16,
-    _load_jit, create_memory,
+    create_memory,
 )
 
 HEADER = '#include "suomi_gfx.h"\n'
@@ -433,22 +433,16 @@ class GpuTests(unittest.TestCase):
 
 
 class Gpu3DTests(unittest.TestCase):
-    def test_numba_triangle_rasterizer_matches_python_fallback(self):
-        jit = _load_jit()
-        if jit is None:
-            self.skipTest("Numba JIT is unavailable")
-
+    def test_triangle_rasterizer_clips_and_draws_on_selected_layer(self):
         cpu = bare_cpu()
         cpu._ensure_gpu_state()
         cpu._drawing_layer = 3
         points = ((-12, 8), (71, 19), (23, 91))
-        with patch("src.SuomiCPU._load_jit", return_value=None):
-            cpu._gpu3d_triangle(points, 13)
-        expected = bytes(cpu.gpu_layers[3])
-        cpu.gpu_layers[3][:] = bytes(len(cpu.gpu_layers[3]))
         cpu._gpu3d_triangle(points, 13)
 
-        self.assertEqual(bytes(cpu.gpu_layers[3]), expected)
+        width, _ = cpu._screen_size()
+        self.assertEqual(cpu.gpu_layers[3][30 * width + 30], 13)
+        self.assertEqual(cpu.gpu_layers[3][100 * width + 100], 0)
 
     def render_scene(self, scene, mode=0):
         cpu = bare_cpu()
@@ -624,20 +618,6 @@ class CGraphicsTests(unittest.TestCase):
             cpu.step()
         self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
         self.assertEqual(cpu.read(MOUSE_ADDR + 5), 0)
-
-    def test_jit_mouse_event_read_consumes_latched_click(self):
-        if _load_jit() is None:
-            self.skipTest("Numba JIT is unavailable")
-        cpu = make_cpu(compile_source(
-            HEADER + "int click_events;\n"
-            "int main(void) { click_events = gfx_mouse_events(); return 0; }\n",
-            str(ROOT / "mouse_events_jit.c")))
-        cpu.set_mouse_position(70, 225)
-        cpu.mouse_button(0, True, 70, 225, 1000)
-        cpu._execute_jit(30000)
-        self.assertEqual(cpu.read_16(GLOBAL_BASE), 1)
-        self.assertEqual(cpu.memory[MOUSE_ADDR + 5], 0)
-
 
     def test_signed_char_loads_are_sign_extended(self):
         source = ROOT / "tests" / "_sc.c"

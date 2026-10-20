@@ -198,7 +198,6 @@ class CCompilerTests(unittest.TestCase):
         cpu.sp = 0x2FFFF
         cpu.load_program(image)
         cpu.reset()
-        cpu.use_jit = False
 
         cpu.execute_frame()
 

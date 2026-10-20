@@ -1,12 +1,10 @@
 import pygame
 import datetime
 import math
-import sys
 import argparse
 import array
 import struct
 import random
-import os
 import time
 import mmap
 from collections.abc import Callable
@@ -280,38 +278,6 @@ def load_program_file(
     verbose: bool = False,
 ) -> AssemblyImage:
     return _load_program_file(path, logger, MEM_SIZE, verbose)
-
-_JIT = False  # False = not tried yet, None = unavailable
-
-def _load_jit():
-    """Import the optional Numba CPU core once; returns None if numba is missing or disabled
-    (set SC16_NOJIT=1 to force the pure-Python core)."""
-    global _JIT
-    if _JIT is False:
-        _JIT = None
-        if not os.environ.get("SC16_NOJIT"):
-            try:
-                src_dir = os.path.dirname(os.path.abspath(__file__))
-                if src_dir not in sys.path:
-                    sys.path.insert(0, src_dir)
-                import sc16_jit
-                expected_constants = (
-                    MEM_MASK,
-                    GPU_BASE,
-                    ICR_ADDR,
-                    DISK_BASE,
-                    CONSOLE_DATA,
-                    CONSOLE_STATUS,
-                    CONSOLE_CONTROL,
-                    MOUSE_ADDR + 5,
-                    GPU_LAYER_SELECT,
-                    GPU_LAYER_ORDER + GPU_LAYER_COUNT,
-                )
-                if sc16_jit.CONSTANTS == expected_constants:
-                    _JIT = sc16_jit
-            except Exception:
-                _JIT = None
-    return _JIT
 
 class SuomiCompute16:
     """Tämä on itse tietokoneen sydän (emulaattori)."""
@@ -1095,14 +1061,6 @@ class SuomiCompute16:
             getattr(self, "_drawing_layer", self.memory[GPU_LAYER_SELECT]),
             GPU_LAYER_COUNT - 1,
         )
-        jit = _load_jit()
-        if jit is not None and layer != 0:
-            jit.fill_triangle(
-                self.gpu_layers[layer], width, height,
-                ax, ay, bx, by, cx, cy,
-                color & (0x0F if self._graphics_mode() == GFX_MODE_640_480 else 0xFF),
-            )
-            return
 
         def edge(x0, y0, x1, y1, px, py):
             return (px - x0) * (y1 - y0) - (py - y0) * (x1 - x0)
@@ -2415,55 +2373,10 @@ class SuomiCompute16:
             exact_budget = rate * max(now - previous, 0.0) + fraction
             budget = int(exact_budget)
             self._speed_budget_fraction = exact_budget - budget
-        if getattr(self, 'use_jit', True) and _load_jit() is not None:
-            self._execute_jit(budget)
-            return
         for _ in range(budget):
             if not self.running or self.frame_yield:
                 break
             self.step()
-
-    def _execute_jit(self, budget):
-        """Run `budget` instructions with the compiled core (sc16_jit). Instructions the core
-        cannot handle (graphics register writes, HALT, float ops) are run by step(), and
-        pending interrupts are dispatched here, so the result is identical to step()-ing."""
-        import numpy as np
-        run_block = _load_jit().run_block
-        regs = np.array(self.registers, dtype=np.int64)
-        st = np.zeros(6, dtype=np.int64)
-        flags = self.flags
-        step = self.step
-        check_interrupts = self.check_interrupts
-        memory = np.frombuffer(self.memory, dtype=np.uint8)
-        remaining = budget
-        try:
-            while remaining > 0 and self.running and not self.frame_yield:
-                st[0] = self.pc
-                st[1] = self.sp
-                st[2] = flags['Z']
-                st[3] = flags['C']
-                st[4] = flags.get('N', 0)
-                st[5] = flags.get('V', 0)
-                regs[:] = self.registers
-                count, status = run_block(memory, regs, st, remaining)
-                self.registers[:] = regs.tolist()
-                pc, sp, z, c, n, v = st.tolist()
-                self.pc = pc
-                self.sp = sp
-                flags['Z'] = z
-                flags['C'] = c
-                flags['N'] = n
-                flags['V'] = v
-                remaining -= count
-                if status == 0:
-                    break
-                if status == 2:
-                    check_interrupts()
-                else:
-                    step()
-                    remaining -= 1
-        finally:
-            del memory
 
     # Mouse button bits: held (MOUSE_ADDR+4) bit0 left, bit1 right.
     # Events (MOUSE_ADDR+5): bit0/1 left/right press, bit2/3 left/right double click,

@@ -344,8 +344,8 @@ shifted out) and clear `V`. A zero-count shift preserves `C`. `NEG32` sets
 does not change flags.
 
 These instructions use the extended `0x1A` selector in the `OP_SHR` space and
-are implemented by the Python emulator. The optional JIT hands this group back
-to the emulator. The `MOVSPH` miscellaneous instruction reads the high 14
+are implemented by the Python compatibility emulator and the Rust CPU. The
+`MOVSPH` miscellaneous instruction reads the high 14
 bits of the 30-bit stack pointer; together with `MOVSP`, it lets compiler code
 form full stack addresses for 32-bit objects. `SETSPH` sets those upper bits
 without disturbing the low 16-bit offset, allowing code to restore a full
@@ -1275,6 +1275,9 @@ Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchma
     python tools/c_compiler.py "modules/SC-16 showcase/sc16_showcase.c" -o showcase.bin
     cargo run -- showcase.bin
 
-## Optional JIT acceleration
+## CPU execution
 
-If [Numba](https://numba.readthedocs.io/) is installed (`pip install numba`), the emulator runs the CPU core as compiled machine code, typically 5-15x faster than the pure-Python interpreter, and uses compiled triangle rasterization for the 3D layer. A local rasterizer microbenchmark (40 fills of a 235x205-pixel triangle) measured 2.89 s in Python and 3.3 ms with Numba, about 873x faster for that kernel only; whole-frame speedup depends on scene content and remains lower. The first use compiles kernels and can take a few seconds; Numba caches compiled code. Without Numba the emulator falls back automatically to the pure-Python CPU and rasterizer. Set `SC16_NOJIT=1` to force the Python paths. CPU instruction equivalence is tested in `tests/test_jit_core.py`; the GPU triangle kernel is tested against the Python fallback.
+The Rust emulator executes SC-16 programs with its Rust CPU implementation and
+does not require Numba or a Python JIT. The retained Python compatibility
+emulator uses its interpreter while migration tests remain; the former optional
+Numba backend has been removed.

@@ -9,7 +9,7 @@ grow support against real module builds.
 
 ## Current inventory
 
-There are 32 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
+There are 30 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
 Generated maps, Tank-16 atlas tools, map loading, and the graphical map editor
 now use Rust implementations. Python remains in the emulator and developer
 tests while those larger migrations continue.
@@ -37,7 +37,6 @@ Status meanings:
 | [`src/isa.py`](../src/isa.py) | Rust exists — Python consumers remain | ISA metadata is available in Rust, but the Python assembler and emulator still import Python definitions. Remove it with those consumers after encoding/execution parity is covered. |
 | [`src/lib_disk.py`](../src/lib_disk.py) | Rust exists — Python consumers remain | Rust disk behavior and parity tests exist, but the Python emulator, Tank-16 loader, and Python tests still import this implementation. |
 | [`src/program_loader.py`](../src/program_loader.py) | Rust exists — Python consumers remain | Tank-16 runtime compilation now routes through `sc16tank build-runtime`; the Python loader still serves the Python emulator and other Python callers. Retire it with those consumers. |
-| [`src/sc16_jit.py`](../src/sc16_jit.py) | Rust exists — Python consumer remains | The Rust CPU replaces the need for this Numba execution backend, but `src/SuomiCPU.py` still optionally imports it. Remove it when the Python emulator is retired and the Rust CPU parity suite is sufficient. |
 | [`src/__init__.py`](../src/__init__.py) | Package marker | Python test/tool imports still use `src` as a package. Remove after those imports disappear. |
 
 ## Build, network, and developer tools
@@ -103,7 +102,6 @@ considered migration.
 | [`tests/test_gpu_games.py`](../tests/test_gpu_games.py) | Test/helper — retain for coverage | Game-level GPU behavior through the Python emulator; replace with Rust CPU/runtime integration tests. |
 | [`tests/test_hertta3d.py`](../tests/test_hertta3d.py) | Test/helper — retain for coverage | Hertta3D game integration through the Python harness; port equivalent execution/render checks to Rust. |
 | [`tests/test_isa_opcodes.py`](../tests/test_isa_opcodes.py) | Test/helper — retain for coverage | Exhaustive Python assembler/CPU opcode combinations; migrate uncovered combinations to Rust assembler and CPU tests. |
-| [`tests/test_jit_core.py`](../tests/test_jit_core.py) | Test/helper — retain for coverage | Checks Numba JIT equivalence against the Python interpreter. Replace with Rust CPU differential/parity tests; the JIT itself is superseded. |
 | [`tests/test_map_editor.py`](../tests/test_map_editor.py) | Test/helper — retain for coverage | Exercises Rust CLI map loading, validation, saving, and the editor entry point. Rust unit tests cover map mutation and serialization contracts. |
 | [`tests/test_natural_maps.py`](../tests/test_natural_maps.py) | Test/helper — retain for coverage | Runs the Rust generator and validates generated maps through the Rust CLI. |
 | [`tests/test_net.py`](../tests/test_net.py) | Test/helper — retain for coverage | Python transport and emulator networking integration; retain/port end-to-end coverage using the Rust networking path. |
@@ -141,8 +139,9 @@ point and its required tests pass.
 
 3. **Close Rust emulator/device parity and switch the default workflows.**
    - Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,
-     `src/lib_disk.py`, `src/isa.py`, `src/sc16_jit.py`, and
-     `tools/sc16net.py` with the Rust CPU/runtime/device implementations.
+     `src/lib_disk.py`, `src/isa.py`, and `tools/sc16net.py` with the Rust
+     CPU/runtime/device implementations. The optional Python Numba JIT has
+     been removed; the Rust CPU is the primary execution engine.
    - Rust now provides the console MMIO buffers and text/scrollback state.
      Retire the Python Tk terminal, console logging, and emulator integration
      alongside the Python emulator.
@@ -155,7 +154,7 @@ point and its required tests pass.
 4. **Migrate Python test harnesses and integration coverage.**
    - Replace `tests/gfx_harness.py` with Rust test helpers and convert
      emulator-dependent tests (`test_display`, `test_extended_opcodes`,
-     `test_gpu_games`, `test_hertta3d`, `test_jit_core`, `test_net`,
+     `test_gpu_games`, `test_hertta3d`, `test_net`,
      `test_spacecave`, `test_storage_bios`, and `test_tank16`) to Rust coverage.
    - Move assembler/compiler/BIOS and map validation cases into their relevant
      Rust test modules; keep tests for behaviors until they are ported or

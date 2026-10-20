@@ -35,8 +35,8 @@ an ABI choice as delivered.
   `0x80000..0xFFFFF`; `LDI30` loads full addresses. Regression coverage
   exercises the C90 minimum 65,535-byte object size, but this does not establish
   all C90 translation limits.
-- The assembler and emulator now provide binary32/binary64 floating-point
-  instructions with JIT interpreter fallback and focused opcode regressions.
+- The assembler and Rust emulator provide binary32/binary64 floating-point
+  instructions with interpreter fallback and focused opcode regressions.
   The C compiler, C object layout, literals, and `float.h` still use binary16;
   `double` therefore does not satisfy C90 minimum range and precision.
 - Function pointers and indirect calls, bit-fields, full linkage/storage
@@ -110,7 +110,7 @@ Passing the Rust build or parser tests does not establish feature parity.
   Rust compiler integration tests.
 - [ ] Expand Rust compiler support until existing `.c` source and module builds
   no longer encounter unsupported syntax or semantics.
-- [ ] Port remaining Python emulator, JIT, assembler, utilities, map tools,
+- [ ] Port remaining Python emulator, assembler, utilities, map tools,
   GIF generation, build scripts, and tests to Rust or remove them if obsolete.
 - [ ] Remove Python C compiler dependencies only after all required build,
   runtime, test, and tooling paths are migrated.
@@ -139,7 +139,7 @@ or correct runtime helpers cannot meet the ABI requirements.
     register-pair indirect `JMPRP` / `CALLRP` for full 30-bit addresses.
   - Add `LDI30` (with `LDI19`/`LDA` compatibility aliases) so assembler and
     compiler-generated addresses preserve all 30 bits; verify assembler,
-    emulator, JIT, ABI offsets, and high addresses.
+    emulator, ABI offsets, and high addresses.
 
 ### A1. Define C90 floating-point representations
 
@@ -164,8 +164,8 @@ or correct runtime helpers cannot meet the ABI requirements.
   - [x] Implement IEEE binary32/binary64 register encoding, rounding,
     subnormal arithmetic, signed zero, infinities, NaNs, and comparison flags
     in the emulator.
-  - [x] Route the new instructions through the JIT's interpreter fallback and
-    add assembler, validation, and JIT-equivalence regressions.
+  - [x] Implement the new instructions in the Rust CPU and add assembler,
+    validation, and execution regressions.
   - **Depends on:** A1 (`c90-float-model`).
 
 ### A3. Validate floating-point execution and ABI
@@ -173,7 +173,7 @@ or correct runtime helpers cannot meet the ABI requirements.
 - [ ] **Validate floating-point ABI behavior** (`c90-float-validation`)
   - Test exponent and precision boundaries, subnormals, signed zero,
     infinities, NaNs, rounding, casts, constants, calls, and returns.
-  - Compare emulator and JIT results with an independent reference.
+  - Compare Rust CPU results with an independent reference.
   - **Depends on:** B1 (`c90-float-backend`).
 
 ### A4. Validate the complete SuomiCPU-16 C ABI
@@ -183,7 +183,7 @@ or correct runtime helpers cannot meet the ABI requirements.
     layout, object/function pointers, conversions, stack frames, and scalar
     and aggregate calling conventions.
   - Exercise relevant C-visible memory, control-flow, and floating-point
-    behavior across assembler, emulator, and JIT.
+    behavior across assembler and both emulator implementations.
   - Update `c90_target_abi.md` only from verified behavior.
   - **Depends on:** A3, B2 (`c90-indirect-calls`), C1
     (`c90-pointer-qualifiers`), C3 (`c90-bitfield-codegen`), B4
@@ -405,7 +405,7 @@ required before claiming full C90 compatibility.
   - Classify failures as implementation defects, documented
     implementation-defined/unspecified behavior, unsupported hosted
     facilities, or invalid test assumptions.
-  - Fix defects, add regressions, and publish repeatable emulator/JIT results.
+  - Fix defects, add regressions, and publish repeatable emulator results.
   - **Depends on:** A4 (`c90-abi-conformance`), B3
     (`c90-declarators`), C4 (`c90-preprocessor`), C5
     (`c90-translation-limits`), C8 (`c90-library-functions`), and C9
@@ -415,7 +415,7 @@ required before claiming full C90 compatibility.
 
 - [ ] **Close C90 compatibility release gates** (`c90-release-gate`)
   - Run repository tests and the independent conformance suite.
-  - Verify ABI and assembler/emulator/JIT parity, translation limits,
+  - Verify ABI and assembler/emulator parity, translation limits,
     required headers/library behavior, and documentation.
   - Remove the nonconformance disclaimer only if the C90 requirements are
     satisfied and independent evidence supports the claim.
@@ -432,7 +432,7 @@ true:
    aggregate, and function-call ABI behavior is verified.
 3. Required hosted headers and library facilities have documented and tested
    behavior, including errors and unavailable resources.
-4. Assembler, emulator, and JIT agree on generated programs and C-visible
+4. Assembler and both emulator implementations agree on generated programs and C-visible
    machine behavior.
 5. An independent C90 conformance suite has been run; failures are resolved
    or correctly classified, and implementation-defined/unspecified behavior
