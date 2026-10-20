@@ -9,7 +9,7 @@ grow support against real module builds.
 
 ## Current inventory
 
-There are 28 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
+There are 27 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
 Generated maps, Tank-16 atlas tools, map loading, and the graphical map editor
 now use Rust implementations. Python remains in the emulator and developer
 tests while those larger migrations continue.
@@ -98,7 +98,6 @@ considered migration.
 | [`tests/test_console_device.py`](../tests/test_console_device.py) | Test/helper — retain for coverage | Python emulator and Tk console-window integration remain; Rust unit tests now cover console MMIO buffering, bounds, text rendering state, and scrollback. |
 | [`tests/test_display.py`](../tests/test_display.py) | Test/helper — retain for coverage | Pygame display rendering and emulator integration; replace with Rust runtime/frame tests. |
 | [`tests/test_extended_opcodes.py`](../tests/test_extended_opcodes.py) | Test/helper — retain for coverage | Extended ISA execution and graphics behavior; confirm Rust CPU coverage, then move remaining graphics cases to Rust. |
-| [`tests/test_finland_map.py`](../tests/test_finland_map.py) | Test/helper — retain for coverage | Finland map/GIS generator and asset output; port generator checks or retain a clearly documented Python authoring-tool test. |
 | [`tests/test_gpu_games.py`](../tests/test_gpu_games.py) | Test/helper — retain for coverage | Game-level GPU behavior through the Python emulator; replace with Rust CPU/runtime integration tests. |
 | [`tests/test_hertta3d.py`](../tests/test_hertta3d.py) | Test/helper — retain for coverage | Hertta3D game integration through the Python harness; port equivalent execution/render checks to Rust. |
 | [`tests/test_isa_opcodes.py`](../tests/test_isa_opcodes.py) | Test/helper — retain for coverage | Exhaustive Python assembler/CPU opcode combinations; migrate uncovered combinations to Rust assembler and CPU tests. |
@@ -137,6 +136,8 @@ point and its required tests pass.
    - Map-editor and natural-map CLI integration coverage now runs as Rust
      Cargo integration tests; the redundant Python subprocess tests were
      removed.
+   - Finland map metadata/encoding, validation, atlas extension, GeoJSON
+     generation, and 100x100 tilemap upload are covered by Rust tests.
 
 3. **Close Rust emulator/device parity and switch the default workflows.**
    - Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,

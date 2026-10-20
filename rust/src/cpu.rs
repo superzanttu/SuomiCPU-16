@@ -3465,6 +3465,23 @@ mod tests {
     }
 
     #[test]
+    fn finland_sized_tilemap_upload_preserves_all_ten_thousand_tiles() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let expected: Vec<u8> = (0..10_000).map(|index| (index % 256) as u8).collect();
+        cpu.memory[0x4000..0x4000 + expected.len()].copy_from_slice(&expected);
+        cpu.write_u16(GPU_BASE + 10, 0x4000);
+        cpu.write_u16(GPU_BASE + 2, 0);
+        cpu.write_u16(GPU_BASE + 4, 0);
+        cpu.write_u16(GPU_BASE + 6, 100);
+        cpu.write_u16(GPU_BASE + 8, 100);
+        cpu.write(GPU_BASE, GPU_TILEMAP);
+
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        assert_eq!((cpu.tilemap_width, cpu.tilemap_height), (100, 100));
+        assert_eq!(cpu.tilemap, expected);
+    }
+
+    #[test]
     fn invalid_tilemap_dimensions_return_error_without_replacing_map() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.tilemap = vec![3];
