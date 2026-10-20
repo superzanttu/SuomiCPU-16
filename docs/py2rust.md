@@ -9,7 +9,7 @@ grow support against real module builds.
 
 ## Current inventory
 
-There are 30 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
+There are 28 Python files in `src/`, `tools/`, `modules/`, and `tests/`.
 Generated maps, Tank-16 atlas tools, map loading, and the graphical map editor
 now use Rust implementations. Python remains in the emulator and developer
 tests while those larger migrations continue.
@@ -102,8 +102,6 @@ considered migration.
 | [`tests/test_gpu_games.py`](../tests/test_gpu_games.py) | Test/helper — retain for coverage | Game-level GPU behavior through the Python emulator; replace with Rust CPU/runtime integration tests. |
 | [`tests/test_hertta3d.py`](../tests/test_hertta3d.py) | Test/helper — retain for coverage | Hertta3D game integration through the Python harness; port equivalent execution/render checks to Rust. |
 | [`tests/test_isa_opcodes.py`](../tests/test_isa_opcodes.py) | Test/helper — retain for coverage | Exhaustive Python assembler/CPU opcode combinations; migrate uncovered combinations to Rust assembler and CPU tests. |
-| [`tests/test_map_editor.py`](../tests/test_map_editor.py) | Test/helper — retain for coverage | Exercises Rust CLI map loading, validation, saving, and the editor entry point. Rust unit tests cover map mutation and serialization contracts. |
-| [`tests/test_natural_maps.py`](../tests/test_natural_maps.py) | Test/helper — retain for coverage | Runs the Rust generator and validates generated maps through the Rust CLI. |
 | [`tests/test_net.py`](../tests/test_net.py) | Test/helper — retain for coverage | Python transport and emulator networking integration; retain/port end-to-end coverage using the Rust networking path. |
 | [`tests/test_spacecave.py`](../tests/test_spacecave.py) | Test/helper — retain for coverage | Spacecave network/game integration through Python CPU and transport; replace with Rust integration coverage. |
 | [`tests/test_storage_bios.py`](../tests/test_storage_bios.py) | Test/helper — retain for coverage | Python disk and BIOS integration, including behaviors that need parity checks against Rust storage/runtime. |
@@ -136,6 +134,9 @@ point and its required tests pass.
      and atlas-extension tests now exercise the Rust CLI.
    - Keep C compilation in Python as an explicit migration-boundary exception;
      Tank-16 map/asset callers and tests now use Rust.
+   - Map-editor and natural-map CLI integration coverage now runs as Rust
+     Cargo integration tests; the redundant Python subprocess tests were
+     removed.
 
 3. **Close Rust emulator/device parity and switch the default workflows.**
    - Compare `src/SuomiCPU.py`, `src/bios.py`, `src/console_device.py`,
