@@ -241,6 +241,8 @@ C90 requirements listed under C.
   - Close gaps in nested and abstract declarators, array/function parameter
     adjustment, compatible declarations/definitions, and old-style parameter
     metadata.
+  - The Rust native subset resolves block-scope local names, including shadowed
+    locals and the scope of `for` initializers.
   - Preserve supported structure/union assignment, by-value argument copies,
     and caller-owned returns.
   - Diagnose unsupported or invalid forms rather than silently miscompiling.

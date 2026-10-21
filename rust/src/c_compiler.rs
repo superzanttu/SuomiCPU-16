@@ -570,7 +570,7 @@ pub fn compile_minimal_program(
                 {
                     return Ok(None);
                 }
-                functions.push(function);
+                functions.push(function.clone());
             }
             ExternalDeclaration::FunctionPrototype(function) => {
                 let is_library_function = native_library_for_symbol(&function.name).is_some();
@@ -789,7 +789,31 @@ pub fn compile_minimal_program(
     }
     assembly.push_str(".address 0x4800\n");
     let mut label_counter = 0usize;
-    for function in functions {
+    for function in &mut functions {
+        let mut scopes = vec![HashMap::new()];
+        let mut local_counter = 0usize;
+        for parameter in &mut function.declaration.parameters {
+            let Some(name) = parameter.name.as_mut() else {
+                return Ok(None);
+            };
+            let unique_name = native_local_name(local_counter);
+            local_counter += 1;
+            if scopes[0]
+                .insert(name.clone(), unique_name.clone())
+                .is_some()
+            {
+                return Ok(None);
+            }
+            *name = unique_name;
+        }
+        let StatementKind::Compound(statements) = &mut function.body.kind else {
+            return Ok(None);
+        };
+        if !rewrite_native_local_scopes(statements, &mut scopes, &mut local_counter, false) {
+            return Ok(None);
+        }
+    }
+    for function in &functions {
         let StatementKind::Compound(statements) = &function.body.kind else {
             return Ok(None);
         };
@@ -1075,6 +1099,213 @@ fn statement_calls_are_defined(
         }
         StatementKind::Break | StatementKind::Continue | StatementKind::Goto(_) => true,
     }
+}
+
+fn native_local_name(index: usize) -> String {
+    format!("\0sc16_local_{index}")
+}
+
+fn rewrite_native_local_expression(
+    expression: &mut Expression,
+    scopes: &[HashMap<String, String>],
+) {
+    match &mut expression.kind {
+        ExpressionKind::Atom(name) => {
+            if let Some(local) = scopes.iter().rev().find_map(|scope| scope.get(name)) {
+                *name = local.clone();
+            }
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            rewrite_native_local_expression(operand, scopes);
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Assignment {
+            target: left,
+            value: right,
+            ..
+        }
+        | ExpressionKind::Index {
+            expression: left,
+            index: right,
+        } => {
+            rewrite_native_local_expression(left, scopes);
+            rewrite_native_local_expression(right, scopes);
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            rewrite_native_local_expression(condition, scopes);
+            rewrite_native_local_expression(when_true, scopes);
+            rewrite_native_local_expression(when_false, scopes);
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            rewrite_native_local_expression(function, scopes);
+            for argument in arguments {
+                rewrite_native_local_expression(argument, scopes);
+            }
+        }
+        ExpressionKind::Member { expression, .. } => {
+            rewrite_native_local_expression(expression, scopes);
+        }
+        ExpressionKind::InitializerList(values) => {
+            for value in values {
+                rewrite_native_local_expression(value, scopes);
+            }
+        }
+        ExpressionKind::SizeofType(_) => {}
+    }
+}
+
+fn rewrite_native_local_scopes(
+    statements: &mut [Statement],
+    scopes: &mut Vec<HashMap<String, String>>,
+    next_name: &mut usize,
+    create_scope: bool,
+) -> bool {
+    if create_scope {
+        scopes.push(HashMap::new());
+    }
+    let mut valid = true;
+    for statement in statements {
+        match &mut statement.kind {
+            StatementKind::Compound(nested) => {
+                valid &= rewrite_native_local_scopes(nested, scopes, next_name, true);
+            }
+            StatementKind::Declaration(declarations) => {
+                for declaration in declarations {
+                    let scope = scopes.last_mut().expect("function scope exists");
+                    if scope.contains_key(&declaration.name) {
+                        valid = false;
+                        break;
+                    }
+                    let unique_name = native_local_name(*next_name);
+                    *next_name += 1;
+                    scope.insert(declaration.name.clone(), unique_name.clone());
+                    declaration.name = unique_name;
+                    if let Some(initializer) = &mut declaration.initializer {
+                        rewrite_native_local_expression(initializer, scopes);
+                    }
+                }
+            }
+            StatementKind::Expression(expression) => {
+                if let Some(expression) = expression {
+                    rewrite_native_local_expression(expression, scopes);
+                }
+            }
+            StatementKind::Return(expression) => {
+                if let Some(expression) = expression {
+                    rewrite_native_local_expression(expression, scopes);
+                }
+            }
+            StatementKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                rewrite_native_local_expression(condition, scopes);
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(then_branch),
+                    scopes,
+                    next_name,
+                    false,
+                );
+                if let Some(branch) = else_branch {
+                    valid &= rewrite_native_local_scopes(
+                        std::slice::from_mut(branch),
+                        scopes,
+                        next_name,
+                        false,
+                    );
+                }
+            }
+            StatementKind::While { condition, body } => {
+                rewrite_native_local_expression(condition, scopes);
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(body),
+                    scopes,
+                    next_name,
+                    false,
+                );
+            }
+            StatementKind::DoWhile { body, condition } => {
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(body),
+                    scopes,
+                    next_name,
+                    false,
+                );
+                rewrite_native_local_expression(condition, scopes);
+            }
+            StatementKind::For {
+                initializer,
+                condition,
+                update,
+                body,
+            } => {
+                scopes.push(HashMap::new());
+                if let Some(initializer) = initializer {
+                    valid &= rewrite_native_local_scopes(
+                        std::slice::from_mut(initializer),
+                        scopes,
+                        next_name,
+                        false,
+                    );
+                }
+                if let Some(condition) = condition {
+                    rewrite_native_local_expression(condition, scopes);
+                }
+                if let Some(update) = update {
+                    rewrite_native_local_expression(update, scopes);
+                }
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(body),
+                    scopes,
+                    next_name,
+                    false,
+                );
+                scopes.pop();
+            }
+            StatementKind::Switch { expression, cases } => {
+                rewrite_native_local_expression(expression, scopes);
+                for (value, case_statements) in cases {
+                    if let Some(value) = value {
+                        rewrite_native_local_expression(value, scopes);
+                    }
+                    valid &= rewrite_native_local_scopes(case_statements, scopes, next_name, false);
+                }
+            }
+            StatementKind::Label { statement, .. } => {
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(statement),
+                    scopes,
+                    next_name,
+                    false,
+                );
+            }
+            StatementKind::Break | StatementKind::Continue | StatementKind::Goto(_) => {}
+        }
+        if !valid {
+            break;
+        }
+    }
+    if create_scope {
+        scopes.pop();
+    }
+    valid
 }
 
 fn collect_native_locals(
@@ -6992,6 +7223,54 @@ mod tests {
             .unwrap();
         cpu.run(64).unwrap();
         assert_eq!(cpu.registers[0], 12);
+    }
+
+    #[test]
+    fn compiles_shadowed_locals_with_independent_block_scope() {
+        for (source, expected) in [
+            (
+                "int main(void) { int value = 7; { int value = 3; value++; } return value; }",
+                7,
+            ),
+            (
+                "int main(void) { int value = 5; { int copy = value + 2; int value = 9; return copy + value; } }",
+                16,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "shadowed-locals.c")
+                .unwrap()
+                .expect("supported block-scoped local shadowing");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_for_initializer_scope_and_shadowed_parameters() {
+        for (source, expected) in [
+            (
+                "int main(void) { int i = 9; for (int i = 0; i < 2; i++) { int i = 4; i++; } return i; }",
+                9,
+            ),
+            (
+                "int helper(int value) { { int value = 5; value++; } return value; } int main(void) { return helper(12); }",
+                12,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "nested-scope.c")
+                .unwrap()
+                .expect("supported nested declaration scope");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(256).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
     }
 
     #[test]

@@ -104,7 +104,8 @@ encounter a pre-existing C90 declaration-order diagnostic in the retained C
 compiler. `sc16build smoke-modules` does not invoke Python; it reports modules
 whose C exceeds the current Rust compiler subset as failures. Rust compiler
 parity for all modules is still outstanding; the current Rust-only smoke run
-builds Netgame Demo and reports the other 16 modules as unsupported.
+builds Asteroids and Netgame Demo and reports the other 15 modules as
+unsupported.
 
 ## Python tests and test helpers
 
