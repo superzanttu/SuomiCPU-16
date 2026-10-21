@@ -1834,11 +1834,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_c_program_is_rejected_without_running_python() {
+    fn rust_compiler_loads_ana_clock_without_running_python() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let program = root.join("modules").join("AnaClock").join("anaclock.c");
-        let error = load_program(&program).unwrap_err();
-        assert!(error.to_string().contains("Rust C compiler"));
+        let image = load_program(&program).expect("Rust C compiler should load AnaClock");
+        assert_eq!(image.entry_point, 0);
+        assert!(!image.segments.is_empty());
     }
 
     #[test]

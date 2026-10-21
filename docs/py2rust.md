@@ -1,11 +1,12 @@
 # Python-to-Rust migration
 
 This document inventories the Python files still present in the repository and
-orders the remaining work by dependency. The target is to run the SC-16 emulator
-and its supported build/runtime workflows with Rust, then remove Python
-implementations and their Python-only tests. It does not claim full C90
-compatibility as a prerequisite; implement the C needed by the SC-16 modules and
-grow support against real module builds.
+orders the remaining work by dependency. The end goal is a repository with no
+Python source, Python runtime/build dependencies, or Python-only CI workflows.
+Replace every required behavior with Rust, migrate or intentionally retire its
+tests and tools, and then remove the Python implementation. This does not claim
+full C90 compatibility as a prerequisite; implement the C needed by the SC-16
+modules and grow support against real module builds.
 
 ## Current inventory
 
@@ -258,24 +259,19 @@ point and its required tests pass.
    - [ ] Complete the C subset required by the repository's runnable modules in
      `rust/src/c_compiler.rs`; use the Rust assembler rather than
      `tools/assembler.py`.
-   - [ ] Reproduce the remaining useful `src/program_loader.py` behavior. Its
-     Tank-16 dynamic-asset path now delegates to the Rust `sc16tank` CLI.
+   - [ ] Reproduce the remaining useful `src/program_loader.py` behavior.
    - [x] Exercise supported Rust C source loading through the headless runtime
      with a compiled program that executes and halts.
-   - [x] Add Rust discovery/orchestration in `sc16build smoke-modules`.
-     This aggregate smoke command still delegates C translation to the
-     retained Python compiler; it is not evidence of Rust compiler parity.
+   - [x] Add Rust discovery/orchestration in `sc16build smoke-modules`; it now
+     invokes the Rust compiler only.
    - [ ] Keep the Rust-only module-build sweep as the parity gate. The latest
-     direct Rust compiler sweep still fails all 16 selected non-Tank-16 BIOS
-     C modules; Tank-16 uses its specialized Rust runtime builder and is not
-     part of that sweep. Unsupported compiler/runtime features remain, including
-     record layout/member code generation, standard-library calls, and broader
-     game-specific C semantics. Unsigned 16-bit word support now covers globals,
-     locals, function parameters, and returns, but does not yet make a selected
-     module build pass.
-   - [ ] Gate deletion of `tools/c_compiler.py`, `tools/assembler.py`, and
-     `src/program_loader.py` on builds of selected real module programs and
-     migrated regression tests.
+     sweep compiles Asteroids and Netgame Demo, and fails 15 other selected
+     modules, including Tank-16. Unsupported features include record layout
+     and member code generation, standard-library calls, and broader
+     game-specific C semantics.
+   - [ ] Remove `tools/c_compiler.py`, `tools/assembler.py`, and
+     `src/program_loader.py` after real module builds and migrated regressions
+     pass without them.
 
 - [x] **Port and route the Tank-16 map/asset workflow through Rust.**
    - Rust now owns map data validation, editing, runtime encoding, asset
@@ -320,21 +316,20 @@ point and its required tests pass.
      explicitly retired.
    - [ ] Remove the Python test package markers when no Python tests remain.
 
-- [ ] **Resolve optional authoring and gallery utilities.**
-   - [x] Port the README gallery generator to Rust; source translation uses
-     the retained Python C compiler.
-   - [ ] Decide and document whether the remaining Python developer utilities are
-     required in the Rust-only workflow.
+- [ ] **Migrate authoring and gallery utilities.**
+   - [x] Port the README gallery generator to Rust; source translation still
+     needs to move from Python to the Rust C compiler.
+   - [ ] Port or retire every remaining Python developer utility; none are
+     accepted as permanent exceptions.
 
 ## Completion criteria
 
 - [ ] All supported emulator, BIOS, compiler, networking, storage, and module
   workflows use Rust.
-- [ ] Required Python runtime/build entry points and their Python-only dependencies
-  have been removed; optional authoring tools have an explicit disposition.
+- [ ] Python runtime/build entry points, Python-only CI workflows, and Python
+  dependencies have been removed.
 - [ ] Rust tests cover the retained behavior, including module build and Tank-16
   runtime map/assets.
 - [ ] Documentation and examples no longer direct users to removed Python
   commands.
-- [ ] The remaining Python-file inventory is empty, or every intentionally retained
-  file is explicitly called out as an accepted exception.
+- [ ] The tracked Python-file inventory is empty.
