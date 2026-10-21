@@ -198,6 +198,14 @@ pub struct TranslationUnit {
 #[derive(Clone)]
 enum NativeLocation {
     Register(u8),
+    PointerRegister {
+        register: u8,
+        element_size: usize,
+        element_signed: bool,
+    },
+    StackScalar {
+        offset: usize,
+    },
     Constant(i64),
     GlobalScalar,
     GlobalArray {
@@ -248,6 +256,20 @@ fn native_argument_is_pointer(function: &str, index: usize) -> bool {
 
 fn is_native_word_type(c_type: &str) -> bool {
     matches!(c_type.trim(), "int" | "unsigned int")
+}
+
+fn native_pointer_element(c_type: &str) -> Option<(usize, bool)> {
+    let base_type = c_type.trim().strip_suffix('*')?.trim();
+    match base_type {
+        "char" | "signed char" => Some((1, true)),
+        "unsigned char" => Some((1, false)),
+        "int" | "unsigned int" => Some((2, false)),
+        _ => None,
+    }
+}
+
+fn is_native_parameter_type(c_type: &str) -> bool {
+    is_native_word_type(c_type) || native_pointer_element(c_type).is_some()
 }
 
 pub struct ExpressionParser {
@@ -540,7 +562,7 @@ pub fn compile_minimal_program(
                         .declaration
                         .parameters
                         .iter()
-                        .any(|parameter| !is_native_word_type(&parameter.c_type))
+                        .any(|parameter| !is_native_parameter_type(&parameter.c_type))
                     || !names.insert(function.declaration.name.as_str())
                 {
                     return Ok(None);
@@ -558,7 +580,7 @@ pub fn compile_minimal_program(
                         && function
                             .parameters
                             .iter()
-                            .any(|parameter| !is_native_word_type(&parameter.c_type)))
+                            .any(|parameter| !is_native_parameter_type(&parameter.c_type)))
                 {
                     return Ok(None);
                 }
@@ -752,30 +774,43 @@ pub fn compile_minimal_program(
             return Ok(None);
         }
         let has_local_array = statement_has_local_array(&function.body);
-        if has_local_array && function.declaration.parameters.len() > 2 {
-            return Ok(None);
-        }
+        let has_excess_locals = function.declaration.parameters.len()
+            + statement_scalar_local_count(&function.body)
+            > 3;
+        let spill_third_parameter = function.declaration.parameters.len() == 3;
+        let reserve_frame_register = has_local_array || has_excess_locals || spill_third_parameter;
         let mut locals = HashMap::new();
         for (index, parameter) in function.declaration.parameters.iter().enumerate() {
             let Some(name) = &parameter.name else {
                 return Ok(None);
             };
-            if locals
-                .insert(name.clone(), NativeLocation::Register(index as u8 + 1))
-                .is_some()
+            let location = if index == 2 && reserve_frame_register {
+                NativeLocation::StackScalar { offset: 0 }
+            } else if let Some((element_size, element_signed)) =
+                native_pointer_element(&parameter.c_type)
             {
+                NativeLocation::PointerRegister {
+                    register: index as u8 + 1,
+                    element_size,
+                    element_signed,
+                }
+            } else {
+                NativeLocation::Register(index as u8 + 1)
+            };
+            if locals.insert(name.clone(), location).is_some() {
                 return Ok(None);
             }
         }
         let mut next_local_register = function.declaration.parameters.len() as u8 + 1;
-        let mut frame_size = 0;
+        let mut frame_size = if spill_third_parameter { 2 } else { 0 };
         if !collect_native_locals(
             statements,
             &mut locals,
             &mut next_local_register,
             &mut frame_size,
-            has_local_array,
+            reserve_frame_register,
         ) {
+            eprintln!("unsupported locals in {}", function.declaration.name);
             return Ok(None);
         }
         for global in &globals {
@@ -802,7 +837,10 @@ pub fn compile_minimal_program(
             assembly.push_str(&format!("    LDWS R{}, {}\n", index + 1, 4 + index * 2));
         }
         emit_native_stack_adjustment(frame_size, true, &mut assembly);
-        if has_local_array {
+        if frame_size > 0 {
+            if spill_third_parameter {
+                assembly.push_str("    MOVSP R7\n    STW R7, R3\n");
+            }
             assembly.push_str("    MOVSP R3\n");
         }
         let returns_void = function.declaration.return_type.trim() == "void";
@@ -818,6 +856,7 @@ pub fn compile_minimal_program(
                 &mut loop_labels,
                 &mut assembly,
             ) else {
+                eprintln!("unsupported statement in {}", function.declaration.name);
                 return Ok(None);
             };
             if !returned {
@@ -1023,6 +1062,7 @@ fn collect_native_locals(
             StatementKind::Declaration(declarations) => {
                 for declaration in declarations {
                     if locals.contains_key(&declaration.name) {
+                        eprintln!("duplicate local {}", declaration.name);
                         return false;
                     }
                     if let Some(length) = declaration.array_length {
@@ -1056,14 +1096,24 @@ fn collect_native_locals(
                         if reserve_frame_register && *next_register == 3 {
                             *next_register += 1;
                         }
-                        if !is_native_word_type(&declaration.c_type) || *next_register > 3 {
+                        if !is_native_word_type(&declaration.c_type) {
                             return false;
                         }
-                        locals.insert(
-                            declaration.name.clone(),
-                            NativeLocation::Register(*next_register),
-                        );
-                        *next_register += 1;
+                        let location = if *next_register <= 3 {
+                            let location = NativeLocation::Register(*next_register);
+                            *next_register += 1;
+                            location
+                        } else if reserve_frame_register {
+                            let offset = *frame_size;
+                            let Some(new_frame_size) = frame_size.checked_add(2) else {
+                                return false;
+                            };
+                            *frame_size = new_frame_size;
+                            NativeLocation::StackScalar { offset }
+                        } else {
+                            return false;
+                        };
+                        locals.insert(declaration.name.clone(), location);
                     }
                 }
             }
@@ -1190,6 +1240,50 @@ fn statement_has_local_array(statement: &Statement) -> bool {
             .any(|(_, statements)| statements.iter().any(statement_has_local_array)),
         StatementKind::Label { statement, .. } => statement_has_local_array(statement),
         _ => false,
+    }
+}
+
+fn statement_scalar_local_count(statement: &Statement) -> usize {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .filter(|declaration| declaration.array_length.is_none())
+            .count(),
+        StatementKind::Compound(statements) => {
+            statements.iter().map(statement_scalar_local_count).sum()
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_scalar_local_count(then_branch)
+                + else_branch
+                    .as_ref()
+                    .map_or(0, |branch| statement_scalar_local_count(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_scalar_local_count(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .map_or(0, |initializer| statement_scalar_local_count(initializer))
+                + statement_scalar_local_count(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .map(|(_, statements)| {
+                statements
+                    .iter()
+                    .map(statement_scalar_local_count)
+                    .sum::<usize>()
+            })
+            .sum(),
+        StatementKind::Label { statement, .. } => statement_scalar_local_count(statement),
+        _ => 0,
     }
 }
 
@@ -1370,9 +1464,15 @@ fn emit_native_array_address(
             ..
         } => {
             assembly.push_str("    MOV R7, R3\n");
-            if *offset > 0 {
-                assembly.push_str(&format!("    ADD R7, {offset}\n"));
-            }
+            emit_native_stack_offset(7, *offset, assembly);
+            (*element_size, *element_signed)
+        }
+        NativeLocation::PointerRegister {
+            register,
+            element_size,
+            element_signed,
+        } => {
+            assembly.push_str(&format!("    MOV R7, R{register}\n"));
             (*element_size, *element_signed)
         }
         _ => return None,
@@ -1382,6 +1482,12 @@ fn emit_native_array_address(
     }
     assembly.push_str(&format!("    ADD R7, R{index_register}\n"));
     Some((element_size, element_signed))
+}
+
+fn emit_native_stack_offset(register: u8, offset: usize, assembly: &mut String) {
+    if offset > 0 {
+        assembly.push_str(&format!("    LDI R6, {offset}\n    ADD R{register}, R6\n"));
+    }
 }
 
 fn collect_native_array_indices<'a>(
@@ -1417,6 +1523,28 @@ fn emit_native_array_element_address(
     let dimensions = match locals.get(name)? {
         NativeLocation::GlobalArray { dimensions, .. }
         | NativeLocation::StackArray { dimensions, .. } => dimensions,
+        NativeLocation::PointerRegister {
+            register,
+            element_size,
+            element_signed,
+        } if indices.len() == 1 => {
+            if !emit_native_expression(
+                indices[0],
+                index_destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str(&format!("    MOV R7, R{register}\n"));
+            if *element_size == 2 {
+                assembly.push_str(&format!("    SHL R{index_destination}, 1\n"));
+            }
+            assembly.push_str(&format!("    ADD R7, R{index_destination}\n"));
+            return Some((*element_size, *element_signed));
+        }
         _ => return None,
     };
     if indices.len() != dimensions.len() || indices.is_empty() {
@@ -1518,7 +1646,23 @@ fn emit_native_expression(
                         "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
                     )),
                     NativeLocation::GlobalArray { .. } | NativeLocation::StackArray { .. } => {
-                        return false;
+                        assembly.push_str("    LDI R0, 0\n");
+                        if emit_native_array_address(value, 0, locals, assembly).is_none() {
+                            return false;
+                        }
+                        if destination != 7 {
+                            assembly.push_str(&format!("    MOV R{destination}, R7\n"));
+                        }
+                    }
+                    NativeLocation::PointerRegister { register, .. } => {
+                        if *register != destination {
+                            assembly.push_str(&format!("    MOV R{destination}, R{register}\n"));
+                        }
+                    }
+                    NativeLocation::StackScalar { offset } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                        assembly.push_str(&format!("    LDW R{destination}, R7\n"));
                     }
                     NativeLocation::Register(source) if *source != destination => {
                         assembly.push_str(&format!("    MOV R{destination}, R{source}\n"));
@@ -2117,7 +2261,10 @@ fn emit_native_assignment(
         NativeLocation::Register(register) => (*register, false),
         NativeLocation::Constant(_) => return false,
         NativeLocation::GlobalScalar => (0, true),
-        NativeLocation::GlobalArray { .. } | NativeLocation::StackArray { .. } => return false,
+        NativeLocation::StackScalar { .. } => (0, false),
+        NativeLocation::PointerRegister { .. }
+        | NativeLocation::GlobalArray { .. }
+        | NativeLocation::StackArray { .. } => return false,
     };
     let binary_operator = match operator.as_str() {
         "=" => None,
@@ -2168,6 +2315,23 @@ fn emit_native_assignment(
             assembly.push_str(&format!("    MOV R{destination}, R{value_register}\n"))
         }
         None => {}
+    }
+    if let NativeLocation::StackScalar { offset } = location {
+        if let Some(binary_operator) = binary_operator {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str(&format!(
+                "    LDW R0, R7\n    {binary_operator} R0, R{value_register}\n"
+            ));
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    STW R7, R0\n");
+        } else {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str(&format!("    STW R7, R{value_register}\n"));
+        }
+        return true;
     }
     true
 }
@@ -2244,19 +2408,35 @@ fn emit_native_statement(
                     }
                 } else if let Some(initializer) = &declaration.initializer {
                     let initializer = scalar_initializer(initializer)?;
-                    let NativeLocation::Register(destination) = locals.get(&declaration.name)?
-                    else {
-                        return None;
-                    };
-                    if !emit_native_expression(
-                        initializer,
-                        *destination,
-                        &[4, 5, 6, 7],
-                        locals,
-                        label_counter,
-                        assembly,
-                    ) {
-                        return None;
+                    match locals.get(&declaration.name)? {
+                        NativeLocation::Register(destination) => {
+                            if !emit_native_expression(
+                                initializer,
+                                *destination,
+                                &[4, 5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                        }
+                        NativeLocation::StackScalar { offset } => {
+                            if !emit_native_expression(
+                                initializer,
+                                4,
+                                &[5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                            assembly.push_str("    MOV R7, R3\n");
+                            emit_native_stack_offset(7, *offset, assembly);
+                            assembly.push_str("    STW R7, R4\n");
+                        }
+                        _ => return None,
                     }
                 }
             }
@@ -2677,7 +2857,16 @@ fn emit_native_update(
         NativeLocation::Register(register) => {
             assembly.push_str(&format!("    {instruction} R{register}\n"));
         }
+        NativeLocation::StackScalar { offset } => {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str(&format!("    LDW R0, R7\n    {instruction} R0\n"));
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    STW R7, R0\n");
+        }
         NativeLocation::Constant(_)
+        | NativeLocation::PointerRegister { .. }
         | NativeLocation::GlobalArray { .. }
         | NativeLocation::StackArray { .. } => return false,
     }
@@ -6332,7 +6521,7 @@ mod tests {
         let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
-        cpu.run(256).unwrap();
+        cpu.run(128).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 10);
         assert_eq!(cpu.read_u16(0x80000), 2);
@@ -6414,6 +6603,40 @@ mod tests {
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 23);
         assert_eq!(cpu.read_u16(0x80000), 23);
+    }
+
+    #[test]
+    fn passes_local_character_arrays_to_pointer_parameters() {
+        let image = compile_minimal_program(
+            "void write_first(char *output) { output[0] = 'A'; } \
+             int main(void) { char buffer[1]; write_first(buffer); return buffer[0]; }",
+            "char-pointer-parameter.c",
+        )
+        .unwrap()
+        .expect("supported pointer-parameter program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], i64::from(b'A'));
+    }
+
+    #[test]
+    fn spills_third_parameters_and_excess_locals_to_stack_frames() {
+        let image = compile_minimal_program(
+            "int sum(int first, int second, int third) { int result = 0; result = first + second + third; return result; } \
+             int main(void) { return sum(11, 13, 17); }",
+            "stacked-parameters.c",
+        )
+        .unwrap()
+        .expect("supported three-parameter stack-frame program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 41);
     }
 
     #[test]
