@@ -256,6 +256,10 @@ C90 requirements listed under C.
     initialization.
   - Enforce register address-taking rules and define volatile accesses,
     including memory-mapped device behavior.
+  - The Rust native subset accepts file-scope `extern` declarations and
+    merges compatible tentative definitions with at most one initializer,
+    including incomplete-array `extern` declarations. Multi-translation-unit
+    linkage and the remaining storage-duration semantics are not implemented.
 
 ### B5. Complete initializers for game state and data
 

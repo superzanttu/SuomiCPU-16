@@ -225,11 +225,13 @@ enum NativeLocation {
 
 struct NativeGlobal {
     name: String,
+    c_type: String,
     data: Vec<u8>,
     is_array: bool,
     array_dimensions: Vec<usize>,
     element_size: usize,
     element_signed: bool,
+    has_initializer: bool,
 }
 
 const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 2] = [
@@ -548,6 +550,7 @@ pub fn compile_minimal_program(
     let mut static_data_size = 0usize;
     let mut names = HashSet::new();
     let mut global_names = HashSet::new();
+    let mut global_indices: HashMap<&str, usize> = HashMap::new();
     let mut prototypes = HashMap::new();
     for declaration in &unit.declarations {
         match declaration {
@@ -612,23 +615,17 @@ pub fn compile_minimal_program(
                 };
                 if (element_size == 1 && global.array_length.is_none())
                     || prototypes.contains_key(global.name.as_str())
-                    || !global_names.insert(global.name.as_str())
-                    || !names.insert(global.name.as_str())
                 {
                     return Ok(None);
                 }
                 let is_array = global.array_length.is_some();
                 let element_count = global.array_length.unwrap_or(1);
+                if element_count == 0 {
+                    return Ok(None);
+                }
                 let Some(byte_count) = element_count.checked_mul(element_size) else {
                     return Ok(None);
                 };
-                let Some(total_data_size) = static_data_size.checked_add(byte_count) else {
-                    return Ok(None);
-                };
-                if element_count == 0 || total_data_size > 0x1000000 - 0x80000 {
-                    return Ok(None);
-                }
-                static_data_size = total_data_size;
                 let mut data = vec![0; byte_count];
                 if let Some(initializer) = &global.initializer {
                     if let ExpressionKind::Atom(value) = &initializer.kind
@@ -676,13 +673,43 @@ pub fn compile_minimal_program(
                         }
                     }
                 }
+                if let Some(index) = global_indices.get(global.name.as_str()).copied() {
+                    let existing = &mut globals[index];
+                    if existing.c_type != global.c_type
+                        || existing.array_dimensions != global.array_dimensions
+                        || (existing.element_size, existing.element_signed)
+                            != (element_size, element_signed)
+                        || (existing.has_initializer && global.initializer.is_some())
+                    {
+                        return Ok(None);
+                    }
+                    if global.initializer.is_some() {
+                        existing.data = data;
+                        existing.has_initializer = true;
+                    }
+                    continue;
+                }
+                if !global_names.insert(global.name.as_str()) || !names.insert(global.name.as_str())
+                {
+                    return Ok(None);
+                }
+                let Some(total_data_size) = static_data_size.checked_add(byte_count) else {
+                    return Ok(None);
+                };
+                if total_data_size > 0x1000000 - 0x80000 {
+                    return Ok(None);
+                }
+                static_data_size = total_data_size;
+                global_indices.insert(global.name.as_str(), globals.len());
                 globals.push(NativeGlobal {
                     name: global.name.clone(),
+                    c_type: global.c_type.clone(),
                     data,
                     is_array,
                     array_dimensions: global.array_dimensions.clone(),
                     element_size,
                     element_signed,
+                    has_initializer: global.initializer.is_some(),
                 });
             }
         }
@@ -3778,6 +3805,14 @@ impl TranslationUnitParser {
             } else {
                 None
             };
+            if storage_class.as_deref() == Some("extern") && initializer.is_none() {
+                next = if self.statements.accept(",").is_some() {
+                    Some(self.parse_declarator(&base_type)?)
+                } else {
+                    None
+                };
+                continue;
+            }
             if array_dimensions.first() == Some(&INCOMPLETE_ARRAY_LENGTH) {
                 if array_dimensions.len() != 1 {
                     return Err(error(
@@ -6584,6 +6619,44 @@ mod tests {
         assert_eq!(cpu.registers[0], 10);
         assert_eq!(cpu.read_u16(0x80000), 10);
         assert_eq!(cpu.read_u16(0x80002), 10);
+    }
+
+    #[test]
+    fn compiles_extern_declarations_and_merges_tentative_global_definitions() {
+        let image = compile_minimal_program(
+            "extern int total; extern int values[]; \
+             int total; int values[2]; int total; \
+             int values[2] = { 3, 4 }; int total = 5; \
+             int main(void) { return total + values[0] + values[1]; }",
+            "global-linkage.c",
+        )
+        .unwrap()
+        .expect("supported external and tentative global declarations");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 12);
+        assert_eq!(cpu.read_u16(0x80000), 5);
+        assert_eq!(cpu.read_u16(0x80002), 3);
+        assert_eq!(cpu.read_u16(0x80004), 4);
+    }
+
+    #[test]
+    fn rejects_incompatible_or_repeated_initialized_global_definitions() {
+        for source in [
+            "int value; unsigned int value; int main(void) { return value; }",
+            "int value = 1; int value = 2; int main(void) { return value; }",
+            "extern int value; int main(void) { return value; }",
+        ] {
+            assert!(
+                compile_minimal_program(source, "global-linkage-error.c")
+                    .unwrap()
+                    .is_none(),
+                "source unexpectedly compiled: {source}"
+            );
+        }
     }
 
     #[test]

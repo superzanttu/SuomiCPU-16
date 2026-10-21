@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn main() {
     if let Err(error) = run() {
@@ -43,7 +42,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if output.exists() && source == output.canonicalize()? {
         return Err("output path must not overwrite the source".into());
     }
-    let image = suomicpu16::image::load_program(&source)?;
+    let image = match source.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("bin") => {
+            suomicpu16::image::load_binary(&source)?
+        }
+        Some(extension) if extension.eq_ignore_ascii_case("json") => {
+            suomicpu16::image::load_program(&source)?
+        }
+        _ => suomicpu16::image::build_source(&source)?,
+    };
     suomicpu16::image::write_image(&output, &image)?;
     println!(
         "Built {} bytes in {} segment(s), entry point {:#x} -> {}",
@@ -138,19 +145,11 @@ fn discover_boot_modules(directory: &Path) -> Result<Vec<BootModule>, std::io::E
 fn smoke_modules() -> Result<(), Box<dyn std::error::Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let modules = discover_boot_modules(&root.join("modules"))?;
-    let temp_dir = std::env::temp_dir().join(format!(
-        "sc16-smoke-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-    ));
-    fs::create_dir(&temp_dir)?;
     let mut compiled = 0usize;
     let mut skipped = 0usize;
     let mut failures = Vec::new();
 
-    for (index, module) in modules.iter().enumerate() {
+    for module in &modules {
         let Some(source) = &module.source else {
             skipped += 1;
             println!(
@@ -160,35 +159,7 @@ fn smoke_modules() -> Result<(), Box<dyn std::error::Error>> {
             );
             continue;
         };
-        let result = if source.canonicalize().ok()
-            == Some(root.join("modules/Tank-16/main.c").canonicalize()?)
-        {
-            suomicpu16::tank16_map::compile_runtime_tank16(&root.join("modules/Tank-16"))
-                .map(|_| ())
-                .map_err(std::io::Error::other)
-        } else {
-            let output = temp_dir.join(format!("{index}.bin"));
-            Command::new("python")
-                .arg(root.join("tools/c_compiler.py"))
-                .arg(source)
-                .arg("--quiet")
-                .arg("--output")
-                .arg(output)
-                .current_dir(root)
-                .output()
-                .and_then(|result| {
-                    if result.status.success() {
-                        Ok(())
-                    } else {
-                        let details = String::from_utf8_lossy(&result.stderr).trim().to_owned();
-                        Err(std::io::Error::other(if details.is_empty() {
-                            format!("C compiler exited with {}", result.status)
-                        } else {
-                            details
-                        }))
-                    }
-                })
-        };
+        let result = suomicpu16::image::build_source(source).map(|_| ());
         match result {
             Ok(()) => {
                 println!("Compiled {}: {}", module.name, source.display());
@@ -200,8 +171,6 @@ fn smoke_modules() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let cleanup_result = fs::remove_dir_all(&temp_dir);
-    cleanup_result?;
     if !failures.is_empty() {
         return Err(format!(
             "{} of {} BIOS modules failed to compile: {}",

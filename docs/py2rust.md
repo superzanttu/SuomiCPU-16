@@ -87,8 +87,8 @@ cargo run --bin sc16mapedit -- --map modules\Tank-16\disks\maps\FINLAND.json
 cargo run --bin sc16mapedit -- --name ARENA --width 10 --height 8
 ```
 
-Compile every bootable BIOS module with the Rust smoke-build orchestrator
-(the explicitly retained Python C compiler performs the C translation):
+Check every bootable BIOS C source against the Rust compiler with the Rust
+smoke-build orchestrator:
 
 ```powershell
 cargo run --bin sc16build -- smoke-modules
@@ -101,8 +101,10 @@ encoding, asset inspection, and C-header generation. The Rust editor opens an
 existing map with `--map`, or creates one with `--name`, `--width`, and
 `--height`; Ctrl+S saves it. Static builds with round-map variants still
 encounter a pre-existing C90 declaration-order diagnostic in the retained C
-compiler. The default dynamic Tank-16 build path and the static single-map
-build have both compiled successfully.
+compiler. `sc16build smoke-modules` does not invoke Python; it reports modules
+whose C exceeds the current Rust compiler subset as failures. Rust compiler
+parity for all modules is still outstanding; the current Rust-only smoke run
+builds Netgame Demo and reports the other 16 modules as unsupported.
 
 ## Python tests and test helpers
 
