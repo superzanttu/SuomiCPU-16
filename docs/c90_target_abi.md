@@ -71,9 +71,7 @@ square root. A float value occupies an even pair of registers; a double or
 long-double value occupies R0-R3 or R4-R7, most-significant word first.
 Assembler mnemonics use the `F32`/`F64` prefixes (`F32ADD`, `F64CMP`,
 `I32TOF64`, `F64TOI32`, etc.) and reject register groups that cross these
-boundaries. The Rust CPU implements these instructions directly, and the
-retained Python compatibility emulator uses its interpreter for the same IEEE
-conversion and rounding behavior. Float-to-integer conversion truncates toward
+boundaries. The Rust CPU implements these instructions directly. Float-to-integer conversion truncates toward
 zero. The
 instruction returns zero for non-finite input and the low destination bits for
 finite values outside the destination range; C code must not rely on this

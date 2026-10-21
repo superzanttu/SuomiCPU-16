@@ -127,6 +127,9 @@ printf:
     ADD R5, R5
     ADD R4, R5
     LDI R1, 0
+    MOVSP R2
+    LDI R7, 8
+    ADD R2, R7
 printf_next:
     LD R0, R4
     LDI R7, 0
@@ -149,10 +152,18 @@ printf_format:
     LDI R7, 115
     CMP R0, R7
     BZX printf_string
-    LDI R0, 37
-    LDI30 R7, 0x43200
-    ST R7, R0
-    INC R1
+    LDI R7, 100
+    CMP R0, R7
+    BZX printf_signed_integer
+    LDI R7, 105
+    CMP R0, R7
+    BZX printf_signed_integer
+    LDI R7, 117
+    CMP R0, R7
+    BZX printf_unsigned_integer
+    LDI R7, 99
+    CMP R0, R7
+    BZX printf_character
     JMPX printf_emit_format_character
 printf_percent:
     LDI30 R7, 0x43200
@@ -167,9 +178,68 @@ printf_emit_format_character:
     INC R1
     INC R4
     JMPX printf_next
+printf_signed_integer:
+    LDW R0, R2
+    INC R2
+    INC R2
+    LDI R7, 0
+    CMP R0, R7
+    BGEX printf_integer_digits
+    LDI R7, 45
+    LDI30 R6, 0x43200
+    ST R6, R7
+    INC R1
+    NOT R0
+    INC R0
+    JMPX printf_integer_digits
+printf_unsigned_integer:
+    LDW R0, R2
+    INC R2
+    INC R2
+printf_integer_digits:
+    LDI R5, 0
+    LDI R6, 10
+printf_integer_divide:
+    MOV R7, R0
+    MOD R7, R6
+    PUSH R7
+    INC R5
+    DIV R0, R6
+    LDI R7, 0
+    CMP R0, R7
+    BNZX printf_integer_divide
+printf_integer_emit:
+    POP R0
+    LDI R7, 48
+    ADD R0, R7
+    LDI30 R7, 0x43200
+    ST R7, R0
+    INC R1
+    DEC R5
+    LDI R7, 0
+    CMP R5, R7
+    BNZX printf_integer_emit
+    INC R4
+    JMPX printf_next
+printf_character:
+    LDW R0, R2
+    INC R2
+    INC R2
+    LDI30 R7, 0x43200
+    ST R7, R0
+    INC R1
+    INC R4
+    JMPX printf_next
 printf_string:
-    LDWS R5, 8
-    LDWS R6, 10
+    LDW R5, R2
+    MOV R7, R2
+    INC R7
+    INC R7
+    LDW R6, R7
+    INC R2
+    INC R2
+    INC R2
+    INC R2
     ADD R6, R6
     ADD R6, R6
     ADD R6, R6

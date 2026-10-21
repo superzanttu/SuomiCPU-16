@@ -18,7 +18,7 @@
 // .....######.....
 //
 // Start the emulator several times on the same network (up to 8 instances):
-//     python src/SuomiCPU.py examples/net_game_demo.c
+//     cargo run -- "modules/Netgame Demo/net_game_demo.c"
 // Every instance announces itself with the game title "netdemo" and only talks to
 // other instances with the same title. Each player gets a slot 0..7 (a colour).
 //

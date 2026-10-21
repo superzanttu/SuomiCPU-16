@@ -1,20 +1,7 @@
 # Rust build output
 /target/
-
-# Python bytecode, environments, and test/build output
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-ENV/
 /build/
 /dist/
-*.egg-info/
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
 
 # Local environment and editor/OS files
 .env

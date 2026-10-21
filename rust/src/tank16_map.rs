@@ -1166,7 +1166,7 @@ pub fn compile_runtime_tank16(game_dir: &Path) -> Result<crate::image::ProgramIm
     }
     let header = runtime_assets_header(game_dir)?;
     let source = source.replacen(include, &header, 1);
-    compile_with_python_c_compiler(&source, game_dir)
+    compile_with_rust_c_compiler(&source, &source_path)
 }
 
 fn compile_with_rust_c_compiler(
@@ -1181,100 +1181,6 @@ fn compile_with_rust_c_compiler(
                 source_path.display()
             )
         })
-}
-
-fn compile_with_python_c_compiler(
-    source: &str,
-    game_dir: &Path,
-) -> Result<crate::image::ProgramImage, String> {
-    use std::process::{Command, Output};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let compiler = manifest.join("tools/c_compiler.py");
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("cannot create temporary source name: {error}"))?
-        .as_nanos();
-    let temporary_dir =
-        std::env::temp_dir().join(format!("sc16-tank16-{}-{timestamp}", std::process::id()));
-    fs::create_dir(&temporary_dir)
-        .map_err(|error| format!("cannot create temporary build folder: {error}"))?;
-    let temporary_source = game_dir.join(format!(".sc16-main-{timestamp}.c"));
-    let output_binary = temporary_dir.join("main.bin");
-    let mut source_created = false;
-    let result = (|| {
-        use std::io::Write;
-        let mut source_file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_source)
-            .map_err(|error| format!("cannot create temporary Tank-16 source: {error}"))?;
-        source_created = true;
-        source_file
-            .write_all(source.as_bytes())
-            .map_err(|error| format!("cannot write temporary Tank-16 source: {error}"))?;
-        let invoke = |program: &str, prefix: &[&str]| -> std::io::Result<Output> {
-            let mut command = Command::new(program);
-            command.args(prefix).arg(&compiler).arg(&temporary_source);
-            command
-                .arg("--output")
-                .arg(&output_binary)
-                .arg("--quiet")
-                .current_dir(manifest)
-                .output()
-        };
-        let mut output = None;
-        for (program, prefix) in [
-            ("python", &[][..]),
-            ("python3", &[][..]),
-            ("py", &["-3"][..]),
-        ] {
-            match invoke(program, prefix) {
-                Ok(result) => {
-                    output = Some(result);
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "cannot start retained Python C compiler with {program}: {error}"
-                    ));
-                }
-            }
-        }
-        let output = output.ok_or_else(|| {
-            "cannot start retained Python C compiler: none of python, python3, or py -3 is available"
-                .to_owned()
-        })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!(
-                "retained Python C compiler failed ({}): {}{}",
-                output.status,
-                stderr.trim(),
-                if stdout.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", stdout.trim())
-                }
-            ));
-        }
-        crate::image::load_binary(&output_binary).map_err(|error| error.to_string())
-    })();
-    let source_cleanup = if source_created {
-        fs::remove_file(&temporary_source)
-    } else {
-        Ok(())
-    };
-    let cleanup = fs::remove_dir_all(&temporary_dir);
-    match (result, source_cleanup, cleanup) {
-        (Ok(image), Ok(()), Ok(())) => Ok(image),
-        (Err(error), _, _) => Err(error),
-        (Ok(_), Err(error), _) => Err(format!("cannot clean temporary source: {error}")),
-        (Ok(_), Ok(()), Err(error)) => Err(format!("cannot clean temporary build folder: {error}")),
-    }
 }
 
 pub fn discover_round_maps(game_dir: &Path, selected_path: &Path) -> Result<Vec<PathBuf>, String> {

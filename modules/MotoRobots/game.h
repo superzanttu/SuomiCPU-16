@@ -4,6 +4,7 @@
 #define MAX_BUILDINGS 100
 #define MAX_ROBOTS 8
 #define TILE_PIXELS 32
+#define GAME_TIME_UNITS_PER_SECOND 3000
 #define MAP_VIEW_TOP 72
 #define MAP_VIEW_BOTTOM 404
 
@@ -34,7 +35,7 @@ typedef struct {
     int map_layer_toolbar_hovered;
     int map_layer_valid;
     unsigned int pan_keys_was_down;
-    float pan_repeat_timer;
+    int pan_repeat_timer;
     BuildingType build_tool;
     int toolbar_pressed;
     int toolbar_hovered;
@@ -57,7 +58,7 @@ typedef struct {
 } GameState;
 
 void game_init(GameState* state);
-void game_update(GameState* state, float delta_time);
+void game_update(GameState* state, int delta_time);
 void game_draw(GameState* state);
 
 #endif

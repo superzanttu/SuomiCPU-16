@@ -392,7 +392,7 @@ irq_key:
     EI
     RTI
 
-; ---- LAN networking: GPU commands 16-20 (see tools/sc16net.py) ----
+; ---- LAN networking: GPU commands 16-20 (implemented by the Rust runtime) ----
 ; Pointer argument at sp+N: word at N, high byte at N+2.
 net_open:
     LDI R0, 0

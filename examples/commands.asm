@@ -1,5 +1,5 @@
 ; Instruction reference for the SC-16 assembler.
-; Load with: python SuomiCPU.py examples/commands.asm
+; Load with: cargo run -- examples/commands.asm
 ; Interrupt instructions and the extended stack/control operations are placed
 ; after HALT so the tour can run without enabling interrupts.
 

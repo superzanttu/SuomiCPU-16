@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_assembly_sources_without_invoking_python() {
+    fn builds_assembly_sources_natively() {
         let path =
             std::env::temp_dir().join(format!("sc16-assembly-source-{}.asm", std::process::id()));
         fs::write(&path, "start: LDI R0, 1\nHALT\n").unwrap();
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_rust_supported_c_sources_without_invoking_python() {
+    fn builds_supported_c_sources_natively() {
         let path = std::env::temp_dir().join(format!("sc16-native-c-{}.c", std::process::id()));
         fs::write(
             &path,
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_c_without_starting_a_python_compiler() {
+    fn rejects_unsupported_c_without_a_fallback_compiler() {
         let path = std::env::temp_dir().join(format!("sc16-unsupported-{}.c", std::process::id()));
         fs::write(&path, "int main(void) { return calculate_answer(); }").unwrap();
         let result = build_source(&path);

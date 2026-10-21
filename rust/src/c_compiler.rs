@@ -274,6 +274,9 @@ struct NativeRecordField {
     offset: usize,
     size: usize,
     signed: bool,
+    record_layout: Option<Box<NativeRecordLayout>>,
+    dimensions: Vec<usize>,
+    element_size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,53 +325,25 @@ fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Express
         "fgets" => matches!(index, 0 | 2),
         "printf" if index == 0 => true,
         "printf" => {
-            let Some(format) = arguments
-                .first()
-                .and_then(|expression| match &expression.kind {
-                    ExpressionKind::Atom(token) => decode_string_token(token),
-                    _ => None,
-                })
-            else {
-                return false;
-            };
-            let mut specifiers = Vec::new();
-            let mut position = 0;
-            while position < format.len() {
-                if format[position] != b'%' {
-                    position += 1;
-                    continue;
-                }
-                position += 1;
-                if position < format.len() && format[position] == b'%' {
-                    position += 1;
-                    continue;
-                }
-                let Some(specifier) = format.get(position) else {
-                    return false;
-                };
-                specifiers.push(*specifier);
-                position += 1;
-            }
-            specifiers.get(index - 1) == Some(&b's')
+            native_printf_specifiers(arguments)
+                .and_then(|specifiers| specifiers.get(index - 1).copied())
+                == Some(b's')
         }
         _ => false,
     }
 }
 
-fn native_printf_call_is_supported(arguments: &[Expression]) -> bool {
-    if !(1..=2).contains(&arguments.len()) {
-        return false;
+fn native_printf_specifiers(arguments: &[Expression]) -> Option<Vec<u8>> {
+    if arguments.is_empty() {
+        return None;
     }
-    let Some(format) = arguments
+    let format = arguments
         .first()
         .and_then(|expression| match &expression.kind {
             ExpressionKind::Atom(token) => decode_string_token(token),
             _ => None,
-        })
-    else {
-        return false;
-    };
-    let mut specifiers = 0;
+        })?;
+    let mut specifiers = Vec::new();
     let mut position = 0;
     while position < format.len() {
         if format[position] != b'%' {
@@ -378,14 +353,18 @@ fn native_printf_call_is_supported(arguments: &[Expression]) -> bool {
         position += 1;
         match format.get(position) {
             Some(b'%') => position += 1,
-            Some(b's') if specifiers == 0 => {
-                specifiers += 1;
+            Some(specifier @ (b's' | b'd' | b'i' | b'u' | b'c')) => {
+                specifiers.push(*specifier);
                 position += 1;
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    arguments.len() == specifiers + 1
+    (specifiers.len() + 1 == arguments.len() && arguments.len() <= 32).then_some(specifiers)
+}
+
+fn native_printf_call_is_supported(arguments: &[Expression]) -> bool {
+    native_printf_specifiers(arguments).is_some()
 }
 
 fn emit_native_pointer_push(label_counter: &mut usize, assembly: &mut String) {
@@ -2449,6 +2428,28 @@ fn collect_native_array_indices<'a>(
     }
 }
 
+fn collect_native_member_array_indices<'a>(
+    expression: &'a Expression,
+    indices: &mut Vec<&'a Expression>,
+) -> Option<(&'a Expression, &'a str, &'a str)> {
+    match &expression.kind {
+        ExpressionKind::Member {
+            expression,
+            operator,
+            name,
+        } => Some((expression, operator, name)),
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let member = collect_native_member_array_indices(base, indices)?;
+            indices.push(index);
+            Some(member)
+        }
+        _ => None,
+    }
+}
+
 fn emit_native_array_element_address(
     base: &Expression,
     index: &Expression,
@@ -2599,6 +2600,7 @@ fn native_array_index_is_partial(
     indices.len() < dimensions.len()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_native_member_address(
     base: &Expression,
     operator: &str,
@@ -2609,69 +2611,368 @@ fn emit_native_member_address(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> Option<NativeRecordField> {
-    let mut indices = Vec::new();
-    let name = collect_native_array_indices(base, &mut indices)?;
-    let location = locals.get(name)?;
-    let layout = match (operator, location) {
-        (".", NativeLocation::GlobalRecord { layout, .. }) => layout,
-        (
-            "->",
-            NativeLocation::PointerRegister {
-                record_layout: Some(layout),
-                ..
-            },
-        )
-        | (
-            "->",
-            NativeLocation::PointerStack {
-                record_layout: Some(layout),
-                ..
-            },
-        )
-        | (
-            "->",
-            NativeLocation::GlobalPointer {
-                record_layout: Some(layout),
-                ..
-            },
-        ) => layout,
-        _ => return None,
+    let indexed_member = if matches!(base.kind, ExpressionKind::Index { .. }) {
+        let mut indices = Vec::new();
+        collect_native_member_array_indices(base, &mut indices).map(|member| (member, indices))
+    } else {
+        None
     };
-    let field = layout.fields.get(member)?.clone();
-    match (operator, &base.kind, location) {
-        (".", ExpressionKind::Atom(_), NativeLocation::GlobalRecord { .. }) => {
-            assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
-        }
-        (".", ExpressionKind::Index { expression, index }, _) => {
-            emit_native_array_element_address(
-                expression,
-                index,
+    let indexed_base =
+        if let Some(((record, record_operator, array_name), indices)) = indexed_member {
+            let array = emit_native_member_address(
+                record,
+                record_operator,
+                array_name,
                 index_destination,
                 temporary_registers,
                 locals,
                 label_counter,
                 assembly,
             )?;
+            if array.dimensions.is_empty() || indices.len() != array.dimensions.len() {
+                return None;
+            }
+            assembly.push_str("    PUSH R7\n");
+            let (&first_index, remaining_indices) = indices.split_first()?;
+            if !emit_native_expression(
+                first_index,
+                index_destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            for (dimension_index, index) in remaining_indices.iter().enumerate() {
+                let (&index_register, remaining_registers) = temporary_registers.split_first()?;
+                assembly.push_str(&format!("    PUSH R{index_destination}\n"));
+                if !emit_native_expression(
+                    index,
+                    index_register,
+                    remaining_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return None;
+                }
+                assembly.push_str(&format!(
+                    "    POP R{index_destination}\n    LDI R7, {}\n\
+                 MUL R{index_destination}, R7\n    ADD R{index_destination}, R{index_register}\n",
+                    array.dimensions[dimension_index + 1]
+                ));
+            }
+            emit_native_index_scale(index_destination, array.element_size, assembly);
+            assembly.push_str(&format!("    POP R7\n    ADD R7, R{index_destination}\n"));
+            Some(array)
+        } else {
+            None
+        };
+    let nested_base = if let ExpressionKind::Member {
+        expression,
+        operator,
+        name,
+    } = &base.kind
+    {
+        Some(emit_native_member_address(
+            expression,
+            operator,
+            name,
+            index_destination,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )?)
+    } else {
+        None
+    };
+    let layout = if let Some(field) = &indexed_base {
+        field.record_layout.as_deref()?
+    } else if let Some(field) = &nested_base {
+        field.record_layout.as_deref()?
+    } else {
+        let mut indices = Vec::new();
+        let name = collect_native_array_indices(base, &mut indices)?;
+        let location = locals.get(name)?;
+        match (operator, location) {
+            (".", NativeLocation::GlobalRecord { layout, .. }) => layout,
+            (
+                "->",
+                NativeLocation::PointerRegister {
+                    record_layout: Some(layout),
+                    ..
+                },
+            )
+            | (
+                "->",
+                NativeLocation::PointerStack {
+                    record_layout: Some(layout),
+                    ..
+                },
+            )
+            | (
+                "->",
+                NativeLocation::GlobalPointer {
+                    record_layout: Some(layout),
+                    ..
+                },
+            ) => layout,
+            _ => return None,
         }
-        ("->", ExpressionKind::Atom(_), NativeLocation::PointerRegister { register, .. }) => {
-            assembly.push_str(&format!("    MOV R7, R{register}\n"));
+    };
+    let field = layout.fields.get(member)?.clone();
+    if nested_base.is_none() && indexed_base.is_none() {
+        let mut indices = Vec::new();
+        let name = collect_native_array_indices(base, &mut indices)?;
+        let location = locals.get(name)?;
+        match (operator, &base.kind, location) {
+            (".", ExpressionKind::Atom(_), NativeLocation::GlobalRecord { .. }) => {
+                assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+            }
+            (".", ExpressionKind::Index { expression, index }, _) => {
+                emit_native_array_element_address(
+                    expression,
+                    index,
+                    index_destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                )?;
+            }
+            ("->", ExpressionKind::Atom(_), NativeLocation::PointerRegister { register, .. }) => {
+                assembly.push_str(&format!("    MOV R7, R{register}\n"));
+            }
+            ("->", ExpressionKind::Atom(_), NativeLocation::PointerStack { offset, .. }) => {
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, *offset, assembly);
+                assembly.push_str("    LDW R7, R7\n");
+            }
+            ("->", ExpressionKind::Atom(_), NativeLocation::GlobalPointer { .. }) => {
+                assembly.push_str(&format!(
+                    "    LDI30 R7, __c_global_{name}\n    LDW R7, R7\n"
+                ));
+            }
+            _ => return None,
         }
-        ("->", ExpressionKind::Atom(_), NativeLocation::PointerStack { offset, .. }) => {
-            assembly.push_str("    MOV R7, R3\n");
-            emit_native_stack_offset(7, *offset, assembly);
-            assembly.push_str("    LDW R7, R7\n");
-        }
-        ("->", ExpressionKind::Atom(_), NativeLocation::GlobalPointer { .. }) => {
-            assembly.push_str(&format!(
-                "    LDI30 R7, __c_global_{name}\n    LDW R7, R7\n"
-            ));
-        }
-        _ => return None,
     }
     if field.offset > 0 {
         assembly.push_str(&format!("    LDI R6, {}\n    ADD R7, R6\n", field.offset));
     }
     Some(field)
+}
+
+fn emit_native_member_array_element_address(
+    expression: &Expression,
+    index_destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<NativeRecordField> {
+    let mut indices = Vec::new();
+    let (record, record_operator, array_name) =
+        collect_native_member_array_indices(expression, &mut indices)?;
+    let array = emit_native_member_address(
+        record,
+        record_operator,
+        array_name,
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    )?;
+    if array.dimensions.is_empty() || indices.len() != array.dimensions.len() {
+        return None;
+    }
+    assembly.push_str("    PUSH R7\n");
+    let (&first_index, remaining_indices) = indices.split_first()?;
+    if !emit_native_expression(
+        first_index,
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    ) {
+        return None;
+    }
+    for (dimension_index, index) in remaining_indices.iter().enumerate() {
+        let (&index_register, remaining_registers) = temporary_registers.split_first()?;
+        assembly.push_str(&format!("    PUSH R{index_destination}\n"));
+        if !emit_native_expression(
+            index,
+            index_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return None;
+        }
+        assembly.push_str(&format!(
+            "    POP R{index_destination}\n    LDI R7, {}\n\
+             MUL R{index_destination}, R7\n    ADD R{index_destination}, R{index_register}\n",
+            array.dimensions[dimension_index + 1]
+        ));
+    }
+    emit_native_index_scale(index_destination, array.element_size, assembly);
+    assembly.push_str(&format!("    POP R7\n    ADD R7, R{index_destination}\n"));
+    Some(array)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_native_indexed_element_address(
+    expression: &Expression,
+    base: &Expression,
+    index: &Expression,
+    index_destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<(usize, bool)> {
+    let mut indices = Vec::new();
+    if collect_native_member_array_indices(expression, &mut indices).is_some() {
+        let field = emit_native_member_array_element_address(
+            expression,
+            index_destination,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )?;
+        return Some((field.element_size, field.signed));
+    }
+    emit_native_array_element_address(
+        base,
+        index,
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    )
+}
+
+fn append_native_record_copy_fields(
+    layout: &NativeRecordLayout,
+    base_offset: usize,
+    fields: &mut Vec<(usize, usize)>,
+) -> Option<()> {
+    for field in layout.fields.values() {
+        let field_offset = base_offset.checked_add(field.offset)?;
+        if !field.dimensions.is_empty() {
+            let element_count = field
+                .dimensions
+                .iter()
+                .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))?;
+            for element in 0..element_count {
+                let element_offset =
+                    field_offset.checked_add(element.checked_mul(field.element_size)?)?;
+                if let Some(nested_layout) = &field.record_layout {
+                    append_native_record_copy_fields(nested_layout, element_offset, fields)?;
+                } else {
+                    fields.push((element_offset, field.element_size));
+                }
+            }
+        } else if let Some(nested_layout) = &field.record_layout {
+            append_native_record_copy_fields(nested_layout, field_offset, fields)?;
+        } else {
+            fields.push((field_offset, field.size));
+        }
+    }
+    Some(())
+}
+
+fn emit_native_record_array_assignment(
+    target: &Expression,
+    value: &Expression,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<()> {
+    if !matches!(target.kind, ExpressionKind::Index { .. })
+        || !matches!(value.kind, ExpressionKind::Index { .. })
+    {
+        return None;
+    }
+    let mut indices = Vec::new();
+    collect_native_member_array_indices(target, &mut indices)?;
+
+    let original_length = assembly.len();
+    let original_label_counter = *label_counter;
+    let target_field = emit_native_member_array_element_address(
+        target,
+        0,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    );
+    let Some(target_layout) = target_field.and_then(|field| field.record_layout) else {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    };
+    assembly.push_str("    PUSH R7\n");
+    let value_field = emit_native_member_array_element_address(
+        value,
+        0,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    );
+    let Some(value_layout) = value_field.and_then(|field| field.record_layout) else {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    };
+    if target_layout != value_layout {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    }
+
+    let mut fields = Vec::new();
+    if append_native_record_copy_fields(&target_layout, 0, &mut fields).is_none()
+        || fields.iter().any(|(_, size)| !matches!(size, 1 | 2))
+    {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    }
+    assembly.push_str("    MOV R6, R7\n    POP R7\n");
+    for (offset, size) in fields {
+        let instruction = match size {
+            1 => "LD",
+            _ => "LDW",
+        };
+        if offset == 0 {
+            assembly.push_str(&format!("    {instruction} R0, R6\n"));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI R5, {offset}\n    ADD R5, R6\n    {instruction} R0, R5\n"
+            ));
+        }
+        if offset == 0 {
+            assembly.push_str(&format!(
+                "    {} R7, R0\n",
+                if size == 1 { "ST" } else { "STW" }
+            ));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI R5, {offset}\n    ADD R5, R7\n    {} R5, R0\n",
+                if size == 1 { "ST" } else { "STW" }
+            ));
+        }
+    }
+    Some(())
 }
 
 fn decode_string_token(value: &str) -> Option<Vec<u8>> {
@@ -2837,7 +3138,8 @@ fn emit_native_expression(
             index,
         } => {
             let is_partial_array = native_array_index_is_partial(base, index, locals);
-            let Some((element_size, element_signed)) = emit_native_array_element_address(
+            let Some((element_size, element_signed)) = emit_native_indexed_element_address(
+                expression,
                 base,
                 index,
                 0,
@@ -2902,11 +3204,11 @@ fn emit_native_expression(
             let Some(operand) = native_incdec_operand(expression) else {
                 return false;
             };
-            let ExpressionKind::Atom(name) = &operand.kind else {
-                return false;
-            };
-            if matches!(locals.get(name), Some(NativeLocation::Register(register)) if *register == destination)
-            {
+            if matches!(
+                &operand.kind,
+                ExpressionKind::Atom(name)
+                    if matches!(locals.get(name), Some(NativeLocation::Register(register)) if *register == destination)
+            ) {
                 return false;
             }
             if !emit_native_expression(
@@ -2952,10 +3254,15 @@ fn emit_native_expression(
                     }
                     _ => return false,
                 },
-                ExpressionKind::Index { expression, index } => {
-                    let Some((_, _)) = emit_native_array_element_address(
-                        expression,
-                        index,
+                ExpressionKind::Member {
+                    expression: base,
+                    operator,
+                    name,
+                } => {
+                    let Some(field) = emit_native_member_address(
+                        base,
+                        operator,
+                        name,
                         0,
                         temporary_registers,
                         locals,
@@ -2964,6 +3271,38 @@ fn emit_native_expression(
                     ) else {
                         return false;
                     };
+                    if !field.dimensions.is_empty() {
+                        return false;
+                    }
+                }
+                ExpressionKind::Index { expression, index } => {
+                    let mut indices = Vec::new();
+                    if collect_native_member_array_indices(operand, &mut indices).is_some() {
+                        if emit_native_member_array_element_address(
+                            operand,
+                            0,
+                            temporary_registers,
+                            locals,
+                            label_counter,
+                            assembly,
+                        )
+                        .is_none()
+                        {
+                            return false;
+                        }
+                    } else if emit_native_array_element_address(
+                        expression,
+                        index,
+                        0,
+                        temporary_registers,
+                        locals,
+                        label_counter,
+                        assembly,
+                    )
+                    .is_none()
+                    {
+                        return false;
+                    }
                 }
                 _ => return false,
             }
@@ -3362,7 +3701,14 @@ fn emit_native_expression(
                 return true;
             }
             let library_function = native_library_for_symbol(name).is_some();
-            if arguments.len() > if library_function { 8 } else { 32_767 } {
+            let maximum_arguments = if name == "printf" {
+                32
+            } else if library_function {
+                8
+            } else {
+                32_767
+            };
+            if arguments.len() > maximum_arguments {
                 return false;
             }
             let preserve_frame_pointer = locals.values().any(|location| {
@@ -3543,7 +3889,12 @@ fn native_incdec_operand(expression: &Expression) -> Option<&Expression> {
             operator,
             expression: operand,
         } if matches!(operator.as_str(), "++" | "--")
-            && matches!(&operand.kind, ExpressionKind::Atom(_)) =>
+            && (matches!(
+                &operand.kind,
+                ExpressionKind::Atom(_)
+                    | ExpressionKind::Index { .. }
+                    | ExpressionKind::Member { .. }
+            ) || matches!(&operand.kind, ExpressionKind::Unary { operator, .. } if operator == "*")) =>
         {
             Some(operand)
         }
@@ -3598,6 +3949,19 @@ fn emit_native_assignment_store(
     else {
         return false;
     };
+    if operator == "="
+        && emit_native_record_array_assignment(
+            target,
+            value,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )
+        .is_some()
+    {
+        return true;
+    }
     if let ExpressionKind::Unary {
         operator: dereference_operator,
         operand,
@@ -3741,7 +4105,8 @@ fn emit_native_assignment_store(
         ) {
             return false;
         }
-        let Some((element_size, element_signed)) = emit_native_array_element_address(
+        let Some((element_size, element_signed)) = emit_native_indexed_element_address(
+            target,
             base,
             index,
             0,
@@ -4269,8 +4634,8 @@ fn emit_native_statement(
             update,
             body,
         } => {
-            if let Some(initializer) = initializer {
-                if emit_native_statement(
+            if let Some(initializer) = initializer
+                && emit_native_statement(
                     initializer,
                     locals,
                     function_name,
@@ -4280,13 +4645,12 @@ fn emit_native_statement(
                     assembly,
                 )
                 .is_none()
-                {
-                    eprintln!(
-                        "unsupported for-loop initializer at line {}",
-                        statement.line
-                    );
-                    return None;
-                }
+            {
+                eprintln!(
+                    "unsupported for-loop initializer at line {}",
+                    statement.line
+                );
+                return None;
             }
             let label = *label_counter;
             *label_counter += 1;
@@ -4578,7 +4942,8 @@ fn emit_native_update(
         index,
     } = &expression.kind
     {
-        let Some((element_size, element_signed)) = emit_native_array_element_address(
+        let Some((element_size, element_signed)) = emit_native_indexed_element_address(
+            expression,
             base,
             index,
             0,
@@ -5883,31 +6248,75 @@ impl TranslationUnitParser {
                 let field_size = native_byte_type(field_type)
                     .map(|_| 1)
                     .or_else(|| is_native_word_type(field_type).then_some(2));
-                if pointer || !dimensions.is_empty() || field_size.is_none() {
+                let nested_size = self
+                    .records
+                    .get(field_type)
+                    .map(|layout| layout.size)
+                    .or_else(|| {
+                        field_type
+                            .strip_prefix("struct ")
+                            .and_then(|tag| self.records.get(&format!("struct {tag}")))
+                            .map(|layout| layout.size)
+                    });
+                let Some(element_size) = field_size.or(nested_size) else {
                     layout_supported = false;
-                } else if let Some(field_size) = field_size {
-                    if field_size == 2 && size % 2 != 0 {
+                    if self.statements.accept(",").is_none() {
+                        break;
+                    }
+                    continue;
+                };
+                if pointer {
+                    layout_supported = false;
+                } else if let Some(member_size) = dimensions
+                    .iter()
+                    .try_fold(element_size, |member_size, dimension| {
+                        member_size.checked_mul(*dimension)
+                    })
+                {
+                    let alignment = element_size.min(2);
+                    if alignment == 2 && size & 1 != 0 {
                         size += 1;
                     }
-                    let signed = native_byte_type(field_type).unwrap_or(false);
-                    if fields
-                        .insert(
-                            name.value.clone(),
-                            NativeRecordField {
-                                offset: size,
-                                size: field_size,
-                                signed,
-                            },
-                        )
-                        .is_some()
                     {
-                        return Err(error(
+                        let signed = native_byte_type(field_type).unwrap_or(false);
+                        if fields
+                            .insert(
+                                name.value.clone(),
+                                NativeRecordField {
+                                    offset: size,
+                                    size: if dimensions.is_empty() {
+                                        element_size
+                                    } else {
+                                        member_size
+                                    },
+                                    signed,
+                                    record_layout: self
+                                        .records
+                                        .get(field_type)
+                                        .cloned()
+                                        .map(Box::new),
+                                    dimensions: dimensions.clone(),
+                                    element_size,
+                                },
+                            )
+                            .is_some()
+                        {
+                            return Err(error(
+                                name.filename.as_deref().unwrap_or("<source>"),
+                                name.line,
+                                "duplicate record member name",
+                            ));
+                        }
+                    }
+                    size = size.checked_add(member_size).ok_or_else(|| {
+                        error(
                             name.filename.as_deref().unwrap_or("<source>"),
                             name.line,
-                            "duplicate record member name",
-                        ));
-                    }
-                    size += field_size;
+                            "record layout exceeds the supported size",
+                        )
+                    })?;
+                } else {
+                    layout_supported = false;
                 }
                 if self.statements.accept(",").is_none() {
                     break;
@@ -5916,7 +6325,7 @@ impl TranslationUnitParser {
             self.statements.expect(";")?;
         }
         self.statements.expect("}")?;
-        if size % 2 != 0 {
+        if size & 1 != 0 {
             size += 1;
         }
         if layout_supported && size > 0 {
@@ -8109,6 +8518,182 @@ mod tests {
     }
 
     #[test]
+    fn computes_record_layouts_with_nested_records_and_arrays() {
+        let unit = translation_unit(
+            "typedef struct { int x; int y; } Point; \
+             typedef struct { Point origin; unsigned char path[5]; int count; } Route; \
+             Route route;",
+        );
+        let ExternalDeclaration::Global(route) = &unit.declarations[0] else {
+            panic!("expected global route");
+        };
+        let layout = unit.records.get(&route.c_type).expect("Route layout");
+        assert_eq!(layout.size, 12);
+        assert_eq!(layout.fields["count"].offset, 10);
+        assert_eq!(layout.fields["count"].size, 2);
+    }
+
+    #[test]
+    fn accesses_nested_record_members_through_pointer_and_global() {
+        let image = compile_minimal_program(
+            "typedef struct { int x; int y; } Point; \
+             typedef struct { Point origin; int count; } State; \
+             State state; \
+             void update(State *value) { value->origin.x = 7; value->origin.y = 9; } \
+             int main(void) { update(&state); return state.origin.x + state.origin.y; }",
+            "nested-record-members.c",
+        )
+        .unwrap()
+        .expect("supported nested record members");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 16);
+    }
+
+    #[test]
+    fn indexes_arrays_of_nested_records_inside_records() {
+        let image = compile_minimal_program(
+            "typedef struct { int x; int y; } Point; \
+             typedef struct { Point points[3]; } State; \
+             State state; \
+             int main(void) { state.points[2].x = 17; state.points[2].y = 19; \
+                 return state.points[2].x + state.points[2].y; }",
+            "nested-record-array.c",
+        )
+        .unwrap()
+        .expect("supported arrays of nested records");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 36);
+    }
+
+    #[test]
+    fn takes_address_of_record_array_member_element() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Robot; \
+             typedef struct { Robot robots[2]; } State; \
+             State state; \
+             void update(State *state, int index) { Robot *robot; \
+                 robot = &state->robots[index]; robot->value = 42; } \
+             int main(void) { update(&state, 1); \
+                 return state.robots[1].value; }",
+            "record-array-member-address.c",
+        )
+        .unwrap()
+        .expect("supported address of a record-array member element");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn takes_address_of_nested_record_member() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Inner; \
+             typedef struct { Inner inner; } Outer; \
+             Outer state; \
+             void update(Inner *inner) { inner->value = 27; } \
+             int main(void) { update(&state.inner); return state.inner.value; }",
+            "nested-record-member-address.c",
+        )
+        .unwrap()
+        .expect("supported address of a nested record member");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 27);
+    }
+
+    #[test]
+    fn assigns_conditional_values_to_record_members() {
+        let image = compile_minimal_program(
+            "typedef enum { NONE, MINE } Kind; \
+             typedef struct { Kind kind; } Item; Item item; \
+             void update(Item *value, Kind requested) { \
+                 value->kind = requested == MINE ? requested : NONE; } \
+             int main(void) { update(&item, MINE); return item.kind; }",
+            "conditional-record-member-assignment.c",
+        )
+        .unwrap()
+        .expect("supported conditional assignment to a record member");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 1);
+    }
+
+    #[test]
+    fn preserves_postfix_value_when_incrementing_record_member() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Item; Item item; \
+             int main(void) { int previous; item.value = 8; \
+                 previous = item.value++; return previous + item.value; }",
+            "postfix-record-member.c",
+        )
+        .unwrap()
+        .expect("supported postfix increment of a record member");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 17);
+    }
+
+    #[test]
+    fn reads_and_writes_arrays_inside_records() {
+        let image = compile_minimal_program(
+            "typedef struct { int values[3]; } State; \
+             State state; \
+             int main(void) { state.values[1] = 9; \
+                 state.values[2] = state.values[1]; return state.values[2]; }",
+            "record-member-array.c",
+        )
+        .unwrap()
+        .expect("supported reads and writes of arrays inside records");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 9);
+    }
+
+    #[test]
+    fn copies_records_between_elements_of_member_arrays() {
+        let image = compile_minimal_program(
+            "typedef struct { int x; unsigned char flag; int y; } Item; \
+             typedef struct { Item items[2]; } State; \
+             State state; \
+             int main(void) { state.items[0].x = 11; state.items[0].flag = 1; \
+                 state.items[0].y = 31; state.items[1] = state.items[0]; \
+                 return state.items[1].x + state.items[1].flag + state.items[1].y; }",
+            "member-record-array-copy.c",
+        )
+        .unwrap()
+        .expect("supported copies between member-array record elements");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 43);
+    }
+
+    #[test]
     fn uses_file_scope_enumerators_in_local_array_bounds() {
         let unit = translation_unit(
             "enum Size { BUFFER_SIZE = 5 }; \
@@ -8446,7 +9031,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_object_like_macro_constants_without_python() {
+    fn compiles_object_like_macro_constants() {
         let image = compile_minimal_program(
             "#define OFFSET 5\n#define ENABLE_RESULT 1\n\
              #if defined(ENABLE_RESULT) && ENABLE_RESULT == 1\n#define RESULT (OFFSET * 2)\n\
@@ -8595,11 +9180,28 @@ mod tests {
     }
 
     #[test]
+    fn printf_formats_multiple_strings_and_integer_arguments() {
+        let image = compile_minimal_program(
+            "int printf(const char *format, ...); \
+             int main(void) { printf(\"%s:%d,%u%%\", \"value\", -12, 34); return 0; }",
+            "printf-integers.c",
+        )
+        .unwrap()
+        .expect("supported mixed printf arguments");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.console.output(), b"value:-12,34%");
+    }
+
+    #[test]
     fn rejects_printf_formats_outside_the_supported_stdio_subset() {
         assert!(
             compile_minimal_program(
                 "int printf(const char *format, ...); \
-                 int main(void) { printf(\"%d\", 5); return 0; }",
+                 int main(void) { printf(\"%f\", 5); return 0; }",
                 "unsupported-printf-format.c",
             )
             .unwrap()
@@ -8803,9 +9405,9 @@ mod tests {
     #[test]
     fn compiles_volatile_byte_pointer_accesses() {
         let image = compile_minimal_program(
-            "unsigned char value = 0x5a; \
+            "unsigned char values[1] = { 0x5a }; \
              int read_value(volatile unsigned char *pointer) { return *pointer; } \
-             int main(void) { return read_value(&value); }",
+             int main(void) { return read_value(values); }",
             "volatile-byte-pointer.c",
         )
         .unwrap()

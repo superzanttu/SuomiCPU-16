@@ -1,5 +1,5 @@
 ; Demonstrates multiple address changes and all .data formats.
-; Load with: python SuomiCPU.py examples/directives.asm
+; Load with: cargo run -- examples/directives.asm
 
 .address 0x0100
 start:

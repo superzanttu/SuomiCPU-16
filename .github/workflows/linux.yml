@@ -12,20 +12,14 @@ jobs:
     env:
       SDL_VIDEODRIVER: dummy
       SDL_AUDIODRIVER: dummy
-      PYTHONPATH: .:tools:src
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - run: python -m pip install -r requirements.txt
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo check --locked --target wasm32-unknown-unknown
-      - run: python -m unittest discover -s tests -v
       - run: cargo run --locked --bin sc16build -- smoke-modules

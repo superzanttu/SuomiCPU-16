@@ -24,11 +24,6 @@ typedef struct {
     int y;
 } Vec2i;
 
-typedef struct {
-    float x;
-    float y;
-} Vec2f;
-
 typedef enum {
     BUILDING_NONE,
     BUILDING_MINE,
@@ -65,7 +60,7 @@ typedef struct {
     int factory_copper_plate_input;
     int factory_robot_rombonent_input;
     int factory_status;
-    float production_timer;
+    int production_timer;
     int processing_batch;
 } Building;
 
@@ -76,13 +71,13 @@ typedef struct {
     int source_building;
     int target_building;
     RobotState state;
-    float timer;
+    int timer;
     int path_length;
     int path_position;
     int path_status;
     int route_valid;
     int route_direction;
-    float path_retry_timer;
+    int path_retry_timer;
 } Robot;
 
 #endif

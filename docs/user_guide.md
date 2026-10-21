@@ -2,8 +2,7 @@
 
 ## 1. Overview
 
-SuomiCPU-16's primary emulator is implemented in Rust. The Python emulator is
-retained as a migration reference. SC-16 is a small, byte-addressed machine with
+SuomiCPU-16 is implemented in Rust. SC-16 is a small, byte-addressed machine with
 eight general-purpose registers and a 16-bit instruction format. Assembly source
 files use the `.asm` extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
@@ -36,8 +35,8 @@ subset handles multiple `int` functions with up to three parameters and local
 `int` variables, assignments, arithmetic/bitwise/shift/logical and signed comparison
 expressions, conditional expressions, nested blocks, `if`/`else`, and
 `while`/`do`/`for` loops with `break` and `continue`, including recursion.
-Other C programs are rejected until their required features are ported; C builds
-never fall back to Python. At startup,
+Other C programs are rejected until their required features are ported. At
+startup,
 the BIOS lists each subfolder in `modules/` as a module, using the folder name
 as its module name. A folder with one `.c` file loads that file; a folder with
 multiple `.c` files must contain `main.c`, which is loaded instead. The first
@@ -85,8 +84,8 @@ comma expressions, nested blocks,
 `switch`/`case`/`default` with fallthrough, `goto` labels, `while`, `do`/`while`,
 basic integer `sizeof`, and `for` loops with `break` and `continue`, including
 recursion.
-Programs outside this subset are rejected with a Rust compiler diagnostic;
-Python is not invoked. Only object-like macros and `#undef` are preprocessed;
+Programs outside this subset are rejected with a Rust compiler diagnostic.
+Only object-like macros and `#undef` are preprocessed;
 `#if`/`#elif` integer constant expressions and `#ifdef`/`#ifndef` conditional
 branches are supported. Backslash-newline source continuations are spliced
 before preprocessing and tokenizing. Quoted includes search beside the
@@ -95,18 +94,15 @@ Function-like macros support argument substitution, stringification, and token
 pasting; variadic macros remain unsupported. The Rust C frontend also supports
 console `fgets`, `puts`, and a restricted `printf` format subset: literal text,
 `%%`, and at most one `%s` argument. Other `printf` conversions remain
-unsupported. The legacy reference compiler can still be invoked directly:
+unsupported. Compile C sources to segmented images with the Rust build tool:
 
 ```console
 cargo run -- examples/example.asm
-python tools/c_compiler.py examples/factorial.c
-python tools/c_compiler.py examples/factorial.c -S -o examples/factorial.asm
+cargo run --bin sc16build -- examples/factorial.c examples/factorial.sc16img
 cargo run -- examples/factorial.bin
 ```
 
-The Python compiler defaults to an output file with the input name and a `.bin`
-extension. `-S` emits readable SC-16 assembly instead. The Rust emulator
-accepts `.asm`, `.c`, and flat `.bin` inputs.
+The Rust emulator accepts `.asm`, supported `.c`, and flat `.bin` inputs.
 
 The input file argument is optional. Without it, the BIOS compiles and loads a
 selected program from `modules/`; storage disks are only for program data. Use
@@ -133,8 +129,8 @@ Macroquad for its window, display, and input.
   ```
 
 - `;` and `#` start comments outside quoted strings.
-- Numeric instruction operands use Python-style integer prefixes: decimal
-  (`25`), hexadecimal (`0x19`), octal (`0o31`), or binary (`0b11001`).
+- Integer instruction operands accept decimal (`25`), hexadecimal (`0x19`),
+  octal (`0o31`), and binary (`0b11001`) notation.
 - There is no implicit `CALL`, `RET`, `NOP`, expression evaluation, or data
   alignment directive. Base instructions occupy two bytes; extended
   instructions use two, four, or six bytes depending on their operands.
@@ -208,8 +204,8 @@ This emits bytes `0x53` and `0x43`.
 #### Strings
 
 The `string` format accepts one or more quoted strings. Strings are encoded as
-UTF-8 and emitted exactly as given; no null terminator is added. Python-style
-quoted escapes such as `\n` and `\t` are interpreted:
+UTF-8 and emitted exactly as given; no null terminator is added. Quoted escapes
+such as `\n` and `\t` are interpreted:
 
 ```asm
 .data string "Hello", " world!\n"
@@ -306,7 +302,7 @@ For two-register arithmetic/logical operations the first operand is also the
 destination. `CMP` uses its two operands only as inputs.
 
 The original byte-oriented instructions retain their existing behavior:
-register values are Python integers, `LDI` may load up to 16 bits, arithmetic
+register values use signed 64-bit host storage, `LDI` may load up to 16 bits, arithmetic
 does not automatically mask its result, and byte stores and `POP` retain only a
 byte. `SHR` explicitly operates on a 16-bit word. The C compiler emits masks
 where needed to implement its 16-bit integer semantics.
@@ -346,7 +342,7 @@ shifted out) and clear `V`. A zero-count shift preserves `C`. `NEG32` sets
 does not change flags.
 
 These instructions use the extended `0x1A` selector in the `OP_SHR` space and
-are implemented by the Python compatibility emulator and the Rust CPU. The
+are implemented by the Rust CPU. The
 `MOVSPH` miscellaneous instruction reads the high 14
 bits of the 30-bit stack pointer; together with `MOVSP`, it lets compiler code
 form full stack addresses for 32-bit objects. `SETSPH` sets those upper bits
@@ -646,9 +642,9 @@ table to unpack the pixels.
 
 ## 9. ANSI C90 compiler
 
-[`tools/c_compiler.py`](tools/c_compiler.py) is a C90-oriented compiler, **not a
-fully conforming ANSI/ISO C90 implementation**. It implements a substantial
-subset of the language and common preprocessing features, but some required
+The Rust C compiler is C90-oriented, **not a fully conforming ANSI/ISO C90
+implementation**. It implements a subset of the language and common
+preprocessing features, but some required
 C90 constructs, target type requirements, and the standard library are not
 implemented. Do not assume that a program accepted by another C90 compiler
 will compile or have identical behavior on SC-16.
@@ -767,9 +763,9 @@ minimum requirements:
   pointer-target qualifications. Const qualification through multiple pointer
   levels and const-qualified pointer objects are not supported; do not treat
   other accepted pointer qualifier combinations as strictly conforming.
-- Global/static storage begins at `0x80000` (`GLOBAL_BASE` in
-  [`tools/c_compiler.py`](tools/c_compiler.py)); uninitialized globals are
-  zeroed. The current compiler allocates static data through `0xFFFFF`.
+- Global/static storage begins at `0x80000` (`GLOBAL_BASE` in the Rust C
+  compiler); uninitialized globals are zeroed. The current compiler allocates
+  static data through `0xFFFFF`.
   Local variables, arguments, return addresses, and temporaries use the machine
   stack.
 
@@ -1090,7 +1086,8 @@ so send state continuously rather than relying on single events.
 | `int net_active(int slot)`                                             | 1 if a player occupies `slot`.                                          |
 | `int net_ready(void)` / `int net_full(void)` / `int net_is_open(void)` | Slot settled / group had no free slot / joined.                         |
 
-Windows may need to allow Python through the firewall for private networks.
+Windows may need to allow the application through the firewall for private
+networks.
 [`modules/Netgame Demo/net_game_demo.c`](<modules/Netgame Demo/net_game_demo.c>)
 shows the pattern.
 
@@ -1104,8 +1101,8 @@ with four ghosts, power pellets, a wrap-around tunnel, lives, and levels. Build
 and run one from the repository root:
 
 ```
-python tools/c_compiler.py "modules/Asteroids/asteroids.c" -o asteroids.bin
-cargo run -- asteroids.bin
+cargo run --bin sc16build -- "modules/Asteroids/asteroids.c" asteroids.sc16img
+cargo run -- asteroids.sc16img
 ```
 
 [`examples/factorial.c`](examples/factorial.c) and
@@ -1126,7 +1123,7 @@ wall tiles with separate markers for you and Hertta.
 
 All games and the showcase play sound effects through `gfx_sound` (lasers, explosions,
 engine rumble, pellet and ghost sounds, page and benchmark beeps); sound is
-synthesized by the emulator and needs a working pygame audio device.
+synthesized by the emulator and needs a working audio device.
 
 Controls: Left/Right (A/D) steer or move; Up (W) thrusts in Asteroids; Space
 fires; Enter or Space restarts after GAME OVER. In Pac-Man, all four directions
@@ -1274,12 +1271,9 @@ C globals start at 0x80000.
 
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 
-    python tools/c_compiler.py "modules/SC-16 showcase/sc16_showcase.c" -o showcase.bin
-    cargo run -- showcase.bin
+    cargo run --bin sc16build -- "modules/SC-16 showcase/sc16_showcase.c" showcase.sc16img
+    cargo run -- showcase.sc16img
 
 ## CPU execution
 
-The Rust emulator executes SC-16 programs with its Rust CPU implementation and
-does not require Numba or a Python JIT. The retained Python compatibility
-emulator uses its interpreter while migration tests remain; the former optional
-Numba backend has been removed.
+The Rust emulator executes SC-16 programs with its Rust CPU implementation.

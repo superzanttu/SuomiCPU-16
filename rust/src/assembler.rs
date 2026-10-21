@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_python_style_numeric_separators_and_rejects_ambiguous_octal() {
+    fn parses_underscore_separators_and_rejects_ambiguous_octal() {
         assert_eq!(
             assemble("LDI R0, 1_000\n", 0).unwrap().segments[0].data,
             b"\x08\xe8\x80\x03"
@@ -1289,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_python_assembler_encoding_and_sparse_address_regressions() {
+    fn preserves_assembler_encoding_and_sparse_address_regressions() {
         let image = assemble("JMP finish\nLDI R1, 315\nfinish: HALT\n", 0).unwrap();
         assert_eq!(image.entry_point, 0);
         assert_eq!(image.segments[0].data, b"\x58\x06\x09\x3b\x81\x01\x00\x00");
@@ -1661,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_python_reference_examples_and_bitmap_font() {
+    fn matches_reference_examples_and_bitmap_font() {
         let example = assemble(include_str!("../../examples/example.asm"), 0).unwrap();
         assert_eq!(example.entry_point, 0);
         assert_eq!(example.segments.len(), 1);

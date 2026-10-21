@@ -1834,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_compiler_loads_ana_clock_without_running_python() {
+    fn rust_compiler_loads_ana_clock_module() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let program = root.join("modules").join("AnaClock").join("anaclock.c");
         let image = load_program(&program).expect("Rust C compiler should load AnaClock");

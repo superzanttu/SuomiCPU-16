@@ -1,5 +1,5 @@
 ; Demonstrates reusable routines from lib_gfx.asm and glyph data from the font.
-; Load with: python SuomiCPU.py examples/gfx_demo.asm
+; Load with: cargo run -- examples/gfx_demo.asm
 .include "../fonts/font5x7.asm"
 .address 0x0100
 

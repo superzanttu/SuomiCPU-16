@@ -1,9 +1,7 @@
 # SuomiCPU-16
 
-SuomiCPU-16 is an emulator for the SC-16, a small, byte-addressed machine. The
-Rust emulator is the primary runtime; Python implementations remain during the
-ongoing migration. See the [Python-to-Rust migration inventory](docs/py2rust.md)
-for file status and the dependency-ordered plan.
+SuomiCPU-16 is an emulator for the SC-16, a small, byte-addressed machine.
+Runtime, tools, and tests are implemented in Rust.
 
 ## Features
 - Full emulation of the SC-16 architecture.
@@ -51,15 +49,15 @@ cargo run -- examples/example.asm
 
 For five analog clock styles, a Nixie-tube display, and a flip clock, run:
 ```console
-python tools/c_compiler.py examples/anaclock.c -o anaclock.bin
-cargo run -- anaclock.bin
+cargo run --bin sc16build -- examples/anaclock.c anaclock.sc16img
+cargo run -- anaclock.sc16img
 ```
 Press Tab to cycle through the seven clock faces.
 
 For a first-person Elite-style space combat demo, run:
 ```console
-python tools/c_compiler.py examples/elitedemo.c -o elitedemo.bin
-cargo run -- elitedemo.bin
+cargo run --bin sc16build -- examples/elitedemo.c elitedemo.sc16img
+cargo run -- elitedemo.sc16img
 ```
 Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
 Space. The ship accelerates and drifts with inertia; shields regenerate and the
@@ -93,19 +91,18 @@ signed comparison expressions, conditional and comma expressions, `if`/`else`,
 `switch` with case fallthrough, `goto` labels, nested
 blocks, basic integer `sizeof`, and `while`/`do`/`for` loops with `break` and
 `continue`, including recursive calls. Programs outside this subset are rejected
-with a Rust compiler diagnostic; the emulator no longer invokes Python to build
-C sources. The Python compiler remains in the repository as migration reference
-code, not as a runtime fallback. Object-like macros, `#undef`, and
+with a Rust compiler diagnostic; C sources are compiled only by Rust.
+Object-like macros, `#undef`, and
 `#if`/`#elif`/`#ifdef`/`#ifndef` conditional branches are preprocessed.
 Quoted includes search beside the including source; angle-bracket includes
 search the repository `lib` directory. Function-like macros support argument
 substitution, stringification, and token pasting; backslash-newline source
 continuations are also supported. Variadic macros are not implemented in Rust
-yet. To compile a C file explicitly with the legacy tool:
+yet. To compile a C file into a segmented image:
 
 ```console
-python tools/c_compiler.py examples/asteroids.c -o asteroids.bin
-cargo run -- asteroids.bin
+cargo run --bin sc16build -- examples/asteroids.c asteroids.sc16img
+cargo run -- asteroids.sc16img
 ```
 
 See the [user guide](docs/user_guide.md) for setup details, controls, and the full
@@ -124,8 +121,7 @@ cargo build --target wasm32-unknown-unknown
 The browser build is not yet a standalone web release: module discovery and
 module file access still rely on the host filesystem. Rust builds `.asm`
 programs with its native assembler and compiles the documented subset of `.c`
-files directly. Unsupported C programs are rejected; there is no Python
-runtime fallback.
+files directly. Unsupported C programs are rejected.
 
 Run a program with optional persistent data-disk and LAN settings:
 
@@ -182,8 +178,7 @@ cargo run --bin sc16gallery
 ```
 Each generated GIF loops continuously with a 15-second cycle by default.
 The Rust CPU runs the source module for 10 simulated seconds during capture.
-The retained Python C compiler translates C sources; frame execution and GIF
-generation use Rust. Use
+Use
 `--run-seconds` to change the capture window and `--gif-seconds` to set the
 total GIF duration; `--fps` and `--capture-fps` adjust sampling. The command
 discovers modules from `modules/` each time it runs and updates this gallery.

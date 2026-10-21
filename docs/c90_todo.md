@@ -47,17 +47,11 @@ an ABI choice as delivered.
 
 ## Rust compiler migration status
 
-Priority is to replace every Python implementation and Python-dependent
-runtime/build path with Rust. This migration is separate from C90 conformance:
-do not delay removal of Python-only implementation choices to pursue unrelated
-language features, and do not mistake migration completion for C90 conformance.
-Passing the Rust build or parser tests does not establish feature parity.
+The runtime, compiler, tools, and validation path now use Rust only. Migration
+completion is separate from C90 conformance: passing Rust build or parser tests
+does not establish language feature parity.
 
-- [x] Make Rust the default Windows launcher and README quick-start runtime.
-- [x] Remove the obsolete Python `main.py` wrapper and unused
-  `src/SuomiCPU_backup.py`; migrated examples/tests no longer refer to them.
-- [x] Remove the eager Python image-builder requirement from Rust emulator
-  startup; BIOS and native `.asm`/`.bin` launches no longer require it.
+- [x] Make Rust the only runtime, compiler, tools, and CI path.
 - [x] Source-located tokenization and literal/operator recognition in
   `rust/src/c_compiler.rs`.
 - [x] Expression parser for operators, assignments, conditional expressions,
@@ -82,12 +76,10 @@ Passing the Rust build or parser tests does not establish feature parity.
   `switch`/`case`/`default`
   with fallthrough, function-scoped `goto` labels, nested blocks, `while`,
   `do`/`while`, basic `for` loops, and loop `break`/`continue`.
-- [x] Remove the Python compiler invocation from Rust `.c` source and BIOS
-  module build paths; Rust reports unsupported C instead of falling back.
-- [x] Replace `tools/sc16_build_image.py` with the Rust `sc16build` CLI for
-  assembling `.asm`, compiling the supported `.c` subset, and wrapping `.bin`.
-- [x] Execute focused Rust C compiler integration tests on Windows, including
-  native source builds and unsupported-source rejection without Python.
+- [x] Accept supported `volatile`-qualified byte scalars and one-level byte
+  pointers; reads and writes remain explicit in generated code.
+- [x] Use Rust `sc16build` to assemble `.asm`, compile supported `.c` sources,
+  wrap `.bin`, and reject unsupported C without a compatibility fallback.
 - [x] Evaluate integer constant expressions for local and global array bounds
   (including C integer bases/suffixes and common arithmetic, comparison,
   logical, and bitwise operators).
@@ -112,25 +104,18 @@ Passing the Rust build or parser tests does not establish feature parity.
 - [ ] Type checking, diagnostics, and target ABI semantics.
 - [ ] Complete SC-16 assembly generation, runtime library linking, and image
   output beyond the current integer-function subset.
-- [ ] Migrate the 158 Python C compiler regression tests and add executable
-  Rust compiler integration tests.
-- [ ] Expand Rust compiler support until existing `.c` source and module builds
+- [x] Remove the legacy runtime, compiler, assembler, network tool, test suite,
+  and non-Rust dependency installation from CI.
+- [ ] Restore useful integration coverage as Rust tests.
+- [ ] Expand Rust compiler support until required `.c` source and module builds
   no longer encounter unsupported syntax or semantics.
-- [ ] Port remaining Python emulator, assembler, utilities, map tools,
-  GIF generation, build scripts, and tests to Rust or remove them if obsolete.
-- [ ] Remove Python C compiler dependencies only after all required build,
-  runtime, test, and tooling paths are migrated.
 
-The Python C compiler remains in the repository as migration reference code,
-but Rust runtime builds do not invoke it. C programs outside the current native
-subset fail with an unsupported-program diagnostic until their features are
-ported. The Rust frontend now compiles Text Demo using console `fgets`, `puts`,
-and the restricted literal/`%s` `printf` subset documented in the user guide.
-The Rust-only module smoke build currently compiles 16 of 17 BIOS modules;
-MotoRobots remains blocked on floating-point semantics. Keep these limitations
-visible while extending Rust compiler coverage. There are 27 tracked Python
-source files remaining across the emulator,
-compiler, assembler, tools, and tests; Python removal is not complete.
+The repository uses Rust for runtime, build, tools, and CI. Some legacy
+integration coverage has not yet been recreated as Rust tests. C programs
+outside the current native subset fail with an unsupported-program diagnostic
+until their features are ported. The Rust frontend compiles Text Demo using
+console `fgets`, `puts`, and its supported `printf` formats. The module smoke
+build compiles all 17 bootable BIOS C modules.
 
 ## A — SuomiCPU-16 platform required
 

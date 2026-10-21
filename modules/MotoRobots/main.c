@@ -11,8 +11,8 @@ int main() {
     game_init(&state);
     
     while (1) {
-        float dt;
-        dt = 0.03333f;
+        int dt;
+        dt = GAME_TIME_UNITS_PER_SECOND / 30;
         game_update(&state, dt);
         game_draw(&state);
         gfx_present();

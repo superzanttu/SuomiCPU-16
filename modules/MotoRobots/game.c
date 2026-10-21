@@ -7,9 +7,9 @@
 #define MINE_BUFFER_CAP 5
 #define BUILDING_BUFFER_CAP 20
 #define ROBOT_CAPACITY 5
-#define ROBOT_MOVE_INTERVAL 1.0f
-#define ROBOT_TRANSFER_INTERVAL 0.5f
-#define ROBOT_PATH_RETRY_DELAY 1.0f
+#define ROBOT_MOVE_INTERVAL GAME_TIME_UNITS_PER_SECOND
+#define ROBOT_TRANSFER_INTERVAL (GAME_TIME_UNITS_PER_SECOND / 2)
+#define ROBOT_PATH_RETRY_DELAY GAME_TIME_UNITS_PER_SECOND
 #define TOOLBAR_Y MAP_VIEW_BOTTOM
 #define TOOL_BUTTON_COUNT 5
 #define TOOL_BUTTON_WIDTH 118
@@ -17,7 +17,7 @@
 #define MINIMAP_X 568
 #define MINIMAP_Y 332
 #define MINIMAP_SIZE 64
-#define PAN_REPEAT_DELAY 0.15f
+#define PAN_REPEAT_DELAY (GAME_TIME_UNITS_PER_SECOND * 15 / 100)
 
 static int tile_size(GameState *state)
 {
@@ -187,13 +187,13 @@ static void delete_building(GameState *state, int index)
             robot->target_building = -1;
             robot->carrying_amount = 0;
             robot->carrying_type = RES_NONE;
-            robot->timer = 0.0f;
+            robot->timer = 0;
             robot->path_status = ROBOT_PATH_NONE;
             robot->path_length = 0;
             robot->path_position = 0;
             robot->route_valid = 0;
             robot->route_direction = 0;
-            robot->path_retry_timer = 0.0f;
+            robot->path_retry_timer = 0;
             if (state->pathfinding_robot == i)
                 state->pathfinding_robot = -1;
         }
@@ -291,8 +291,6 @@ static void format_count(char *output, int value)
 
     if (value < 0)
         value = 0;
-    if (value > 99999)
-        value = 99999;
     count = 0;
     do
     {
@@ -395,7 +393,7 @@ static void place_building(GameState *state, int x, int y)
     building->factory_copper_plate_input = 0;
     building->factory_robot_rombonent_input = 0;
     building->factory_status = 0;
-    building->production_timer = 0.0f;
+    building->production_timer = 0;
     building->processing_batch = 0;
     state->selected_building = state->building_count;
     state->building_count++;
@@ -476,13 +474,13 @@ static void assign_robot_route(GameState *state, int source_index,
     robot->source_building = source_index;
     robot->target_building = target_index;
     robot->state = ROBOT_TO_SOURCE;
-    robot->timer = 0.0f;
+    robot->timer = 0;
     robot->path_status = ROBOT_PATH_QUEUED;
     robot->path_length = 0;
     robot->path_position = 0;
     robot->route_valid = 0;
     robot->route_direction = 0;
-    robot->path_retry_timer = 0.0f;
+    robot->path_retry_timer = 0;
     printf("Robot %d route assigned: %s(%d) at (%d,%d) -> "
            "%s(%d) at (%d,%d)\n",
            (int)(robot - state->robots) + 1,
@@ -522,7 +520,7 @@ static void choose_route_building(GameState *state, int x, int y)
     state->route_source = -1;
 }
 
-static void update_mines(GameState *state, float delta_time)
+static void update_mines(GameState *state, int delta_time)
 {
     int i;
     for (i = 0; i < state->building_count; i++)
@@ -534,21 +532,21 @@ static void update_mines(GameState *state, float delta_time)
 
         if (building->inventory_count >= MINE_BUFFER_CAP)
         {
-            building->production_timer = 0.0f;
+            building->production_timer = 0;
             continue;
         }
         building->production_timer += delta_time;
-        while (building->production_timer >= 1.0f &&
+        while (building->production_timer >= GAME_TIME_UNITS_PER_SECOND &&
                building->inventory_count < MINE_BUFFER_CAP)
         {
-            building->production_timer -= 1.0f;
+            building->production_timer -= GAME_TIME_UNITS_PER_SECOND;
             building->inventory_type = building->resource_type;
             building->inventory_count++;
         }
     }
 }
 
-static void update_factories(GameState *state, float delta_time)
+static void update_factories(GameState *state, int delta_time)
 {
     int i;
     Building *building;
@@ -565,14 +563,14 @@ static void update_factories(GameState *state, float delta_time)
             if (building->processing_batch <= 0)
             {
                 building->processing_batch = building->inventory_count;
-                building->production_timer = 0.0f;
+                building->production_timer = 0;
             }
             building->production_timer += delta_time;
             if (building->production_timer >=
-                (float)building->processing_batch)
+                building->processing_batch * GAME_TIME_UNITS_PER_SECOND)
             {
                 building->inventory_type = output;
-                building->production_timer = 0.0f;
+                building->production_timer = 0;
                 building->processing_batch = 0;
                 printf("Factory(%d) at (%d,%d) produced %s x%d\n",
                        building->id,
@@ -587,7 +585,7 @@ static void update_factories(GameState *state, float delta_time)
             state->robot_count < MAX_ROBOTS)
         {
             building->production_timer += delta_time;
-            if (building->production_timer >= 1.0f)
+            if (building->production_timer >= GAME_TIME_UNITS_PER_SECOND)
             {
                 Robot *robot;
                 robot = &state->robots[state->robot_count++];
@@ -597,16 +595,16 @@ static void update_factories(GameState *state, float delta_time)
                 robot->source_building = -1;
                 robot->target_building = -1;
                 robot->state = ROBOT_IDLE;
-                robot->timer = 0.0f;
+                robot->timer = 0;
                 robot->path_length = 0;
                 robot->path_position = 0;
                 robot->path_status = ROBOT_PATH_NONE;
                 robot->route_valid = 0;
                 robot->route_direction = 0;
-                robot->path_retry_timer = 0.0f;
+                robot->path_retry_timer = 0;
                 building->factory_robot_rombonent_input--;
                 building->factory_iron_plate_input--;
-                building->production_timer -= 1.0f;
+                building->production_timer -= GAME_TIME_UNITS_PER_SECOND;
                 printf("Factory(%d) at (%d,%d) produced robot %d\n",
                        building->id,
                        building->position.x, building->position.y,
@@ -620,13 +618,13 @@ static void update_factories(GameState *state, float delta_time)
              building->inventory_type != RES_ROMBONENT) ||
             building->inventory_count >= BUILDING_BUFFER_CAP)
         {
-            building->production_timer = 0.0f;
+            building->production_timer = 0;
             continue;
         }
         building->production_timer += delta_time;
-        if (building->production_timer >= 1.0f)
+        if (building->production_timer >= GAME_TIME_UNITS_PER_SECOND)
         {
-            building->production_timer -= 1.0f;
+            building->production_timer -= GAME_TIME_UNITS_PER_SECOND;
             building->factory_iron_plate_input--;
             building->factory_copper_plate_input -= 2;
             building->inventory_type = RES_ROMBONENT;
@@ -716,8 +714,8 @@ static void queue_robot_path(GameState *state, Robot *robot)
     robot->path_status = ROBOT_PATH_QUEUED;
     robot->path_length = 0;
     robot->path_position = 0;
-    robot->timer = 0.0f;
-    robot->path_retry_timer = 0.0f;
+    robot->timer = 0;
+    robot->path_retry_timer = 0;
     robot->route_valid = 0;
     robot->route_direction = 0;
     if (state->pathfinding_robot >= 0 &&
@@ -781,8 +779,8 @@ static int use_cached_robot_route(GameState *state, int robot_index,
     }
     robot->path_position = 0;
     robot->path_status = ROBOT_PATH_READY;
-    robot->path_retry_timer = 0.0f;
-    robot->timer = 0.0f;
+    robot->path_retry_timer = 0;
+    robot->timer = 0;
     return 1;
 }
 
@@ -796,8 +794,8 @@ static void invalidate_robot_route(GameState *state, int robot_index)
     robot->path_status = ROBOT_PATH_FAILED;
     robot->path_length = 0;
     robot->path_position = 0;
-    robot->timer = 0.0f;
-    robot->path_retry_timer = 0.0f;
+    robot->timer = 0;
+    robot->path_retry_timer = 0;
     if (state->pathfinding_robot == robot_index)
         state->pathfinding_robot = -1;
 }
@@ -840,7 +838,7 @@ static void finish_robot_path(GameState *state, int robot_index, int goal)
     }
     robot->path_position = 0;
     robot->path_status = ROBOT_PATH_READY;
-    robot->timer = 0.0f;
+    robot->timer = 0;
     if (robot->state == ROBOT_TO_TARGET &&
         state->path_queue[0] ==
             state->buildings[robot->source_building].position.y *
@@ -964,8 +962,8 @@ static void update_pathfinding(GameState *state)
         if (state->path_queue_head >= state->path_queue_tail)
         {
             robot->path_status = ROBOT_PATH_FAILED;
-            robot->timer = 0.0f;
-            robot->path_retry_timer = 0.0f;
+            robot->timer = 0;
+            robot->path_retry_timer = 0;
             state->pathfinding_robot = -1;
             start_next_path_search(state);
             continue;
@@ -1012,7 +1010,7 @@ static void update_pathfinding(GameState *state)
     }
 }
 
-static void update_robots(GameState *state, float delta_time)
+static void update_robots(GameState *state, int delta_time)
 {
     int i;
     int direction;
@@ -1053,7 +1051,7 @@ static void update_robots(GameState *state, float delta_time)
                 else
                     log_robot_transfer(
                         i, "unload started", &state->buildings[destination]);
-                robot->timer = 0.0f;
+                robot->timer = 0;
                 robot->path_status = ROBOT_PATH_NONE;
                 continue;
             }
@@ -1067,11 +1065,11 @@ static void update_robots(GameState *state, float delta_time)
             if (robot->path_status != ROBOT_PATH_READY)
                 continue;
             robot->timer += delta_time;
-            if (robot->timer < ROBOT_MOVE_INTERVAL - 0.02f)
+            if (robot->timer < ROBOT_MOVE_INTERVAL - 60)
                 continue;
             robot->timer -= ROBOT_MOVE_INTERVAL;
-            if (robot->timer < 0.0f)
-                robot->timer = 0.0f;
+            if (robot->timer < 0)
+                robot->timer = 0;
             if (robot->path_position >= robot->path_length)
             {
                 invalidate_robot_route(state, i);
@@ -1143,7 +1141,7 @@ static void update_robots(GameState *state, float delta_time)
                 source->inventory_count == 0)
             {
                 robot->state = ROBOT_TO_TARGET;
-                robot->timer = 0.0f;
+                robot->timer = 0;
                 log_robot_transfer(i, "load ended", source);
                 printf("Robot departs: Robot %d from %s(%d) at (%d,%d)\n",
                        i + 1, building_name(source->type), source->id,
@@ -1432,7 +1430,7 @@ void game_init(GameState *state)
     state->mouse_right_was_down = 0;
     state->selected_building = 0;
     state->pan_keys_was_down = 0;
-    state->pan_repeat_timer = 0.0f;
+    state->pan_repeat_timer = 0;
     state->tab_was_down = 0;
     state->mouse_last_x = 0;
     state->mouse_last_y = 0;
@@ -1454,7 +1452,7 @@ void game_init(GameState *state)
     base->factory_copper_plate_input = 0;
     base->factory_robot_rombonent_input = 0;
     base->factory_status = 0;
-    base->production_timer = 0.0f;
+    base->production_timer = 0;
     base->processing_batch = 0;
     state->building_count = 1;
     robot = &state->robots[0];
@@ -1464,18 +1462,18 @@ void game_init(GameState *state)
     robot->source_building = -1;
     robot->target_building = -1;
     robot->state = ROBOT_IDLE;
-    robot->timer = 0.0f;
+    robot->timer = 0;
     robot->path_status = ROBOT_PATH_NONE;
     robot->path_length = 0;
     robot->path_position = 0;
     robot->route_valid = 0;
     robot->route_direction = 0;
-    robot->path_retry_timer = 0.0f;
+    robot->path_retry_timer = 0;
     state->robot_count = 1;
     update_resource_totals(state);
 }
 
-void game_update(GameState *state, float delta_time)
+void game_update(GameState *state, int delta_time)
 {
     unsigned int keys;
     unsigned int mouse_events;
@@ -1496,10 +1494,10 @@ void game_update(GameState *state, float delta_time)
     int dy;
     int button;
 
-    if (delta_time < 0.0f)
-        delta_time = 0.0f;
-    if (delta_time > 0.25f)
-        delta_time = 0.25f;
+    if (delta_time < 0)
+        delta_time = 0;
+    if (delta_time > GAME_TIME_UNITS_PER_SECOND / 4)
+        delta_time = GAME_TIME_UNITS_PER_SECOND / 4;
     keys = gfx_keys();
     size = tile_size(state);
     pan_keys = keys & (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN);
@@ -1514,7 +1512,7 @@ void game_update(GameState *state, float delta_time)
             state->camera_y -= size;
         if (newly_pressed_pan_keys & KEY_DOWN)
             state->camera_y += size;
-        state->pan_repeat_timer = 0.0f;
+        state->pan_repeat_timer = 0;
     }
     else if (pan_keys != 0)
     {
@@ -1534,7 +1532,7 @@ void game_update(GameState *state, float delta_time)
     }
     else
     {
-        state->pan_repeat_timer = 0.0f;
+        state->pan_repeat_timer = 0;
     }
     state->pan_keys_was_down = pan_keys;
     clamp_camera(state);

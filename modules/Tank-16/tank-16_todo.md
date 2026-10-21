@@ -148,7 +148,9 @@ smoke particles without allocating one guest particle pool per old fire.
 
 Run `cargo run --release --bin sc16sprites` from the repository root to view either atlas. Use Tab to switch atlases, +/- to zoom, and click a cell to print its atlas name, ID, and coordinates. IDs are numbered from zero, left-to-right and then top-to-bottom within the selected atlas. Incomplete edge cells are included in the displayed grid.
 
-The Python helpers `sprite_id_at(image, x, y)`, `sprite_bounds(image, sprite_id)`, and `extract_sprite(image, sprite_id)` map between coordinates, IDs, and 64×64 images. The ID is the source cell index; C code still has to upload the selected pixel data to the GPU's tile or sprite slot.
+Atlas inspection is available through `cargo run --release --bin sc16sprites`.
+Cell IDs are numbered left-to-right and top-to-bottom; C code uploads selected
+pixel data to the GPU's tile or sprite slot.
 
 In `main.c`, `TILE_*` defines name the tile IDs stored in the map, while `TANK_SPRITE_*_BASE` defines the sprite-slot ranges used by the two players' rotated tanks. Use these names instead of raw IDs when referring to the game's tile and sprite slots.
 
