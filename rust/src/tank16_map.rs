@@ -1169,6 +1169,20 @@ pub fn compile_runtime_tank16(game_dir: &Path) -> Result<crate::image::ProgramIm
     compile_with_python_c_compiler(&source, game_dir)
 }
 
+fn compile_with_rust_c_compiler(
+    source: &str,
+    source_path: &Path,
+) -> Result<crate::image::ProgramImage, String> {
+    crate::c_compiler::compile_minimal_program(source, &source_path.to_string_lossy())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "Rust C compiler does not support Tank-16 source {}",
+                source_path.display()
+            )
+        })
+}
+
 fn compile_with_python_c_compiler(
     source: &str,
     game_dir: &Path,
@@ -1743,7 +1757,7 @@ pub fn compile_map_file(
         Vec::new()
     };
     let header = build_map_header(game_dir, map_path, &round_maps)?;
-    compile_with_python_c_compiler(&source.replacen(include, &header, 1), game_dir)
+    compile_with_rust_c_compiler(&source.replacen(include, &header, 1), &source_path)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

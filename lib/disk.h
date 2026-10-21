@@ -11,17 +11,10 @@ static void sc16_disk_write16(volatile unsigned char *registers,
 static void sc16_disk_write32(volatile unsigned char *registers,
                               int offset, unsigned long value)
 {
-    union
-    {
-        unsigned long value;
-        unsigned char bytes[4];
-    } encoded;
-
-    encoded.value = value;
-    registers[offset] = encoded.bytes[0];
-    registers[offset + 1] = encoded.bytes[1];
-    registers[offset + 2] = encoded.bytes[2];
-    registers[offset + 3] = encoded.bytes[3];
+    registers[offset] = (unsigned char)(value >> 24);
+    registers[offset + 1] = (unsigned char)(value >> 16);
+    registers[offset + 2] = (unsigned char)(value >> 8);
+    registers[offset + 3] = (unsigned char)value;
 }
 
 static unsigned int sc16_disk_read16(volatile unsigned char *registers,
@@ -33,17 +26,10 @@ static unsigned int sc16_disk_read16(volatile unsigned char *registers,
 static unsigned long sc16_disk_read32(volatile unsigned char *registers,
                                       int offset)
 {
-    union
-    {
-        unsigned long value;
-        unsigned char bytes[4];
-    } decoded;
-
-    decoded.bytes[0] = registers[offset];
-    decoded.bytes[1] = registers[offset + 1];
-    decoded.bytes[2] = registers[offset + 2];
-    decoded.bytes[3] = registers[offset + 3];
-    return decoded.value;
+    return ((unsigned long)registers[offset] << 24) |
+           ((unsigned long)registers[offset + 1] << 16) |
+           ((unsigned long)registers[offset + 2] << 8) |
+           (unsigned long)registers[offset + 3];
 }
 
 static int disk_read_file(const char *path, unsigned long offset,

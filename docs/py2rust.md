@@ -67,7 +67,7 @@ Status meanings:
 - [ ] **Migrate [tools/assembler.py](../tools/assembler.py)** — Rust exists; Python consumers remain.
   - Why it remains: the Python C compiler, emulator, smoke tool, and tests still use this module. Migrate those callers before removal.
 - [ ] **Port [tools/c_compiler.py](../tools/c_compiler.py)** — blocking; Rust port is incomplete.
-  - Why it remains: Rust does not yet build all module programs, and the Python loader, Tank-16 asset builder, tests, and developer tools still depend on it.
+  - Why it remains: Rust does not yet build every module program. Tank-16 static map builds now use the Rust compiler, but runtime-map builds still depend on Python because the Rust compiler does not yet support the `char **` JSON parser parameters and their 32-bit pointer/`unsigned long` operations; Python tests and developer tools also remain.
 - [ ] **Migrate [tools/sc16net.py](../tools/sc16net.py)** — Rust exists; Python consumer remains.
   - Why it remains: the Python emulator and network tests still import this transport. Switch integration tests and retire the emulator before deletion.
 - [ ] **Remove [tools/__init__.py](../tools/__init__.py)** — package marker.
@@ -317,8 +317,9 @@ point and its required tests pass.
    - [ ] Remove the Python test package markers when no Python tests remain.
 
 - [ ] **Migrate authoring and gallery utilities.**
-   - [x] Port the README gallery generator to Rust; source translation still
-     needs to move from Python to the Rust C compiler.
+   - [x] Port the README gallery generator and module compilation to Rust.
+     Modules outside the Rust C compiler's supported subset report a build
+     failure instead of falling back to Python.
    - [ ] Port or retire every remaining Python developer utility; none are
      accepted as permanent exceptions.
 

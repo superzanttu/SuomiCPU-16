@@ -124,8 +124,12 @@ Passing the Rust build or parser tests does not establish feature parity.
 The Python C compiler remains in the repository as migration reference code,
 but Rust runtime builds do not invoke it. C programs outside the current native
 subset fail with an unsupported-program diagnostic until their features are
-ported. Keep this limitation visible while extending Rust compiler coverage.
-There are 42 tracked Python source files remaining across the emulator,
+ported. The Rust frontend now compiles Text Demo using console `fgets`, `puts`,
+and the restricted literal/`%s` `printf` subset documented in the user guide.
+The Rust-only module smoke build currently compiles 16 of 17 BIOS modules;
+MotoRobots remains blocked on floating-point semantics. Keep these limitations
+visible while extending Rust compiler coverage. There are 27 tracked Python
+source files remaining across the emulator,
 compiler, assembler, tools, and tests; Python removal is not complete.
 
 ## A — SuomiCPU-16 platform required

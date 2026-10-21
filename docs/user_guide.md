@@ -92,8 +92,10 @@ branches are supported. Backslash-newline source continuations are spliced
 before preprocessing and tokenizing. Quoted includes search beside the
 including source; angle-bracket includes search the repository `lib` directory.
 Function-like macros support argument substitution, stringification, and token
-pasting; variadic macros remain unsupported. The legacy reference compiler can
-still be invoked directly:
+pasting; variadic macros remain unsupported. The Rust C frontend also supports
+console `fgets`, `puts`, and a restricted `printf` format subset: literal text,
+`%%`, and at most one `%s` argument. Other `printf` conversions remain
+unsupported. The legacy reference compiler can still be invoked directly:
 
 ```console
 cargo run -- examples/example.asm

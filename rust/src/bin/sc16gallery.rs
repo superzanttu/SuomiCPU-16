@@ -2,9 +2,8 @@ use gif::{Encoder, Frame, Repeat};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use suomicpu16::{Cpu, MemorySegment};
+use suomicpu16::Cpu;
 
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
@@ -35,32 +34,6 @@ struct Module {
     name: String,
     source: Option<PathBuf>,
     error: Option<String>,
-}
-
-struct TemporaryDirectory(PathBuf);
-
-impl TemporaryDirectory {
-    fn create() -> io::Result<Self> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("sc16-gallery-{}-{timestamp}", std::process::id()));
-        fs::create_dir(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for TemporaryDirectory {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.0) {
-            eprintln!(
-                "sc16gallery: could not remove temporary directory {}: {error}",
-                self.0.display()
-            );
-        }
-    }
 }
 
 fn parse_options() -> Result<Option<Options>, String> {
@@ -167,7 +140,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let temporary = TemporaryDirectory::create()?;
     let mut results = Vec::with_capacity(modules.len());
     let mut generated = 0;
     let mut failures = 0;
@@ -175,13 +147,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for module in modules {
         let slug = slug(&module.name, &mut used_slugs);
         let destination = options.output_dir.join(format!("{slug}.gif"));
-        match capture_module(
-            &module,
-            &destination,
-            &options,
-            &temporary.0,
-            generated + failures,
-        ) {
+        match capture_module(&module, &destination, &options) {
             Ok(count) => {
                 println!(
                     "{}: captured {count} frames -> {}",
@@ -285,41 +251,14 @@ fn discover_modules(directory: &Path) -> io::Result<Vec<Module>> {
         .collect()
 }
 
-fn capture_module(
-    module: &Module,
-    destination: &Path,
-    options: &Options,
-    temporary: &Path,
-    index: usize,
-) -> Result<usize, String> {
+fn capture_module(module: &Module, destination: &Path, options: &Options) -> Result<usize, String> {
     let source = module.source.as_ref().ok_or_else(|| {
         module
             .error
             .clone()
             .unwrap_or_else(|| "No source file found.".into())
     })?;
-    let binary = temporary.join(format!("{index}.bin"));
-    let compiler = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tools")
-        .join("c_compiler.py");
-    let output = Command::new("python")
-        .arg(compiler)
-        .arg(source)
-        .arg("--quiet")
-        .arg("--output")
-        .arg(&binary)
-        .output()
-        .map_err(|error| format!("could not start the retained Python C compiler: {error}"))?;
-    if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if details.is_empty() {
-            format!("C compiler exited with {}", output.status)
-        } else {
-            details
-        });
-    }
-    let data =
-        fs::read(&binary).map_err(|error| format!("could not read compiled binary: {error}"))?;
+    let image = suomicpu16::image::build_source(source).map_err(|error| error.to_string())?;
     let mut cpu = Cpu::new();
     let source_disk = source
         .parent()
@@ -330,7 +269,7 @@ fn capture_module(
         source_disk,
     )
     .map_err(|error| format!("could not configure module storage: {error}"))?;
-    cpu.load_program(&[MemorySegment { address: 0, data }], 0)
+    cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| error.to_string())?;
     let source_text = fs::read_to_string(source).map_err(|error| error.to_string())?;
     let text_mode = source_text.contains("SCREEN_");
