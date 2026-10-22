@@ -33,9 +33,10 @@ In windowed mode, the emulator toolbar appears at the top left with
 **PAUSE/CONTINUE**, **RESET**, **REBOOT**, and **CONSOLE** buttons. RESET returns
 to the BIOS selector when launched through BIOS, or restarts a directly launched
 program; REBOOT restarts the active program. **CONSOLE** opens the small-font
-console overlay. Press **F2** to toggle the console, **F10** to pause or resume,
+console in its own resizable OS window. Press **F2** to toggle the console,
+**F10** to pause or resume,
 or **Shift+Ctrl+F** to toggle windowed/fullscreen mode (**F11** is also
-supported). The toolbar and console overlay are hidden in fullscreen mode.
+supported). The toolbar and console window are closed in fullscreen mode.
 Start directly in fullscreen with
 `cargo run -- --fullscreen` or `.\run.ps1 -Fullscreen`.
 Detailed stage logs are on by default and show which SC-16 component is

@@ -9,6 +9,8 @@ use macroquad::prelude::{
     is_mouse_button_pressed, is_mouse_button_released, mouse_position, mouse_wheel, next_frame,
     screen_height, screen_width, set_fullscreen, vec2,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use minifb::{Window as NativeWindow, WindowOptions};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,8 @@ const BIOS_VISIBLE_MODULES: usize = 12;
 const BIOS_MODULE_ROW_TOP: usize = 128;
 const BIOS_MODULE_ROW_HEIGHT: usize = 24;
 const TOOLBAR_HEIGHT: f32 = 36.0;
+const CONSOLE_WINDOW_WIDTH: usize = 480;
+const CONSOLE_WINDOW_HEIGHT: usize = 200;
 const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
     ("PAUSE", 8.0, 104.0),
     ("RESET", 120.0, 80.0),
@@ -211,13 +215,9 @@ impl Canvas {
         triangles: &[GpuTriangle],
         lines: &[GpuLine],
         palette: &[[u8; 3]; 256],
-        overlay: CanvasOverlay<'_>,
+        toolbar: Option<ToolbarState>,
     ) {
         let (width, height) = logical_size;
-        let CanvasOverlay {
-            toolbar,
-            console_lines,
-        } = overlay;
         self.rgba.fill(0);
         for y in 0..height {
             for x in 0..width {
@@ -281,9 +281,6 @@ impl Canvas {
         }
         if let Some(toolbar) = toolbar {
             draw_toolbar(toolbar);
-            if let Some(lines) = console_lines {
-                draw_console_window(lines);
-            }
         }
         next_frame().await;
     }
@@ -318,9 +315,67 @@ struct ToolbarState {
     paused: bool,
 }
 
-struct CanvasOverlay<'a> {
-    toolbar: Option<ToolbarState>,
-    console_lines: Option<&'a [String]>,
+#[cfg(not(target_arch = "wasm32"))]
+struct ConsoleWindow {
+    window: NativeWindow,
+    pixels: Vec<u32>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct ConsoleWindow;
+
+impl ConsoleWindow {
+    fn new() -> Result<Self, RuntimeError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let window = NativeWindow::new(
+                "SC-16 Console",
+                CONSOLE_WINDOW_WIDTH,
+                CONSOLE_WINDOW_HEIGHT,
+                WindowOptions {
+                    resize: true,
+                    ..WindowOptions::default()
+                },
+            )
+            .map_err(|error| {
+                RuntimeError::Window(format!("cannot open SC-16 console window: {error}"))
+            })?;
+            Ok(Self {
+                window,
+                pixels: vec![rgb(8, 12, 18); CONSOLE_WINDOW_WIDTH * CONSOLE_WINDOW_HEIGHT],
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self)
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.window.is_open()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            true
+        }
+    }
+
+    fn present(&mut self, lines: &[String], font: &[[u8; 8]]) -> Result<(), RuntimeError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            draw_console_lines(&mut self.pixels, lines, font);
+            self.window
+                .update_with_buffer(&self.pixels, CONSOLE_WINDOW_WIDTH, CONSOLE_WINDOW_HEIGHT)
+                .map_err(|error| {
+                    RuntimeError::Window(format!("cannot update SC-16 console window: {error}"))
+                })?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (lines, font);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -396,6 +451,7 @@ pub async fn run_with_devices(
     let runtime_started = Instant::now();
     let mut paused = false;
     let mut console_visible = false;
+    let mut console_window = None;
     let mut fullscreen = fullscreen;
     while !is_key_down(KeyCode::Escape) {
         let pressed_keys = get_keys_pressed();
@@ -456,6 +512,14 @@ pub async fn run_with_devices(
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
                 RuntimeControl::FullscreenToggled(_) => {}
             }
+        }
+        if fullscreen {
+            console_visible = false;
+            console_window = None;
+        } else if console_visible && console_window.is_none() {
+            console_window = Some(ConsoleWindow::new()?);
+        } else if !console_visible {
+            console_window = None;
         }
         if let Some(action @ (RuntimeControl::ResetRequested | RuntimeControl::RebootRequested)) =
             pending_action
@@ -603,11 +667,14 @@ pub async fn run_with_devices(
                 &font,
             );
         }
-        let console_lines = if !fullscreen && console_visible {
-            Some(cpu.console.text_snapshot())
-        } else {
-            None
-        };
+        if let Some(window) = console_window.as_mut() {
+            if window.is_open() {
+                window.present(&cpu.console.text_snapshot(), &font)?;
+            } else {
+                console_window = None;
+                console_visible = false;
+            }
+        }
         canvas
             .present(
                 &pixels,
@@ -615,10 +682,7 @@ pub async fn run_with_devices(
                 &cpu.gpu_triangles,
                 &cpu.gpu_lines,
                 &cpu.palette,
-                CanvasOverlay {
-                    toolbar: (!fullscreen).then_some(ToolbarState { paused }),
-                    console_lines: console_lines.as_deref(),
-                },
+                (!fullscreen).then_some(ToolbarState { paused }),
             )
             .await;
     }
@@ -773,17 +837,7 @@ async fn select_and_boot(
             message.as_deref(),
         );
         canvas
-            .present(
-                pixels,
-                (640, 480),
-                &[],
-                &[],
-                &cpu.palette,
-                CanvasOverlay {
-                    toolbar: None,
-                    console_lines: None,
-                },
-            )
+            .present(pixels, (640, 480), &[], &[], &cpu.palette, None)
             .await;
         let wheel_delta = mouse_wheel().1;
         if wheel_delta != 0.0
@@ -1558,33 +1612,21 @@ fn draw_toolbar(state: ToolbarState) {
     }
 }
 
-fn draw_console_window(lines: &[String]) {
-    let width = screen_width().min(500.0);
-    let height = (screen_height() - TOOLBAR_HEIGHT - 20.0).min(280.0);
-    if width < 100.0 || height < 70.0 {
-        return;
-    }
-    let x = screen_width() - width - 12.0;
-    let y = TOOLBAR_HEIGHT + 12.0;
-    draw_rectangle(x, y, width, height, Color::from_rgba(8, 12, 18, 238));
-    draw_rectangle(x, y, width, 22.0, Color::from_rgba(35, 48, 65, 255));
-    draw_ui_text(
-        "SC-16 CONSOLE",
-        x + 8.0,
-        y + 16.0,
-        12.0,
-        Color::from_rgba(255, 210, 80, 255),
-    );
-    let columns = ((width - 16.0) / 7.0) as usize;
-    let rows = ((height - 30.0) / 12.0) as usize;
-    for (row, line) in lines.iter().rev().take(rows).rev().enumerate() {
-        let text = line.trim_end().chars().take(columns).collect::<String>();
-        draw_ui_text(
-            &text,
-            x + 8.0,
-            y + 36.0 + row as f32 * 12.0,
-            11.0,
-            Color::from_rgba(190, 220, 190, 255),
+fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]]) {
+    pixels.fill(rgb(8, 12, 18));
+    for (row, line) in lines
+        .iter()
+        .skip(lines.len().saturating_sub(CONSOLE_WINDOW_HEIGHT / 8))
+        .enumerate()
+    {
+        draw_text(
+            pixels,
+            CONSOLE_WINDOW_WIDTH,
+            0,
+            row * 8,
+            line,
+            rgb(190, 220, 190),
+            font,
         );
     }
 }
@@ -1679,6 +1721,34 @@ fn draw_text_limited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_window_renders_snapshot_with_small_font_in_a_separate_framebuffer() {
+        let mut pixels = vec![0; CONSOLE_WINDOW_WIDTH * CONSOLE_WINDOW_HEIGHT];
+        let font = load_font();
+        let lines = (0..30)
+            .map(|line| format!("line-{line:02}"))
+            .collect::<Vec<_>>();
+        draw_console_lines(&mut pixels, &lines, &font);
+        let mut expected_first_row =
+            vec![rgb(8, 12, 18); CONSOLE_WINDOW_WIDTH * CONSOLE_WINDOW_HEIGHT];
+        draw_text(
+            &mut expected_first_row,
+            CONSOLE_WINDOW_WIDTH,
+            0,
+            0,
+            "line-05",
+            rgb(190, 220, 190),
+            &font,
+        );
+
+        assert_eq!(pixels.len(), 480 * 200);
+        assert_eq!(pixels[CONSOLE_WINDOW_WIDTH - 1], rgb(8, 12, 18));
+        assert_eq!(
+            &pixels[..CONSOLE_WINDOW_WIDTH * 8],
+            &expected_first_row[..CONSOLE_WINDOW_WIDTH * 8]
+        );
+    }
 
     #[test]
     fn bios_module_discovery_sorts_selects_main_and_reads_descriptions() {
@@ -2290,6 +2360,38 @@ mod tests {
         let image = load_program(&program).expect("Rust C compiler should load AnaClock");
         assert_eq!(image.entry_point, 0);
         assert!(!image.segments.is_empty());
+    }
+
+    #[test]
+    fn infinite_city_keeps_running_across_rendered_frames() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let program = root
+            .join("modules")
+            .join("Infinite CIty")
+            .join("infinite_city.c");
+        let image = load_program(&program).expect("Infinite City should compile and load");
+        let mut cpu = Cpu::new();
+        cpu.load_program(&image.segments, image.entry_point)
+            .expect("Infinite City should load");
+        cpu.set_key(2, true);
+
+        for frame in 0..120 {
+            cpu.begin_frame();
+            for _ in 0..1_000_000 {
+                cpu.step()
+                    .expect("Infinite City instruction should execute");
+                if !cpu.running {
+                    panic!("Infinite City halted during rendered frame {frame}");
+                }
+                if cpu.frame_yield {
+                    break;
+                }
+            }
+            assert!(
+                cpu.frame_yield,
+                "Infinite City did not present frame {frame}"
+            );
+        }
     }
 
     #[test]
