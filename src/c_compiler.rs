@@ -10649,6 +10649,49 @@ mod tests {
     }
 
     #[test]
+    fn showcase_benchmark_advances_with_emulator_frame_ticks() {
+        let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("modules")
+            .join("SC-16 showcase")
+            .join("sc16_showcase.c");
+        let mut source =
+            std::fs::read_to_string(module).expect("SC-16 showcase source should load");
+        source = source.replacen("int main(void)", "int original_game_main(void)", 1);
+        source.push_str(
+            "\nint main(void) { \
+                 int i; int completed; \
+                 gfx_speed(SPEED_MAX); gfx_vsync(1); \
+                 page = 7; bench_state = 1; bench_index = 0; \
+                 while (bench_state == 1) { bench_step(); gfx_present(); } \
+                 completed = 0; \
+                 for (i = 0; i < NTEST; i++) { \
+                     if (bench_kops[i] > 0) completed++; \
+                 } \
+                 return bench_state * 100 + completed; \
+             }",
+        );
+        let image = compile_minimal_program(&source, "showcase-benchmark-test.c")
+            .unwrap()
+            .expect("SC-16 showcase benchmark harness should compile");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        for _ in 0..400 {
+            cpu.begin_frame();
+            cpu.run(200_000).unwrap();
+            if !cpu.running {
+                break;
+            }
+        }
+
+        assert!(!cpu.running, "showcase benchmark did not complete");
+        assert_eq!(
+            cpu.registers[0], 207,
+            "all benchmark results should be recorded"
+        );
+    }
+
+    #[test]
     fn passes_full_asset_pointer_to_native_graphics_calls() {
         let image = compile_minimal_program(
             "#include <suomi_gfx.h>\n\

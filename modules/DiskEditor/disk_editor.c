@@ -8,7 +8,7 @@
 
 unsigned char *dk = 0x43100;      /* control byte, id at +1..+8 */
 unsigned int *dw = 0x43100;       /* dw[5] pointer, dw[6] RAM offset, dw[7] disk count */
-char *ram = 0x20000;              /* edit buffer at 0, directory scratch at 0x200 */
+char *ram = 0x40000;              /* edit buffer at 0, directory scratch at 0x200 */
 
 char dirs[144];                   /* up to 16 disk ids, 9 bytes each */
 char dprot[16];                   /* write-protect flag per listed disk */

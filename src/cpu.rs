@@ -875,16 +875,16 @@ impl Cpu {
         }
         if operation == 8 {
             let address = self.registers[source] as u32 & self.memory_mask;
-            let low = self.read_u16(address);
-            let high = self.read_u16(address.wrapping_add(2)) & 0x3fff;
+            let high = self.read_u16(address) & 0x3fff;
+            let low = self.read_u16(address.wrapping_add(2));
             self.registers[destination] = i64::from((u32::from(high) << 16) | u32::from(low));
             return;
         }
         if operation == 9 {
             let address = self.registers[source] as u32 & self.memory_mask;
             let value = self.registers[destination] as u32 & self.memory_mask;
-            self.write_u16(address, value as u16);
-            self.write_u16(address.wrapping_add(2), (value >> 16) as u16);
+            self.write_u16(address, (value >> 16) as u16);
+            self.write_u16(address.wrapping_add(2), value as u16);
             return;
         }
         if operation == 10 {
@@ -3255,10 +3255,10 @@ mod tests {
         );
         assert_eq!(cpu.registers[2], 0x12345678);
         assert_eq!(
-            &cpu.memory[cpu.memory_mask as usize - 1..=cpu.memory_mask as usize],
-            &[0x78, 0x12]
+            &cpu.memory[cpu.memory_mask as usize - 2..=cpu.memory_mask as usize],
+            &[0x12, 0x34, 0x56]
         );
-        assert_eq!(cpu.memory[0], 0x34);
+        assert_eq!(cpu.memory[0], 0x78);
     }
 
     #[test]

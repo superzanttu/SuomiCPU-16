@@ -10,7 +10,10 @@ use macroquad::prelude::{
     screen_height, screen_width, set_fullscreen, vec2,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use minifb::{Window as NativeWindow, WindowOptions};
+use minifb::{
+    Key as NativeKey, KeyRepeat, MouseButton as NativeMouseButton, MouseMode,
+    Window as NativeWindow, WindowOptions,
+};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,12 +30,14 @@ const BIOS_MODULE_ROW_HEIGHT: usize = 24;
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const CONSOLE_WINDOW_WIDTH: usize = 480;
 const CONSOLE_WINDOW_HEIGHT: usize = 200;
+const CONSOLE_TOOLBAR_HEIGHT: usize = 28;
 const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
     ("PAUSE", 8.0, 104.0),
     ("RESET", 120.0, 80.0),
     ("REBOOT", 208.0, 88.0),
     ("CONSOLE", 304.0, 96.0),
 ];
+const CONSOLE_TOOLBAR_BUTTONS: [(usize, usize); 4] = [(6, 94), (106, 72), (184, 92), (282, 104)];
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -319,6 +324,7 @@ struct ToolbarState {
 struct ConsoleWindow {
     window: NativeWindow,
     pixels: Vec<u32>,
+    left_mouse_down: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -329,7 +335,7 @@ impl ConsoleWindow {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let window = NativeWindow::new(
-                "SC-16 Console",
+                "SC-16 Console | F2 close  F5 reset  F6 reboot  F10 pause",
                 CONSOLE_WINDOW_WIDTH,
                 CONSOLE_WINDOW_HEIGHT,
                 WindowOptions {
@@ -343,6 +349,7 @@ impl ConsoleWindow {
             Ok(Self {
                 window,
                 pixels: vec![rgb(8, 12, 18); CONSOLE_WINDOW_WIDTH * CONSOLE_WINDOW_HEIGHT],
+                left_mouse_down: false,
             })
         }
         #[cfg(target_arch = "wasm32")]
@@ -362,10 +369,56 @@ impl ConsoleWindow {
         }
     }
 
-    fn present(&mut self, lines: &[String], font: &[[u8; 8]]) -> Result<(), RuntimeError> {
+    fn runtime_control_pressed(
+        &mut self,
+        paused: bool,
+        console_visible: bool,
+    ) -> Option<RuntimeControl> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            draw_console_lines(&mut self.pixels, lines, font);
+            self.window.update();
+            if !self.window.is_open() {
+                return Some(RuntimeControl::ConsoleToggled(false));
+            }
+            let keyboard_control = [NativeKey::F2, NativeKey::F5, NativeKey::F6, NativeKey::F10]
+                .into_iter()
+                .find_map(|key| {
+                    self.window
+                        .is_key_pressed(key, KeyRepeat::No)
+                        .then_some(key)
+                        .and_then(|key| console_runtime_control(key, paused))
+                });
+            let mouse_down = self.window.get_mouse_down(NativeMouseButton::Left);
+            let mouse_clicked = mouse_down && !self.left_mouse_down;
+            self.left_mouse_down = mouse_down;
+            keyboard_control.or_else(|| {
+                if mouse_clicked {
+                    self.window
+                        .get_mouse_pos(MouseMode::Clamp)
+                        .and_then(|position| {
+                            console_toolbar_control(position, paused, console_visible)
+                        })
+                } else {
+                    None
+                }
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (paused, console_visible);
+            None
+        }
+    }
+
+    fn present(
+        &mut self,
+        lines: &[String],
+        font: &[[u8; 8]],
+        paused: bool,
+    ) -> Result<(), RuntimeError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            draw_console_lines(&mut self.pixels, lines, font, paused);
             self.window
                 .update_with_buffer(&self.pixels, CONSOLE_WINDOW_WIDTH, CONSOLE_WINDOW_HEIGHT)
                 .map_err(|error| {
@@ -373,8 +426,19 @@ impl ConsoleWindow {
                 })?;
         }
         #[cfg(target_arch = "wasm32")]
-        let _ = (lines, font);
+        let _ = (lines, font, paused);
         Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn console_runtime_control(key: NativeKey, paused: bool) -> Option<RuntimeControl> {
+    match key {
+        NativeKey::F2 => Some(RuntimeControl::ConsoleToggled(false)),
+        NativeKey::F5 => Some(RuntimeControl::ResetRequested),
+        NativeKey::F6 => Some(RuntimeControl::RebootRequested),
+        NativeKey::F10 => Some(RuntimeControl::PauseToggled(!paused)),
+        _ => None,
     }
 }
 
@@ -382,6 +446,14 @@ impl ConsoleWindow {
 struct BootTarget {
     source: PathBuf,
     disk_id: Option<String>,
+}
+
+struct BiosUiOptions<'a> {
+    disk_id: Option<&'a str>,
+    fullscreen: &'a mut bool,
+    paused: &'a mut bool,
+    console_visible: &'a mut bool,
+    console_window: &'a mut Option<ConsoleWindow>,
 }
 
 pub fn window_conf() -> Conf {
@@ -421,6 +493,10 @@ pub async fn run_with_devices(
         None
     };
     let mut cpu = fresh_runtime_cpu(root, program, disk_id, network_port, None)?;
+    let mut paused = false;
+    let mut console_visible = false;
+    let mut console_window: Option<ConsoleWindow> = None;
+    let mut fullscreen = fullscreen;
     let mut target = if let Some(source) = program {
         let target = BootTarget {
             source: source.to_path_buf(),
@@ -436,7 +512,13 @@ pub async fn run_with_devices(
             &mut pixels,
             &font,
             modules.as_deref().expect("BIOS modules were loaded"),
-            disk_id,
+            BiosUiOptions {
+                disk_id,
+                fullscreen: &mut fullscreen,
+                paused: &mut paused,
+                console_visible: &mut console_visible,
+                console_window: &mut console_window,
+            },
         )
         .await?
         else {
@@ -453,10 +535,6 @@ pub async fn run_with_devices(
     let mut presented_lines = Vec::new();
     let mut presented_palette = cpu.palette;
     let runtime_started = Instant::now();
-    let mut paused = false;
-    let mut console_visible = false;
-    let mut console_window = None;
-    let mut fullscreen = fullscreen;
     while !is_key_down(KeyCode::Escape) {
         let pressed_keys = get_keys_pressed();
         let keys = get_keys_down();
@@ -497,6 +575,27 @@ pub async fn run_with_devices(
                 last_frame = Instant::now();
             }
         }
+        let console_control = console_window
+            .as_mut()
+            .and_then(|window| window.runtime_control_pressed(paused, console_visible));
+        if let Some(control) = console_control {
+            match control {
+                RuntimeControl::ResetRequested | RuntimeControl::RebootRequested => {
+                    pending_action = Some(control);
+                }
+                RuntimeControl::PauseToggled(new_paused) => {
+                    paused = new_paused;
+                    cpu.console.write_text(if paused {
+                        "Emulation paused"
+                    } else {
+                        "Emulation continued"
+                    });
+                }
+                RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
+                RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
+            }
+            last_frame = Instant::now();
+        }
         if !fullscreen
             && is_mouse_button_pressed(MouseButton::Left)
             && let Some(control) = toolbar_control(mouse_position(), paused, console_visible)
@@ -533,6 +632,8 @@ pub async fn run_with_devices(
             if action == RuntimeControl::ResetRequested
                 && let Some(modules) = &modules
             {
+                console_window = None;
+                console_visible = false;
                 cpu = fresh_runtime_cpu(root, None, None, network_port, Some(&previous_console))?;
                 let Some(new_target) = select_and_boot(
                     root,
@@ -541,7 +642,13 @@ pub async fn run_with_devices(
                     &mut pixels,
                     &font,
                     modules,
-                    target.as_ref().and_then(|target| target.disk_id.as_deref()),
+                    BiosUiOptions {
+                        disk_id: target.as_ref().and_then(|target| target.disk_id.as_deref()),
+                        fullscreen: &mut fullscreen,
+                        paused: &mut paused,
+                        console_visible: &mut console_visible,
+                        console_window: &mut console_window,
+                    },
                 )
                 .await?
                 else {
@@ -679,7 +786,7 @@ pub async fn run_with_devices(
         }
         if let Some(window) = console_window.as_mut() {
             if window.is_open() {
-                window.present(&cpu.console.text_snapshot(), &font)?;
+                window.present(&cpu.console.text_snapshot(), &font, paused)?;
             } else {
                 console_window = None;
                 console_visible = false;
@@ -819,8 +926,15 @@ async fn select_and_boot(
     pixels: &mut [u32],
     font: &[[u8; 8]],
     modules: &[BootModule],
-    disk_id: Option<&str>,
+    options: BiosUiOptions<'_>,
 ) -> Result<Option<BootTarget>, RuntimeError> {
+    let BiosUiOptions {
+        disk_id,
+        fullscreen,
+        paused,
+        console_visible,
+        console_window,
+    } = options;
     let mut selected = 0usize;
     let mut scroll_offset = 0usize;
     let mut last_clicked_module = None;
@@ -837,6 +951,7 @@ async fn select_and_boot(
         None => 0,
     };
     loop {
+        let toolbar_height = if *fullscreen { 0.0 } else { TOOLBAR_HEIGHT };
         draw_bios_selector(
             pixels,
             font,
@@ -847,13 +962,21 @@ async fn select_and_boot(
             message.as_deref(),
         );
         canvas
-            .present(pixels, (640, 480), &[], &[], &cpu.palette, None)
+            .present(
+                pixels,
+                (640, 480),
+                &[],
+                &[],
+                &cpu.palette,
+                (!*fullscreen).then_some(ToolbarState { paused: *paused }),
+            )
             .await;
         let wheel_delta = mouse_wheel().1;
         if wheel_delta != 0.0
+            && !*paused
             && let Some((x, y)) = screen_to_logical(
-                mouse_position(),
-                (screen_width(), screen_height()),
+                (mouse_position().0, mouse_position().1 - toolbar_height),
+                (screen_width(), screen_height() - toolbar_height),
                 (640, 480),
             )
             && (32..608).contains(&x)
@@ -872,10 +995,82 @@ async fn select_and_boot(
             continue;
         }
         let mut launch_selected = false;
-        if is_mouse_button_pressed(MouseButton::Left)
+        let keys = get_keys_down();
+        let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
+        let controlled =
+            keys.contains(&KeyCode::LeftControl) || keys.contains(&KeyCode::RightControl);
+        for key in get_keys_pressed() {
+            if let Some(control) = apply_runtime_control(
+                key,
+                paused,
+                fullscreen,
+                console_visible,
+                shifted,
+                controlled,
+            ) {
+                match control {
+                    RuntimeControl::PauseToggled(value) => *paused = value,
+                    RuntimeControl::FullscreenToggled(value) => set_fullscreen(value),
+                    RuntimeControl::ConsoleToggled(value) => *console_visible = value,
+                    RuntimeControl::ResetRequested | RuntimeControl::RebootRequested => {}
+                }
+            }
+        }
+        if !*fullscreen
+            && is_mouse_button_pressed(MouseButton::Left)
+            && let Some(control) = toolbar_control(mouse_position(), *paused, *console_visible)
+        {
+            match control {
+                RuntimeControl::PauseToggled(value) => *paused = value,
+                RuntimeControl::ResetRequested => {
+                    selected = 0;
+                    scroll_offset = 0;
+                    selected_disk = 0;
+                    message = None;
+                    last_clicked_module = None;
+                    *paused = false;
+                }
+                RuntimeControl::RebootRequested => launch_selected = true,
+                RuntimeControl::ConsoleToggled(visible) => *console_visible = visible,
+                RuntimeControl::FullscreenToggled(_) => {}
+            }
+        }
+        let console_control = console_window
+            .as_mut()
+            .and_then(|window| window.runtime_control_pressed(*paused, *console_visible));
+        if let Some(control) = console_control {
+            match control {
+                RuntimeControl::PauseToggled(value) => *paused = value,
+                RuntimeControl::ResetRequested => {
+                    selected = 0;
+                    scroll_offset = 0;
+                    selected_disk = 0;
+                    message = None;
+                    last_clicked_module = None;
+                    *paused = false;
+                }
+                RuntimeControl::RebootRequested => launch_selected = true,
+                RuntimeControl::ConsoleToggled(visible) => *console_visible = visible,
+                RuntimeControl::FullscreenToggled(_) => {}
+            }
+        }
+        if *console_visible && console_window.is_none() {
+            *console_window = Some(ConsoleWindow::new()?);
+        } else if !*console_visible {
+            *console_window = None;
+        }
+        if console_window
+            .as_ref()
+            .is_some_and(|window| !window.is_open())
+        {
+            *console_window = None;
+            *console_visible = false;
+        }
+        if !*paused
+            && is_mouse_button_pressed(MouseButton::Left)
             && let Some(action) = bios_mouse_action(
-                mouse_position(),
-                (screen_width(), screen_height()),
+                (mouse_position().0, mouse_position().1 - toolbar_height),
+                (screen_width(), screen_height() - toolbar_height),
                 modules.len(),
                 scroll_offset,
             )
@@ -903,24 +1098,35 @@ async fn select_and_boot(
                 continue;
             }
         }
-        if !launch_selected && is_key_pressed(KeyCode::Escape) {
+        if let Some(window) = console_window.as_mut()
+            && window.is_open()
+        {
+            window.present(&cpu.console.text_snapshot(), font, *paused)?;
+        }
+        if !launch_selected && !*paused && is_key_pressed(KeyCode::Escape) {
             return Ok(None);
-        } else if !launch_selected && is_key_pressed(KeyCode::Up) {
+        } else if !launch_selected && !*paused && is_key_pressed(KeyCode::Up) {
             selected = bios_move_selection(selected, -1, modules.len());
             scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
             message = None;
-        } else if !launch_selected && is_key_pressed(KeyCode::Down) {
+        } else if !launch_selected && !*paused && is_key_pressed(KeyCode::Down) {
             selected = bios_move_selection(selected, 1, modules.len());
             scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
             message = None;
-        } else if !launch_selected && (is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right))
+        } else if !launch_selected
+            && !*paused
+            && (is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right))
         {
             selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, true);
             message = None;
-        } else if !launch_selected && is_key_pressed(KeyCode::Left) {
+        } else if !launch_selected && !*paused && is_key_pressed(KeyCode::Left) {
             selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, false);
             message = None;
-        } else if !launch_selected && !modules.is_empty() && is_key_pressed(KeyCode::Enter) {
+        } else if !launch_selected
+            && !*paused
+            && !modules.is_empty()
+            && is_key_pressed(KeyCode::Enter)
+        {
             launch_selected = true;
         }
         if launch_selected {
@@ -971,16 +1177,24 @@ fn draw_bios_selector(
     pixels.fill(rgb(7, 10, 20));
     fill_rect(pixels, 640, 24, 18, 592, 82, rgb(16, 22, 38));
     fill_rect(pixels, 640, 24, 108, 592, 326, rgb(11, 15, 28));
-    draw_text(pixels, 640, 40, 31, "SUOMICPU-16 BIOS", 0xffffd000, font);
-    draw_text(pixels, 640, 40, 49, "MODULE MANAGER", 0xff90a8c8, font);
-    draw_text(
+    draw_text_scaled(
         pixels,
         640,
-        40,
-        79,
+        (40, 28),
+        "SUOMICPU-16 BIOS",
+        0xffffd000,
+        font,
+        2,
+    );
+    draw_text_scaled(pixels, 640, (40, 50), "MODULE MANAGER", 0xff90a8c8, font, 2);
+    draw_text_scaled(
+        pixels,
+        640,
+        (40, 80),
         "UP/DOWN SELECT   ENTER START   ESC EXIT",
         0xffc2cee0,
         font,
+        2,
     );
 
     let disk_name = if selected_disk == 0 {
@@ -992,18 +1206,18 @@ fn draw_bios_selector(
             .unwrap_or("NONE")
     };
     fill_rect(pixels, 640, 420, 73, 184, 27, rgb(35, 31, 19));
-    draw_text(
+    draw_text_scaled(
         pixels,
         640,
-        430,
-        83,
-        &format!("DISK: {disk_name}  < >"),
+        (430, 79),
+        &format!("DISK: {disk_name}"),
         0xffffd000,
         font,
+        2,
     );
 
-    draw_text(pixels, 640, 42, 111, "MODULE", 0xff90a8c8, font);
-    draw_text(pixels, 640, 250, 111, "DESCRIPTION", 0xff90a8c8, font);
+    draw_text_scaled(pixels, 640, (42, 108), "MODULE", 0xff90a8c8, font, 2);
+    draw_text_scaled(pixels, 640, (250, 108), "DESCRIPTION", 0xff90a8c8, font, 2);
     let first = scroll_offset.min(modules.len().saturating_sub(BIOS_VISIBLE_MODULES));
     for (row, (index, module)) in modules
         .iter()
@@ -1024,14 +1238,22 @@ fn draw_bios_selector(
         fill_rect(pixels, 640, 32, y, 576, 22, background);
         let name_color = if is_selected { 0xffffffff } else { 0xffd0d9e8 };
         let number = format!("{:02}", index + 1);
-        draw_text(pixels, 640, 42, y + 7, &number, 0xff7185a3, font);
-        draw_text_limited(pixels, 640, (66, y + 7), &module.name, 27, name_color, font);
-        draw_text_limited(
+        draw_text_scaled(pixels, 640, (42, y + 4), &number, 0xff7185a3, font, 2);
+        draw_text_limited_scaled(
             pixels,
             640,
-            (250, y + 7),
+            (66, y + 4),
+            &module.name,
+            (14, 2),
+            name_color,
+            font,
+        );
+        draw_text_limited_scaled(
+            pixels,
+            640,
+            (250, y + 4),
             &module.description,
-            60,
+            (29, 2),
             if is_selected { 0xffe2e8f2 } else { 0xff9eacc1 },
             font,
         );
@@ -1042,18 +1264,18 @@ fn draw_bios_selector(
     } else {
         format!("MODULE {:02}/{:02}", selected + 1, modules.len())
     };
-    draw_text(pixels, 640, 42, 445, &position, 0xff90a8c8, font);
-    draw_text(
+    draw_text_scaled(pixels, 640, (42, 441), &position, 0xff90a8c8, font, 2);
+    draw_text_scaled(
         pixels,
         640,
-        250,
-        445,
+        (250, 441),
         "D / LEFT / RIGHT: CHANGE DISK",
         0xff90a8c8,
         font,
+        2,
     );
     if let Some(message) = message {
-        draw_text_limited(pixels, 640, (32, 465), message, 96, 0xffff6060, font);
+        draw_text_limited_scaled(pixels, 640, (32, 465), message, (48, 2), 0xffff6060, font);
     }
 }
 
@@ -1622,23 +1844,85 @@ fn draw_toolbar(state: ToolbarState) {
     }
 }
 
-fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]]) {
+fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]], paused: bool) {
     pixels.fill(rgb(8, 12, 18));
+    fill_rect(
+        pixels,
+        CONSOLE_WINDOW_WIDTH,
+        0,
+        0,
+        CONSOLE_WINDOW_WIDTH,
+        CONSOLE_TOOLBAR_HEIGHT,
+        rgb(16, 22, 34),
+    );
+    for (index, (left, width)) in CONSOLE_TOOLBAR_BUTTONS.iter().enumerate() {
+        fill_rect(
+            pixels,
+            CONSOLE_WINDOW_WIDTH,
+            *left,
+            4,
+            *width,
+            20,
+            rgb(43, 54, 72),
+        );
+        let label = match index {
+            0 if paused => "CONTINUE",
+            0 => "PAUSE",
+            1 => "RESET",
+            2 => "REBOOT",
+            3 => "CONSOLE",
+            _ => unreachable!(),
+        };
+        draw_text(
+            pixels,
+            CONSOLE_WINDOW_WIDTH,
+            *left + 7,
+            10,
+            label,
+            rgb(238, 242, 248),
+            font,
+        );
+    }
     for (row, line) in lines
         .iter()
-        .skip(lines.len().saturating_sub(CONSOLE_WINDOW_HEIGHT / 8))
+        .skip(
+            lines
+                .len()
+                .saturating_sub((CONSOLE_WINDOW_HEIGHT - CONSOLE_TOOLBAR_HEIGHT) / 8),
+        )
         .enumerate()
     {
         draw_text(
             pixels,
             CONSOLE_WINDOW_WIDTH,
             0,
-            row * 8,
+            CONSOLE_TOOLBAR_HEIGHT + row * 8,
             line,
             rgb(190, 220, 190),
             font,
         );
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn console_toolbar_control(
+    (x, y): (f32, f32),
+    paused: bool,
+    console_visible: bool,
+) -> Option<RuntimeControl> {
+    if !(4.0..24.0).contains(&y) {
+        return None;
+    }
+    CONSOLE_TOOLBAR_BUTTONS
+        .iter()
+        .position(|(left, width)| (*left as f32..(*left + *width) as f32).contains(&x))
+        .and_then(|index| match index {
+            0 => Some(RuntimeControl::PauseToggled(!paused)),
+            1 => Some(RuntimeControl::ResetRequested),
+            2 => Some(RuntimeControl::RebootRequested),
+            3 => Some(RuntimeControl::ConsoleToggled(!console_visible)),
+            _ => None,
+        })
 }
 
 fn screen_size(cpu: &Cpu) -> (usize, usize) {
@@ -1691,21 +1975,38 @@ fn draw_text(
     color: u32,
     font: &[[u8; 8]],
 ) {
+    draw_text_scaled(pixels, width, (x, y), text, color, font, 1);
+}
+
+fn draw_text_scaled(
+    pixels: &mut [u32],
+    width: usize,
+    (x, y): (usize, usize),
+    text: &str,
+    color: u32,
+    font: &[[u8; 8]],
+    scale: usize,
+) {
     for (character_index, byte) in text.bytes().enumerate() {
         let glyph_index = byte.saturating_sub(32) as usize;
         let Some(glyph) = font.get(glyph_index) else {
             continue;
         };
-        let glyph_x = x + character_index * 6;
+        let glyph_x = x + character_index * 6 * scale;
         for (row, bits) in glyph.iter().copied().enumerate().take(7) {
             for column in 0..5 {
-                let pixel_x = glyph_x + column;
-                let pixel_y = y + row;
-                if bits & (0x80 >> column) != 0
-                    && pixel_x < width
-                    && let Some(pixel) = pixels.get_mut(pixel_y * width + pixel_x)
-                {
-                    *pixel = color;
+                if bits & (0x80 >> column) != 0 {
+                    for scale_y in 0..scale {
+                        for scale_x in 0..scale {
+                            let pixel_x = glyph_x + column * scale + scale_x;
+                            let pixel_y = y + row * scale + scale_y;
+                            if pixel_x < width
+                                && let Some(pixel) = pixels.get_mut(pixel_y * width + pixel_x)
+                            {
+                                *pixel = color;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1721,15 +2022,35 @@ fn draw_text_limited(
     color: u32,
     font: &[[u8; 8]],
 ) {
+    draw_text_limited_scaled(
+        pixels,
+        width,
+        (x, y),
+        text,
+        (max_characters, 1),
+        color,
+        font,
+    );
+}
+
+fn draw_text_limited_scaled(
+    pixels: &mut [u32],
+    width: usize,
+    (x, y): (usize, usize),
+    text: &str,
+    (max_characters, scale): (usize, usize),
+    color: u32,
+    font: &[[u8; 8]],
+) {
     let character_count = text.chars().count();
     if character_count <= max_characters {
-        draw_text(pixels, width, x, y, text, color, font);
+        draw_text_scaled(pixels, width, (x, y), text, color, font, scale);
         return;
     }
     let visible_characters = max_characters.saturating_sub(3);
     let mut clipped = text.chars().take(visible_characters).collect::<String>();
     clipped.push_str("...");
-    draw_text(pixels, width, x, y, &clipped, color, font);
+    draw_text_scaled(pixels, width, (x, y), &clipped, color, font, scale);
 }
 
 #[cfg(test)]
@@ -1743,25 +2064,54 @@ mod tests {
         let lines = (0..30)
             .map(|line| format!("line-{line:02}"))
             .collect::<Vec<_>>();
-        draw_console_lines(&mut pixels, &lines, &font);
+        draw_console_lines(&mut pixels, &lines, &font, false);
         let mut expected_first_row =
             vec![rgb(8, 12, 18); CONSOLE_WINDOW_WIDTH * CONSOLE_WINDOW_HEIGHT];
         draw_text(
             &mut expected_first_row,
             CONSOLE_WINDOW_WIDTH,
             0,
-            0,
-            "line-05",
+            CONSOLE_TOOLBAR_HEIGHT,
+            "line-09",
             rgb(190, 220, 190),
             &font,
         );
 
         assert_eq!(pixels.len(), 480 * 200);
-        assert_eq!(pixels[CONSOLE_WINDOW_WIDTH - 1], rgb(8, 12, 18));
+        assert_eq!(pixels[0], rgb(16, 22, 34));
         assert_eq!(
-            &pixels[..CONSOLE_WINDOW_WIDTH * 8],
-            &expected_first_row[..CONSOLE_WINDOW_WIDTH * 8]
+            pixels[CONSOLE_TOOLBAR_HEIGHT * CONSOLE_WINDOW_WIDTH],
+            rgb(8, 12, 18)
         );
+        assert_eq!(
+            &pixels[CONSOLE_TOOLBAR_HEIGHT * CONSOLE_WINDOW_WIDTH
+                ..(CONSOLE_TOOLBAR_HEIGHT + 8) * CONSOLE_WINDOW_WIDTH],
+            &expected_first_row[CONSOLE_TOOLBAR_HEIGHT * CONSOLE_WINDOW_WIDTH
+                ..(CONSOLE_TOOLBAR_HEIGHT + 8) * CONSOLE_WINDOW_WIDTH]
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn console_toolbar_buttons_dispatch_controls_when_the_console_has_focus() {
+        assert_eq!(
+            console_toolbar_control((20.0, 12.0), false, true),
+            Some(RuntimeControl::PauseToggled(true))
+        );
+        assert_eq!(
+            console_toolbar_control((120.0, 12.0), false, true),
+            Some(RuntimeControl::ResetRequested)
+        );
+        assert_eq!(
+            console_toolbar_control((220.0, 12.0), false, true),
+            Some(RuntimeControl::RebootRequested)
+        );
+        assert_eq!(
+            console_toolbar_control((320.0, 12.0), false, true),
+            Some(RuntimeControl::ConsoleToggled(false))
+        );
+        assert_eq!(console_toolbar_control((20.0, 30.0), false, true), None);
+        assert_eq!(console_toolbar_control((103.0, 12.0), false, true), None);
     }
 
     #[test]
@@ -2357,6 +2707,43 @@ mod tests {
     }
 
     #[test]
+    fn bios_text_can_render_at_double_size_without_wrapping() {
+        let font = vec![[0xf8; 8]; 128];
+        let mut pixels = vec![0; 24 * 20];
+        draw_text_scaled(&mut pixels, 24, (1, 1), "A", 1, &font, 2);
+        assert_eq!(pixels[25], 1);
+        assert_eq!(pixels[2 * 24 + 2], 1);
+        assert_eq!(pixels[14 * 24 + 10], 1);
+        assert_eq!(pixels[37], 0);
+        assert_eq!(pixels[15 * 24 + 1], 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn console_window_shortcuts_control_emulation_when_console_has_focus() {
+        assert_eq!(
+            console_runtime_control(NativeKey::F2, false),
+            Some(RuntimeControl::ConsoleToggled(false))
+        );
+        assert_eq!(
+            console_runtime_control(NativeKey::F5, false),
+            Some(RuntimeControl::ResetRequested)
+        );
+        assert_eq!(
+            console_runtime_control(NativeKey::F6, false),
+            Some(RuntimeControl::RebootRequested)
+        );
+        assert_eq!(
+            console_runtime_control(NativeKey::F10, false),
+            Some(RuntimeControl::PauseToggled(true))
+        );
+        assert_eq!(
+            console_runtime_control(NativeKey::F10, true),
+            Some(RuntimeControl::PauseToggled(false))
+        );
+    }
+
+    #[test]
     fn bios_selector_renders_empty_state_and_persistent_error_message() {
         let font = vec![[0xf8; 8]; 128];
         let mut pixels = vec![0; 640 * 480];
@@ -2382,6 +2769,114 @@ mod tests {
         let image = load_program(&program).expect("Rust C compiler should load AnaClock");
         assert_eq!(image.entry_point, 0);
         assert!(!image.segments.is_empty());
+    }
+
+    #[test]
+    fn ana_clock_continues_presenting_frames_after_startup() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let program = root.join("modules").join("AnaClock").join("anaclock.c");
+        let image = load_program(&program).expect("AnaClock should compile");
+        let mut cpu = Cpu::new();
+        cpu.load_program(&image.segments, image.entry_point)
+            .expect("AnaClock should load");
+
+        for frame in 0..3 {
+            cpu.begin_frame();
+            for _ in 0..300_000 {
+                cpu.step().expect("AnaClock instruction should execute");
+                if cpu.frame_yield || !cpu.running {
+                    break;
+                }
+            }
+            assert!(cpu.running, "AnaClock halted during frame {frame}");
+            assert!(cpu.frame_yield, "AnaClock did not present frame {frame}");
+        }
+    }
+
+    #[test]
+    fn disk_editor_compiles_and_presents_a_frame_in_the_emulator() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = root
+            .join("modules")
+            .join("DiskEditor")
+            .join("disk_editor.c");
+        let image = load_program(&source).expect("DiskEditor should compile");
+        let temp = std::env::temp_dir().join(format!(
+            "sc16-disk-editor-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp.join("disks")).unwrap();
+        fs::copy(
+            root.join("disks").join("DISK0001.json"),
+            temp.join("disks").join("DISK0001.json"),
+        )
+        .expect("existing virtual disk should be copied into test storage");
+        let mut cpu = Cpu::new();
+        cpu.configure_disk(temp.join("disks"), source.parent().unwrap().join("disks"))
+            .expect("DiskEditor disk paths should configure");
+        assert_eq!(cpu.available_disks().unwrap(), ["DISK0001"]);
+        cpu.load_program(&image.segments, image.entry_point)
+            .expect("DiskEditor should load");
+        cpu.begin_frame();
+        for _ in 0..100_000 {
+            cpu.step().expect("DiskEditor instruction should execute");
+            if cpu.frame_yield || !cpu.running {
+                break;
+            }
+        }
+        let presents_frame = cpu.frame_yield;
+        let remains_running = cpu.running;
+        let listed_disk = &cpu.memory[0x40200..0x40208];
+        fs::remove_dir_all(&temp).unwrap();
+
+        assert!(remains_running, "DiskEditor halted during startup");
+        assert!(presents_frame, "DiskEditor did not present its first frame");
+        assert_eq!(
+            &cpu.memory[0x4310e..0x43110],
+            &[0, 1],
+            "Disk directory command should report one disk"
+        );
+        assert_eq!(
+            listed_disk, b"DISK0001",
+            "DiskEditor should receive existing disk IDs in its directory buffer"
+        );
+    }
+
+    #[test]
+    fn c_guest_can_issue_disk_directory_command() {
+        let source = "unsigned char *dk = 0x43100; unsigned int *dw = 0x43100; int main(void) { dw[5] = 0; dw[6] = 0x200; dk[0] = 0x10; return 0; }";
+        let image = crate::c_compiler::compile_minimal_program(source, "disk-list-test.c")
+            .unwrap()
+            .expect("disk-list test should compile");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let temp = std::env::temp_dir().join(format!(
+            "sc16-disk-list-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp.join("disks")).unwrap();
+        fs::copy(
+            root.join("disks").join("DISK0001.json"),
+            temp.join("disks").join("DISK0001.json"),
+        )
+        .unwrap();
+        let mut cpu = Cpu::new();
+        cpu.configure_disk(temp.join("disks"), temp.join("module-disks"))
+            .unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+
+        assert_eq!(&cpu.memory[0x4310e..0x43110], &[0, 1]);
+        assert_eq!(&cpu.memory[0x40200..0x40208], b"DISK0001");
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

@@ -597,13 +597,13 @@ to store data blocks of 256 characters.
 - Write `0x02` to `0x43100` to unload and save the current disk.
 - Write `0x04` to `0x43100` to read a block; the 16-bit block pointer is at
   `0x4310A` and the RAM destination offset is at `0x4310C`. The block is copied
-  to `0x20000 + offset`.
+  to `0x40000 + offset`.
 - Write `0x08` to `0x43100` to write a block; the 16-bit block pointer is at
   `0x4310A` and the RAM source offset is at `0x4310C`. Data is read from
-  `0x20000 + offset`.
+  `0x40000 + offset`.
 - Write `0x10` to `0x43100` to read the disk directory: the disk number (0-based)
   is taken from `0x4310A`, and the ID of that disk (zero terminated, empty when
-  out of range) is copied to `0x20000 + offset` (offset at `0x4310C`). The number
+  out of range) is copied to `0x40000 + offset` (offset at `0x4310C`). The number
   of disks in the `disks/` folder is returned in the word at `0x4310E`. The byte
   after the terminating zero (offset 9) is `1` if that disk is write protected.
 - Write `0x20` to `0x43100` to set write protection of the loaded disk: `0` (off)
