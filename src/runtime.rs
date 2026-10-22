@@ -32,7 +32,7 @@ const CONSOLE_WINDOW_WIDTH: usize = 480;
 const CONSOLE_WINDOW_HEIGHT: usize = 200;
 const CONSOLE_TOOLBAR_HEIGHT: usize = 28;
 const RUNTIME_INSTRUCTION_CHUNK: usize = 5_000;
-const RUNTIME_CPU_SLICE: Duration = Duration::from_millis(12);
+const RUNTIME_CPU_SLICE: Duration = Duration::from_millis(30);
 const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
     ("PAUSE", 8.0, 104.0),
     ("RESET", 120.0, 80.0),
