@@ -17,7 +17,7 @@ use minifb::{
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPEED_ADDR: usize = 0x43003;
 const RTC_START: usize = 0x43010;
@@ -31,6 +31,8 @@ const TOOLBAR_HEIGHT: f32 = 36.0;
 const CONSOLE_WINDOW_WIDTH: usize = 480;
 const CONSOLE_WINDOW_HEIGHT: usize = 200;
 const CONSOLE_TOOLBAR_HEIGHT: usize = 28;
+const RUNTIME_INSTRUCTION_CHUNK: usize = 5_000;
+const RUNTIME_CPU_SLICE: Duration = Duration::from_millis(12);
 const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
     ("PAUSE", 8.0, 104.0),
     ("RESET", 120.0, 80.0),
@@ -529,6 +531,8 @@ pub async fn run_with_devices(
 
     let mut old_keys = HashSet::new();
     let mut speed_remainder = 0.0;
+    let mut cpu_budget_remaining = 0;
+    let mut cpu_frame_started = false;
     let mut last_frame = Instant::now();
     let mut presented_size = screen_size(&cpu);
     let mut presented_triangles = Vec::new();
@@ -680,6 +684,8 @@ pub async fn run_with_devices(
             paused = false;
             old_keys.clear();
             speed_remainder = 0.0;
+            cpu_budget_remaining = 0;
+            cpu_frame_started = false;
             last_frame = Instant::now();
             continue;
         }
@@ -728,20 +734,28 @@ pub async fn run_with_devices(
             let typed_characters = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
             receive_typed_text(&mut cpu, typed_characters);
             update_rtc(&mut cpu);
-            cpu.begin_frame();
             if !paused {
-                let elapsed = last_frame.elapsed().as_secs_f64();
-                last_frame = Instant::now();
-                let mode = cpu.memory[SPEED_ADDR];
-                let budget = match mode {
-                    0 => rate_budget(10.0, elapsed, &mut speed_remainder),
-                    1 => rate_budget(100.0, elapsed, &mut speed_remainder),
-                    2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
-                    3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
-                    _ => 300_000,
-                };
-                cpu.run(budget)
-                    .map_err(|error| RuntimeError::Window(error.to_string()))?;
+                if cpu_budget_remaining == 0 {
+                    if !cpu_frame_started {
+                        cpu.begin_frame();
+                        cpu_frame_started = true;
+                    }
+                    let elapsed = last_frame.elapsed().as_secs_f64();
+                    last_frame = Instant::now();
+                    let mode = cpu.memory[SPEED_ADDR];
+                    cpu_budget_remaining = match mode {
+                        0 => rate_budget(10.0, elapsed, &mut speed_remainder),
+                        1 => rate_budget(100.0, elapsed, &mut speed_remainder),
+                        2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
+                        3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
+                        _ => 300_000,
+                    };
+                }
+                run_instruction_slice(&mut cpu, &mut cpu_budget_remaining)?;
+                if cpu_budget_remaining == 0 || cpu.frame_yield || !cpu.running {
+                    cpu_budget_remaining = 0;
+                    cpu_frame_started = false;
+                }
                 for command in cpu.take_sound_commands() {
                     audio.apply(command).await?;
                 }
@@ -1717,6 +1731,30 @@ fn rate_budget(rate: f64, elapsed: f64, remainder: &mut f64) -> usize {
     let result = exact.floor() as usize;
     *remainder = exact - result as f64;
     result
+}
+
+fn run_instruction_slice(
+    cpu: &mut Cpu,
+    budget_remaining: &mut usize,
+) -> Result<usize, RuntimeError> {
+    let started = Instant::now();
+    let mut total_executed = 0;
+    while *budget_remaining > 0
+        && started.elapsed() < RUNTIME_CPU_SLICE
+        && cpu.running
+        && !cpu.frame_yield
+    {
+        let chunk = (*budget_remaining).min(RUNTIME_INSTRUCTION_CHUNK);
+        let executed = cpu
+            .run(chunk)
+            .map_err(|error| RuntimeError::Window(error.to_string()))?;
+        *budget_remaining = budget_remaining.saturating_sub(executed);
+        total_executed += executed;
+        if executed == 0 {
+            break;
+        }
+    }
+    Ok(total_executed)
 }
 
 fn halted_window_should_close(cpu_running: bool, has_keypress: bool) -> bool {
@@ -2791,6 +2829,37 @@ mod tests {
             assert!(cpu.running, "AnaClock halted during frame {frame}");
             assert!(cpu.frame_yield, "AnaClock did not present frame {frame}");
         }
+    }
+
+    #[test]
+    fn elite_can_restart_between_bounded_instruction_slices() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = root.join("modules").join("Elite").join("elitedemo.c");
+        let target = BootTarget {
+            source: source.clone(),
+            disk_id: None,
+        };
+        let mut cpu = fresh_runtime_cpu(root, Some(&source), None, DEFAULT_PORT, None).unwrap();
+        boot_target(&mut cpu, &target).unwrap();
+        cpu.begin_frame();
+        let mut budget_remaining = 1_000_000;
+        let first_slice = run_instruction_slice(&mut cpu, &mut budget_remaining).unwrap();
+        assert!(first_slice > 0);
+        assert!(first_slice <= 1_000_000);
+        assert!(
+            budget_remaining > 0,
+            "Elite should still have work remaining"
+        );
+
+        let console = cpu.console.clone();
+        cpu = fresh_runtime_cpu(root, Some(&source), None, DEFAULT_PORT, Some(&console)).unwrap();
+        boot_target(&mut cpu, &target).unwrap();
+
+        cpu.begin_frame();
+        budget_remaining = 1_000_000;
+        let restarted_slice = run_instruction_slice(&mut cpu, &mut budget_remaining).unwrap();
+        assert!(restarted_slice > 0);
+        assert!(cpu.running, "Elite halted after reset");
     }
 
     #[test]
