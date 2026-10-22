@@ -1,4 +1,4 @@
-use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle};
+use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle, VSYNC_ADDR};
 use crate::image::{ImageError, load_program};
 use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
@@ -448,6 +448,10 @@ pub async fn run_with_devices(
     let mut old_keys = HashSet::new();
     let mut speed_remainder = 0.0;
     let mut last_frame = Instant::now();
+    let mut presented_size = screen_size(&cpu);
+    let mut presented_triangles = Vec::new();
+    let mut presented_lines = Vec::new();
+    let mut presented_palette = cpu.palette;
     let runtime_started = Instant::now();
     let mut paused = false;
     let mut console_visible = false;
@@ -640,8 +644,14 @@ pub async fn run_with_devices(
                 last_frame = Instant::now();
             }
         }
-        render_cpu(&cpu, &mut pixels);
-        let (width, height) = screen_size(&cpu);
+        if should_capture_display_frame(cpu.memory[VSYNC_ADDR] != 0, cpu.frame_presented) {
+            render_cpu(&cpu, &mut pixels);
+            presented_size = screen_size(&cpu);
+            presented_triangles.clone_from(&cpu.gpu_triangles);
+            presented_lines.clone_from(&cpu.gpu_lines);
+            presented_palette = cpu.palette;
+        }
+        let (width, height) = presented_size;
         if !cpu.running || paused {
             fill_rect(
                 &mut pixels,
@@ -679,9 +689,9 @@ pub async fn run_with_devices(
             .present(
                 &pixels,
                 (width, height),
-                &cpu.gpu_triangles,
-                &cpu.gpu_lines,
-                &cpu.palette,
+                &presented_triangles,
+                &presented_lines,
+                &presented_palette,
                 (!fullscreen).then_some(ToolbarState { paused }),
             )
             .await;
@@ -1651,6 +1661,10 @@ fn render_cpu(cpu: &Cpu, pixels: &mut [u32]) {
     }
 }
 
+fn should_capture_display_frame(vsync_enabled: bool, frame_presented: bool) -> bool {
+    !vsync_enabled || frame_presented
+}
+
 const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
     ((red as u32) << 16) | ((green as u32) << 8) | blue as u32
 }
@@ -2076,6 +2090,14 @@ mod tests {
 
         cpu.memory[GFX_MODE_ADDR] = 0;
         assert_eq!(screen_size(&cpu), (320, 240));
+    }
+
+    #[test]
+    fn vsync_refreshes_only_after_a_gpu_present_command() {
+        assert!(should_capture_display_frame(false, false));
+        assert!(should_capture_display_frame(false, true));
+        assert!(!should_capture_display_frame(true, false));
+        assert!(should_capture_display_frame(true, true));
     }
 
     #[test]

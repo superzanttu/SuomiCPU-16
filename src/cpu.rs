@@ -11,6 +11,7 @@ pub const MEMORY_SIZE: usize = 1 << 30;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
 
 const ICR_ADDR: u32 = 0x43002;
+pub const VSYNC_ADDR: usize = 0x43013;
 const KEY_VECTOR_ADDR: u32 = 0x0002;
 const RTC_VECTOR_ADDR: u32 = 0x0006;
 const KEYBOARD_ADDR: u32 = 0x43000;
@@ -248,6 +249,7 @@ pub struct Cpu {
     pub flags: Flags,
     pub running: bool,
     pub frame_yield: bool,
+    pub frame_presented: bool,
     pub frame_count: u16,
     pub console: ConsoleDevice,
     pub saved_video: Option<Vec<u8>>,
@@ -349,6 +351,7 @@ impl Cpu {
             flags: Flags::default(),
             running: true,
             frame_yield: false,
+            frame_presented: false,
             frame_count: 0,
             console: ConsoleDevice::new(),
             saved_video: None,
@@ -1433,6 +1436,7 @@ impl Cpu {
 
     pub fn begin_frame(&mut self) {
         self.frame_yield = false;
+        self.frame_presented = false;
         self.frame_count = self.frame_count.wrapping_add(1);
     }
 
@@ -2362,7 +2366,10 @@ impl Cpu {
                 }
             }
             GPU_TEXT => self.gpu_text(x, y, color),
-            GPU_PRESENT => self.frame_yield = true,
+            GPU_PRESENT => {
+                self.frame_yield = true;
+                self.frame_presented = true;
+            }
             GPU_RANDOM => {
                 let mut value = self.random_state;
                 value ^= value << 13;
@@ -4400,6 +4407,10 @@ mod tests {
         assert_eq!(cpu.memory[(VRAM_START + 961) as usize], 7);
         cpu.write(GPU_BASE, GPU_PRESENT);
         assert!(cpu.frame_yield);
+        assert!(cpu.frame_presented);
+        cpu.begin_frame();
+        assert!(!cpu.frame_yield);
+        assert!(!cpu.frame_presented);
     }
 
     #[test]
@@ -4411,6 +4422,7 @@ mod tests {
         assert_eq!(cpu.read(CONSOLE_STATUS), 2);
         assert_eq!(cpu.console.output(), b"A");
         assert!(cpu.frame_yield);
+        assert!(!cpu.frame_presented);
         cpu.frame_yield = false;
         cpu.signal_keyboard_event(b'B');
         assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], b'B');

@@ -3383,6 +3383,33 @@ fn emit_native_stack_adjustment(frame_size: usize, allocate: bool, assembly: &mu
     }
 }
 
+fn native_expression_pointer_element_size(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => match locals.get(name)? {
+            NativeLocation::PointerRegister { element_size, .. }
+            | NativeLocation::PointerStack { element_size, .. }
+            | NativeLocation::GlobalPointer { element_size, .. }
+            | NativeLocation::GlobalArray { element_size, .. }
+            | NativeLocation::StackArray { element_size, .. } => Some(*element_size),
+            NativeLocation::GlobalRecord { layout, .. } => Some(layout.size),
+            _ => None,
+        },
+        ExpressionKind::Cast { c_type, .. } => {
+            native_pointer_element(c_type).map(|(element_size, _)| element_size)
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "+" => native_expression_pointer_element_size(left, locals)
+            .or_else(|| native_expression_pointer_element_size(right, locals)),
+        _ => None,
+    }
+}
+
 fn native_expression_is_unsigned(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
@@ -3926,6 +3953,69 @@ fn emit_native_expression(
             "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>"
         ) =>
         {
+            let pointer_arithmetic = match operator.as_str() {
+                "+" => {
+                    let left_pointer = native_expression_pointer_element_size(left, locals);
+                    let right_pointer = native_expression_pointer_element_size(right, locals);
+                    match (left_pointer, right_pointer) {
+                        (Some(element_size), None) => Some((left, right, element_size)),
+                        (None, Some(element_size)) => Some((right, left, element_size)),
+                        _ => None,
+                    }
+                }
+                "-" if native_expression_pointer_element_size(right, locals).is_none() => {
+                    native_expression_pointer_element_size(left, locals)
+                        .map(|element_size| (left, right, element_size))
+                }
+                _ => None,
+            };
+            if let Some((pointer, offset, element_size)) = pointer_arithmetic {
+                if !emit_native_expression(
+                    pointer,
+                    destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                let pointer_register = if destination == 7 { 0 } else { destination };
+                if destination == 7 {
+                    assembly.push_str("    MOV R0, R7\n");
+                }
+                assembly.push_str(&format!(
+                    "    ADJSP -4\n    MOVSP R7\n    STP R{pointer_register}, R7\n"
+                ));
+                let (right_register, remaining_registers) =
+                    temporary_registers.split_first().map_or_else(
+                        || (if matches!(destination, 0 | 7) { 4 } else { 0 }, &[][..]),
+                        |(register, remaining)| (*register, remaining),
+                    );
+                if !emit_native_expression(
+                    offset,
+                    right_register,
+                    remaining_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                if element_size > 1 {
+                    assembly.push_str(&format!(
+                        "    LDI R7, {element_size}\n    MUL R{right_register}, R7\n"
+                    ));
+                }
+                assembly.push_str(&format!(
+                    "    MOVSP R7\n    LDP R{pointer_register}, R7\n    ADJSP 4\n    {} R{pointer_register}, R{right_register}\n",
+                    if operator == "-" { "SUB" } else { "ADD" }
+                ));
+                if destination == 7 {
+                    assembly.push_str("    MOV R7, R0\n");
+                }
+                return true;
+            }
             if matches!(operator.as_str(), "/" | "%")
                 && let ExpressionKind::Atom(value) = &right.kind
                 && parse_integer_constant(value).is_some_and(|value| value > u16::MAX as i64)
@@ -4218,11 +4308,30 @@ fn emit_native_expression(
                         | NativeLocation::StackArray { .. }
                 )
             });
+            let pointer_registers = (1..=6)
+                .filter(|register| {
+                    locals.values().any(|location| {
+                        matches!(
+                            location,
+                            NativeLocation::PointerRegister {
+                                register: pointer_register,
+                                ..
+                            } if pointer_register == register
+                        )
+                    })
+                })
+                .collect::<HashSet<_>>();
             if preserve_frame_pointer {
                 assembly.push_str("    MOVSPH R7\n    PUSH R7\n");
             }
             for register in 1..=6 {
-                assembly.push_str(&format!("    PUSH R{register}\n"));
+                if pointer_registers.contains(&register) {
+                    assembly.push_str(&format!(
+                        "    ADJSP -4\n    MOVSP R7\n    STP R{register}, R7\n"
+                    ));
+                } else {
+                    assembly.push_str(&format!("    PUSH R{register}\n"));
+                }
             }
             let mut argument_bytes = 0;
             if library_function {
@@ -4318,7 +4427,13 @@ fn emit_native_expression(
                 assembly.push_str(&format!("    ADJSP {argument_bytes}\n"));
             }
             for register in (1..=6).rev() {
-                assembly.push_str(&format!("    POP R{register}\n"));
+                if pointer_registers.contains(&register) {
+                    assembly.push_str(&format!(
+                        "    MOVSP R7\n    LDP R{register}, R7\n    ADJSP 4\n"
+                    ));
+                } else {
+                    assembly.push_str(&format!("    POP R{register}\n"));
+                }
             }
             if preserve_frame_pointer {
                 assembly.push_str("    POP R7\n");
@@ -10432,6 +10547,45 @@ mod tests {
     }
 
     #[test]
+    fn passes_pointer_arguments_to_functions_with_many_parameters() {
+        let image = compile_minimal_program(
+            "int target(int first, char *text, int third, int fourth, int fifth, int sixth) { \
+                 return text[0]; \
+             } \
+             int main(void) { return target(1, \"H\", 3, 4, 5, 6); }",
+            "many-parameter-pointer-argument.c",
+        )
+        .unwrap()
+        .expect("supported pointer argument to a many-parameter function");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], i64::from(b'H'));
+    }
+
+    #[test]
+    fn preserves_pointer_parameters_across_nested_calls() {
+        let image = compile_minimal_program(
+            "int helper(void) { return 1; } \
+             int first_character(char *text) { helper(); return text[0]; } \
+             int main(void) { return first_character(\"H\"); }",
+            "pointer-parameter-preservation.c",
+        )
+        .unwrap()
+        .expect("supported pointer parameter across nested calls");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], i64::from(b'H'));
+    }
+
+    #[test]
     fn stores_nul_terminated_string_literals_for_native_graphics_calls() {
         let image = compile_minimal_program(
             "#include <suomi_gfx.h>\n\
@@ -10446,6 +10600,52 @@ mod tests {
         cpu.run(8192).unwrap();
         assert!(!cpu.running);
         assert!(cpu.memory.windows(3).any(|bytes| bytes == b"Hi\0"));
+    }
+
+    #[test]
+    fn renders_lunar_lander_hud_speed_text_from_local_buffers() {
+        let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("modules")
+            .join("Lunar Lander")
+            .join("lunarlander.c");
+        let mut source = std::fs::read_to_string(module).expect("Lunar Lander source should load");
+        source = source.replacen("int main(void)", "int original_game_main(void)", 1);
+        source.push_str(
+            "\nint main(void) { \
+             gfx_layer_select(LAYER_HUD); gfx_clear(255); \
+             mode = M_CLASSIC; score = 123; fuel = 800; fuel_max = 900; \
+             level = 2; lives = 3; vx = 80; vy = -120; \
+             hlim = 200; vlim = 200; throttle = 5; \
+             draw_hud(); gfx_present(); return 0; \
+         }",
+        );
+        let image = compile_minimal_program(&source, "lunar-lander-hud-test.c")
+            .unwrap()
+            .expect("Lunar Lander HUD test harness should compile");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(20_000).unwrap();
+
+        let hud = &cpu.layers[4];
+        for (label_y, value_y) in [(34, 34), (44, 44)] {
+            let label_pixels = (label_y..label_y + 7)
+                .flat_map(|y| (4..36).map(move |x| hud[y * 320 + x]))
+                .filter(|&color| color == 9)
+                .count();
+            let value_pixels = (value_y..value_y + 7)
+                .flat_map(|y| (46..70).map(move |x| hud[y * 320 + x]))
+                .filter(|&color| color == 3)
+                .count();
+            assert!(
+                label_pixels > 20,
+                "expected the speed label to render, got {label_pixels} pixels"
+            );
+            assert!(
+                value_pixels > 20,
+                "expected direction arrow and digits to render, got {value_pixels} pixels"
+            );
+        }
     }
 
     #[test]
