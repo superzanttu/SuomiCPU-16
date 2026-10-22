@@ -43,7 +43,14 @@ an ABI choice as delivered.
   semantics, complete hosted standard-library facilities, and independent
   conformance validation remain incomplete.
 - Repository regression tests do not substitute for an independent C90
-  conformance suite.
+  conformance suite. `tests/c90_conformance.rs` sends compiler-emitted assembly
+  through the assembler and executes the resulting image on the CPU for
+  supported integer expressions and control flow, calls, arrays/pointers,
+  preprocessing, and standalone header smoke tests. It also checks that the
+  normal compile-to-image API matches an independently assembled image and
+  locks in rejection of selected unsupported features and the current
+  `setjmp.h`/`signal.h` gaps. Header smoke tests do not establish library
+  function conformance or complete C90 compatibility.
 
 ## Rust compiler migration status
 
@@ -53,7 +60,7 @@ does not establish language feature parity.
 
 - [x] Make Rust the only runtime, compiler, tools, and CI path.
 - [x] Source-located tokenization and literal/operator recognition in
-  `rust/src/c_compiler.rs`.
+  `src/c_compiler.rs`.
 - [x] Expression parser for operators, assignments, conditional expressions,
   calls, indexing, member access, casts, and `sizeof`.
 - [x] Statement parser for basic declarations, compound blocks, control flow,
@@ -106,7 +113,7 @@ does not establish language feature parity.
   output beyond the current integer-function subset.
 - [x] Remove the legacy runtime, compiler, assembler, network tool, test suite,
   and non-Rust dependency installation from CI.
-- [ ] Restore useful integration coverage as Rust tests.
+- [x] Restore useful integration coverage as Rust tests.
 - [ ] Expand Rust compiler support until required `.c` source and module builds
   no longer encounter unsupported syntax or semantics.
 
@@ -255,6 +262,10 @@ C90 requirements listed under C.
 ### B5. Complete initializers for game state and data
 
 - [ ] **Complete C90 initializer semantics** (`c90-initializers`)
+  - File-scope structures and arrays of structures accept nested-brace
+    integer constant initializers, including nested records, scalar arrays,
+    and zero-filling omitted members. Runtime initializers, brace elision,
+    unions, and local structure initializers remain unsupported.
   - Implement scalar, array, structure, and union initialization, including
     brace elision, nested aggregates, string-literal arrays, omitted outer
     bounds, and zero filling.

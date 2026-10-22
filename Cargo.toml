@@ -3,45 +3,6 @@ name = "suomicpu16"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-path = "rust/src/lib.rs"
-
-[[bin]]
-name = "suomicpu16"
-path = "rust/src/main.rs"
-
-[[bin]]
-name = "sc16asm"
-path = "rust/src/bin/sc16asm.rs"
-
-[[bin]]
-name = "sc16build"
-path = "rust/src/bin/sc16build.rs"
-
-[[bin]]
-name = "sc16maps"
-path = "rust/src/bin/sc16maps.rs"
-
-[[bin]]
-name = "sc16sprites"
-path = "rust/src/bin/sc16sprites.rs"
-
-[[bin]]
-name = "sc16mapedit"
-path = "rust/src/bin/sc16mapedit.rs"
-
-[[bin]]
-name = "sc16tank"
-path = "rust/src/bin/sc16tank.rs"
-
-[[bin]]
-name = "sc16objects"
-path = "rust/src/bin/sc16objects.rs"
-
-[[bin]]
-name = "sc16gallery"
-path = "rust/src/bin/sc16gallery.rs"
-
 [dependencies]
 gif = "0.13"
 image = { version = "0.24.9", default-features = false, features = ["gif", "png"] }

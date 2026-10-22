@@ -395,7 +395,7 @@ fn render_console(output: &[u8]) -> Vec<u8> {
 }
 
 fn console_font() -> Vec<[u8; 8]> {
-    let bytes = include_str!("../../../fonts/font5x7.asm")
+    let bytes = include_str!("../../fonts/font5x7.asm")
         .lines()
         .filter_map(|line| line.split_once(".data hex").map(|(_, bytes)| bytes))
         .flat_map(|bytes| {

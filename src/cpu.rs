@@ -1,6 +1,7 @@
 use memmap2::MmapMut;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::console::ConsoleDevice;
 use crate::disk::DiskDevice;
@@ -94,6 +95,7 @@ const GPU3D_SIN_8_8: [i32; 64] = [
 const GPU3D_MAX_VERTICES: usize = 128;
 const GPU3D_MAX_FACES: usize = 128;
 const FONT_ADDR: usize = 0x4400;
+static FONT_DATA: OnceLock<Vec<u8>> = OnceLock::new();
 const OP_HALT: u16 = 0x00;
 const OP_LDI: u16 = 0x01;
 const OP_LD: u16 = 0x02;
@@ -286,6 +288,20 @@ impl Cpu {
         let memory =
             MmapMut::map_anon(size).map_err(|error| CpuError::MemoryMap(error.to_string()))?;
         let mut memory = memory;
+        let font = FONT_DATA.get_or_init(|| {
+            let image = crate::assembler::assemble(include_str!("../fonts/font5x7.asm"), 0)
+                .expect("embedded bitmap font assembles");
+            image
+                .segments
+                .into_iter()
+                .find(|segment| segment.address == FONT_ADDR as u32)
+                .expect("embedded bitmap font segment exists")
+                .data
+        });
+        if size > FONT_ADDR {
+            let font_size = font.len().min(size - FONT_ADDR);
+            memory[FONT_ADDR..FONT_ADDR + font_size].copy_from_slice(&font[..font_size]);
+        }
         if size > CONSOLE_CONTROL as usize {
             memory[CONSOLE_CONTROL as usize] = 3;
             memory[(GPU_BASE - 12) as usize] = 0;

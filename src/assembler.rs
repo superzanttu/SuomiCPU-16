@@ -1620,7 +1620,7 @@ mod tests {
 
     #[test]
     fn assembles_the_full_command_tour_with_extended_instruction_sizes() {
-        let image = assemble(include_str!("../../examples/commands.asm"), 0).unwrap();
+        let image = assemble(include_str!("../examples/commands.asm"), 0).unwrap();
         assert_eq!(image.entry_point, 0x80);
         assert_eq!(
             image
@@ -1634,7 +1634,7 @@ mod tests {
 
     #[test]
     fn assembles_the_directive_example_into_five_sparse_segments() {
-        let image = assemble(include_str!("../../examples/directives.asm"), 0).unwrap();
+        let image = assemble(include_str!("../examples/directives.asm"), 0).unwrap();
         assert_eq!(image.entry_point, 0x100);
         assert_eq!(
             image
@@ -1662,14 +1662,14 @@ mod tests {
 
     #[test]
     fn matches_reference_examples_and_bitmap_font() {
-        let example = assemble(include_str!("../../examples/example.asm"), 0).unwrap();
+        let example = assemble(include_str!("../examples/example.asm"), 0).unwrap();
         assert_eq!(example.entry_point, 0);
         assert_eq!(example.segments.len(), 1);
         assert_eq!(example.segments[0].data.len(), 94);
         assert_eq!(&example.segments[0].data[..2], b"\x08\x0a");
         assert_eq!(&example.segments[0].data[92..], b"\x00\x00");
 
-        let font = assemble(include_str!("../../fonts/font5x7.asm"), 0).unwrap();
+        let font = assemble(include_str!("../fonts/font5x7.asm"), 0).unwrap();
         let font_segment = font
             .segments
             .iter()

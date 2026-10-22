@@ -668,9 +668,11 @@ Supported language features include:
   default promotions needed by the current target types. `<stdarg.h>` provides
   `va_list`, `va_start`, `va_arg`, and `va_end` for accessing variadic arguments.
 - `typedef` names, including one-dimensional array typedefs, enumerations,
-  structure and union declarations, member access with `.` and `->`, scalar,
-  array, and aggregate initialization, and C90
-  integer type specifiers including standalone `signed` and `unsigned`;
+  structure and union declarations, member access with `.` and `->`, scalar and
+  array initialization, and file-scope structures and arrays of structures
+  initialized with nested braces and integer constant expressions (omitted
+  members are zero-filled). C90 integer type specifiers include standalone
+  `signed` and `unsigned`;
   `char` and `unsigned char` operands receive integer promotions. Global
   pointer initializers accept null pointer constant expressions and the
   compiler's SC-16 hexadecimal address-constant extension. Redeclarations with

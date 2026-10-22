@@ -1,14 +1,24 @@
 # Rust implementation status
 
-Runtime, compiler, tools, and CI use Rust exclusively. Legacy non-Rust
-implementations and dependencies have been removed.
+The Python-to-Rust migration is complete for the repository's supported
+emulator, compiler, build, and developer-tool workflows. There are no `.py`,
+`.pyc`, or `.pyo` files and no Python package/dependency manifests in the
+repository. Runtime, compiler, tools, tests, and CI use Rust; unsupported C
+syntax or semantics produce a Rust diagnostic, with no compatibility-compiler
+fallback.
 
-The C compiler remains a partial C90 implementation. Sources using unsupported
-syntax or semantics fail with a Rust diagnostic; there is no compatibility
-compiler fallback. The Rust test suite currently covers 277 cases, and the
-module smoke build compiles all 17 bootable BIOS C modules.
+Migration completion does not imply full C90 conformance. The C compiler
+remains a partial C90 implementation; see [`c90_todo.md`](c90_todo.md) and
+[`c90_target_abi.md`](c90_target_abi.md) for the separate language and ABI
+work. The browser build is also not yet a standalone web release; see the
+browser-build note in [`README.md`](../README.md).
 
-Run the Rust validation suite with:
+Recent graphics verification covers Elite's compiler-generated graphics calls,
+layer clearing and transparency, palette composition, text, and multiple
+presented frames. Elite draws its scene with 2D GPU calls; it does not use the
+separate `gfx3d_draw` route.
+
+Run the Rust validation suite and build every bootable BIOS module with:
 
 ```console
 cargo fmt --check

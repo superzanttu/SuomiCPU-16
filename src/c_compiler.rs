@@ -111,6 +111,98 @@ fn flatten_initializer_values(expression: &Expression) -> Option<Vec<&Expression
     }
 }
 
+fn write_native_record_initializer(
+    layout: &NativeRecordLayout,
+    expression: &Expression,
+    data: &mut [u8],
+    base_offset: usize,
+    enumerators: &HashMap<String, i64>,
+) -> Option<()> {
+    let ExpressionKind::InitializerList(values) = &expression.kind else {
+        return None;
+    };
+    if values.len() > layout.field_order.len() {
+        return None;
+    }
+    for (name, initializer) in layout.field_order.iter().zip(values) {
+        let field = layout.fields.get(name)?;
+        let field_offset = base_offset.checked_add(field.offset)?;
+        if let Some(nested_layout) = &field.record_layout {
+            if field.dimensions.is_empty() {
+                write_native_record_initializer(
+                    nested_layout,
+                    initializer,
+                    data,
+                    field_offset,
+                    enumerators,
+                )?;
+            } else {
+                if field.dimensions.len() != 1 {
+                    return None;
+                }
+                let ExpressionKind::InitializerList(elements) = &initializer.kind else {
+                    return None;
+                };
+                if elements.len() > field.dimensions[0] {
+                    return None;
+                }
+                for (index, element) in elements.iter().enumerate() {
+                    write_native_record_initializer(
+                        nested_layout,
+                        element,
+                        data,
+                        field_offset.checked_add(index.checked_mul(field.element_size)?)?,
+                        enumerators,
+                    )?;
+                }
+            }
+        } else if !field.dimensions.is_empty() {
+            let values = if let ExpressionKind::Atom(token) = &initializer.kind
+                && let Some(bytes) = decode_string_token(token)
+            {
+                if field.element_size != 1 || bytes.len() > field.size {
+                    return None;
+                }
+                for (index, byte) in bytes.into_iter().enumerate() {
+                    *data.get_mut(field_offset.checked_add(index)?)? = byte;
+                }
+                continue;
+            } else {
+                flatten_initializer_values(initializer)?
+            };
+            if values.len() > field.size / field.element_size {
+                return None;
+            }
+            for (index, value) in values.into_iter().enumerate() {
+                let value = evaluate_integer_constant_with_names(value, enumerators).ok()?;
+                let offset = field_offset.checked_add(index.checked_mul(field.element_size)?)?;
+                if field.element_size == 1 {
+                    *data.get_mut(offset)? = value as u8;
+                } else if field.element_size == 2 {
+                    let value = value as u16;
+                    let target = data.get_mut(offset..offset.checked_add(2)?)?;
+                    target.copy_from_slice(&value.to_be_bytes());
+                } else {
+                    return None;
+                }
+            }
+        } else {
+            let value = scalar_initializer(initializer)?;
+            let value = evaluate_integer_constant_with_names(value, enumerators).ok()?;
+            if field.size == 1 {
+                *data.get_mut(field_offset)? = value as u8;
+            } else if field.size == 2 {
+                let value = value as u16;
+                let target = data.get_mut(field_offset..field_offset.checked_add(2)?)?;
+                target.copy_from_slice(&value.to_be_bytes());
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub kind: StatementKind,
@@ -283,6 +375,7 @@ struct NativeRecordField {
 struct NativeRecordLayout {
     size: usize,
     fields: HashMap<String, NativeRecordField>,
+    field_order: Vec<String>,
 }
 
 struct NativeGlobal {
@@ -300,9 +393,9 @@ struct NativeGlobal {
 }
 
 const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 3] = [
-    ("lib_cgfx.asm", include_str!("../../lib/lib_cgfx.asm")),
-    ("lib_text.asm", include_str!("../../lib/lib_text.asm")),
-    ("lib_stdio.asm", include_str!("../../lib/lib_stdio.asm")),
+    ("lib_cgfx.asm", include_str!("../lib/lib_cgfx.asm")),
+    ("lib_text.asm", include_str!("../lib/lib_text.asm")),
+    ("lib_stdio.asm", include_str!("../lib/lib_stdio.asm")),
 ];
 
 fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
@@ -320,6 +413,12 @@ fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
 
 fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Expression]) -> bool {
     match function {
+        "gfx_sprite" | "gfx_bitmap" => index == 4,
+        "gfx_poly" => index == 3,
+        "gfx_sprite_upload" => index == 3,
+        "gfx_tile_upload" => index == 1,
+        "gfx_tilemap" | "gfx_tilemap_wide" | "gfx3d_draw" => index == 0,
+        "gfx_world_emitters" | "gfx_world_emitters_wide" => index == 0,
         "gfx_text" => index == 2,
         "puts" => index == 0,
         "fgets" => matches!(index, 0 | 2),
@@ -381,6 +480,46 @@ fn emit_native_pointer_push(label_counter: &mut usize, assembly: &mut String) {
          __c_pointer_high_done_{label}:\n\
          PUSH R7\n    PUSH R5\n"
     ));
+}
+
+fn native_library_pointer_element_size(function: &str, index: usize) -> usize {
+    match (function, index) {
+        ("gfx3d_draw", 0) => 2,
+        _ => 1,
+    }
+}
+
+fn emit_native_library_pointer_argument(
+    function: &str,
+    index: usize,
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if let ExpressionKind::Binary {
+        operator,
+        left,
+        right,
+    } = &expression.kind
+        && matches!(operator.as_str(), "+" | "-")
+    {
+        if !emit_native_expression(left, 4, &[6, 7], locals, label_counter, assembly)
+            || !emit_native_expression(right, 6, &[7], locals, label_counter, assembly)
+        {
+            return false;
+        }
+        if native_library_pointer_element_size(function, index) == 2 {
+            assembly.push_str("    SHL R6, 1\n");
+        }
+        assembly.push_str(&format!(
+            "    {} R4, R6\n",
+            if operator == "+" { "ADD" } else { "SUB" }
+        ));
+        true
+    } else {
+        emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly)
+    }
 }
 
 fn native_unqualified_type(c_type: &str) -> &str {
@@ -719,6 +858,18 @@ pub fn compile_minimal_program(
     source: &str,
     filename: &str,
 ) -> Result<Option<ProgramImage>, CCompilerError> {
+    let Some(assembly) = compile_minimal_program_to_assembly(source, filename)? else {
+        return Ok(None);
+    };
+    crate::assembler::assemble(&assembly, 0)
+        .map(Some)
+        .map_err(|error| CCompilerError(format!("{filename}: {error}")))
+}
+
+pub fn compile_minimal_program_to_assembly(
+    source: &str,
+    filename: &str,
+) -> Result<Option<String>, CCompilerError> {
     let mut parser = TranslationUnitParser::from_source(source, filename)?;
     let unit = parser.parse()?;
     let mut functions = Vec::new();
@@ -868,6 +1019,45 @@ pub fn compile_minimal_program(
                             return Ok(None);
                         }
                         data[..bytes.len()].copy_from_slice(&bytes);
+                    } else if !is_record_pointer && let Some(layout) = &record_layout {
+                        let ExpressionKind::InitializerList(values) = &initializer.kind else {
+                            eprintln!("unsupported record initializer for global {}", global.name);
+                            return Ok(None);
+                        };
+                        if is_array {
+                            if values.len() > element_count {
+                                eprintln!("too many initializer values for global {}", global.name);
+                                return Ok(None);
+                            }
+                            for (index, value) in values.iter().enumerate() {
+                                if write_native_record_initializer(
+                                    layout,
+                                    value,
+                                    &mut data,
+                                    index * element_size,
+                                    &unit.enumerators,
+                                )
+                                .is_none()
+                                {
+                                    eprintln!(
+                                        "unsupported record initializer for global {}",
+                                        global.name
+                                    );
+                                    return Ok(None);
+                                }
+                            }
+                        } else if write_native_record_initializer(
+                            layout,
+                            initializer,
+                            &mut data,
+                            0,
+                            &unit.enumerators,
+                        )
+                        .is_none()
+                        {
+                            eprintln!("unsupported record initializer for global {}", global.name);
+                            return Ok(None);
+                        }
                     } else {
                         let values = if is_array {
                             if !matches!(&initializer.kind, ExpressionKind::InitializerList(_)) {
@@ -900,13 +1090,7 @@ pub fn compile_minimal_program(
                                 eprintln!("non-constant initializer for global {}", global.name);
                                 return Ok(None);
                             };
-                            if record_layout.is_some() {
-                                eprintln!(
-                                    "record initializer for global {} is not supported",
-                                    global.name
-                                );
-                                return Ok(None);
-                            } else if element_size == 1 {
+                            if element_size == 1 {
                                 data[index] = value as u8;
                             } else {
                                 let value = value as u16;
@@ -1366,9 +1550,7 @@ pub fn compile_minimal_program(
             assembly.push('\n');
         }
     }
-    crate::assembler::assemble(&assembly, 0)
-        .map(Some)
-        .map_err(|error| CCompilerError(format!("{filename}: {error}")))
+    Ok(Some(assembly))
 }
 
 fn expression_calls_are_defined(
@@ -2327,6 +2509,85 @@ fn emit_native_index_scale(index_register: u8, element_size: usize, assembly: &m
         assembly.push_str(&format!(
             "    LDI R6, {element_size}\n    MUL R{index_register}, R6\n"
         ));
+    }
+}
+
+fn native_location_has_signed_byte_elements(location: &NativeLocation) -> bool {
+    match location {
+        NativeLocation::GlobalArray {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::StackArray {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::PointerRegister {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::PointerStack {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::GlobalPointer {
+            element_size,
+            element_signed,
+            ..
+        } => *element_size == 1 && *element_signed,
+        _ => false,
+    }
+}
+
+fn native_location_is_signed_byte_scalar(location: &NativeLocation) -> bool {
+    matches!(
+        location,
+        NativeLocation::ByteRegister { signed: true, .. }
+            | NativeLocation::ByteStackScalar { signed: true, .. }
+            | NativeLocation::GlobalByteScalar { signed: true }
+    )
+}
+
+fn native_expression_uses_signed_byte(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => locals
+            .get(name)
+            .is_some_and(native_location_is_signed_byte_scalar),
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let indexed_signed_byte = match &base.kind {
+                ExpressionKind::Atom(name) => locals
+                    .get(name)
+                    .is_some_and(native_location_has_signed_byte_elements),
+                _ => false,
+            };
+            indexed_signed_byte
+                || native_expression_uses_signed_byte(base, locals)
+                || native_expression_uses_signed_byte(index, locals)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_expression_uses_signed_byte(left, locals)
+                || native_expression_uses_signed_byte(right, locals)
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        } => native_expression_uses_signed_byte(operand, locals),
+        _ => false,
     }
 }
 
@@ -3517,6 +3778,14 @@ fn emit_native_expression(
             assembly.push_str(&format!(
                 "    {instruction} R{destination}, R{right_register}\n"
             ));
+            if native_expression_uses_signed_byte(left, locals)
+                || native_expression_uses_signed_byte(right, locals)
+            {
+                assembly.push_str(&format!(
+                    "    LDI R{right_register}, 0xFFFF\n\
+                     AND R{destination}, R{right_register}\n"
+                ));
+            }
             true
         }
         ExpressionKind::Binary {
@@ -3729,30 +3998,46 @@ fn emit_native_expression(
             let mut argument_bytes = 0;
             if library_function {
                 for (index, argument) in arguments.iter().enumerate().rev() {
-                    if !emit_native_expression(
-                        argument,
-                        4,
-                        &[5, 6, 7],
-                        locals,
-                        label_counter,
-                        assembly,
-                    ) {
-                        return false;
-                    }
                     if native_argument_is_pointer(name, index, arguments) {
+                        if !emit_native_library_pointer_argument(
+                            name,
+                            index,
+                            argument,
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
                         emit_native_pointer_push(label_counter, assembly);
                         argument_bytes += 4;
                     } else {
+                        if !emit_native_expression(
+                            argument,
+                            4,
+                            &[5, 6, 7],
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
                         assembly.push_str("    PUSH R4\n");
                         argument_bytes += 2;
                     }
                 }
             } else if arguments.len() <= 3 {
                 for (index, argument) in arguments.iter().enumerate() {
+                    let argument_register = index as u8 + 4;
+                    let argument_temporaries = temporary_registers
+                        .iter()
+                        .copied()
+                        .filter(|register| *register > argument_register)
+                        .collect::<Vec<_>>();
                     if !emit_native_expression(
                         argument,
-                        4 + index as u8,
-                        &temporary_registers[index.min(temporary_registers.len())..],
+                        argument_register,
+                        &argument_temporaries,
                         locals,
                         label_counter,
                         assembly,
@@ -6184,6 +6469,7 @@ impl TranslationUnitParser {
 
     fn parse_record_members(&mut self, record_name: &str) -> Result<(), CCompilerError> {
         let mut fields = HashMap::new();
+        let mut field_order = Vec::new();
         let mut size = 0usize;
         let mut layout_supported = !record_name.starts_with("union ");
         while !self.statements.at("}") {
@@ -6307,6 +6593,7 @@ impl TranslationUnitParser {
                                 "duplicate record member name",
                             ));
                         }
+                        field_order.push(name.value.clone());
                     }
                     size = size.checked_add(member_size).ok_or_else(|| {
                         error(
@@ -6329,8 +6616,14 @@ impl TranslationUnitParser {
             size += 1;
         }
         if layout_supported && size > 0 {
-            self.records
-                .insert(record_name.to_owned(), NativeRecordLayout { size, fields });
+            self.records.insert(
+                record_name.to_owned(),
+                NativeRecordLayout {
+                    size,
+                    fields,
+                    field_order,
+                },
+            );
         }
         Ok(())
     }
@@ -9162,7 +9455,7 @@ mod tests {
     #[test]
     fn compiles_and_runs_text_demo_stdio_subset() {
         let image = compile_minimal_program(
-            include_str!("../../modules/Text Demo/text_demo.c"),
+            include_str!("../modules/Text Demo/text_demo.c"),
             "text-demo.c",
         )
         .unwrap()
@@ -9313,6 +9606,48 @@ mod tests {
         cpu.run(128).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 8);
+    }
+
+    #[test]
+    fn initializes_global_records_and_record_arrays() {
+        let image = compile_minimal_program(
+            "typedef struct { unsigned char kind; int value; } Cell; \
+             typedef struct { int id; Cell cells[2]; unsigned char flags[2]; } Board; \
+             Board board = { 7, { { 1, 10 }, { 2, 20 } }, { 3 } }; \
+             Board boards[2] = { \
+                 { 1, { { 2, 30 }, { 3, 40 } }, { 4, 5 } }, \
+                 { 6, { { 7, 80 }, { 9, 100 } } } \
+             }; \
+             int main(void) { return board.id; }",
+            "global-record-initializers.c",
+        )
+        .unwrap()
+        .expect("supported global record initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            &cpu.memory[0x80000..0x80024],
+            &[
+                0, 7, 1, 0, 0, 10, 2, 0, 0, 20, 3, 0, 0, 1, 2, 0, 0, 30, 3, 0, 0, 40, 4, 5, 0, 6,
+                7, 0, 0, 80, 9, 0, 0, 100, 0, 0,
+            ]
+        );
+        assert_eq!(cpu.registers[0], 7);
+    }
+
+    #[test]
+    fn rejects_nonconstant_global_record_initializers() {
+        let result = compile_minimal_program(
+            "int value(void) { return 1; } \
+             typedef struct { int field; } Item; Item item = { value() }; \
+             int main(void) { return item.field; }",
+            "nonconstant-global-record-initializer.c",
+        )
+        .unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
@@ -9810,6 +10145,299 @@ mod tests {
         cpu.run(8192).unwrap();
         assert!(!cpu.running);
         assert!(cpu.memory.windows(3).any(|bytes| bytes == b"Hi\0"));
+    }
+
+    #[test]
+    fn passes_full_asset_pointer_to_native_graphics_calls() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             unsigned char pixels[4] = { 9, 0, 0, 12 }; \
+             int main(void) { gfx_sprite(10, 11, 2, 2, pixels); return 0; }",
+            "native-gfx-asset-pointer.c",
+        )
+        .unwrap()
+        .expect("supported graphics asset pointer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.memory[0x50000 + 11 * 320 + 10], 9);
+        assert_eq!(cpu.memory[0x50000 + 12 * 320 + 11], 12);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn passes_asset_pointers_to_sprite_upload_and_tilemap_calls() {
+        let sprite_image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             unsigned char pixels[4] = { 7, 0, 0, 8 }; \
+             int main(void) { gfx_sprite_upload(0, 2, 2, pixels); \
+                 gfx_sprite_move(0, 10, 11, SPRITE_VISIBLE); return 0; }",
+            "native-gfx-sprite-upload.c",
+        )
+        .unwrap()
+        .expect("supported sprite upload pointer");
+        let mut sprite_cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        sprite_cpu
+            .load_program(&sprite_image.segments, sprite_image.entry_point)
+            .unwrap();
+        sprite_cpu.run(4096).unwrap();
+        assert!(!sprite_cpu.running);
+        let sprite_frame = sprite_cpu.composited_framebuffer();
+        assert_eq!(sprite_frame[11 * 320 + 10], 7);
+        assert_eq!(sprite_frame[12 * 320 + 11], 8);
+
+        let tile_image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             unsigned char pixels[4] = { 2, 3, 4, 5 }; \
+             unsigned char map[1] = { 1 }; \
+             int main(void) { gfx_layer_select(LAYER_TILES); gfx_tile_size(2); \
+                 gfx_tile_upload(1, pixels); gfx_tilemap(map, 1, 1, 0, 0); \
+                 return 0; }",
+            "native-gfx-tile-upload.c",
+        )
+        .unwrap()
+        .expect("supported tile and tilemap pointers");
+        let mut tile_cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        tile_cpu
+            .load_program(&tile_image.segments, tile_image.entry_point)
+            .unwrap();
+        tile_cpu.run(4096).unwrap();
+        assert!(!tile_cpu.running);
+        let tile_frame = tile_cpu.composited_framebuffer();
+        assert_eq!(&tile_frame[..2], &[2, 3]);
+        assert_eq!(&tile_frame[320..322], &[4, 5]);
+    }
+
+    #[test]
+    fn draws_asteroid_style_polygons_at_expected_coordinates() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             char shape[48] = { 0, -6, 3, -3, 6, 0, 4, 4, \
+                 0, 6, -3, 3, -6, 0, -4, -4, \
+                 0, -11, 6, -6, 11, 0, 7, 7, \
+                 0, 11, -6, 6, -11, 0, -7, -7, \
+                 0, -18, 10, -10, 18, 0, 11, 11, \
+                 0, 18, -10, 10, -18, 0, -11, -11 }; \
+             int main(void) { gfx_poly(50, 100, 8, shape, WHITE); \
+                 gfx_poly(150, 100, 8, shape + 16, WHITE); \
+                 gfx_poly(250, 100, 8, shape + 32, WHITE); return 0; }",
+            "native-gfx-asteroid-poly.c",
+        )
+        .unwrap()
+        .expect("supported asteroid-style polygon");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+        assert!(!cpu.running);
+        let drawn = cpu.memory[0x50000..0x50000 + 320 * 240]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, color)| (*color == 1).then_some((index % 320, index / 320)))
+            .collect::<Vec<_>>();
+        for (origin_x, radius) in [(50, 6), (150, 11), (250, 18)] {
+            let points = drawn
+                .iter()
+                .filter(|point| (origin_x - 25..=origin_x + 25).contains(&point.0))
+                .collect::<Vec<_>>();
+            let min_x = points.iter().map(|point| point.0).min().unwrap();
+            let max_x = points.iter().map(|point| point.0).max().unwrap();
+            let min_y = points.iter().map(|point| point.1).min().unwrap();
+            let max_y = points.iter().map(|point| point.1).max().unwrap();
+            assert_eq!(min_x, origin_x - radius);
+            assert_eq!(max_x, origin_x + radius);
+            assert_eq!(min_y, 100 - radius);
+            assert_eq!(max_y, 100 + radius);
+        }
+    }
+
+    #[test]
+    fn passes_local_polygon_points_to_the_graphics_library() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             int main(void) { char points[16]; \
+                 points[0] = 0; points[1] = -9; points[2] = 7; points[3] = -7; \
+                 points[4] = 11; points[5] = -1; points[6] = 7; points[7] = 7; \
+                 points[8] = 1; points[9] = 10; points[10] = -6; points[11] = 8; \
+                 points[12] = -10; points[13] = 3; points[14] = -8; points[15] = -5; \
+                 gfx_poly(160, 100, 8, points, GRAY); return 0; }",
+            "native-gfx-local-polygon.c",
+        )
+        .unwrap()
+        .expect("supported local polygon data");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(20_000).unwrap();
+        assert!(!cpu.running);
+        let pixels = &cpu.memory[0x50000..0x50000 + 320 * 240];
+        assert!(pixels.iter().filter(|&&color| color == 9).count() > 40);
+    }
+
+    #[test]
+    fn asteroids_first_frame_keeps_polygon_draws_bounded() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("modules")
+            .join("Asteroids")
+            .join("asteroids.c");
+        let image = crate::image::build_source(&source).expect("built Asteroids module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2_000_000).unwrap();
+        assert!(cpu.frame_yield, "Asteroids did not present its first frame");
+        let white_pixels = cpu.layers[2].iter().filter(|&&color| color == 1).count();
+        assert!(
+            white_pixels < 10_000,
+            "polygon rendering produced {white_pixels} white pixels"
+        );
+    }
+
+    #[test]
+    fn elite_frames_render_scene_and_hud() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("modules")
+            .join("Elite")
+            .join("elitedemo.c");
+        let image = crate::image::build_source(&source).expect("built Elite module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        let executed = cpu.run(300_000).unwrap();
+        assert!(cpu.frame_yield, "Elite did not present its first frame");
+        assert!(
+            executed < 300_000,
+            "Elite exceeded the per-frame instruction budget"
+        );
+        let scene = &cpu.layers[3][..320 * 240];
+        for (color, minimum) in [(4, 100), (6, 100), (10, 50)] {
+            let pixels = scene.iter().filter(|&&pixel| pixel == color).count();
+            assert!(
+                pixels >= minimum,
+                "Elite scene rendered only {pixels} pixels with color {color}"
+            );
+        }
+        let title_pixels = (6..13)
+            .map(|row| {
+                cpu.layers[4][row * 320 + 8..row * 320 + 110]
+                    .iter()
+                    .filter(|&&color| color == 6)
+                    .count()
+            })
+            .sum::<usize>();
+        assert!(
+            title_pixels > 30,
+            "Elite title rendered only {title_pixels} cyan pixels"
+        );
+        for (x, y) in [(250, 6), (260, 196), (260, 206)] {
+            let number_pixels = (y..y + 7)
+                .flat_map(|row| cpu.layers[4][row * 320 + x..row * 320 + x + 42].iter())
+                .filter(|&&color| color == 1)
+                .count();
+            assert!(
+                number_pixels >= 10,
+                "Elite numeric HUD text at ({x}, {y}) rendered only {number_pixels} white pixels"
+            );
+        }
+        let framebuffer = cpu.composited_framebuffer();
+        assert!(
+            framebuffer[30 * 320..190 * 320]
+                .iter()
+                .any(|&color| color != 0),
+            "Elite scene layer was not included in the presented framebuffer"
+        );
+        let first_scene = scene.to_vec();
+        cpu.begin_frame();
+        cpu.run(300_000).unwrap();
+        assert!(cpu.frame_yield, "Elite did not present its second frame");
+        assert_ne!(
+            &cpu.layers[3][..320 * 240],
+            first_scene,
+            "Elite scene did not update between frames"
+        );
+    }
+
+    #[test]
+    fn passes_computed_arguments_without_clobbering_operands() {
+        for (source, expected) in [
+            (
+                "int identity(int value) { return value; } \
+                 int main(void) { return identity(70 - 72); }",
+                -2,
+            ),
+            (
+                "int abs_i(int value) { if (value < 0) return -value; return value; } \
+                 int main(void) { return abs_i(70 - 72); }",
+                2,
+            ),
+            (
+                "int sum(int a, int b, int c) { return a + b + c; } \
+                 int main(void) { return sum(10 + 1, 20 + 2, 30 + 3); }",
+                66,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "computed-call-argument.c")
+                .unwrap()
+                .expect("supported computed function argument");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(1000).unwrap();
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn pacman_round_starts_without_a_false_collision() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("modules")
+            .join("PacMan")
+            .join("pacman.c");
+        let source = std::fs::read_to_string(path).unwrap();
+        let source = source.replace("int main(void)", "int pacman_main(void)");
+        let source = format!(
+            "{source}\nint main(void) {{ int i; new_game(); \
+             for (i = 0; i < 72; i++) {{ tick++; update(0); }} \
+             return mode * 10 + lives; }}"
+        );
+        let image = compile_minimal_program(&source, "pacman-opening-round.c")
+            .unwrap()
+            .expect("supported PacMan module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            cpu.registers[0], 13,
+            "PacMan should be playing with 3 lives"
+        );
+    }
+
+    #[test]
+    fn pacman_stops_at_the_wall_in_its_starting_corridor() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("modules")
+            .join("PacMan")
+            .join("pacman.c");
+        let source = std::fs::read_to_string(path).unwrap();
+        let source = source.replace("int main(void)", "int pacman_main(void)");
+        let source = format!(
+            "{source}\nint main(void) {{ int i; load_maze(); reset_positions(); mode = 1; \
+             for (i = 0; i < 100; i++) move_pac(0); \
+             return px; }}"
+        );
+        let image = compile_minimal_program(&source, "pacman-wall-collision.c")
+            .unwrap()
+            .expect("supported PacMan module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 32, "PacMan must stop before the wall");
     }
 
     #[test]

@@ -5,6 +5,10 @@
 *.lock text eol=lf
 *.gitattributes text eol=lf
 *.gitignore text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.asm text eol=lf
+*.md text eol=lf
 
-# Tank-16 runtime maps use fixed byte offsets; never convert line endings
+# Preserve map JSON bytes for deterministic generated images
 modules/Tank-16/disks/maps/*.json -text
