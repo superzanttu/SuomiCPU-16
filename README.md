@@ -29,13 +29,13 @@ to cycle through available data disks or choose no disk; virtual disks store
 application data only.
 Use `--disk ID` to preselect a data disk in BIOS, or mount it with a directly
 launched program.
-The game fills its own window by default. The 80×25 console opens in a separate
-window with **REBOOT**, **RESET** (return to BIOS), **COPY**, and
-**PAUSE/CONTINUE** controls and emulator status. Select console text and press
-Ctrl+C to copy it; **COPY** copies the selection or the visible screen. The
-console retains 1,000 rows of scrollback, accessible with the mouse wheel.
-Press **F2** in the emulator window to hide/show the console; **F11** toggles
-windowed/fullscreen game display, and **F10** pauses or resumes the emulator.
+In windowed mode, the emulator toolbar appears at the top left with
+**PAUSE/CONTINUE**, **RESET**, **REBOOT**, and **CONSOLE** buttons. RESET returns
+to the BIOS selector when launched through BIOS, or restarts a directly launched
+program; REBOOT restarts the active program. **CONSOLE** opens the small-font
+console overlay. Press **F2** to toggle the console, **F10** to pause or resume,
+or **Shift+Ctrl+F** to toggle windowed/fullscreen mode (**F11** is also
+supported). The toolbar and console overlay are hidden in fullscreen mode.
 Start directly in fullscreen with
 `cargo run -- --fullscreen` or `.\run.ps1 -Fullscreen`.
 Detailed stage logs are on by default and show which SC-16 component is

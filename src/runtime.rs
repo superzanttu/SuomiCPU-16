@@ -4,10 +4,10 @@ use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, Rect, Texture2D,
-    WHITE, clear_background, draw_line, draw_texture_ex, draw_triangle, get_char_pressed,
-    get_keys_down, get_keys_pressed, is_key_down, is_key_pressed, is_mouse_button_pressed,
-    is_mouse_button_released, mouse_position, mouse_wheel, next_frame, screen_height, screen_width,
-    set_fullscreen, vec2,
+    WHITE, clear_background, draw_line, draw_rectangle, draw_text as draw_ui_text, draw_texture_ex,
+    draw_triangle, get_char_pressed, get_keys_down, get_keys_pressed, is_key_down, is_key_pressed,
+    is_mouse_button_pressed, is_mouse_button_released, mouse_position, mouse_wheel, next_frame,
+    screen_height, screen_width, set_fullscreen, vec2,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -22,6 +22,13 @@ const SOUND_FPS: u32 = 60;
 const BIOS_VISIBLE_MODULES: usize = 12;
 const BIOS_MODULE_ROW_TOP: usize = 128;
 const BIOS_MODULE_ROW_HEIGHT: usize = 24;
+const TOOLBAR_HEIGHT: f32 = 36.0;
+const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
+    ("PAUSE", 8.0, 104.0),
+    ("RESET", 120.0, 80.0),
+    ("REBOOT", 208.0, 88.0),
+    ("CONSOLE", 304.0, 96.0),
+];
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -101,6 +108,14 @@ impl AudioEngine {
         );
         self.channels[channel] = Some(ActiveSound { command, sound });
         Ok(())
+    }
+
+    fn stop_all(&mut self) {
+        for active in &mut self.channels {
+            if let Some(active) = active.take() {
+                stop_sound(&active.sound);
+            }
+        }
     }
 }
 
@@ -192,12 +207,17 @@ impl Canvas {
     async fn present(
         &mut self,
         pixels: &[u32],
-        width: usize,
-        height: usize,
+        logical_size: (usize, usize),
         triangles: &[GpuTriangle],
         lines: &[GpuLine],
         palette: &[[u8; 3]; 256],
+        overlay: CanvasOverlay<'_>,
     ) {
+        let (width, height) = logical_size;
+        let CanvasOverlay {
+            toolbar,
+            console_lines,
+        } = overlay;
         self.rgba.fill(0);
         for y in 0..height {
             for x in 0..width {
@@ -211,11 +231,17 @@ impl Canvas {
         }
         self.texture.update_from_bytes(640, 480, &self.rgba);
 
-        let scale = (screen_width() / width as f32).min(screen_height() / height as f32);
+        let toolbar_height = if toolbar.is_some() {
+            TOOLBAR_HEIGHT
+        } else {
+            0.0
+        };
+        let available_height = (screen_height() - toolbar_height).max(1.0);
+        let scale = (screen_width() / width as f32).min(available_height / height as f32);
         let destination = vec2(width as f32 * scale, height as f32 * scale);
         let position = vec2(
             (screen_width() - destination.x) / 2.0,
-            (screen_height() - destination.y) / 2.0,
+            toolbar_height + (available_height - destination.y) / 2.0,
         );
         clear_background(BLACK);
         draw_texture_ex(
@@ -253,6 +279,12 @@ impl Canvas {
                 Color::from_rgba(color[0], color[1], color[2], 255),
             );
         }
+        if let Some(toolbar) = toolbar {
+            draw_toolbar(toolbar);
+            if let Some(lines) = console_lines {
+                draw_console_window(lines);
+            }
+        }
         next_frame().await;
     }
 }
@@ -276,6 +308,25 @@ enum BiosMouseAction {
 enum RuntimeControl {
     PauseToggled(bool),
     FullscreenToggled(bool),
+    ConsoleToggled(bool),
+    ResetRequested,
+    RebootRequested,
+}
+
+#[derive(Clone, Copy)]
+struct ToolbarState {
+    paused: bool,
+}
+
+struct CanvasOverlay<'a> {
+    toolbar: Option<ToolbarState>,
+    console_lines: Option<&'a [String]>,
+}
+
+#[derive(Clone)]
+struct BootTarget {
+    source: PathBuf,
+    disk_id: Option<String>,
 }
 
 pub fn window_conf() -> Conf {
@@ -305,60 +356,172 @@ pub async fn run_with_devices(
 ) -> Result<(), RuntimeError> {
     set_fullscreen(fullscreen);
 
-    let mut cpu = Cpu::new();
-    cpu.set_network_port(network_port);
     let font = load_font();
     let mut pixels = vec![0u32; 640 * 480];
     let mut canvas = Canvas::new();
     let mut audio = AudioEngine::new();
-    if let Some(source) = program {
-        configure_disk(&mut cpu, root, source)?;
-        if let Some(disk_id) = disk_id {
-            cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
-        }
-        let image = load_program(source).map_err(RuntimeError::from)?;
-        cpu.load_program(&image.segments, image.entry_point)
-            .map_err(|error| RuntimeError::Window(error.to_string()))?;
+    let modules = if program.is_none() {
+        Some(discover_modules(&root.join("modules"))?)
     } else {
-        cpu.configure_disk(root.join("disks"), root.join("disks"))
-            .map_err(RuntimeError::Window)?;
-        let modules = discover_modules(&root.join("modules"))?;
-        if !select_and_boot(
+        None
+    };
+    let mut cpu = fresh_runtime_cpu(root, program, disk_id, network_port, None)?;
+    let mut target = if let Some(source) = program {
+        let target = BootTarget {
+            source: source.to_path_buf(),
+            disk_id: disk_id.map(str::to_owned),
+        };
+        boot_target(&mut cpu, &target)?;
+        Some(target)
+    } else {
+        let Some(target) = select_and_boot(
             root,
             &mut cpu,
             &mut canvas,
             &mut pixels,
             &font,
-            &modules,
+            modules.as_deref().expect("BIOS modules were loaded"),
             disk_id,
         )
         .await?
-        {
+        else {
             return Ok(());
-        }
-    }
+        };
+        Some(target)
+    };
 
     let mut old_keys = HashSet::new();
     let mut speed_remainder = 0.0;
     let mut last_frame = Instant::now();
     let runtime_started = Instant::now();
     let mut paused = false;
+    let mut console_visible = false;
     let mut fullscreen = fullscreen;
     while !is_key_down(KeyCode::Escape) {
         let pressed_keys = get_keys_pressed();
-        if halted_window_should_close(cpu.running, !pressed_keys.is_empty()) {
+        let keys = get_keys_down();
+        let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
+        let controlled =
+            keys.contains(&KeyCode::LeftControl) || keys.contains(&KeyCode::RightControl);
+        let mut pending_action = None;
+        let mut control_key_count = 0;
+        let mut handled_control_keys = HashSet::new();
+        for key in pressed_keys.iter().copied() {
+            if let Some(control) = apply_runtime_control(
+                key,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                shifted,
+                controlled,
+            ) {
+                control_key_count += 1;
+                handled_control_keys.insert(key);
+                match control {
+                    RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
+                    RuntimeControl::ResetRequested => {
+                        pending_action = Some(RuntimeControl::ResetRequested)
+                    }
+                    RuntimeControl::RebootRequested => {
+                        pending_action = Some(RuntimeControl::RebootRequested)
+                    }
+                    RuntimeControl::PauseToggled(paused) => {
+                        cpu.console.write_text(if paused {
+                            "Emulation paused"
+                        } else {
+                            "Emulation continued"
+                        });
+                    }
+                    RuntimeControl::ConsoleToggled(_) => {}
+                }
+                last_frame = Instant::now();
+            }
+        }
+        if !fullscreen
+            && is_mouse_button_pressed(MouseButton::Left)
+            && let Some(control) = toolbar_control(mouse_position(), paused, console_visible)
+        {
+            match control {
+                RuntimeControl::PauseToggled(new_paused) => {
+                    paused = new_paused;
+                    cpu.console.write_text(if paused {
+                        "Emulation paused"
+                    } else {
+                        "Emulation continued"
+                    });
+                }
+                RuntimeControl::ResetRequested | RuntimeControl::RebootRequested => {
+                    pending_action = Some(control);
+                }
+                RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
+                RuntimeControl::FullscreenToggled(_) => {}
+            }
+        }
+        if let Some(action @ (RuntimeControl::ResetRequested | RuntimeControl::RebootRequested)) =
+            pending_action
+        {
+            audio.stop_all();
+            let previous_console = cpu.console.clone();
+            if action == RuntimeControl::ResetRequested
+                && let Some(modules) = &modules
+            {
+                cpu = fresh_runtime_cpu(root, None, None, network_port, Some(&previous_console))?;
+                let Some(new_target) = select_and_boot(
+                    root,
+                    &mut cpu,
+                    &mut canvas,
+                    &mut pixels,
+                    &font,
+                    modules,
+                    target.as_ref().and_then(|target| target.disk_id.as_deref()),
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                target = Some(new_target);
+            } else {
+                let Some(active_target) = target.as_ref() else {
+                    return Ok(());
+                };
+                cpu = fresh_runtime_cpu(
+                    root,
+                    Some(&active_target.source),
+                    active_target.disk_id.as_deref(),
+                    network_port,
+                    Some(&previous_console),
+                )?;
+                boot_target(
+                    &mut cpu,
+                    target.as_ref().expect("active program target exists"),
+                )?;
+            }
+            cpu.console
+                .write_text(if action == RuntimeControl::ResetRequested {
+                    "System reset complete"
+                } else {
+                    "Program restarted"
+                });
+            paused = false;
+            old_keys.clear();
+            speed_remainder = 0.0;
+            last_frame = Instant::now();
+            continue;
+        }
+        let key_control_only = control_key_count == pressed_keys.len();
+        if halted_window_should_close(cpu.running, !pressed_keys.is_empty() && !key_control_only) {
             break;
         }
         if cpu.running {
-            let keys = get_keys_down();
-            let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
             update_keys(&mut cpu, &old_keys, &keys, shifted);
             old_keys = keys;
             let (width, height) = screen_size(&cpu);
-            let logical_mouse = screen_to_logical_clamped(
+            let toolbar_height = if fullscreen { 0.0 } else { TOOLBAR_HEIGHT };
+            let logical_mouse = screen_to_logical_clamped_with_toolbar(
                 mouse_position(),
                 (screen_width(), screen_height()),
                 (width, height),
+                toolbar_height,
             );
             let wheel_delta = mouse_wheel().1.round() as i16;
             update_mouse(
@@ -375,12 +538,8 @@ pub async fn run_with_devices(
                 ],
                 runtime_started.elapsed().as_millis() as u64,
             );
-            for key in pressed_keys {
-                if let Some(control) = apply_runtime_control(key, &mut paused, &mut fullscreen) {
-                    last_frame = Instant::now();
-                    if let RuntimeControl::FullscreenToggled(fullscreen) = control {
-                        set_fullscreen(fullscreen);
-                    }
+            for key in pressed_keys.iter().copied() {
+                if handled_control_keys.contains(&key) {
                     continue;
                 }
                 if key == KeyCode::Enter {
@@ -444,14 +603,22 @@ pub async fn run_with_devices(
                 &font,
             );
         }
+        let console_lines = if !fullscreen && console_visible {
+            Some(cpu.console.text_snapshot())
+        } else {
+            None
+        };
         canvas
             .present(
                 &pixels,
-                width,
-                height,
+                (width, height),
                 &cpu.gpu_triangles,
                 &cpu.gpu_lines,
                 &cpu.palette,
+                CanvasOverlay {
+                    toolbar: (!fullscreen).then_some(ToolbarState { paused }),
+                    console_lines: console_lines.as_deref(),
+                },
             )
             .await;
     }
@@ -579,7 +746,7 @@ async fn select_and_boot(
     font: &[[u8; 8]],
     modules: &[BootModule],
     disk_id: Option<&str>,
-) -> Result<bool, RuntimeError> {
+) -> Result<Option<BootTarget>, RuntimeError> {
     let mut selected = 0usize;
     let mut scroll_offset = 0usize;
     let mut last_clicked_module = None;
@@ -606,7 +773,17 @@ async fn select_and_boot(
             message.as_deref(),
         );
         canvas
-            .present(pixels, 640, 480, &[], &[], &cpu.palette)
+            .present(
+                pixels,
+                (640, 480),
+                &[],
+                &[],
+                &cpu.palette,
+                CanvasOverlay {
+                    toolbar: None,
+                    console_lines: None,
+                },
+            )
             .await;
         let wheel_delta = mouse_wheel().1;
         if wheel_delta != 0.0
@@ -663,7 +840,7 @@ async fn select_and_boot(
             }
         }
         if !launch_selected && is_key_pressed(KeyCode::Escape) {
-            return Ok(false);
+            return Ok(None);
         } else if !launch_selected && is_key_pressed(KeyCode::Up) {
             selected = bios_move_selection(selected, -1, modules.len());
             scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
@@ -710,7 +887,10 @@ async fn select_and_boot(
                 message = Some(format!("{}: {error}", module.name));
                 continue;
             }
-            return Ok(true);
+            return Ok(Some(BootTarget {
+                source: source.clone(),
+                disk_id: (selected_disk != 0).then(|| disks[selected_disk - 1].clone()),
+            }));
         }
     }
 }
@@ -922,6 +1102,7 @@ fn screen_to_logical(
     Some((logical_x as usize, logical_y as usize))
 }
 
+#[cfg(test)]
 fn screen_to_logical_clamped(
     position: (f32, f32),
     screen_size: (f32, f32),
@@ -930,16 +1111,33 @@ fn screen_to_logical_clamped(
     if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 || logical_size.0 == 0 || logical_size.1 == 0 {
         return None;
     }
-    let scale = (screen_size.0 / logical_size.0 as f32).min(screen_size.1 / logical_size.1 as f32);
+    screen_to_logical_clamped_with_toolbar(position, screen_size, logical_size, 0.0)
+}
+
+fn screen_to_logical_clamped_with_toolbar(
+    position: (f32, f32),
+    screen_size: (f32, f32),
+    logical_size: (usize, usize),
+    toolbar_height: f32,
+) -> Option<(usize, usize)> {
+    if screen_size.0 <= 0.0
+        || screen_size.1 <= toolbar_height
+        || logical_size.0 == 0
+        || logical_size.1 == 0
+        || (toolbar_height > 0.0 && position.1 < toolbar_height)
+    {
+        return None;
+    }
+    let available_height = screen_size.1 - toolbar_height;
+    let scale =
+        (screen_size.0 / logical_size.0 as f32).min(available_height / logical_size.1 as f32);
     let left = (screen_size.0 - logical_size.0 as f32 * scale) / 2.0;
-    let top = (screen_size.1 - logical_size.1 as f32 * scale) / 2.0;
+    let top = toolbar_height + (available_height - logical_size.1 as f32 * scale) / 2.0;
     let max_x = left + (logical_size.0 as f32 - 0.001) * scale;
     let max_y = top + (logical_size.1 as f32 - 0.001) * scale;
-    screen_to_logical(
-        (position.0.clamp(left, max_x), position.1.clamp(top, max_y)),
-        screen_size,
-        logical_size,
-    )
+    let logical_x = (position.0.clamp(left, max_x) - left) / scale;
+    let logical_y = (position.1.clamp(top, max_y) - top) / scale;
+    Some((logical_x as usize, logical_y as usize))
 }
 
 fn bios_mouse_action(
@@ -991,6 +1189,37 @@ fn configure_disk(cpu: &mut Cpu, root: &Path, source: &Path) -> Result<(), Runti
         .join("disks");
     cpu.configure_disk(root.join("disks"), module_disk)
         .map_err(RuntimeError::Window)
+}
+
+fn fresh_runtime_cpu(
+    root: &Path,
+    source: Option<&Path>,
+    disk_id: Option<&str>,
+    network_port: u16,
+    previous_console: Option<&crate::console::ConsoleDevice>,
+) -> Result<Cpu, RuntimeError> {
+    let mut cpu = Cpu::new();
+    cpu.set_network_port(network_port);
+    if let Some(source) = source {
+        configure_disk(&mut cpu, root, source)?;
+    } else {
+        cpu.configure_disk(root.join("disks"), root.join("disks"))
+            .map_err(RuntimeError::Window)?;
+    }
+    if let Some(disk_id) = disk_id {
+        cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
+    }
+    if let Some(previous_console) = previous_console {
+        cpu.console = previous_console.clone();
+        cpu.console.reset(true);
+    }
+    Ok(cpu)
+}
+
+fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
+    let image = load_program(&target.source)?;
+    cpu.load_program(&image.segments, image.entry_point)
+        .map_err(|error| RuntimeError::Window(error.to_string()))
 }
 
 fn update_keys(
@@ -1245,6 +1474,9 @@ fn apply_runtime_control(
     key: KeyCode,
     paused: &mut bool,
     fullscreen: &mut bool,
+    console_visible: &mut bool,
+    shifted: bool,
+    controlled: bool,
 ) -> Option<RuntimeControl> {
     match key {
         KeyCode::F10 => {
@@ -1255,7 +1487,105 @@ fn apply_runtime_control(
             *fullscreen = !*fullscreen;
             Some(RuntimeControl::FullscreenToggled(*fullscreen))
         }
+        KeyCode::F if shifted && controlled => {
+            *fullscreen = !*fullscreen;
+            Some(RuntimeControl::FullscreenToggled(*fullscreen))
+        }
+        KeyCode::F2 if !*fullscreen => {
+            *console_visible = !*console_visible;
+            Some(RuntimeControl::ConsoleToggled(*console_visible))
+        }
         _ => None,
+    }
+}
+
+fn toolbar_control(
+    position: (f32, f32),
+    paused: bool,
+    console_visible: bool,
+) -> Option<RuntimeControl> {
+    let (x, y) = position;
+    if !(5.0..31.0).contains(&y) {
+        return None;
+    }
+    for (index, (_, left, width)) in TOOLBAR_BUTTONS.iter().enumerate() {
+        if (*left..*left + *width).contains(&x) {
+            return match index {
+                0 => Some(RuntimeControl::PauseToggled(!paused)),
+                1 => Some(RuntimeControl::ResetRequested),
+                2 => Some(RuntimeControl::RebootRequested),
+                3 => Some(RuntimeControl::ConsoleToggled(!console_visible)),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn draw_toolbar(state: ToolbarState) {
+    draw_rectangle(
+        0.0,
+        0.0,
+        screen_width(),
+        TOOLBAR_HEIGHT,
+        Color::from_rgba(12, 16, 24, 255),
+    );
+    for (index, (label, x, width)) in TOOLBAR_BUTTONS.iter().enumerate() {
+        let label = if index == 0 && state.paused {
+            "CONTINUE"
+        } else {
+            label
+        };
+        let active = index == 0 && state.paused;
+        draw_rectangle(
+            *x,
+            5.0,
+            *width,
+            26.0,
+            if active {
+                Color::from_rgba(43, 95, 70, 255)
+            } else {
+                Color::from_rgba(43, 54, 72, 255)
+            },
+        );
+        draw_ui_text(
+            label,
+            *x + 8.0,
+            23.0,
+            14.0,
+            Color::from_rgba(238, 242, 248, 255),
+        );
+    }
+}
+
+fn draw_console_window(lines: &[String]) {
+    let width = screen_width().min(500.0);
+    let height = (screen_height() - TOOLBAR_HEIGHT - 20.0).min(280.0);
+    if width < 100.0 || height < 70.0 {
+        return;
+    }
+    let x = screen_width() - width - 12.0;
+    let y = TOOLBAR_HEIGHT + 12.0;
+    draw_rectangle(x, y, width, height, Color::from_rgba(8, 12, 18, 238));
+    draw_rectangle(x, y, width, 22.0, Color::from_rgba(35, 48, 65, 255));
+    draw_ui_text(
+        "SC-16 CONSOLE",
+        x + 8.0,
+        y + 16.0,
+        12.0,
+        Color::from_rgba(255, 210, 80, 255),
+    );
+    let columns = ((width - 16.0) / 7.0) as usize;
+    let rows = ((height - 30.0) / 12.0) as usize;
+    for (row, line) in lines.iter().rev().take(rows).rev().enumerate() {
+        let text = line.trim_end().chars().take(columns).collect::<String>();
+        draw_ui_text(
+            &text,
+            x + 8.0,
+            y + 36.0 + row as f32 * 12.0,
+            11.0,
+            Color::from_rgba(190, 220, 190, 255),
+        );
     }
 }
 
@@ -1486,27 +1816,129 @@ mod tests {
 
     #[test]
     fn runtime_pause_and_fullscreen_controls_toggle_independently() {
-        let (mut paused, mut fullscreen) = (false, false);
+        let (mut paused, mut fullscreen, mut console_visible) = (false, false, false);
         assert_eq!(
-            apply_runtime_control(KeyCode::F10, &mut paused, &mut fullscreen),
+            apply_runtime_control(
+                KeyCode::F10,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                false,
+                false,
+            ),
             Some(RuntimeControl::PauseToggled(true))
         );
         assert!(paused);
         assert!(!fullscreen);
         assert_eq!(
-            apply_runtime_control(KeyCode::F11, &mut paused, &mut fullscreen),
+            apply_runtime_control(
+                KeyCode::F11,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                false,
+                false,
+            ),
             Some(RuntimeControl::FullscreenToggled(true))
         );
         assert_eq!(
-            apply_runtime_control(KeyCode::F10, &mut paused, &mut fullscreen),
+            apply_runtime_control(
+                KeyCode::F10,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                false,
+                false,
+            ),
             Some(RuntimeControl::PauseToggled(false))
         );
         assert!(!paused);
         assert!(fullscreen);
         assert_eq!(
-            apply_runtime_control(KeyCode::A, &mut paused, &mut fullscreen),
+            apply_runtime_control(
+                KeyCode::A,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                false,
+                false,
+            ),
             None
         );
+    }
+
+    #[test]
+    fn runtime_shift_control_f_toggles_fullscreen_and_f2_only_opens_windowed_console() {
+        let (mut paused, mut fullscreen, mut console_visible) = (false, false, false);
+        assert_eq!(
+            apply_runtime_control(
+                KeyCode::F,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                true,
+                true,
+            ),
+            Some(RuntimeControl::FullscreenToggled(true))
+        );
+        assert_eq!(
+            apply_runtime_control(
+                KeyCode::F2,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                false,
+                false,
+            ),
+            None
+        );
+        assert!(!console_visible);
+
+        assert_eq!(
+            apply_runtime_control(
+                KeyCode::F,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                true,
+                true,
+            ),
+            Some(RuntimeControl::FullscreenToggled(false))
+        );
+        assert_eq!(
+            apply_runtime_control(
+                KeyCode::F2,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                false,
+                false,
+            ),
+            Some(RuntimeControl::ConsoleToggled(true))
+        );
+        assert!(console_visible);
+    }
+
+    #[test]
+    fn runtime_toolbar_controls_hit_expected_buttons_and_ignore_gaps() {
+        assert_eq!(
+            toolbar_control((50.0, 18.0), false, false),
+            Some(RuntimeControl::PauseToggled(true))
+        );
+        assert_eq!(
+            toolbar_control((150.0, 18.0), false, false),
+            Some(RuntimeControl::ResetRequested)
+        );
+        assert_eq!(
+            toolbar_control((250.0, 18.0), false, false),
+            Some(RuntimeControl::RebootRequested)
+        );
+        assert_eq!(
+            toolbar_control((350.0, 18.0), false, false),
+            Some(RuntimeControl::ConsoleToggled(true))
+        );
+        assert_eq!(toolbar_control((115.0, 18.0), false, false), None);
+        assert_eq!(toolbar_control((50.0, 34.0), false, false), None);
     }
 
     #[test]
@@ -1746,6 +2178,24 @@ mod tests {
         assert_eq!(
             screen_to_logical_clamped((100.0, 540.0), (1920.0, 1080.0), (320, 240)),
             Some((0, 120))
+        );
+        assert_eq!(
+            screen_to_logical_clamped_with_toolbar(
+                (480.0, 30.0),
+                (960.0, 756.0),
+                (640, 480),
+                TOOLBAR_HEIGHT,
+            ),
+            None
+        );
+        assert_eq!(
+            screen_to_logical_clamped_with_toolbar(
+                (480.0, 36.0),
+                (960.0, 756.0),
+                (640, 480),
+                TOOLBAR_HEIGHT,
+            ),
+            Some((320, 0))
         );
     }
 
