@@ -1,18 +1,15 @@
 # ANSI C90 Compatibility TODO
 
-This roadmap divides the remaining work into three categories:
+This roadmap divides the remaining C90 compiler work into two categories:
 
-- **A — SuomiCPU-16 platform required:** target ABI, architecture, ISA, and
-  execution-engine work needed to make the C implementation correct on
-  SuomiCPU-16.
 - **B — Basic C game programming:** compiler and runtime work that directly
   helps users write and run practical, ordinary C games on this platform.
 - **C — Other C90 work:** remaining language completeness, hosted-standard
   library coverage, limits, independent conformance testing, and release
   certification.
 
-These categories prioritize and explain the tasks; **all three are needed for
-full C90 compatibility**. Tasks may depend on items in another category.
+These categories prioritize and explain the tasks; **both are needed for full
+C90 compatibility**. Tasks may depend on items in another category.
 
 **The compiler is not currently a fully conforming C90 implementation.** Keep
 that disclaimer in [`user_guide.md`](user_guide.md) until the release gates at
@@ -20,6 +17,14 @@ the end of this document pass. The ABI target is recorded in
 [`c90_target_abi.md`](c90_target_abi.md); it contains intended
 choices as well as existing behavior, so verify implementation before treating
 an ABI choice as delivered.
+
+SC-16 platform architecture, CPU features, target ABI prerequisites, boot,
+disk, privilege, multitasking, virtual-memory, and syscall work are tracked in
+[`sc16_improvements.md`](sc16_improvements.md). Architecture-dependent image
+format, linking, and hosted file I/O must follow that plan's executable-image,
+disk, and syscall contracts; do not create parallel designs here. This
+document remains the checklist for C90 language, compiler, library, and
+conformance work.
 
 ## Current baseline
 
@@ -108,9 +113,11 @@ does not establish language feature parity.
 - [ ] Full C90 declarators, typedefs, records, enums, linkage, and initializer
   semantics at translation-unit scope.
 - [ ] C90 preprocessor and include/header compatibility.
-- [ ] Type checking, diagnostics, and target ABI semantics.
-- [ ] Complete SC-16 assembly generation, runtime library linking, and image
-  output beyond the current integer-function subset.
+- [ ] Type checking and diagnostics for C90 semantics, including compiler
+  conformance to the target ABI defined in `c90_target_abi.md`.
+- [ ] Expand C90 assembly generation to cover the language and runtime features
+  listed in this roadmap. The target executable-image format, linking pipeline,
+  and disk packaging are tracked in [`sc16_improvements.md`](sc16_improvements.md).
 - [x] Remove the legacy runtime, compiler, assembler, network tool, test suite,
   and non-Rust dependency installation from CI.
 - [x] Restore useful integration coverage as Rust tests.
@@ -123,73 +130,6 @@ outside the current native subset fail with an unsupported-program diagnostic
 until their features are ported. The Rust frontend compiles Text Demo using
 console `fgets`, `puts`, and its supported `printf` formats. The module smoke
 build compiles all 17 bootable BIOS C modules.
-
-## A — SuomiCPU-16 platform required
-
-These tasks define and verify the target-specific representations and
-execution behavior. Add machine instructions only when existing instructions
-or correct runtime helpers cannot meet the ABI requirements.
-
-### A0. Implement the 30-bit control-flow ABI
-
-- [x] **Implement full-address calls, returns, and compact far control**
-  - Store return PCs as four big-endian bytes; `RET` and `RTI` restore all
-    30 address bits.
-  - Set the first function parameter at `SP + 4` and update assembly-library
-    argument offsets to match.
-  - Encode direct far control and conditional branches in six bytes, and add
-    register-pair indirect `JMPRP` / `CALLRP` for full 30-bit addresses.
-  - Add `LDI30` (with `LDI19`/`LDA` compatibility aliases) so assembler and
-    compiler-generated addresses preserve all 30 bits; verify assembler,
-    emulator, ABI offsets, and high addresses.
-
-### A1. Define C90 floating-point representations
-
-- [ ] **Define C90 floating-point representations** (`c90-float-model`)
-  - [x] Select and document IEEE-754 binary32 `float`, binary64 `double` and
-    `long double`, their sizes, byte order, alignment, literal conversion,
-    rounding, subnormals, signed zero, infinities, NaNs, and exception policy
-    in `c90_target_abi.md`.
-  - [x] Implement this model consistently in compiler types, object layout,
-    literal conversion, and the execution backend.
-  - [x] Update `float.h` limits and type sizes only with the implementation
-    that makes those limits true; the header now reports the implemented
-    binary32/binary64 limits.
-  - [x] Add compile-time and runtime boundary tests; claim C90 minimum range
-    and precision only when verified.
-
-### A2. Provide required floating-point machine operations
-
-- [x] **Provide required floating-point machine operations** (`c90-float-isa`)
-  - [x] Add assembler-encoded binary32/binary64 arithmetic, ordered compare,
-    integer and format conversions, negation, and square root.
-  - [x] Implement IEEE binary32/binary64 register encoding, rounding,
-    subnormal arithmetic, signed zero, infinities, NaNs, and comparison flags
-    in the emulator.
-  - [x] Implement the new instructions in the Rust CPU and add assembler,
-    validation, and execution regressions.
-  - **Depends on:** A1 (`c90-float-model`).
-
-### A3. Validate floating-point execution and ABI
-
-- [ ] **Validate floating-point ABI behavior** (`c90-float-validation`)
-  - Test exponent and precision boundaries, subnormals, signed zero,
-    infinities, NaNs, rounding, casts, constants, calls, and returns.
-  - Compare Rust CPU results with an independent reference.
-  - **Depends on:** B1 (`c90-float-backend`).
-
-### A4. Validate the complete SuomiCPU-16 C ABI
-
-- [ ] **Validate the complete target ABI** (`c90-abi-conformance`)
-  - Verify widths, ranges, representations, endianness, alignment, aggregate
-    layout, object/function pointers, conversions, stack frames, and scalar
-    and aggregate calling conventions.
-  - Exercise relevant C-visible memory, control-flow, and floating-point
-    behavior across assembler and both emulator implementations.
-  - Update `c90_target_abi.md` only from verified behavior.
-  - **Depends on:** A3, B2 (`c90-indirect-calls`), C1
-    (`c90-pointer-qualifiers`), C3 (`c90-bitfield-codegen`), B4
-    (`c90-linkage-storage`), and B5 (`c90-initializers`).
 
 ## B — Basic C game programming
 
@@ -207,7 +147,8 @@ C90 requirements listed under C.
     arithmetic, comparisons, assignments, and conditional expressions.
   - Implement arguments, returns, variadic promotions, and `sizeof` according
     to the target ABI.
-  - **Depends on:** A1 (`c90-float-model`) and A2 (`c90-float-isa`).
+  - **Depends on:** `c90-float-model` and `c90-float-isa` in
+    [`sc16_improvements.md`](sc16_improvements.md).
 
 ### B2. Parse and call through function pointers
 
@@ -229,7 +170,7 @@ C90 requirements listed under C.
     register clobbers.
   - Diagnose invalid conversions between object and function pointers.
   - **Depends on:** B2a (`c90-function-pointer-types`). Verify the completed
-    ABI in A4 (`c90-abi-conformance`).
+    ABI in `c90-abi-conformance` in [`sc16_improvements.md`](sc16_improvements.md).
 
 ### B3. Complete declarations needed for real programs
 
@@ -307,27 +248,19 @@ required before claiming full C90 compatibility.
     and declaration paths.
   - **Depends on:** B2a (`c90-function-pointer-types`).
 
-### C2. Define bit-field layout
-
-- [ ] **Define C90 bit-field allocation rules** (`c90-bitfield-layout`)
-  - Specify allocation-unit size, bit order, signedness, alignment, packing,
-    boundary crossing, unnamed fields, and zero-width fields.
-  - Define interactions with `sizeof`, unions, record padding, and
-    `offsetof` constraints.
-  - Document implementation-defined choices in `c90_target_abi.md` and
-    add layout tests.
-
-### C3. Implement bit-field accesses
+### C2. Implement bit-field accesses
 
 - [ ] **Implement C90 bit-field accesses** (`c90-bitfield-codegen`)
-  - Parse and validate fields and allocate them using C2's ABI rules.
+  - Parse and validate fields and allocate them using `c90-bitfield-layout`
+    in [`sc16_improvements.md`](sc16_improvements.md).
   - Generate signed/unsigned loads and read/modify/write stores.
   - Cover assignment, compound assignment, increment/decrement, promotions,
     initialization, unions, and volatile fields.
   - Diagnose invalid base types and widths.
-  - **Depends on:** C2 (`c90-bitfield-layout`).
+  - **Depends on:** `c90-bitfield-layout` in
+    [`sc16_improvements.md`](sc16_improvements.md).
 
-### C4. Complete preprocessing semantics
+### C3. Complete preprocessing semantics
 
 - [ ] **Complete C90 preprocessing semantics** (`c90-preprocessor`)
   - Audit preprocessing translation phases and directives against C90.
@@ -337,7 +270,7 @@ required before claiming full C90 compatibility.
     diagnostics, line mapping, and trigraph/splice ordering.
   - Add tests independent of code generation.
 
-### C5. Enforce C90 translation limits
+### C4. Enforce C90 translation limits
 
 - [ ] **Enforce C90 translation limits and constraints**
   (`c90-translation-limits`)
@@ -348,7 +281,7 @@ required before claiming full C90 compatibility.
     target/resource limits.
   - Test at and immediately beyond each required minimum.
 
-### C6. Implement all required C90 headers
+### C5. Implement all required C90 headers
 
 - [ ] **Implement all required C90 headers** (`c90-required-headers`)
   - Partial implementation now includes the console-only `<stdio.h>` interface
@@ -365,7 +298,9 @@ required before claiming full C90 compatibility.
     C90 `double` range, precision, or exceptional-value requirements.
   - The emulator now supplies a text console, BIOS device descriptor and
     startup data-disk selection. This does not load programs from disk:
-    programs selected by the BIOS still come from `modules/`.
+    programs selected by the BIOS still come from `modules/`. This is current
+    behavior; its replacement boot and disk model is planned in
+    [`sc16_improvements.md`](sc16_improvements.md).
   - Audit all required headers: `assert.h`, `ctype.h`, `errno.h`, `float.h`,
     `limits.h`, `locale.h`, `math.h`, `setjmp.h`, `signal.h`, `stdarg.h`,
     `stddef.h`, `stdio.h`, `stdlib.h`, `string.h`, and `time.h`.
@@ -373,17 +308,20 @@ required before claiming full C90 compatibility.
   - Verify standalone use, repeated inclusion where permitted, and varied
     combinations/order.
 
-### C7. Define hosted execution behavior
+### C6. Define hosted execution behavior
 
 - [ ] **Define C90 hosted execution behavior** (`c90-hosted-runtime`)
   - Specify standard stream/device mapping, file operations or explicit
     capability policy, buffering, EOF/error indicators, environment and
     command behavior, and process termination/status.
+  - Base file operations and process behavior on the folder-backed disk and
+    syscall ABI specified in [`sc16_improvements.md`](sc16_improvements.md);
+    keep the standard C interface distinct from SC-16-specific syscalls.
   - Surface unavailable resources and errors through documented C interfaces.
   - Add tests for available and unavailable services.
-  - **Depends on:** C6 (`c90-required-headers`).
+  - **Depends on:** C5 (`c90-required-headers`).
 
-### C8. Complete the required C90 library
+### C7. Complete the required C90 library
 
 - [ ] **Complete required C90 library functions** (`c90-library-functions`)
   - Implement required functions and macros from C90 headers, including
@@ -398,10 +336,10 @@ required before claiming full C90 compatibility.
     limitations.
   - Keep SC-16 screen/graphics routines documented as extensions, not
     replacements for standard interfaces.
-  - **Depends on:** C6 (`c90-required-headers`) and C7
+  - **Depends on:** C5 (`c90-required-headers`) and C6
     (`c90-hosted-runtime`).
 
-### C9. Integrate an independent conformance suite
+### C8. Integrate an independent conformance suite
 
 - [ ] **Integrate an independent C90 conformance suite**
   (`c90-independent-suite`)
@@ -409,7 +347,7 @@ required before claiming full C90 compatibility.
   - Add a repeatable runner for SC-16 and preserve categorized output.
   - Keep the suite independent of compiler implementation internals.
 
-### C10. Run conformance tests and resolve findings
+### C9. Run conformance tests and resolve findings
 
 - [ ] **Validate C90 conformance** (`c90-conformance-tests`)
   - Exercise the language, ABI, preprocessing, translation limits, and hosted
@@ -418,12 +356,13 @@ required before claiming full C90 compatibility.
     implementation-defined/unspecified behavior, unsupported hosted
     facilities, or invalid test assumptions.
   - Fix defects, add regressions, and publish repeatable emulator results.
-  - **Depends on:** A4 (`c90-abi-conformance`), B3
-    (`c90-declarators`), C4 (`c90-preprocessor`), C5
-    (`c90-translation-limits`), C8 (`c90-library-functions`), and C9
+  - **Depends on:** `c90-abi-conformance` in
+    [`sc16_improvements.md`](sc16_improvements.md), B3
+    (`c90-declarators`), C3 (`c90-preprocessor`), C4
+    (`c90-translation-limits`), C7 (`c90-library-functions`), and C8
     (`c90-independent-suite`).
 
-### C11. Close compatibility release gates
+### C10. Close compatibility release gates
 
 - [ ] **Close C90 compatibility release gates** (`c90-release-gate`)
   - Run repository tests and the independent conformance suite.
@@ -431,7 +370,8 @@ required before claiming full C90 compatibility.
     required headers/library behavior, and documentation.
   - Remove the nonconformance disclaimer only if the C90 requirements are
     satisfied and independent evidence supports the claim.
-  - **Depends on:** A4, C5, C8, and C10.
+  - **Depends on:** `c90-abi-conformance` in
+    [`sc16_improvements.md`](sc16_improvements.md), C4, C7, and C9.
 
 ## Completion criteria
 

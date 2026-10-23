@@ -1,0 +1,334 @@
+# SC-16 architecture modernization plan
+
+## Goal and design boundaries
+
+Evolve SC-16 from a flat-memory emulator with emulator-side module compilation
+and block-oriented virtual disks into a bootable computer architecture capable
+of running a protected, preemptively multitasking operating system with virtual
+memory.
+
+The work is intentionally staged. Keep the existing emulator, programs, and
+console usable while defining the new machine contract, then migrate firmware,
+disk images, and applications in explicit compatibility steps. Do not claim
+process isolation until user-mode memory accesses are actually protected by the
+MMU.
+
+## Existing roadmap integration
+
+- The architecture, boot, folder-backed disk, privilege, multitasking, MMU, and
+  syscall work that affects the C runtime is tracked here. The related C90
+  compiler, language, and ABI conformance work remains in
+  [`c90_todo.md`](./c90_todo.md); its hosted-runtime and image-output tasks must
+  follow this plan's syscall, disk, and executable-image contracts rather than
+  introducing competing interfaces.
+- The completed Python-to-Rust migration is recorded in
+  [`rust_migration.md`](./rust_migration.md). This plan does not reopen that
+  completed migration.
+- The SC-16 target ABI and CPU floating-point prerequisites formerly grouped
+  under “SuomiCPU-16 platform required” in `c90_todo.md` are tracked below.
+  Remaining C language/compiler features and independent C90 conformance stay
+  in [`c90_todo.md`](./c90_todo.md), with dependencies pointing back here.
+
+## Step-by-step TODO
+
+### Phase 0 — Maintain target ABI and CPU compatibility
+
+- [x] **Implement the 30-bit control-flow ABI** (`sc16-control-flow-abi`)
+  - Store return PCs as four big-endian bytes; `RET` and `RTI` restore all
+    30 address bits.
+  - Set the first function parameter at `SP + 4` and update assembly-library
+    argument offsets to match.
+  - Encode direct far control and conditional branches in six bytes; add
+    register-pair indirect `JMPRP` / `CALLRP` for full 30-bit addresses.
+  - Add `LDI30` (with `LDI19`/`LDA` compatibility aliases) so assembler and
+    compiler-generated addresses preserve all 30 bits; verify high addresses.
+- [ ] **Define and maintain the C target floating-point model**
+  (`c90-float-model`)
+  - [x] Select and document IEEE-754 binary32 `float`, binary64 `double` and
+    `long double`, their sizes, byte order, alignment, literal conversion,
+    rounding, subnormals, signed zero, infinities, NaNs, and exception policy
+    in `c90_target_abi.md`.
+  - [x] Implement the model consistently in compiler types, object layout,
+    literal conversion, and the execution backend.
+  - [x] Update `float.h` limits and type sizes only with the implementation
+    that makes those limits true.
+  - [x] Add compile-time and runtime boundary tests for the selected model.
+- [x] **Provide binary32/binary64 CPU operations** (`c90-float-isa`)
+  - [x] Add assembler-encoded arithmetic, ordered compare, integer and format
+    conversions, negation, and square root.
+  - [x] Implement register encoding, rounding, subnormal arithmetic, signed
+    zero, infinities, NaNs, and comparison flags in the emulator.
+  - [x] Add assembler, validation, and execution regressions.
+  - **Depends on:** `c90-float-model`.
+- [ ] **Validate floating-point execution and ABI behavior**
+  (`c90-float-validation`)
+  - Test exponent and precision boundaries, subnormals, signed zero,
+    infinities, NaNs, rounding, casts, constants, calls, and returns.
+  - Compare Rust CPU results with an independent reference.
+  - **Depends on:** `c90-float-backend` in `c90_todo.md`.
+- [ ] **Validate the complete C target ABI** (`c90-abi-conformance`)
+  - Verify widths, ranges, representations, endianness, alignment, aggregate
+    layout, object/function pointers, conversions, stack frames, and scalar
+    and aggregate calling conventions.
+  - Exercise C-visible memory, control-flow, and floating-point behavior
+    against the assembler and CPU implementation.
+  - Update `c90_target_abi.md` only from verified behavior.
+  - **Depends on:** `c90-float-validation`, `c90-indirect-calls`,
+    `c90-pointer-qualifiers`, `c90-bitfield-codegen`,
+    `c90-linkage-storage`, and `c90-initializers` in `c90_todo.md`.
+- [ ] **Define C90 bit-field target layout** (`c90-bitfield-layout`)
+  - Specify allocation-unit size, bit order, signedness, alignment, packing,
+    boundary crossing, unnamed fields, and zero-width fields.
+  - Define interactions with `sizeof`, unions, record padding, and
+    `offsetof` constraints.
+  - Document implementation-defined choices in `c90_target_abi.md` and add
+    layout tests.
+
+### Phase 1 — Specify the machine and image contracts
+
+- [ ] Write an SC-16 architecture specification covering reset state, address
+  width, byte order, instruction behavior, exceptions, privilege transitions,
+  interrupts, memory translation, and device access.
+- [ ] Define the privilege model: reset enters kernel mode; user mode cannot
+  execute privileged instructions, alter control registers, modify interrupt
+  state, access kernel-only mappings, or access protected devices.
+- [ ] Define exception and interrupt entry/return frames, including the saved
+  privilege level, PC, flags, stack selection, and the behavior for faults
+  during entry or return.
+- [ ] Define a versioned boot manifest and disk metadata JSON schema. Specify
+  required and optional fields, validation errors, encoding, path rules, file
+  lengths, disk capacity, boot image names, default executable, requested
+  execution mode, and manifest compatibility/version handling.
+- [ ] Define a standard executable image format and offline build pipeline.
+  Include entry point, load segments, permissions, alignment, relocation policy,
+  and rejected malformed-image cases.
+- [ ] Coordinate executable-image, calling-convention, and process-entry
+  decisions with the target ABI in `c90_target_abi.md`; update that ABI document
+  only after implementation and conformance tests confirm the behavior.
+- [ ] Document the current architecture and migration incompatibilities.
+  Keep this specification authoritative for implementation and tests.
+
+### Phase 2 — Establish deterministic boot and firmware boundaries
+
+- [ ] Change CPU reset/power-on state to enter kernel mode at a documented
+  firmware entry point with interrupts disabled and a defined stack/control
+  state.
+- [ ] Keep the current graphical console/window behavior as the default
+  presentation. Do not make text-console startup a prerequisite for boot.
+- [ ] Separate emulator hardware initialization from guest firmware execution.
+  The emulator initializes devices and memory, then transfers control to BIOS
+  firmware; it must not compile or assemble guest programs during boot.
+- [ ] Define and implement one unambiguous firmware chain: system BIOS starts in
+  kernel mode, discovers disks and presents the existing graphical selector,
+  loads the selected disk's standardized `boot.bin` in kernel mode, and transfers
+  control to it.
+- [ ] Implement `boot.bin` as the common disk boot program. It reads and
+  validates the selected disk's JSON manifest, loads the declared executable,
+  applies the manifest's USER/KERNEL launch mode, and enters it through the
+  specified privilege-transition mechanism.
+- [ ] Treat each disk's `bios.bin` and `main.bin` as required disk contents
+  while keeping their responsibilities distinct from host BIOS and `boot.bin`.
+  Reject missing, malformed, or incompatible required images with a visible
+  boot error instead of silently falling back to compilation.
+- [ ] Add boot tests for cold reset, firmware selection, `boot.bin` loading,
+  manifest-driven program selection, both launch modes, invalid images, and
+  recoverable boot failures.
+
+### Phase 3 — Replace block disks with host-folder disks
+
+- [ ] Design a disk abstraction backed by one explicitly configured host folder
+  per disk. A disk's files and subfolders appear as its guest-visible
+  filesystem; do not emulate sectors, cylinders, blocks, or block pointers.
+- [ ] Implement manifest parsing and disk discovery using the new metadata
+  format, including disk identity, label, capacity/size metadata, and boot-file
+  declarations.
+- [ ] Implement guest filesystem operations for listing directories, reading
+  files, writing files, creating directories, deleting/renaming entries, and
+  querying metadata, subject to the finalized syscall/device interface.
+- [ ] Confine normalized guest paths to the mounted disk root. Reject traversal,
+  invalid paths, unsupported file types, and host I/O failures explicitly.
+- [ ] Make read-only status a per-file manifest property used for files needed
+  to boot. Enforce it on writes, replacement, deletion, rename, and other
+  mutations; do not add general user/group/owner access-control semantics.
+- [ ] Define capacity accounting and behavior when files exceed the declared
+  disk size. Ensure it is enforced consistently for every operation.
+- [ ] Migrate existing JSON block disks and module data into folder-backed disk
+  images with a documented conversion tool or import path.
+- [ ] Remove block-level disk device behavior only after replacement APIs and
+  migration are covered by tests. Update disk editor, BIOS selection, examples,
+  and documentation to use disks rather than data-disk blocks.
+
+### Phase 4 — Implement kernel/user privilege and protected transitions
+
+- [ ] Add a CPU privilege-state representation and a reliable kernel-mode reset.
+- [ ] Classify instructions, control registers, interrupts, and MMIO regions as
+  privileged or user-accessible. Raise a defined exception on forbidden access.
+- [ ] Add a protected transition from kernel to user mode with a user PC and
+  user stack; prevent user code from forging or bypassing that transition.
+- [ ] Add a protected transition back to kernel mode for exceptions, interrupts,
+  and software system calls, using a kernel stack rather than trusting the
+  current user stack.
+- [ ] Implement exception vectors and interrupt descriptor handling with
+  privilege checks, nested-interrupt policy, acknowledgement, and a defined
+  return-from-interrupt instruction or frame contract.
+- [ ] Add tests proving that kernel operations continue to work and that
+  user-mode code cannot modify kernel state, execute privileged operations, or
+  reach protected memory/devices.
+
+### Phase 5 — Add interrupt-controller and scheduling foundations
+
+- [ ] Specify an interrupt descriptor table (IDT): descriptor layout, vector
+  numbering, gate types, privilege rules, installation, and invalid-vector
+  behavior. Migrate the existing fixed vectors to the specified table.
+- [ ] Specify and implement a programmable interval timer (PIT) with defined
+  clock source, frequency/divisor behavior, interrupt generation, masking, and
+  acknowledgement. Keep timer behavior deterministic in tests and headless
+  execution.
+- [ ] Add timer-driven preemption and a documented complete task context,
+  including all registers, flags, PC, privilege state, address-space identity,
+  and kernel/user stack state.
+- [ ] Implement kernel scheduler primitives for creating a task context,
+  switching contexts, yielding, exiting, and selecting the next runnable task.
+- [ ] Add tests with multiple tasks that demonstrate timer preemption, explicit
+  yield, register/flag preservation, blocked/woken tasks, and clean task exit.
+
+### Phase 6 — Add MMU and virtual memory protection
+
+- [ ] Specify MMU control registers, virtual/physical address widths, page size,
+  permission bits, page-fault causes, and the supervisor rules for translation.
+- [ ] Define and implement the page directory and page table entry formats,
+  including present, read/write, user/supervisor, and any required execute/cache
+  bits.
+- [ ] Implement page translation and page-fault exceptions for instruction
+  fetches, data reads/writes, and user/kernel permission violations.
+- [ ] Add address-space control registers and a safe address-space switch
+  operation. Define translation-cache/TLB behavior even if the first emulator
+  implementation has no performance cache.
+- [ ] Implement kernel page-frame allocation and freeing, page-table management,
+  and memory accounting.
+- [ ] Establish and test the kernel's physical-memory identity mapping and
+  transition to normal virtual mappings. Specify which devices are mapped and
+  ensure user mappings cannot access kernel or protected MMIO pages.
+- [ ] Add kernel mapping helpers for allocation, mapping, unmapping, and
+  permission changes. Define page-fault recovery versus process termination.
+- [ ] Test isolation between processes, guard pages, invalid/unmapped accesses,
+  read-only pages, user/supervisor permissions, address-space switching, and
+  physical-frame reuse.
+
+### Phase 7 — Define and implement the system-call ABI
+
+- [ ] Specify the software-interrupt or dedicated system-call instruction,
+  syscall number and argument convention, return/error convention, privilege
+  transition frame, and ABI versioning.
+- [ ] Define how the C runtime and hosted C library use the syscall ABI.
+  Preserve standard C interfaces where appropriate, document SC-16 extensions,
+  and distinguish unavailable host services from implemented file operations.
+- [ ] Implement syscall dispatch with validated user pointers, bounded
+  transfers, defined errors, and no direct trust of user-supplied addresses.
+- [ ] Implement `sys_spawn` to load a manifest-authorized executable into a new
+  protected address space and create a task.
+- [ ] Implement `sys_exit`, `sys_yield`, and `sys_getpid`.
+- [ ] Implement `sys_mmap` with page permissions and process ownership rules.
+- [ ] Implement `sys_read` and `sys_write` for the console and folder-backed
+  disk filesystem, with explicit file-handle, path, and partial-I/O behavior.
+- [ ] Implement `sys_sleep` using timer ticks and a blocked-task wakeup queue.
+- [ ] Implement `sys_wait` with child-process status collection and defined
+  behavior for invalid/non-child process IDs.
+- [ ] Resolve and implement the requested `sys_sep_op` syscall after confirming
+  its intended name and behavior.
+- [ ] Add ABI-level tests for valid calls, invalid syscall numbers, invalid or
+  unmapped user pointers, permissions, interrupted calls, and task lifecycle.
+
+### Phase 8 — Convert modules and build workflows to disks
+
+- [ ] Convert each runnable module into a disk folder/image containing
+  `disk.json`, required `bios.bin`, standardized `boot.bin`, `main.bin`, and its
+  runtime assets/data.
+- [ ] Move assembly and C compilation out of BIOS/emulator startup. Provide
+  offline build commands that compile and link programs, produce the specified
+  executable image, and package the disk manifest and files.
+- [ ] Preserve `sc16build` and the Rust compiler as offline developer/build
+  tools; ensure disk boot and program launch consume prebuilt images and never
+  invoke a compiler or assembler inside the guest BIOS.
+- [ ] Reconcile C90 hosted execution and file-backed `stdio` work in
+  `c90_todo.md` with the folder-backed disk and `sys_read`/`sys_write` ABI.
+  Implement hosted file streams only after those interfaces and error semantics
+  are stable.
+- [ ] Update module discovery and BIOS UI to enumerate disks and show manifest
+  metadata rather than scanning C source files and compiling selected modules.
+- [ ] Update direct-program launch, `--disk`, reset/reboot, gallery, examples,
+  build scripts, CI, and test fixtures to use disk images and the standard boot
+  flow.
+- [ ] Remove the old in-emulator assembler/compiler boot path after all
+  supported applications have migrated and equivalent offline tooling is
+  verified.
+- [ ] Update user and architecture documentation, including disk creation,
+  offline compilation, boot troubleshooting, privilege modes, interrupts, MMU,
+  and syscall ABI.
+
+### Phase 9 — Demonstrate a protected multitasking OS
+
+- [ ] Build a minimal kernel disk that boots through the standardized firmware
+  chain, initializes protected memory and the PIT/IDT, and enters user mode.
+- [ ] Run at least two isolated user tasks that are preempted and scheduled
+  without losing register state or allowing one task to access the other's
+  memory.
+- [ ] Demonstrate the syscall lifecycle (`spawn`, `yield`, `sleep`, `wait`,
+  file/console I/O, and `exit`) from user programs.
+- [ ] Add end-to-end tests for cold boot through disk selection, kernel startup,
+  user launch, task switching, protection faults, and clean shutdown/reboot.
+- [ ] Publish the supported machine/boot/disk/syscall versions and explicitly
+  list any unimplemented features before describing the architecture as ready
+  for general-purpose operating systems.
+
+## Questions and answers
+
+### Q1. What does `sys_sep_op` mean?
+
+**A:** Unresolved. Confirm whether this means `sys_seek` (change a file's read
+position), `sys_sem_op` (semaphore operation), or another syscall before
+finalizing the syscall ABI.
+
+### Q2. How do host BIOS, per-disk `bios.bin`, and standardized `boot.bin` relate?
+
+**A:** The plan assumes host/emulator BIOS performs device setup and disk
+selection, then launches the standardized kernel-mode `boot.bin`; each disk
+also contains `bios.bin` as requested, but its exact role relative to
+`boot.bin` remains unresolved. Decide whether it is per-disk firmware,
+compatibility metadata, a secondary loader, or redundant before freezing disk
+requirements.
+
+### Q3. Which image chooses the default program and USER/KERNEL launch mode?
+
+**A:** The plan assumes `boot.bin` reads these choices from the selected disk's
+JSON manifest. Confirm whether `main.bin` is always the default executable or
+whether the manifest may select a different executable and mode.
+
+### Q4. What exact meaning should disk `size` have?
+
+**A:** The plan assumes it is a capacity limit enforced on host-folder contents.
+Confirm whether size instead describes virtual media capacity, should be
+derived from files, or is only informational; also decide whether disk folders
+may be mounted read-only as a whole.
+
+### Q5. What is the target MMU architecture?
+
+**A:** Unresolved. Select virtual and physical address widths, page size,
+page-table depth/format, TLB expectations, and whether the existing 30-bit
+physical address space should be retained. The plan treats identity mapping as
+a boot-time kernel mapping, not as the final user address-space layout.
+
+### Q6. What does “bios.bin prepares SC-16 to run main.bin USER or KERNEL mode”
+mean for the trust model?
+
+**A:** Unresolved. Decide which component is trusted to request kernel-mode
+execution, whether disk-provided kernel programs are always trusted, and what
+policy prevents an untrusted disk manifest or user program from requesting
+kernel privileges.
+
+### Q7. Which legacy disk and application compatibility is required?
+
+**A:** Unresolved. Decide whether existing block-disk data, C/assembly sources,
+`.sc16img` files, command-line direct launches, and older module folders need
+automatic migration, an import tool, or may be retired after a documented
+transition period.
