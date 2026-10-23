@@ -336,6 +336,7 @@ enum NativeLocation {
         size: usize,
     },
     StackFloatingPointScalar {
+        offset: usize,
         size: usize,
     },
     ByteStackScalar {
@@ -2233,13 +2234,7 @@ fn collect_native_locals(
                         *frame_size = new_frame_size;
                     } else {
                         if let Some(size) = native_floating_type_size(&declaration.c_type) {
-                            if declaration.initializer.is_some() {
-                                eprintln!(
-                                    "floating local initializers are not supported for {}",
-                                    declaration.name
-                                );
-                                return false;
-                            }
+                            let offset = *frame_size;
                             let Some(new_frame_size) = frame_size.checked_add(size) else {
                                 return false;
                             };
@@ -2253,7 +2248,7 @@ fn collect_native_locals(
                             *frame_size = new_frame_size;
                             locals.insert(
                                 declaration.name.clone(),
-                                NativeLocation::StackFloatingPointScalar { size },
+                                NativeLocation::StackFloatingPointScalar { offset, size },
                             );
                             continue;
                         }
@@ -3558,6 +3553,26 @@ fn emit_native_stack_adjustment(frame_size: usize, allocate: bool, assembly: &mu
     }
 }
 
+fn emit_native_floating_stack_store(
+    bytes: &[u8],
+    offset: usize,
+    assembly: &mut String,
+) -> Option<()> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    for (word_index, word) in bytes.chunks_exact(2).enumerate() {
+        let word_offset = offset.checked_add(word_index.checked_mul(2)?)?;
+        assembly.push_str("    MOV R7, R3\n");
+        emit_native_stack_offset(7, word_offset, assembly);
+        assembly.push_str(&format!(
+            "    LDI R4, 0x{:02X}{:02X}\n    STW R7, R4\n",
+            word[0], word[1]
+        ));
+    }
+    Some(())
+}
+
 fn native_expression_pointer_element_size(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
@@ -3925,6 +3940,7 @@ fn emit_native_expression(
                 ExpressionKind::Atom(name) => match locals.get(name) {
                     Some(NativeLocation::StackScalar { offset, .. })
                     | Some(NativeLocation::ByteStackScalar { offset, .. })
+                    | Some(NativeLocation::StackFloatingPointScalar { offset, .. })
                     | Some(NativeLocation::PointerStack { offset, .. }) => {
                         assembly.push_str("    MOV R7, R3\n");
                         emit_native_stack_offset(7, *offset, assembly);
@@ -5112,6 +5128,7 @@ fn emit_native_statement(
         StatementKind::Declaration(declarations) => {
             for declaration in declarations {
                 if let Some(NativeLocation::StackArray {
+                    offset,
                     length,
                     element_size,
                     ..
@@ -5119,7 +5136,31 @@ fn emit_native_statement(
                 {
                     if let Some(initializer) = &declaration.initializer {
                         if *element_size > 2 {
-                            return None;
+                            if declaration.array_dimensions.len() != 1
+                                || *length > 512
+                                || !matches!(initializer.kind, ExpressionKind::InitializerList(_))
+                            {
+                                return None;
+                            }
+                            let values = flatten_initializer_values(initializer)?;
+                            if values.len() > *length {
+                                return None;
+                            }
+                            let element_type = native_unqualified_type(&declaration.c_type);
+                            for index in 0..*length {
+                                let bytes = if let Some(value) = values.get(index) {
+                                    native_floating_initializer(value, element_type)?
+                                } else {
+                                    vec![0; *element_size]
+                                };
+                                if bytes.len() != *element_size {
+                                    return None;
+                                }
+                                let element_offset =
+                                    offset.checked_add(index.checked_mul(*element_size)?)?;
+                                emit_native_floating_stack_store(&bytes, element_offset, assembly)?;
+                            }
+                            continue;
                         }
                         if let ExpressionKind::Atom(string_token) = &initializer.kind
                             && let Some(bytes) = decode_string_token(string_token)
@@ -5230,8 +5271,17 @@ fn emit_native_statement(
                             emit_native_stack_offset(7, *offset, assembly);
                             assembly.push_str("    STW R7, R4\n");
                         }
-                        NativeLocation::StackFloatingPointScalar { .. }
-                        | NativeLocation::FloatingPointScalar { .. } => return None,
+                        NativeLocation::StackFloatingPointScalar { offset, size } => {
+                            let bytes = native_floating_initializer(
+                                initializer,
+                                native_unqualified_type(&declaration.c_type),
+                            )?;
+                            if bytes.len() != *size {
+                                return None;
+                            }
+                            emit_native_floating_stack_store(&bytes, *offset, assembly)?;
+                        }
+                        NativeLocation::FloatingPointScalar { .. } => return None,
                         NativeLocation::ByteStackScalar { offset, signed } => {
                             if !emit_native_expression(
                                 initializer,
@@ -11508,7 +11558,6 @@ mod tests {
         assert_eq!(cpu.registers[0], 28);
 
         for unsupported in [
-            "int main(void) { float value = 1.5f; return 0; }",
             "int main(void) { float value; return value; }",
             "int main(void) { float values[2]; return values[0]; }",
         ] {
@@ -11517,6 +11566,83 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "unsupported floating object use must be rejected: {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn initializes_local_floating_scalars_and_arrays_from_literal_values() {
+        let source = "int main(void) { float single = 1.5f; double real = -2.0; \
+                      long double extended = 3.0L; float values[3] = { 1.0f, -0.0f }; \
+                      return sizeof(single) + sizeof(real) + sizeof(extended) + \
+                      sizeof(values); }";
+        let assembly = compile_minimal_program_to_assembly(source, "local-float-init.c")
+            .unwrap()
+            .expect("literal-initialized local floating objects");
+        for encoded in [
+            "LDI R4, 0x3FC0",
+            "LDI R4, 0xC000",
+            "LDI R4, 0x4008",
+            "LDI R4, 0x3F80",
+            "LDI R4, 0x8000",
+            "LDI R4, 0x0000",
+        ] {
+            assert!(assembly.contains(encoded), "missing {encoded}");
+        }
+        let image = compile_minimal_program(source, "local-float-init.c")
+            .unwrap()
+            .expect("local floating initializer program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 32);
+
+        let representation_source = "int main(void) { float value = 1.5f; \
+                                     unsigned char *bytes = (unsigned char *)&value; \
+                                     float values[2] = { -2.0f }; \
+                                     unsigned char *array = (unsigned char *)values; \
+                                     return bytes[0] != 0x3f || bytes[1] != 0xc0 || \
+                                     bytes[2] != 0 || bytes[3] != 0 || array[0] != 0xc0 || \
+                                     array[1] != 0 || array[2] != 0 || array[3] != 0 || \
+                                     array[4] != 0 || array[5] != 0 || array[6] != 0 || \
+                                     array[7] != 0; }";
+        let image = compile_minimal_program(representation_source, "local-float-bytes.c")
+            .unwrap()
+            .expect("character access to floating object representation");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let binary64_source = "int main(void) { double value = -2.0; \
+                               unsigned char *bytes = (unsigned char *)&value; \
+                               return bytes[0] != 0xc0 || bytes[1] != 0 || \
+                               bytes[2] != 0 || bytes[3] != 0 || bytes[4] != 0 || \
+                               bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0; }";
+        let image = compile_minimal_program(binary64_source, "local-double-bytes.c")
+            .unwrap()
+            .expect("character access to binary64 object representation");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        for unsupported in [
+            "int main(void) { float value = 1.0f + 2.0f; return 0; }",
+            "int main(void) { float values[2] = 1.0f; return 0; }",
+            "int main(void) { float values[1] = { 1.0f, 2.0f }; return 0; }",
+        ] {
+            assert!(
+                compile_minimal_program(unsupported, "unsupported-local-float-init.c")
+                    .unwrap()
+                    .is_none(),
+                "unsupported initializer must not be miscompiled: {unsupported}"
             );
         }
     }

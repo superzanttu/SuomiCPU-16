@@ -76,8 +76,12 @@ Checklist status: [x] completed; [ ] planned.
    initializers in big-endian object representation.
 ** [x] Reserve target-sized stack storage for uninitialized automatic floating
    scalars and arrays; report their correct +sizeof+ values.
-** [ ] Implement initialized automatic floating objects, runtime loads/stores,
-   literal expressions, conversions, arithmetic, comparisons, and
+** [x] Initialize automatic floating scalars and one-dimensional arrays from
+   numeric literal constants using the target binary32/binary64 object
+   representation; permit character-pointer inspection of initialized object
+   bytes.
+** [ ] Implement general automatic initializers, floating-value loads/stores,
+   expression evaluation, conversions, arithmetic, comparisons, and
    floating-point function arguments and results.
 ** [x] Verify +float.h+ limits against the target model and test binary32 /
    binary64 maximum, minimum-normal, epsilon, subnormal, and tie-rounding
