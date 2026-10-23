@@ -8,6 +8,7 @@
 *.c text eol=lf
 *.h text eol=lf
 *.asm text eol=lf
+*.adoc text eol=lf
 *.md text eol=lf
 
 # Preserve map JSON bytes for deterministic generated images

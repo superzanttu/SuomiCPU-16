@@ -8,8 +8,8 @@ use suomicpu16::Cpu;
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
 const INSTRUCTIONS_PER_FRAME: usize = 300_000;
-const GALLERY_START: &str = "<!-- module-gif-gallery:start -->";
-const GALLERY_END: &str = "<!-- module-gif-gallery:end -->";
+const GALLERY_START: &str = "// module-gif-gallery:start";
+const GALLERY_END: &str = "// module-gif-gallery:end";
 
 fn main() {
     if let Err(error) = run() {
@@ -41,7 +41,7 @@ fn parse_options() -> Result<Option<Options>, String> {
     let mut options = Options {
         modules_dir: root.join("modules"),
         output_dir: root.join("docs").join("module-gifs"),
-        readme: root.join("README.md"),
+        readme: root.join("README.adoc"),
         run_seconds: 10.0,
         gif_seconds: 15.0,
         fps: 30,
@@ -508,20 +508,20 @@ fn update_readme(
         String::new(),
         "Each animation captures a module running in the SC-16 emulator.".to_owned(),
         String::new(),
-        "| Module | Animation |".to_owned(),
-        "| --- | --- |".to_owned(),
     ];
     for (module, gif_path, error) in modules {
-        let name = module.name.replace('|', "\\|");
         if let Some(gif_path) = gif_path {
             let relative = pathdiff(readme.parent().unwrap_or_else(|| Path::new(".")), gif_path);
             rows.push(format!(
-                "| {name} | <img src=\"{}\" alt=\"{name} running in SC-16\" width=\"320\"> |",
-                relative.to_string_lossy().replace('\\', "/")
+                "* {}\n+\nimage::{}[{} running in SC-16,width=320]",
+                module.name,
+                relative.to_string_lossy().replace('\\', "/"),
+                module.name
             ));
         } else {
             rows.push(format!(
-                "| {name} | Capture unavailable: {} |",
+                "* {} — Capture unavailable: {}",
+                module.name,
                 error.as_deref().unwrap_or("not generated")
             ));
         }
@@ -545,7 +545,7 @@ fn update_readme(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "README gallery markers are incomplete: {}",
+                    "AsciiDoc gallery markers are incomplete: {}",
                     readme.display()
                 ),
             ));
@@ -655,11 +655,11 @@ mod tests {
     }
 
     #[test]
-    fn readme_gallery_update_is_idempotent_and_emits_relative_links() {
+    fn readme_gallery_update_is_idempotent_and_emits_asciidoc_images() {
         let root = temp_path("sc16-gallery-readme");
         fs::create_dir_all(&root).unwrap();
-        let readme = root.join("README.md");
-        fs::write(&readme, "# Project\n").unwrap();
+        let readme = root.join("README.adoc");
+        fs::write(&readme, "= Project\n").unwrap();
         let module = Module {
             name: "Demo".to_owned(),
             source: Some(root.join("modules").join("Demo.c")),
@@ -671,7 +671,7 @@ mod tests {
         update_readme(&readme, &results).unwrap();
         let second = fs::read_to_string(&readme).unwrap();
         assert_eq!(first, second);
-        assert!(first.contains("docs/demo.gif"));
+        assert!(first.contains("image::docs/demo.gif[Demo running in SC-16,width=320]"));
         fs::remove_dir_all(root).unwrap();
     }
 

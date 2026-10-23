@@ -1,4 +1,4 @@
-# SC-16 C90 Target ABI
+= SC-16 C90 Target ABI
 
 This document records the target ABI decisions for completing hosted ANSI C90
 support. Floating-point object representation, literal conversion, scalar
@@ -7,59 +7,114 @@ not a claim that the compiler implements every C90 requirement; the compiler
 remains nonconforming until the implementation and independent conformance
 tests meet the acceptance criteria below.
 
-## Data model
+== Data model
 
-| C type | Target representation |
-| --- | --- |
-| `char`, `signed char`, `unsigned char` | 8 bits; plain `char` is signed |
-| `short`, `unsigned short` | 16 bits |
-| `int`, `unsigned int` | 16 bits |
-| `long`, `unsigned long` | 32 bits |
-| `float` | IEEE-754 binary32, 4 bytes |
-| `double` | IEEE-754 binary64, 8 bytes |
-| `long double` | IEEE-754 binary64, 8 bytes |
-| object pointer | 30-bit byte address, stored in 4 bytes |
-| function pointer | 30-bit byte address, stored in 4 bytes |
+[cols="1,1"]
+|===
+|C type
+|Target representation
+
+|+char+, +signed char+, +unsigned char+
+|8 bits; plain +char+ is signed
+
+|+short+, +unsigned short+
+|16 bits
+
+|+int+, +unsigned int+
+|16 bits
+
+|+long+, +unsigned long+
+|32 bits
+
+|+float+
+|IEEE-754 binary32, 4 bytes
+
+|+double+
+|IEEE-754 binary64, 8 bytes
+
+|+long double+
+|IEEE-754 binary64, 8 bytes
+
+|object pointer
+|30-bit byte address, stored in 4 bytes
+
+|function pointer
+|30-bit byte address, stored in 4 bytes
+|===
 
 Bytes are 8 bits. Multi-byte integer and floating representations are
 big-endian. Integer signedness and ranges follow the representations above;
-`long` therefore provides the minimum range required by C90. `float` and
-`double` are separate types in this target model. `long double` has the same
-representation and precision as `double`. The floating-point format decisions
++long+ therefore provides the minimum range required by C90. +float+ and
++double+ are separate types in this target model. +long double+ has the same
+representation and precision as +double+. The floating-point format decisions
 meet the C90 minimum precision and range requirements.
 
-### Floating-point representations
+=== Floating-point representations
 
-The target uses the IEEE-754 binary interchange formats. `float` is binary32:
+The target uses the IEEE-754 binary interchange formats. +float+ is binary32:
 one sign bit, an 8-bit exponent with bias 127, and a 23-bit trailing significand
-field. `double` and `long double` are binary64: one sign bit, an 11-bit
+field. +double+ and +long double+ are binary64: one sign bit, an 11-bit
 exponent with bias 1023, and a 52-bit trailing significand field. Floating
 objects use big-endian byte order. There is no additional alignment
 requirement; the existing aggregate layout places objects larger than one
 byte at even offsets.
 
-| Property | `float` | `double` / `long double` |
-| --- | ---: | ---: |
-| `*_MANT_DIG` | 24 | 53 |
-| `*_DIG` | 6 | 15 |
-| `*_MIN_EXP` | -125 | -1021 |
-| `*_MIN_10_EXP` | -37 | -307 |
-| `*_MAX_EXP` | 128 | 1024 |
-| `*_MAX_10_EXP` | 38 | 308 |
-| `*_EPSILON` | 2^-23 | 2^-52 |
-| `*_MIN` (minimum positive normalized value) | 2^-126 | 2^-1022 |
-| `*_MAX` | 2^128 - 2^104 | 2^1024 - 2^971 |
-| minimum positive subnormal | 2^-149 | 2^-1074 |
+[cols="1,1,1"]
+|===
+|Property
+|+float+
+|+double+ / +long double+
 
-Decimal floating constants without a suffix have type `double`; `f`/`F`
-suffixes select `float`, and `l`/`L` suffixes select `long double`. Conversion
+|+*_MANT_DIG+
+|24
+|53
+
+|+*_DIG+
+|6
+|15
+
+|+*_MIN_EXP+
+|-125
+|-1021
+
+|+*_MIN_10_EXP+
+|-37
+|-307
+
+|+*_MAX_EXP+
+|128
+|1024
+
+|+*_MAX_10_EXP+
+|38
+|308
+
+|+*_EPSILON+
+|2^-23
+|2^-52
+
+|+*_MIN+ (minimum positive normalized value)
+|2^-126
+|2^-1022
+
+|+*_MAX+
+|2^128 - 2^104
+|2^1024 - 2^971
+
+|minimum positive subnormal
+|2^-149
+|2^-1074
+|===
+
+Decimal floating constants without a suffix have type +double+; +f+/+F+
+suffixes select +float+, and +l+/+L+ suffixes select +long double+. Conversion
 to the destination format and every arithmetic operation round to nearest,
-ties to even; consequently `FLT_ROUNDS` is 1. Subnormals are supported
+ties to even; consequently +FLT_ROUNDS+ is 1. Subnormals are supported
 (gradual underflow), and signed zero is preserved. Overflow produces a signed
 infinity; finite nonzero division by zero produces a signed infinity; invalid
 arithmetic produces a quiet NaN.
 Newly generated NaNs use the canonical positive encodings
-`0x7FC00000` for binary32 and `0x7FF8000000000000` for binary64; NaN payload
++0x7FC00000+ for binary32 and +0x7FF8000000000000+ for binary64; NaN payload
 propagation is not part of the ABI. NaNs do not trap: ordered comparisons with
 a NaN are false, and NaN compares unequal to itself. Positive and negative
 zero compare equal. Floating exceptions do not trap and no floating status
@@ -69,8 +124,8 @@ The ISA implements binary32 and binary64 add, subtract, multiply, divide,
 ordered comparison, integer conversions, format conversion, negation, and
 square root. A float value occupies an even pair of registers; a double or
 long-double value occupies R0-R3 or R4-R7, most-significant word first.
-Assembler mnemonics use the `F32`/`F64` prefixes (`F32ADD`, `F64CMP`,
-`I32TOF64`, `F64TOI32`, etc.) and reject register groups that cross these
+Assembler mnemonics use the +F32+/+F64+ prefixes (+F32ADD+, +F64CMP+,
++I32TOF64+, +F64TOI32+, etc.) and reject register groups that cross these
 boundaries. The Rust CPU implements these instructions directly. Float-to-integer conversion truncates toward
 zero. The
 instruction returns zero for non-finite input and the low destination bits for
@@ -79,25 +134,25 @@ extension where C90 leaves the conversion result undefined.
 
 The compiler converts decimal floating constants directly to the selected
 binary format using round-to-nearest, ties-to-even. Unsuffixed constants have
-type `double`, `f`/`F` constants have type `float`, and `l`/`L` constants have
-type `long double`. In non-prototype calls, `float` arguments are promoted to
-`double`, as required by the default argument promotions. `float.h` describes
+type +double+, +f+/+F+ constants have type +float+, and +l+/+L+ constants have
+type +long double+. In non-prototype calls, +float+ arguments are promoted to
++double+, as required by the default argument promotions. +float.h+ describes
 the formats implemented here; its maximum, epsilon, and minimum constants
 round to the corresponding binary32/binary64 values.
 
 Pointer objects occupy four bytes. Their representation stores the low 16
 address bits first, followed by the high 14 address bits; each 16-bit word is
-big-endian. For example, address `0x01234567` is stored as `45 67 01 23`.
+big-endian. For example, address +0x01234567+ is stored as +45 67 01 23+.
 This word order is specific to the pointer representation; other multi-byte
 integer and floating representations are big-endian. Pointer arithmetic is
 defined over the flat byte-addressed machine space but must still obey C90's
 same-array object rules. The compiler must not silently truncate addresses or
 offsets. Explicit pointer-to-integer conversions preserve the complete address
-in a 32-bit `long` and the low 16 bits in a 16-bit `int`. Explicit integer-to-
+in a 32-bit +long+ and the low 16 bits in a 16-bit +int+. Explicit integer-to-
 pointer conversions use the low 30 bits. These conversion choices are
 implementation-defined.
 
-## Alignment and aggregates
+== Alignment and aggregates
 
 The machine is byte-addressable and permits unaligned loads and stores, so this
 ABI imposes no minimum address alignment on objects. Arrays have contiguous
@@ -109,30 +164,30 @@ of the structure. Other members use the current offset. The size of every
 structure or union is rounded up to an even number of bytes. Union members
 start at offset zero. These are implementation-defined padding choices, not
 hardware alignment requirements, and must be reflected identically by
-`sizeof`, `offsetof`, initializer emission, address calculations, and runtime
++sizeof+, +offsetof+, initializer emission, address calculations, and runtime
 accesses.
 
 There is no bit-field allocation-unit rule yet; before claiming conformance,
 the compiler must implement C90 bit-field declarations and document allocation
 order, unit size, and boundary behavior as implementation-defined choices.
 
-## Function calls
+== Function calls
 
 Arguments are evaluated and pushed right-to-left. The stack grows toward
 lower addresses. The caller removes arguments after return. The return address
 occupies four bytes and stores the 30-bit PC in big-endian order. At function
-entry, the first named parameter begins at `SP + 4`, followed by subsequent
+entry, the first named parameter begins at +SP \+ 4+, followed by subsequent
 parameters in declaration order; locals are
 allocated below the entry stack position.
 
-16-bit integer results use `R0`; 32-bit integer results use `R0:R1`, with the
-high word in the even register. Pointer results use `R0` for the low 16 address
-bits and the low 14 bits of `R1` for the high address bits. The machine
-provides register-pair `CALLRP` and `JMPRP` operations for full 30-bit
+16-bit integer results use +R0+; 32-bit integer results use +R0:R1+, with the
+high word in the even register. Pointer results use +R0+ for the low 16 address
+bits and the low 14 bits of +R1+ for the high address bits. The machine
+provides register-pair +CALLRP+ and +JMPRP+ operations for full 30-bit
 addresses, but compiler parsing and calling through C function-pointer
 declarators remain incomplete. Once implemented,
-32-bit floating results use `R0:R1` and 64-bit floating results use
-`R0:R1:R2:R3`, from most- to least-significant word. Arguments use their
+32-bit floating results use +R0:R1+ and 64-bit floating results use
++R0:R1:R2:R3+, from most- to least-significant word. Arguments use their
 in-memory object representations on the stack, including the 4-byte pointer
 representation.
 
@@ -146,24 +201,24 @@ temporaries in the caller's stack frame, so recursive calls do not share
 scratch storage. Runtime regressions cover nested return/argument expressions
 and recursive returns.
 
-## Hosted execution environment
+== Hosted execution environment
 
 The hosted implementation uses the emulator's byte-addressable 1 GiB
-address space. Startup firmware exposes a descriptor at `0x43040`, an
-interactive data-disk selector, and a memory-mapped console at `0x43200`.
+address space. Startup firmware exposes a descriptor at +0x43040+, an
+interactive data-disk selector, and a memory-mapped console at +0x43200+.
 Selected modules are still loaded into memory by the emulator; virtual disks
 store program data only. The console currently supports a subset of standard
 text streams and formatted output. File-backed streams, floating-point format
 conversions, and several required C90 I/O facilities remain unimplemented.
 Device-mapped addresses retain their documented SC-16 behavior. Compiler
-global/static data is currently placed in `0x80000..0xFFFFF`; generated
-addresses use `LDI30` so this region and other addresses are not truncated to
+global/static data is currently placed in +0x80000..0xFFFFF+; generated
+addresses use +LDI30+ so this region and other addresses are not truncated to
 16 bits. This allocation does
 not reserve additional runtime heap or imply that every C90 translation-limit
 requirement has been met. Screen and graphics APIs remain implementation
 extensions and do not replace required C90 library interfaces.
 
-## Conformance gates
+== Conformance gates
 
 The current code does not yet satisfy this target. In particular, C
 function-pointer declarators and calls are incomplete, and the hosted library
@@ -172,21 +227,21 @@ parameter copies, and caller-owned record returns are implemented, but other
 declarator and ABI requirements remain incomplete. Regression tests cover
 30-bit pointer accesses and 30-bit return PCs, explicit
 32-bit-integer-to-pointer casts, high-address byte/word/long accesses, and
-indexed accesses crossing `0xFFFF`; these cases do not establish every pointer
+indexed accesses crossing +0xFFFF+; these cases do not establish every pointer
 conversion, arithmetic, alignment, or wraparound behavior.
 
 Do not remove the compiler's nonconformance disclaimer until all of the
 following pass:
 
-1. Compile-time and runtime ABI tests verify widths, ranges, endianness,
+. Compile-time and runtime ABI tests verify widths, ranges, endianness,
    alignment, aggregate offsets, pointer encoding, and all scalar/aggregate
    calling conventions.
-2. Rust CPU, compatibility emulator, and assembler execute identical tests for every C-visible
+. Rust CPU, compatibility emulator, and assembler execute identical tests for every C-visible
    memory, control-flow, and floating-point opcode. Calls and returns,
    including indirect calls, preserve all 30 PC bits; interrupt frames contain
    the four-byte PC and two-byte flags value.
-3. An independent C90 conformance suite passes, with each remaining failure
+. An independent C90 conformance suite passes, with each remaining failure
    categorized as a documented implementation-defined/unspecified behavior
    or fixed as a defect.
-4. Every required hosted C90 header and library interface is present and has
+. Every required hosted C90 header and library interface is present and has
    behavior and boundary tests.
