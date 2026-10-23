@@ -52,9 +52,12 @@ conformance work.
   arithmetic constant expressions are supported for addition, subtraction,
   multiplication, division, and integer remainder. Automatic scalar +float+
   initializers also support runtime binary32 arithmetic (+-+, +*+, +/+,
-  unary signs), loading local float values, and integer-to-float conversion.
-  General floating-value access and runtime expressions outside this
-  initializer subset remain unsupported. Constant casts to +float+, +double+,
+  unary signs), loading local float values, and integer-to-float conversion,
+  including integer arithmetic subexpressions in mixed expressions. Runtime
+  binary32 comparisons (+==+, +<+, +<=+, +>+, +>=+) are supported in automatic
+  integer initializers; tests cover unordered NaN behavior. The +!=+ operator
+  and general floating-value access and runtime expressions outside these
+  initializer subsets remain unsupported. Constant casts to +float+, +double+,
   and +long double+ are supported in these initializers.
   Tests verify +float.h+ limit macros,
   binary32/binary64 maximum, minimum-normal, epsilon, subnormal, and

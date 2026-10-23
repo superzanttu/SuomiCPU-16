@@ -39,8 +39,10 @@ contracts.
   now lays out and initializes global floating objects and supports sized
   automatic floating storage plus constant initializers using those formats.
   Runtime binary32 arithmetic is supported for automatic scalar initializers,
-  including local float loads and integer-to-float conversion. General
-  floating-value access, expressions outside this initializer subset,
+  including local float loads and integer-to-float conversion in mixed
+  expressions. Binary32 comparisons (+==+, +<+, +<=+, +>+, +>=+) are supported
+  in automatic integer initializers, with unordered NaN behavior tested.
+  General floating-value access, +!=+, expressions outside these initializer subsets,
   conversions, calls, and returns remain incomplete. Existing math routines
   still use binary16. See
   link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
@@ -89,13 +91,17 @@ Checklist status: [x] completed; [ ] planned.
    integer division semantics, operand order, and casts to binary32/binary64.
 ** [ ] Implement general automatic initializers, floating-value loads/stores,
    runtime conversions, arithmetic outside automatic scalar initializers,
-   comparisons, and floating-point function arguments and results.
+   complete comparison operators, and floating-point function arguments and
+   results.
 ** [x] Verify +float.h+ limits against the target model and test binary32 /
    binary64 maximum, minimum-normal, epsilon, subnormal, and tie-rounding
    initializer representations, including promotion of a rounded +float+
    constant to +double+.
 ** [x] Test binary32 runtime arithmetic in automatic scalar initializers,
-   including local loads, integer conversion, and all four arithmetic operators.
+   including local loads, integer subexpressions, and all four arithmetic
+   operators.
+** [ ] Test and implement binary32 runtime comparisons in automatic
+   initializers, including all comparison operators and unordered values.
 ** [ ] Add runtime floating-point execution tests for conversions, comparisons,
    calls, returns, and behavior outside the initializer subset.
 

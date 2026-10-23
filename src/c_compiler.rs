@@ -3728,7 +3728,12 @@ fn emit_native_f32_expression(
                         ) {
                             return false;
                         }
-                        assembly.push_str("    I16TOF32 R4, R0\n");
+                        let conversion = if native_expression_is_unsigned(expression, locals) {
+                            "U16TOF32"
+                        } else {
+                            "I16TOF32"
+                        };
+                        assembly.push_str(&format!("    {conversion} R4, R0\n"));
                         return true;
                     }
                     _ => return false,
@@ -3753,9 +3758,14 @@ fn emit_native_f32_expression(
             } else if let Some(value) = parse_integer_constant(value)
                 && (-0x8000..=0xffff).contains(&value)
             {
+                let conversion = if value > i64::from(i16::MAX) {
+                    "U16TOF32"
+                } else {
+                    "I16TOF32"
+                };
                 assembly.push_str(&format!(
-                    "    LDI R0, 0x{:04X}\n    I16TOF32 R4, R0\n",
-                    value as u16
+                    "    LDI R0, 0x{:04X}\n    {conversion} R4, R0\n",
+                    value as u16,
                 ));
                 true
             } else {
@@ -3780,10 +3790,29 @@ fn emit_native_f32_expression(
             operator,
             left,
             right,
-        } if matches!(operator.as_str(), "+" | "-" | "*" | "/")
-            && (native_expression_is_f32(left, locals)
-                || native_expression_is_f32(right, locals)) =>
-        {
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/") => {
+            if native_expression_is_f64(left, locals) || native_expression_is_f64(right, locals) {
+                return false;
+            }
+            if !native_expression_is_f32(left, locals) && !native_expression_is_f32(right, locals) {
+                if !emit_native_expression(
+                    expression,
+                    0,
+                    &[1, 2, 3, 4, 5, 6],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                let conversion = if native_expression_is_unsigned(expression, locals) {
+                    "U16TOF32"
+                } else {
+                    "I16TOF32"
+                };
+                assembly.push_str(&format!("    {conversion} R4, R0\n"));
+                return true;
+            }
             if !emit_native_f32_expression(left, locals, label_counter, assembly) {
                 return false;
             }
@@ -3802,8 +3831,76 @@ fn emit_native_f32_expression(
             assembly.push_str(&format!("    {instruction} R4, R0\n"));
             true
         }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "<" | "<=" | ">" | ">=")
+            && (native_expression_is_f32(left, locals)
+                || native_expression_is_f32(right, locals)) =>
+        {
+            if native_expression_is_f64(left, locals) || native_expression_is_f64(right, locals) {
+                return false;
+            }
+            if !emit_native_f32_comparison(
+                operator,
+                left,
+                right,
+                0,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    I16TOF32 R4, R0\n");
+            true
+        }
         _ => false,
     }
+}
+
+fn emit_native_f32_comparison(
+    operator: &str,
+    left: &Expression,
+    right: &Expression,
+    destination: u8,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let reverse_operands = matches!(operator, ">" | ">=");
+    let (first, second) = if reverse_operands {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    if !emit_native_f32_expression(first, locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str("    PUSH R4\n    PUSH R5\n");
+    if !emit_native_f32_expression(second, locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n    POP R5\n    POP R4\n");
+    assembly.push_str("    F32CMP R4, R0\n");
+    let branch = match operator {
+        "==" => "BZX",
+        "<" | ">" => "BCX",
+        "<=" | ">=" => "BLSX",
+        _ => return false,
+    };
+    let label = *label_counter;
+    *label_counter += 1;
+    assembly.push_str(&format!(
+        "    {branch} __c_fcmp_{label}_true\n\
+         LDI R{destination}, 0\n\
+         JMPX __c_fcmp_{label}_end\n\
+         __c_fcmp_{label}_true:\n\
+         LDI R{destination}, 1\n\
+         __c_fcmp_{label}_end:\n"
+    ));
+    true
 }
 
 fn native_expression_is_f32(
@@ -3826,6 +3923,37 @@ fn native_expression_is_f32(
         ExpressionKind::Cast { c_type, .. } => native_unqualified_type(c_type) == "float",
         ExpressionKind::Binary { left, right, .. } => {
             native_expression_is_f32(left, locals) || native_expression_is_f32(right, locals)
+        }
+        _ => false,
+    }
+}
+
+fn native_expression_is_f64(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(value) => match locals.get(value) {
+            Some(NativeLocation::FloatingPointScalar { size: 8 })
+            | Some(NativeLocation::StackFloatingPointScalar { size: 8, .. }) => true,
+            Some(NativeLocation::FloatingPointScalar { .. })
+            | Some(NativeLocation::StackFloatingPointScalar { .. }) => false,
+            None if parse_integer_constant(value).is_none() => {
+                let literal = value.strip_suffix(['f', 'F', 'l', 'L']).unwrap_or(value);
+                literal.parse::<f64>().is_ok() && !value.ends_with(['f', 'F'])
+            }
+            _ => false,
+        },
+        ExpressionKind::Unary { operand, .. } => native_expression_is_f64(operand, locals),
+        ExpressionKind::Cast { c_type, .. } => {
+            matches!(native_unqualified_type(c_type), "double" | "long double")
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/") => {
+            native_expression_is_f64(left, locals) || native_expression_is_f64(right, locals)
         }
         _ => false,
     }
@@ -4563,6 +4691,24 @@ fn emit_native_expression(
                 ));
             }
             true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "<" | "<=" | ">" | ">=")
+            && (native_expression_is_f32(left, locals)
+                || native_expression_is_f32(right, locals)) =>
+        {
+            emit_native_f32_comparison(
+                operator,
+                left,
+                right,
+                destination,
+                locals,
+                label_counter,
+                assembly,
+            )
         }
         ExpressionKind::Binary {
             operator,
@@ -12001,6 +12147,7 @@ mod tests {
         for unsupported in [
             "int main(void) { float values[2] = 1.0f; return 0; }",
             "int main(void) { float values[1] = { 1.0f, 2.0f }; return 0; }",
+            "int main(void) { float value = 1.0f; float result = value + 2.0; return 0; }",
         ] {
             assert!(
                 compile_minimal_program(unsupported, "unsupported-local-float-init.c")
@@ -12022,6 +12169,79 @@ mod tests {
         let image = compile_minimal_program(source, "runtime-f32-arithmetic.c")
             .unwrap()
             .expect("binary32 runtime arithmetic in local initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let mixed_source = "int main(void) { int first = 1; int second = 2; \
+                            float mixed = (first + second) + 0.5f; \
+                            unsigned char *bytes = (unsigned char *)&mixed; \
+                            return bytes[0] != 0x40 || bytes[1] != 0x60 || \
+                            bytes[2] != 0 || bytes[3] != 0; }";
+        let image = compile_minimal_program(mixed_source, "runtime-f32-mixed.c")
+            .unwrap()
+            .expect("integer subexpression converted for binary32 arithmetic");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let unsigned_source = "int main(void) { unsigned int value = 50000; \
+                               float converted = value; \
+                               unsigned char *bytes = (unsigned char *)&converted; \
+                               return bytes[0] != 0x47 || bytes[1] != 0x43 || \
+                               bytes[2] != 0x50 || bytes[3] != 0; }";
+        let image = compile_minimal_program(unsigned_source, "runtime-f32-unsigned-conversion.c")
+            .unwrap()
+            .expect("unsigned integer converted to binary32");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn evaluates_binary32_runtime_comparisons_in_local_initializers() {
+        for (expression, expected) in [
+            ("low < high", 1),
+            ("low <= high", 1),
+            ("high > low", 1),
+            ("high >= low", 1),
+            ("low == 1.25f", 1),
+            ("nan < high", 0),
+            ("nan <= high", 0),
+            ("nan == nan", 0),
+        ] {
+            let source = format!(
+                "int main(void) {{ float low = 1.25f; float high = 2.5f; \
+                 float nan = 0.0f / 0.0f; int result = {expression}; return result; }}"
+            );
+            let image = compile_minimal_program(&source, "runtime-f32-comparisons.c")
+                .unwrap()
+                .expect("binary32 comparison in an automatic integer initializer");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(2048).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "{expression}");
+        }
+
+        let source = "int main(void) { float low = 1.25f; float high = 2.5f; \
+                      float result = low < high; \
+                      unsigned char *bytes = (unsigned char *)&result; \
+                      return bytes[0] != 0x3f || bytes[1] != 0x80 || \
+                      bytes[2] != 0 || bytes[3] != 0; }";
+        let image = compile_minimal_program(source, "runtime-f32-comparison-to-float.c")
+            .unwrap()
+            .expect("binary32 comparison converted for a floating initializer");
         let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
