@@ -2624,6 +2624,153 @@ fn native_floating_type_size(c_type: &str) -> Option<usize> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum NativeFloatingConstant {
+    Integer(i64),
+    Binary32(f32),
+    Binary64(f64),
+}
+
+fn evaluate_native_floating_constant(expression: &Expression) -> Option<NativeFloatingConstant> {
+    match &expression.kind {
+        ExpressionKind::Atom(value) => {
+            if let Some(integer) =
+                parse_integer_constant(value).or_else(|| value.parse::<i64>().ok())
+            {
+                return Some(NativeFloatingConstant::Integer(integer));
+            }
+            let (literal, precision) = match value.chars().last() {
+                Some('f' | 'F') => (&value[..value.len() - 1], 32),
+                Some('l' | 'L') => (&value[..value.len() - 1], 64),
+                _ => (value.as_str(), 64),
+            };
+            if precision == 32 {
+                let value = literal.parse::<f32>().ok()?;
+                value
+                    .is_finite()
+                    .then_some(NativeFloatingConstant::Binary32(value))
+            } else {
+                let value = literal.parse::<f64>().ok()?;
+                value
+                    .is_finite()
+                    .then_some(NativeFloatingConstant::Binary64(value))
+            }
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "+" || operator == "-" => {
+            let value = evaluate_native_floating_constant(operand)?;
+            Some(match (operator.as_str(), value) {
+                ("+", value) => value,
+                ("-", NativeFloatingConstant::Integer(value)) => {
+                    NativeFloatingConstant::Integer(value.checked_neg()?)
+                }
+                ("-", NativeFloatingConstant::Binary32(value)) => {
+                    NativeFloatingConstant::Binary32(-value)
+                }
+                ("-", NativeFloatingConstant::Binary64(value)) => {
+                    NativeFloatingConstant::Binary64(-value)
+                }
+                _ => return None,
+            })
+        }
+        ExpressionKind::Cast { c_type, expression } => {
+            let target_type = native_unqualified_type(c_type);
+            let value = evaluate_native_floating_constant(expression)?;
+            match target_type {
+                "float" => {
+                    let value = match value {
+                        NativeFloatingConstant::Integer(value) => value as f32,
+                        NativeFloatingConstant::Binary32(value) => value,
+                        NativeFloatingConstant::Binary64(value) => value as f32,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary32(value))
+                }
+                "double" | "long double" => {
+                    let value = match value {
+                        NativeFloatingConstant::Integer(value) => value as f64,
+                        NativeFloatingConstant::Binary32(value) => value as f64,
+                        NativeFloatingConstant::Binary64(value) => value,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary64(value))
+                }
+                _ => None,
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/" | "%") => {
+            let left = evaluate_native_floating_constant(left)?;
+            let right = evaluate_native_floating_constant(right)?;
+            match (left, right) {
+                (NativeFloatingConstant::Integer(left), NativeFloatingConstant::Integer(right)) => {
+                    let value = match operator.as_str() {
+                        "+" => left.checked_add(right)?,
+                        "-" => left.checked_sub(right)?,
+                        "*" => left.checked_mul(right)?,
+                        "/" if right != 0 => left.checked_div(right)?,
+                        "%" if right != 0 => left.checked_rem(right)?,
+                        _ => return None,
+                    };
+                    Some(NativeFloatingConstant::Integer(value))
+                }
+                (left, right)
+                    if matches!(left, NativeFloatingConstant::Binary64(_))
+                        || matches!(right, NativeFloatingConstant::Binary64(_)) =>
+                {
+                    let to_f64 = |value| match value {
+                        NativeFloatingConstant::Integer(value) => value as f64,
+                        NativeFloatingConstant::Binary32(value) => value as f64,
+                        NativeFloatingConstant::Binary64(value) => value,
+                    };
+                    let left = to_f64(left);
+                    let right = to_f64(right);
+                    if matches!(operator.as_str(), "/" | "%") && right == 0.0 {
+                        return None;
+                    }
+                    let value = match operator.as_str() {
+                        "+" => left + right,
+                        "-" => left - right,
+                        "*" => left * right,
+                        "/" => left / right,
+                        _ => return None,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary64(value))
+                }
+                (left, right) => {
+                    let to_f32 = |value| match value {
+                        NativeFloatingConstant::Integer(value) => Some(value as f32),
+                        NativeFloatingConstant::Binary32(value) => Some(value),
+                        NativeFloatingConstant::Binary64(_) => None,
+                    };
+                    let left = to_f32(left)?;
+                    let right = to_f32(right)?;
+                    if matches!(operator.as_str(), "/" | "%") && right == 0.0 {
+                        return None;
+                    }
+                    let value = match operator.as_str() {
+                        "+" => left + right,
+                        "-" => left - right,
+                        "*" => left * right,
+                        "/" => left / right,
+                        _ => return None,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary32(value))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn native_floating_initializer(expression: &Expression, c_type: &str) -> Option<Vec<u8>> {
     let c_type = native_unqualified_type(c_type);
     let width = match c_type {
@@ -2639,45 +2786,21 @@ fn native_floating_initializer(expression: &Expression, c_type: &str) -> Option<
             }
             Some(bytes)
         }
-        ExpressionKind::Atom(value) => {
-            if let Some(integer) =
-                parse_integer_constant(value).or_else(|| value.parse::<i64>().ok())
-            {
-                return if width == 4 {
-                    Some((integer as f32).to_be_bytes().to_vec())
-                } else {
-                    Some((integer as f64).to_be_bytes().to_vec())
-                };
+        _ => match evaluate_native_floating_constant(expression)? {
+            NativeFloatingConstant::Integer(value) if width == 4 => {
+                Some((value as f32).to_be_bytes().to_vec())
             }
-            let (literal, source_is_float) = match value.chars().last() {
-                Some('f' | 'F') => (&value[..value.len() - 1], true),
-                Some('l' | 'L') => (&value[..value.len() - 1], false),
-                _ => (value.as_str(), false),
-            };
-            if source_is_float {
-                let value = literal.parse::<f32>().ok()?;
-                if !value.is_finite() {
-                    return None;
-                }
-                if width == 4 {
-                    Some(value.to_be_bytes().to_vec())
-                } else {
-                    Some((value as f64).to_be_bytes().to_vec())
-                }
-            } else {
-                let value = literal.parse::<f64>().ok()?;
-                if !value.is_finite() {
-                    return None;
-                }
-                if width == 4 {
-                    let value = value as f32;
-                    value.is_finite().then(|| value.to_be_bytes().to_vec())
-                } else {
-                    Some(value.to_be_bytes().to_vec())
-                }
+            NativeFloatingConstant::Integer(value) => Some((value as f64).to_be_bytes().to_vec()),
+            NativeFloatingConstant::Binary32(value) if width == 4 => {
+                Some(value.to_be_bytes().to_vec())
             }
-        }
-        _ => None,
+            NativeFloatingConstant::Binary32(value) => Some((value as f64).to_be_bytes().to_vec()),
+            NativeFloatingConstant::Binary64(value) if width == 4 => {
+                let value = value as f32;
+                value.is_finite().then(|| value.to_be_bytes().to_vec())
+            }
+            NativeFloatingConstant::Binary64(value) => Some(value.to_be_bytes().to_vec()),
+        },
     }
 }
 
@@ -5136,8 +5259,7 @@ fn emit_native_statement(
                 {
                     if let Some(initializer) = &declaration.initializer {
                         if *element_size > 2 {
-                            if declaration.array_dimensions.len() != 1
-                                || *length > 512
+                            if *length > 512
                                 || !matches!(initializer.kind, ExpressionKind::InitializerList(_))
                             {
                                 return None;
@@ -11462,6 +11584,15 @@ mod tests {
                       float ftie = 1.000000059604644775390625F;\n\
                       double dtie = 1.00000000000000011102230246251565404236316680908203125;\n\
                       double promoted = 1.000000059604644775390625F;\n\
+                      float fsum = 0.1f + 0.2f;\n\
+                      float fmul = 2.0f * 3.0f;\n\
+                      double ddiv = 7.0 / 2.0;\n\
+                      double mixed = 1.0f + 2.0;\n\
+                      double reverse_subtraction = 1.0 - 2.0f;\n\
+                      float integer_division = 1 / 2;\n\
+                      float integer_remainder = 5 % 2;\n\
+                      float cast_float = (float)1.000000059604644775390625;\n\
+                      double cast_double = (double)1.5f;\n\
                       int main(void) { return 0; }";
         let image = compile_minimal_program(source, "float-header-boundaries.c")
             .unwrap()
@@ -11490,6 +11621,35 @@ mod tests {
             &data.data[68..76],
             &[0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             "a float constant rounds to binary32 before promotion to double"
+        );
+        assert_eq!(&data.data[76..80], &[0x3e, 0x99, 0x99, 0x9a]);
+        assert_eq!(&data.data[80..84], &[0x40, 0xc0, 0x00, 0x00]);
+        assert_eq!(
+            &data.data[84..92],
+            &[0x40, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            &data.data[92..100],
+            &[0x40, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "binary64 arithmetic keeps operands in source order"
+        );
+        assert_eq!(
+            &data.data[100..108],
+            &[0xbf, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(&data.data[108..112], &[0, 0, 0, 0]);
+        assert_eq!(&data.data[112..116], &[0x3f, 0x80, 0, 0]);
+        assert_eq!(&data.data[116..120], &[0x3f, 0x80, 0, 0]);
+        assert_eq!(&data.data[120..128], &[0x3f, 0xf8, 0, 0, 0, 0, 0, 0]);
+
+        assert!(
+            compile_minimal_program(
+                "float invalid = 1.0f / 0.0f; int main(void) { return 0; }",
+                "float-divide-by-zero-initializer.c"
+            )
+            .unwrap()
+            .is_none(),
+            "constant-expression division by zero must not be silently emitted"
         );
 
         for (name, expected) in [
@@ -11618,6 +11778,41 @@ mod tests {
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 0);
 
+        let expression_source = "int main(void) { float value = 0.1f + 0.2f; \
+                                 unsigned char *bytes = (unsigned char *)&value; \
+                                 return bytes[0] != 0x3e || bytes[1] != 0x99 || \
+                                 bytes[2] != 0x99 || bytes[3] != 0x9a; }";
+        let image = compile_minimal_program(expression_source, "local-float-expression.c")
+            .unwrap()
+            .expect("local floating constant arithmetic");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let cast_source = "int main(void) { \
+                           float narrow = (float)1.000000059604644775390625; \
+                           double promoted = (double)1.5f; \
+                           unsigned char *narrow_bytes = (unsigned char *)&narrow; \
+                           unsigned char *wide_bytes = (unsigned char *)&promoted; \
+                           return narrow_bytes[0] != 0x3f || narrow_bytes[1] != 0x80 || \
+                           narrow_bytes[2] != 0 || narrow_bytes[3] != 0 || \
+                           wide_bytes[0] != 0x3f || wide_bytes[1] != 0xf8 || \
+                           wide_bytes[2] != 0 || wide_bytes[3] != 0 || \
+                           wide_bytes[4] != 0 || wide_bytes[5] != 0 || \
+                           wide_bytes[6] != 0 || wide_bytes[7] != 0; }";
+        let image = compile_minimal_program(cast_source, "local-float-casts.c")
+            .unwrap()
+            .expect("automatic floating casts in constant initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
         let binary64_source = "int main(void) { double value = -2.0; \
                                unsigned char *bytes = (unsigned char *)&value; \
                                return bytes[0] != 0xc0 || bytes[1] != 0 || \
@@ -11633,8 +11828,27 @@ mod tests {
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 0);
 
+        let multidimensional_source = "int main(void) { \
+                                      float values[2][2] = { { 1.0f, 2.0f }, { 3.0f } }; \
+                                      unsigned char *bytes = (unsigned char *)values; \
+                                      return bytes[0] != 0x3f || bytes[1] != 0x80 || \
+                                      bytes[4] != 0x40 || bytes[5] != 0 || \
+                                      bytes[8] != 0x40 || bytes[9] != 0x40 || \
+                                      bytes[12] != 0 || bytes[13] != 0 || \
+                                      bytes[14] != 0 || bytes[15] != 0; }";
+        let image =
+            compile_minimal_program(multidimensional_source, "local-float-multidimensional.c")
+                .unwrap()
+                .expect("multidimensional floating array initializer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
         for unsupported in [
-            "int main(void) { float value = 1.0f + 2.0f; return 0; }",
+            "int main(void) { float value = 1.0f / 0.0f; return 0; }",
             "int main(void) { float values[2] = 1.0f; return 0; }",
             "int main(void) { float values[1] = { 1.0f, 2.0f }; return 0; }",
         ] {

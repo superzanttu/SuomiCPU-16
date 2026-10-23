@@ -36,10 +36,11 @@ contracts.
   privilege modes, protected address spaces, page tables, or hardware task
   contexts.
 * The assembler and CPU provide binary32/binary64 instructions. The C compiler
-  now lays out and initializes global floating objects using those formats, but
-  runtime floating expressions, conversions, automatic objects, calls, and
-  returns remain unsupported. Existing math routines still use binary16.
-  See link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
+  now lays out and initializes global floating objects and supports sized
+  automatic floating storage plus constant initializers using those formats.
+  Runtime floating-value access, expressions, conversions, calls, and returns
+  remain unsupported. Existing math routines still use binary16. See
+  link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
 
 == Existing roadmap integration
 
@@ -76,13 +77,16 @@ Checklist status: [x] completed; [ ] planned.
    initializers in big-endian object representation.
 ** [x] Reserve target-sized stack storage for uninitialized automatic floating
    scalars and arrays; report their correct +sizeof+ values.
-** [x] Initialize automatic floating scalars and one-dimensional arrays from
-   numeric literal constants using the target binary32/binary64 object
-   representation; permit character-pointer inspection of initialized object
-   bytes.
+** [x] Initialize automatic floating scalars and arrays of any supported
+   dimensions from numeric literal constants using the target
+   binary32/binary64 object representation; permit character-pointer
+   inspection of initialized object bytes.
+** [x] Evaluate supported arithmetic constant expressions in global and
+   automatic floating initializers, preserving binary32 operation rounding,
+   integer division semantics, operand order, and casts to binary32/binary64.
 ** [ ] Implement general automatic initializers, floating-value loads/stores,
-   expression evaluation, conversions, arithmetic, comparisons, and
-   floating-point function arguments and results.
+   runtime conversions, arithmetic, comparisons, and floating-point function
+   arguments and results.
 ** [x] Verify +float.h+ limits against the target model and test binary32 /
    binary64 maximum, minimum-normal, epsilon, subnormal, and tie-rounding
    initializer representations, including promotion of a rounded +float+

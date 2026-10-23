@@ -46,11 +46,14 @@ conformance work.
   compiler now uses the target binary32/binary64 sizes for +sizeof+ and emits
   direct global floating initializers in big-endian form. Uninitialized
   automatic float objects and arrays reserve target-sized stack storage and
-  have correct +sizeof+ values. Automatic float scalars and one-dimensional
-  arrays can be initialized from numeric literals; their object bytes can be
-  inspected through character pointers. General initializer expressions,
-  floating-value access, and floating expressions remain unsupported. Tests
-  verify +float.h+ limit macros,
+  have correct +sizeof+ values. Automatic float scalars and arrays, including
+  multidimensional arrays, can be initialized from numeric literals; their
+  object bytes can be inspected through character pointers. General initializer
+  arithmetic constant expressions are supported for addition, subtraction,
+  multiplication, division, and integer remainder, but floating-value access
+  and runtime floating expressions remain unsupported. Constant casts to
+  +float+, +double+, and +long double+ are supported in these initializers.
+  Tests verify +float.h+ limit macros,
   binary32/binary64 maximum, minimum-normal, epsilon, subnormal, and
   halfway-rounding object encodings, including rounding a +float+ constant
   before promotion to +double+. Existing math routines still use binary16
