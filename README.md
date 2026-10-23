@@ -14,6 +14,8 @@ Runtime, tools, and tests are implemented in Rust.
 - Memory-mapped console, BIOS data-disk selection, JSON-backed virtual disks,
   module-sandboxed file reads, a layered GPU with 640x480x4-bit VRAM, hardware
   tile/sprite engines, and a fixed-point 3D graphics coprocessor.
+- Keyboard, RTC, and programmable instruction-timer interrupts for
+  software-managed task scheduling.
 
 ## Getting Started
 Install Rust and Cargo, then start the emulator with:

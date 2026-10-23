@@ -10,10 +10,11 @@ use crate::net::{DEFAULT_PORT, NetNode};
 pub const MEMORY_SIZE: usize = 1 << 30;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
 
-const ICR_ADDR: u32 = 0x43002;
+pub const ICR_ADDR: u32 = 0x43002;
 pub const VSYNC_ADDR: usize = 0x43013;
 const KEY_VECTOR_ADDR: u32 = 0x0002;
 const RTC_VECTOR_ADDR: u32 = 0x0006;
+const TIMER_VECTOR_ADDR: u32 = 0x000a;
 const KEYBOARD_ADDR: u32 = 0x43000;
 const KEYS_ADDR: u32 = 0x43004;
 const MOUSE_ADDR: u32 = 0x43008;
@@ -27,6 +28,7 @@ const GPU_LAYER_ORDER: u32 = GPU_BASE + 23;
 const GPU_LAYER_COUNT: usize = 5;
 const GPU_PALETTE: u8 = 27;
 const RTC_START: u32 = 0x43010;
+pub const TIMER_PERIOD_ADDR: u32 = 0x43014;
 const DISK_BASE: u32 = 0x43100;
 const DISK_STATUS: u32 = DISK_BASE + 16;
 const CONSOLE_DATA: u32 = 0x43200;
@@ -275,6 +277,8 @@ pub struct Cpu {
     split_cameras: Option<[(i32, i32); 2]>,
     memory_mask: u32,
     layer_mode: u8,
+    timer_period: u16,
+    timer_countdown: u16,
 }
 
 impl Cpu {
@@ -377,6 +381,8 @@ impl Cpu {
             split_cameras: None,
             memory_mask,
             layer_mode: 0,
+            timer_period: 0,
+            timer_countdown: 0,
         })
     }
 
@@ -673,6 +679,13 @@ impl Cpu {
         let address = address & self.memory_mask;
         let index = address as usize;
         self.memory[index] = value;
+        let timer_period_address = TIMER_PERIOD_ADDR & self.memory_mask;
+        if address == timer_period_address
+            || address == (timer_period_address.wrapping_add(1) & self.memory_mask)
+        {
+            self.timer_period = self.read_u16(TIMER_PERIOD_ADDR);
+            self.timer_countdown = self.timer_period;
+        }
         match address {
             GPU_BASE => self.gpu_command(value),
             DISK_BASE => self.disk_control(value),
@@ -1419,6 +1432,7 @@ impl Cpu {
             _ => return Err(CpuError::UnsupportedInstruction(instruction)),
         }
 
+        self.advance_timer();
         if self.read(ICR_ADDR) & 1 != 0 {
             self.check_interrupts();
         }
@@ -2712,21 +2726,37 @@ impl Cpu {
         if icr & 1 == 0 {
             return;
         }
-        let vector = if icr & 2 != 0 {
-            Some(KEY_VECTOR_ADDR)
+        let (pending_bit, vector) = if icr & 2 != 0 {
+            (2, KEY_VECTOR_ADDR)
+        } else if icr & 0x10 != 0 {
+            (0x10, TIMER_VECTOR_ADDR)
         } else if icr & 8 != 0 {
-            Some(RTC_VECTOR_ADDR)
+            (8, RTC_VECTOR_ADDR)
         } else {
-            None
+            return;
         };
-        if let Some(vector) = vector {
-            self.push_u32(self.pc);
-            self.push_u16(self.pack_flags());
-            let icr = self.read(ICR_ADDR) & !1;
+        self.push_u32(self.pc);
+        self.push_u16(self.pack_flags());
+        self.write(ICR_ADDR, (icr & !1) & !pending_bit);
+        self.pc = self.read_u32(vector) & self.memory_mask;
+    }
+
+    fn advance_timer(&mut self) {
+        let period = self.read_u16(TIMER_PERIOD_ADDR);
+        if period != self.timer_period {
+            self.timer_period = period;
+            self.timer_countdown = period;
+        }
+        if period == 0 {
+            self.timer_countdown = 0;
+            return;
+        }
+        if self.timer_countdown <= 1 {
+            self.timer_countdown = period;
+            let icr = self.read(ICR_ADDR) | 0x10;
             self.write(ICR_ADDR, icr);
-            let icr = self.read(ICR_ADDR) & !2 & !8;
-            self.write(ICR_ADDR, icr);
-            self.pc = self.read_u32(vector) & self.memory_mask;
+        } else {
+            self.timer_countdown -= 1;
         }
     }
 }
@@ -4481,7 +4511,10 @@ mod tests {
             assert_eq!(cpu.pc, handler);
             assert_eq!(cpu.read_u16(cpu.sp), 0b1101);
             assert_eq!(cpu.read_u32(cpu.sp + 2), 2);
-            assert_eq!(cpu.read(ICR_ADDR), 0);
+            assert_eq!(
+                cpu.read(ICR_ADDR),
+                pending & !(if pending & 2 != 0 { 2 } else { 8 })
+            );
 
             cpu.step().unwrap();
             assert_eq!(cpu.pc, 2);
@@ -4496,6 +4529,31 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn instruction_timer_interrupts_at_its_period_and_preserves_other_pending_sources() {
+        let mut cpu = cpu_with_program(&[(OP_MOV << 11), (OP_MOV << 11), (OP_MOV << 11)]);
+        cpu.write_u32_for_test(TIMER_VECTOR_ADDR, 0x100);
+        cpu.write_u16(0x100, OP_RTI << 11);
+        cpu.write_u16(TIMER_PERIOD_ADDR, 2);
+        cpu.write(ICR_ADDR, 1);
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 2);
+        cpu.write(ICR_ADDR, 1 | 8);
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(cpu.read_u32(cpu.sp + 2), 4);
+        assert_eq!(cpu.read(ICR_ADDR), 8);
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 4);
+        cpu.write(ICR_ADDR, 1 | 8);
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(cpu.read_u32(cpu.sp + 2), 6);
+        assert_eq!(cpu.read(ICR_ADDR), 8);
     }
 
     #[test]

@@ -13,4 +13,6 @@ pub mod tank16_finland;
 pub mod tank16_map;
 pub mod tank_maps;
 
-pub use cpu::{ADDRESS_MASK, Cpu, CpuError, Flags, MEMORY_SIZE, MemorySegment};
+pub use cpu::{
+    ADDRESS_MASK, Cpu, CpuError, Flags, ICR_ADDR, MEMORY_SIZE, MemorySegment, TIMER_PERIOD_ADDR,
+};

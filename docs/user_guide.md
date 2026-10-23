@@ -513,26 +513,55 @@ stores a big-endian word; `POP` reads that word and advances the pointer by two.
 into a general-purpose register, whereas `RET` and `RTI` use the full popped
 word. `LDW`/`STW` use big-endian byte order. `LDWS`/`STWS` address words from
 the current stack pointer; `ADJSP` reserves or releases a small stack region.
-Interrupt handling attempts to save the PC and `Z` flag, but not `C`.
-The interrupt vectors are two-byte absolute addresses stored at `0x0002`
-(keyboard) and `0x0004` (RTC).
+On interrupt entry, the CPU pushes the 30-bit return PC and all four condition
+flags (`Z`, `C`, `N`, and `V`) onto the current stack. `RTI` restores them.
+The interrupt vectors are four-byte, big-endian addresses at `0x0002`
+(keyboard), `0x0006` (RTC), and `0x000A` (instruction timer).
 
 Example vector setup:
 
 ```asm
 .address 0x0002
-.data hex 00, 70
-.address 0x0004
-.data hex 00, 70
+.data hex 00, 00, 00, 70
+.address 0x0006
+.data hex 00, 00, 00, 70
+.address 0x000a
+.data hex 00, 00, 00, 70
 .address 0x0070
 interrupt_handler:
     RTI
 ```
 
-Interrupt input and timing are emulator-specific. The emulated RTC sets its
-interrupt-pending bit on each display-loop update, and the emulator checks
-interrupts after each instruction. Set up vectors and an `RTI` handler before
-enabling interrupts.
+The interrupt control register (`ICR`, `0x43002`) uses bit 0 as the global
+interrupt enable, bit 1 as keyboard-pending, bit 3 as RTC-pending, and bit 4
+as instruction-timer-pending. The CPU services one pending source after each
+instruction, in keyboard, timer, RTC priority order. It clears only the source
+being serviced; other pending sources remain set. A pending bit coalesces
+repeated events of the same source until serviced.
+
+The 16-bit instruction-timer period is stored big-endian at `0x43014`-`0x43015`.
+Writing zero disables it; a nonzero period raises the timer interrupt every
+that many executed instructions and writing a new period restarts its countdown.
+The timer is independent of rendering and also runs during headless execution.
+The RTC still raises its interrupt on display-loop updates. Set up vectors and
+handlers before enabling interrupts.
+
+### Multitasking model
+
+The instruction timer and interrupt-return frame make preemptive software task
+switching possible. An interrupt frame saves the PC and flags, but not the
+general registers or stack pointer. A scheduler handler must first save every
+general register it will modify, save the resulting stack pointer in the
+current task's control block, load the next task's saved stack pointer, restore
+that task's registers, and finish with `RTI`. A task's saved stack must include
+its suspended interrupt frame so `RTI` resumes its own PC and flags. Enable the
+timer and global interrupts only after all task stacks, vectors, and scheduler
+state are initialized.
+
+SC-16 currently has one shared, writable address space and no user/supervisor
+modes, memory protection, or hardware task contexts. Such an OS can schedule
+cooperating tasks, but tasks are not isolated from one another or from the
+kernel; scheduling and register preservation are software responsibilities.
 
 ## 6. Instruction encoding and execution
 
@@ -569,6 +598,7 @@ memory ranges:
 | Interrupt control (`ICR`)                |           `0x43002` |       1 byte |
 | Speed register (0 = fixed, 1 = maximum)  |           `0x43003` |       1 byte |
 | Held-key bitmask                         |           `0x43004` |       1 byte |
+| Instruction-timer period                | `0x43014`-`0x43015` |      2 bytes |
 | Disk storage device                      |           `0x43100` |     16 bytes |
 | RTC seconds/minutes/hours                | `0x43010`-`0x43012` |      3 bytes |
 | Graphics coprocessor and layer registers| `0x43020`-`0x4303B` |     28 bytes |
