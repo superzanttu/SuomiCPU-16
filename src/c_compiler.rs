@@ -3696,6 +3696,147 @@ fn emit_native_floating_stack_store(
     Some(())
 }
 
+fn emit_native_f32_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(value) => {
+            if let Some(location) = locals.get(value) {
+                let (offset, global) = match location {
+                    NativeLocation::StackFloatingPointScalar { offset, size: 4 } => {
+                        (Some(*offset), false)
+                    }
+                    NativeLocation::FloatingPointScalar { size: 4 } => (None, true),
+                    NativeLocation::FloatingPointScalar { .. }
+                    | NativeLocation::StackFloatingPointScalar { .. } => return false,
+                    NativeLocation::Register { .. }
+                    | NativeLocation::StackScalar { .. }
+                    | NativeLocation::ByteRegister { .. }
+                    | NativeLocation::ByteStackScalar { .. }
+                    | NativeLocation::GlobalScalar { .. }
+                    | NativeLocation::GlobalByteScalar { .. } => {
+                        if !emit_native_expression(
+                            expression,
+                            0,
+                            &[1, 2, 3, 4, 5, 6],
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        assembly.push_str("    I16TOF32 R4, R0\n");
+                        return true;
+                    }
+                    _ => return false,
+                };
+                if global {
+                    assembly.push_str(&format!("    LDI30 R7, __c_global_{value}\n"));
+                } else {
+                    assembly.push_str("    MOV R7, R3\n");
+                    let Some(offset) = offset else {
+                        return false;
+                    };
+                    emit_native_stack_offset(7, offset, assembly);
+                }
+                assembly.push_str("    LDW R4, R7\n    ADD R7, 2\n    LDW R5, R7\n");
+                true
+            } else if let Some(bytes) = native_floating_initializer(expression, "float") {
+                assembly.push_str(&format!(
+                    "    LDI R4, 0x{:02X}{:02X}\n    LDI R5, 0x{:02X}{:02X}\n",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                ));
+                true
+            } else if let Some(value) = parse_integer_constant(value)
+                && (-0x8000..=0xffff).contains(&value)
+            {
+                assembly.push_str(&format!(
+                    "    LDI R0, 0x{:04X}\n    I16TOF32 R4, R0\n",
+                    value as u16
+                ));
+                true
+            } else {
+                false
+            }
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "+" || operator == "-" => {
+            if !emit_native_f32_expression(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            if operator == "-" {
+                assembly.push_str("    F32NEG R4\n");
+            }
+            true
+        }
+        ExpressionKind::Cast { c_type, expression }
+            if native_unqualified_type(c_type) == "float" =>
+        {
+            emit_native_f32_expression(expression, locals, label_counter, assembly)
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/")
+            && (native_expression_is_f32(left, locals)
+                || native_expression_is_f32(right, locals)) =>
+        {
+            if !emit_native_f32_expression(left, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n");
+            if !emit_native_f32_expression(right, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n    POP R5\n    POP R4\n");
+            let instruction = match operator.as_str() {
+                "+" => "F32ADD",
+                "-" => "F32SUB",
+                "*" => "F32MUL",
+                "/" => "F32DIV",
+                _ => return false,
+            };
+            assembly.push_str(&format!("    {instruction} R4, R0\n"));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn native_expression_is_f32(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(value) => match locals.get(value) {
+            Some(NativeLocation::FloatingPointScalar { size: 4 })
+            | Some(NativeLocation::StackFloatingPointScalar { size: 4, .. }) => true,
+            Some(NativeLocation::FloatingPointScalar { .. })
+            | Some(NativeLocation::StackFloatingPointScalar { .. }) => false,
+            None => value
+                .chars()
+                .last()
+                .is_some_and(|suffix| matches!(suffix, 'f' | 'F')),
+            _ => false,
+        },
+        ExpressionKind::Unary { operand, .. } => native_expression_is_f32(operand, locals),
+        ExpressionKind::Cast { c_type, .. } => native_unqualified_type(c_type) == "float",
+        ExpressionKind::Binary { left, right, .. } => {
+            native_expression_is_f32(left, locals) || native_expression_is_f32(right, locals)
+        }
+        _ => false,
+    }
+}
+
+fn emit_native_f32_stack_store(offset: usize, assembly: &mut String) {
+    assembly.push_str("    MOV R7, R3\n");
+    emit_native_stack_offset(7, offset, assembly);
+    assembly.push_str("    STW R7, R4\n    ADD R7, 2\n    STW R7, R5\n");
+}
+
 fn native_expression_pointer_element_size(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
@@ -5394,14 +5535,24 @@ fn emit_native_statement(
                             assembly.push_str("    STW R7, R4\n");
                         }
                         NativeLocation::StackFloatingPointScalar { offset, size } => {
-                            let bytes = native_floating_initializer(
-                                initializer,
-                                native_unqualified_type(&declaration.c_type),
-                            )?;
-                            if bytes.len() != *size {
+                            let c_type = native_unqualified_type(&declaration.c_type);
+                            if let Some(bytes) = native_floating_initializer(initializer, c_type) {
+                                if bytes.len() != *size {
+                                    return None;
+                                }
+                                emit_native_floating_stack_store(&bytes, *offset, assembly)?;
+                            } else if *size == 4
+                                && emit_native_f32_expression(
+                                    initializer,
+                                    locals,
+                                    label_counter,
+                                    assembly,
+                                )
+                            {
+                                emit_native_f32_stack_store(*offset, assembly);
+                            } else {
                                 return None;
                             }
-                            emit_native_floating_stack_store(&bytes, *offset, assembly)?;
                         }
                         NativeLocation::FloatingPointScalar { .. } => return None,
                         NativeLocation::ByteStackScalar { offset, signed } => {
@@ -11848,7 +11999,6 @@ mod tests {
         assert_eq!(cpu.registers[0], 0);
 
         for unsupported in [
-            "int main(void) { float value = 1.0f / 0.0f; return 0; }",
             "int main(void) { float values[2] = 1.0f; return 0; }",
             "int main(void) { float values[1] = { 1.0f, 2.0f }; return 0; }",
         ] {
@@ -11859,6 +12009,25 @@ mod tests {
                 "unsupported initializer must not be miscompiled: {unsupported}"
             );
         }
+    }
+
+    #[test]
+    fn evaluates_binary32_runtime_scalar_arithmetic_in_local_initializers() {
+        let source = "int main(void) { float left = 1.5f; float right = 2.25f; \
+                      float sum = left + right; float difference = sum - 1; \
+                      float product = -difference * 2.0f; float quotient = product / -2; \
+                      unsigned char *bytes = (unsigned char *)&quotient; \
+                      return bytes[0] != 0x40 || bytes[1] != 0x30 || \
+                      bytes[2] != 0 || bytes[3] != 0; }";
+        let image = compile_minimal_program(source, "runtime-f32-arithmetic.c")
+            .unwrap()
+            .expect("binary32 runtime arithmetic in local initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
     }
 
     #[test]

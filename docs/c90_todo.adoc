@@ -50,9 +50,12 @@ conformance work.
   multidimensional arrays, can be initialized from numeric literals; their
   object bytes can be inspected through character pointers. General initializer
   arithmetic constant expressions are supported for addition, subtraction,
-  multiplication, division, and integer remainder, but floating-value access
-  and runtime floating expressions remain unsupported. Constant casts to
-  +float+, +double+, and +long double+ are supported in these initializers.
+  multiplication, division, and integer remainder. Automatic scalar +float+
+  initializers also support runtime binary32 arithmetic (+-+, +*+, +/+,
+  unary signs), loading local float values, and integer-to-float conversion.
+  General floating-value access and runtime expressions outside this
+  initializer subset remain unsupported. Constant casts to +float+, +double+,
+  and +long double+ are supported in these initializers.
   Tests verify +float.h+ limit macros,
   binary32/binary64 maximum, minimum-normal, epsilon, subnormal, and
   halfway-rounding object encodings, including rounding a +float+ constant
