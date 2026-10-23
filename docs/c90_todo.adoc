@@ -46,9 +46,12 @@ conformance work.
   compiler now uses the target binary32/binary64 sizes for +sizeof+ and emits
   direct global floating initializers in big-endian form, but automatic
   floating objects, expression execution, conversions, calls, and returns
-  remain unsupported. Existing math routines still use binary16 arithmetic;
-  this partial compiler support does not establish C90 floating range or
-  precision at runtime.
+  remain unsupported. Tests verify +float.h+ limit macros, binary32/binary64
+  maximum, minimum-normal, epsilon, subnormal, and halfway-rounding object
+  encodings, including rounding a +float+ constant before promotion to
+  +double+. Existing math routines still use binary16 arithmetic; this partial
+  compiler support does not establish C90 floating range or precision at
+  runtime.
 * Function pointers and indirect calls, bit-fields, full linkage/storage
   semantics, complete hosted standard-library facilities, and independent
   conformance validation remain incomplete.

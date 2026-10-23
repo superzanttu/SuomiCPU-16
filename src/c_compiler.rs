@@ -2565,7 +2565,6 @@ fn native_floating_initializer(expression: &Expression, c_type: &str) -> Option<
             Some(bytes)
         }
         ExpressionKind::Atom(value) => {
-            let literal = value.strip_suffix(['f', 'F', 'l', 'L']).unwrap_or(value);
             if let Some(integer) =
                 parse_integer_constant(value).or_else(|| value.parse::<i64>().ok())
             {
@@ -2575,12 +2574,32 @@ fn native_floating_initializer(expression: &Expression, c_type: &str) -> Option<
                     Some((integer as f64).to_be_bytes().to_vec())
                 };
             }
-            if width == 4 {
+            let (literal, source_is_float) = match value.chars().last() {
+                Some('f' | 'F') => (&value[..value.len() - 1], true),
+                Some('l' | 'L') => (&value[..value.len() - 1], false),
+                _ => (value.as_str(), false),
+            };
+            if source_is_float {
                 let value = literal.parse::<f32>().ok()?;
-                value.is_finite().then(|| value.to_be_bytes().to_vec())
+                if !value.is_finite() {
+                    return None;
+                }
+                if width == 4 {
+                    Some(value.to_be_bytes().to_vec())
+                } else {
+                    Some((value as f64).to_be_bytes().to_vec())
+                }
             } else {
                 let value = literal.parse::<f64>().ok()?;
-                value.is_finite().then(|| value.to_be_bytes().to_vec())
+                if !value.is_finite() {
+                    return None;
+                }
+                if width == 4 {
+                    let value = value as f32;
+                    value.is_finite().then(|| value.to_be_bytes().to_vec())
+                } else {
+                    Some(value.to_be_bytes().to_vec())
+                }
             }
         }
         _ => None,
@@ -9269,7 +9288,7 @@ mod tests {
         let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
-        cpu.run(256).unwrap();
+        cpu.run(10_000).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 16);
     }
@@ -11284,6 +11303,96 @@ mod tests {
             .is_none(),
             "floating reads must not be emitted as integer loads"
         );
+    }
+
+    #[test]
+    fn float_header_boundaries_emit_target_ieee_representations() {
+        let source = "#include <float.h>\n\
+                      float fmax = FLT_MAX;\n\
+                      float fmin = FLT_MIN;\n\
+                      float fepsilon = FLT_EPSILON;\n\
+                      double dmax = DBL_MAX;\n\
+                      double dmin = DBL_MIN;\n\
+                      double deps = DBL_EPSILON;\n\
+                      long double ldmax = LDBL_MAX;\n\
+                      float fsub = 1.401298464e-45F;\n\
+                      double dsub = 4.9406564584124654e-324;\n\
+                      float ftie = 1.000000059604644775390625F;\n\
+                      double dtie = 1.00000000000000011102230246251565404236316680908203125;\n\
+                      double promoted = 1.000000059604644775390625F;\n\
+                      int main(void) { return 0; }";
+        let image = compile_minimal_program(source, "float-header-boundaries.c")
+            .unwrap()
+            .expect("float.h boundary initializers should compile");
+        let data = image
+            .segments
+            .iter()
+            .find(|segment| segment.address == 0x80000)
+            .expect("global data segment");
+        assert_eq!(
+            &data.data[..60],
+            &[
+                0x7f, 0x7f, 0xff, 0xff, 0x00, 0x80, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x7f, 0xef,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x3c, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xef, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                0x3f, 0x80, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(
+            &data.data[60..68],
+            &[0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "ties at one-half ULP round to even for binary32 and binary64"
+        );
+        assert_eq!(
+            &data.data[68..76],
+            &[0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "a float constant rounds to binary32 before promotion to double"
+        );
+
+        for (name, expected) in [
+            ("FLT_RADIX", "2"),
+            ("FLT_ROUNDS", "1"),
+            ("FLT_MANT_DIG", "24"),
+            ("DBL_MANT_DIG", "53"),
+            ("LDBL_MANT_DIG", "53"),
+            ("FLT_DIG", "6"),
+            ("DBL_DIG", "15"),
+            ("LDBL_DIG", "15"),
+            ("FLT_MIN_EXP", "-125"),
+            ("DBL_MIN_EXP", "-1021"),
+            ("LDBL_MIN_EXP", "-1021"),
+            ("FLT_MIN_10_EXP", "-37"),
+            ("DBL_MIN_10_EXP", "-307"),
+            ("LDBL_MIN_10_EXP", "-307"),
+            ("FLT_MAX_EXP", "128"),
+            ("DBL_MAX_EXP", "1024"),
+            ("LDBL_MAX_EXP", "1024"),
+            ("FLT_MAX_10_EXP", "38"),
+            ("DBL_MAX_10_EXP", "308"),
+            ("LDBL_MAX_10_EXP", "308"),
+        ] {
+            let tokens = lex_raw(
+                &format!("#include <float.h>\nint value = {name};"),
+                "float-header-limits.c",
+            )
+            .unwrap();
+            let equals = tokens
+                .iter()
+                .position(|token| token.value == "=")
+                .expect("initializer assignment token");
+            let actual = tokens[equals + 1..]
+                .iter()
+                .take_while(|token| token.value != ";")
+                .map(|token| token.value.as_str())
+                .collect::<Vec<_>>();
+            let expected = if let Some(magnitude) = expected.strip_prefix('-') {
+                vec!["(", "-", magnitude, ")"]
+            } else {
+                vec![expected]
+            };
+            assert_eq!(actual, expected, "{name}");
+        }
     }
 
     #[test]

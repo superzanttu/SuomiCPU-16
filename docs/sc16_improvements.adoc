@@ -77,8 +77,12 @@ Checklist status: [x] completed; [ ] planned.
 ** [ ] Implement automatic floating objects, runtime loads/stores, literal
    expressions, conversions, arithmetic, comparisons, and floating-point
    function arguments and results.
-** [ ] Update +float.h+ limits to match the implementation.
-** [ ] Add compile-time and runtime boundary tests.
+** [x] Verify +float.h+ limits against the target model and test binary32 /
+   binary64 maximum, minimum-normal, epsilon, subnormal, and tie-rounding
+   initializer representations, including promotion of a rounded +float+
+   constant to +double+.
+** [ ] Add runtime floating-point execution tests for arithmetic, conversions,
+   comparisons, calls, and returns.
 
 * [x] *Provide binary32/binary64 CPU operations* (+c90-float-isa+)
 ** [x] Add arithmetic, ordered comparisons, conversions, negation, and square
