@@ -3962,7 +3962,9 @@ fn native_expression_is_f64(
 fn emit_native_f32_stack_store(offset: usize, assembly: &mut String) {
     assembly.push_str("    MOV R7, R3\n");
     emit_native_stack_offset(7, offset, assembly);
-    assembly.push_str("    STW R7, R4\n    ADD R7, 2\n    STW R7, R5\n");
+    assembly.push_str("    STW R7, R4\n    MOV R7, R3\n");
+    emit_native_stack_offset(7, offset + 2, assembly);
+    assembly.push_str("    STW R7, R5\n");
 }
 
 fn native_expression_pointer_element_size(

@@ -41,10 +41,10 @@ contracts.
   Runtime binary32 arithmetic is supported for automatic scalar initializers,
   including local float loads and integer-to-float conversion in mixed
   expressions. Binary32 comparisons (+==+, +<+, +<=+, +>+, +>=+) are supported
-  in automatic integer initializers, with unordered NaN behavior tested.
-  General floating-value access, +!=+, expressions outside these initializer subsets,
-  conversions, calls, and returns remain incomplete. Existing math routines
-  still use binary16. See
+  in automatic scalar initializers, with unordered NaN behavior tested.
+  General floating-value access, +!=+, expressions outside these initializer
+  subsets, conversions, calls, and returns remain incomplete. Existing math
+  routines still use binary16. See
   link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
 
 == Existing roadmap integration

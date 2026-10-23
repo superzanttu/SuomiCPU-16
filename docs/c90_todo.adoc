@@ -55,10 +55,11 @@ conformance work.
   unary signs), loading local float values, and integer-to-float conversion,
   including integer arithmetic subexpressions in mixed expressions. Runtime
   binary32 comparisons (+==+, +<+, +<=+, +>+, +>=+) are supported in automatic
-  integer initializers; tests cover unordered NaN behavior. The +!=+ operator
-  and general floating-value access and runtime expressions outside these
-  initializer subsets remain unsupported. Constant casts to +float+, +double+,
-  and +long double+ are supported in these initializers.
+  scalar initializers; tests cover unordered NaN behavior and conversion of a
+  comparison result to +float+. The +!=+ operator and general floating-value
+  access and runtime expressions outside these initializer subsets remain
+  unsupported. Constant casts to +float+, +double+, and +long double+ are
+  supported in these initializers.
   Tests verify +float.h+ limit macros,
   binary32/binary64 maximum, minimum-normal, epsilon, subnormal, and
   halfway-rounding object encodings, including rounding a +float+ constant
