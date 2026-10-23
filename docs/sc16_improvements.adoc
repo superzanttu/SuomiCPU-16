@@ -35,9 +35,11 @@ contracts.
   vectors. Interrupts save PC and flags on the current stack; the CPU has no
   privilege modes, protected address spaces, page tables, or hardware task
   contexts.
-* The assembler and CPU provide binary32/binary64 instructions, but the C
-  compiler, object layout, literals, and +float.h+ still use binary16. See
-  link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
+* The assembler and CPU provide binary32/binary64 instructions. The C compiler
+  now lays out and initializes global floating objects using those formats, but
+  runtime floating expressions, conversions, automatic objects, calls, and
+  returns remain unsupported. Existing math routines still use binary16.
+  See link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
 
 == Existing roadmap integration
 
@@ -69,8 +71,12 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Define IEEE-754 binary32 +float+ and binary64 +double+ / +long double+
    representations, sizes, byte order, alignment, rounding, and special-value
    behavior in +c90_target_abi.adoc+.
-** [ ] Implement the model in compiler types, object layout, literal
-   conversion, and execution.
+** [x] Use target sizes for +sizeof(float)+, +sizeof(double)+, and
+   +sizeof(long double)+; emit binary32/binary64 global scalar and array
+   initializers in big-endian object representation.
+** [ ] Implement automatic floating objects, runtime loads/stores, literal
+   expressions, conversions, arithmetic, comparisons, and floating-point
+   function arguments and results.
 ** [ ] Update +float.h+ limits to match the implementation.
 ** [ ] Add compile-time and runtime boundary tests.
 

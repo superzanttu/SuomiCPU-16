@@ -42,9 +42,13 @@ conformance work.
   exercises the C90 minimum 65,535-byte object size, but this does not establish
   all C90 translation limits.
 * The assembler and Rust emulator provide binary32/binary64 floating-point
-  instructions with interpreter fallback and focused opcode regressions.
-  The C compiler, C object layout, literals, and +float.h+ still use binary16;
-  +double+ therefore does not satisfy C90 minimum range and precision.
+  instructions with interpreter fallback and focused opcode regressions. The C
+  compiler now uses the target binary32/binary64 sizes for +sizeof+ and emits
+  direct global floating initializers in big-endian form, but automatic
+  floating objects, expression execution, conversions, calls, and returns
+  remain unsupported. Existing math routines still use binary16 arithmetic;
+  this partial compiler support does not establish C90 floating range or
+  precision at runtime.
 * Function pointers and indirect calls, bit-fields, full linkage/storage
   semantics, complete hosted standard-library facilities, and independent
   conformance validation remain incomplete.

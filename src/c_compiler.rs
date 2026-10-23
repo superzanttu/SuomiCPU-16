@@ -332,6 +332,9 @@ enum NativeLocation {
         offset: usize,
         unsigned: bool,
     },
+    FloatingPointScalar {
+        size: usize,
+    },
     ByteStackScalar {
         offset: usize,
         signed: bool,
@@ -999,6 +1002,8 @@ pub fn compile_minimal_program_to_assembly(
                     "unsigned int" | "unsigned long" => (2, false),
                     "unsigned char" => (1, false),
                     "char" | "signed char" => (1, true),
+                    "float" => (4, false),
+                    "double" | "long double" => (8, false),
                     _ if record_layout.is_some() && !is_record_pointer => {
                         (record_layout.as_ref().unwrap().size, false)
                     }
@@ -1109,6 +1114,20 @@ pub fn compile_minimal_program_to_assembly(
                             return Ok(None);
                         };
                         for (index, expression) in values.into_iter().enumerate() {
+                            if matches!(global_type, "float" | "double" | "long double") {
+                                let Some(value) =
+                                    native_floating_initializer(expression, global_type)
+                                else {
+                                    eprintln!(
+                                        "unsupported floating initializer for global {}",
+                                        global.name
+                                    );
+                                    return Ok(None);
+                                };
+                                let offset = index * element_size;
+                                data[offset..offset + element_size].copy_from_slice(&value);
+                                continue;
+                            }
                             let Ok(value) =
                                 evaluate_integer_constant_with_names(expression, &unit.enumerators)
                             else {
@@ -1433,6 +1452,13 @@ pub fn compile_minimal_program_to_assembly(
                 }
             } else if let Some(signed) = native_byte_type(&global.c_type) {
                 NativeLocation::GlobalByteScalar { signed }
+            } else if matches!(
+                native_unqualified_type(&global.c_type),
+                "float" | "double" | "long double"
+            ) {
+                NativeLocation::FloatingPointScalar {
+                    size: global.element_size,
+                }
             } else {
                 NativeLocation::GlobalScalar {
                     unsigned: is_native_unsigned_word_type(&global.c_type),
@@ -2505,6 +2531,10 @@ fn native_sizeof_type(c_type: &str) -> Option<u16> {
     let c_type = native_unqualified_type(c_type);
     if c_type.ends_with('*') {
         Some(4)
+    } else if c_type == "float" {
+        Some(4)
+    } else if matches!(c_type, "double" | "long double") {
+        Some(8)
     } else if matches!(c_type, "char" | "signed char" | "unsigned char") {
         Some(1)
     } else if matches!(
@@ -2516,6 +2546,44 @@ fn native_sizeof_type(c_type: &str) -> Option<u16> {
         Some(4)
     } else {
         None
+    }
+}
+
+fn native_floating_initializer(expression: &Expression, c_type: &str) -> Option<Vec<u8>> {
+    let c_type = native_unqualified_type(c_type);
+    let width = match c_type {
+        "float" => 4,
+        "double" | "long double" => 8,
+        _ => return None,
+    };
+    match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if operator == "+" || operator == "-" => {
+            let mut bytes = native_floating_initializer(operand, c_type)?;
+            if operator == "-" {
+                bytes[0] ^= 0x80;
+            }
+            Some(bytes)
+        }
+        ExpressionKind::Atom(value) => {
+            let literal = value.strip_suffix(['f', 'F', 'l', 'L']).unwrap_or(value);
+            if let Some(integer) =
+                parse_integer_constant(value).or_else(|| value.parse::<i64>().ok())
+            {
+                return if width == 4 {
+                    Some((integer as f32).to_be_bytes().to_vec())
+                } else {
+                    Some((integer as f64).to_be_bytes().to_vec())
+                };
+            }
+            if width == 4 {
+                let value = literal.parse::<f32>().ok()?;
+                value.is_finite().then(|| value.to_be_bytes().to_vec())
+            } else {
+                let value = literal.parse::<f64>().ok()?;
+                value.is_finite().then(|| value.to_be_bytes().to_vec())
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2536,6 +2604,7 @@ fn native_sizeof_expression(
                 element_size,
                 ..
             }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
+            Some(NativeLocation::FloatingPointScalar { size }) => u16::try_from(*size).ok(),
             Some(_) => Some(2),
             None => None,
         },
@@ -3545,6 +3614,7 @@ fn emit_native_expression(
                     NativeLocation::GlobalScalar { .. } => assembly.push_str(&format!(
                         "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
                     )),
+                    NativeLocation::FloatingPointScalar { .. } => return false,
                     NativeLocation::GlobalByteScalar { signed } => {
                         assembly.push_str(&format!(
                             "    LDI30 R7, __c_global_{value}\n    LD R{destination}, R7\n"
@@ -3630,6 +3700,9 @@ fn emit_native_expression(
                 );
                 return false;
             };
+            if field.size > 2 {
+                return false;
+            }
             let load_destination = if destination == 7 { 0 } else { destination };
             assembly.push_str(&format!(
                 "    {} R{load_destination}, R7\n",
@@ -3661,6 +3734,9 @@ fn emit_native_expression(
                 eprintln!("unsupported native array read at line {}", expression.line);
                 return false;
             };
+            if element_size > 2 {
+                return false;
+            }
             if is_partial_array {
                 if destination != 7 {
                     assembly.push_str(&format!("    MOV R{destination}, R7\n"));
@@ -4745,6 +4821,9 @@ fn emit_native_assignment_store(
         ) else {
             return false;
         };
+        if element_size > 2 {
+            return false;
+        }
         let (load, store) = if element_size == 1 {
             ("LD", "ST")
         } else {
@@ -4775,6 +4854,7 @@ fn emit_native_assignment_store(
         NativeLocation::Register { register, .. } => (*register, false, None),
         NativeLocation::ByteRegister { register, signed } => (*register, false, Some(*signed)),
         NativeLocation::Constant(_) => return false,
+        NativeLocation::FloatingPointScalar { .. } => return false,
         NativeLocation::GlobalScalar { .. } => (0, true, None),
         NativeLocation::GlobalByteScalar { signed } => (0, false, Some(*signed)),
         NativeLocation::GlobalPointer { .. } => (0, true, None),
@@ -5581,6 +5661,9 @@ fn emit_native_update(
         ) else {
             return false;
         };
+        if element_size > 2 {
+            return false;
+        }
         let (load, store) = if element_size == 1 {
             ("LD", "ST")
         } else {
@@ -5690,6 +5773,7 @@ fn emit_native_update(
             ));
         }
         NativeLocation::Constant(_)
+        | NativeLocation::FloatingPointScalar { .. }
         | NativeLocation::GlobalArray { .. }
         | NativeLocation::GlobalRecord { .. }
         | NativeLocation::FunctionParameters { .. }
@@ -11165,6 +11249,41 @@ mod tests {
         cpu.run(128).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 24);
+    }
+
+    #[test]
+    fn lays_out_binary32_and_binary64_static_floating_objects() {
+        let source = "float narrow[2] = { 1.5f, -0.0f }; \
+                      double wide = 1.5; long double extended = -2.0L; \
+                      int main(void) { return sizeof(float) + sizeof(double) + \
+                      sizeof(long double) + sizeof(narrow) + sizeof(wide); }";
+        let assembly = compile_minimal_program_to_assembly(source, "floating-layout.c")
+            .unwrap()
+            .expect("supported floating static data and sizeof");
+        assert!(assembly.contains(".data hex 0x3F 0xC0 0x00 0x00"));
+        assert!(assembly.contains("0x80 0x00 0x00 0x00"));
+        assert!(assembly.contains(".data hex 0x3F 0xF8 0x00 0x00 0x00 0x00 0x00 0x00"));
+        assert!(assembly.contains(".data hex 0xC0 0x00 0x00 0x00 0x00 0x00 0x00 0x00"));
+
+        let image = compile_minimal_program(source, "floating-layout.c")
+            .unwrap()
+            .expect("floating layout program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 36);
+
+        assert!(
+            compile_minimal_program(
+                "float value = 1.5f; int main(void) { return value; }",
+                "unsupported-floating-read.c"
+            )
+            .unwrap()
+            .is_none(),
+            "floating reads must not be emitted as integer loads"
+        );
     }
 
     #[test]
