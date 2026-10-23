@@ -429,7 +429,11 @@ fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Express
         "gfx_tilemap" | "gfx_tilemap_wide" | "gfx3d_draw" => index == 0,
         "gfx_world_emitters" | "gfx_world_emitters_wide" => index == 0,
         "gfx_text" => index == 2,
-        "puts" => index == 0,
+        "puts"
+        | "bug_monitor_debug"
+        | "bug_monitor_info"
+        | "bug_monitor_warning"
+        | "bug_monitor_error" => index == 0,
         "fgets" => matches!(index, 0 | 2),
         "printf" if index == 0 => true,
         "printf" => {
@@ -9827,6 +9831,33 @@ mod tests {
         cpu.run(10_000).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.console.output(), b"value:-12,34%");
+    }
+
+    #[test]
+    fn guest_bug_monitor_functions_write_severity_tagged_serial_messages() {
+        let source = format!(
+            "{}\n{}",
+            include_str!("../lib/bug_monitor.h"),
+            "int main(void) { \
+                bug_monitor_debug(\"step\"); \
+                bug_monitor_info(\"ready\"); \
+                bug_monitor_warning(\"slow\"); \
+                bug_monitor_error(\"failed\"); \
+                return 0; \
+            }"
+        );
+        let image = compile_minimal_program(&source, "bug-monitor.c")
+            .unwrap()
+            .expect("Bug Monitor functions should link from lib_stdio.asm");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            cpu.console.output(),
+            b"[DEBUG] step\n[INFO] ready\n[WARN] slow\n[ERROR] failed\n"
+        );
     }
 
     #[test]

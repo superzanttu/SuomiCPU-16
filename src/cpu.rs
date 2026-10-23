@@ -494,7 +494,8 @@ impl Cpu {
         self.memory[DISK_STATUS as usize] = 0;
         if let Err(error) = self.disk_control_inner(command) {
             self.memory[DISK_STATUS as usize] = 1;
-            eprintln!("ERROR: Disk operation failed: {error}");
+            self.console
+                .log_error("disk", &format!("operation failed: {error}"));
         }
     }
 
@@ -630,7 +631,8 @@ impl Cpu {
                 match node.open(&title) {
                     Ok(opened) => self.set_gpu_result(u16::from(opened)),
                     Err(error) => {
-                        eprintln!("ERROR: Network open failed: {error}");
+                        self.console
+                            .log_error("network", &format!("open failed: {error}"));
                         self.set_gpu_result(0);
                     }
                 }

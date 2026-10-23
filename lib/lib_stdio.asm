@@ -39,6 +39,115 @@ puts_newline:
     MOV R0, R6
     RET
 
+bug_monitor_debug:
+    LDI30 R7, 0x43200
+    LDI R0, 91
+    ST R7, R0
+    LDI R0, 68
+    ST R7, R0
+    LDI R0, 69
+    ST R7, R0
+    LDI R0, 66
+    ST R7, R0
+    LDI R0, 85
+    ST R7, R0
+    LDI R0, 71
+    ST R7, R0
+    LDI R0, 93
+    ST R7, R0
+    LDI R0, 32
+    ST R7, R0
+    JMPX bug_monitor_write_message
+
+bug_monitor_info:
+    LDI30 R7, 0x43200
+    LDI R0, 91
+    ST R7, R0
+    LDI R0, 73
+    ST R7, R0
+    LDI R0, 78
+    ST R7, R0
+    LDI R0, 70
+    ST R7, R0
+    LDI R0, 79
+    ST R7, R0
+    LDI R0, 93
+    ST R7, R0
+    LDI R0, 32
+    ST R7, R0
+    JMPX bug_monitor_write_message
+
+bug_monitor_warning:
+    LDI30 R7, 0x43200
+    LDI R0, 91
+    ST R7, R0
+    LDI R0, 87
+    ST R7, R0
+    LDI R0, 65
+    ST R7, R0
+    LDI R0, 82
+    ST R7, R0
+    LDI R0, 78
+    ST R7, R0
+    LDI R0, 93
+    ST R7, R0
+    LDI R0, 32
+    ST R7, R0
+    JMPX bug_monitor_write_message
+
+bug_monitor_error:
+    LDI30 R7, 0x43200
+    LDI R0, 91
+    ST R7, R0
+    LDI R0, 69
+    ST R7, R0
+    LDI R0, 82
+    ST R7, R0
+    LDI R0, 82
+    ST R7, R0
+    LDI R0, 79
+    ST R7, R0
+    LDI R0, 82
+    ST R7, R0
+    LDI R0, 93
+    ST R7, R0
+    LDI R0, 32
+    ST R7, R0
+    JMPX bug_monitor_write_message
+
+bug_monitor_write_message:
+    LDWS R4, 4
+    LDWS R5, 6
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R5, R5
+    ADD R4, R5
+bug_monitor_write_message_next:
+    LD R0, R4
+    LDI R1, 0
+    CMP R0, R1
+    BZX bug_monitor_write_message_done
+    ST R7, R0
+    INC R4
+    JMPX bug_monitor_write_message_next
+bug_monitor_write_message_done:
+    LDI R0, 10
+    ST R7, R0
+    RET
+
 fgets:
     LDWS R4, 4
     MOV R3, R4

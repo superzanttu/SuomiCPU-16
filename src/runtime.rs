@@ -25,8 +25,16 @@ const GFX_MODE_ADDR: usize = 0x43014;
 const SOUND_RATE: u32 = 22_050;
 const SOUND_FPS: u32 = 60;
 const BIOS_VISIBLE_MODULES: usize = 12;
-const BIOS_MODULE_ROW_TOP: usize = 128;
-const BIOS_MODULE_ROW_HEIGHT: usize = 24;
+const BIOS_TEXT_COLUMNS: usize = 53;
+const BIOS_TEXT_ROWS: usize = 25;
+const BIOS_TEXT_CELL_WIDTH: usize = 12;
+const BIOS_TEXT_CELL_HEIGHT: usize = 16;
+const BIOS_TEXT_LEFT: usize = (640 - BIOS_TEXT_COLUMNS * BIOS_TEXT_CELL_WIDTH) / 2;
+const BIOS_TEXT_TOP: usize = (480 - BIOS_TEXT_ROWS * BIOS_TEXT_CELL_HEIGHT) / 2;
+const BIOS_MODULE_ROW_TOP: usize = BIOS_TEXT_TOP + 6 * BIOS_TEXT_CELL_HEIGHT;
+const BIOS_MODULE_ROW_HEIGHT: usize = BIOS_TEXT_CELL_HEIGHT;
+const BIOS_PHOSPHOR: u32 = 0xff75ff9a;
+const BIOS_PHOSPHOR_BRIGHT: u32 = 0xffc8ffd5;
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const CONSOLE_WINDOW_WIDTH: usize = 480;
 const CONSOLE_WINDOW_HEIGHT: usize = 200;
@@ -37,7 +45,7 @@ const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
     ("PAUSE", 8.0, 104.0),
     ("RESET", 120.0, 80.0),
     ("REBOOT", 208.0, 88.0),
-    ("CONSOLE", 304.0, 96.0),
+    ("BUG MONITOR", 304.0, 112.0),
 ];
 const CONSOLE_TOOLBAR_BUTTONS: [(usize, usize); 4] = [(6, 94), (106, 72), (184, 92), (282, 104)];
 
@@ -337,7 +345,7 @@ impl ConsoleWindow {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let window = NativeWindow::new(
-                "SC-16 Console | F2 close  F5 reset  F6 reboot  F10 pause",
+                "SC-16 Bug Monitor | F2 close  F5 reset  F6 reboot  F10 pause",
                 CONSOLE_WINDOW_WIDTH,
                 CONSOLE_WINDOW_HEIGHT,
                 WindowOptions {
@@ -346,7 +354,7 @@ impl ConsoleWindow {
                 },
             )
             .map_err(|error| {
-                RuntimeError::Window(format!("cannot open SC-16 console window: {error}"))
+                RuntimeError::Window(format!("cannot open SC-16 Bug Monitor window: {error}"))
             })?;
             Ok(Self {
                 window,
@@ -495,6 +503,7 @@ pub async fn run_with_devices(
         None
     };
     let mut cpu = fresh_runtime_cpu(root, program, disk_id, network_port, None)?;
+    cpu.console.log_info("emulator", "BIOS started");
     let mut paused = false;
     let mut console_visible = false;
     let mut console_window: Option<ConsoleWindow> = None;
@@ -568,11 +577,14 @@ pub async fn run_with_devices(
                         pending_action = Some(RuntimeControl::RebootRequested)
                     }
                     RuntimeControl::PauseToggled(paused) => {
-                        cpu.console.write_text(if paused {
-                            "Emulation paused"
-                        } else {
-                            "Emulation continued"
-                        });
+                        cpu.console.log_info(
+                            "emulator",
+                            if paused {
+                                "Emulation paused"
+                            } else {
+                                "Emulation continued"
+                            },
+                        );
                     }
                     RuntimeControl::ConsoleToggled(_) => {}
                 }
@@ -589,11 +601,14 @@ pub async fn run_with_devices(
                 }
                 RuntimeControl::PauseToggled(new_paused) => {
                     paused = new_paused;
-                    cpu.console.write_text(if paused {
-                        "Emulation paused"
-                    } else {
-                        "Emulation continued"
-                    });
+                    cpu.console.log_info(
+                        "emulator",
+                        if paused {
+                            "Emulation paused"
+                        } else {
+                            "Emulation continued"
+                        },
+                    );
                 }
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
                 RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
@@ -607,11 +622,14 @@ pub async fn run_with_devices(
             match control {
                 RuntimeControl::PauseToggled(new_paused) => {
                     paused = new_paused;
-                    cpu.console.write_text(if paused {
-                        "Emulation paused"
-                    } else {
-                        "Emulation continued"
-                    });
+                    cpu.console.log_info(
+                        "emulator",
+                        if paused {
+                            "Emulation paused"
+                        } else {
+                            "Emulation continued"
+                        },
+                    );
                 }
                 RuntimeControl::ResetRequested | RuntimeControl::RebootRequested => {
                     pending_action = Some(control);
@@ -675,12 +693,14 @@ pub async fn run_with_devices(
                     target.as_ref().expect("active program target exists"),
                 )?;
             }
-            cpu.console
-                .write_text(if action == RuntimeControl::ResetRequested {
+            cpu.console.log_info(
+                "emulator",
+                if action == RuntimeControl::ResetRequested {
                     "System reset complete"
                 } else {
                     "Program restarted"
-                });
+                },
+            );
             paused = false;
             old_keys.clear();
             speed_remainder = 0.0;
@@ -1188,28 +1208,9 @@ fn draw_bios_selector(
     selected_disk: usize,
     message: Option<&str>,
 ) {
-    pixels.fill(rgb(7, 10, 20));
-    fill_rect(pixels, 640, 24, 18, 592, 82, rgb(16, 22, 38));
-    fill_rect(pixels, 640, 24, 108, 592, 326, rgb(11, 15, 28));
-    draw_text_scaled(
-        pixels,
-        640,
-        (40, 28),
-        "SUOMICPU-16 BIOS",
-        0xffffd000,
-        font,
-        2,
-    );
-    draw_text_scaled(pixels, 640, (40, 50), "MODULE MANAGER", 0xff90a8c8, font, 2);
-    draw_text_scaled(
-        pixels,
-        640,
-        (40, 80),
-        "UP/DOWN SELECT   ENTER START   ESC EXIT",
-        0xffc2cee0,
-        font,
-        2,
-    );
+    pixels.fill(0);
+    draw_bios_text(pixels, font, 0, 2, "SUOMICPU-16 BIOS", BIOS_PHOSPHOR_BRIGHT);
+    draw_bios_text(pixels, font, 1, 2, "POWER-ON SELF TEST: OK", BIOS_PHOSPHOR);
 
     let disk_name = if selected_disk == 0 {
         "NONE"
@@ -1219,19 +1220,31 @@ fn draw_bios_selector(
             .map(String::as_str)
             .unwrap_or("NONE")
     };
-    fill_rect(pixels, 640, 420, 73, 184, 27, rgb(35, 31, 19));
-    draw_text_scaled(
+    draw_bios_text(
         pixels,
-        640,
-        (430, 79),
-        &format!("DISK: {disk_name}"),
-        0xffffd000,
         font,
+        3,
         2,
+        &format!("DISK: {disk_name}"),
+        BIOS_PHOSPHOR,
+    );
+    draw_bios_text(
+        pixels,
+        font,
+        4,
+        2,
+        "< D / LEFT: PREVIOUS      D / RIGHT: NEXT >",
+        BIOS_PHOSPHOR,
     );
 
-    draw_text_scaled(pixels, 640, (42, 108), "MODULE", 0xff90a8c8, font, 2);
-    draw_text_scaled(pixels, 640, (250, 108), "DESCRIPTION", 0xff90a8c8, font, 2);
+    draw_bios_text(
+        pixels,
+        font,
+        5,
+        2,
+        "NO  PROGRAM             DESCRIPTION",
+        BIOS_PHOSPHOR,
+    );
     let first = scroll_offset.min(modules.len().saturating_sub(BIOS_VISIBLE_MODULES));
     for (row, (index, module)) in modules
         .iter()
@@ -1242,54 +1255,62 @@ fn draw_bios_selector(
     {
         let y = BIOS_MODULE_ROW_TOP + row * BIOS_MODULE_ROW_HEIGHT;
         let is_selected = index == selected;
-        let background = if is_selected {
-            rgb(37, 47, 68)
-        } else if row % 2 == 0 {
-            rgb(14, 20, 34)
-        } else {
-            rgb(11, 15, 28)
-        };
-        fill_rect(pixels, 640, 32, y, 576, 22, background);
-        let name_color = if is_selected { 0xffffffff } else { 0xffd0d9e8 };
-        let number = format!("{:02}", index + 1);
-        draw_text_scaled(pixels, 640, (42, y + 4), &number, 0xff7185a3, font, 2);
-        draw_text_limited_scaled(
-            pixels,
-            640,
-            (66, y + 4),
-            &module.name,
-            (14, 2),
-            name_color,
-            font,
+        let text_row = (y - BIOS_TEXT_TOP) / BIOS_TEXT_CELL_HEIGHT;
+        if is_selected {
+            fill_rect(
+                pixels,
+                640,
+                BIOS_TEXT_LEFT,
+                y,
+                BIOS_TEXT_COLUMNS * BIOS_TEXT_CELL_WIDTH,
+                BIOS_TEXT_CELL_HEIGHT,
+                rgb(0, 30, 12),
+            );
+        }
+        let line = format!(
+            "{} {:02} {:<18} {}",
+            if is_selected { '>' } else { ' ' },
+            index + 1,
+            module.name,
+            module.description
         );
-        draw_text_limited_scaled(
+        draw_bios_text(
             pixels,
-            640,
-            (250, y + 4),
-            &module.description,
-            (29, 2),
-            if is_selected { 0xffe2e8f2 } else { 0xff9eacc1 },
             font,
+            text_row,
+            2,
+            &line,
+            if is_selected {
+                BIOS_PHOSPHOR_BRIGHT
+            } else {
+                BIOS_PHOSPHOR
+            },
         );
     }
 
     let position = if modules.is_empty() {
-        "NO MODULES FOUND".to_owned()
+        "NO PROGRAMS FOUND".to_owned()
     } else {
-        format!("MODULE {:02}/{:02}", selected + 1, modules.len())
+        format!("PROGRAM {:02}/{:02}", selected + 1, modules.len())
     };
-    draw_text_scaled(pixels, 640, (42, 441), &position, 0xff90a8c8, font, 2);
-    draw_text_scaled(
+    draw_bios_text(pixels, font, 20, 2, &position, BIOS_PHOSPHOR);
+    draw_bios_text(
         pixels,
-        640,
-        (250, 441),
-        "D / LEFT / RIGHT: CHANGE DISK",
-        0xff90a8c8,
         font,
+        21,
         2,
+        "ARROWS SELECT  ENTER BOOT  ESC EXIT  F2 MONITOR",
+        BIOS_PHOSPHOR,
     );
     if let Some(message) = message {
-        draw_text_limited_scaled(pixels, 640, (32, 465), message, (48, 2), 0xffff6060, font);
+        draw_bios_text(
+            pixels,
+            font,
+            23,
+            2,
+            &format!("ERROR: {message}"),
+            BIOS_PHOSPHOR_BRIGHT,
+        );
     }
 }
 
@@ -1447,8 +1468,8 @@ fn bios_mouse_action(
     scroll_offset: usize,
 ) -> Option<BiosMouseAction> {
     let (x, y) = screen_to_logical(position, screen_size, (640, 480))?;
-    if (420..604).contains(&x) && (73..100).contains(&y) {
-        return Some(if x < 512 {
+    if (32..608).contains(&x) && (88..120).contains(&y) {
+        return Some(if x < 320 {
             BiosMouseAction::PreviousDisk
         } else {
             BiosMouseAction::NextDisk
@@ -1517,9 +1538,25 @@ fn fresh_runtime_cpu(
 }
 
 fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
-    let image = load_program(&target.source)?;
+    let name = target
+        .source
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("program");
+    cpu.console.log_info("emulator", &format!("Loading {name}"));
+    let image = load_program(&target.source).map_err(|error| {
+        cpu.console
+            .log_error("emulator", &format!("Loading {name} failed: {error}"));
+        error
+    })?;
     cpu.load_program(&image.segments, image.entry_point)
-        .map_err(|error| RuntimeError::Window(error.to_string()))
+        .map_err(|error| {
+            cpu.console
+                .log_error("emulator", &format!("Loading {name} failed: {error}"));
+            RuntimeError::Window(error.to_string())
+        })?;
+    cpu.console.log_info("emulator", &format!("{name} loaded"));
+    Ok(())
 }
 
 fn update_keys(
@@ -1908,7 +1945,7 @@ fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]], pa
             0 => "PAUSE",
             1 => "RESET",
             2 => "REBOOT",
-            3 => "CONSOLE",
+            3 => "BUG MONITOR",
             _ => unreachable!(),
         };
         draw_text(
@@ -2014,6 +2051,54 @@ fn draw_text(
     font: &[[u8; 8]],
 ) {
     draw_text_scaled(pixels, width, (x, y), text, color, font, 1);
+}
+
+fn draw_bios_text(
+    pixels: &mut [u32],
+    font: &[[u8; 8]],
+    row: usize,
+    column: usize,
+    text: &str,
+    color: u32,
+) {
+    if row >= BIOS_TEXT_ROWS || column >= BIOS_TEXT_COLUMNS {
+        return;
+    }
+    let y_base = BIOS_TEXT_TOP + row * BIOS_TEXT_CELL_HEIGHT;
+    let text = text
+        .bytes()
+        .take(BIOS_TEXT_COLUMNS - column)
+        .map(|byte| {
+            if (32..=126).contains(&byte) {
+                byte
+            } else {
+                b'?'
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (character_offset, byte) in text.into_iter().enumerate() {
+        let Some(glyph) = font.get(byte.saturating_sub(32) as usize) else {
+            continue;
+        };
+        let x_base = BIOS_TEXT_LEFT + (column + character_offset) * BIOS_TEXT_CELL_WIDTH + 1;
+        for (glyph_row, bits) in glyph.iter().copied().enumerate().take(7) {
+            for glyph_column in 0..5 {
+                if bits & (0x80 >> glyph_column) == 0 {
+                    continue;
+                }
+                for scale_y in 0..2 {
+                    for scale_x in 0..2 {
+                        let x = x_base + glyph_column * 2 + scale_x;
+                        let y = y_base + 1 + glyph_row * 2 + scale_y;
+                        if let Some(pixel) = pixels.get_mut(y * 640 + x) {
+                            *pixel = color;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn draw_text_scaled(
@@ -2690,11 +2775,11 @@ mod tests {
             Some(BiosMouseAction::SelectModule(3))
         );
         assert_eq!(
-            bios_mouse_action((500.0, 80.0), (640.0, 480.0), 20, 0),
+            bios_mouse_action((200.0, 96.0), (640.0, 480.0), 20, 0),
             Some(BiosMouseAction::PreviousDisk)
         );
         assert_eq!(
-            bios_mouse_action((550.0, 80.0), (640.0, 480.0), 20, 0),
+            bios_mouse_action((550.0, 96.0), (640.0, 480.0), 20, 0),
             Some(BiosMouseAction::NextDisk)
         );
         assert_eq!(
@@ -2756,6 +2841,25 @@ mod tests {
         assert_eq!(pixels[15 * 24 + 1], 0);
     }
 
+    #[test]
+    fn bios_text_renders_crisp_double_size_pixels_without_effects() {
+        let mut font = vec![[0; 8]; 128];
+        font[usize::from(b'A' - 32)][0] = 0x80;
+        let mut pixels = vec![0; 640 * 480];
+
+        draw_bios_text(&mut pixels, &font, 0, 0, "A", BIOS_PHOSPHOR);
+
+        let x = BIOS_TEXT_LEFT + 1;
+        let y = BIOS_TEXT_TOP + 1;
+        for pixel_y in y..y + 2 {
+            for pixel_x in x..x + 2 {
+                assert_eq!(pixels[pixel_y * 640 + pixel_x], BIOS_PHOSPHOR);
+            }
+        }
+        assert_eq!(pixels[y * 640 + x + 2], 0);
+        assert!(!pixels.contains(&0xff005020));
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn console_window_shortcuts_control_emulation_when_console_has_focus() {
@@ -2786,8 +2890,11 @@ mod tests {
         let font = vec![[0xf8; 8]; 128];
         let mut pixels = vec![0; 640 * 480];
         draw_bios_selector(&mut pixels, &font, &[], (0, 0), &[], 0, None);
-        assert_eq!(pixels[0], rgb(7, 10, 20));
+        assert_eq!(pixels[0], 0);
+        assert!(pixels.contains(&BIOS_PHOSPHOR));
+        assert!(!pixels.contains(&0xff005020));
 
+        let without_error = pixels.clone();
         draw_bios_selector(
             &mut pixels,
             &font,
@@ -2797,7 +2904,8 @@ mod tests {
             0,
             Some("broken: compiler rejected module"),
         );
-        assert!(pixels.contains(&0xffff_6060));
+        assert_ne!(pixels, without_error);
+        assert!(pixels.contains(&BIOS_PHOSPHOR_BRIGHT));
     }
 
     #[test]

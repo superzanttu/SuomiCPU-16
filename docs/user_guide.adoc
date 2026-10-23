@@ -7,9 +7,11 @@ eight general-purpose registers and a 16-bit instruction format. Assembly source
 files use the +.asm+ extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
 
-The emulator presents a BIOS startup screen before launching a program. The
-BIOS selects and compiles a program from +modules/+, optionally mounts an
-existing virtual data disk, and loads the resulting image into machine memory.
+The emulator presents a text-mode BIOS startup screen in its main window before
+launching a program. It uses bright green fixed-width characters on black with
+enlarged pixels and no glow or post-processing. The BIOS selects and compiles a
+program from +modules/+, optionally mounts an existing virtual data disk, and
+loads the resulting image into machine memory.
 Disks hold application data only; they are not boot media. Once started, CPU
 reset begins execution at the loaded image's entry point. The first instruction
 in the source determines that entry point, regardless of the numeric order of
@@ -52,15 +54,14 @@ double-click to load it. Use the mouse wheel over the module list to scroll;
 indicators show how many modules remain above or below the visible rows. Click
 the data-disk line or press *D* to cycle through available data disks or no
 disk. Press Escape to exit the BIOS.
-The game fills its own window by default. The 80×25 console runs in a separate
-window. Its *RESET* button returns to BIOS module selection; *REBOOT*
-restarts the current program. Select text and press Ctrl+C to copy it; the
-*COPY* button copies selected text or the visible console screen. The console
-keeps a 1,000-row scrollback buffer, navigated with the mouse wheel. It logs
-source and generated assembly file sizes, program image size, address span, and
-emulator memory capacity/remaining memory when a program loads. Press F2 in the
-emulator window to hide/show the console, and F11 to toggle fullscreen and
-windowed game display. Start in fullscreen with
+The game fills the emulator's main window after BIOS startup. The optional
+80×25 *Bug Monitor* runs in a separate window and displays emulator logs and
+guest serial output. Its *RESET* button returns to BIOS module selection;
+*REBOOT* restarts the current program. Select text and press Ctrl+C to copy it;
+the *COPY* button copies selected text or the visible monitor screen. The Bug
+Monitor keeps a 1,000-row scrollback buffer, navigated with the mouse wheel.
+Press F2 in the emulator window to hide/show the Bug Monitor, and F11 to toggle
+fullscreen and windowed game display. Start in fullscreen with
 +cargo run -- --fullscreen+ or
 +.\run.ps1 -Fullscreen+.
 
@@ -1154,9 +1155,11 @@ value behavior. In particular, +HUGE_VAL+ is the largest finite target value,
 not an IEEE infinity. Do not use this math subset for numerically sensitive
 work or assume C90 numerical accuracy.
 
-=== Console, BIOS, and virtual disks
+=== BIOS, Bug Monitor, and virtual disks
 
-The emulator starts with a BIOS selection screen. It lists C programs from
+The emulator starts with a text-mode BIOS selection screen in its main window.
+The BIOS uses bright green characters on black, with a fixed-width, enlarged
+font and no glow or post-processing effects. It lists C programs from
 +modules/+ for selection and can optionally mount any valid 8-character +*.json+
 virtual disk found in the repository's +disks/+ folder. The selected disk is
 made available to the program; it is *not* used to load executable code. The
@@ -1173,7 +1176,7 @@ contain the disk-control address, and byte +15+ is the startup status.
 The status is +0+ after successful initialization or disk selection and +1+
 when a disk cannot be mounted.
 
-The console is a memory-mapped UART-like device:
+The serial device is memory-mapped at the legacy UART-like console addresses:
 
 [cols="1,1,1"]
 |===
@@ -1194,19 +1197,33 @@ The console is a memory-mapped UART-like device:
 |Bit 0 enables local echo; bit 1 enables host keyboard input. Both are enabled at reset.
 |===
 
-The game and 80×25 text console run in separate windows. The console has
+The game window and the optional *Bug Monitor* run separately. The Bug Monitor
+is an 80×25 serial output display for emulator logs and guest-program output
+written to the UART-like device; it is not the BIOS display. The monitor has
 *REBOOT*, *RESET*, *COPY*, and *PAUSE/CONTINUE* buttons in its top row.
 *COPY* copies selected text or the visible console screen; Ctrl+C copies
 selected text. The 1,000-row scrollback can be navigated with the mouse wheel.
-Program loading logs source and generated assembly file sizes, image size,
-address span, and available SC-16 memory. *RESET*
+Emulator lifecycle and device errors are tagged by severity. Guest C programs
+can include +<bug_monitor.h>+ and call the dedicated serial logging functions:
+
+[source,c]
+----
+bug_monitor_debug("entered update loop");
+bug_monitor_info("player ready");
+bug_monitor_warning("low on memory");
+bug_monitor_error("unable to load level");
+----
+
+The functions write +[DEBUG]+, +[INFO]+, +[WARN]+, or +[ERROR]+ followed by
+the message and a newline to the serial output. The serial input path remains
+available to guest programs. *RESET*
 returns to BIOS module selection, while *REBOOT* restarts the current program.
 The status line below
 shows local time, uptime, mounted data disk, and loaded module. It also displays
-host lifecycle messages such as emulator startup, C compilation/assembly,
-program loading, disk operations, and errors. Type into the console text area
-to send input; Enter and Backspace are supported. Press F2 in the emulator window
-to hide/show the console. An empty console-status poll yields the current
+host lifecycle messages such as emulator startup, program loading, disk
+operations, and errors. Type into the monitor text area to send serial input;
+Enter and Backspace are supported. Press F2 in the emulator window
+to hide/show the Bug Monitor. An empty serial-status poll yields the current
 instruction frame to the host event loop, so a C +getchar+ wait does not prevent
 keyboard events from being processed.
 

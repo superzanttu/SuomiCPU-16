@@ -10,9 +10,34 @@ preemptively multitasking operating system with virtual memory. It replaces
 emulator-side program compilation and block-oriented virtual disks with
 prebuilt programs and folder-backed disks.
 
-Implement the work in stages. Preserve the existing emulator, programs, and
-graphical console during the transition. Do not claim process isolation until
-the MMU enforces user/kernel memory permissions.
+Implement the work in stages. Preserve the existing emulator, programs, game
+window, and serial Bug Monitor during the transition. Do not claim process
+isolation until the MMU enforces user/kernel memory permissions.
+
+=== Current implementation baseline
+
+This baseline describes the emulator today, not the intended OS architecture.
+The checklist below tracks the migration from these behaviors to the target
+contracts.
+
+* The guest is byte-addressed, uses 16-bit instructions and eight general
+  registers, and has up to 1 GiB of memory. The CPU supports 30-bit addresses
+  and big-endian multi-byte values. A loaded program starts at its image entry
+  point; CPU construction initializes the PC to zero and the stack pointer to
+  the top of configured memory.
+* The emulator's BIOS selects a source program from +modules/+ and compiles it
+  during startup. Applications run in the game window; the optional Bug Monitor
+  displays emulator logs and guest serial output from the UART-style device.
+  It is separate from the text-mode BIOS.
+* Data disks are JSON-backed 256-byte block devices. They are not boot media,
+  and the BIOS loads executable images from module sources rather than disks.
+* The CPU has keyboard, RTC, and instruction-count timer interrupts with fixed
+  vectors. Interrupts save PC and flags on the current stack; the CPU has no
+  privilege modes, protected address spaces, page tables, or hardware task
+  contexts.
+* The assembler and CPU provide binary32/binary64 instructions, but the C
+  compiler, object layout, literals, and +float.h+ still use binary16. See
+  link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
 
 == Existing roadmap integration
 
@@ -31,8 +56,7 @@ Checklist status: [x] completed; [ ] planned.
 === Phase 0 — Maintain target ABI and CPU compatibility
 
 * [x] *Implement the 30-bit control-flow ABI* (+sc16-control-flow-abi+)
-** Store return PCs as four big-endian bytes; +RET+ and +RTI+ restore all
-   30 address bits.
+** Store return PCs as four big-endian bytes; +RET+ and +RTI+ restore all 30 address bits.
 ** Place the first function parameter four bytes above the stack pointer and
    update assembly-library argument offsets.
 ** Encode far control flow in six bytes and add +JMPRP+ / +CALLRP+ for full
@@ -45,10 +69,10 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Define IEEE-754 binary32 +float+ and binary64 +double+ / +long double+
    representations, sizes, byte order, alignment, rounding, and special-value
    behavior in +c90_target_abi.adoc+.
-** [x] Implement the model in compiler types, object layout, literal
+** [ ] Implement the model in compiler types, object layout, literal
    conversion, and execution.
-** [x] Update +float.h+ limits to match the implementation.
-** [x] Add compile-time and runtime boundary tests.
+** [ ] Update +float.h+ limits to match the implementation.
+** [ ] Add compile-time and runtime boundary tests.
 
 * [x] *Provide binary32/binary64 CPU operations* (+c90-float-isa+)
 ** [x] Add arithmetic, ordered comparisons, conversions, negation, and square
@@ -85,72 +109,93 @@ Checklist status: [x] completed; [ ] planned.
 
 * [ ] Write an SC-16 architecture specification covering reset state, address
   width, byte order, instruction behavior, exceptions, privilege transitions,
-  interrupts, memory translation, and device access.
+  interrupts, memory translation, device access, and the text-display interface
+  used by firmware.
+* [ ] Specify the character-cell display contract for firmware and guest
+  software, including screen dimensions, character encoding/font, cursor and
+  scrolling behavior, color attributes, and display-mode ownership. Keep text
+  output distinct from serial diagnostics and guest pixel graphics.
 * [ ] Define the privilege model: reset enters kernel mode; user mode cannot
   execute privileged instructions, alter control registers, modify interrupt
   state, access kernel-only mappings, or access protected devices.
 * [ ] Define exception and interrupt entry/return frames, including the saved
   privilege level, PC, flags, stack selection, and the behavior for faults
   during entry or return.
-* [ ] Define a versioned boot manifest and disk metadata JSON schema. Specify
+* [ ] Define a versioned disk metadata JSON schema. Specify
   required and optional fields, validation errors, encoding, path rules, file
-  lengths, disk capacity, boot image names, default executable, requested
-  execution mode, and manifest compatibility/version handling.
+  lengths, virtual capacity, disk-wide read/write mode, the read-only file
+  list, required executable names, and metadata compatibility/version handling.
+  The executable and its mode are selected by the fixed +main.bin+ / +kernel.bin+
+  rule, not by a metadata field.
 * [ ] Define a standard executable image format and offline build pipeline.
   Include entry point, load segments, permissions, alignment, relocation policy,
   and rejected malformed-image cases.
 * [ ] Coordinate executable-image, calling-convention, and process-entry
   decisions with the target ABI in +c90_target_abi.adoc+. Update the ABI
   document only after implementation and conformance tests confirm behavior.
-* [ ] Document the current architecture and migration incompatibilities.
+* [x] Document the current architecture and migration incompatibilities in the
+  baseline above.
   Keep this specification authoritative for implementation and tests.
 
-=== Phase 2 — Boot through firmware and +boot.bin+
+=== Phase 2 — Boot through system BIOS
 
 * [ ] Change CPU reset/power-on state to enter kernel mode at a documented
   firmware entry point with interrupts disabled and a defined stack/control
   state.
-* [ ] Keep the current graphical console/window behavior as the default
-  presentation. Do not make text-console startup a prerequisite for boot.
-* [ ] Separate emulator hardware initialization from guest firmware execution.
-  The emulator initializes devices and memory, then transfers control to BIOS
-  firmware; it must not compile or assemble guest programs during boot.
-* [ ] Define and implement one unambiguous firmware chain: system BIOS starts in
-  kernel mode, discovers disks and presents the existing graphical selector,
-  loads the selected disk's standardized +boot.bin+ in kernel mode, and transfers
-  control to it.
-* [ ] Implement +boot.bin+ as the common disk boot program. It reads and
-  validates the selected disk's JSON manifest, loads the declared executable,
-  applies the manifest's USER/KERNEL launch mode, and enters it through the
-  specified privilege-transition mechanism.
-* [ ] Treat each disk's +bios.bin+ and +main.bin+ as required disk contents
-  while keeping their responsibilities distinct from host BIOS and +boot.bin+.
-  Reject missing, malformed, or incompatible required images with a visible
-  boot error instead of silently falling back to compilation.
-* [ ] Add boot tests for cold reset, firmware selection, +boot.bin+ loading,
-  manifest-driven program selection, both launch modes, invalid images, and
-  recoverable boot failures.
+* [x] Implement the BIOS character-cell text renderer in the emulator's main
+  window. Use bright green text on black with enlarged fixed-width characters
+  and no glow or post-processing; do not open a separate terminal window.
+* [ ] Implement a guest-visible character-cell text display if the finalized
+  architecture does not already provide one, for use by guest software. The
+  BIOS must continue rendering in the emulator's main window.
+* [x] Preserve the existing game window and optional serial Bug Monitor after
+  boot; switching the BIOS to text mode must not force applications into a
+  text-only display mode.
+* [x] Provide dedicated emulator logging methods and guest C functions for
+  DEBUG, INFO, WARN, and ERROR records over the serial output in
+  +lib/bug_monitor.h+. Route emulator lifecycle and device errors to the Bug
+  Monitor; preserve raw guest serial output and the existing serial input path.
+* [ ] Use one emulator-wide +bios.bin+ as firmware; do not require a BIOS or
+  +boot.bin+ on each disk. Separate emulator hardware initialization from
+  firmware execution, then transfer control to the BIOS at the documented
+  kernel-mode entry point. BIOS must not compile or assemble guest programs.
+* [ ] Implement BIOS disk discovery and text-mode disk selection. After
+  selection, validate disk metadata and require exactly one boot
+  executable: if only +kernel.bin+ exists, load it in KERNEL mode; if only
+  +main.bin+ exists, load it in USER mode. If both files exist, or if neither
+  exists, report +NOT_BOOT+. Metadata does not choose the executable or its
+  mode.
+* [ ] Treat the presence of +kernel.bin+ as authorization to execute that
+  disk-provided image in KERNEL mode. Document this trust model clearly; disk
+  metadata and user-mode programs must not be able to change the BIOS rule.
+* [ ] Add boot tests for cold reset, common BIOS startup, text-mode rendering
+  and selection, direct executable loading, both launch modes, both
+  +NOT_BOOT+ cases, invalid images, and recoverable boot failures.
 
 === Phase 3 — Replace block disks with folder-backed filesystems
 
 * [ ] Design a disk abstraction backed by one explicitly configured host folder
   per disk. A disk's files and subfolders appear as its guest-visible
   filesystem; do not emulate sectors, cylinders, blocks, or block pointers.
-* [ ] Implement manifest parsing and disk discovery using the new metadata
-  format, including disk identity, label, capacity/size metadata, and boot-file
-  declarations.
+* [ ] Implement metadata parsing and disk discovery, including disk identity,
+  label, virtual capacity, disk-wide read-only/read-write mode, and the list of
+  protected files.
 * [ ] Implement guest filesystem operations for listing directories, reading
   files, writing files, creating directories, deleting/renaming entries, and
   querying metadata, subject to the finalized syscall/device interface.
 * [ ] Confine normalized guest paths to the mounted disk root. Reject traversal,
   invalid paths, unsupported file types, and host I/O failures explicitly.
-* [ ] Make read-only status a per-file manifest property used for files needed
-  to boot. Enforce it on writes, replacement, deletion, rename, and other
-  mutations; do not add general user/group/owner access-control semantics.
-* [ ] Define capacity accounting and behavior when files exceed the declared
-  disk size. Ensure it is enforced consistently for every operation.
+* [ ] Enforce disk-wide read-only status and the metadata-listed per-file
+  read-only set. Protected files cannot be written, replaced, deleted, renamed,
+  or otherwise mutated; do not add general user/group/owner access-control
+  semantics.
+* [ ] Define used capacity as the sum of regular-file byte lengths, excluding
+  directory and metadata overhead, and enforce the declared virtual-capacity
+  hard limit for writes, copies, and file growth. Reject non-regular host-file
+  types and host I/O failures explicitly.
 * [ ] Migrate existing JSON block disks and module data into folder-backed disk
-  images with a documented conversion tool or import path.
+  images with a documented conversion tool or import path; keep all source
+  files and source disk images.
 * [ ] Remove block-level disk device behavior only after replacement APIs and
   migration are covered by tests. Update disk editor, BIOS selection, examples,
   and documentation to use disks rather than data-disk blocks.
@@ -191,8 +236,12 @@ Checklist status: [x] completed; [ ] planned.
 
 === Phase 6 — Implement the MMU and protected virtual memory
 
-* [ ] Specify MMU control registers, virtual/physical address widths, page size,
-  permission bits, page-fault causes, and the supervisor rules for translation.
+* [ ] Specify an MMU with the existing 30-bit address width, 4 KiB pages, and
+  two-level paging with 512 32-bit entries per directory/table. Use 9 directory
+  bits, 9 table bits, and 12 page-offset bits; each directory/table occupies
+  2 KiB and each page-table entry contains an 18-bit physical frame number and
+  flags. Define control registers, permissions, page-fault causes, and
+  supervisor translation rules.
 * [ ] Define and implement the page directory and page table entry formats,
   including present, read/write, user/supervisor, and any required execute/cache
   bits.
@@ -222,8 +271,8 @@ Checklist status: [x] completed; [ ] planned.
   and distinguish unavailable host services from implemented file operations.
 * [ ] Implement syscall dispatch with validated user pointers, bounded
   transfers, defined errors, and no direct trust of user-supplied addresses.
-* [ ] Implement +sys_spawn+ to load a manifest-authorized executable into a new
-  protected address space and create a task.
+* [ ] Implement +sys_spawn+ to load an executable into a new protected address
+  space and create a task, enforcing the specified privilege-transition rules.
 * [ ] Implement +sys_exit+, +sys_yield+, and +sys_getpid+.
 * [ ] Implement +sys_mmap+ with page permissions and process ownership rules.
 * [ ] Implement +sys_read+ and +sys_write+ for the console and folder-backed
@@ -231,16 +280,18 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Implement +sys_sleep+ using timer ticks and a blocked-task wakeup queue.
 * [ ] Implement +sys_wait+ with child-process status collection and defined
   behavior for invalid/non-child process IDs.
-* [ ] Resolve and implement the requested +sys_sep_op+ syscall after confirming
-  its intended name and behavior.
+* [ ] Specify and implement +sys_sep_op+ for semaphore operations, including
+  operation codes, semaphore ownership and lifetime, blocking/wakeup behavior,
+  and error handling.
 * [ ] Add ABI-level tests for valid calls, invalid syscall numbers, invalid or
   unmapped user pointers, permissions, interrupted calls, and task lifecycle.
 
 === Phase 8 — Move applications to bootable disk images
 
 * [ ] Convert each runnable module into a disk folder/image containing
-  +disk.json+, required +bios.bin+, standardized +boot.bin+, +main.bin+, and its
-  runtime assets/data.
+  +disk.json+, exactly one of +main.bin+ or +kernel.bin+, and its runtime
+  assets/data. Use the emulator-wide BIOS; do not package per-disk +bios.bin+
+  or +boot.bin+.
 * [ ] Move assembly and C compilation out of BIOS/emulator startup. Provide
   offline build commands that compile and link programs, produce the specified
   executable image, and package the disk manifest and files.
@@ -252,21 +303,23 @@ Checklist status: [x] completed; [ ] planned.
   Implement hosted file streams only after those interfaces and error semantics
   are stable.
 * [ ] Update module discovery and BIOS UI to enumerate disks and show manifest
-  metadata rather than scanning C source files and compiling selected modules.
+  metadata in the text-mode BIOS rather than scanning C source files and
+  compiling selected modules.
 * [ ] Update direct-program launch, +--disk+, reset/reboot, gallery, examples,
   build scripts, CI, and test fixtures to use disk images and the standard boot
   flow.
 * [ ] Remove the old in-emulator assembler/compiler boot path after all
   supported applications have migrated and equivalent offline tooling is
-  verified.
+  verified. Preserve legacy source, tools, and data files; move or archive
+  them rather than deleting them.
 * [ ] Update user and architecture documentation, including disk creation,
   offline compilation, boot troubleshooting, privilege modes, interrupts, MMU,
   and syscall ABI.
 
 === Phase 9 — Verify a protected multitasking OS
 
-* [ ] Build a minimal kernel disk that boots through the standardized firmware
-  chain, initializes protected memory and the PIT/IDT, and enters user mode.
+* [ ] Build a minimal kernel disk that boots through the emulator-wide BIOS,
+  initializes protected memory and the PIT/IDT, and enters user mode.
 * [ ] Run at least two isolated user tasks that are preempted and scheduled
   without losing register state or allowing one task to access the other's
   memory.
@@ -277,55 +330,3 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Publish the supported machine/boot/disk/syscall versions and explicitly
   list any unimplemented features before describing the architecture as ready
   for general-purpose operating systems.
-
-== Open questions
-
-=== Q1. What does +sys_sep_op+ mean?
-
-*A:* Unresolved. Confirm whether this means +sys_seek+ (change a file's read
-position), +sys_sem_op+ (semaphore operation), or another syscall before
-finalizing the syscall ABI.
-
-=== Q2. How do host BIOS, per-disk +bios.bin+, and standardized +boot.bin+ relate?
-
-*A:* The plan assumes host/emulator BIOS performs device setup and disk
-selection, then launches the standardized kernel-mode +boot.bin+; each disk
-also contains +bios.bin+ as requested, but its exact role relative to
-+boot.bin+ remains unresolved. Decide whether it is per-disk firmware,
-compatibility metadata, a secondary loader, or redundant before freezing disk
-requirements.
-
-=== Q3. Which image chooses the default program and USER/KERNEL launch mode?
-
-*A:* The plan assumes +boot.bin+ reads these choices from the selected disk's
-JSON manifest. Confirm whether +main.bin+ is always the default executable or
-whether the manifest may select a different executable and mode.
-
-=== Q4. What exact meaning should disk +size+ have?
-
-*A:* The plan assumes it is a capacity limit enforced on host-folder contents.
-Confirm whether size instead describes virtual media capacity, should be
-derived from files, or is only informational; also decide whether disk folders
-may be mounted read-only as a whole.
-
-=== Q5. What is the target MMU architecture?
-
-*A:* Unresolved. Select virtual and physical address widths, page size,
-page-table depth/format, TLB expectations, and whether the existing 30-bit
-physical address space should be retained. The plan treats identity mapping as
-a boot-time kernel mapping, not as the final user address-space layout.
-
-=== Q6. What does “bios.bin prepares SC-16 to run main.bin USER or KERNEL mode”
-mean for the trust model?
-
-*A:* Unresolved. Decide which component is trusted to request kernel-mode
-execution, whether disk-provided kernel programs are always trusted, and what
-policy prevents an untrusted disk manifest or user program from requesting
-kernel privileges.
-
-=== Q7. Which legacy disk and application compatibility is required?
-
-*A:* Unresolved. Decide whether existing block-disk data, C/assembly sources,
-+.sc16img+ files, command-line direct launches, and older module folders need
-automatic migration, an import tool, or may be retired after a documented
-transition period.

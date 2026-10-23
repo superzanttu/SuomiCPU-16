@@ -156,6 +156,26 @@ impl ConsoleDevice {
         }
     }
 
+    pub fn log_debug(&mut self, source: &str, message: &str) {
+        self.write_log("DEBUG", source, message);
+    }
+
+    pub fn log_info(&mut self, source: &str, message: &str) {
+        self.write_log("INFO", source, message);
+    }
+
+    pub fn log_warning(&mut self, source: &str, message: &str) {
+        self.write_log("WARN", source, message);
+    }
+
+    pub fn log_error(&mut self, source: &str, message: &str) {
+        self.write_log("ERROR", source, message);
+    }
+
+    fn write_log(&mut self, level: &str, source: &str, message: &str) {
+        self.write_text(&format!("[{level}] {source}: {message}"));
+    }
+
     fn advance_line(&mut self) {
         self.column = 0;
         self.row += 1;
@@ -291,5 +311,22 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("previous"))
         );
+    }
+
+    #[test]
+    fn writes_tagged_log_messages_to_the_serial_output_and_monitor() {
+        let mut console = ConsoleDevice::new();
+        console.log_debug("cpu", "instruction trace");
+        console.log_info("emulator", "program started");
+        console.log_warning("disk", "capacity nearly full");
+        console.log_error("gpu", "invalid mode");
+
+        assert_eq!(
+            console.output(),
+            b"[DEBUG] cpu: instruction trace\n[INFO] emulator: program started\n[WARN] disk: capacity nearly full\n[ERROR] gpu: invalid mode\n"
+        );
+        let lines = console.text_snapshot();
+        assert!(lines[0].starts_with("[DEBUG] cpu: instruction trace"));
+        assert!(lines[3].starts_with("[ERROR] gpu: invalid mode"));
     }
 }
