@@ -1,91 +1,87 @@
 = SC-16 architecture modernization plan
-
+:toc: left
+:toclevels: 2
 :experimental:
+
 == Goal and design boundaries
 
-Evolve SC-16 from a flat-memory emulator with emulator-side module compilation
-and block-oriented virtual disks into a bootable computer architecture capable
-of running a protected, preemptively multitasking operating system with virtual
-memory.
+This plan evolves SC-16 into a bootable computer architecture for a protected,
+preemptively multitasking operating system with virtual memory. It replaces
+emulator-side program compilation and block-oriented virtual disks with
+prebuilt programs and folder-backed disks.
 
-The work is intentionally staged. Keep the existing emulator, programs, and
-console usable while defining the new machine contract, then migrate firmware,
-disk images, and applications in explicit compatibility steps. Do not claim
-process isolation until user-mode memory accesses are actually protected by the
-MMU.
+Implement the work in stages. Preserve the existing emulator, programs, and
+graphical console during the transition. Do not claim process isolation until
+the MMU enforces user/kernel memory permissions.
 
 == Existing roadmap integration
 
-* The architecture, boot, folder-backed disk, privilege, multitasking, MMU, and
-  syscall work that affects the C runtime is tracked here. The related C90
-  compiler, language, and ABI conformance work remains in
-  link:./c90_todo.adoc[+c90_todo.adoc+]; its hosted-runtime and image-output tasks must
-  follow this plan's syscall, disk, and executable-image contracts rather than
-  introducing competing interfaces.
-* The completed Python-to-Rust migration is recorded in
-  link:./rust_migration.adoc[+rust_migration.adoc+]. This plan does not reopen that
-  completed migration.
-* The SC-16 target ABI and CPU floating-point prerequisites formerly grouped
-  under “SuomiCPU-16 platform required” in +c90_todo.adoc+ are tracked below.
-  Remaining C language/compiler features and independent C90 conformance stay
-  in link:./c90_todo.adoc[+c90_todo.adoc+], with dependencies pointing back here.
+* This document owns the SC-16 architecture, boot, disk, privilege,
+  multitasking, memory-management, syscall, and target-ABI work.
+* C90 language and compiler work remains in
+  link:c90_todo.adoc[c90_todo.adoc]. Its hosted-runtime and executable-image
+  work must use the interfaces defined here.
+* The completed Python-to-Rust migration is documented in
+  link:rust_migration.adoc[rust_migration.adoc].
 
-== Step-by-step TODO
+== Implementation checklist
+
+Checklist status: [x] completed; [ ] planned.
 
 === Phase 0 — Maintain target ABI and CPU compatibility
 
 * [x] *Implement the 30-bit control-flow ABI* (+sc16-control-flow-abi+)
 ** Store return PCs as four big-endian bytes; +RET+ and +RTI+ restore all
-    30 address bits.
-** Set the first function parameter at +SP \+ 4+ and update assembly-library
-    argument offsets to match.
-** Encode direct far control and conditional branches in six bytes; add
-    register-pair indirect +JMPRP+ / +CALLRP+ for full 30-bit addresses.
-** Add +LDI30+ (with +LDI19+/+LDA+ compatibility aliases) so assembler and
-    compiler-generated addresses preserve all 30 bits; verify high addresses.
+   30 address bits.
+** Place the first function parameter four bytes above the stack pointer and
+   update assembly-library argument offsets.
+** Encode far control flow in six bytes and add +JMPRP+ / +CALLRP+ for full
+   30-bit addresses.
+** Add +LDI30+ (with +LDI19+ / +LDA+ compatibility aliases) for full-width
+   addresses.
+
 * [ ] *Define and maintain the C target floating-point model*
   (+c90-float-model+)
-** [x] Select and document IEEE-754 binary32 +float+, binary64 +double+ and
-    +long double+, their sizes, byte order, alignment, literal conversion,
-    rounding, subnormals, signed zero, infinities, NaNs, and exception policy
-    in +c90_target_abi.adoc+.
-** [x] Implement the model consistently in compiler types, object layout,
-    literal conversion, and the execution backend.
-** [x] Update +float.h+ limits and type sizes only with the implementation
-    that makes those limits true.
-** [x] Add compile-time and runtime boundary tests for the selected model.
+** [x] Define IEEE-754 binary32 +float+ and binary64 +double+ / +long double+
+   representations, sizes, byte order, alignment, rounding, and special-value
+   behavior in +c90_target_abi.adoc+.
+** [x] Implement the model in compiler types, object layout, literal
+   conversion, and execution.
+** [x] Update +float.h+ limits to match the implementation.
+** [x] Add compile-time and runtime boundary tests.
+
 * [x] *Provide binary32/binary64 CPU operations* (+c90-float-isa+)
-** [x] Add assembler-encoded arithmetic, ordered compare, integer and format
-    conversions, negation, and square root.
-** [x] Implement register encoding, rounding, subnormal arithmetic, signed
-    zero, infinities, NaNs, and comparison flags in the emulator.
-** [x] Add assembler, validation, and execution regressions.
+** [x] Add arithmetic, ordered comparisons, conversions, negation, and square
+   root instructions.
+** [x] Implement register encoding, rounding, subnormals, signed zero,
+   infinities, NaNs, and comparison flags.
+** [x] Add assembler and execution regressions.
 ** *Depends on:* +c90-float-model+.
+
 * [ ] *Validate floating-point execution and ABI behavior*
   (+c90-float-validation+)
-** Test exponent and precision boundaries, subnormals, signed zero,
-    infinities, NaNs, rounding, casts, constants, calls, and returns.
-** Compare Rust CPU results with an independent reference.
-** *Depends on:* +c90-float-backend+ in +c90_todo.adoc+.
+** Test numeric boundaries, rounding, casts, constants, calls, and returns.
+** Compare CPU results against an independent reference.
+** *Depends on:* +c90-float-backend+ in
+   link:c90_todo.adoc[+c90_todo.adoc+].
+
 * [ ] *Validate the complete C target ABI* (+c90-abi-conformance+)
-** Verify widths, ranges, representations, endianness, alignment, aggregate
-    layout, object/function pointers, conversions, stack frames, and scalar
-    and aggregate calling conventions.
-** Exercise C-visible memory, control-flow, and floating-point behavior
-    against the assembler and CPU implementation.
-** Update +c90_target_abi.adoc+ only from verified behavior.
-** *Depends on:* +c90-float-validation+, +c90-indirect-calls+,
-    +c90-pointer-qualifiers+, +c90-bitfield-codegen+,
-    +c90-linkage-storage+, and +c90-initializers+ in +c90_todo.adoc+.
+** Verify data types, representations, alignment, pointers, conversions,
+   stack frames, and calling conventions.
+** Test C-visible memory, control flow, and floating-point behavior.
+** Update +c90_target_abi.adoc+ only from verified results.
+** *Depends on:* +c90-float-validation+ and the C compiler tasks
+   +c90-indirect-calls+, +c90-pointer-qualifiers+, +c90-bitfield-codegen+,
+   +c90-linkage-storage+, and +c90-initializers+ in
+   link:c90_todo.adoc[+c90_todo.adoc+].
+
 * [ ] *Define C90 bit-field target layout* (+c90-bitfield-layout+)
 ** Specify allocation-unit size, bit order, signedness, alignment, packing,
-    boundary crossing, unnamed fields, and zero-width fields.
-** Define interactions with +sizeof+, unions, record padding, and
-    +offsetof+ constraints.
-** Document implementation-defined choices in +c90_target_abi.adoc+ and add
-    layout tests.
+   boundary crossing, and zero-width fields.
+** Define interactions with +sizeof+, unions, padding, and +offsetof+.
+** Document ABI choices and add layout tests.
 
-=== Phase 1 — Specify the machine and image contracts
+=== Phase 1 — Define architecture, disk, and image contracts
 
 * [ ] Write an SC-16 architecture specification covering reset state, address
   width, byte order, instruction behavior, exceptions, privilege transitions,
@@ -104,12 +100,12 @@ MMU.
   Include entry point, load segments, permissions, alignment, relocation policy,
   and rejected malformed-image cases.
 * [ ] Coordinate executable-image, calling-convention, and process-entry
-  decisions with the target ABI in +c90_target_abi.adoc+; update that ABI document
-  only after implementation and conformance tests confirm the behavior.
+  decisions with the target ABI in +c90_target_abi.adoc+. Update the ABI
+  document only after implementation and conformance tests confirm behavior.
 * [ ] Document the current architecture and migration incompatibilities.
   Keep this specification authoritative for implementation and tests.
 
-=== Phase 2 — Establish deterministic boot and firmware boundaries
+=== Phase 2 — Boot through firmware and +boot.bin+
 
 * [ ] Change CPU reset/power-on state to enter kernel mode at a documented
   firmware entry point with interrupts disabled and a defined stack/control
@@ -135,7 +131,7 @@ MMU.
   manifest-driven program selection, both launch modes, invalid images, and
   recoverable boot failures.
 
-=== Phase 3 — Replace block disks with host-folder disks
+=== Phase 3 — Replace block disks with folder-backed filesystems
 
 * [ ] Design a disk abstraction backed by one explicitly configured host folder
   per disk. A disk's files and subfolders appear as its guest-visible
@@ -159,7 +155,7 @@ MMU.
   migration are covered by tests. Update disk editor, BIOS selection, examples,
   and documentation to use disks rather than data-disk blocks.
 
-=== Phase 4 — Implement kernel/user privilege and protected transitions
+=== Phase 4 — Enforce kernel/user privilege
 
 * [ ] Add a CPU privilege-state representation and a reliable kernel-mode reset.
 * [ ] Classify instructions, control registers, interrupts, and MMIO regions as
@@ -176,7 +172,7 @@ MMU.
   user-mode code cannot modify kernel state, execute privileged operations, or
   reach protected memory/devices.
 
-=== Phase 5 — Add interrupt-controller and scheduling foundations
+=== Phase 5 — Add interrupts and preemptive scheduling
 
 * [ ] Specify an interrupt descriptor table (IDT): descriptor layout, vector
   numbering, gate types, privilege rules, installation, and invalid-vector
@@ -193,7 +189,7 @@ MMU.
 * [ ] Add tests with multiple tasks that demonstrate timer preemption, explicit
   yield, register/flag preservation, blocked/woken tasks, and clean task exit.
 
-=== Phase 6 — Add MMU and virtual memory protection
+=== Phase 6 — Implement the MMU and protected virtual memory
 
 * [ ] Specify MMU control registers, virtual/physical address widths, page size,
   permission bits, page-fault causes, and the supervisor rules for translation.
@@ -216,7 +212,7 @@ MMU.
   read-only pages, user/supervisor permissions, address-space switching, and
   physical-frame reuse.
 
-=== Phase 7 — Define and implement the system-call ABI
+=== Phase 7 — Define the system-call ABI and services
 
 * [ ] Specify the software-interrupt or dedicated system-call instruction,
   syscall number and argument convention, return/error convention, privilege
@@ -240,7 +236,7 @@ MMU.
 * [ ] Add ABI-level tests for valid calls, invalid syscall numbers, invalid or
   unmapped user pointers, permissions, interrupted calls, and task lifecycle.
 
-=== Phase 8 — Convert modules and build workflows to disks
+=== Phase 8 — Move applications to bootable disk images
 
 * [ ] Convert each runnable module into a disk folder/image containing
   +disk.json+, required +bios.bin+, standardized +boot.bin+, +main.bin+, and its
@@ -267,7 +263,7 @@ MMU.
   offline compilation, boot troubleshooting, privilege modes, interrupts, MMU,
   and syscall ABI.
 
-=== Phase 9 — Demonstrate a protected multitasking OS
+=== Phase 9 — Verify a protected multitasking OS
 
 * [ ] Build a minimal kernel disk that boots through the standardized firmware
   chain, initializes protected memory and the PIT/IDT, and enters user mode.
@@ -282,7 +278,7 @@ MMU.
   list any unimplemented features before describing the architecture as ready
   for general-purpose operating systems.
 
-== Questions and answers
+== Open questions
 
 === Q1. What does +sys_sep_op+ mean?
 
