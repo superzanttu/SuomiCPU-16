@@ -54,12 +54,12 @@ conformance work.
   initializers also support runtime binary32 arithmetic (+-+, +*+, +/+,
   unary signs), loading local float values, and integer-to-float conversion,
   including integer arithmetic subexpressions in mixed expressions. Runtime
-  binary32 comparisons (+==+, +<+, +<=+, +>+, +>=+) are supported in automatic
-  scalar initializers; tests cover unordered NaN behavior and conversion of a
-  comparison result to +float+. The +!=+ operator and general floating-value
-  access and runtime expressions outside these initializer subsets remain
-  unsupported. Constant casts to +float+, +double+, and +long double+ are
-  supported in these initializers.
+  binary32 comparisons (+==+, +!=+, +<+, +<=+, +>+, +>=+) are supported in
+  automatic scalar initializers; tests cover unordered NaN behavior and
+  conversion of a comparison result to +float+. General floating-value access
+  and runtime expressions outside these initializer subsets remain unsupported.
+  Constant casts to +float+, +double+, and +long double+ are supported in these
+  initializers.
   Tests verify +float.h+ limit macros,
   binary32/binary64 maximum, minimum-normal, epsilon, subnormal, and
   halfway-rounding object encodings, including rounding a +float+ constant
@@ -163,12 +163,26 @@ C90 requirements listed under C.
 === B1. Implement C90 floating-point compiler support
 
 * [ ] *Implement floating-point code generation* (+c90-float-backend+)
-** Represent +float+, +double+, and +long double+ distinctly in parsing,
-    type checking, constant evaluation, and code generation.
-** Implement literals, constants, conversions, usual arithmetic conversions,
-    arithmetic, comparisons, assignments, and conditional expressions.
-** Implement arguments, returns, variadic promotions, and +sizeof+ according
-    to the target ABI.
+** Step 1: Add typed floating-expression analysis for literals, lvalues,
+   casts, integer signedness, and C90 usual arithmetic conversions. Reject
+   unsupported conversions explicitly.
+** Step 2: Implement general binary32 and binary64 lvalue reads and writes for
+   local, global, and indexed objects; cover assignments and compound
+   assignments.
+** Step 3: Implement signed and unsigned 16-bit / 32-bit integer conversions
+   to and from both floating widths, binary32/binary64 conversions in both
+   directions, and conversion boundary diagnostics/tests.
+** Step 4: Extend binary32 arithmetic and all six comparisons from automatic
+   initializer expressions to general expression contexts, conditions,
+   conditional expressions, and discarded expressions.
+** Step 5: Implement binary64 arithmetic and comparisons and mixed-precision
+   expressions using C90's usual arithmetic conversions.
+** Step 6: Implement floating-point function arguments, return values,
+   prototype conversions, and default argument promotions according to
+   +c90_target_abi.adoc+, including nested and recursive calls.
+** Step 7: Add end-to-end execution tests for operations, conversions, memory
+   representation, comparisons, calls, and returns; compare results against an
+   independent reference and document verified target behavior.
 ** *Depends on:* +c90-float-model+ and +c90-float-isa+ in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+].
 

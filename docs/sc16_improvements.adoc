@@ -40,11 +40,10 @@ contracts.
   automatic floating storage plus constant initializers using those formats.
   Runtime binary32 arithmetic is supported for automatic scalar initializers,
   including local float loads and integer-to-float conversion in mixed
-  expressions. Binary32 comparisons (+==+, +<+, +<=+, +>+, +>=+) are supported
-  in automatic scalar initializers, with unordered NaN behavior tested.
-  General floating-value access, +!=+, expressions outside these initializer
-  subsets, conversions, calls, and returns remain incomplete. Existing math
-  routines still use binary16. See
+  expressions. All six binary32 comparisons are supported in automatic scalar
+  initializers, with unordered NaN behavior tested. General floating-value
+  access, expressions outside these initializer subsets, conversions, calls,
+  and returns remain incomplete. Existing math routines still use binary16. See
   link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
 
 == Existing roadmap integration
@@ -100,10 +99,36 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Test binary32 runtime arithmetic in automatic scalar initializers,
    including local loads, integer subexpressions, and all four arithmetic
    operators.
-** [ ] Test and implement binary32 runtime comparisons in automatic
-   initializers, including all comparison operators and unordered values.
-** [ ] Add runtime floating-point execution tests for conversions, comparisons,
-   calls, returns, and behavior outside the initializer subset.
+** [x] Test binary32 runtime comparisons in automatic scalar initializers for
+   all six operators, unordered NaN cases, and conversion of comparison results
+   to +float+.
+** [ ] Implement typed floating-expression analysis for literals, lvalues,
+   casts, signedness, and C90 usual arithmetic conversions. Reject unsupported
+   conversions instead of silently treating +double+ as +float+.
+** [ ] Implement general binary32 object access: loads and stores for local,
+   global, and indexed objects; assignments and compound assignments. Reuse
+   the existing big-endian object representation.
+** [ ] Implement runtime integer-to-binary32 and binary32-to-integer
+   conversions for signed and unsigned 16-bit and 32-bit integers, integer
+   conversions to binary64, and binary32/binary64 conversions in both
+   directions. Test range edges and C90's undefined conversion cases without
+   relying on CPU extensions.
+** [ ] Move verified binary32 arithmetic and comparisons from automatic
+   initializer-only code paths into general expressions, including conditions,
+   assignments, compound assignments, conditional expressions, and discarded
+   expressions.
+** [ ] Implement general binary64 runtime loads, stores, conversions,
+   arithmetic, and comparisons using the ABI's four-register groups; add
+   mixed-precision operations according to C90 conversion rules.
+** [ ] Implement floating-point function arguments and results according to
+   +c90_target_abi.adoc+, including prototype and default argument promotions,
+   nested calls, and recursion.
+** [ ] Add end-to-end runtime tests for each supported operation, conversion,
+   object access, comparison, and call boundary. Compare numeric results and
+   boundary rounding with an independent reference.
+** [ ] Update +c90_target_abi.adoc+ only for behavior verified by the runtime
+   tests; do not claim complete C conformance until the C90 backend and ABI
+   acceptance suites pass.
 
 * [x] *Provide binary32/binary64 CPU operations* (+c90-float-isa+)
 ** [x] Add arithmetic, ordered comparisons, conversions, negation, and square
@@ -115,8 +140,10 @@ Checklist status: [x] completed; [ ] planned.
 
 * [ ] *Validate floating-point execution and ABI behavior*
   (+c90-float-validation+)
-** Test numeric boundaries, rounding, casts, constants, calls, and returns.
-** Compare CPU results against an independent reference.
+** Test binary32/binary64 numeric boundaries, rounding, casts, constants, calls,
+   and returns after the corresponding backend tasks above are implemented.
+** Compare arithmetic and conversion results against an independent reference.
+** Verify the documented calling convention and C-visible object bytes.
 ** *Depends on:* +c90-float-backend+ in
    link:c90_todo.adoc[+c90_todo.adoc+].
 

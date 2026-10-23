@@ -3835,7 +3835,7 @@ fn emit_native_f32_expression(
             operator,
             left,
             right,
-        } if matches!(operator.as_str(), "==" | "<" | "<=" | ">" | ">=")
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
             && (native_expression_is_f32(left, locals)
                 || native_expression_is_f32(right, locals)) =>
         {
@@ -3886,6 +3886,7 @@ fn emit_native_f32_comparison(
     assembly.push_str("    F32CMP R4, R0\n");
     let branch = match operator {
         "==" => "BZX",
+        "!=" => "BNZX",
         "<" | ">" => "BCX",
         "<=" | ">=" => "BLSX",
         _ => return false,
@@ -3913,10 +3914,11 @@ fn native_expression_is_f32(
             | Some(NativeLocation::StackFloatingPointScalar { size: 4, .. }) => true,
             Some(NativeLocation::FloatingPointScalar { .. })
             | Some(NativeLocation::StackFloatingPointScalar { .. }) => false,
-            None => value
+            None if parse_integer_constant(value).is_none() => value
                 .chars()
                 .last()
                 .is_some_and(|suffix| matches!(suffix, 'f' | 'F')),
+            None => false,
             _ => false,
         },
         ExpressionKind::Unary { operand, .. } => native_expression_is_f32(operand, locals),
@@ -4698,7 +4700,7 @@ fn emit_native_expression(
             operator,
             left,
             right,
-        } if matches!(operator.as_str(), "==" | "<" | "<=" | ">" | ">=")
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
             && (native_expression_is_f32(left, locals)
                 || native_expression_is_f32(right, locals)) =>
         {
@@ -12217,9 +12219,14 @@ mod tests {
             ("high > low", 1),
             ("high >= low", 1),
             ("low == 1.25f", 1),
+            ("low != high", 1),
+            ("low != 1.25f", 0),
             ("nan < high", 0),
             ("nan <= high", 0),
             ("nan == nan", 0),
+            ("nan != high", 1),
+            ("high != nan", 1),
+            ("nan != nan", 1),
         ] {
             let source = format!(
                 "int main(void) {{ float low = 1.25f; float high = 2.5f; \
