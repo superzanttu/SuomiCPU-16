@@ -74,9 +74,11 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Use target sizes for +sizeof(float)+, +sizeof(double)+, and
    +sizeof(long double)+; emit binary32/binary64 global scalar and array
    initializers in big-endian object representation.
-** [ ] Implement automatic floating objects, runtime loads/stores, literal
-   expressions, conversions, arithmetic, comparisons, and floating-point
-   function arguments and results.
+** [x] Reserve target-sized stack storage for uninitialized automatic floating
+   scalars and arrays; report their correct +sizeof+ values.
+** [ ] Implement initialized automatic floating objects, runtime loads/stores,
+   literal expressions, conversions, arithmetic, comparisons, and
+   floating-point function arguments and results.
 ** [x] Verify +float.h+ limits against the target model and test binary32 /
    binary64 maximum, minimum-normal, epsilon, subnormal, and tie-rounding
    initializer representations, including promotion of a rounded +float+

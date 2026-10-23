@@ -335,6 +335,9 @@ enum NativeLocation {
     FloatingPointScalar {
         size: usize,
     },
+    StackFloatingPointScalar {
+        size: usize,
+    },
     ByteStackScalar {
         offset: usize,
         signed: bool,
@@ -1338,6 +1341,7 @@ pub fn compile_minimal_program_to_assembly(
             return Ok(None);
         }
         let has_local_array = statement_has_local_array(&function.body);
+        let has_local_floating_scalar = statement_has_local_floating_scalar(&function.body);
         let has_excess_locals = function.declaration.parameters.len()
             + statement_scalar_local_count(&function.body)
             > 3;
@@ -1356,6 +1360,7 @@ pub fn compile_minimal_program_to_assembly(
             return Ok(None);
         }
         let reserve_frame_register = has_local_array
+            || has_local_floating_scalar
             || has_excess_locals
             || function.declaration.parameters.len() >= 3
             || !address_taken.is_empty();
@@ -2187,19 +2192,22 @@ fn collect_native_locals(
                         return false;
                     }
                     if let Some(length) = declaration.array_length {
-                        let (element_size, element_signed) = match declaration.c_type.trim() {
-                            "int" => (2, true),
-                            "unsigned int" => (2, false),
-                            "unsigned char" => (1, false),
-                            "char" | "signed char" => (1, true),
-                            _ => {
-                                eprintln!(
-                                    "unsupported local array type {} for {}",
-                                    declaration.c_type, declaration.name
-                                );
-                                return false;
-                            }
-                        };
+                        let (element_size, element_signed) =
+                            match native_unqualified_type(&declaration.c_type) {
+                                "int" => (2, true),
+                                "unsigned int" => (2, false),
+                                "unsigned char" => (1, false),
+                                "char" | "signed char" => (1, true),
+                                "float" => (4, false),
+                                "double" | "long double" => (8, false),
+                                _ => {
+                                    eprintln!(
+                                        "unsupported local array type {} for {}",
+                                        declaration.c_type, declaration.name
+                                    );
+                                    return false;
+                                }
+                            };
                         let Some(byte_count) = length.checked_mul(element_size) else {
                             eprintln!("local array {} is too large", declaration.name);
                             return false;
@@ -2224,6 +2232,31 @@ fn collect_native_locals(
                         );
                         *frame_size = new_frame_size;
                     } else {
+                        if let Some(size) = native_floating_type_size(&declaration.c_type) {
+                            if declaration.initializer.is_some() {
+                                eprintln!(
+                                    "floating local initializers are not supported for {}",
+                                    declaration.name
+                                );
+                                return false;
+                            }
+                            let Some(new_frame_size) = frame_size.checked_add(size) else {
+                                return false;
+                            };
+                            if new_frame_size > 65_535 {
+                                eprintln!(
+                                    "floating local {} exceeds the stack frame",
+                                    declaration.name
+                                );
+                                return false;
+                            }
+                            *frame_size = new_frame_size;
+                            locals.insert(
+                                declaration.name.clone(),
+                                NativeLocation::StackFloatingPointScalar { size },
+                            );
+                            continue;
+                        }
                         if reserve_frame_register && *next_register == 3 {
                             *next_register += 1;
                         }
@@ -2445,6 +2478,47 @@ fn statement_has_local_array(statement: &Statement) -> bool {
     }
 }
 
+fn statement_has_local_floating_scalar(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations.iter().any(|declaration| {
+            declaration.array_length.is_none()
+                && matches!(
+                    native_unqualified_type(&declaration.c_type),
+                    "float" | "double" | "long double"
+                )
+        }),
+        StatementKind::Compound(statements) => {
+            statements.iter().any(statement_has_local_floating_scalar)
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_has_local_floating_scalar(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| statement_has_local_floating_scalar(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_has_local_floating_scalar(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .is_some_and(|initializer| statement_has_local_floating_scalar(initializer))
+                || statement_has_local_floating_scalar(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|(_, statements)| statements.iter().any(statement_has_local_floating_scalar)),
+        StatementKind::Label { statement, .. } => statement_has_local_floating_scalar(statement),
+        _ => false,
+    }
+}
+
 fn statement_scalar_local_count(statement: &Statement) -> usize {
     match &statement.kind {
         StatementKind::Declaration(declarations) => declarations
@@ -2531,10 +2605,8 @@ fn native_sizeof_type(c_type: &str) -> Option<u16> {
     let c_type = native_unqualified_type(c_type);
     if c_type.ends_with('*') {
         Some(4)
-    } else if c_type == "float" {
-        Some(4)
-    } else if matches!(c_type, "double" | "long double") {
-        Some(8)
+    } else if let Some(size) = native_floating_type_size(c_type) {
+        u16::try_from(size).ok()
     } else if matches!(c_type, "char" | "signed char" | "unsigned char") {
         Some(1)
     } else if matches!(
@@ -2546,6 +2618,14 @@ fn native_sizeof_type(c_type: &str) -> Option<u16> {
         Some(4)
     } else {
         None
+    }
+}
+
+fn native_floating_type_size(c_type: &str) -> Option<usize> {
+    match native_unqualified_type(c_type) {
+        "float" => Some(4),
+        "double" | "long double" => Some(8),
+        _ => None,
     }
 }
 
@@ -2624,6 +2704,9 @@ fn native_sizeof_expression(
                 ..
             }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
             Some(NativeLocation::FloatingPointScalar { size }) => u16::try_from(*size).ok(),
+            Some(NativeLocation::StackFloatingPointScalar { size, .. }) => {
+                u16::try_from(*size).ok()
+            }
             Some(_) => Some(2),
             None => None,
         },
@@ -3634,6 +3717,7 @@ fn emit_native_expression(
                         "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
                     )),
                     NativeLocation::FloatingPointScalar { .. } => return false,
+                    NativeLocation::StackFloatingPointScalar { .. } => return false,
                     NativeLocation::GlobalByteScalar { signed } => {
                         assembly.push_str(&format!(
                             "    LDI30 R7, __c_global_{value}\n    LD R{destination}, R7\n"
@@ -4403,6 +4487,7 @@ fn emit_native_expression(
                     location,
                     NativeLocation::StackScalar { .. }
                         | NativeLocation::ByteStackScalar { .. }
+                        | NativeLocation::StackFloatingPointScalar { .. }
                         | NativeLocation::PointerStack { .. }
                         | NativeLocation::StackArray { .. }
                 )
@@ -4874,6 +4959,7 @@ fn emit_native_assignment_store(
         NativeLocation::ByteRegister { register, signed } => (*register, false, Some(*signed)),
         NativeLocation::Constant(_) => return false,
         NativeLocation::FloatingPointScalar { .. } => return false,
+        NativeLocation::StackFloatingPointScalar { .. } => return false,
         NativeLocation::GlobalScalar { .. } => (0, true, None),
         NativeLocation::GlobalByteScalar { signed } => (0, false, Some(*signed)),
         NativeLocation::GlobalPointer { .. } => (0, true, None),
@@ -5032,6 +5118,9 @@ fn emit_native_statement(
                 }) = locals.get(&declaration.name)
                 {
                     if let Some(initializer) = &declaration.initializer {
+                        if *element_size > 2 {
+                            return None;
+                        }
                         if let ExpressionKind::Atom(string_token) = &initializer.kind
                             && let Some(bytes) = decode_string_token(string_token)
                         {
@@ -5141,6 +5230,8 @@ fn emit_native_statement(
                             emit_native_stack_offset(7, *offset, assembly);
                             assembly.push_str("    STW R7, R4\n");
                         }
+                        NativeLocation::StackFloatingPointScalar { .. }
+                        | NativeLocation::FloatingPointScalar { .. } => return None,
                         NativeLocation::ByteStackScalar { offset, signed } => {
                             if !emit_native_expression(
                                 initializer,
@@ -5793,6 +5884,7 @@ fn emit_native_update(
         }
         NativeLocation::Constant(_)
         | NativeLocation::FloatingPointScalar { .. }
+        | NativeLocation::StackFloatingPointScalar { .. }
         | NativeLocation::GlobalArray { .. }
         | NativeLocation::GlobalRecord { .. }
         | NativeLocation::FunctionParameters { .. }
@@ -11392,6 +11484,40 @@ mod tests {
                 vec![expected]
             };
             assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn reserves_local_floating_objects_without_generating_integer_accesses() {
+        let source = "int main(void) { float single; double real; long double extended; \
+                      float values[2]; return sizeof(single) + sizeof(real) + \
+                      sizeof(extended) + sizeof(values); }";
+        let assembly = compile_minimal_program_to_assembly(source, "local-floating-layout.c")
+            .unwrap()
+            .expect("uninitialized local floating objects and sizeof");
+        assert!(assembly.contains("ADJSP -28"));
+
+        let image = compile_minimal_program(source, "local-floating-layout.c")
+            .unwrap()
+            .expect("local floating layout program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 28);
+
+        for unsupported in [
+            "int main(void) { float value = 1.5f; return 0; }",
+            "int main(void) { float value; return value; }",
+            "int main(void) { float values[2]; return values[0]; }",
+        ] {
+            assert!(
+                compile_minimal_program(unsupported, "unsupported-local-float.c")
+                    .unwrap()
+                    .is_none(),
+                "unsupported floating object use must be rejected: {unsupported}"
+            );
         }
     }
 

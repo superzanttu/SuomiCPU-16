@@ -44,14 +44,15 @@ conformance work.
 * The assembler and Rust emulator provide binary32/binary64 floating-point
   instructions with interpreter fallback and focused opcode regressions. The C
   compiler now uses the target binary32/binary64 sizes for +sizeof+ and emits
-  direct global floating initializers in big-endian form, but automatic
-  floating objects, expression execution, conversions, calls, and returns
-  remain unsupported. Tests verify +float.h+ limit macros, binary32/binary64
-  maximum, minimum-normal, epsilon, subnormal, and halfway-rounding object
-  encodings, including rounding a +float+ constant before promotion to
-  +double+. Existing math routines still use binary16 arithmetic; this partial
-  compiler support does not establish C90 floating range or precision at
-  runtime.
+  direct global floating initializers in big-endian form. Uninitialized
+  automatic float objects and arrays reserve target-sized stack storage and
+  have correct +sizeof+ values, but initialization, value access, and floating
+  expressions remain unsupported. Tests verify +float.h+ limit macros,
+  binary32/binary64 maximum, minimum-normal, epsilon, subnormal, and
+  halfway-rounding object encodings, including rounding a +float+ constant
+  before promotion to +double+. Existing math routines still use binary16
+  arithmetic; this partial compiler support does not establish C90 floating
+  range or precision at runtime.
 * Function pointers and indirect calls, bit-fields, full linkage/storage
   semantics, complete hosted standard-library facilities, and independent
   conformance validation remain incomplete.
