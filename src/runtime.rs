@@ -24,17 +24,6 @@ const RTC_START: usize = 0x43010;
 const GFX_MODE_ADDR: usize = 0x43014;
 const SOUND_RATE: u32 = 22_050;
 const SOUND_FPS: u32 = 60;
-const BIOS_VISIBLE_MODULES: usize = 12;
-const BIOS_TEXT_COLUMNS: usize = 53;
-const BIOS_TEXT_ROWS: usize = 25;
-const BIOS_TEXT_CELL_WIDTH: usize = 12;
-const BIOS_TEXT_CELL_HEIGHT: usize = 16;
-const BIOS_TEXT_LEFT: usize = (640 - BIOS_TEXT_COLUMNS * BIOS_TEXT_CELL_WIDTH) / 2;
-const BIOS_TEXT_TOP: usize = (480 - BIOS_TEXT_ROWS * BIOS_TEXT_CELL_HEIGHT) / 2;
-const BIOS_MODULE_ROW_TOP: usize = BIOS_TEXT_TOP + 6 * BIOS_TEXT_CELL_HEIGHT;
-const BIOS_MODULE_ROW_HEIGHT: usize = BIOS_TEXT_CELL_HEIGHT;
-const BIOS_PHOSPHOR: u32 = 0xff75ff9a;
-const BIOS_PHOSPHOR_BRIGHT: u32 = 0xffc8ffd5;
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const CONSOLE_WINDOW_WIDTH: usize = 480;
 const CONSOLE_WINDOW_HEIGHT: usize = 200;
@@ -452,21 +441,15 @@ fn console_runtime_control(key: NativeKey, paused: bool) -> Option<RuntimeContro
     }
 }
 
+// ...existing code...
 #[derive(Clone)]
 struct BootTarget {
     source: PathBuf,
     disk_id: Option<String>,
 }
 
-struct BiosUiOptions<'a> {
-    disk_id: Option<&'a str>,
-    fullscreen: &'a mut bool,
-    paused: &'a mut bool,
-    console_visible: &'a mut bool,
-    console_window: &'a mut Option<ConsoleWindow>,
-}
-
 pub fn window_conf() -> Conf {
+// ...existing code...
     Conf {
         window_title: "SuomiCPU-16 Emulator (Rust)".to_owned(),
         window_width: 960,
@@ -497,18 +480,23 @@ pub async fn run_with_devices(
     let mut pixels = vec![0u32; 640 * 480];
     let mut canvas = Canvas::new();
     let mut audio = AudioEngine::new();
-    let modules = if program.is_none() {
-        Some(discover_modules(&root.join("modules"))?)
-    } else {
-        None
-    };
     let mut cpu = fresh_runtime_cpu(root, program, disk_id, network_port, None)?;
+    
+    let bios_path = root.join("bios.bin");
+    if bios_path.exists() {
+        let bios_data = fs::read(&bios_path).map_err(RuntimeError::Io)?;
+        cpu.memory[0..bios_data.len()].copy_from_slice(&bios_data);
+        cpu.console.log_info("emulator", "BIOS loaded from bios.bin");
+    } else {
+        cpu.console.log_warn("emulator", "bios.bin not found; booting from empty memory");
+    }
+
     cpu.console.log_info("emulator", "BIOS started");
     let mut paused = false;
     let mut console_visible = false;
     let mut console_window: Option<ConsoleWindow> = None;
     let mut fullscreen = fullscreen;
-    let mut target = if let Some(source) = program {
+    let target = if let Some(source) = program {
         let target = BootTarget {
             source: source.to_path_buf(),
             disk_id: disk_id.map(str::to_owned),
@@ -516,26 +504,7 @@ pub async fn run_with_devices(
         boot_target(&mut cpu, &target)?;
         Some(target)
     } else {
-        let Some(target) = select_and_boot(
-            root,
-            &mut cpu,
-            &mut canvas,
-            &mut pixels,
-            &font,
-            modules.as_deref().expect("BIOS modules were loaded"),
-            BiosUiOptions {
-                disk_id,
-                fullscreen: &mut fullscreen,
-                paused: &mut paused,
-                console_visible: &mut console_visible,
-                console_window: &mut console_window,
-            },
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        Some(target)
+        None
     };
 
     let mut old_keys = HashSet::new();
@@ -652,27 +621,30 @@ pub async fn run_with_devices(
             audio.stop_all();
             let previous_console = cpu.console.clone();
             if action == RuntimeControl::ResetRequested
-                && let Some(modules) = &modules
             {
                 console_window = None;
                 console_visible = false;
                 cpu = fresh_runtime_cpu(root, None, None, network_port, Some(&previous_console))?;
-                let Some(new_target) = select_and_boot(
-                    root,
-                    &mut cpu,
-                    &mut canvas,
-                    &mut pixels,
-                    &font,
-                    modules,
-                    BiosUiOptions {
-                        disk_id: target.as_ref().and_then(|target| target.disk_id.as_deref()),
-                        fullscreen: &mut fullscreen,
-                        paused: &mut paused,
-                        console_visible: &mut console_visible,
-                        console_window: &mut console_window,
-                    },
-                )
-                .await?
+                
+                let bios_path = root.join("bios.bin");
+                if bios_path.exists() {
+                    let bios_data = fs::read(&bios_path).map_err(RuntimeError::Io)?;
+                    cpu.memory[0..bios_data.len()].copy_from_slice(&bios_data);
+                    cpu.console.log_info("emulator", "BIOS loaded from bios.bin");
+                } else {
+                    cpu.console.log_warn("emulator", "bios.bin not found; booting from empty memory");
+                }
+
+                let Some(new_target) = if let Some(source) = program {
+                    let target = BootTarget {
+                        source: source.to_path_buf(),
+                        disk_id: disk_id.map(str::to_owned),
+                    };
+                    boot_target(&mut cpu, &target)?;
+                    Some(target)
+                } else {
+                    None
+                }
                 else {
                     return Ok(());
                 };
@@ -844,6 +816,7 @@ pub fn run_headless(root: &Path, program: &Path, budget: usize) -> Result<usize,
     run_headless_with_devices(root, program, budget, None, DEFAULT_PORT)
 }
 
+// ...existing code...
 pub fn run_headless_with_devices(
     root: &Path,
     program: &Path,
@@ -870,145 +843,7 @@ pub fn run_headless_with_devices(
     }
     Ok(executed)
 }
-
-fn discover_modules(directory: &Path) -> Result<Vec<BootModule>, RuntimeError> {
-    let mut modules = Vec::new();
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
-    for entry in entries {
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let mut sources = fs::read_dir(entry.path())?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|item| {
-                item.path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("c"))
-            })
-            .map(|item| item.path())
-            .collect::<Vec<_>>();
-        sources.sort_by_key(|path| {
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase()
-        });
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let (source, error) = match sources.len() {
-            0 => (None, Some("No .c files found in module folder.".to_owned())),
-            1 => (sources.pop(), None),
-            _ => {
-                let main = sources
-                    .iter()
-                    .find(|path| {
-                        path.file_name()
-                            .is_some_and(|name| name.eq_ignore_ascii_case("main.c"))
-                    })
-                    .cloned();
-                match main {
-                    Some(path) => (Some(path), None),
-                    None => (
-                        None,
-                        Some("Multiple .c files found; expected main.c.".to_owned()),
-                    ),
-                }
-            }
-        };
-        let description = if let Some(path) = &source {
-            let contents = fs::read_to_string(path)?;
-            let line = contents
-                .trim_start_matches('\u{feff}')
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim();
-            let description = if let Some(line) = line.strip_prefix("//") {
-                line.trim().to_owned()
-            } else if let Some(line) = line.strip_prefix("/*") {
-                line.strip_suffix("*/")
-                    .unwrap_or(line)
-                    .trim_start_matches('*')
-                    .trim()
-                    .to_owned()
-            } else {
-                line.to_owned()
-            };
-            if description.is_empty() {
-                "No description".to_owned()
-            } else {
-                description
-            }
-        } else {
-            error.clone().unwrap_or_else(|| "No description".to_owned())
-        };
-        modules.push(BootModule {
-            name,
-            description,
-            source,
-            error,
-        });
-    }
-    Ok(modules)
-}
-
-async fn select_and_boot(
-    root: &Path,
-    cpu: &mut Cpu,
-    canvas: &mut Canvas,
-    pixels: &mut [u32],
-    font: &[[u8; 8]],
-    modules: &[BootModule],
-    options: BiosUiOptions<'_>,
-) -> Result<Option<BootTarget>, RuntimeError> {
-    let BiosUiOptions {
-        disk_id,
-        fullscreen,
-        paused,
-        console_visible,
-        console_window,
-    } = options;
-    let mut selected = 0usize;
-    let mut scroll_offset = 0usize;
-    let mut last_clicked_module = None;
-    let mut message = None;
-    let disks = cpu.available_disks().map_err(RuntimeError::Window)?;
-    let mut selected_disk = match disk_id {
-        Some(disk_id) => disks
-            .iter()
-            .position(|disk| disk == disk_id)
-            .map(|index| index + 1)
-            .ok_or_else(|| {
-                RuntimeError::Window(format!("virtual data disk {disk_id:?} does not exist"))
-            })?,
-        None => 0,
-    };
-    loop {
-        let toolbar_height = if *fullscreen { 0.0 } else { TOOLBAR_HEIGHT };
-        draw_bios_selector(
-            pixels,
-            font,
-            modules,
-            (selected, scroll_offset),
-            &disks,
-            selected_disk,
-            message.as_deref(),
-        );
-        canvas
-            .present(
-                pixels,
-                (640, 480),
-                &[],
-                &[],
-                &cpu.palette,
-                (!*fullscreen).then_some(ToolbarState { paused: *paused }),
-            )
-            .await;
-        let wheel_delta = mouse_wheel().1;
-        if wheel_delta != 0.0
-            && !*paused
-            && let Some((x, y)) = screen_to_logical(
+// ...existing code...
                 (mouse_position().0, mouse_position().1 - toolbar_height),
                 (screen_width(), screen_height() - toolbar_height),
                 (640, 480),

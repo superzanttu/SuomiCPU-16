@@ -1591,9 +1591,6 @@ pub fn compile_minimal_program_to_assembly(
 
         let mut source_offset = 4;
         for (index, parameter) in function.declaration.parameters.iter().enumerate() {
-            if index >= 3 {
-                break;
-            }
             let register = index + 1;
             let c_type = &parameter.c_type;
 
@@ -1618,6 +1615,8 @@ pub fn compile_minimal_program_to_assembly(
                     &mut assembly,
                 );
                 source_offset += 2;
+            }
+        }
             }
         }
 
@@ -5244,7 +5243,17 @@ fn emit_native_expression(
                             assembly,
                         );
                     }
-                    NativeLocation::StackWideScalar { .. } => return false,
+                    NativeLocation::StackWideScalar { offset, unsigned } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                        assembly.push_str(&format!("    LDW R{destination}, R7\n"));
+                        emit_native_word_normalization(
+                            destination,
+                            *unsigned,
+                            label_counter,
+                            assembly,
+                        );
+                    }
                     NativeLocation::ByteStackScalar { offset, signed } => {
                         assembly.push_str("    MOV R7, R3\n");
                         emit_native_stack_offset(7, *offset, assembly);
@@ -6160,68 +6169,7 @@ fn emit_native_expression(
                     assembly.push_str("    PUSH R4\n");
                     argument_bytes += 2;
                 }
-            } else if library_function {
-                for (index, argument) in arguments.iter().enumerate().rev() {
-                    if native_argument_is_pointer(name, index, arguments) {
-                        if !emit_native_library_pointer_argument(
-                            name,
-                            index,
-                            argument,
-                            locals,
-                            label_counter,
-                            assembly,
-                        ) {
-                            return false;
-                        }
-                        emit_native_pointer_push(label_counter, assembly);
-                        argument_bytes += 4;
-                    } else {
-                        if !emit_native_expression(
-                            argument,
-                            4,
-                            &[5, 6, 7],
-                            locals,
-                            label_counter,
-                            assembly,
-                        ) {
-                            return false;
-                        }
-                        assembly.push_str("    PUSH R4\n");
-                        argument_bytes += 2;
-                    }
-                }
-            } else if arguments.len() <= 3 {
-                for (index, argument) in arguments.iter().enumerate() {
-                    let argument_register = index as u8 + 4;
-                    let argument_temporaries = temporary_registers
-                        .iter()
-                        .copied()
-                        .filter(|register| *register > argument_register)
-                        .collect::<Vec<_>>();
-                    if !emit_native_expression(
-                        argument,
-                        argument_register,
-                        &argument_temporaries,
-                        locals,
-                        label_counter,
-                        assembly,
-                    ) {
-                        return false;
-                    }
-                }
-                for index in 0..arguments.len() {
-                    assembly.push_str(&format!("    MOV R{}, R{}\n", index + 1, index + 4));
-                }
             } else {
-                let Some(NativeLocation::FunctionParameters {
-                    pointer_parameters, ..
-                }) = locals.get(name)
-                else {
-                    return false;
-                };
-                if pointer_parameters.len() != arguments.len() {
-                    return false;
-                }
                 for (index, argument) in arguments.iter().enumerate().rev() {
                     if !emit_native_expression(
                         argument,
