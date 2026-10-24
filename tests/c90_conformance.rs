@@ -193,6 +193,128 @@ fn c90_three_word_call_arguments_use_documented_stack_abi() {
 }
 
 #[test]
+fn c90_four_word_call_arguments_use_documented_stack_abi() {
+    let source = "int check(int first, int second, int third, int fourth) { \
+                 if (first != -1) return 1; if (second != 2) return 2; \
+                 if (third != -3) return 3; if (fourth != 4) return 4; \
+                 return first; } \
+                 int main(void) { return check(-1, 2, -3, 4); }";
+    let assembly = compile_minimal_program_to_assembly(source, "c90-call-abi.c")
+        .expect("C source should parse")
+        .expect("C source should compile");
+    let combine_start = assembly
+        .find("__c_function_check:\n")
+        .expect("check function should be emitted");
+    let main_start = assembly
+        .find("__c_function_main:\n")
+        .expect("main function should be emitted");
+    let combine = &assembly[combine_start..main_start];
+    let main = &assembly[main_start..];
+    let call_start = main
+        .find("CALLX __c_function_check\n")
+        .expect("check call should be emitted");
+
+    for (register, offset) in [(1, 4), (2, 6), (3, 8)] {
+        assert!(
+            combine.contains(&format!("LDWS R{register}, {offset}\n")),
+            "{combine}"
+        );
+    }
+    let register_save_end = main[..call_start]
+        .find("PUSH R6\n")
+        .map(|index| index + "PUSH R6\n".len())
+        .expect("caller should save its registers before evaluating arguments");
+    assert_eq!(
+        main[register_save_end..call_start]
+            .matches("PUSH R4\n")
+            .count(),
+        4,
+        "{}",
+        &main[register_save_end..call_start]
+    );
+    assert!(main[call_start..].contains("ADJSP 8\n"), "{main}");
+    assert_eq!(run_c(source), -1);
+}
+
+#[test]
+fn c90_five_word_call_arguments_use_documented_stack_abi() {
+    let source = "int check(int first, int second, int third, int fourth, int fifth) { \
+                 if (first != -1) return 1; if (second != 2) return 2; \
+                 if (third != -3) return 3; if (fourth != 4) return 4; \
+                 if (fifth != -5) return 5; return first; } \
+                 int main(void) { return check(-1, 2, -3, 4, -5); }";
+    let assembly = compile_minimal_program_to_assembly(source, "c90-call-abi.c")
+        .expect("C source should parse")
+        .expect("C source should compile");
+    let check_start = assembly
+        .find("__c_function_check:\n")
+        .expect("check function should be emitted");
+    let main_start = assembly
+        .find("__c_function_main:\n")
+        .expect("main function should be emitted");
+    let check = &assembly[check_start..main_start];
+    let main = &assembly[main_start..];
+    let call_start = main
+        .find("CALLX __c_function_check\n")
+        .expect("check call should be emitted");
+
+    for (register, offset) in [(1, 4), (2, 6), (3, 8)] {
+        assert!(
+            check.contains(&format!("LDWS R{register}, {offset}\n")),
+            "{check}"
+        );
+    }
+    let register_save_end = main[..call_start]
+        .find("PUSH R6\n")
+        .map(|index| index + "PUSH R6\n".len())
+        .expect("caller should save its registers before evaluating arguments");
+    assert_eq!(
+        main[register_save_end..call_start]
+            .matches("PUSH R4\n")
+            .count(),
+        5,
+        "{}",
+        &main[register_save_end..call_start]
+    );
+    assert!(main[call_start..].contains("ADJSP 10\n"), "{main}");
+    assert_eq!(run_c(source), -1);
+}
+
+#[test]
+fn c90_signed_char_call_argument_uses_documented_stack_abi() {
+    let source = "int identity(signed char value) { return value; } \
+                 int unsigned_identity(unsigned char value) { return value; } \
+                 int main(void) { if (identity(-3) != -3) return 1; \
+                 return unsigned_identity(250) == 250 ? 0 : 2; }";
+    let assembly = compile_minimal_program_to_assembly(source, "c90-call-abi.c")
+        .expect("C source should parse")
+        .expect("C source should compile");
+    let identity_start = assembly
+        .find("__c_function_identity:\n")
+        .expect("identity function should be emitted");
+    let main_start = assembly
+        .find("__c_function_main:\n")
+        .expect("main function should be emitted");
+    let identity = &assembly[identity_start..main_start];
+    let main = &assembly[main_start..];
+
+    assert!(identity.contains("LD R1, R7\n"), "{identity}");
+    assert!(
+        main.contains("ADJSP -1\n    MOVSP R7\n    ST R7, R4\n"),
+        "{main}"
+    );
+    assert!(
+        main.contains("CALLX __c_function_identity\n    ADJSP 1\n"),
+        "{main}"
+    );
+    assert!(
+        main.contains("CALLX __c_function_unsigned_identity\n    ADJSP 1\n"),
+        "{main}"
+    );
+    assert_eq!(run_c(source), 0);
+}
+
+#[test]
 fn c90_object_layout_arrays_and_pointers() {
     for (source, expected) in [
         (

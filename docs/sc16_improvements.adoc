@@ -76,9 +76,16 @@ Checklist status: [x] completed; [ ] planned.
   caller cleanup.
 ** [x] Pass up to three 16-bit scalar parameters right-to-left at +SP \+ 4+,
    +SP \+ 6+, and +SP \+ 8+; verify signed values, order, and caller cleanup.
+** [x] Pass four 16-bit scalar parameters on the stack; test signed parameter
+  values, argument order, and caller cleanup.
+** [x] Pass five 16-bit scalar parameters through the callee's stack-copy path;
+   test signed values, argument order, and caller cleanup.
+** [x] Pass a one-byte signed or unsigned scalar parameter on the stack; test
+  sign/zero extension and caller cleanup.
 ** [ ] Pass all supported C argument types using their documented stack object
-  representations; cover byte, pointer, wide integer, aggregate, and floating
-  arguments, callee offsets, promotions, nested calls, and recursion.
+   representations; cover other arities, byte, pointer, wide integer,
+   aggregate, and floating arguments, callee offsets, promotions, nested calls,
+   and recursion.
 ** [ ] Audit and update assembly-library argument offsets for the documented
   stack convention.
 
@@ -205,8 +212,10 @@ Checklist status: [x] completed; [ ] planned.
   The executable and its mode are selected by the fixed +main.bin+ / +kernel.bin+
   rule, not by a metadata field.
 * [ ] Define a standard executable image format and offline build pipeline.
-  Include entry point, load segments, permissions, alignment, relocation policy,
-  and rejected malformed-image cases.
+** [x] Validate existing +SC16IMG1+ segment memory ranges and reject entry
+  points outside loaded segment bytes when reading or writing images.
+** [ ] Specify a versioned format with entry point, load segments, permissions,
+  alignment, relocation policy, and rejected malformed-image cases.
 * [ ] Coordinate executable-image, calling-convention, and process-entry
   decisions with the target ABI in +c90_target_abi.adoc+. Update the ABI
   document only after implementation and conformance tests confirm behavior.

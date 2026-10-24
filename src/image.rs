@@ -52,15 +52,54 @@ pub struct ProgramImage {
     pub segments: Vec<MemorySegment>,
 }
 
+fn validate_image(image: &ProgramImage) -> Result<(), ImageError> {
+    if u64::from(image.entry_point) >= MEMORY_SIZE {
+        return Err(ImageError::InvalidFormat(
+            "entry point is outside SC-16 memory",
+        ));
+    }
+    let mut total = 0u64;
+    let mut contains_entry_point = false;
+    for segment in &image.segments {
+        let length = segment.data.len() as u64;
+        let end = u64::from(segment.address)
+            .checked_add(length)
+            .ok_or(ImageError::InvalidFormat("segment range overflow"))?;
+        if end > MEMORY_SIZE {
+            return Err(ImageError::InvalidFormat("segment is outside SC-16 memory"));
+        }
+        if length > 0
+            && u64::from(segment.address) <= u64::from(image.entry_point)
+            && u64::from(image.entry_point) < end
+        {
+            contains_entry_point = true;
+        }
+        total = total
+            .checked_add(length)
+            .ok_or(ImageError::InvalidFormat("total image size overflow"))?;
+        if total > MEMORY_SIZE {
+            return Err(ImageError::InvalidFormat("image exceeds memory"));
+        }
+    }
+    if !contains_entry_point {
+        return Err(ImageError::InvalidFormat(
+            "entry point is not inside a load segment",
+        ));
+    }
+    Ok(())
+}
+
 pub fn load_binary(path: &Path) -> Result<ProgramImage, ImageError> {
     let data = fs::read(path)?;
     if data.len() as u64 > MEMORY_SIZE {
         return Err(ImageError::InvalidFormat("binary exceeds SC-16 memory"));
     }
-    Ok(ProgramImage {
+    let image = ProgramImage {
         entry_point: 0,
         segments: vec![MemorySegment { address: 0, data }],
-    })
+    };
+    validate_image(&image)?;
+    Ok(image)
 }
 
 pub fn load_program(path: &Path) -> Result<ProgramImage, ImageError> {
@@ -86,28 +125,9 @@ pub fn load_program(path: &Path) -> Result<ProgramImage, ImageError> {
 }
 
 pub fn write_image(path: &Path, image: &ProgramImage) -> Result<(), ImageError> {
-    if image.entry_point >= MEMORY_SIZE as u32 {
-        return Err(ImageError::InvalidFormat(
-            "entry point is outside SC-16 memory",
-        ));
-    }
+    validate_image(image)?;
     let segment_count = u32::try_from(image.segments.len())
         .map_err(|_| ImageError::InvalidFormat("segment count is excessive"))?;
-    let mut total = 0u64;
-    for segment in &image.segments {
-        let end = u64::from(segment.address)
-            .checked_add(segment.data.len() as u64)
-            .ok_or(ImageError::InvalidFormat("segment range overflow"))?;
-        if end > MEMORY_SIZE {
-            return Err(ImageError::InvalidFormat("segment is outside SC-16 memory"));
-        }
-        total = total
-            .checked_add(segment.data.len() as u64)
-            .ok_or(ImageError::InvalidFormat("total image size overflow"))?;
-        if total > MEMORY_SIZE {
-            return Err(ImageError::InvalidFormat("image exceeds memory"));
-        }
-    }
     let mut file = fs::File::create(path)?;
     file.write_all(MAGIC)?;
     file.write_all(&image.entry_point.to_be_bytes())?;
@@ -186,10 +206,12 @@ pub fn read_image(path: &Path) -> Result<ProgramImage, ImageError> {
     if file.read(&mut trailing)? != 0 {
         return Err(ImageError::InvalidFormat("trailing bytes"));
     }
-    Ok(ProgramImage {
+    let image = ProgramImage {
         entry_point,
         segments,
-    })
+    };
+    validate_image(&image)?;
+    Ok(image)
 }
 
 #[cfg(test)]
@@ -225,6 +247,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn rejects_entry_point_outside_load_segments() {
+        let path = std::env::temp_dir().join(format!(
+            "sc16-invalid-entry-image-{}.img",
+            std::process::id()
+        ));
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&0x20u32.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&0x10u32.to_be_bytes());
+        bytes.extend_from_slice(&2u64.to_be_bytes());
+        bytes.extend_from_slice(&[0x12, 0x34]);
+        fs::write(&path, bytes).unwrap();
+
+        let result = read_image(&path);
+
+        fs::remove_file(path).unwrap();
+        assert!(matches!(result, Err(ImageError::InvalidFormat(_))));
     }
 
     #[test]
@@ -297,7 +339,7 @@ mod tests {
         let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
-        cpu.run(32).unwrap();
+        cpu.run(256).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 42);
     }

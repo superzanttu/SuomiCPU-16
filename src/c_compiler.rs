@@ -383,6 +383,7 @@ enum NativeLocation {
     FunctionParameters {
         pointer_parameters: Vec<bool>,
         float_parameters: Vec<usize>,
+        byte_parameters: Vec<bool>,
         word_parameters: Vec<bool>,
         float_return_size: usize,
     },
@@ -1461,9 +1462,16 @@ pub fn compile_minimal_program_to_assembly(
                     record_layout: record_layout.clone(),
                 }
             } else if let Some(signed) = native_byte_type(&parameter.c_type) {
-                NativeLocation::ByteRegister {
-                    register: index as u8 + 1,
-                    signed,
+                if function.declaration.parameters.len() == 1 && index == 0 {
+                    NativeLocation::Register {
+                        register: 1,
+                        unsigned: !signed,
+                    }
+                } else {
+                    NativeLocation::ByteRegister {
+                        register: index as u8 + 1,
+                        signed,
+                    }
                 }
             } else {
                 NativeLocation::Register {
@@ -1559,6 +1567,10 @@ pub fn compile_minimal_program_to_assembly(
                         .iter()
                         .map(|parameter| native_floating_type_size(&parameter.c_type).unwrap_or(0))
                         .collect(),
+                    byte_parameters: parameters
+                        .iter()
+                        .map(|parameter| native_byte_type(&parameter.c_type).is_some())
+                        .collect(),
                     word_parameters: parameters
                         .iter()
                         .map(|parameter| is_native_stack_word_type(&parameter.c_type))
@@ -1576,6 +1588,15 @@ pub fn compile_minimal_program_to_assembly(
                 });
         }
         assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
+        if function.declaration.parameters.len() == 1 {
+            if let Some(signed) = native_byte_type(&function.declaration.parameters[0].c_type) {
+                assembly.push_str("    MOVSP R7\n");
+                emit_native_stack_offset(7, 4, &mut assembly);
+                assembly.push_str("    LD R1, R7\n");
+                emit_native_byte_normalization(1, signed, &mut assembly);
+                emit_native_word_normalization(1, !signed, &mut label_counter, &mut assembly);
+            }
+        }
         if (1..=3).contains(&function.declaration.parameters.len())
             && function
                 .declaration
@@ -1608,6 +1629,14 @@ pub fn compile_minimal_program_to_assembly(
                     source_offset += 4;
                 } else {
                     assembly.push_str(&format!("    LDWS R{}, {source_offset}\n", index + 1));
+                    if is_native_stack_word_type(&parameter.c_type) {
+                        emit_native_word_normalization(
+                            index as u8 + 1,
+                            is_native_unsigned_word_type(&parameter.c_type),
+                            &mut label_counter,
+                            &mut assembly,
+                        );
+                    }
                     source_offset += 2;
                 }
             }
@@ -6014,24 +6043,26 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &function.kind else {
                 return false;
             };
-            let (float_return_size, float_parameter_size, word_parameters) = match locals.get(name)
-            {
-                Some(NativeLocation::FunctionParameters {
-                    float_parameters,
-                    word_parameters,
-                    float_return_size,
-                    ..
-                }) => (
-                    *float_return_size,
-                    if float_parameters.len() == 1 {
-                        float_parameters[0]
-                    } else {
-                        0
-                    },
-                    word_parameters.clone(),
-                ),
-                _ => (0, 0, Vec::new()),
-            };
+            let (float_return_size, float_parameter_size, byte_parameter, word_parameters) =
+                match locals.get(name) {
+                    Some(NativeLocation::FunctionParameters {
+                        float_parameters,
+                        byte_parameters,
+                        word_parameters,
+                        float_return_size,
+                        ..
+                    }) => (
+                        *float_return_size,
+                        if float_parameters.len() == 1 {
+                            float_parameters[0]
+                        } else {
+                            0
+                        },
+                        byte_parameters.len() == 1 && byte_parameters[0],
+                        word_parameters.clone(),
+                    ),
+                    _ => (0, 0, false, Vec::new()),
+                };
             if (float_return_size != 0 && float_parameter_size == 0 && !arguments.is_empty())
                 || (float_parameter_size != 0 && arguments.len() != 1)
             {
@@ -6122,6 +6153,19 @@ fn emit_native_expression(
                 if !emit_native_f64_expression(&arguments[0], locals, label_counter, assembly) {
                     return false;
                 }
+            } else if arguments.len() == 1 && byte_parameter {
+                if !emit_native_expression(
+                    &arguments[0],
+                    4,
+                    &[5, 6, 7],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                assembly.push_str("    ADJSP -1\n    MOVSP R7\n    ST R7, R4\n");
+                argument_bytes += 1;
             } else if (1..=3).contains(&arguments.len())
                 && word_parameters.len() == arguments.len()
                 && word_parameters.iter().all(|is_word| *is_word)
