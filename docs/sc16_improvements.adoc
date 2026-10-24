@@ -213,7 +213,8 @@ Checklist status: [x] completed; [ ] planned.
   rule, not by a metadata field.
 * [ ] Define a standard executable image format and offline build pipeline.
 ** [x] Validate existing +SC16IMG1+ segment memory ranges and reject entry
-  points outside loaded segment bytes when reading or writing images.
+  points outside loaded segment bytes and overlapping load segments when
+  reading or writing images.
 ** [ ] Specify a versioned format with entry point, load segments, permissions,
   alignment, relocation policy, and rejected malformed-image cases.
 * [ ] Coordinate executable-image, calling-convention, and process-entry

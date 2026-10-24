@@ -60,9 +60,11 @@ fn validate_image(image: &ProgramImage) -> Result<(), ImageError> {
     }
     let mut total = 0u64;
     let mut contains_entry_point = false;
+    let mut ranges = Vec::with_capacity(image.segments.len());
     for segment in &image.segments {
         let length = segment.data.len() as u64;
-        let end = u64::from(segment.address)
+        let start = u64::from(segment.address);
+        let end = start
             .checked_add(length)
             .ok_or(ImageError::InvalidFormat("segment range overflow"))?;
         if end > MEMORY_SIZE {
@@ -74,12 +76,19 @@ fn validate_image(image: &ProgramImage) -> Result<(), ImageError> {
         {
             contains_entry_point = true;
         }
+        if length > 0 {
+            ranges.push((start, end));
+        }
         total = total
             .checked_add(length)
             .ok_or(ImageError::InvalidFormat("total image size overflow"))?;
         if total > MEMORY_SIZE {
             return Err(ImageError::InvalidFormat("image exceeds memory"));
         }
+    }
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err(ImageError::InvalidFormat("load segments overlap"));
     }
     if !contains_entry_point {
         return Err(ImageError::InvalidFormat(
@@ -261,6 +270,66 @@ mod tests {
         bytes.extend_from_slice(&0x10u32.to_be_bytes());
         bytes.extend_from_slice(&2u64.to_be_bytes());
         bytes.extend_from_slice(&[0x12, 0x34]);
+        fs::write(&path, bytes).unwrap();
+
+        let result = read_image(&path);
+
+        fs::remove_file(path).unwrap();
+        assert!(matches!(result, Err(ImageError::InvalidFormat(_))));
+
+        let path =
+            std::env::temp_dir().join(format!("sc16-adjacent-segments-{}.img", std::process::id()));
+        let adjacent = ProgramImage {
+            entry_point: 0x10,
+            segments: vec![
+                MemorySegment {
+                    address: 0x10,
+                    data: vec![0x12, 0x34],
+                },
+                MemorySegment {
+                    address: 0x12,
+                    data: vec![0x56],
+                },
+            ],
+        };
+        write_image(&path, &adjacent).unwrap();
+        assert_eq!(read_image(&path).unwrap(), adjacent);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_overlapping_load_segments() {
+        let path = std::env::temp_dir().join(format!(
+            "sc16-overlapping-segments-{}.img",
+            std::process::id()
+        ));
+        let image = ProgramImage {
+            entry_point: 0x10,
+            segments: vec![
+                MemorySegment {
+                    address: 0x10,
+                    data: vec![0x12, 0x34],
+                },
+                MemorySegment {
+                    address: 0x11,
+                    data: vec![0x56],
+                },
+            ],
+        };
+        assert!(matches!(
+            write_image(&path, &image),
+            Err(ImageError::InvalidFormat(_))
+        ));
+
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&0x10u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&0x10u32.to_be_bytes());
+        bytes.extend_from_slice(&2u64.to_be_bytes());
+        bytes.extend_from_slice(&[0x12, 0x34]);
+        bytes.extend_from_slice(&0x11u32.to_be_bytes());
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.push(0x56);
         fs::write(&path, bytes).unwrap();
 
         let result = read_image(&path);
