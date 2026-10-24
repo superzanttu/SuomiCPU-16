@@ -205,12 +205,11 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Define exception and interrupt entry/return frames, including the saved
   privilege level, PC, flags, stack selection, and the behavior for faults
   during entry or return.
-* [ ] Define a versioned disk metadata JSON schema. Specify
-  required and optional fields, validation errors, encoding, path rules, file
-  lengths, virtual capacity, disk-wide read/write mode, the read-only file
-  list, required executable names, and metadata compatibility/version handling.
-  The executable and its mode are selected by the fixed +main.bin+ / +kernel.bin+
-  rule, not by a metadata field.
+* [x] Define versioned folder-disk manifest v1 in
+  link:sc16_disk_format.adoc[+sc16_disk_format.adoc+], including required and
+  optional fields, encoding, path rules, capacity semantics, disk-wide and
+  per-file read-only behavior, version handling, and the fixed executable rule.
+  The manifest cannot select the executable or its privilege mode.
 * [ ] Define a standard executable image format and offline build pipeline.
 ** [x] Validate existing +SC16IMG1+ segment memory ranges and reject entry
   points outside loaded segment bytes and overlapping load segments when
@@ -252,6 +251,10 @@ Checklist status: [x] completed; [ ] planned.
   +main.bin+ exists, load it in USER mode. If both files exist, or if neither
   exists, report +NOT_BOOT+. Metadata does not choose the executable or its
   mode.
+** [x] Provide a folder-disk helper that applies the fixed executable-name
+  rule and validates the selected image before returning its launch mode.
+** [ ] Wire folder-disk discovery, BIOS selection UI, and mode transfer into
+  the emulator runtime without compiling guest source.
 * [ ] Treat the presence of +kernel.bin+ as authorization to execute that
   disk-provided image in KERNEL mode. Document this trust model clearly; disk
   metadata and user-mode programs must not be able to change the BIOS rule.
@@ -264,22 +267,39 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Design a disk abstraction backed by one explicitly configured host folder
   per disk. A disk's files and subfolders appear as its guest-visible
   filesystem; do not emulate sectors, cylinders, blocks, or block pointers.
-* [ ] Implement metadata parsing and disk discovery, including disk identity,
-  label, virtual capacity, disk-wide read-only/read-write mode, and the list of
-  protected files.
+* [x] Implement folder-disk metadata parsing and discovery, including disk
+  identity, label, virtual capacity, disk-wide read/write mode, and protected
+  files.
+** [x] Parse and validate manifest v1 fields, disk IDs, labels, positive
+  capacity, read-only mode, and normalized unique protected-file paths.
+** [x] Mount an individual folder only when it is a real directory with a
+  regular +disk.json+ whose ID matches the directory name.
+** [x] Discover ID-named folder disks in stable order and reject invalid
+  manifests on candidate disks.
+** [x] Enforce capacity and read-only policies during host-side filesystem
+  operations and reject over-capacity disks at mount time.
 * [ ] Implement guest filesystem operations for listing directories, reading
   files, writing files, creating directories, deleting/renaming entries, and
   querying metadata, subject to the finalized syscall/device interface.
+** [x] Implement host-side folder-disk listing, reads, writes, directory
+  listing/creation, file copy, file and directory deletion/rename, and
+  manifest queries.
+** [ ] Expose these operations through the guest filesystem/syscall interface
+   with bounded transfers and defined errors.
 * [ ] Confine normalized guest paths to the mounted disk root. Reject traversal,
   invalid paths, unsupported file types, and host I/O failures explicitly.
+** [x] Enforce path syntax, mounted-root confinement, regular-file-only access,
+   and explicit host I/O errors in the host-side folder-disk API.
 * [ ] Enforce disk-wide read-only status and the metadata-listed per-file
   read-only set. Protected files cannot be written, replaced, deleted, renamed,
   or otherwise mutated; do not add general user/group/owner access-control
   semantics.
-* [ ] Define used capacity as the sum of regular-file byte lengths, excluding
-  directory and metadata overhead, and enforce the declared virtual-capacity
-  hard limit for writes, copies, and file growth. Reject non-regular host-file
-  types and host I/O failures explicitly.
+** [x] Enforce disk-wide read-only and per-file protection for host-side write,
+  create, copy, delete, and rename operations.
+* [x] Define used capacity as the sum of regular-file byte lengths, excluding
+  root manifest and directory overhead.
+** [x] Account file growth and enforce the declared capacity hard limit for
+  host-side writes and file copies.
 * [ ] Migrate existing JSON block disks and module data into folder-backed disk
   images with a documented conversion tool or import path; keep all source
   files and source disk images.

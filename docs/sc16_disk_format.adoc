@@ -1,0 +1,90 @@
+= SC-16 Folder-Backed Disk Format
+:toc: left
+:toclevels: 2
+
+== Manifest version 1
+
+Each folder-backed disk contains a UTF-8 +disk.json+ manifest at its root.
+Version 1 has this form:
+
+[source,json]
+----
+{
+  "version": 1,
+  "id": "DISK0001",
+  "label": "System",
+  "capacity_bytes": 67108864,
+  "read_only": false,
+  "protected_files": ["kernel.bin", "system/config.dat"]
+}
+----
+
+The manifest root must be an object. All fields except +protected_files+ are
+required. Unknown fields and unsupported versions are errors; adding fields
+requires a new manifest version.
+
+[cols="1,1,3"]
+|===
+|Field |Type |Contract
+
+|+version+
+|Unsigned integer
+|Must equal +1+.
+
+|+id+
+|String
+|Exactly eight ASCII letters, digits, +_+, or +-+. Disk discovery must require
+that it matches the containing disk directory's identity.
+
+|+label+
+|String
+|One to 64 Unicode scalar values, non-whitespace, and containing no control
+characters.
+
+|+capacity_bytes+
+|Positive unsigned 64-bit integer
+|Hard maximum for disk usage. Usage is the sum of regular-file content lengths;
+metadata and directory entries do not count. Writes and file growth must not
+exceed this limit.
+
+|+read_only+
+|Boolean
+|When true, all guest mutations to the disk are denied.
+
+|+protected_files+
+|Array of strings
+|Optional; defaults to empty. Entries are unique normalized guest-relative
+file paths. Protected files cannot be written, replaced, deleted, or renamed.
+|===
+
+A protected-file path is at most 128 ASCII bytes, uses +/+ as its only
+separator, and has one or more segments containing only ASCII letters, digits,
++_+, +.+, or +-+. Empty, +.+, +..+, absolute, backslash-containing, and
+otherwise invalid paths are rejected. The mounted filesystem must resolve paths
+beneath the disk root and reject unsupported host-file types and host I/O
+failures.
+
+== Boot selection
+
+The manifest never selects an executable or its privilege mode. The
+folder-disk boot-selection helper applies a fixed rule to regular files at the
+disk root; emulator BIOS integration remains open:
+
+* If exactly +kernel.bin+ exists, load it in kernel mode.
+* If exactly +main.bin+ exists, load it in user mode.
+* If both or neither exist, report +NOT_BOOT+.
+
+A selected +kernel.bin+ is trusted kernel code. This rule is not secure boot and
+does not authenticate the disk or image. Disk metadata and user programs cannot
+override executable selection or mode.
+
+== Implementation status
+
+The Rust parser validates version 1 fields and protected paths. `FolderDisk`
+validates and opens individual folders, discovers ID-named disks, lists and
+reads regular files, lists directories, creates directories, writes, copies,
+renames, and deletes files and empty directories, accounts regular-file bytes,
+enforces disk-wide read-only mode, protected paths, and write/copy capacity,
+rejects over-capacity disks at mount, and selects/validates the fixed-name boot
+image. Guest/syscall integration, application migration, and BIOS boot
+integration remain to be implemented and tested.
