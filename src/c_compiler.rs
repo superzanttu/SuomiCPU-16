@@ -1588,67 +1588,43 @@ pub fn compile_minimal_program_to_assembly(
                 });
         }
         assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
-        if function.declaration.parameters.len() == 1 {
-            if let Some(signed) = native_byte_type(&function.declaration.parameters[0].c_type) {
-                assembly.push_str("    MOVSP R7\n");
-                emit_native_stack_offset(7, 4, &mut assembly);
-                assembly.push_str("    LD R1, R7\n");
-                emit_native_byte_normalization(1, signed, &mut assembly);
-                emit_native_word_normalization(1, !signed, &mut label_counter, &mut assembly);
+
+        let mut source_offset = 4;
+        for (index, parameter) in function.declaration.parameters.iter().enumerate() {
+            if index >= 3 {
+                break;
             }
-        }
-        if (1..=3).contains(&function.declaration.parameters.len())
-            && function
-                .declaration
-                .parameters
-                .iter()
-                .all(|parameter| is_native_stack_word_type(&parameter.c_type))
-        {
-            for (index, parameter) in function.declaration.parameters.iter().enumerate() {
-                let register = index + 1;
-                let stack_offset = 4 + index * 2;
-                assembly.push_str(&format!("    LDWS R{register}, {stack_offset}\n"));
+            let register = index + 1;
+            let c_type = &parameter.c_type;
+
+            if native_is_pointer_type(c_type, &unit.records) {
+                assembly.push_str("    MOVSP R7\n");
+                emit_native_stack_offset(7, source_offset, &mut assembly);
+                assembly.push_str(&format!("    LDP R{register}, R7\n"));
+                source_offset += 4;
+            } else if native_byte_type(c_type).is_some() {
+                assembly.push_str("    MOVSP R7\n");
+                emit_native_stack_offset(7, source_offset, &mut assembly);
+                assembly.push_str(&format!("    LD R{register}, R7\n"));
+                let signed = native_byte_type(c_type).unwrap();
+                emit_native_byte_normalization(register as u8, signed, &mut assembly);
+                source_offset += 1;
+            } else {
+                assembly.push_str(&format!("    LDWS R{register}, {source_offset}\n"));
                 emit_native_word_normalization(
                     register as u8,
-                    is_native_unsigned_word_type(&parameter.c_type),
+                    is_native_unsigned_word_type(c_type),
                     &mut label_counter,
                     &mut assembly,
                 );
+                source_offset += 2;
             }
         }
+
         if function.declaration.parameters.len() > 3 {
             assembly.push_str("    MOVSP R4\n");
         }
-        if function.declaration.parameters.len() > 3 {
-            let mut source_offset = 4;
-            for (index, parameter) in function.declaration.parameters.iter().take(3).enumerate() {
-                if native_is_pointer_type(&parameter.c_type, &unit.records) {
-                    assembly.push_str("    MOV R7, R4\n");
-                    emit_native_stack_offset(7, source_offset, &mut assembly);
-                    assembly.push_str(&format!("    LDP R{}, R7\n", index + 1));
-                    source_offset += 4;
-                } else {
-                    assembly.push_str(&format!("    LDWS R{}, {source_offset}\n", index + 1));
-                    if is_native_stack_word_type(&parameter.c_type) {
-                        emit_native_word_normalization(
-                            index as u8 + 1,
-                            is_native_unsigned_word_type(&parameter.c_type),
-                            &mut label_counter,
-                            &mut assembly,
-                        );
-                    }
-                    source_offset += 2;
-                }
-            }
-        }
-        if let Some(signed) = function
-            .declaration
-            .parameters
-            .get(2)
-            .and_then(|parameter| native_byte_type(&parameter.c_type))
-        {
-            emit_native_byte_normalization(3, signed, &mut assembly);
-        }
+
         emit_native_stack_adjustment(frame_size, true, &mut assembly);
         if frame_size > 0 {
             if spill_third_parameter {
