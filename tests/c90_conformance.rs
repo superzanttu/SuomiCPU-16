@@ -119,6 +119,38 @@ fn c90_object_layout_arrays_and_pointers() {
 }
 
 #[test]
+fn c90_binary64_runtime_arithmetic_conversions_and_calls() {
+    let source = "double scale(double value) { value += 0.5; return value * 2.0; } \
+                 int main(void) { double values[2]; double *pointer = values; \
+                 pointer[0] = 1.25; pointer[1] = pointer[0] + 1.25; \
+                 if (pointer[1] * 2.0 != 5.0) return 10; \
+                 if (pointer[0] + 1 != 2.25) return 15; \
+                 if ((int)2.75 != 2) return 20; \
+                 if (scale(1.25) != 3.5) return 30; return 0; }";
+    assert_eq!(run_c(source), 0, "binary64 runtime execution");
+}
+
+#[test]
+fn c90_bit_field_layout_and_unsupported_access() {
+    let source = "struct Flags { unsigned int ready : 1; unsigned int mode : 3; \
+                  signed int signed_value : 4; unsigned int : 0; \
+                  unsigned int after_zero : 2; }; \
+                  union Overlay { unsigned int low : 4; unsigned int high : 9; \
+                  unsigned char byte; }; \
+                  struct Flags flags; union Overlay overlay; \
+                  int main(void) { return sizeof(flags) * 100 + sizeof(overlay); }";
+    assert_eq!(run_c(source), 602, "bit-field aggregate sizes");
+
+    let unsupported_access = "struct Flags { unsigned int ready : 1; }; \
+                              int main(void) { struct Flags flags; \
+                              return flags.ready; }";
+    assert!(matches!(
+        compile_minimal_program(unsupported_access, "bit-field-access.c"),
+        Ok(None) | Err(_)
+    ));
+}
+
+#[test]
 fn c90_preprocessing_typedef_enum_and_header_macros() {
     let source = "\
         #include <limits.h>\n\
@@ -181,12 +213,9 @@ fn known_unimplemented_c90_headers_are_rejected_explicitly() {
 fn unsupported_c90_facilities_are_not_silently_miscompiled() {
     for source in [
         "int (*callback)(int); int main(void) { return 0; }",
-        "struct Flags { unsigned int ready : 1; }; \
-         int main(void) { return 0; }",
         "typedef struct { int x; int y; } Point; \
          int main(void) { Point point = { 2, 5 }; return point.x; }",
         "int main(void) { return sizeof(short); }",
-        "int main(void) { double value = 1.5; return value != 0.0; }",
     ] {
         match compile_minimal_program(source, "unsupported-c90.c") {
             Ok(None) | Err(_) => {}

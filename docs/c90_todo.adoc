@@ -56,10 +56,19 @@ conformance work.
   including integer arithmetic subexpressions in mixed expressions. Runtime
   binary32 comparisons (+==+, +!=+, +<+, +<=+, +>+, +>=+) are supported in
   automatic scalar initializers; tests cover unordered NaN behavior and
-  conversion of a comparison result to +float+. General floating-value access
-  and runtime expressions outside these initializer subsets remain unsupported.
-  Constant casts to +float+, +double+, and +long double+ are supported in these
-  initializers.
+  conversion of a comparison result to +float+. General binary32 support now
+  includes local/global/indexed-array/float-pointer loads and stores, scalar
+  assignments and compound assignments, all six comparison operators in
+  expressions and conditions, conditional and discarded expressions, and
+  signed/unsigned 16-bit integer conversions in both directions. Calls with a
+  single binary32 parameter and binary32 result are supported. Binary64 runtime
+  coverage now includes tested scalar/pointer-array access, arithmetic,
+  comparisons, signed 16-bit conversion, and a single-parameter call/result.
+  Binary32 conversions involving 32-bit integers, complete binary64
+  conversions, multi-argument, nested, or recursive floating calls, and full
+  C90 usual arithmetic conversions remain unsupported.
+  Constant casts to +float+, +double+, and +long double+ are supported in
+  these initializers.
   Tests verify +float.h+ limit macros,
   binary32/binary64 maximum, minimum-normal, epsilon, subnormal, and
   halfway-rounding object encodings, including rounding a +float+ constant

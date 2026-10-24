@@ -38,13 +38,15 @@ contracts.
 * The assembler and CPU provide binary32/binary64 instructions. The C compiler
   now lays out and initializes global floating objects and supports sized
   automatic floating storage plus constant initializers using those formats.
-  Runtime binary32 arithmetic is supported for automatic scalar initializers,
-  including local float loads and integer-to-float conversion in mixed
-  expressions. All six binary32 comparisons are supported in automatic scalar
-  initializers, with unordered NaN behavior tested. General floating-value
-  access, expressions outside these initializer subsets, conversions, calls,
-  and returns remain incomplete. Existing math routines still use binary16. See
-  link:c90_todo.adoc[+c90_todo.adoc+] for the compiler work.
+  General binary32 support includes scalar, indexed-array, and float-pointer
+  loads/stores; arithmetic, comparisons, conditions, and conditional
+  expressions; signed/unsigned 16-bit conversions; and calls with one binary32
+  parameter and result. Binary64 runtime support now covers tested scalar and
+  pointer-array access, arithmetic, comparisons, signed 16-bit conversion, and
+  a single-parameter call/return path. Typed C90 conversions, complete 32-bit
+  conversions, and multi-argument, nested, or recursive floating-point calls
+  remain incomplete. Existing math routines still use binary16. See
+  link:c90_todo.adoc[+c90_todo.adoc+] for the remaining compiler work.
 
 == Existing roadmap integration
 
@@ -102,24 +104,32 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Test binary32 runtime comparisons in automatic scalar initializers for
    all six operators, unordered NaN cases, and conversion of comparison results
    to +float+.
+** [x] Support binary32 scalar assignments and compound assignments, runtime
+  signed/unsigned 16-bit integer conversions, and single-binary32-parameter
+  function calls and returns; validate the call and object representations
+  end to end.
+** [x] Implement tested binary32 general expressions, conversions, and object
+   access for scalar locals/globals, indexed arrays, and float pointers,
+   including conditions, conditional expressions, and discarded expressions.
 ** [ ] Implement typed floating-expression analysis for literals, lvalues,
    casts, signedness, and C90 usual arithmetic conversions. Reject unsupported
    conversions instead of silently treating +double+ as +float+.
-** [ ] Implement general binary32 object access: loads and stores for local,
-   global, and indexed objects; assignments and compound assignments. Reuse
-   the existing big-endian object representation.
-** [ ] Implement runtime integer-to-binary32 and binary32-to-integer
-   conversions for signed and unsigned 16-bit and 32-bit integers, integer
-   conversions to binary64, and binary32/binary64 conversions in both
-   directions. Test range edges and C90's undefined conversion cases without
-   relying on CPU extensions.
-** [ ] Move verified binary32 arithmetic and comparisons from automatic
+** [x] Implement runtime signed/unsigned 16-bit integer-to-binary32 and
+   binary32-to-integer conversions; test negative truncation and unsigned word
+   representations.
+** [ ] Implement 32-bit integer conversions to/from binary32, conversions
+   between integer types and binary64, and binary32/binary64 conversions in
+   both directions. Test range edges and C90's undefined conversion cases
+   without relying on CPU extensions.
+** [x] Move verified binary32 arithmetic and comparisons from automatic
    initializer-only code paths into general expressions, including conditions,
    assignments, compound assignments, conditional expressions, and discarded
    expressions.
-** [ ] Implement general binary64 runtime loads, stores, conversions,
-   arithmetic, and comparisons using the ABI's four-register groups; add
-   mixed-precision operations according to C90 conversion rules.
+** [x] Implement and execute tested binary64 runtime scalar/pointer-array
+  loads and stores, arithmetic, comparisons, and signed 16-bit conversions
+  using the ABI's four-register groups.
+** [ ] Complete binary64 conversions, including unsigned and 32-bit integer
+  cases, and add mixed-precision operations according to C90 conversion rules.
 ** [ ] Implement floating-point function arguments and results according to
    +c90_target_abi.adoc+, including prototype and default argument promotions,
    nested calls, and recursion.
@@ -157,7 +167,7 @@ Checklist status: [x] completed; [ ] planned.
    +c90-linkage-storage+, and +c90-initializers+ in
    link:c90_todo.adoc[+c90_todo.adoc+].
 
-* [ ] *Define C90 bit-field target layout* (+c90-bitfield-layout+)
+* [x] *Define C90 bit-field target layout* (+c90-bitfield-layout+)
 ** Specify allocation-unit size, bit order, signedness, alignment, packing,
    boundary crossing, and zero-width fields.
 ** Define interactions with +sizeof+, unions, padding, and +offsetof+.

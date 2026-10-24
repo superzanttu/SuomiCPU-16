@@ -167,9 +167,27 @@ hardware alignment requirements, and must be reflected identically by
 +sizeof+, +offsetof+, initializer emission, address calculations, and runtime
 accesses.
 
-There is no bit-field allocation-unit rule yet; before claiming conformance,
-the compiler must implement C90 bit-field declarations and document allocation
-order, unit size, and boundary behavior as implementation-defined choices.
+=== Bit-fields
+
+The selected bit-field ABI uses 16-bit allocation units. Only +int+,
++signed int+, and +unsigned int+ bit-fields are supported; plain +int+ fields
+are signed. A field's width must be between zero and 16. Fields are allocated
+from the least-significant bit upward. Consecutive fields with the same
+declared base type share an allocation unit while they fit; a field that does
+not fit starts a new unit and never straddles two units. A nonzero-width
+unnamed field reserves its bits. A zero-width field must be unnamed and starts
+the next allocation unit. An allocation unit begins at an even structure
+offset, consumes two bytes even when partially used, and uses the target's
+big-endian word representation.
+
+Each union bit-field member begins at bit zero of an allocation unit at offset
+zero. Union size includes the largest member representation and is rounded up
+to an even number of bytes. Bit-fields have no address, so applying +&+ or
++offsetof+ to one is invalid. Signed fields use the low-width two's-complement
+representation and sign-extend when read; unsigned fields zero-extend.
+Assignments update only the selected bits in the allocation unit. These are
+implementation-defined ABI choices; documenting them does not imply that the
+compiler already implements bit-field parsing or code generation.
 
 == Function calls
 
@@ -185,8 +203,8 @@ high word in the even register. Pointer results use +R0+ for the low 16 address
 bits and the low 14 bits of +R1+ for the high address bits. The machine
 provides register-pair +CALLRP+ and +JMPRP+ operations for full 30-bit
 addresses, but compiler parsing and calling through C function-pointer
-declarators remain incomplete. Once implemented,
-32-bit floating results use +R0:R1+ and 64-bit floating results use
+declarators remain incomplete. 32-bit floating results use +R0:R1+ and
+64-bit floating results use
 +R0:R1:R2:R3+, from most- to least-significant word. Arguments use their
 in-memory object representations on the stack, including the 4-byte pointer
 representation.
