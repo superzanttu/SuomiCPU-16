@@ -589,6 +589,10 @@ fn is_native_wide_integer_type(c_type: &str) -> bool {
     )
 }
 
+fn is_native_stack_word_type(c_type: &str) -> bool {
+    is_native_word_type(c_type) && !is_native_wide_integer_type(c_type)
+}
+
 fn is_native_unsigned_word_type(c_type: &str) -> bool {
     matches!(
         native_unqualified_type(c_type),
@@ -1557,13 +1561,7 @@ pub fn compile_minimal_program_to_assembly(
                         .collect(),
                     word_parameters: parameters
                         .iter()
-                        .map(|parameter| {
-                            native_floating_type_size(&parameter.c_type).is_none()
-                                && native_byte_type(&parameter.c_type).is_none()
-                                && !is_native_wide_integer_type(&parameter.c_type)
-                                && !native_is_pointer_type(&parameter.c_type, &unit.records)
-                                && native_record_pointer(&parameter.c_type, &unit.records).is_none()
-                        })
+                        .map(|parameter| is_native_stack_word_type(&parameter.c_type))
                         .collect(),
                     float_return_size: match declaration {
                         ExternalDeclaration::FunctionDefinition(function) => {
@@ -1578,26 +1576,23 @@ pub fn compile_minimal_program_to_assembly(
                 });
         }
         assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
-        if function.declaration.parameters.len() == 1 {
-            let parameter = &function.declaration.parameters[0];
-            if native_floating_type_size(&parameter.c_type).is_none()
-                && native_byte_type(&parameter.c_type).is_none()
-                && !is_native_wide_integer_type(&parameter.c_type)
-                && !native_is_pointer_type(&parameter.c_type, &unit.records)
-                && native_record_pointer(&parameter.c_type, &unit.records).is_none()
-            {
-                assembly.push_str("    LDWS R1, 4\n");
-                if !is_native_unsigned_word_type(&parameter.c_type) {
-                    let label = label_counter;
-                    label_counter += 1;
-                    assembly.push_str(&format!(
-                        "    LDI R7, 0x8000\n    AND R7, R1\n\
-                         LDI R6, 0\n    CMP R7, R6\n\
-                         BZX __c_parameter_sign_{label}_done\n\
-                         LDI30 R7, 0x10000\n    SUB R1, R7\n\
-                         __c_parameter_sign_{label}_done:\n"
-                    ));
-                }
+        if (1..=3).contains(&function.declaration.parameters.len())
+            && function
+                .declaration
+                .parameters
+                .iter()
+                .all(|parameter| is_native_stack_word_type(&parameter.c_type))
+        {
+            for (index, parameter) in function.declaration.parameters.iter().enumerate() {
+                let register = index + 1;
+                let stack_offset = 4 + index * 2;
+                assembly.push_str(&format!("    LDWS R{register}, {stack_offset}\n"));
+                emit_native_word_normalization(
+                    register as u8,
+                    is_native_unsigned_word_type(&parameter.c_type),
+                    &mut label_counter,
+                    &mut assembly,
+                );
             }
         }
         if function.declaration.parameters.len() > 3 {
@@ -3278,6 +3273,25 @@ fn emit_native_byte_normalization(register: u8, signed: bool, assembly: &mut Str
         assembly.push_str(&format!("    SHL R{register}, 8\n    ASR R{register}, 8\n"));
     } else {
         assembly.push_str(&format!("    LDI R7, 0x00FF\n    AND R{register}, R7\n"));
+    }
+}
+
+fn emit_native_word_normalization(
+    register: u8,
+    unsigned: bool,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) {
+    if !unsigned {
+        let label = *label_counter;
+        *label_counter += 1;
+        assembly.push_str(&format!(
+            "    LDI R7, 0x8000\n    AND R7, R{register}\n\
+             LDI R6, 0\n    CMP R7, R6\n\
+             BZX __c_parameter_sign_{label}_done\n\
+             LDI30 R7, 0x10000\n    SUB R{register}, R7\n\
+             __c_parameter_sign_{label}_done:\n"
+        ));
     }
 }
 
@@ -5214,10 +5228,16 @@ fn emit_native_expression(
                         }
                         emit_native_byte_normalization(destination, *signed, assembly);
                     }
-                    NativeLocation::StackScalar { offset, .. } => {
+                    NativeLocation::StackScalar { offset, unsigned } => {
                         assembly.push_str("    MOV R7, R3\n");
                         emit_native_stack_offset(7, *offset, assembly);
                         assembly.push_str(&format!("    LDW R{destination}, R7\n"));
+                        emit_native_word_normalization(
+                            destination,
+                            *unsigned,
+                            label_counter,
+                            assembly,
+                        );
                     }
                     NativeLocation::StackWideScalar { .. } => return false,
                     NativeLocation::ByteStackScalar { offset, signed } => {
@@ -5994,7 +6014,8 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &function.kind else {
                 return false;
             };
-            let (float_return_size, float_parameter_size, word_parameter) = match locals.get(name) {
+            let (float_return_size, float_parameter_size, word_parameters) = match locals.get(name)
+            {
                 Some(NativeLocation::FunctionParameters {
                     float_parameters,
                     word_parameters,
@@ -6007,9 +6028,9 @@ fn emit_native_expression(
                     } else {
                         0
                     },
-                    word_parameters.len() == 1 && word_parameters[0],
+                    word_parameters.clone(),
                 ),
-                _ => (0, 0, false),
+                _ => (0, 0, Vec::new()),
             };
             if (float_return_size != 0 && float_parameter_size == 0 && !arguments.is_empty())
                 || (float_parameter_size != 0 && arguments.len() != 1)
@@ -6101,19 +6122,24 @@ fn emit_native_expression(
                 if !emit_native_f64_expression(&arguments[0], locals, label_counter, assembly) {
                     return false;
                 }
-            } else if arguments.len() == 1 && word_parameter {
-                if !emit_native_expression(
-                    &arguments[0],
-                    4,
-                    &[5, 6, 7],
-                    locals,
-                    label_counter,
-                    assembly,
-                ) {
-                    return false;
+            } else if (1..=3).contains(&arguments.len())
+                && word_parameters.len() == arguments.len()
+                && word_parameters.iter().all(|is_word| *is_word)
+            {
+                for argument in arguments.iter().rev() {
+                    if !emit_native_expression(
+                        argument,
+                        4,
+                        &[5, 6, 7],
+                        locals,
+                        label_counter,
+                        assembly,
+                    ) {
+                        return false;
+                    }
+                    assembly.push_str("    PUSH R4\n");
+                    argument_bytes += 2;
                 }
-                assembly.push_str("    PUSH R4\n");
-                argument_bytes += 2;
             } else if library_function {
                 for (index, argument) in arguments.iter().enumerate().rev() {
                     if native_argument_is_pointer(name, index, arguments) {

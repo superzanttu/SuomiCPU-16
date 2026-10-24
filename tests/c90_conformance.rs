@@ -120,6 +120,79 @@ fn c90_scalar_call_argument_uses_documented_stack_abi() {
 }
 
 #[test]
+fn c90_two_word_call_arguments_use_documented_stack_abi() {
+    let source = "int combine(int left, int right) { return left * 100 + right; } \
+                 int main(void) { return combine(12, 34); }";
+    let assembly = compile_minimal_program_to_assembly(source, "c90-call-abi.c")
+        .expect("C source should parse")
+        .expect("C source should compile");
+    let combine_start = assembly
+        .find("__c_function_combine:\n")
+        .expect("combine function should be emitted");
+    let main_start = assembly
+        .find("__c_function_main:\n")
+        .expect("main function should be emitted");
+    let combine = &assembly[combine_start..main_start];
+    let main = &assembly[main_start..];
+    let call_start = main
+        .find("CALLX __c_function_combine\n")
+        .expect("combine call should be emitted");
+
+    let left_load = combine
+        .find("LDWS R1, 4\n")
+        .expect("left parameter should load from SP + 4");
+    let right_load = combine
+        .find("LDWS R2, 6\n")
+        .expect("right parameter should load from SP + 6");
+    assert!(left_load < right_load, "{combine}");
+    assert!(
+        main[..call_start]
+            .contains("LDI R4, 0x0022\n    PUSH R4\n    LDI R4, 0x000C\n    PUSH R4\n"),
+        "{}",
+        &main[..call_start]
+    );
+    assert!(main[call_start..].contains("ADJSP 4\n"), "{main}");
+    assert_eq!(run_c(source), 1234);
+}
+
+#[test]
+fn c90_three_word_call_arguments_use_documented_stack_abi() {
+    let source = "int combine(int first, int second, int third) { \
+                 return first * 100 + second * 10 + third; } \
+                 int main(void) { if (combine(1, 2, 3) != 123) return 1; \
+                 return combine(1, 2, -3); }";
+    let assembly = compile_minimal_program_to_assembly(source, "c90-call-abi.c")
+        .expect("C source should parse")
+        .expect("C source should compile");
+    let combine_start = assembly
+        .find("__c_function_combine:\n")
+        .expect("combine function should be emitted");
+    let main_start = assembly
+        .find("__c_function_main:\n")
+        .expect("main function should be emitted");
+    let combine = &assembly[combine_start..main_start];
+    let main = &assembly[main_start..];
+    let call_start = main
+        .find("CALLX __c_function_combine\n")
+        .expect("combine call should be emitted");
+
+    for (register, offset) in [(1, 4), (2, 6), (3, 8)] {
+        assert!(
+            combine.contains(&format!("LDWS R{register}, {offset}\n")),
+            "{combine}"
+        );
+    }
+    assert!(
+        main[..call_start]
+            .contains("LDI R4, 0x0003\n    PUSH R4\n    LDI R4, 0x0002\n    PUSH R4\n    LDI R4, 0x0001\n    PUSH R4\n"),
+        "{}",
+        &main[..call_start]
+    );
+    assert!(main[call_start..].contains("ADJSP 6\n"), "{main}");
+    assert_eq!(run_c(source), 117);
+}
+
+#[test]
 fn c90_object_layout_arrays_and_pointers() {
     for (source, expected) in [
         (

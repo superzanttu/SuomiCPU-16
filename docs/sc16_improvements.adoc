@@ -66,12 +66,21 @@ Checklist status: [x] completed; [ ] planned.
 
 * [x] *Implement the 30-bit control-flow ABI* (+sc16-control-flow-abi+)
 ** Store return PCs as four big-endian bytes; +RET+ and +RTI+ restore all 30 address bits.
-** Place the first function parameter four bytes above the stack pointer and
-   update assembly-library argument offsets.
 ** Encode far control flow in six bytes and add +JMPRP+ / +CALLRP+ for full
    30-bit addresses.
 ** Add +LDI30+ (with +LDI19+ / +LDA+ compatibility aliases) for full-width
    addresses.
+
+* [ ] *Implement the C stack argument ABI* (+c90-stack-call-abi+)
+** [x] Pass one 16-bit scalar parameter at +SP \+ 4+; test signed values and
+  caller cleanup.
+** [x] Pass up to three 16-bit scalar parameters right-to-left at +SP \+ 4+,
+   +SP \+ 6+, and +SP \+ 8+; verify signed values, order, and caller cleanup.
+** [ ] Pass all supported C argument types using their documented stack object
+  representations; cover byte, pointer, wide integer, aggregate, and floating
+  arguments, callee offsets, promotions, nested calls, and recursion.
+** [ ] Audit and update assembly-library argument offsets for the documented
+  stack convention.
 
 * [ ] *Define and maintain the C target floating-point model*
   (+c90-float-model+)
