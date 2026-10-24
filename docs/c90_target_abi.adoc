@@ -219,6 +219,33 @@ temporaries in the caller's stack frame, so recursive calls do not share
 scratch storage. Runtime regressions cover nested return/argument expressions
 and recursive returns.
 
+=== Verified scalar call subset
+
+The Rust compiler now shares scalar stack sizes and offsets between call
+sites and function entries. Fixed byte parameters occupy one byte even in
+mixed signatures; word parameters occupy two bytes, pointer and long
+parameters four, binary32 parameters four, and binary64 parameters eight.
+There is no inter-argument padding. Callees copy floating and wide-parameter
+objects into their own frames, so parameter updates and recursive calls do
+not share storage.
+
+Execution tests in +tests/target_abi.rs+ verify exact incoming byte/word/
+floating stack bytes, mixed pointer values, signed and unsigned long
+arguments, nested binary32 calls, recursive binary64 calls, and caller stack
+restoration. Large-arity tests cover 70 word parameters and 20 binary64
+parameters, including cleanup exceeding one stack-adjustment instruction.
+Precision conversions at fixed floating parameters and returns are checked
+against independent IEEE bit patterns and Rust reference results. Integer
+subexpressions retain integer evaluation before conversion at these boundaries.
+Conflicting function parameter or return types are rejected before lowering.
+
+These tests do not establish complete C90 call compatibility. Default argument
+promotions, old-style function compatibility, complete typed expression
+conversions, wide integer expressions/results, aggregate call combinations,
+and all pointer object encodings remain acceptance work. The historical
+assembly-library calling paths are separate and retain their existing
+conventions; their binary16 math routines are not binary64 C90 implementations.
+
 == Hosted execution environment
 
 The hosted implementation uses the emulator's byte-addressable 1 GiB

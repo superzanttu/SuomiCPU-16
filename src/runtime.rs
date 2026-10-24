@@ -16,7 +16,6 @@ use minifb::{
     Window as NativeWindow, WindowOptions,
 };
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2037,6 +2036,7 @@ fn draw_text_limited_scaled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn console_window_renders_snapshot_with_small_font_in_a_separate_framebuffer() {

@@ -42,11 +42,13 @@ contracts.
   automatic floating storage plus constant initializers using those formats.
   General binary32 support includes scalar, indexed-array, and float-pointer
   loads/stores; arithmetic, comparisons, conditions, and conditional
-  expressions; signed/unsigned 16-bit conversions; and calls with one binary32
-  parameter and result. Binary64 runtime support now covers tested scalar and
-  pointer-array access, arithmetic, comparisons, signed 16-bit conversion, and
-  a single-parameter call/return path. Typed C90 conversions, complete 32-bit
-  conversions, and multi-argument, nested, or recursive floating-point calls
+  expressions; signed/unsigned 16-bit conversions; and binary32 results.
+  Binary64 runtime support now covers tested scalar and
+  pointer-array access, arithmetic, comparisons, and signed 16-bit conversion.
+  Fixed-signature calls use a shared scalar stack layout, with tested mixed
+  integer/pointer/floating arguments, multiple floating parameters, nested
+  calls, and recursion. Typed C90 conversions, complete 32-bit conversions,
+  default argument promotions, and complete floating call compatibility
   remain incomplete. Existing math routines still use binary16. See
   link:c90_todo.adoc[+c90_todo.adoc+] for the remaining compiler work.
 
@@ -84,6 +86,10 @@ Checklist status: [x] completed; [ ] planned.
    test signed values, argument order, and caller cleanup.
 ** [x] Pass a one-byte signed or unsigned scalar parameter on the stack; test
   sign/zero extension and caller cleanup.
+** [x] Share scalar argument sizes and offsets between callers and callees;
+   test compact mixed byte/word parameters, fixed mixed integer/pointer/
+   floating signatures, wide integer object arguments, nested and recursive
+   floating calls, and cleanup beyond a single +ADJSP+ immediate.
 ** [ ] Pass all supported C argument types using their documented stack object
    representations; cover other arities, byte, pointer, wide integer,
    aggregate, and floating arguments, callee offsets, promotions, nested calls,
@@ -151,6 +157,10 @@ Checklist status: [x] completed; [ ] planned.
 ** [ ] Implement floating-point function arguments and results according to
    +c90_target_abi.adoc+, including prototype and default argument promotions,
    nested calls, and recursion.
+** [x] Execute fixed-signature binary32/binary64 stack calls with multiple
+   floating parameters, mixed scalar arguments, nested calls, recursion,
+   prototype/return precision conversions, and independent IEEE bit-pattern
+   checks; reject conflicting declared function types before call lowering.
 ** [ ] Add end-to-end runtime tests for each supported operation, conversion,
    object access, comparison, and call boundary. Compare numeric results and
    boundary rounding with an independent reference.

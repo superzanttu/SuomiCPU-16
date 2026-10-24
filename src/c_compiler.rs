@@ -310,6 +310,86 @@ pub struct TranslationUnit {
 }
 
 #[derive(Clone)]
+enum NativeArgumentKind {
+    Byte,
+    Word,
+    Pointer,
+    WideInteger,
+    Binary32,
+    Binary64,
+}
+
+impl NativeArgumentKind {
+    fn size(&self) -> usize {
+        match self {
+            Self::Byte => 1,
+            Self::Word => 2,
+            Self::Pointer | Self::WideInteger | Self::Binary32 => 4,
+            Self::Binary64 => 8,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NativeStackArgument {
+    kind: NativeArgumentKind,
+    offset: usize,
+}
+
+#[derive(Clone)]
+struct NativeCallLayout {
+    arguments: Vec<NativeStackArgument>,
+    size: usize,
+}
+
+impl NativeCallLayout {
+    fn new(
+        parameters: &[FunctionParameter],
+        records: &HashMap<String, NativeRecordLayout>,
+    ) -> Option<Self> {
+        let mut arguments = Vec::with_capacity(parameters.len());
+        let mut size = 0usize;
+        for parameter in parameters {
+            let kind = if native_is_pointer_type(&parameter.c_type, records) {
+                NativeArgumentKind::Pointer
+            } else if native_byte_type(&parameter.c_type).is_some() {
+                NativeArgumentKind::Byte
+            } else if let Some(width) = native_floating_type_size(&parameter.c_type) {
+                match width {
+                    4 => NativeArgumentKind::Binary32,
+                    8 => NativeArgumentKind::Binary64,
+                    _ => return None,
+                }
+            } else if is_native_stack_word_type(&parameter.c_type) {
+                NativeArgumentKind::Word
+            } else if is_native_wide_integer_type(&parameter.c_type) {
+                NativeArgumentKind::WideInteger
+            } else {
+                return None;
+            };
+            let offset = size;
+            size = size.checked_add(kind.size())?;
+            if size > u16::MAX as usize {
+                return None;
+            }
+            arguments.push(NativeStackArgument { kind, offset });
+        }
+        Some(Self { arguments, size })
+    }
+
+    fn needs_stack_parameters(&self) -> bool {
+        self.arguments.iter().any(|argument| {
+            matches!(
+                argument.kind,
+                NativeArgumentKind::Binary32
+                    | NativeArgumentKind::Binary64
+                    | NativeArgumentKind::WideInteger
+            )
+        })
+    }
+}
+
+#[derive(Clone)]
 enum NativeLocation {
     Register {
         register: u8,
@@ -342,10 +422,6 @@ enum NativeLocation {
         unsigned: bool,
     },
     FloatingPointScalar {
-        size: usize,
-    },
-    FloatRegister {
-        register: u8,
         size: usize,
     },
     StackFloatingPointScalar {
@@ -381,10 +457,7 @@ enum NativeLocation {
         layout: NativeRecordLayout,
     },
     FunctionParameters {
-        pointer_parameters: Vec<bool>,
-        float_parameters: Vec<usize>,
-        byte_parameters: Vec<bool>,
-        word_parameters: Vec<bool>,
+        layout: Option<NativeCallLayout>,
         float_return_size: usize,
     },
     StackArray {
@@ -664,6 +737,30 @@ fn is_native_return_type(c_type: &str) -> bool {
         || native_byte_type(c_type).is_some()
         || native_pointer_element(c_type).is_some()
         || native_floating_type_size(c_type).is_some()
+}
+
+fn native_function_types_match(left: &FunctionDeclaration, right: &FunctionDeclaration) -> bool {
+    let parameter_type = |c_type: &str| {
+        let c_type = if c_type.contains('*') {
+            c_type.trim()
+        } else {
+            native_unqualified_type(c_type)
+        };
+        match c_type {
+            "signed" | "signed int" => "int".to_owned(),
+            "unsigned" => "unsigned int".to_owned(),
+            "signed long" => "long".to_owned(),
+            _ => c_type.to_owned(),
+        }
+    };
+    parameter_type(&left.return_type) == parameter_type(&right.return_type)
+        && left.variadic == right.variadic
+        && left.parameters.len() == right.parameters.len()
+        && left
+            .parameters
+            .iter()
+            .zip(&right.parameters)
+            .all(|(left, right)| parameter_type(&left.c_type) == parameter_type(&right.c_type))
 }
 
 pub struct ExpressionParser {
@@ -949,6 +1046,22 @@ pub fn compile_minimal_program_to_assembly(
 ) -> Result<Option<String>, CCompilerError> {
     let mut parser = TranslationUnitParser::from_source(source, filename)?;
     let unit = parser.parse()?;
+    let mut signatures: HashMap<&str, &FunctionDeclaration> = HashMap::new();
+    for declaration in &unit.declarations {
+        let function = match declaration {
+            ExternalDeclaration::FunctionDefinition(function) => &function.declaration,
+            ExternalDeclaration::FunctionPrototype(function) => function,
+            ExternalDeclaration::Global(_) => continue,
+        };
+        if let Some(previous) = signatures.insert(&function.name, function)
+            && !native_function_types_match(previous, function)
+        {
+            return Err(CCompilerError(format!(
+                "{filename}: conflicting function type for {}",
+                function.name
+            )));
+        }
+    }
     let mut functions = Vec::new();
     let mut globals: Vec<NativeGlobal> = Vec::new();
     let mut static_data_size = 0usize;
@@ -1392,14 +1505,26 @@ pub fn compile_minimal_program_to_assembly(
         let has_excess_locals = function.declaration.parameters.len()
             + statement_scalar_local_count(&function.body)
             > 3;
-        let spill_third_parameter = function.declaration.parameters.len() >= 3;
+        let parameter_layout =
+            NativeCallLayout::new(&function.declaration.parameters, &unit.records).ok_or_else(
+                || {
+                    CCompilerError(format!(
+                        "{filename}: unsupported argument layout for {}",
+                        function.declaration.name
+                    ))
+                },
+            )?;
+        let stack_parameters = parameter_layout.needs_stack_parameters();
+        let spill_third_parameter = !stack_parameters && function.declaration.parameters.len() >= 3;
         let address_taken = native_address_taken_locals(&function.body);
-        if function.declaration.parameters.iter().any(|parameter| {
-            parameter
-                .name
-                .as_ref()
-                .is_some_and(|name| address_taken.contains(name))
-        }) {
+        if !stack_parameters
+            && function.declaration.parameters.iter().any(|parameter| {
+                parameter
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| address_taken.contains(name))
+            })
+        {
             eprintln!(
                 "address of function parameter is not supported in {}",
                 function.declaration.name
@@ -1410,6 +1535,7 @@ pub fn compile_minimal_program_to_assembly(
             || has_local_floating_scalar
             || has_local_wide_integer
             || has_excess_locals
+            || stack_parameters
             || function.declaration.parameters.len() >= 3
             || !address_taken.is_empty();
         let mut locals = HashMap::new();
@@ -1421,11 +1547,35 @@ pub fn compile_minimal_program_to_assembly(
             let record_layout = native_record_pointer(&parameter.c_type, &unit.records);
             let pointer_element = native_pointer_element(&parameter.c_type)
                 .or_else(|| record_layout.as_ref().map(|layout| (layout.size, false)));
-            let location = if let Some(size) = native_floating_type_size(&parameter.c_type) {
-                if function.declaration.parameters.len() != 1 || index != 0 {
-                    return Ok(None);
+            let location = if stack_parameters {
+                let argument = &parameter_layout.arguments[index];
+                stacked_parameter_bytes = parameter_layout.size;
+                let offset = argument.offset;
+                if let Some(size) = native_floating_type_size(&parameter.c_type) {
+                    NativeLocation::StackFloatingPointScalar { offset, size }
+                } else if is_native_wide_integer_type(&parameter.c_type) {
+                    NativeLocation::StackWideScalar {
+                        offset,
+                        unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                    }
+                } else if let Some((element_size, element_signed)) = pointer_element {
+                    NativeLocation::PointerStack {
+                        offset,
+                        element_size,
+                        element_signed,
+                        element_floating_size: native_pointer_element_floating_size(
+                            &parameter.c_type,
+                        ),
+                        record_layout: record_layout.clone(),
+                    }
+                } else if let Some(signed) = native_byte_type(&parameter.c_type) {
+                    NativeLocation::ByteStackScalar { offset, signed }
+                } else {
+                    NativeLocation::StackScalar {
+                        offset,
+                        unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                    }
                 }
-                NativeLocation::FloatRegister { register: 4, size }
             } else if index >= 2 && reserve_frame_register {
                 let offset = stacked_parameter_bytes;
                 stacked_parameter_bytes += if native_byte_type(&parameter.c_type).is_some() {
@@ -1483,7 +1633,11 @@ pub fn compile_minimal_program_to_assembly(
                 return Ok(None);
             }
         }
-        let mut next_local_register = function.declaration.parameters.len().min(2) as u8 + 1;
+        let mut next_local_register = if stack_parameters {
+            4
+        } else {
+            function.declaration.parameters.len().min(2) as u8 + 1
+        };
         let mut frame_size = stacked_parameter_bytes;
         if !collect_native_locals(
             statements,
@@ -1556,25 +1710,7 @@ pub fn compile_minimal_program_to_assembly(
             locals
                 .entry(name.to_owned())
                 .or_insert_with(|| NativeLocation::FunctionParameters {
-                    pointer_parameters: parameters
-                        .iter()
-                        .map(|parameter| {
-                            native_pointer_element(&parameter.c_type).is_some()
-                                || native_record_pointer(&parameter.c_type, &unit.records).is_some()
-                        })
-                        .collect(),
-                    float_parameters: parameters
-                        .iter()
-                        .map(|parameter| native_floating_type_size(&parameter.c_type).unwrap_or(0))
-                        .collect(),
-                    byte_parameters: parameters
-                        .iter()
-                        .map(|parameter| native_byte_type(&parameter.c_type).is_some())
-                        .collect(),
-                    word_parameters: parameters
-                        .iter()
-                        .map(|parameter| is_native_stack_word_type(&parameter.c_type))
-                        .collect(),
+                    layout: NativeCallLayout::new(parameters, &unit.records),
                     float_return_size: match declaration {
                         ExternalDeclaration::FunctionDefinition(function) => {
                             native_floating_type_size(&function.declaration.return_type)
@@ -1589,23 +1725,29 @@ pub fn compile_minimal_program_to_assembly(
         }
         assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
 
-        let mut source_offset = 4;
-        for (index, parameter) in function.declaration.parameters.iter().enumerate() {
+        for (index, parameter) in function
+            .declaration
+            .parameters
+            .iter()
+            .take(if stack_parameters { 0 } else { 3 })
+            .enumerate()
+        {
             let register = index + 1;
             let c_type = &parameter.c_type;
+            let source_offset = 4 + parameter_layout.arguments[index].offset;
 
-            if native_is_pointer_type(c_type, &unit.records) {
+            if native_floating_type_size(c_type).is_some() {
+                continue;
+            } else if native_is_pointer_type(c_type, &unit.records) {
                 assembly.push_str("    MOVSP R7\n");
                 emit_native_stack_offset(7, source_offset, &mut assembly);
                 assembly.push_str(&format!("    LDP R{register}, R7\n"));
-                source_offset += 4;
             } else if native_byte_type(c_type).is_some() {
                 assembly.push_str("    MOVSP R7\n");
                 emit_native_stack_offset(7, source_offset, &mut assembly);
                 assembly.push_str(&format!("    LD R{register}, R7\n"));
                 let signed = native_byte_type(c_type).unwrap();
                 emit_native_byte_normalization(register as u8, signed, &mut assembly);
-                source_offset += 1;
             } else {
                 assembly.push_str(&format!("    LDWS R{register}, {source_offset}\n"));
                 emit_native_word_normalization(
@@ -1614,9 +1756,6 @@ pub fn compile_minimal_program_to_assembly(
                     &mut label_counter,
                     &mut assembly,
                 );
-                source_offset += 2;
-            }
-        }
             }
         }
 
@@ -1625,7 +1764,19 @@ pub fn compile_minimal_program_to_assembly(
         }
 
         emit_native_stack_adjustment(frame_size, true, &mut assembly);
-        if frame_size > 0 {
+        if stack_parameters {
+            assembly.push_str("    MOVSP R3\n    MOV R4, R3\n");
+            emit_native_stack_offset(4, frame_size + 4, &mut assembly);
+            let label = label_counter;
+            label_counter += 1;
+            assembly.push_str(&format!(
+                "    MOV R7, R3\n    LDI R6, {}\n    LDI R0, 0\n\
+                 __c_parameters_{label}:\n\
+                 LD R5, R4\n    ST R7, R5\n    INC R4\n    INC R7\n\
+                 DEC R6\n    CMP R6, R0\n    BNZX __c_parameters_{label}\n",
+                parameter_layout.size
+            ));
+        } else if frame_size > 0 {
             if spill_third_parameter {
                 assembly.push_str("    MOVSP R7\n");
                 let third_parameter = &function.declaration.parameters[2].c_type;
@@ -1657,27 +1808,22 @@ pub fn compile_minimal_program_to_assembly(
                         }
                     });
             for index in 3..function.declaration.parameters.len() {
-                let mut source_offset = 4;
-                for parameter in function.declaration.parameters.iter().take(index) {
-                    source_offset += if native_is_pointer_type(&parameter.c_type, &unit.records) {
-                        4
-                    } else {
-                        2
-                    };
-                }
+                let source_offset = 4 + parameter_layout.arguments[index].offset;
                 assembly.push_str("    MOV R7, R4\n");
                 emit_native_stack_offset(7, source_offset, &mut assembly);
                 let is_pointer = native_is_pointer_type(
                     &function.declaration.parameters[index].c_type,
                     &unit.records,
                 );
+                let is_byte =
+                    native_byte_type(&function.declaration.parameters[index].c_type).is_some();
                 assembly.push_str(if is_pointer {
                     "    LDP R5, R7\n"
+                } else if is_byte {
+                    "    LD R5, R7\n"
                 } else {
                     "    LDW R5, R7\n"
                 });
-                let is_byte =
-                    native_byte_type(&function.declaration.parameters[index].c_type).is_some();
                 if let Some(signed) =
                     native_byte_type(&function.declaration.parameters[index].c_type)
                 {
@@ -3238,7 +3384,14 @@ fn emit_native_array_address(
 
 fn emit_native_stack_offset(register: u8, offset: usize, assembly: &mut String) {
     if offset > 0 {
-        assembly.push_str(&format!("    LDI R6, {offset}\n    ADD R{register}, R6\n"));
+        let instruction = if offset > u16::MAX as usize {
+            "LDI30"
+        } else {
+            "LDI"
+        };
+        assembly.push_str(&format!(
+            "    {instruction} R6, {offset}\n    ADD R{register}, R6\n"
+        ));
     }
 }
 
@@ -3252,14 +3405,13 @@ fn emit_native_i32_source(
             Some(NativeLocation::StackWideScalar { offset, .. }) => {
                 assembly.push_str("    MOV R7, R3\n");
                 emit_native_stack_offset(7, *offset, assembly);
-                assembly.push_str("    LDW R4, R7\n    ADD R7, 2\n    LDW R5, R7\n");
+                assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
                 true
             }
             _ => parse_integer_constant(name).is_some_and(|value| {
-                let Ok(value) = i32::try_from(value) else {
+                let Ok(bits) = u32::try_from(value) else {
                     return false;
                 };
-                let bits = value as u32;
                 assembly.push_str(&format!(
                     "    LDI R4, 0x{:04X}\n    LDI R5, 0x{:04X}\n",
                     bits >> 16,
@@ -3268,6 +3420,15 @@ fn emit_native_i32_source(
                 true
             }),
         },
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "+" | "-") => {
+            if !emit_native_i32_source(operand, locals, assembly) {
+                return false;
+            }
+            if operator == "-" {
+                assembly.push_str("    NEG32 R4\n");
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -3983,20 +4144,14 @@ fn emit_native_f32_expression_inner(
         ExpressionKind::Atom(value) => {
             if let Some(location) = locals.get(value) {
                 let (offset, global) = match location {
-                    NativeLocation::FloatRegister { register, size: 4 } => {
-                        assembly.push_str(&format!(
-                            "    MOV R4, R{register}\n    MOV R5, R{}\n",
-                            register + 1
-                        ));
-                        return true;
-                    }
                     NativeLocation::StackFloatingPointScalar { offset, size: 4 } => {
                         (Some(*offset), false)
                     }
                     NativeLocation::StackWideScalar { offset, unsigned } => {
                         assembly.push_str("    MOV R7, R3\n");
                         emit_native_stack_offset(7, *offset, assembly);
-                        assembly.push_str("    LDW R0, R7\n    ADD R7, 2\n    LDW R1, R7\n");
+                        assembly
+                            .push_str("    LDW R0, R7\n    INC R7\n    INC R7\n    LDW R1, R7\n");
                         assembly.push_str(&format!(
                             "    {} R4, R0\n",
                             if *unsigned { "U32TOF32" } else { "I32TOF32" }
@@ -4041,7 +4196,7 @@ fn emit_native_f32_expression_inner(
                     };
                     emit_native_stack_offset(7, offset, assembly);
                 }
-                assembly.push_str("    LDW R4, R7\n    ADD R7, 2\n    LDW R5, R7\n");
+                assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
                 true
             } else if let Some(bytes) = native_floating_initializer(expression, "float") {
                 assembly.push_str(&format!(
@@ -4332,18 +4487,6 @@ fn emit_native_f64_expression_inner(
         ExpressionKind::Atom(value) => {
             if let Some(location) = locals.get(value) {
                 let (offset, global) = match location {
-                    NativeLocation::FloatRegister { register, size: 8 } => {
-                        for index in 0..4 {
-                            if *register + index != 4 + index {
-                                assembly.push_str(&format!(
-                                    "    MOV R{}, R{}\n",
-                                    4 + index,
-                                    register + index
-                                ));
-                            }
-                        }
-                        return true;
-                    }
                     NativeLocation::StackFloatingPointScalar { offset, size: 8 } => {
                         (Some(*offset), false)
                     }
@@ -4384,8 +4527,8 @@ fn emit_native_f64_expression_inner(
                     emit_native_stack_offset(7, offset, assembly);
                 }
                 assembly.push_str(
-                    "    LDW R4, R7\n    ADD R7, 2\n    LDW R5, R7\n\
-                     ADD R7, 2\n    LDW R6, R7\n    ADD R7, 2\n    LDW R7, R7\n",
+                    "    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n\
+                     INC R7\n    INC R7\n    LDW R6, R7\n    INC R7\n    INC R7\n    LDW R7, R7\n",
                 );
                 true
             } else if let Some(bytes) = native_floating_initializer(expression, "double") {
@@ -4496,8 +4639,8 @@ fn emit_native_f64_expression_inner(
                 return false;
             }
             assembly.push_str(
-                "    LDW R4, R7\n    ADD R7, 2\n    LDW R5, R7\n\
-                 ADD R7, 2\n    LDW R6, R7\n    ADD R7, 2\n    LDW R7, R7\n",
+                "    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n\
+                 INC R7\n    INC R7\n    LDW R6, R7\n    INC R7\n    INC R7\n    LDW R7, R7\n",
             );
             true
         }
@@ -4515,9 +4658,9 @@ fn emit_native_f64_expression_inner(
                 return false;
             }
             assembly.push_str(
-                "    MOV R7, R0\n    LDW R4, R7\n    ADD R7, 2\n\
-                 LDW R5, R7\n    ADD R7, 2\n    LDW R6, R7\n\
-                 ADD R7, 2\n    LDW R7, R7\n",
+                "    MOV R7, R0\n    LDW R4, R7\n    INC R7\n    INC R7\n\
+                 LDW R5, R7\n    INC R7\n    INC R7\n    LDW R6, R7\n\
+                 INC R7\n    INC R7\n    LDW R7, R7\n",
             );
             true
         }
@@ -4595,6 +4738,58 @@ fn emit_native_f64_operand(
         assembly.push_str(&format!("    {conversion} R4, R0\n"));
         true
     }
+}
+
+fn emit_native_floating_conversion(
+    expression: &Expression,
+    size: usize,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if size == 8 {
+        return emit_native_f64_operand(expression, locals, label_counter, assembly);
+    }
+    if size != 4 {
+        return false;
+    }
+    match native_expression_floating_size(expression, locals) {
+        Some(8) => {
+            if !emit_native_f64_expression(expression, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    F64TOF32 R4, R4\n");
+        }
+        Some(4) => {
+            return emit_native_f32_expression(expression, locals, label_counter, assembly);
+        }
+        None => {
+            if matches!(
+                &expression.kind,
+                ExpressionKind::Atom(name)
+                    if matches!(locals.get(name), Some(NativeLocation::StackWideScalar { .. }))
+            ) {
+                return emit_native_f32_expression(expression, locals, label_counter, assembly);
+            }
+            if !emit_native_expression(
+                expression,
+                0,
+                &[1, 2, 3, 4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(if native_expression_is_unsigned(expression, locals) {
+                "    U16TOF32 R4, R0\n"
+            } else {
+                "    I16TOF32 R4, R0\n"
+            });
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn emit_native_f64_comparison(
@@ -4794,8 +4989,7 @@ fn native_expression_floating_size(
     match &expression.kind {
         ExpressionKind::Atom(value) => match locals.get(value) {
             Some(NativeLocation::FloatingPointScalar { size })
-            | Some(NativeLocation::StackFloatingPointScalar { size, .. })
-            | Some(NativeLocation::FloatRegister { size, .. }) => Some(*size),
+            | Some(NativeLocation::StackFloatingPointScalar { size, .. }) => Some(*size),
             _ if parse_integer_constant(value).is_none() => {
                 let parsed = value.strip_suffix(['f', 'F', 'l', 'L']).unwrap_or(value);
                 parsed
@@ -4939,8 +5133,8 @@ fn emit_native_f64_stack_store(offset: usize, assembly: &mut String) {
     assembly.push_str("    MOV R0, R3\n");
     emit_native_stack_offset(0, offset, assembly);
     assembly.push_str(
-        "    POP R6\n    STW R0, R4\n    ADD R0, 2\n    STW R0, R5\n\
-         ADD R0, 2\n    STW R0, R6\n    ADD R0, 2\n    STW R0, R7\n",
+        "    POP R6\n    STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+         INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n",
     );
 }
 
@@ -4961,15 +5155,6 @@ fn emit_native_f32_scalar_store(
             ));
             true
         }
-        Some(NativeLocation::FloatRegister { register, size: 4 }) => {
-            if *register != 4 {
-                assembly.push_str(&format!("    MOV R{register}, R4\n"));
-            }
-            if *register + 1 != 5 {
-                assembly.push_str(&format!("    MOV R{}, R5\n", register + 1));
-            }
-            true
-        }
         _ => false,
     }
 }
@@ -4987,17 +5172,9 @@ fn emit_native_f64_scalar_store(
         Some(NativeLocation::FloatingPointScalar { size: 8 }) => {
             assembly.push_str(&format!(
                 "    LDI30 R0, __c_global_{name}\n\
-                 STW R0, R4\n    ADD R0, 2\n    STW R0, R5\n\
-                 ADD R0, 2\n    STW R0, R6\n    ADD R0, 2\n    STW R0, R7\n"
+                 STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+                 INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n"
             ));
-            true
-        }
-        Some(NativeLocation::FloatRegister { register, size: 8 }) => {
-            for index in 0..4 {
-                if *register + index != 4 + index {
-                    assembly.push_str(&format!("    MOV R{}, R{}\n", register + index, 4 + index));
-                }
-            }
             true
         }
         _ => false,
@@ -5195,7 +5372,6 @@ fn emit_native_expression(
                     )),
                     NativeLocation::FloatingPointScalar { .. } => return false,
                     NativeLocation::StackFloatingPointScalar { .. } => return false,
-                    NativeLocation::FloatRegister { .. } => return false,
                     NativeLocation::GlobalByteScalar { signed } => {
                         assembly.push_str(&format!(
                             "    LDI30 R7, __c_global_{value}\n    LD R{destination}, R7\n"
@@ -5245,7 +5421,7 @@ fn emit_native_expression(
                     }
                     NativeLocation::StackWideScalar { offset, unsigned } => {
                         assembly.push_str("    MOV R7, R3\n");
-                        emit_native_stack_offset(7, *offset, assembly);
+                        emit_native_stack_offset(7, *offset + 2, assembly);
                         assembly.push_str(&format!("    LDW R{destination}, R7\n"));
                         emit_native_word_normalization(
                             destination,
@@ -6028,31 +6204,13 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &function.kind else {
                 return false;
             };
-            let (float_return_size, float_parameter_size, byte_parameter, word_parameters) =
-                match locals.get(name) {
-                    Some(NativeLocation::FunctionParameters {
-                        float_parameters,
-                        byte_parameters,
-                        word_parameters,
-                        float_return_size,
-                        ..
-                    }) => (
-                        *float_return_size,
-                        if float_parameters.len() == 1 {
-                            float_parameters[0]
-                        } else {
-                            0
-                        },
-                        byte_parameters.len() == 1 && byte_parameters[0],
-                        word_parameters.clone(),
-                    ),
-                    _ => (0, 0, false, Vec::new()),
-                };
-            if (float_return_size != 0 && float_parameter_size == 0 && !arguments.is_empty())
-                || (float_parameter_size != 0 && arguments.len() != 1)
-            {
-                return false;
-            }
+            let (float_return_size, layout) = match locals.get(name) {
+                Some(NativeLocation::FunctionParameters {
+                    layout,
+                    float_return_size,
+                }) => (*float_return_size, layout.as_ref()),
+                _ => (0, None),
+            };
             if name == "abs" {
                 if arguments.len() != 1
                     || !emit_native_expression(
@@ -6130,65 +6288,100 @@ fn emit_native_expression(
                 }
             }
             let mut argument_bytes = 0;
-            if float_parameter_size == 4 {
-                if !emit_native_f32_expression(&arguments[0], locals, label_counter, assembly) {
-                    return false;
-                }
-            } else if float_parameter_size == 8 {
-                if !emit_native_f64_expression(&arguments[0], locals, label_counter, assembly) {
-                    return false;
-                }
-            } else if arguments.len() == 1 && byte_parameter {
-                if !emit_native_expression(
-                    &arguments[0],
-                    4,
-                    &[5, 6, 7],
-                    locals,
-                    label_counter,
-                    assembly,
-                ) {
-                    return false;
-                }
-                assembly.push_str("    ADJSP -1\n    MOVSP R7\n    ST R7, R4\n");
-                argument_bytes += 1;
-            } else if (1..=3).contains(&arguments.len())
-                && word_parameters.len() == arguments.len()
-                && word_parameters.iter().all(|is_word| *is_word)
-            {
-                for argument in arguments.iter().rev() {
-                    if !emit_native_expression(
-                        argument,
-                        4,
-                        &[5, 6, 7],
-                        locals,
-                        label_counter,
-                        assembly,
-                    ) {
-                        return false;
-                    }
-                    assembly.push_str("    PUSH R4\n");
-                    argument_bytes += 2;
-                }
-            } else {
+            if library_function {
                 for (index, argument) in arguments.iter().enumerate().rev() {
-                    if !emit_native_expression(
-                        argument,
-                        4,
-                        &[5, 6, 7],
-                        locals,
-                        label_counter,
-                        assembly,
-                    ) {
-                        return false;
-                    }
-                    if pointer_parameters[index] {
-                        assembly.push_str("    ADJSP -4\n    MOVSP R7\n    STP R4, R7\n");
+                    if native_argument_is_pointer(name, index, arguments) {
+                        if !emit_native_library_pointer_argument(
+                            name,
+                            index,
+                            argument,
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        emit_native_pointer_push(label_counter, assembly);
                         argument_bytes += 4;
                     } else {
+                        if !emit_native_expression(
+                            argument,
+                            4,
+                            &[5, 6, 7],
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
                         assembly.push_str("    PUSH R4\n");
                         argument_bytes += 2;
                     }
                 }
+            } else {
+                let Some(layout) = layout else {
+                    return false;
+                };
+                if arguments.len() != layout.arguments.len() {
+                    return false;
+                }
+                for (expression, argument) in arguments.iter().zip(&layout.arguments).rev() {
+                    match argument.kind {
+                        NativeArgumentKind::Binary32 => {
+                            if !emit_native_floating_conversion(
+                                expression,
+                                4,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            assembly.push_str("    PUSH R5\n    PUSH R4\n");
+                        }
+                        NativeArgumentKind::Binary64 => {
+                            if !emit_native_floating_conversion(
+                                expression,
+                                8,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            assembly
+                                .push_str("    PUSH R7\n    PUSH R6\n    PUSH R5\n    PUSH R4\n");
+                        }
+                        NativeArgumentKind::WideInteger => {
+                            if !emit_native_i32_source(expression, locals, assembly) {
+                                return false;
+                            }
+                            assembly.push_str("    PUSH R5\n    PUSH R4\n");
+                        }
+                        _ => {
+                            if !emit_native_expression(
+                                expression,
+                                4,
+                                &[5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            match argument.kind {
+                                NativeArgumentKind::Pointer => assembly
+                                    .push_str("    ADJSP -4\n    MOVSP R7\n    STP R4, R7\n"),
+                                NativeArgumentKind::Byte => {
+                                    assembly.push_str("    ADJSP -1\n    MOVSP R7\n    ST R7, R4\n")
+                                }
+                                NativeArgumentKind::Word => assembly.push_str("    PUSH R4\n"),
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                }
+                argument_bytes = layout.size;
             }
             assembly.push_str(&format!(
                 "    CALLX {}\n",
@@ -6205,26 +6398,33 @@ fn emit_native_expression(
                     .push_str("    MOV R4, R0\n    MOV R5, R1\n    MOV R6, R2\n    MOV R7, R3\n");
             }
             if argument_bytes != 0 {
-                assembly.push_str(&format!("    ADJSP {argument_bytes}\n"));
+                emit_native_stack_adjustment(argument_bytes, false, assembly);
             }
             for register in (1..=6).rev() {
                 if (4..4 + floating_return_registers).contains(&register) {
                     continue;
                 }
                 if pointer_registers.contains(&(register as u8)) {
+                    let scratch = if float_return_size == 8 { 0 } else { 7 };
                     assembly.push_str(&format!(
-                        "    MOVSP R7\n    LDP R{register}, R7\n    ADJSP 4\n"
+                        "    MOVSP R{scratch}\n    LDP R{register}, R{scratch}\n    ADJSP 4\n"
                     ));
                 } else {
                     assembly.push_str(&format!("    POP R{register}\n"));
                 }
             }
             if preserve_frame_pointer {
+                if float_return_size == 8 {
+                    assembly.push_str("    MOV R0, R7\n");
+                }
                 assembly.push_str("    POP R7\n");
                 for _ in 0..16 {
                     assembly.push_str("    ADD R7, R7\n");
                 }
                 assembly.push_str("    ADD R3, R7\n");
+                if float_return_size == 8 {
+                    assembly.push_str("    MOV R7, R0\n");
+                }
             }
             if destination != 0 && float_return_size == 0 {
                 assembly.push_str(&format!("    MOV R{destination}, R0\n"));
@@ -6658,7 +6858,6 @@ fn emit_native_assignment_store(
             locals.get(name),
             Some(NativeLocation::FloatingPointScalar { size: 4 })
                 | Some(NativeLocation::StackFloatingPointScalar { size: 4, .. })
-                | Some(NativeLocation::FloatRegister { size: 4, .. })
         )
     {
         let wide_pointer = emit_native_save_r1(locals, assembly);
@@ -6702,7 +6901,6 @@ fn emit_native_assignment_store(
         NativeLocation::Constant(_) => return false,
         NativeLocation::FloatingPointScalar { .. } => return false,
         NativeLocation::StackFloatingPointScalar { .. } => return false,
-        NativeLocation::FloatRegister { .. } => return false,
         NativeLocation::StackWideScalar { .. } => return false,
         NativeLocation::GlobalScalar { .. } => (0, true, None),
         NativeLocation::GlobalByteScalar { signed } => (0, false, Some(*signed)),
@@ -6857,7 +7055,6 @@ fn emit_native_f64_assignment_store(
                 locals.get(name),
                 Some(NativeLocation::FloatingPointScalar { size: 8 })
                     | Some(NativeLocation::StackFloatingPointScalar { size: 8, .. })
-                    | Some(NativeLocation::FloatRegister { size: 8, .. })
             ) =>
         {
             Some(name.as_str())
@@ -6906,6 +7103,10 @@ fn emit_native_f64_assignment_store(
         assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R0, R6\n");
     }
     if operator != "=" {
+        let frame_pointer = native_uses_stack_frame(locals);
+        if frame_pointer {
+            emit_native_save_frame_pointer(assembly);
+        }
         let instruction = match operator {
             "+=" => "F64ADD",
             "-=" => "F64SUB",
@@ -6919,9 +7120,9 @@ fn emit_native_f64_assignment_store(
             }
         } else {
             assembly.push_str(
-                "    MOVSP R6\n    LDP R0, R6\n    LDW R4, R0\n    ADD R0, 2\n\
-                 LDW R5, R0\n    ADD R0, 2\n    LDW R6, R0\n\
-                 ADD R0, 2\n    LDW R7, R0\n",
+                "    MOVSP R6\n    LDP R0, R6\n    LDW R4, R0\n    INC R0\n    INC R0\n\
+                 LDW R5, R0\n    INC R0\n    INC R0\n    LDW R6, R0\n\
+                 INC R0\n    INC R0\n    LDW R7, R0\n",
             );
         }
         assembly.push_str("    PUSH R4\n    PUSH R5\n    PUSH R6\n    PUSH R7\n");
@@ -6933,6 +7134,9 @@ fn emit_native_f64_assignment_store(
              POP R7\n    POP R6\n    POP R5\n    POP R4\n",
         );
         assembly.push_str(&format!("    {instruction} R4, R0\n"));
+        if frame_pointer {
+            emit_native_restore_frame_pointer(0, assembly);
+        }
     } else if !emit_native_f64_operand(value, locals, label_counter, assembly) {
         return false;
     }
@@ -6941,8 +7145,8 @@ fn emit_native_f64_assignment_store(
     } else {
         assembly.push_str(
             "    MOVSP R0\n    LDP R0, R0\n    ADJSP 4\n\
-             STW R0, R4\n    ADD R0, 2\n    STW R0, R5\n\
-             ADD R0, 2\n    STW R0, R6\n    ADD R0, 2\n    STW R0, R7\n",
+             STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+             INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n",
         );
         true
     }
@@ -7030,8 +7234,8 @@ fn emit_native_statement(
                                     }
                                     assembly.push_str(
                                         "    MOVSP R0\n    LDP R0, R0\n    ADJSP 4\n\
-                                         STW R0, R4\n    ADD R0, 2\n    STW R0, R5\n\
-                                         ADD R0, 2\n    STW R0, R6\n    ADD R0, 2\n    STW R0, R7\n",
+                                         STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+                                         INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n",
                                     );
                                 } else {
                                     return None;
@@ -7154,7 +7358,9 @@ fn emit_native_statement(
                             }
                             assembly.push_str("    MOV R7, R3\n");
                             emit_native_stack_offset(7, *offset, assembly);
-                            assembly.push_str("    STW R7, R4\n    ADD R7, 2\n    STW R7, R5\n");
+                            assembly.push_str(
+                                "    STW R7, R4\n    INC R7\n    INC R7\n    STW R7, R5\n",
+                            );
                         }
                         NativeLocation::StackFloatingPointScalar { offset, size } => {
                             let c_type = native_unqualified_type(&declaration.c_type);
@@ -7248,15 +7454,14 @@ fn emit_native_statement(
                 }) => *float_return_size,
                 _ => 0,
             };
-            if native_expression_floating_size(expression, locals) == Some(return_size)
-                && return_size != 0
-            {
-                let emitted = match return_size {
-                    4 => emit_native_f32_expression(expression, locals, label_counter, assembly),
-                    8 => emit_native_f64_expression(expression, locals, label_counter, assembly),
-                    _ => false,
-                };
-                if !emitted {
+            if return_size != 0 {
+                if !emit_native_floating_conversion(
+                    expression,
+                    return_size,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
                     return None;
                 }
                 assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n");
@@ -7858,7 +8063,6 @@ fn emit_native_update(
         | NativeLocation::StackWideScalar { .. }
         | NativeLocation::FloatingPointScalar { .. }
         | NativeLocation::StackFloatingPointScalar { .. }
-        | NativeLocation::FloatRegister { .. }
         | NativeLocation::GlobalArray { .. }
         | NativeLocation::GlobalRecord { .. }
         | NativeLocation::FunctionParameters { .. }
@@ -13268,7 +13472,7 @@ mod tests {
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
         let executed = cpu.run(300_000).unwrap();
-        assert!(cpu.frame_yield, "Elite did not present its first frame");
+        assert!(cpu.frame_presented, "Elite did not present its first frame");
         assert!(
             executed < 300_000,
             "Elite exceeded the per-frame instruction budget"
@@ -13311,13 +13515,19 @@ mod tests {
             "Elite scene layer was not included in the presented framebuffer"
         );
         let first_scene = scene.to_vec();
-        cpu.begin_frame();
-        cpu.run(300_000).unwrap();
-        assert!(cpu.frame_yield, "Elite did not present its second frame");
+        for frame in 2..=4 {
+            cpu.begin_frame();
+            let executed = cpu.run(300_000).unwrap();
+            assert!(cpu.frame_presented, "Elite did not present frame {frame}");
+            assert!(
+                executed < 300_000,
+                "Elite exceeded the instruction budget for frame {frame}"
+            );
+        }
         assert_ne!(
             &cpu.layers[3][..320 * 240],
             first_scene,
-            "Elite scene did not update between frames"
+            "Elite scene did not update within four frames"
         );
     }
 
