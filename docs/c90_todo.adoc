@@ -301,12 +301,21 @@ required before claiming full C90 compatibility.
 === C2. Implement bit-field accesses
 
 * [ ] *Implement C90 bit-field accesses* (+c90-bitfield-codegen+)
-** Parse and validate fields and allocate them using +c90-bitfield-layout+
+** [x] Parse and validate fields and allocate them using +c90-bitfield-layout+
     in link:sc16_improvements.adoc[+sc16_improvements.adoc+].
-** Generate signed/unsigned loads and read/modify/write stores.
-** Cover assignment, compound assignment, increment/decrement, promotions,
-    initialization, unions, and volatile fields.
-** Diagnose invalid base types and widths.
+** [x] Generate signed/unsigned loads and read/modify/write stores; verify all
+    widths, neighboring bits, exact object bytes, and single evaluation of
+    indexed lvalues.
+** [x] Execute word-integer assignment/compound assignment, prefix/postfix
+    updates, promotions, global integer and automatic runtime initializers,
+    unions, nested members, recursive frame-local records, and volatile
+    allocation-unit access counts.
+** [ ] Complete floating/wide compound conversions, qualifier enforcement,
+    and all initializer combinations through the typed backend. Direct
+    unsupported floating/wide compound assignments currently produce a
+    diagnostic instead of silently using word arithmetic.
+** [x] Diagnose invalid base types and widths, address-taking, and +sizeof+
+    of a bit-field.
 ** *Depends on:* +c90-bitfield-layout+ in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+].
 

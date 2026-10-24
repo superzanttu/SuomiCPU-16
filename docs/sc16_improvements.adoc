@@ -200,6 +200,11 @@ Checklist status: [x] completed; [ ] planned.
    boundary crossing, and zero-width fields.
 ** Define interactions with +sizeof+, unions, padding, and +offsetof+.
 ** Document ABI choices and add layout tests.
+** [x] Revalidate layout with executed signed/unsigned accesses at every
+   width, exact unit bytes, unnamed/zero-width fields, unions, nested members,
+   integer updates, runtime automatic initialization, recursive local records,
+   and volatile read/write counts. The remaining typed conversions and
+   qualifier/initializer combinations stay open under +c90-bitfield-codegen+.
 
 === Phase 1 — Define architecture, disk, and image contracts
 

@@ -182,12 +182,34 @@ big-endian word representation.
 
 Each union bit-field member begins at bit zero of an allocation unit at offset
 zero. Union size includes the largest member representation and is rounded up
-to an even number of bytes. Bit-fields have no address, so applying +&+ or
-+offsetof+ to one is invalid. Signed fields use the low-width two's-complement
+to an even number of bytes. Bit-fields have no address, so applying +&+,
++sizeof+, or +offsetof+ to one is invalid. Signed fields use the low-width two's-complement
 representation and sign-extend when read; unsigned fields zero-extend.
-Assignments update only the selected bits in the allocation unit. These are
-implementation-defined ABI choices; documenting them does not imply that the
-compiler already implements bit-field parsing or code generation.
+Assignments update only the selected bits in the allocation unit.
+
+Execution tests verify signed and unsigned reads at every width from 1 to 16,
+word-integer assignments and compound assignments, prefix/postfix updates,
+integer promotions, and preservation of neighboring fields. Lvalue indices
+are evaluated once, including assignment results and updates across calls.
+Integer updates perform one allocation-unit read and one write, including
+volatile fields; a discarded volatile field expression still reads its unit.
+The tests inspect exact big-endian unit bytes, unnamed and zero-width fields,
+unit boundaries, unions, nested members, global constant initializers, and
+frame-local objects and arrays across recursion. Simple floating assignments
+and automatic initializers convert to the declared integer type before field
+narrowing. Invalid widths, base types, address-taking, and +sizeof+ uses are
+diagnosed.
+
+Scalar record layout uses the target four-byte +long+ and +float+ widths and
+eight-byte +double+ width for global and frame-local objects. This size/layout
+coverage does not enable runtime accesses to wide or floating record members;
+unsupported accesses are rejected rather than emitted as word-sized stores.
+
+This is a verified subset, not complete C90 bit-field support. Floating and
+wide-integer compound conversions, complete qualifier enforcement, and the
+remaining general aggregate initializer semantics still require the typed
+backend work. Direct floating/wide compound assignments are diagnosed rather
+than lowered as word operations.
 
 == Function calls
 

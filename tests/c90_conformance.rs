@@ -367,7 +367,7 @@ fn c90_binary32_and_binary64_convert_32_bit_integer_values() {
 }
 
 #[test]
-fn c90_bit_field_layout_and_unsupported_access() {
+fn c90_bit_field_layout_and_access() {
     let source = "struct Flags { unsigned int ready : 1; unsigned int mode : 3; \
                   signed int signed_value : 4; unsigned int : 0; \
                   unsigned int after_zero : 2; }; \
@@ -377,13 +377,22 @@ fn c90_bit_field_layout_and_unsupported_access() {
                   int main(void) { return sizeof(flags) * 100 + sizeof(overlay); }";
     assert_eq!(run_c(source), 602, "bit-field aggregate sizes");
 
-    let unsupported_access = "struct Flags { unsigned int ready : 1; }; \
-                              int main(void) { struct Flags flags; \
-                              return flags.ready; }";
-    assert!(matches!(
-        compile_minimal_program(unsupported_access, "bit-field-access.c"),
-        Ok(None) | Err(_)
-    ));
+    let access = "struct Flags { unsigned int ready : 1; }; \
+                  int main(void) { struct Flags flags = { 1 }; \
+                  return flags.ready; }";
+    assert_eq!(
+        run_c(access),
+        1,
+        "automatic bit-field initialization and access"
+    );
+    assert_eq!(
+        run_c(
+            "typedef struct { int x; int y; } Point; \
+               int main(void) { Point point = { 2, 5 }; return point.x; }"
+        ),
+        2,
+        "automatic record initialization and access"
+    );
 }
 
 #[test]
@@ -449,8 +458,6 @@ fn known_unimplemented_c90_headers_are_rejected_explicitly() {
 fn unsupported_c90_facilities_are_not_silently_miscompiled() {
     for source in [
         "int (*callback)(int); int main(void) { return 0; }",
-        "typedef struct { int x; int y; } Point; \
-         int main(void) { Point point = { 2, 5 }; return point.x; }",
         "int main(void) { return sizeof(short); }",
     ] {
         match compile_minimal_program(source, "unsupported-c90.c") {

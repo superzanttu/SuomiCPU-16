@@ -275,3 +275,262 @@ fn incompatible_function_types_are_diagnosed_before_call_lowering() {
     );
     assert_eq!(cpu.registers[0], -7);
 }
+
+#[test]
+fn bitfields_preserve_allocation_units_neighbors_and_big_endian_bytes() {
+    let mut cpu = run_c(
+        "struct Flags { unsigned int low:3; unsigned int :2; unsigned int high:4; \
+         signed int value:5; unsigned int :0; unsigned int final:16; }; \
+         struct Flags flags = {5, 9, -7, 4660}; \
+         int main(void) { \
+         if (flags.low != 5 || flags.high != 9 || flags.value != -7) return 1; \
+         flags.high = 3; flags.value += 2; flags.low ^= 2; flags.final |= 32768U; \
+         return flags.low == 7 && flags.high == 3 && flags.value == -5 \
+             && flags.final == 37428U ? 0 : 2; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let bytes = (0..6)
+        .map(|offset| cpu.read(0x80000 + offset))
+        .collect::<Vec<_>>();
+    assert_eq!(bytes, [0x00, 0x67, 0x00, 0x1b, 0x92, 0x34]);
+}
+
+#[test]
+fn bitfields_cover_signed_widths_unsigned_promotions_and_every_update_operator() {
+    for width in 1..=16 {
+        let min = -(1i32 << (width - 1));
+        let max = (1u32 << width) - 1;
+        let source = format!(
+            "struct S {{ signed int s:{width}; unsigned int u:{width}; }} value; \
+             int main(void) {{ value.s={min}; value.u={max}U; \
+             if (value.s != {min} || value.u != {max}U) return 1; \
+             value.s >>= 1; return value.s == {} ? 0 : 2; }}",
+            min >> 1,
+        );
+        assert_eq!(run_c(&source).registers[0], 0, "width {width}");
+    }
+    let cpu = run_c(
+        "struct S { unsigned int small:3; unsigned int full:16; signed int s:6; } v; \
+         int main(void) { v.small=7; v.full=65535U; v.s=-12; \
+         if (!(v.small > -1) || !(v.full > 1) || !((v.small-8) < 0)) return 1; \
+         v.s /= 3; v.s %= 3; if (v.s != -1) return 2; \
+         v.small += 4; if (v.small != 3) return 3; \
+         v.small *= 2; v.small -= 1; v.small <<= 1; \
+         v.small |= 4; v.small &= 6; v.small ^= 2; \
+         if (v.small != 4) return 4; \
+         if (v.small++ != 4 || ++v.small != 6) return 5; \
+         if (v.small-- != 6 || --v.small != 4) return 6; \
+         return (v.small=15) == 7 ? 0 : 7; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn bitfield_lvalues_evaluate_indices_once_and_survive_nested_calls() {
+    let cpu = run_c(
+        "struct S { unsigned int left:4; unsigned int right:4; }; \
+         struct S values[3] = {{1,2},{3,4},{5,6}}; \
+         int rhs(int n) { if (n == 0) return 2; return rhs(n-1)+1; } \
+         int main(void) { int i=0; int result; \
+         result=(values[i++].left=rhs(2)); \
+         if (i != 1 || result != 4) return 1; \
+         result=(values[i++].left+=rhs(1)); \
+         if (i != 2 || result != 6) return 2; \
+         result=values[i++].right++; \
+         if (i != 3 || result != 6 || values[2].right != 7) return 3; \
+         i=0; result=++values[i++].left; \
+         return i == 1 && result == 5 && values[0].right == 2 ? 0 : 4; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "struct S { unsigned int a:4; unsigned int b:4; } v = {1, 2}; \
+         int change(void) { v.b=7; return 2; } \
+         int main(void) { v.a+=change(); \
+         if (v.a != 3 || v.b != 7) return 1; \
+         v.a+=(v.b=3); return v.a == 6 && v.b == 3 ? 0 : 2; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn bitfield_automatic_objects_unions_and_recursive_frames() {
+    let source = "union U { unsigned int bits:9; unsigned int word; }; \
+         union U initial = {257}; \
+         struct S { signed int s:5; unsigned int u:3; }; \
+         int recur(int n) { struct S local = {n-4, n}; \
+         struct S *p=&local; int child=0; \
+         if (p->s != n-4 || p->u != n) return 200; \
+         if (n) child=recur(n-1); \
+         if (p->s != n-4 || p->u != n) return 100+n; return child+1; } \
+         int main(void) { union U overlay = {17}; \
+         struct S array[2] = {{-7,2},{3,5}}; struct S *p=array; \
+         if (initial.word != 257 || overlay.word != 17) return 1; \
+         overlay.bits+=3; if (overlay.word != 20) return 2; \
+         p->s+=2; if (p->s != -5 || array[0].u != 2) return 3; \
+         if (array[1].s != 3) return 4; return recur(5); }";
+    let cpu = run_c(source);
+    assert_eq!(cpu.registers[0], 6);
+}
+
+#[test]
+fn bitfield_unit_boundaries_nested_members_and_volatile_accesses() {
+    let mut cpu = run_c(
+        "struct S { unsigned int a:12; unsigned int b:8; unsigned int :0; \
+         unsigned int c:3; }; \
+         struct Outer { unsigned char sentinel; struct S nested; }; \
+         volatile struct Outer object = {165, {2748, 129, 5}}; \
+         struct V { volatile unsigned int bits:4; volatile signed int signed_bits:5; }; \
+         volatile struct V v; \
+         int main(void) { object.nested.b+=1; v.bits=7; v.signed_bits=-3; \
+         if (v.bits++ != 7 || v.bits != 8 || v.signed_bits != -3) return 1; \
+         return object.sentinel == 165 && object.nested.a == 2748 \
+             && object.nested.b == 130 && object.nested.c == 5 ? 0 : 2; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let bytes = (0..8)
+        .map(|offset| cpu.read(0x80000 + offset))
+        .collect::<Vec<_>>();
+    assert_eq!(bytes, [165, 0, 0x0a, 0xbc, 0, 130, 0, 5]);
+}
+
+#[test]
+fn volatile_bitfields_execute_one_unit_read_and_write_per_update() {
+    let source = "struct V { volatile unsigned int low:3; volatile unsigned int high:3; }; \
+         volatile struct V v = {1, 5}; \
+         int main(void) { int saved; v.low=2; v.low+=1; \
+         saved=v.low++; ++v.low; v.low; return saved; }";
+    let assembly = compile_minimal_program_to_assembly(source, "volatile-bits.c")
+        .unwrap()
+        .unwrap();
+    let image = assemble(&assembly, 0).unwrap();
+    let load = assemble("LDW R0, R7", 0).unwrap();
+    let store = assemble("STW R7, R0", 0).unwrap();
+    let opcode = |image: &suomicpu16::image::ProgramImage| {
+        u16::from_be_bytes([image.segments[0].data[0], image.segments[0].data[1]]) >> 11
+    };
+    let load_opcode = opcode(&load);
+    let store_opcode = opcode(&store);
+    let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    let initial_sp = cpu.sp;
+    let (mut reads, mut writes) = (0, 0);
+    for _ in 0..10_000 {
+        if !cpu.running {
+            break;
+        }
+        let instruction = u16::from_be_bytes([cpu.read(cpu.pc), cpu.read(cpu.pc + 1)]);
+        let address_register = ((instruction >> 5) & 7) as usize;
+        if cpu.registers[address_register] == 0x80000 {
+            if instruction >> 11 == load_opcode {
+                reads += 1;
+            } else if instruction >> 11 == store_opcode {
+                writes += 1;
+            }
+        }
+        cpu.step().unwrap();
+    }
+    assert!(!cpu.running);
+    assert_eq!(cpu.sp, initial_sp);
+    assert_eq!(cpu.registers[0], 3);
+    assert_eq!((reads, writes), (5, 4));
+    assert_eq!([cpu.read(0x80000), cpu.read(0x80001)], [0, 45]);
+}
+
+#[test]
+fn bitfield_address_sizeof_and_invalid_declarations_are_diagnosed() {
+    for expression in ["&v.bits", "sizeof(v.bits)", "sizeof((v.bits))"] {
+        let source = format!(
+            "struct V {{ unsigned int bits:3; }} v; \
+             int main(void) {{ {expression}; return 0; }}"
+        );
+        let error = compile_minimal_program_to_assembly(&source, "invalid-bits.c").unwrap_err();
+        assert!(
+            error.0.contains("bit-field has no address or sizeof"),
+            "{error}"
+        );
+        assert!(error.0.contains("invalid-bits.c:1:"), "{error}");
+    }
+    for declaration in [
+        "int named:0",
+        "int bits:17",
+        "int bits:-1",
+        "char bits:3",
+        "long bits:3",
+        "int *bits:3",
+        "unsigned int bits[2]:3",
+    ] {
+        let source = format!("struct V {{ {declaration}; }} v; int main(void) {{ return 0; }}");
+        assert!(
+            compile_minimal_program_to_assembly(&source, "invalid-bits.c").is_err(),
+            "{declaration}"
+        );
+    }
+    let source = "#include <stddef.h>\nstruct V { unsigned int bits:3; }; \
+                  int main(void) { return offsetof(struct V, bits); }";
+    assert!(compile_minimal_program_to_assembly(source, "invalid-offset.c").is_err());
+    for (c_type, value) in [("double", "2.5"), ("long", "65536L")] {
+        let source = format!(
+            "struct V {{ unsigned int bits:3; }} v; \
+             int main(void) {{ {c_type} rhs={value}; v.bits+=rhs; return 0; }}"
+        );
+        let error =
+            compile_minimal_program_to_assembly(&source, "pending-conversion.c").unwrap_err();
+        assert!(
+            error
+                .0
+                .contains("bit-field compound assignments are not supported"),
+            "{error}"
+        );
+    }
+    for source in [
+        "struct V { double real; }; int main(void) { struct V v={1.5}; return 0; }",
+        "struct V { long wide; }; int main(void) { struct V v; v.wide=1234; return 0; }",
+        "struct V { double real; } v; int main(void) { v.real++; return 0; }",
+    ] {
+        assert!(
+            !matches!(
+                compile_minimal_program_to_assembly(source, "pending-record-member.c"),
+                Ok(Some(_))
+            ),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn bitfield_assignment_converts_floating_values_before_narrowing() {
+    let cpu = run_c(
+        "struct V { signed int s:5; unsigned int u:4; } global; \
+         int main(void) { double real=-3.75; float single=12.5f; \
+         struct V local = {real, single}; \
+         global.s=real; global.u=single; \
+         if (local.s != -3 || local.u != 12) return 1; \
+         return global.s == -3 && global.u == 12 ? 0 : 2; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn record_scalar_layout_uses_target_widths_without_enabling_word_only_accesses() {
+    let cpu = run_c(
+        "struct S { signed char byte; long wide; float single; double real; }; \
+         union U { unsigned char byte; long wide; double real; }; \
+         struct S global; union U overlay; \
+         int main(void) { struct S local; \
+         return sizeof(global) == 18 && sizeof(local) == 18 && sizeof(overlay) == 8 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn signed_word_comparisons_and_full_width_pointer_spills_are_consistent() {
+    let cpu = run_c(
+        "int main(void) { int negative=-3; int values[2]; int *p=values; \
+         if (negative != 1-4 || 1-4 != negative || -1 != -1) return 1; \
+         if (!(negative < 1) || !(1 > negative)) return 2; \
+         if (p != values || p != &values[0] || &values[0] != p) return 3; \
+         return p < p+1 && p+1 > p ? 0 : 4; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
