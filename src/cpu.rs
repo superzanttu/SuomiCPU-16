@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use crate::console::ConsoleDevice;
 use crate::disk::DiskDevice;
+use crate::guest_text::GuestTextDisplay;
 use crate::net::{DEFAULT_PORT, NetNode};
 
 pub const MEMORY_SIZE: usize = 1 << 30;
@@ -262,6 +263,7 @@ pub struct Cpu {
     pub frame_presented: bool,
     pub frame_count: u16,
     pub console: ConsoleDevice,
+    pub guest_text: GuestTextDisplay,
     pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
     pub layers: [Vec<u8>; GPU_LAYER_COUNT],
@@ -317,6 +319,7 @@ impl Cpu {
             memory[FONT_ADDR..FONT_ADDR + font_size].copy_from_slice(&font[..font_size]);
         }
         if size > CONSOLE_CONTROL as usize {
+            memory[ICR_ADDR as usize] = 0;
             memory[CONSOLE_CONTROL as usize] = 3;
             memory[(GPU_BASE - 12) as usize] = 0;
             memory[(GPU_BASE - 13) as usize] = 2;
@@ -368,6 +371,7 @@ impl Cpu {
             frame_presented: false,
             frame_count: 0,
             console: ConsoleDevice::new(),
+            guest_text: GuestTextDisplay::new(),
             saved_video: None,
             random_state: 0x16c0_ffee,
             layers: std::array::from_fn(|_| vec![0; 640 * 480]),

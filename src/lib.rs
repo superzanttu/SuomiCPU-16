@@ -3,6 +3,7 @@ pub mod c_compiler;
 pub mod console;
 pub mod cpu;
 pub mod disk;
+pub mod guest_text;
 pub mod image;
 pub mod isa;
 pub mod net;

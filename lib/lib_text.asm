@@ -41,10 +41,7 @@ SCREEN_GET_CURSOR_PACK:
     RET
 
 SCREEN_PRINT:
-    MOVSP R7
-    LDI R6, 4
-    ADD R7, R6
-    LDP R0, R7
+    LDWS R0, 4
     LDI R7, 0x4350
     STP R0, R7
     LDWS R0, 8

@@ -114,10 +114,7 @@ gfx_sprite:
     LDWS R3, 10
     CALLX CGFX_FIELDS
     LDWS R4, 12
-    MOVSP R7
-    LDI R6, 14
-    ADD R7, R6
-    LDW R5, R7
+    LDWS R5, 14
     CALLX CGFX_SRC
     LDI R5, 5
     CALLX CGFX_GO
@@ -130,10 +127,7 @@ gfx_bitmap:
     LDWS R3, 10
     CALLX CGFX_FIELDS
     LDWS R4, 12
-    MOVSP R7
-    LDI R6, 14
-    ADD R7, R6
-    LDW R5, R7
+    LDWS R5, 14
     CALLX CGFX_SRC
     LDWS R4, 16
     CALLX CGFX_COLOR
@@ -148,10 +142,7 @@ gfx_poly:
     LDI R3, 0
     CALLX CGFX_FIELDS
     LDWS R4, 10
-    MOVSP R7
-    LDI R6, 12
-    ADD R7, R6
-    LDW R5, R7
+    LDWS R5, 12
     CALLX CGFX_SRC
     LDWS R4, 14
     CALLX CGFX_COLOR
@@ -166,10 +157,7 @@ gfx_text:
     LDI R3, 0
     CALLX CGFX_FIELDS
     LDWS R4, 8
-    MOVSP R7
-    LDI R6, 10
-    ADD R7, R6
-    LDW R5, R7
+    LDWS R5, 10
     CALLX CGFX_SRC
     LDWS R4, 12
     CALLX CGFX_COLOR
@@ -401,10 +389,7 @@ net_open:
     LDI R3, 0
     CALLX CGFX_FIELDS
     LDWS R4, 4
-    MOVSP R7
-    LDI R6, 6
-    ADD R7, R6
-    LDW R5, R7
+    LDWS R5, 6
     CALLX CGFX_SRC
     LDI R5, 16
     CALLX NET_RUN
@@ -423,10 +408,7 @@ net_send:
     LDI R3, 0
     CALLX CGFX_FIELDS
     LDWS R4, 4
-    MOVSP R7
-    LDI R6, 6
-    ADD R7, R6
-    LDW R5, R7
+    LDWS R5, 6
     CALLX CGFX_SRC
     LDI R5, 18
     CALLX NET_RUN
@@ -439,10 +421,7 @@ net_recv:
     LDI R3, 0
     CALLX CGFX_FIELDS
     LDWS R4, 4
-    MOVSP R7
-    LDI R6, 6
-    ADD R7, R6
-    LDW R5, R7
+    LDWS R5, 6
     CALLX CGFX_SRC
     LDI R5, 19
     CALLX NET_RUN

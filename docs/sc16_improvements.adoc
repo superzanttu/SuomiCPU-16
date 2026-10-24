@@ -86,7 +86,7 @@ Checklist status: [x] completed; [ ] planned.
    representations; cover other arities, byte, pointer, wide integer,
    aggregate, and floating arguments, callee offsets, promotions, nested calls,
    and recursion.
-** [ ] Audit and update assembly-library argument offsets for the documented
+** [x] Audit and update assembly-library argument offsets for the documented
   stack convention.
 
 * [ ] *Define and maintain the C target floating-point model*
@@ -227,14 +227,13 @@ Checklist status: [x] completed; [ ] planned.
 
 === Phase 2 — Boot through system BIOS
 
-* [ ] Change CPU reset/power-on state to enter kernel mode at a documented
+* [x] Change CPU reset/power-on state to enter kernel mode at a documented
   firmware entry point with interrupts disabled and a defined stack/control
   state.
 * [x] Implement the BIOS character-cell text renderer in the emulator's main
   window. Use bright green text on black with enlarged fixed-width characters
   and no glow or post-processing; do not open a separate terminal window.
-* [ ] Implement a guest-visible character-cell text display if the finalized
-  architecture does not already provide one, for use by guest software. The
+* [x] Implement a guest-visible character-cell text display for use by guest software. The
   BIOS must continue rendering in the emulator's main window.
 * [x] Preserve the existing game window and optional serial Bug Monitor after
   boot; switching the BIOS to text mode must not force applications into a
