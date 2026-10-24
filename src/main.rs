@@ -26,7 +26,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "       suomicpu16 --headless [--disk ID] [--net-port PORT] PROGRAM.asm|PROGRAM.c|PROGRAM.bin"
             );
-            println!("Without a program, open the BIOS module selector.");
+            println!(
+                "Without a program, open the BIOS folder-disk selector (--disk preselects a boot disk)."
+            );
             return Ok(());
         } else if argument == "--fullscreen" {
             fullscreen = true;

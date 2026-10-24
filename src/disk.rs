@@ -152,6 +152,13 @@ impl FolderDisk {
     }
 
     pub fn discover(root: &Path) -> Result<Vec<Self>, String> {
+        Self::discover_paths(root)?
+            .iter()
+            .map(|path| Self::open(path))
+            .collect()
+    }
+
+    pub fn discover_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
         let root_metadata = fs::symlink_metadata(root)
             .map_err(|error| format!("cannot inspect folder disk collection: {error}"))?;
         if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
@@ -178,7 +185,7 @@ impl FolderDisk {
             }
         }
         candidates.sort_by_key(|path| path.file_name().map(|name| name.to_os_string()));
-        candidates.iter().map(|path| Self::open(path)).collect()
+        Ok(candidates)
     }
 
     pub fn root(&self) -> &Path {

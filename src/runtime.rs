@@ -1,4 +1,5 @@
-use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle, VSYNC_ADDR};
+use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle, PrivilegeMode, VSYNC_ADDR};
+use crate::disk::{FolderBootMode, FolderDisk};
 use crate::image::{ImageError, load_program};
 use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
@@ -37,6 +38,17 @@ const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
     ("BUG MONITOR", 304.0, 112.0),
 ];
 const CONSOLE_TOOLBAR_BUTTONS: [(usize, usize); 4] = [(6, 94), (106, 72), (184, 92), (282, 104)];
+const BIOS_TEXT_COLUMNS: usize = 53;
+const BIOS_TEXT_ROWS: usize = 25;
+const BIOS_TEXT_CELL_WIDTH: usize = 12;
+const BIOS_TEXT_CELL_HEIGHT: usize = 16;
+const BIOS_TEXT_LEFT: usize = (640 - BIOS_TEXT_COLUMNS * BIOS_TEXT_CELL_WIDTH) / 2;
+const BIOS_TEXT_TOP: usize = (480 - BIOS_TEXT_ROWS * BIOS_TEXT_CELL_HEIGHT) / 2;
+const BIOS_MODULE_ROW_TOP: usize = BIOS_TEXT_TOP + 6 * BIOS_TEXT_CELL_HEIGHT;
+const BIOS_MODULE_ROW_HEIGHT: usize = BIOS_TEXT_CELL_HEIGHT;
+const BIOS_VISIBLE_MODULES: usize = 12;
+const BIOS_PHOSPHOR: u32 = 0xff75ff9a;
+const BIOS_PHOSPHOR_BRIGHT: u32 = 0xffc8ffd5;
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -291,18 +303,14 @@ impl Canvas {
 }
 
 #[derive(Clone)]
-struct BootModule {
+struct BootDisk {
     name: String,
-    description: String,
-    source: Option<PathBuf>,
-    error: Option<String>,
+    path: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum BiosMouseAction {
-    SelectModule(usize),
-    PreviousDisk,
-    NextDisk,
+    SelectDisk(usize),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -446,10 +454,11 @@ fn console_runtime_control(key: NativeKey, paused: bool) -> Option<RuntimeContro
 struct BootTarget {
     source: PathBuf,
     disk_id: Option<String>,
+    folder_disk: bool,
 }
 
 pub fn window_conf() -> Conf {
-// ...existing code...
+    // ...existing code...
     Conf {
         window_title: "SuomiCPU-16 Emulator (Rust)".to_owned(),
         window_width: 960,
@@ -480,31 +489,35 @@ pub async fn run_with_devices(
     let mut pixels = vec![0u32; 640 * 480];
     let mut canvas = Canvas::new();
     let mut audio = AudioEngine::new();
-    let mut cpu = fresh_runtime_cpu(root, program, disk_id, network_port, None)?;
-    
-    let bios_path = root.join("bios.bin");
-    if bios_path.exists() {
-        let bios_data = fs::read(&bios_path).map_err(RuntimeError::Io)?;
-        cpu.memory[0..bios_data.len()].copy_from_slice(&bios_data);
-        cpu.console.log_info("emulator", "BIOS loaded from bios.bin");
-    } else {
-        cpu.console.log_warn("emulator", "bios.bin not found; booting from empty memory");
-    }
-
+    let mut cpu = fresh_runtime_cpu(root, program, program.and(disk_id), network_port, None)?;
     cpu.console.log_info("emulator", "BIOS started");
     let mut paused = false;
     let mut console_visible = false;
     let mut console_window: Option<ConsoleWindow> = None;
     let mut fullscreen = fullscreen;
-    let target = if let Some(source) = program {
+    let mut target = if let Some(source) = program {
         let target = BootTarget {
             source: source.to_path_buf(),
             disk_id: disk_id.map(str::to_owned),
+            folder_disk: false,
         };
         boot_target(&mut cpu, &target)?;
         Some(target)
     } else {
-        None
+        let Some(target) = select_boot_disk(
+            root,
+            &mut cpu,
+            &font,
+            &mut pixels,
+            &mut canvas,
+            &mut fullscreen,
+            disk_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        Some(target)
     };
 
     let mut old_keys = HashSet::new();
@@ -620,32 +633,37 @@ pub async fn run_with_devices(
         {
             audio.stop_all();
             let previous_console = cpu.console.clone();
-            if action == RuntimeControl::ResetRequested
-            {
+            if action == RuntimeControl::ResetRequested {
                 console_window = None;
                 console_visible = false;
-                cpu = fresh_runtime_cpu(root, None, None, network_port, Some(&previous_console))?;
-                
-                let bios_path = root.join("bios.bin");
-                if bios_path.exists() {
-                    let bios_data = fs::read(&bios_path).map_err(RuntimeError::Io)?;
-                    cpu.memory[0..bios_data.len()].copy_from_slice(&bios_data);
-                    cpu.console.log_info("emulator", "BIOS loaded from bios.bin");
-                } else {
-                    cpu.console.log_warn("emulator", "bios.bin not found; booting from empty memory");
-                }
+                cpu = fresh_runtime_cpu(
+                    root,
+                    program,
+                    program.and(disk_id),
+                    network_port,
+                    Some(&previous_console),
+                )?;
 
-                let Some(new_target) = if let Some(source) = program {
+                let Some(new_target) = (if let Some(source) = program {
                     let target = BootTarget {
                         source: source.to_path_buf(),
                         disk_id: disk_id.map(str::to_owned),
+                        folder_disk: false,
                     };
                     boot_target(&mut cpu, &target)?;
                     Some(target)
                 } else {
-                    None
-                }
-                else {
+                    select_boot_disk(
+                        root,
+                        &mut cpu,
+                        &font,
+                        &mut pixels,
+                        &mut canvas,
+                        &mut fullscreen,
+                        disk_id,
+                    )
+                    .await?
+                }) else {
                     return Ok(());
                 };
                 target = Some(new_target);
@@ -655,15 +673,34 @@ pub async fn run_with_devices(
                 };
                 cpu = fresh_runtime_cpu(
                     root,
-                    Some(&active_target.source),
+                    (!active_target.folder_disk).then_some(active_target.source.as_path()),
                     active_target.disk_id.as_deref(),
                     network_port,
                     Some(&previous_console),
                 )?;
-                boot_target(
+                let result = boot_target(
                     &mut cpu,
                     target.as_ref().expect("active program target exists"),
-                )?;
+                );
+                if let Err(error) = result {
+                    if !active_target.folder_disk {
+                        return Err(error);
+                    }
+                    let Some(new_target) = select_boot_disk(
+                        root,
+                        &mut cpu,
+                        &font,
+                        &mut pixels,
+                        &mut canvas,
+                        &mut fullscreen,
+                        disk_id,
+                    )
+                    .await?
+                    else {
+                        return Ok(());
+                    };
+                    target = Some(new_target);
+                }
             }
             cpu.console.log_info(
                 "emulator",
@@ -843,193 +880,177 @@ pub fn run_headless_with_devices(
     }
     Ok(executed)
 }
-// ...existing code...
-                (mouse_position().0, mouse_position().1 - toolbar_height),
-                (screen_width(), screen_height() - toolbar_height),
-                (640, 480),
-            )
-            && (32..608).contains(&x)
-            && (BIOS_MODULE_ROW_TOP
-                ..BIOS_MODULE_ROW_TOP + BIOS_VISIBLE_MODULES * BIOS_MODULE_ROW_HEIGHT)
-                .contains(&y)
-        {
-            (selected, scroll_offset) = bios_scroll_modules(
-                selected,
-                scroll_offset,
-                -(wheel_delta.signum() as isize) * 3,
-                modules.len(),
-            );
-            last_clicked_module = None;
-            message = None;
-            continue;
-        }
-        let mut launch_selected = false;
-        let keys = get_keys_down();
-        let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
-        let controlled =
-            keys.contains(&KeyCode::LeftControl) || keys.contains(&KeyCode::RightControl);
-        for key in get_keys_pressed() {
-            if let Some(control) = apply_runtime_control(
-                key,
-                paused,
-                fullscreen,
-                console_visible,
-                shifted,
-                controlled,
-            ) {
-                match control {
-                    RuntimeControl::PauseToggled(value) => *paused = value,
-                    RuntimeControl::FullscreenToggled(value) => set_fullscreen(value),
-                    RuntimeControl::ConsoleToggled(value) => *console_visible = value,
-                    RuntimeControl::ResetRequested | RuntimeControl::RebootRequested => {}
-                }
+fn discover_boot_disks(root: &Path) -> Result<Vec<BootDisk>, RuntimeError> {
+    FolderDisk::discover_paths(root)
+        .map_err(RuntimeError::Window)?
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| RuntimeError::Window("invalid disk directory name".to_owned()))?
+                .to_owned();
+            Ok(BootDisk { name, path })
+        })
+        .collect()
+}
+
+async fn select_boot_disk(
+    root: &Path,
+    cpu: &mut Cpu,
+    font: &[[u8; 8]],
+    pixels: &mut [u32],
+    canvas: &mut Canvas,
+    fullscreen: &mut bool,
+    disk_id: Option<&str>,
+) -> Result<Option<BootTarget>, RuntimeError> {
+    'restart: loop {
+        let mut message = None;
+        let disks = match discover_boot_disks(&root.join("disks")) {
+            Ok(disks) => disks,
+            Err(error) => {
+                cpu.console.log_error("bios", &error.to_string());
+                message = Some(error.to_string());
+                Vec::new()
+            }
+        };
+        let mut selected = 0;
+        if let Some(id) = disk_id {
+            if let Some(index) = disks.iter().position(|disk| disk.name == id) {
+                selected = index;
+            } else {
+                let error = format!("disk {id} not found");
+                cpu.console.log_error("bios", &error);
+                message = Some(error);
             }
         }
-        if !*fullscreen
-            && is_mouse_button_pressed(MouseButton::Left)
-            && let Some(control) = toolbar_control(mouse_position(), *paused, *console_visible)
-        {
-            match control {
-                RuntimeControl::PauseToggled(value) => *paused = value,
-                RuntimeControl::ResetRequested => {
-                    selected = 0;
-                    scroll_offset = 0;
-                    selected_disk = 0;
-                    message = None;
-                    last_clicked_module = None;
-                    *paused = false;
+        let mut offset = bios_scroll_offset(selected, 0, disks.len());
+        let mut last_click = None;
+        let mut paused = false;
+        let mut console_visible = false;
+        let mut console_window: Option<ConsoleWindow> = None;
+        loop {
+            draw_bios_selector(pixels, font, &disks, (selected, offset), message.as_deref());
+            canvas
+                .present(
+                    pixels,
+                    (640, 480),
+                    &[],
+                    &[],
+                    &cpu.palette,
+                    (!*fullscreen).then_some(ToolbarState { paused }),
+                )
+                .await;
+            let toolbar_height = if *fullscreen { 0.0 } else { TOOLBAR_HEIGHT };
+            let keys = get_keys_down();
+            let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
+            let controlled =
+                keys.contains(&KeyCode::LeftControl) || keys.contains(&KeyCode::RightControl);
+            let mut action = None;
+            for key in get_keys_pressed() {
+                if let Some(control) = apply_runtime_control(
+                    key,
+                    &mut paused,
+                    fullscreen,
+                    &mut console_visible,
+                    shifted,
+                    controlled,
+                ) {
+                    action = Some(control);
                 }
-                RuntimeControl::RebootRequested => launch_selected = true,
-                RuntimeControl::ConsoleToggled(visible) => *console_visible = visible,
-                RuntimeControl::FullscreenToggled(_) => {}
             }
-        }
-        let console_control = console_window
-            .as_mut()
-            .and_then(|window| window.runtime_control_pressed(*paused, *console_visible));
-        if let Some(control) = console_control {
-            match control {
-                RuntimeControl::PauseToggled(value) => *paused = value,
-                RuntimeControl::ResetRequested => {
-                    selected = 0;
-                    scroll_offset = 0;
-                    selected_disk = 0;
-                    message = None;
-                    last_clicked_module = None;
-                    *paused = false;
-                }
-                RuntimeControl::RebootRequested => launch_selected = true,
-                RuntimeControl::ConsoleToggled(visible) => *console_visible = visible,
-                RuntimeControl::FullscreenToggled(_) => {}
+            if !*fullscreen && is_mouse_button_pressed(MouseButton::Left) {
+                action = toolbar_control(mouse_position(), paused, console_visible).or(action);
             }
-        }
-        if *console_visible && console_window.is_none() {
-            *console_window = Some(ConsoleWindow::new()?);
-        } else if !*console_visible {
-            *console_window = None;
-        }
-        if console_window
-            .as_ref()
-            .is_some_and(|window| !window.is_open())
-        {
-            *console_window = None;
-            *console_visible = false;
-        }
-        if !*paused
-            && is_mouse_button_pressed(MouseButton::Left)
-            && let Some(action) = bios_mouse_action(
-                (mouse_position().0, mouse_position().1 - toolbar_height),
-                (screen_width(), screen_height() - toolbar_height),
-                modules.len(),
-                scroll_offset,
-            )
-        {
+            if let Some(window) = console_window.as_mut() {
+                action = window
+                    .runtime_control_pressed(paused, console_visible)
+                    .or(action);
+            }
+            let mut launch = false;
             match action {
-                BiosMouseAction::SelectModule(index) => {
-                    selected = index;
-                    scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
-                    launch_selected =
-                        bios_register_module_click(&mut last_clicked_module, index, Instant::now());
-                    message = None;
+                Some(RuntimeControl::FullscreenToggled(value)) => set_fullscreen(value),
+                Some(RuntimeControl::PauseToggled(value)) => paused = value,
+                Some(RuntimeControl::ConsoleToggled(value)) => console_visible = value,
+                Some(RuntimeControl::ResetRequested) => {
+                    continue 'restart;
                 }
-                BiosMouseAction::PreviousDisk => {
-                    selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, false);
-                    last_clicked_module = None;
-                    message = None;
-                }
-                BiosMouseAction::NextDisk => {
-                    selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, true);
-                    last_clicked_module = None;
-                    message = None;
+                Some(RuntimeControl::RebootRequested) => launch = true,
+                None => {}
+            }
+            if *fullscreen {
+                console_visible = false;
+            }
+            if console_visible && console_window.is_none() {
+                console_window = Some(ConsoleWindow::new()?);
+            } else if !console_visible {
+                console_window = None;
+            }
+            if let Some(window) = console_window.as_mut() {
+                if window.is_open() {
+                    window.present(&cpu.console.text_snapshot(), font, paused)?;
+                } else {
+                    console_window = None;
+                    console_visible = false;
                 }
             }
-            if !launch_selected {
+            if paused {
                 continue;
             }
-        }
-        if let Some(window) = console_window.as_mut()
-            && window.is_open()
-        {
-            window.present(&cpu.console.text_snapshot(), font, *paused)?;
-        }
-        if !launch_selected && !*paused && is_key_pressed(KeyCode::Escape) {
-            return Ok(None);
-        } else if !launch_selected && !*paused && is_key_pressed(KeyCode::Up) {
-            selected = bios_move_selection(selected, -1, modules.len());
-            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
-            message = None;
-        } else if !launch_selected && !*paused && is_key_pressed(KeyCode::Down) {
-            selected = bios_move_selection(selected, 1, modules.len());
-            scroll_offset = bios_scroll_offset(selected, scroll_offset, modules.len());
-            message = None;
-        } else if !launch_selected
-            && !*paused
-            && (is_key_pressed(KeyCode::D) || is_key_pressed(KeyCode::Right))
-        {
-            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, true);
-            message = None;
-        } else if !launch_selected && !*paused && is_key_pressed(KeyCode::Left) {
-            selected_disk = bios_cycle_disk(selected_disk, disks.len() + 1, false);
-            message = None;
-        } else if !launch_selected
-            && !*paused
-            && !modules.is_empty()
-            && is_key_pressed(KeyCode::Enter)
-        {
-            launch_selected = true;
-        }
-        if launch_selected {
-            let Some(module) = modules.get(selected) else {
-                continue;
+            if is_key_pressed(KeyCode::Escape) {
+                return Ok(None);
+            }
+            let direction = if is_key_pressed(KeyCode::Up) {
+                -1
+            } else if is_key_pressed(KeyCode::Down) {
+                1
+            } else {
+                0
             };
-            if let Some(error) = &module.error {
-                message = Some(format!("{}: {error}", module.name));
-                last_clicked_module = None;
-                continue;
+            if direction != 0 {
+                selected = bios_move_selection(selected, direction, disks.len());
+                offset = bios_scroll_offset(selected, offset, disks.len());
+                message = None;
+                last_click = None;
             }
-            let Some(source) = module.source.as_ref() else {
-                message = Some(format!("{}: no source file found", module.name));
-                continue;
-            };
-            let boot_result = (|| {
-                configure_disk(cpu, root, source)?;
-                if selected_disk != 0 {
-                    cpu.mount_data_disk(&disks[selected_disk - 1])
-                        .map_err(RuntimeError::Window)?;
+            let wheel = mouse_wheel().1;
+            if wheel != 0.0 {
+                (selected, offset) = bios_scroll_modules(
+                    selected,
+                    offset,
+                    -(wheel.signum() as isize) * 3,
+                    disks.len(),
+                );
+                message = None;
+                last_click = None;
+            }
+            if is_mouse_button_pressed(MouseButton::Left)
+                && let Some(BiosMouseAction::SelectDisk(index)) = bios_mouse_action(
+                    (mouse_position().0, mouse_position().1 - toolbar_height),
+                    (screen_width(), screen_height() - toolbar_height),
+                    disks.len(),
+                    offset,
+                )
+            {
+                selected = index;
+                launch = bios_register_module_click(&mut last_click, index, Instant::now());
+                message = None;
+            }
+            launch |= is_key_pressed(KeyCode::Enter);
+            if launch && let Some(disk) = disks.get(selected) {
+                let target = BootTarget {
+                    source: disk.path.clone(),
+                    disk_id: None,
+                    folder_disk: true,
+                };
+                match boot_target(cpu, &target) {
+                    Ok(()) => return Ok(Some(target)),
+                    Err(error) => {
+                        message = Some(error.to_string());
+                        last_click = None;
+                    }
                 }
-                let image = load_program(source)?;
-                cpu.load_program(&image.segments, image.entry_point)
-                    .map_err(|error| RuntimeError::Window(error.to_string()))?;
-                Ok::<(), RuntimeError>(())
-            })();
-            if let Err(error) = boot_result {
-                message = Some(format!("{}: {error}", module.name));
-                continue;
             }
-            return Ok(Some(BootTarget {
-                source: source.clone(),
-                disk_id: (selected_disk != 0).then(|| disks[selected_disk - 1].clone()),
-            }));
         }
     }
 }
@@ -1037,24 +1058,18 @@ pub fn run_headless_with_devices(
 fn draw_bios_selector(
     pixels: &mut [u32],
     font: &[[u8; 8]],
-    modules: &[BootModule],
+    modules: &[BootDisk],
     (selected, scroll_offset): (usize, usize),
-    disks: &[String],
-    selected_disk: usize,
     message: Option<&str>,
 ) {
     pixels.fill(0);
     draw_bios_text(pixels, font, 0, 2, "SUOMICPU-16 BIOS", BIOS_PHOSPHOR_BRIGHT);
     draw_bios_text(pixels, font, 1, 2, "POWER-ON SELF TEST: OK", BIOS_PHOSPHOR);
 
-    let disk_name = if selected_disk == 0 {
-        "NONE"
-    } else {
-        disks
-            .get(selected_disk - 1)
-            .map(String::as_str)
-            .unwrap_or("NONE")
-    };
+    let disk_name = modules
+        .get(selected)
+        .map(|disk| disk.name.as_str())
+        .unwrap_or("NONE");
     draw_bios_text(
         pixels,
         font,
@@ -1068,18 +1083,11 @@ fn draw_bios_selector(
         font,
         4,
         2,
-        "< D / LEFT: PREVIOUS      D / RIGHT: NEXT >",
+        "SELECT A FOLDER DISK TO BOOT",
         BIOS_PHOSPHOR,
     );
 
-    draw_bios_text(
-        pixels,
-        font,
-        5,
-        2,
-        "NO  PROGRAM             DESCRIPTION",
-        BIOS_PHOSPHOR,
-    );
+    draw_bios_text(pixels, font, 5, 2, "NO  DISK ID", BIOS_PHOSPHOR);
     let first = scroll_offset.min(modules.len().saturating_sub(BIOS_VISIBLE_MODULES));
     for (row, (index, module)) in modules
         .iter()
@@ -1103,11 +1111,10 @@ fn draw_bios_selector(
             );
         }
         let line = format!(
-            "{} {:02} {:<18} {}",
+            "{} {:02} {}",
             if is_selected { '>' } else { ' ' },
             index + 1,
-            module.name,
-            module.description
+            module.name
         );
         draw_bios_text(
             pixels,
@@ -1124,9 +1131,9 @@ fn draw_bios_selector(
     }
 
     let position = if modules.is_empty() {
-        "NO PROGRAMS FOUND".to_owned()
+        "NO DISKS FOUND".to_owned()
     } else {
-        format!("PROGRAM {:02}/{:02}", selected + 1, modules.len())
+        format!("DISK {:02}/{:02}", selected + 1, modules.len())
     };
     draw_bios_text(pixels, font, 20, 2, &position, BIOS_PHOSPHOR);
     draw_bios_text(
@@ -1197,24 +1204,6 @@ fn bios_move_selection(selected: usize, direction: isize, module_count: usize) -
         std::cmp::Ordering::Less => selected.min(module_count - 1).saturating_sub(1),
         std::cmp::Ordering::Equal => selected.min(module_count - 1),
         std::cmp::Ordering::Greater => selected.saturating_add(1).min(module_count - 1),
-    }
-}
-
-fn bios_cycle_disk(selected: usize, choice_count: usize, forward: bool) -> usize {
-    if choice_count == 0 {
-        return 0;
-    }
-    let selected = selected % choice_count;
-    if forward {
-        if selected + 1 == choice_count {
-            0
-        } else {
-            selected + 1
-        }
-    } else if selected == 0 {
-        choice_count - 1
-    } else {
-        selected - 1
     }
 }
 
@@ -1303,13 +1292,6 @@ fn bios_mouse_action(
     scroll_offset: usize,
 ) -> Option<BiosMouseAction> {
     let (x, y) = screen_to_logical(position, screen_size, (640, 480))?;
-    if (32..608).contains(&x) && (88..120).contains(&y) {
-        return Some(if x < 320 {
-            BiosMouseAction::PreviousDisk
-        } else {
-            BiosMouseAction::NextDisk
-        });
-    }
     if !(32..608).contains(&x) || y < BIOS_MODULE_ROW_TOP {
         return None;
     }
@@ -1318,7 +1300,7 @@ fn bios_mouse_action(
         return None;
     }
     let index = scroll_offset.saturating_add(row);
-    (index < module_count).then_some(BiosMouseAction::SelectModule(index))
+    (index < module_count).then_some(BiosMouseAction::SelectDisk(index))
 }
 
 fn fill_rect(
@@ -1369,10 +1351,51 @@ fn fresh_runtime_cpu(
         cpu.console = previous_console.clone();
         cpu.console.reset(true);
     }
+    let bios_path = root.join("bios.bin");
+    if bios_path.try_exists()? {
+        let image = crate::image::load_binary(&bios_path)?;
+        cpu.load_program(&image.segments, image.entry_point)
+            .map_err(|error| RuntimeError::Window(error.to_string()))?;
+        cpu.console
+            .log_info("emulator", "BIOS loaded from bios.bin");
+    } else {
+        cpu.console
+            .log_warning("emulator", "bios.bin not found; using host BIOS selector");
+    }
     Ok(cpu)
 }
 
 fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
+    if target.folder_disk {
+        let boot = FolderDisk::open(&target.source)
+            .and_then(|disk| disk.load_boot_image())
+            .map_err(|error| {
+                cpu.console.log_error("bios", &error);
+                RuntimeError::Window(error)
+            })?;
+        cpu.load_program(&boot.image.segments, boot.image.entry_point)
+            .map_err(|error| {
+                cpu.console.log_error("bios", &error.to_string());
+                RuntimeError::Window(error.to_string())
+            })?;
+        cpu.privilege_mode = match boot.mode {
+            FolderBootMode::Kernel => PrivilegeMode::Supervisor,
+            FolderBootMode::User => PrivilegeMode::User,
+        };
+        cpu.running = true;
+        cpu.console.log_info(
+            "bios",
+            &format!(
+                "Booting {} in {} mode",
+                target.source.display(),
+                match boot.mode {
+                    FolderBootMode::Kernel => "KERNEL",
+                    FolderBootMode::User => "USER",
+                }
+            ),
+        );
+        return Ok(());
+    }
     let name = target
         .source
         .file_stem()
@@ -2073,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn bios_module_discovery_sorts_selects_main_and_reads_descriptions() {
+    fn bios_disk_discovery_sorts_candidates_without_validating_unselected_metadata() {
         let directory = std::env::temp_dir().join(format!(
             "sc16-bios-discovery-{}-{}",
             std::process::id(),
@@ -2082,58 +2105,184 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let modules = directory.join("modules");
-        fs::create_dir_all(modules.join("Alpha")).unwrap();
-        fs::create_dir_all(modules.join("broken")).unwrap();
-        fs::create_dir_all(modules.join("empty")).unwrap();
-        fs::create_dir_all(modules.join("valid")).unwrap();
-        fs::write(modules.join("ignored.c"), "not a module").unwrap();
-        fs::write(modules.join("Alpha").join("alpha.c"), "// Alpha program\n").unwrap();
-        fs::write(modules.join("broken").join("first.c"), "// First\n").unwrap();
-        fs::write(modules.join("broken").join("second.C"), "// Second\n").unwrap();
-        fs::write(
-            modules.join("valid").join("main.C"),
-            "\u{feff}/* Main program */\nint main(void) { return 0; }\n",
-        )
-        .unwrap();
-        fs::write(modules.join("valid").join("helper.c"), "// Helper\n").unwrap();
-
-        let found = discover_modules(&modules).unwrap();
+        let disks = directory.join("disks");
+        fs::create_dir_all(disks.join("DISK0002")).unwrap();
+        fs::create_dir_all(disks.join("DISK0001")).unwrap();
+        fs::create_dir_all(disks.join("not-a-disk")).unwrap();
+        fs::write(disks.join("ignored.c"), "not a disk").unwrap();
+        fs::write(disks.join("DISK0001").join("disk.json"), "{}").unwrap();
+        let found = discover_boot_disks(&disks).unwrap();
         assert_eq!(
             found
                 .iter()
                 .map(|module| module.name.as_str())
                 .collect::<Vec<_>>(),
-            ["Alpha", "broken", "empty", "valid"]
+            ["DISK0001", "DISK0002"]
         );
-        assert_eq!(found[0].description, "Alpha program");
-        assert_eq!(
-            found[0].source.as_deref(),
-            Some(modules.join("Alpha").join("alpha.c").as_path())
-        );
-        assert_eq!(
-            found[1].error.as_deref(),
-            Some("Multiple .c files found; expected main.c.")
-        );
-        assert_eq!(
-            found[2].error.as_deref(),
-            Some("No .c files found in module folder.")
-        );
-        assert_eq!(found[3].description, "Main program",);
-        assert_eq!(
-            found[3].source.as_deref(),
-            Some(modules.join("valid").join("main.C").as_path())
-        );
-        assert!(found[3].error.is_none());
+        assert_eq!(found[0].path, disks.join("DISK0001"));
+        assert!(FolderDisk::open(&found[0].path).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn bios_module_discovery_reports_missing_module_directory() {
+    fn bios_disk_discovery_reports_missing_collection() {
         let missing = std::env::temp_dir()
             .join(format!("sc16-bios-missing-{}", std::process::id()))
-            .join("modules");
-        assert!(discover_modules(&missing).is_err());
+            .join("disks");
+        assert!(discover_boot_disks(&missing).is_err());
+    }
+
+    fn boot_test_disk(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-boot-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let disk = root.join("DISK0001");
+        fs::create_dir_all(&disk).unwrap();
+        fs::write(
+            disk.join("disk.json"),
+            r#"{"version":1,"id":"DISK0001","label":"Boot","capacity_bytes":65536,"read_only":true}"#,
+        ).unwrap();
+        disk
+    }
+
+    #[test]
+    fn bios_boot_executes_fixed_images_at_their_entry_points_in_both_modes() {
+        for (file, mode) in [
+            ("kernel.bin", PrivilegeMode::Supervisor),
+            ("main.bin", PrivilegeMode::User),
+        ] {
+            let disk = boot_test_disk(file);
+            let image = crate::assembler::assemble("LDI R0, 42\nHALT", 0x100).unwrap();
+            crate::image::write_image(&disk.join(file), &image).unwrap();
+            fs::write(disk.join("main.c"), "not valid C").unwrap();
+            let target = BootTarget {
+                source: disk.clone(),
+                disk_id: None,
+                folder_disk: true,
+            };
+            let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+            boot_target(&mut cpu, &target).unwrap();
+            assert_eq!(cpu.pc, 0x100);
+            assert_eq!(cpu.privilege_mode, mode);
+            assert_eq!(cpu.run(10).unwrap(), 2);
+            assert_eq!(cpu.registers[0], 42);
+            assert!(!cpu.running);
+            boot_target(&mut cpu, &target).unwrap();
+            assert!(cpu.running);
+            assert_eq!(cpu.pc, 0x100);
+            assert_eq!(cpu.privilege_mode, mode);
+            fs::remove_dir_all(disk.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn bios_cold_reset_preloads_common_firmware_and_clears_the_previous_guest() {
+        let disk = boot_test_disk("cold-reset");
+        let root = disk.parent().unwrap();
+        let firmware = crate::assembler::assemble("HALT", 0).unwrap();
+        fs::write(root.join("bios.bin"), &firmware.segments[0].data).unwrap();
+        let image = crate::assembler::assemble("LDI R0, 42\nHALT", 0x100).unwrap();
+        crate::image::write_image(&disk.join("main.bin"), &image).unwrap();
+        let target = BootTarget {
+            source: disk.clone(),
+            disk_id: None,
+            folder_disk: true,
+        };
+        let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        assert_eq!(cpu.pc, 0);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(&cpu.memory[..2], firmware.segments[0].data.as_slice());
+        boot_target(&mut cpu, &target).unwrap();
+        cpu.run(10).unwrap();
+        assert_eq!(cpu.registers[0], 42);
+        let console = cpu.console.clone();
+        drop(cpu);
+        let mut reset = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, Some(&console)).unwrap();
+        assert_eq!(reset.pc, 0);
+        assert_eq!(reset.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(reset.registers, [0; 8]);
+        assert_eq!(&reset.memory[0x100..0x104], &[0; 4]);
+        assert_eq!(&reset.memory[..2], firmware.segments[0].data.as_slice());
+        boot_target(&mut reset, &target).unwrap();
+        assert_eq!(reset.privilege_mode, PrivilegeMode::User);
+        reset.run(10).unwrap();
+        assert_eq!(reset.registers[0], 42);
+        drop(reset);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bios_boot_reports_both_not_boot_cases_and_recovers_with_a_valid_disk() {
+        let disk = boot_test_disk("not-boot");
+        let target = BootTarget {
+            source: disk.clone(),
+            disk_id: None,
+            folder_disk: true,
+        };
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.pc = 0x80;
+        let error = boot_target(&mut cpu, &target).unwrap_err().to_string();
+        assert!(error.contains("NOT_BOOT"));
+        assert_eq!(cpu.pc, 0x80);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        let image = crate::assembler::assemble("LDI R0, 27\nHALT", 0x100).unwrap();
+        for file in ["main.bin", "kernel.bin"] {
+            crate::image::write_image(&disk.join(file), &image).unwrap();
+        }
+        let error = boot_target(&mut cpu, &target).unwrap_err().to_string();
+        assert!(error.contains("NOT_BOOT"));
+        assert_eq!(cpu.pc, 0x80);
+        fs::remove_file(disk.join("kernel.bin")).unwrap();
+        boot_target(&mut cpu, &target).unwrap();
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        cpu.run(10).unwrap();
+        assert_eq!(cpu.registers[0], 27);
+        assert!(cpu.console.text_snapshot().join("\n").contains("NOT_BOOT"));
+        fs::remove_dir_all(disk.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn bios_boot_revalidates_metadata_and_rejects_invalid_images_without_transfer() {
+        let disk = boot_test_disk("validation");
+        let target = BootTarget {
+            source: disk.clone(),
+            disk_id: None,
+            folder_disk: true,
+        };
+        let disks = discover_boot_disks(disk.parent().unwrap()).unwrap();
+        assert_eq!(disks.len(), 1);
+        let manifest = fs::read_to_string(disk.join("disk.json")).unwrap();
+        let image = crate::assembler::assemble("HALT", 0x100).unwrap();
+        crate::image::write_image(&disk.join("main.bin"), &image).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.pc = 0x80;
+        for invalid in [
+            "{}".to_owned(),
+            manifest.replace("DISK0001", "DISK0002"),
+            manifest.replace(
+                "\"read_only\":true",
+                "\"read_only\":true,\"mode\":\"kernel\"",
+            ),
+            manifest.replace("65536", "1"),
+        ] {
+            fs::write(disk.join("disk.json"), invalid).unwrap();
+            assert!(boot_target(&mut cpu, &target).is_err());
+            assert_eq!(cpu.pc, 0x80);
+            assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        }
+        fs::write(disk.join("disk.json"), manifest).unwrap();
+        fs::write(disk.join("main.bin"), b"not an SC16 image").unwrap();
+        assert!(boot_target(&mut cpu, &target).is_err());
+        assert_eq!(cpu.pc, 0x80);
+        crate::image::write_image(&disk.join("main.bin"), &image).unwrap();
+        boot_target(&mut cpu, &target).unwrap();
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        fs::remove_dir_all(disk.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -2526,19 +2675,13 @@ mod tests {
     }
 
     #[test]
-    fn bios_keyboard_selection_clamps_and_disk_selection_wraps() {
+    fn bios_keyboard_disk_selection_clamps() {
         assert_eq!(bios_move_selection(0, -1, 5), 0);
         assert_eq!(bios_move_selection(0, 1, 5), 1);
         assert_eq!(bios_move_selection(4, 1, 5), 4);
         assert_eq!(bios_move_selection(4, -1, 5), 3);
         assert_eq!(bios_move_selection(99, 0, 5), 4);
         assert_eq!(bios_move_selection(99, 1, 0), 0);
-
-        assert_eq!(bios_cycle_disk(0, 3, false), 2);
-        assert_eq!(bios_cycle_disk(0, 3, true), 1);
-        assert_eq!(bios_cycle_disk(2, 3, true), 0);
-        assert_eq!(bios_cycle_disk(2, 3, false), 1);
-        assert_eq!(bios_cycle_disk(99, 0, true), 0);
     }
 
     #[test]
@@ -2600,22 +2743,22 @@ mod tests {
     }
 
     #[test]
-    fn bios_mouse_selects_visible_modules_and_cycles_data_disk() {
+    fn bios_mouse_selects_only_visible_disks() {
         assert_eq!(
             bios_mouse_action((150.0, 140.0), (640.0, 480.0), 20, 2),
-            Some(BiosMouseAction::SelectModule(2))
+            Some(BiosMouseAction::SelectDisk(2))
         );
         assert_eq!(
             bios_mouse_action((150.0, 164.0), (640.0, 480.0), 20, 2),
-            Some(BiosMouseAction::SelectModule(3))
+            Some(BiosMouseAction::SelectDisk(3))
         );
         assert_eq!(
             bios_mouse_action((200.0, 96.0), (640.0, 480.0), 20, 0),
-            Some(BiosMouseAction::PreviousDisk)
+            None
         );
         assert_eq!(
             bios_mouse_action((550.0, 96.0), (640.0, 480.0), 20, 0),
-            Some(BiosMouseAction::NextDisk)
+            None
         );
         assert_eq!(
             bios_mouse_action((10.0, 140.0), (640.0, 480.0), 20, 0),
@@ -2724,7 +2867,7 @@ mod tests {
     fn bios_selector_renders_empty_state_and_persistent_error_message() {
         let font = vec![[0xf8; 8]; 128];
         let mut pixels = vec![0; 640 * 480];
-        draw_bios_selector(&mut pixels, &font, &[], (0, 0), &[], 0, None);
+        draw_bios_selector(&mut pixels, &font, &[], (0, 0), None);
         assert_eq!(pixels[0], 0);
         assert!(pixels.contains(&BIOS_PHOSPHOR));
         assert!(!pixels.contains(&0xff005020));
@@ -2735,12 +2878,32 @@ mod tests {
             &font,
             &[],
             (0, 0),
-            &[],
-            0,
-            Some("broken: compiler rejected module"),
+            Some("NOT_BOOT: no boot executable exists"),
         );
         assert_ne!(pixels, without_error);
         assert!(pixels.contains(&BIOS_PHOSPHOR_BRIGHT));
+    }
+
+    #[test]
+    fn bios_selector_renders_selected_disk_id_and_selection_highlight() {
+        let font = vec![[0xf8; 8]; 128];
+        let disks = vec![BootDisk {
+            name: "DISK0001".to_owned(),
+            path: PathBuf::from("DISK0001"),
+        }];
+        let mut pixels = vec![0; 640 * 480];
+        draw_bios_selector(&mut pixels, &font, &disks, (0, 0), None);
+        let mut expected = vec![0; 640 * 480];
+        draw_bios_text(&mut expected, &font, 3, 2, "DISK: DISK0001", BIOS_PHOSPHOR);
+        let y = BIOS_TEXT_TOP + 3 * BIOS_TEXT_CELL_HEIGHT;
+        assert_eq!(
+            &pixels[y * 640..(y + BIOS_TEXT_CELL_HEIGHT) * 640],
+            &expected[y * 640..(y + BIOS_TEXT_CELL_HEIGHT) * 640],
+        );
+        assert_eq!(
+            pixels[BIOS_MODULE_ROW_TOP * 640 + BIOS_TEXT_LEFT],
+            rgb(0, 30, 12)
+        );
     }
 
     #[test]
@@ -2781,6 +2944,7 @@ mod tests {
         let target = BootTarget {
             source: source.clone(),
             disk_id: None,
+            folder_disk: false,
         };
         let mut cpu = fresh_runtime_cpu(root, Some(&source), None, DEFAULT_PORT, None).unwrap();
         boot_target(&mut cpu, &target).unwrap();

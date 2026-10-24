@@ -67,8 +67,7 @@ failures.
 == Boot selection
 
 The manifest never selects an executable or its privilege mode. The
-folder-disk boot-selection helper applies a fixed rule to regular files at the
-disk root; emulator BIOS integration remains open:
+BIOS applies a fixed rule to regular files at the selected disk root:
 
 * If exactly +kernel.bin+ exists, load it in kernel mode.
 * If exactly +main.bin+ exists, load it in user mode.
@@ -77,6 +76,27 @@ disk root; emulator BIOS integration remains open:
 A selected +kernel.bin+ is trusted kernel code. This rule is not secure boot and
 does not authenticate the disk or image. Disk metadata and user programs cannot
 override executable selection or mode.
+
+Without an explicit program path, the runtime discovers real, ID-named
+directories under +disks/+ in stable ID order. The text-mode selector lists
+disk IDs, including disks with missing or invalid metadata. Metadata is
+validated only when a disk is selected for boot, so a broken disk cannot hide
+other boot choices. Boot and reboot reopen +disk.json+ and validate the image;
+metadata cached during discovery never authorizes execution.
+
+Use Up/Down and Enter, or click and double-click, to boot; the mouse wheel
+scrolls the list. +--disk ID+ preselects a boot disk without bypassing checks.
+Failures are logged to the Bug Monitor and remain on the selection screen.
+Reset rescans the collection. The runtime loads the SC-16 image container
+directly, preserving its entry point and segments, and never compiles or
+assembles guest source during BIOS selection. KERNEL maps to the CPU's
++Supervisor+ privilege mode; USER maps to +User+.
+
+This selector is currently host-implemented. Common +bios.bin+ firmware
+execution and the guest folder-filesystem API are separate roadmap items;
+booting a folder disk does not mount it through the legacy block-disk API.
+Explicit source or flat-binary launches retain their existing developer
+workflow and legacy data-disk option.
 
 == Implementation status
 
@@ -90,4 +110,5 @@ image. `sc16build import-block-disk` exports legacy JSON blocks as regular files
 without modifying the source. `sc16build package-disk` builds one program into
 a new boot-disk folder with `main.bin` or `kernel.bin`. Guest/syscall
 integration, module asset migration, package validation for all applications,
-and BIOS boot integration remain to be implemented and tested.
+remain to be implemented and tested. Folder-disk BIOS discovery, selection,
+image validation, and launch-mode transfer are implemented in the runtime.

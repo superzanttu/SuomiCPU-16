@@ -9,10 +9,11 @@ code and places instructions or data at the addresses specified in the source.
 
 The emulator presents a text-mode BIOS startup screen in its main window before
 launching a program. It uses bright green fixed-width characters on black with
-enlarged pixels and no glow or post-processing. The BIOS selects and compiles a
-program from +modules/+, optionally mounts an existing virtual data disk, and
-loads the resulting image into machine memory.
-Disks hold application data only; they are not boot media. Once started, CPU
+enlarged pixels and no glow or post-processing. The BIOS discovers folder
+disks under +disks/+ and loads a prebuilt boot image after validating the
+selected disk's +disk.json+. Exactly one of +kernel.bin+ (KERNEL mode) or
++main.bin+ (USER mode) must exist; both or neither reports +NOT_BOOT+.
+Metadata cannot override the executable or mode. Once started, CPU
 reset begins execution at the loaded image's entry point. The first instruction
 in the source determines that entry point, regardless of the numeric order of
 the image's memory segments.
@@ -40,23 +41,17 @@ subset handles multiple +int+ functions with up to three parameters and local
 expressions, conditional expressions, nested blocks, +if+/+else+, and
 +while+/+do+/+for+ loops with +break+ and +continue+, including recursion.
 Other C programs are rejected until their required features are ported. At
-startup,
-the BIOS lists each subfolder in +modules/+ as a module, using the folder name
-as its module name. A folder with one +.c+ file loads that file; a folder with
-multiple +.c+ files must contain +main.c+, which is loaded instead. The first
-source line is shown as the module description. Folders with no +.c+ file or
-with multiple +.c+ files but no +main.c+ remain selectable and show an error
-when loaded. C modules whose source is outside the Rust compiler's supported
-subset also show a compiler error when loaded. Use the arrow keys to select a
-program and press Enter to load it;
-hover or click a program to select it and
-double-click to load it. Use the mouse wheel over the module list to scroll;
-indicators show how many modules remain above or below the visible rows. Click
-the data-disk line or press *D* to cycle through available data disks or no
-disk. Press Escape to exit the BIOS.
+startup without an explicit program path, the BIOS lists ID-named disk
+directories in stable order. Use Up/Down to select a disk and Enter to boot,
+or click to select and double-click to boot. The mouse wheel scrolls the list.
+Invalid metadata, invalid images, and +NOT_BOOT+ errors remain visible and
+are logged; select another disk to retry. Reset rescans the disk collection.
+Press Escape to exit the BIOS. BIOS never compiles guest source; package
+programs beforehand with +sc16build package-disk+. See
++sc16_disk_format.adoc+ for the manifest and image requirements.
 The game fills the emulator's main window after BIOS startup. The optional
 80×25 *Bug Monitor* runs in a separate window and displays emulator logs and
-guest serial output. Its *RESET* button returns to BIOS module selection;
+guest serial output. Its *RESET* button returns to BIOS disk selection;
 *REBOOT* restarts the current program. Select text and press Ctrl+C to copy it;
 the *COPY* button copies selected text or the visible monitor screen. The Bug
 Monitor keeps a 1,000-row scrollback buffer, navigated with the mouse wheel.
@@ -109,9 +104,10 @@ cargo run -- examples/factorial.bin
 
 The Rust emulator accepts +.asm+, supported +.c+, and flat +.bin+ inputs.
 
-The input file argument is optional. Without it, the BIOS compiles and loads a
-selected program from +modules/+; storage disks are only for program data. Use
-+--disk ID+ to preselect a data disk in the BIOS. The Rust emulator uses
+The input file argument is optional. Without it, the BIOS loads a prebuilt
+image from a selected folder disk. Use +--disk ID+ to preselect a boot disk
+in BIOS, or to mount a legacy data disk with an explicit program path.
+The Rust emulator uses
 Macroquad for its window, display, and input.
 
 == 3. Assembly source syntax
@@ -1159,15 +1155,15 @@ work or assume C90 numerical accuracy.
 
 The emulator starts with a text-mode BIOS selection screen in its main window.
 The BIOS uses bright green characters on black, with a fixed-width, enlarged
-font and no glow or post-processing effects. It lists C programs from
-+modules/+ for selection and can optionally mount any valid 8-character +*.json+
-virtual disk found in the repository's +disks/+ folder. The selected disk is
-made available to the program; it is *not* used to load executable code. The
-BIOS compiles the selected source and the emulator loads it into machine memory.
-Use the mouse to hover or click a program to select it, then double-click to
-load it. Click the data-disk line to cycle disks; keyboard controls remain
-available.
-The optional +--disk ID+ command-line option preselects a data disk in the BIOS.
+font and no glow or post-processing effects. It lists ID-named folder disks
+from +disks/+; metadata is checked after selection. Exactly one regular
++kernel.bin+ or +main.bin+ is required. +kernel.bin+ authorizes KERNEL-mode
+execution and must be trusted; this is not authenticated or secure boot.
++main.bin+ starts in USER mode. Both or neither produces +NOT_BOOT+.
+BIOS loads the selected SC-16 image directly, without compiling source.
+Use Up/Down and Enter, or click and double-click; the mouse wheel scrolls.
+The optional +--disk ID+ preselects a boot disk. With an explicit program
+path, that option still mounts a legacy JSON data disk instead.
 
 The BIOS information block starts at +0x43040+: bytes +0..3+ are the +SC16+
 signature, bytes +4..5+ are the BIOS version, bytes +6..8+ contain the memory
@@ -1217,7 +1213,7 @@ bug_monitor_error("unable to load level");
 The functions write +[DEBUG]+, +[INFO]+, +[WARN]+, or +[ERROR]+ followed by
 the message and a newline to the serial output. The serial input path remains
 available to guest programs. *RESET*
-returns to BIOS module selection, while *REBOOT* restarts the current program.
+returns to BIOS disk selection, while *REBOOT* restarts the current program.
 The status line below
 shows local time, uptime, mounted data disk, and loaded module. It also displays
 host lifecycle messages such as emulator startup, program loading, disk

@@ -11,7 +11,7 @@ Runtime, tools, and tests are implemented in Rust.
   plus a target-specific C99 +<stdint.h>+ header
   (not a fully conforming C90 implementation; see the
   link:docs/user_guide.adoc#9-ansi-c90-compiler[user guide]).
-* Memory-mapped console, BIOS data-disk selection, JSON-backed virtual disks,
+* Memory-mapped console, BIOS folder-disk boot selection, legacy JSON-backed disks,
   module-sandboxed file reads, a layered GPU with 640x480x4-bit VRAM, hardware
   tile/sprite engines, and a fixed-point 3D graphics coprocessor.
 * Keyboard, RTC, and programmable instruction-timer interrupts for
@@ -25,13 +25,16 @@ Install Rust and Cargo, then start the emulator with:
 cargo run --bin suomicpu16
 ----
 
-Start SC-16 without arguments to show the BIOS module selector. Select a
-module folder from +modules/+ to compile and load its C program into memory.
-Folders with multiple +.c+ files use +main.c+ as the entry source. Press *D*
-to cycle through available data disks or choose no disk; virtual disks store
-application data only.
-Use +--disk ID+ to preselect a data disk in BIOS, or mount it with a directly
-launched program.
+Start SC-16 without arguments to show the text-mode BIOS disk selector.
+Use *Up/Down* and *Enter*, or click and double-click, to boot an ID-named
+folder under +disks/+. The mouse wheel scrolls the list. The selected disk
+must have valid +disk.json+ metadata and exactly one boot executable:
++kernel.bin+ starts in KERNEL mode; +main.bin+ starts in USER mode.
+Both or neither produces +NOT_BOOT+; errors remain visible so another disk
+can be selected. BIOS loads prebuilt SC-16 images without compiling source.
+Use +--disk ID+ to preselect a boot disk in BIOS, or mount a legacy data disk
+with a directly launched program. See +docs/sc16_disk_format.adoc+ for the
+folder format and kernel-code trust model.
 In windowed mode, the emulator toolbar appears at the top left with
 *PAUSE/CONTINUE*, *RESET*, *REBOOT*, and *CONSOLE* buttons. RESET returns
 to the BIOS selector when launched through BIOS, or restarts a directly launched
@@ -70,7 +73,8 @@ Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
 Space. The ship accelerates and drifts with inertia; shields regenerate and the
 laser needs time to cool.
 
-Select *Hertta-3D* in the BIOS for a first-person maze game rendered with the
+Launch *Hertta-3D* directly with +modules/Hertta-3D/hertta3d.c+, or package
+it into a folder disk for BIOS boot, for a first-person maze game rendered with the
 SC-GPU. Use W/S to move, A/D to turn, and Space to throw treats toward Hertta;
 feed her enough treats and wait for her to reach you to advance to a harder
 maze. Each visible wall cell is rendered as one outlined surface, and a solid-cell
@@ -150,9 +154,9 @@ cargo run --bin sc16build -- examples\example.asm example.sc16img
 cargo run --bin sc16build -- input.bin output.sc16img
 ----
 
-In the Rust BIOS selector, press *D* or *Left/Right* to choose no data disk
-or an existing virtual disk before starting a module. +--disk ID+ preselects a
-disk in the BIOS or mounts it when launching a program directly.
+In the Rust BIOS selector, choose a folder boot disk with *Up/Down* and
+*Enter*. +--disk ID+ preselects that boot disk; with an explicit program path
+it retains its legacy data-disk mounting behavior.
 
 Virtual block disks are stored as JSON files in +disks/+. A program's virtual
 file area is read from the +disks/+ folder beside its source file. Networking

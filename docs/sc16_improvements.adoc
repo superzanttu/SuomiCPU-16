@@ -25,12 +25,14 @@ contracts.
   and big-endian multi-byte values. A loaded program starts at its image entry
   point; CPU construction initializes the PC to zero and the stack pointer to
   the top of configured memory.
-* The emulator's BIOS selects a source program from +modules/+ and compiles it
-  during startup. Applications run in the game window; the optional Bug Monitor
+* The host-implemented text-mode BIOS selects an ID-named folder disk under
+  +disks/+, validates its metadata, and loads its prebuilt boot image without
+  compiling source. Explicit source launches remain a developer workflow.
+  Applications run in the game window; the optional Bug Monitor
   displays emulator logs and guest serial output from the UART-style device.
   It is separate from the text-mode BIOS.
-* Data disks are JSON-backed 256-byte block devices. They are not boot media,
-  and the BIOS loads executable images from module sources rather than disks.
+* Legacy data disks are JSON-backed 256-byte block devices. Folder disks
+  provide boot images; guest filesystem integration remains incomplete.
 * The CPU has keyboard, RTC, and instruction-count timer interrupts with fixed
   vectors. Interrupts save PC and flags on the current stack; the CPU has no
   privilege modes, protected address spaces, page tables, or hardware task
@@ -246,7 +248,7 @@ Checklist status: [x] completed; [ ] planned.
   +boot.bin+ on each disk. Separate emulator hardware initialization from
   firmware execution, then transfer control to the BIOS at the documented
   kernel-mode entry point. BIOS must not compile or assemble guest programs.
-* [ ] Implement BIOS disk discovery and text-mode disk selection. After
+* [x] Implement BIOS disk discovery and text-mode disk selection. After
   selection, validate disk metadata and require exactly one boot
   executable: if only +kernel.bin+ exists, load it in KERNEL mode; if only
   +main.bin+ exists, load it in USER mode. If both files exist, or if neither
@@ -254,9 +256,9 @@ Checklist status: [x] completed; [ ] planned.
   mode.
 ** [x] Provide a folder-disk helper that applies the fixed executable-name
   rule and validates the selected image before returning its launch mode.
-** [ ] Wire folder-disk discovery, BIOS selection UI, and mode transfer into
+** [x] Wire folder-disk discovery, BIOS selection UI, and mode transfer into
   the emulator runtime without compiling guest source.
-* [ ] Treat the presence of +kernel.bin+ as authorization to execute that
+* [x] Treat the presence of +kernel.bin+ as authorization to execute that
   disk-provided image in KERNEL mode. Document this trust model clearly; disk
   metadata and user-mode programs must not be able to change the BIOS rule.
 * [ ] Add boot tests for cold reset, common BIOS startup, text-mode rendering
