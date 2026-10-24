@@ -96,6 +96,30 @@ fn c90_function_calls_preserve_computed_arguments_and_frames() {
 }
 
 #[test]
+fn c90_scalar_call_argument_uses_documented_stack_abi() {
+    let source = "int identity(int value) { return value; } \
+                 int main(void) { return identity(42); }";
+    let assembly = compile_minimal_program_to_assembly(source, "c90-call-abi.c")
+        .expect("C source should parse")
+        .expect("C source should compile");
+    let identity_start = assembly
+        .find("__c_function_identity:\n")
+        .expect("identity function should be emitted");
+    let main_start = assembly
+        .find("__c_function_main:\n")
+        .expect("main function should be emitted");
+    let identity = &assembly[identity_start..main_start];
+    let main = &assembly[main_start..];
+
+    assert!(identity.contains("LDWS R1, 4\n"), "{identity}");
+    assert!(
+        main.contains("PUSH R4\n    CALLX __c_function_identity\n"),
+        "{main}"
+    );
+    assert_eq!(run_c(source), 42);
+}
+
+#[test]
 fn c90_object_layout_arrays_and_pointers() {
     for (source, expected) in [
         (
@@ -128,6 +152,23 @@ fn c90_binary64_runtime_arithmetic_conversions_and_calls() {
                  if ((int)2.75 != 2) return 20; \
                  if (scale(1.25) != 3.5) return 30; return 0; }";
     assert_eq!(run_c(source), 0, "binary64 runtime execution");
+}
+
+#[test]
+fn c90_binary32_and_binary64_convert_32_bit_integer_values() {
+    let source = "float observed; \
+                 int main(void) { long signed_value = 65536L; \
+                 unsigned long unsigned_value = 131072UL; \
+                 float signed_single = signed_value; \
+                 double signed_real = signed_value; \
+                 float unsigned_single = unsigned_value; \
+                 double unsigned_real = unsigned_value; \
+                 observed = unsigned_single; \
+                 if (signed_single != 65536.0f) return 10; \
+                 if (signed_real != 65536.0) return 20; \
+                 if (unsigned_single != 131072.0f) return 30; \
+                 if (unsigned_real != 131072.0) return 40; return 0; }";
+    assert_eq!(run_c(source), 0, "32-bit integer to float conversions");
 }
 
 #[test]

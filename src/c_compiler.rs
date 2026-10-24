@@ -337,6 +337,10 @@ enum NativeLocation {
         offset: usize,
         unsigned: bool,
     },
+    StackWideScalar {
+        offset: usize,
+        unsigned: bool,
+    },
     FloatingPointScalar {
         size: usize,
     },
@@ -379,6 +383,7 @@ enum NativeLocation {
     FunctionParameters {
         pointer_parameters: Vec<bool>,
         float_parameters: Vec<usize>,
+        word_parameters: Vec<bool>,
         float_return_size: usize,
     },
     StackArray {
@@ -574,6 +579,13 @@ fn is_native_word_type(c_type: &str) -> bool {
     matches!(
         native_unqualified_type(c_type),
         "int" | "unsigned int" | "long" | "unsigned long"
+    )
+}
+
+fn is_native_wide_integer_type(c_type: &str) -> bool {
+    matches!(
+        native_unqualified_type(c_type),
+        "long" | "signed long" | "unsigned long"
     )
 }
 
@@ -1371,6 +1383,7 @@ pub fn compile_minimal_program_to_assembly(
         }
         let has_local_array = statement_has_local_array(&function.body);
         let has_local_floating_scalar = statement_has_local_floating_scalar(&function.body);
+        let has_local_wide_integer = statement_has_local_wide_integer(&function.body);
         let has_excess_locals = function.declaration.parameters.len()
             + statement_scalar_local_count(&function.body)
             > 3;
@@ -1390,6 +1403,7 @@ pub fn compile_minimal_program_to_assembly(
         }
         let reserve_frame_register = has_local_array
             || has_local_floating_scalar
+            || has_local_wide_integer
             || has_excess_locals
             || function.declaration.parameters.len() >= 3
             || !address_taken.is_empty();
@@ -1541,6 +1555,16 @@ pub fn compile_minimal_program_to_assembly(
                         .iter()
                         .map(|parameter| native_floating_type_size(&parameter.c_type).unwrap_or(0))
                         .collect(),
+                    word_parameters: parameters
+                        .iter()
+                        .map(|parameter| {
+                            native_floating_type_size(&parameter.c_type).is_none()
+                                && native_byte_type(&parameter.c_type).is_none()
+                                && !is_native_wide_integer_type(&parameter.c_type)
+                                && !native_is_pointer_type(&parameter.c_type, &unit.records)
+                                && native_record_pointer(&parameter.c_type, &unit.records).is_none()
+                        })
+                        .collect(),
                     float_return_size: match declaration {
                         ExternalDeclaration::FunctionDefinition(function) => {
                             native_floating_type_size(&function.declaration.return_type)
@@ -1554,6 +1578,28 @@ pub fn compile_minimal_program_to_assembly(
                 });
         }
         assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
+        if function.declaration.parameters.len() == 1 {
+            let parameter = &function.declaration.parameters[0];
+            if native_floating_type_size(&parameter.c_type).is_none()
+                && native_byte_type(&parameter.c_type).is_none()
+                && !is_native_wide_integer_type(&parameter.c_type)
+                && !native_is_pointer_type(&parameter.c_type, &unit.records)
+                && native_record_pointer(&parameter.c_type, &unit.records).is_none()
+            {
+                assembly.push_str("    LDWS R1, 4\n");
+                if !is_native_unsigned_word_type(&parameter.c_type) {
+                    let label = label_counter;
+                    label_counter += 1;
+                    assembly.push_str(&format!(
+                        "    LDI R7, 0x8000\n    AND R7, R1\n\
+                         LDI R6, 0\n    CMP R7, R6\n\
+                         BZX __c_parameter_sign_{label}_done\n\
+                         LDI30 R7, 0x10000\n    SUB R1, R7\n\
+                         __c_parameter_sign_{label}_done:\n"
+                    ));
+                }
+            }
+        }
         if function.declaration.parameters.len() > 3 {
             assembly.push_str("    MOVSP R4\n");
         }
@@ -2309,6 +2355,28 @@ fn collect_native_locals(
                             );
                             continue;
                         }
+                        if is_native_wide_integer_type(&declaration.c_type) {
+                            let offset = *frame_size;
+                            let Some(new_frame_size) = frame_size.checked_add(4) else {
+                                return false;
+                            };
+                            if new_frame_size > 65_535 {
+                                eprintln!(
+                                    "wide integer local {} exceeds the stack frame",
+                                    declaration.name
+                                );
+                                return false;
+                            }
+                            *frame_size = new_frame_size;
+                            locals.insert(
+                                declaration.name.clone(),
+                                NativeLocation::StackWideScalar {
+                                    offset,
+                                    unsigned: is_native_unsigned_word_type(&declaration.c_type),
+                                },
+                            );
+                            continue;
+                        }
                         if reserve_frame_register && *next_register == 3 {
                             *next_register += 1;
                         }
@@ -2573,6 +2641,43 @@ fn statement_has_local_floating_scalar(statement: &Statement) -> bool {
             .iter()
             .any(|(_, statements)| statements.iter().any(statement_has_local_floating_scalar)),
         StatementKind::Label { statement, .. } => statement_has_local_floating_scalar(statement),
+        _ => false,
+    }
+}
+
+fn statement_has_local_wide_integer(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations.iter().any(|declaration| {
+            declaration.array_length.is_none() && is_native_wide_integer_type(&declaration.c_type)
+        }),
+        StatementKind::Compound(statements) => {
+            statements.iter().any(statement_has_local_wide_integer)
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_has_local_wide_integer(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| statement_has_local_wide_integer(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_has_local_wide_integer(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .is_some_and(|initializer| statement_has_local_wide_integer(initializer))
+                || statement_has_local_wide_integer(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|(_, statements)| statements.iter().any(statement_has_local_wide_integer)),
+        StatementKind::Label { statement, .. } => statement_has_local_wide_integer(statement),
         _ => false,
     }
 }
@@ -2884,6 +2989,7 @@ fn native_sizeof_expression(
                 element_size,
                 ..
             }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
+            Some(NativeLocation::StackWideScalar { .. }) => Some(4),
             Some(NativeLocation::GlobalRecord { dimensions, layout }) => {
                 let count = dimensions
                     .iter()
@@ -3134,6 +3240,36 @@ fn emit_native_array_address(
 fn emit_native_stack_offset(register: u8, offset: usize, assembly: &mut String) {
     if offset > 0 {
         assembly.push_str(&format!("    LDI R6, {offset}\n    ADD R{register}, R6\n"));
+    }
+}
+
+fn emit_native_i32_source(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    assembly: &mut String,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => match locals.get(name) {
+            Some(NativeLocation::StackWideScalar { offset, .. }) => {
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, *offset, assembly);
+                assembly.push_str("    LDW R4, R7\n    ADD R7, 2\n    LDW R5, R7\n");
+                true
+            }
+            _ => parse_integer_constant(name).is_some_and(|value| {
+                let Ok(value) = i32::try_from(value) else {
+                    return false;
+                };
+                let bits = value as u32;
+                assembly.push_str(&format!(
+                    "    LDI R4, 0x{:04X}\n    LDI R5, 0x{:04X}\n",
+                    bits >> 16,
+                    bits & 0xffff
+                ));
+                true
+            }),
+        },
+        _ => false,
     }
 }
 
@@ -3839,6 +3975,16 @@ fn emit_native_f32_expression_inner(
                     NativeLocation::StackFloatingPointScalar { offset, size: 4 } => {
                         (Some(*offset), false)
                     }
+                    NativeLocation::StackWideScalar { offset, unsigned } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                        assembly.push_str("    LDW R0, R7\n    ADD R7, 2\n    LDW R1, R7\n");
+                        assembly.push_str(&format!(
+                            "    {} R4, R0\n",
+                            if *unsigned { "U32TOF32" } else { "I32TOF32" }
+                        ));
+                        return true;
+                    }
                     NativeLocation::FloatingPointScalar { size: 4 } => (None, true),
                     NativeLocation::FloatingPointScalar { .. }
                     | NativeLocation::StackFloatingPointScalar { .. } => return false,
@@ -4101,6 +4247,30 @@ fn emit_native_f32_expression_inner(
     }
 }
 
+fn native_uses_stack_frame(locals: &HashMap<String, NativeLocation>) -> bool {
+    locals.values().any(|location| {
+        matches!(
+            location,
+            NativeLocation::StackScalar { .. }
+                | NativeLocation::StackWideScalar { .. }
+                | NativeLocation::ByteStackScalar { .. }
+                | NativeLocation::PointerStack { .. }
+                | NativeLocation::StackFloatingPointScalar { .. }
+                | NativeLocation::StackArray { .. }
+        )
+    })
+}
+
+fn emit_native_save_frame_pointer(assembly: &mut String) {
+    assembly.push_str("    ADJSP -4\n    MOVSP R0\n    STP R3, R0\n");
+}
+
+fn emit_native_restore_frame_pointer(scratch: u8, assembly: &mut String) {
+    assembly.push_str(&format!(
+        "    MOVSP R{scratch}\n    LDP R3, R{scratch}\n    ADJSP 4\n"
+    ));
+}
+
 fn emit_native_f64_expression(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
@@ -4109,6 +4279,10 @@ fn emit_native_f64_expression(
 ) -> bool {
     if !native_expression_is_f64(expression, locals) {
         return false;
+    }
+    let frame_pointer = native_uses_stack_frame(locals);
+    if frame_pointer {
+        emit_native_save_frame_pointer(assembly);
     }
     let wide_pointer = emit_native_save_r1(locals, assembly);
     let emitted = emit_native_f64_expression_inner(expression, locals, label_counter, assembly);
@@ -4119,6 +4293,9 @@ fn emit_native_f64_expression(
         emit_native_restore_r1(wide_pointer, assembly);
         if wide_pointer {
             assembly.push_str("    MOV R7, R0\n");
+        }
+        if frame_pointer {
+            emit_native_restore_frame_pointer(0, assembly);
         }
     }
     emitted
@@ -4366,6 +4543,21 @@ fn emit_native_f64_operand(
         true
     } else if native_expression_is_f64(expression, locals) {
         emit_native_f64_expression(expression, locals, label_counter, assembly)
+    } else if matches!(
+        &expression.kind,
+        ExpressionKind::Atom(name)
+            if matches!(locals.get(name), Some(NativeLocation::StackWideScalar { .. }))
+    ) {
+        if !emit_native_i32_source(expression, locals, assembly) {
+            return false;
+        }
+        let conversion = if native_expression_is_unsigned(expression, locals) {
+            "U32TOF64"
+        } else {
+            "I32TOF64"
+        };
+        assembly.push_str(&format!("    {conversion} R4, R4\n"));
+        true
     } else {
         if !emit_native_expression(
             expression,
@@ -4396,6 +4588,10 @@ fn emit_native_f64_comparison(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
+    let frame_pointer = native_uses_stack_frame(locals);
+    if frame_pointer {
+        emit_native_save_frame_pointer(assembly);
+    }
     let saved_register = (destination != 1).then(|| emit_native_save_r1(locals, assembly));
     let reverse_operands = matches!(operator, ">" | ">=");
     let (first, second) = if reverse_operands {
@@ -4433,6 +4629,9 @@ fn emit_native_f64_comparison(
     ));
     if let Some(wide_pointer) = saved_register {
         emit_native_restore_r1(wide_pointer, assembly);
+    }
+    if frame_pointer {
+        emit_native_restore_frame_pointer(6, assembly);
     }
     true
 }
@@ -4844,6 +5043,7 @@ fn native_expression_is_unsigned(
         ExpressionKind::Atom(name) => match locals.get(name) {
             Some(NativeLocation::Register { unsigned, .. })
             | Some(NativeLocation::StackScalar { unsigned, .. })
+            | Some(NativeLocation::StackWideScalar { unsigned, .. })
             | Some(NativeLocation::GlobalScalar { unsigned }) => *unsigned,
             Some(NativeLocation::ByteRegister { .. })
             | Some(NativeLocation::ByteStackScalar { .. })
@@ -5019,6 +5219,7 @@ fn emit_native_expression(
                         emit_native_stack_offset(7, *offset, assembly);
                         assembly.push_str(&format!("    LDW R{destination}, R7\n"));
                     }
+                    NativeLocation::StackWideScalar { .. } => return false,
                     NativeLocation::ByteStackScalar { offset, signed } => {
                         assembly.push_str("    MOV R7, R3\n");
                         emit_native_stack_offset(7, *offset, assembly);
@@ -5793,9 +5994,10 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &function.kind else {
                 return false;
             };
-            let (float_return_size, float_parameter_size) = match locals.get(name) {
+            let (float_return_size, float_parameter_size, word_parameter) = match locals.get(name) {
                 Some(NativeLocation::FunctionParameters {
                     float_parameters,
+                    word_parameters,
                     float_return_size,
                     ..
                 }) => (
@@ -5805,8 +6007,9 @@ fn emit_native_expression(
                     } else {
                         0
                     },
+                    word_parameters.len() == 1 && word_parameters[0],
                 ),
-                _ => (0, 0),
+                _ => (0, 0, false),
             };
             if (float_return_size != 0 && float_parameter_size == 0 && !arguments.is_empty())
                 || (float_parameter_size != 0 && arguments.len() != 1)
@@ -5853,6 +6056,7 @@ fn emit_native_expression(
                 matches!(
                     location,
                     NativeLocation::StackScalar { .. }
+                        | NativeLocation::StackWideScalar { .. }
                         | NativeLocation::ByteStackScalar { .. }
                         | NativeLocation::StackFloatingPointScalar { .. }
                         | NativeLocation::PointerStack { .. }
@@ -5897,6 +6101,19 @@ fn emit_native_expression(
                 if !emit_native_f64_expression(&arguments[0], locals, label_counter, assembly) {
                     return false;
                 }
+            } else if arguments.len() == 1 && word_parameter {
+                if !emit_native_expression(
+                    &arguments[0],
+                    4,
+                    &[5, 6, 7],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                assembly.push_str("    PUSH R4\n");
+                argument_bytes += 2;
             } else if library_function {
                 for (index, argument) in arguments.iter().enumerate().rev() {
                     if native_argument_is_pointer(name, index, arguments) {
@@ -6492,6 +6709,7 @@ fn emit_native_assignment_store(
         NativeLocation::FloatingPointScalar { .. } => return false,
         NativeLocation::StackFloatingPointScalar { .. } => return false,
         NativeLocation::FloatRegister { .. } => return false,
+        NativeLocation::StackWideScalar { .. } => return false,
         NativeLocation::GlobalScalar { .. } => (0, true, None),
         NativeLocation::GlobalByteScalar { signed } => (0, false, Some(*signed)),
         NativeLocation::GlobalPointer { .. } => (0, true, None),
@@ -6936,6 +7154,14 @@ fn emit_native_statement(
                             emit_native_stack_offset(7, *offset, assembly);
                             assembly.push_str("    STW R7, R4\n");
                         }
+                        NativeLocation::StackWideScalar { offset, .. } => {
+                            if !emit_native_i32_source(initializer, locals, assembly) {
+                                return None;
+                            }
+                            assembly.push_str("    MOV R7, R3\n");
+                            emit_native_stack_offset(7, *offset, assembly);
+                            assembly.push_str("    STW R7, R4\n    ADD R7, 2\n    STW R7, R5\n");
+                        }
                         NativeLocation::StackFloatingPointScalar { offset, size } => {
                             let c_type = native_unqualified_type(&declaration.c_type);
                             if let Some(bytes) = native_floating_initializer(initializer, c_type) {
@@ -6953,7 +7179,7 @@ fn emit_native_statement(
                             {
                                 emit_native_f32_stack_store(*offset, assembly);
                             } else if *size == 8
-                                && emit_native_f64_expression(
+                                && emit_native_f64_operand(
                                     initializer,
                                     locals,
                                     label_counter,
@@ -7635,6 +7861,7 @@ fn emit_native_update(
             ));
         }
         NativeLocation::Constant(_)
+        | NativeLocation::StackWideScalar { .. }
         | NativeLocation::FloatingPointScalar { .. }
         | NativeLocation::StackFloatingPointScalar { .. }
         | NativeLocation::FloatRegister { .. }
@@ -14355,6 +14582,34 @@ mod tests {
             &cpu.memory[0x80000..0x80008],
             &[0x40, 0x14, 0, 0, 0, 0, 0, 0]
         );
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn converts_unsigned_long_locals_to_binary32_and_binary64() {
+        let source = "float observed; double observed_real; \
+                      int main(void) { long signed_value = 65536L; \
+                      unsigned long unsigned_value = 131072UL; \
+                      float signed_single = signed_value; \
+                      double signed_real = signed_value; \
+                      float unsigned_single = unsigned_value; \
+                      double unsigned_real = unsigned_value; \
+                      observed = unsigned_single; \
+                      observed_real = unsigned_real; \
+                      if (unsigned_single != 131072.0f) return 30; \
+                      if (signed_single != 65536.0f) return 10; \
+                      if (signed_real != 65536.0) return 20; \
+                      if (unsigned_real != 131072.0) return 40; return 0; }";
+        let image = compile_minimal_program(source, "unsigned-long-float.c")
+            .unwrap()
+            .expect("unsigned long conversions");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(&cpu.memory[0x80000..0x80004], &[0x48, 0, 0, 0]);
+        assert_eq!(&cpu.memory[0x80004..0x8000c], &[0x41, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(cpu.registers[0], 0);
     }
 }
