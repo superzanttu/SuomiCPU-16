@@ -152,6 +152,12 @@ pub struct Flags {
     pub overflow: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivilegeMode {
+    Supervisor,
+    User,
+}
+
 fn branch_condition(flags: Flags, condition: u8) -> bool {
     match condition {
         0 => !flags.zero,
@@ -248,6 +254,8 @@ pub struct Cpu {
     pub registers: [i64; 8],
     pub pc: u32,
     pub sp: u32,
+    pub kernel_sp: u32,
+    pub privilege_mode: PrivilegeMode,
     pub flags: Flags,
     pub running: bool,
     pub frame_yield: bool,
@@ -352,6 +360,8 @@ impl Cpu {
             registers: [0; 8],
             pc: 0,
             sp: memory_mask,
+            kernel_sp: memory_mask,
+            privilege_mode: PrivilegeMode::Supervisor,
             flags: Flags::default(),
             running: true,
             frame_yield: false,
@@ -2886,6 +2896,19 @@ mod tests {
         cpu.run(2000).unwrap();
         assert!(!cpu.running, "program did not halt");
         cpu
+    }
+
+    #[test]
+    fn reset_starts_in_supervisor_mode_with_interrupts_disabled() {
+        let mut cpu = Cpu::with_memory_size(1 << 19).unwrap();
+
+        assert_eq!(cpu.pc, 0);
+        assert_eq!(cpu.registers, [0; 8]);
+        assert_eq!(cpu.sp, 0x7ffff);
+        assert_eq!(cpu.kernel_sp, cpu.sp);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.flags, Flags::default());
+        assert_eq!(cpu.read(ICR_ADDR) & 1, 0);
     }
 
     #[test]

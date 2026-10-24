@@ -191,18 +191,20 @@ Checklist status: [x] completed; [ ] planned.
 
 === Phase 1 — Define architecture, disk, and image contracts
 
-* [ ] Write an SC-16 architecture specification covering reset state, address
+* [x] Write an SC-16 architecture specification in
+  link:sc16_architecture.adoc[+sc16_architecture.adoc+] covering reset state, address
   width, byte order, instruction behavior, exceptions, privilege transitions,
   interrupts, memory translation, device access, and the text-display interface
   used by firmware.
-* [ ] Specify the character-cell display contract for firmware and guest
+* [x] Specify the character-cell display contract for firmware and guest
   software, including screen dimensions, character encoding/font, cursor and
   scrolling behavior, color attributes, and display-mode ownership. Keep text
-  output distinct from serial diagnostics and guest pixel graphics.
-* [ ] Define the privilege model: reset enters kernel mode; user mode cannot
+  output distinct from serial diagnostics and guest pixel graphics. See
+  link:sc16_architecture.adoc[+sc16_architecture.adoc+].
+* [x] Define the privilege model: reset enters kernel mode; user mode cannot
   execute privileged instructions, alter control registers, modify interrupt
   state, access kernel-only mappings, or access protected devices.
-* [ ] Define exception and interrupt entry/return frames, including the saved
+* [x] Define exception and interrupt entry/return frames, including the saved
   privilege level, PC, flags, stack selection, and the behavior for faults
   during entry or return.
 * [x] Define versioned folder-disk manifest v1 in
@@ -282,7 +284,7 @@ Checklist status: [x] completed; [ ] planned.
   files, writing files, creating directories, deleting/renaming entries, and
   querying metadata, subject to the finalized syscall/device interface.
 ** [x] Implement host-side folder-disk listing, reads, writes, directory
-  listing/creation, file copy, file and directory deletion/rename, and
+  listing/creation, file copy, file and empty-directory deletion/rename, and
   manifest queries.
 ** [ ] Expose these operations through the guest filesystem/syscall interface
    with bounded transfers and defined errors.
@@ -303,13 +305,17 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Migrate existing JSON block disks and module data into folder-backed disk
   images with a documented conversion tool or import path; keep all source
   files and source disk images.
+** [x] Provide +sc16build import-block-disk+ to export JSON block contents as
+  +legacy-blocks/NNNNN.bin+, preserve read-only status, and refuse to overwrite
+  the source or an existing destination.
+** [ ] Migrate module assets and package runnable applications as boot disks.
 * [ ] Remove block-level disk device behavior only after replacement APIs and
   migration are covered by tests. Update disk editor, BIOS selection, examples,
   and documentation to use disks rather than data-disk blocks.
 
 === Phase 4 — Enforce kernel/user privilege
 
-* [ ] Add a CPU privilege-state representation and a reliable kernel-mode reset.
+* [x] Add a CPU privilege-state representation and a reliable kernel-mode reset.
 * [ ] Classify instructions, control registers, interrupts, and MMIO regions as
   privileged or user-accessible. Raise a defined exception on forbidden access.
 * [ ] Add a protected transition from kernel to user mode with a user PC and
@@ -399,6 +405,11 @@ Checklist status: [x] completed; [ ] planned.
   +disk.json+, exactly one of +main.bin+ or +kernel.bin+, and its runtime
   assets/data. Use the emulator-wide BIOS; do not package per-disk +bios.bin+
   or +boot.bin+.
+** [x] Add +sc16build package-disk+ to build one source into a new v1 disk
+  folder with +main.bin+ or +kernel.bin+ and a manifest, without overwriting
+  the source or an existing destination.
+** [ ] Migrate all runnable modules and their runtime assets to validated disk
+  folders and boot them through the emulator-wide BIOS.
 * [ ] Move assembly and C compilation out of BIOS/emulator startup. Provide
   offline build commands that compile and link programs, produce the specified
   executable image, and package the disk manifest and files.

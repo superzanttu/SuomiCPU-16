@@ -1,0 +1,199 @@
+= SC-16 Machine Architecture
+:toc: left
+:toclevels: 2
+
+== Status and scope
+
+This document defines the target machine contract and records the relevant
+legacy behavior during migration. Target rules are normative for new CPU,
+firmware, and kernel work; they do not imply that the emulator already enforces
+them. The guest character-cell display contract is specified below but is not
+implemented. The BIOS renderer described below is host-side firmware UI, not a
+guest display device.
+
+== Machine model
+
+SC-16 is byte-addressed with 30-bit addresses, for an address space of
+0x00000000 through 0x3fffffff. Multi-byte values are big-endian. Instructions
+are based on 16-bit words; prefixed instructions consume their encoded
+extension words. The ISA opcode and encoding tables are maintained in
+`src/isa.rs` and the assembler. General registers are R0 through R7; the
+architectural flags are zero, carry, negative, and overflow. The control-flow
+ABI stores return addresses as four bytes and preserves all 30 address bits.
+
+The target physical memory size is 1 GiB. Smaller emulator memories remain
+available for tests and must reject accesses outside configured memory rather
+than silently wrapping. Multi-byte memory values are big-endian; unaligned
+accesses are permitted when every byte is valid and permitted. Address
+translation and permission checks apply independently to every byte of an
+access.
+
+The instruction decoder must distinguish an invalid or unavailable encoding
+from a halt. In the target architecture, an invalid encoding raises an illegal
+instruction exception. Arithmetic, branch, load/store, and flag behavior is
+defined by the individual ISA operation; privileged behavior is additionally
+constrained by the rules below.
+
+== Reset and firmware entry
+
+On cold reset, hardware initialization loads the emulator-wide `bios.bin` at
+physical address zero and initializes devices before starting instruction
+execution. CPU state is:
+
+* PC = 0; R0-R7 = 0; flags clear.
+* Supervisor (kernel) mode; interrupts disabled.
+* MMU disabled, with addresses translated identically to physical addresses.
+* SP and the privileged kernel-stack pointer (KSP) point to the top byte of
+  configured memory. The stack grows toward lower addresses.
+* Interrupt-pending state and device control registers are reset to their
+  documented power-on values.
+
+Firmware owns initialization and boot selection. It may enable interrupts only
+after its handlers and kernel stack are ready. It transfers control to the
+selected kernel through a supervisor-mode entry; it must not compile or
+assemble guest source during boot. A user executable is entered only through
+the protected supervisor-to-user transition.
+
+== Privilege and control state
+
+The processor has two modes: supervisor (kernel) and user. Reset enters
+supervisor mode. The following operations are supervisor-only: changing mode,
+interrupt enable state, exception/interrupt return state, MMU registers or
+page tables, device-control registers, and kernel-only mappings. A user attempt
+raises a protection exception without applying the requested mutation.
+
+User instruction fetches, loads, and stores may access only user-permitted
+memory. User mode cannot access protected device registers or physical device
+pages directly. Device services intended for applications are exposed through
+kernel-controlled interfaces. The kernel-to-user transition is atomic: it
+validates the target user PC and SP, installs them, changes mode, and does not
+allow user code to forge supervisor state. The exact instruction encoding for
+this transition is an ISA implementation detail and must be added only with
+privilege checks and execution tests.
+
+== Exceptions and interrupts
+
+Synchronous faults are precise: the saved PC identifies the faulting
+instruction so the kernel can repair the condition and retry or terminate the
+task. An interrupt is taken at an instruction boundary and saves the next PC.
+Entry disables interrupts and records the prior interrupt-enable state. A
+handler may explicitly enable interrupts when nested delivery is safe. The
+target vector table and descriptor encoding are specified with the IDT work in
+Phase 5; firmware must install valid handlers before enabling an interrupt
+source.
+
+Every exception or interrupt creates a 16-byte, big-endian frame on the
+supervisor stack. At the frame address, increasing offsets contain:
+
+[cols="1,1,2"]
+|===
+|Offset |Size |Value
+
+|0 |4 bytes |Saved PC
+|4 |2 bytes |Saved flags (Z, C, N, V in bits 0-3)
+|6 |2 bytes |Saved status: prior mode in bit 0, prior interrupt-enable in bit 1
+|8 |4 bytes |Prior active SP
+|12 |2 bytes |Exception cause or interrupt vector
+|14 |2 bytes |Entry kind: synchronous exception or interrupt
+|===
+
+The stack grows downward; entry lays out the frame so its PC is at offset zero.
+An event from user mode saves the user SP, switches to KSP, and builds the
+frame there. An event from supervisor mode builds the frame on the current
+supervisor stack. Return is supervisor-only: it validates and consumes the
+frame, restores flags and PC, then restores the prior mode and stack. Returning
+to user mode restores the saved user SP while retaining the post-frame KSP.
+
+An invalid vector, malformed return frame, or fault during entry/return is a
+double fault. A double fault stops the affected CPU rather than attempting a
+second untrusted stack transition. The kernel must not resume by treating a
+double fault as an ordinary user exception.
+
+The current compatibility implementation has fixed vector words at 0x0002
+(keyboard), 0x0006 (RTC), and 0x000a (timer). If multiple sources are pending,
+it services keyboard before timer before RTC. It pushes the 4-byte PC followed
+by 2-byte flags on the current stack, clears the global interrupt-enable bit
+and selected pending bit, then loads the 30-bit handler address. `RTI` restores
+flags and PC. This legacy frame is not the target frame above and has no
+privilege or kernel-stack protection.
+
+== Memory translation
+
+Reset starts with translation disabled. The target MMU uses 4 KiB pages and a
+two-level table: 9 directory-index bits, 9 table-index bits, and 12 offset
+bits. Each directory and table has 512 32-bit entries and occupies 2 KiB. An
+entry contains an 18-bit physical frame number in bits 12-29 and flags in the
+low bits:
+
+* bit 0: present;
+* bit 1: writable;
+* bit 2: user accessible;
+* bit 3: executable;
+* bits 4-11 and 30-31: reserved and required to be zero.
+
+Effective permissions are the intersection of the directory and table entry
+permissions. Missing mappings and read, write, execute, or privilege
+violations raise page faults with the access type and virtual address. Page
+table roots and MMU control state are supervisor-only. The first emulator
+implementation may translate without a TLB; address-space changes must still
+take effect immediately. An identity mapping is required while the kernel
+initializes physical memory and transitions to its normal mappings.
+
+== Device access
+
+The legacy emulator exposes keyboard, mouse, interrupt control, RTC, timer,
+GPU, disk, and serial-style console registers through memory-mapped addresses.
+These addresses and operations remain compatibility behavior while existing
+programs use them. In the target architecture, device registers are
+supervisor-only unless a specific safe mapping is explicitly granted. Kernel
+services, not user pointers or manifest metadata, authorize access. The
+folder-disk and syscall documents define the filesystem boundary; the legacy
+block interface is not the target filesystem ABI.
+
+== Firmware text renderer
+
+The current BIOS selector draws in the emulator's 640 by 480 main window. Its
+logical surface is 53 columns by 25 rows, with 12 by 16 pixel cell slots. It
+renders printable ASCII bytes 32-126 using the embedded 5 by 7 font doubled
+to 10 by 14 pixels; other input bytes render as `?`. The background is black,
+normal text is `0xff75ff9a`, and emphasized text is `0xffc8ffd5`. The BIOS
+redraws its selector frame and has no independent terminal cursor or
+scrollback. Serial diagnostics and guest pixel graphics remain separate
+surfaces.
+
+This renderer contract does not define a guest-visible text device. A guest
+character-cell display is a separate OS service with this contract:
+
+* The surface is 53 columns by 25 rows. Each cell occupies a 12 by 16 pixel
+  slot and uses the same embedded 5 by 7 glyphs doubled to 10 by 14 pixels.
+* Character data is one byte. Printable ASCII bytes 32-126 render as their
+  glyph; other bytes render as `?`. Control bytes are interpreted by the text
+  service and do not occupy cells.
+* Each cell has an 8-bit foreground palette index and an 8-bit background
+  palette index. Palette changes are owned by the kernel display service.
+* The cursor is a row/column pair. Line feed advances one row without changing
+  the column; carriage return moves to column zero; backspace moves left and
+  blanks that cell; tab advances to the next multiple-of-eight column. Text
+  written at the last column wraps. Advancing beyond the last row scrolls all
+  rows up by one, clears the final row using the current background, and leaves
+  the cursor there.
+* The BIOS owns the text surface until a successful kernel handoff. The kernel
+  then owns display-mode selection and grants a guest text service; reset or a
+  recoverable boot failure returns ownership to the BIOS. Guest text and pixel
+  graphics are distinct surfaces, and enabling text does not disable the
+  existing game graphics window.
+
+The guest service is kernel-mediated; user programs do not write host renderer
+memory or protected display registers directly. Its syscall numbers and
+argument encoding belong to the Phase 7 syscall ABI. The guest display is not
+the serial diagnostics/Bug Monitor channel.
+
+== Compatibility boundary
+
+The current emulator initializes PC to zero and SP to the top of configured
+memory, but has no privilege mode, KSP, protected transition, MMU, page faults,
+or precise exception mechanism. Its fixed interrupts use the legacy frame
+described above. Existing source-program boot and block-disk behavior remain
+available during migration. Implementations must not describe user programs
+as isolated until page permissions and supervisor-only device access are
+enforced and tested.

@@ -11,15 +11,19 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let Some(source) = arguments.next() else {
-        return Err(
-            "usage: sc16build <source.asm|source.c|source.bin> [output.img] | smoke-modules".into(),
-        );
+        return Err("usage: sc16build <source.asm|source.c|source.bin> [output.img] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel]".into());
     };
     if source == "--help" || source == "-h" {
         println!("Usage: sc16build <source.asm|source.c|source.bin> [output.img]");
         println!("Build SC-16 source or wrap a flat binary as a segmented image.");
         println!("       sc16build smoke-modules");
         println!("Compile every bootable BIOS module as a smoke check.");
+        println!("       sc16build import-block-disk <legacy.json> <destination-folder>");
+        println!("Import a legacy JSON block disk without modifying its source.");
+        println!(
+            "       sc16build package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel]"
+        );
+        println!("Build a source program into a new folder-backed boot disk.");
         return Ok(());
     }
     if source == "smoke-modules" {
@@ -27,6 +31,71 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err("usage: sc16build smoke-modules".into());
         }
         return smoke_modules();
+    }
+    if source == "import-block-disk" {
+        let Some(legacy_disk) = arguments.next() else {
+            return Err(
+                "usage: sc16build import-block-disk <legacy.json> <destination-folder>".into(),
+            );
+        };
+        let Some(destination) = arguments.next() else {
+            return Err(
+                "usage: sc16build import-block-disk <legacy.json> <destination-folder>".into(),
+            );
+        };
+        if arguments.next().is_some() {
+            return Err(
+                "usage: sc16build import-block-disk <legacy.json> <destination-folder>".into(),
+            );
+        }
+        let destination = PathBuf::from(destination);
+        let disk =
+            suomicpu16::disk::import_legacy_block_disk(Path::new(&legacy_disk), &destination)?;
+        println!(
+            "Imported {} ({} bytes, read_only={}) -> {}",
+            disk.manifest().id,
+            disk.used_bytes()?,
+            disk.manifest().read_only,
+            destination.display()
+        );
+        return Ok(());
+    }
+    if source == "package-disk" {
+        let usage = "usage: sc16build package-disk <source.asm|source.c|source.bin> <disk-folder> <label> <capacity-bytes> [--kernel]";
+        let Some(program_source) = arguments.next() else {
+            return Err(usage.into());
+        };
+        let Some(disk_folder) = arguments.next() else {
+            return Err(usage.into());
+        };
+        let Some(label) = arguments.next().and_then(|value| value.into_string().ok()) else {
+            return Err(usage.into());
+        };
+        let Some(capacity) = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Err(usage.into());
+        };
+        let kernel = match arguments.next() {
+            None => false,
+            Some(option) if option == "--kernel" => true,
+            Some(_) => return Err(usage.into()),
+        };
+        if arguments.next().is_some() {
+            return Err(usage.into());
+        }
+        let source = PathBuf::from(program_source);
+        let disk_folder = PathBuf::from(disk_folder);
+        package_disk(&source, &disk_folder, &label, capacity, kernel)?;
+        println!(
+            "Packaged {} as {} -> {}",
+            source.display(),
+            if kernel { "kernel.bin" } else { "main.bin" },
+            disk_folder.display()
+        );
+        return Ok(());
     }
     if source.to_string_lossy().starts_with('-') {
         return Err(format!("unknown option: {}", source.to_string_lossy()).into());
@@ -64,6 +133,71 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         output.display()
     );
     Ok(())
+}
+
+fn package_disk(
+    source: &Path,
+    disk_folder: &Path,
+    label: &str,
+    capacity_bytes: u64,
+    kernel: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id = disk_folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid disk folder name")
+        })?;
+    let executable = if kernel { "kernel.bin" } else { "main.bin" };
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": id,
+        "label": label,
+        "capacity_bytes": capacity_bytes,
+        "read_only": false,
+        "protected_files": [executable],
+    });
+    let manifest_text = serde_json::to_string(&manifest)?;
+    let parsed_manifest = suomicpu16::disk::parse_folder_disk_manifest(&manifest_text)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let image = match source.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("bin") => {
+            suomicpu16::image::load_binary(source)?
+        }
+        _ => suomicpu16::image::build_source(source)?,
+    };
+    if disk_folder.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "disk destination already exists",
+        )
+        .into());
+    }
+    if let Some(parent) = disk_folder.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir(disk_folder)?;
+    let result = (|| {
+        fs::write(
+            disk_folder.join("disk.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        suomicpu16::image::write_image(&disk_folder.join(executable), &image)?;
+        let mounted = suomicpu16::disk::FolderDisk::open(disk_folder)
+            .map_err(|error| std::io::Error::other(error))?;
+        if mounted.manifest().id != parsed_manifest.id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "packaged disk ID mismatch",
+            )
+            .into());
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(disk_folder);
+    }
+    result
 }
 
 struct BootModule {
@@ -246,6 +380,31 @@ mod tests {
             modules[0].error.as_deref(),
             Some("Multiple .c files found; expected main.c.")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packages_source_into_non_overwriting_folder_disk() {
+        let root = temporary_directory();
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.asm");
+        fs::write(&source, "start: LDI R0, 42\nHALT\n").unwrap();
+        let user_disk_path = root.join("USER0001");
+        package_disk(&source, &user_disk_path, "User disk", 4096, false).unwrap();
+
+        let user_disk = suomicpu16::disk::FolderDisk::open(&user_disk_path).unwrap();
+        assert_eq!(user_disk.manifest().label, "User disk");
+        assert!(user_disk.root().join("main.bin").is_file());
+        assert!(!user_disk.root().join("kernel.bin").exists());
+        assert!(source.exists());
+
+        let kernel_disk_path = root.join("KERN0001");
+        package_disk(&source, &kernel_disk_path, "Kernel disk", 4096, true).unwrap();
+        let kernel_disk = suomicpu16::disk::FolderDisk::open(&kernel_disk_path).unwrap();
+        assert!(kernel_disk.root().join("kernel.bin").is_file());
+        assert!(!kernel_disk.root().join("main.bin").exists());
+
+        assert!(package_disk(&source, &user_disk_path, "Other", 4096, false).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

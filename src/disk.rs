@@ -572,6 +572,63 @@ impl FolderDisk {
     }
 }
 
+pub fn import_legacy_block_disk(source: &Path, destination: &Path) -> Result<FolderDisk, String> {
+    let disk_id = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| "legacy disk filename must contain a valid disk ID".to_owned())?;
+    validate_disk_id(disk_id)?;
+    if destination.file_name().and_then(|name| name.to_str()) != Some(disk_id) {
+        return Err("folder disk destination name must match the legacy disk ID".to_owned());
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Err("folder disk destination already exists".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect folder disk destination: {error}")),
+    }
+    let raw = fs::read_to_string(source)
+        .map_err(|error| format!("cannot read legacy block disk: {error}"))?;
+    let (blocks, read_only) = parse_disk(&raw, disk_id)?;
+    let capacity_bytes = (blocks.len() as u64)
+        .checked_mul(BLOCK_SIZE as u64)
+        .ok_or_else(|| "legacy disk capacity overflow".to_owned())?
+        .max(1);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create folder disk destination parent: {error}"))?;
+    }
+    fs::create_dir(destination)
+        .map_err(|error| format!("cannot create folder disk destination: {error}"))?;
+    let result = (|| {
+        let mut manifest = Map::new();
+        manifest.insert(
+            "version".to_owned(),
+            Value::from(FOLDER_DISK_MANIFEST_VERSION),
+        );
+        manifest.insert("id".to_owned(), Value::String(disk_id.to_owned()));
+        manifest.insert("label".to_owned(), Value::String(disk_id.to_owned()));
+        manifest.insert("capacity_bytes".to_owned(), Value::from(capacity_bytes));
+        manifest.insert("read_only".to_owned(), Value::Bool(read_only));
+        let manifest_bytes = serde_json::to_vec_pretty(&Value::Object(manifest))
+            .map_err(|error| format!("cannot serialize folder disk manifest: {error}"))?;
+        fs::write(destination.join("disk.json"), manifest_bytes)
+            .map_err(|error| format!("cannot write folder disk manifest: {error}"))?;
+        let block_directory = destination.join("legacy-blocks");
+        fs::create_dir(&block_directory)
+            .map_err(|error| format!("cannot create legacy block export folder: {error}"))?;
+        for (number, block) in blocks {
+            let path = block_directory.join(format!("{number:05}.bin"));
+            fs::write(path, block)
+                .map_err(|error| format!("cannot export legacy disk block: {error}"))?;
+        }
+        FolderDisk::open(destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(destination);
+    }
+    result
+}
+
 fn collect_folder_files(
     root: &Path,
     directory: &Path,

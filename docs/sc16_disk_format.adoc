@@ -86,5 +86,8 @@ reads regular files, lists directories, creates directories, writes, copies,
 renames, and deletes files and empty directories, accounts regular-file bytes,
 enforces disk-wide read-only mode, protected paths, and write/copy capacity,
 rejects over-capacity disks at mount, and selects/validates the fixed-name boot
-image. Guest/syscall integration, application migration, and BIOS boot
-integration remain to be implemented and tested.
+image. `sc16build import-block-disk` exports legacy JSON blocks as regular files
+without modifying the source. `sc16build package-disk` builds one program into
+a new boot-disk folder with `main.bin` or `kernel.bin`. Guest/syscall
+integration, module asset migration, package validation for all applications,
+and BIOS boot integration remain to be implemented and tested.
