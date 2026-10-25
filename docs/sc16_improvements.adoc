@@ -78,7 +78,7 @@ Checklist status: [x] completed; [ ] planned.
    size in +LDI30+, +STP+, and +SPLIT30+; verify high-bit round trips and explicit
    scalar long/pointer casts without changing memory-access wrapping.
 
-* [ ] *Implement the C stack argument ABI* (+c90-stack-call-abi+)
+* [x] *Implement the C stack argument ABI* (+c90-stack-call-abi+)
 ** [x] Pass one 16-bit scalar parameter at +SP \+ 4+; test signed values and
   caller cleanup.
 ** [x] Pass up to three 16-bit scalar parameters right-to-left at +SP \+ 4+,
@@ -97,7 +97,23 @@ Checklist status: [x] completed; [ ] planned.
    parameter conversions, and +R0:R1+ results across nested/recursive calls;
    verify exact object bytes, word-to-long promotions, live values, and caller
    cleanup against independent arithmetic references.
-** [ ] Pass all supported C argument types using their documented stack object
+** [x] Load, assign, compound-update, and increment/decrement signed and
+   unsigned long record members and indexed long arrays, including nested and
+   pointer-member access; verify both object words at runtime.
+** [x] Pass fixed-signature structure and union arguments as complete object
+   representations; test mixed scalar offsets, nested records, recursive
+   copies, and caller-object isolation by executing the generated image.
+** [x] Apply default argument promotions to supported variadic calls; execute
+   a linked stack probe that verifies signed/unsigned byte promotion, float to
+   double promotion, pointer and aggregate object representations, wide-
+   integer representation, argument offsets, and caller cleanup.
+** [x] Preserve the distinction between empty parameter lists and +void+
+   prototypes; execute an unprototyped call with default promotions and reject
+   extra arguments to a fixed zero-parameter prototype.
+** [x] Merge compatible no-prototype and prototype declarations; execute both
+   declaration orders and reject mixtures whose parameter types change under
+   default promotions.
+** [x] Pass all supported C argument types using their documented stack object
    representations; cover other arities, byte, pointer, wide integer,
    aggregate, and floating arguments, callee offsets, promotions, nested calls,
    and recursion.
@@ -142,12 +158,22 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Implement tested binary32 general expressions, conversions, and object
    access for scalar locals/globals, indexed arrays, and float pointers,
    including conditions, conditional expressions, and discarded expressions.
+** [x] Execute binary32 and binary64 prefix/postfix increments and decrements
+   for local/global scalars and indexed array elements; verify old values,
+   updated values, and global object bytes.
+** [x] Load, store, compound-update, and increment/decrement binary32 and
+   binary64 scalar record members and indexed floating array fields through
+   nested and pointer-member expressions; verify object bytes and live pointer
+   preservation.
 ** [ ] Implement typed floating-expression analysis for literals, lvalues,
    casts, signedness, and C90 usual arithmetic conversions. Reject unsupported
    conversions instead of silently treating +double+ as +float+.
 ** [x] Implement runtime signed/unsigned 16-bit integer-to-binary32 and
    binary32-to-integer conversions; test negative truncation and unsigned word
    representations.
+** [x] Convert in-range binary32/binary64 values to signed/unsigned byte types
+   by truncating to integer before target-byte normalization; reject explicit
+   floating/pointer casts instead of silently lowering them as scalar values.
 ** [ ] Implement 32-bit integer conversions to/from binary32, conversions
    between integer types and binary64, and binary32/binary64 conversions in
    both directions. Test range edges and C90's undefined conversion cases
@@ -166,6 +192,9 @@ Checklist status: [x] completed; [ ] planned.
   using the ABI's four-register groups.
 ** [ ] Complete binary64 conversions, including unsigned and 32-bit integer
   cases, and add mixed-precision operations according to C90 conversion rules.
+** [x] Execute mixed binary32/binary64 arithmetic and conversions, including
+  unsigned 16/32-bit boundaries, precision narrowing/widening, and live
+  integer locals across binary64 comparisons and truth tests.
 ** [ ] Implement floating-point function arguments and results according to
    +c90_target_abi.adoc+, including prototype and default argument promotions,
    nested calls, and recursion.
@@ -173,10 +202,14 @@ Checklist status: [x] completed; [ ] planned.
    floating parameters, mixed scalar arguments, nested calls, recursion,
    prototype/return precision conversions, and independent IEEE bit-pattern
    checks; reject conflicting declared function types before call lowering.
-** [ ] Add end-to-end runtime tests for each supported operation, conversion,
-   object access, comparison, and call boundary. Compare numeric results and
-   boundary rounding with an independent reference.
-** [ ] Update +c90_target_abi.adoc+ only for behavior verified by the runtime
+** [x] Promote variadic binary32 arguments to binary64 and byte integer
+   arguments to the target word representation; execute stack-layout checks
+   for pointers, aggregates, and wide integers.
+** [x] Add end-to-end runtime tests for the currently supported operations,
+   conversions, object accesses, comparisons, and call boundaries. Compare
+   numeric results, object bytes, and boundary rounding with independent
+   references.
+** [x] Update +c90_target_abi.adoc+ only for behavior verified by runtime
    tests; do not claim complete C conformance until the C90 backend and ABI
    acceptance suites pass.
 

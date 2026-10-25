@@ -57,12 +57,13 @@ conformance work.
   binary32 comparisons (+==+, +!=+, +<+, +<=+, +>+, +>=+) are supported in
   automatic scalar initializers; tests cover unordered NaN behavior and
   conversion of a comparison result to +float+. General binary32 support now
-  includes local/global/indexed-array/float-pointer loads and stores, scalar
-  assignments and compound assignments, all six comparison operators in
+  includes local/global/indexed-array/pointer-dereference loads and stores,
+  scalar assignments and compound assignments, all six comparison operators in
   expressions and conditions, conditional and discarded expressions, and
   signed/unsigned 16-bit integer conversions in both directions. Calls with a
   single binary32 parameter and binary32 result are supported. Binary64 runtime
-  coverage now includes tested scalar/pointer-array access, arithmetic,
+  coverage now includes tested scalar/pointer-array and scalar-pointer
+  dereference access, arithmetic,
   comparisons, signed 16-bit conversion, and a single-parameter call/result.
   Fixed multi-argument, nested, and recursive floating calls are tested.
   Scalar signed/unsigned 32-bit expressions and conversions to/from both
@@ -198,14 +199,32 @@ C90 requirements listed under C.
    layouts, including multiple and mixed binary32/binary64 parameters, nested
    calls, recursion, and tested prototype/return precision conversions.
    Runtime tests inspect argument bytes, stack cleanup, and independent IEEE
-   results. Full typed conversions and default argument promotions remain open.
+   results. Full typed conversions remain open.
+** Verified progress: supported variadic prototypes apply integer promotions
+   to tested signed/unsigned byte arguments and promote binary32 arguments to
+   binary64. An executing linked probe verifies stack offsets, promoted bytes,
+   pointer and aggregate arguments, wide-integer representation, and caller
+   cleanup. The parser distinguishes empty parameter lists from +void+
+   prototypes; unprototyped calls apply the same tested promotions. Compatible
+   prototype/no-prototype declarations are merged, while types changed by
+   default promotions are rejected. K&R identifier-list definitions and full
+   cross-translation-unit compatibility remain open.
 ** Verified progress: signed/unsigned long scalars now retain both words in
    arithmetic, comparisons, conditions, updates, fixed arguments, and results.
    Runtime conversions to/from binary32 and binary64 cover in-range edges,
    truncation, and rounding against independent Rust/IEEE references.
    Frame-backed expression writes prevent conversion/call register saves from
-   restoring stale local or parameter values. General long lvalues, pointer
-   conversions, qualifiers, and constant-expression semantics remain open.
+   restoring stale local or parameter values. Nested and pointer-member long
+   fields and indexed long arrays support tested loads, stores, updates, and
+   bytes. General pointer/dereference lvalues, pointer conversions, qualifiers,
+   and constant-expression semantics remain open.
+** Verified progress: binary32 and binary64 prefix/postfix updates execute for
+   local/global scalars and indexed array elements, with runtime checks for
+   returned old values, stored values, and exact global bytes. Scalar floating
+   record members and indexed floating array fields support nested and pointer
+   access and updates; scalar member initialization and global object bytes are
+   tested. Typed conversion analysis and broader floating-lvalue coverage
+   remain open.
 ** *Depends on:* +c90-float-model+ and +c90-float-isa+ in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+].
 
@@ -256,16 +275,22 @@ C90 requirements listed under C.
     including memory-mapped device behavior.
 ** The Rust native subset accepts file-scope +extern+ declarations and
     merges compatible tentative definitions with at most one initializer,
-    including incomplete-array +extern+ declarations. Multi-translation-unit
-    linkage and the remaining storage-duration semantics are not implemented.
+    including incomplete-array +extern+ declarations. Block-scope +static+
+    and +extern+ declarations are now rejected explicitly instead of being
+    lowered with automatic storage. Multi-translation-unit linkage and the
+    remaining storage-duration semantics are not implemented.
 
 === B5. Complete initializers for game state and data
 
 * [ ] *Complete C90 initializer semantics* (+c90-initializers+)
 ** File-scope structures and arrays of structures accept nested-brace
     integer constant initializers, including nested records, scalar arrays,
-    and zero-filling omitted members. Runtime initializers, brace elision,
-    unions, and local structure initializers remain unsupported.
+    and zero-filling omitted members. Automatic nested record initialization
+    executes nested-brace runtime scalar expressions in declaration order
+    for records and multidimensional arrays of records, and zero-fills
+    omitted members and array elements. Side-effecting nested initializers
+    are covered by end-to-end regressions. Brace elision, unions, and full
+    local aggregate-initializer semantics remain unverified or unsupported.
 ** Implement scalar, array, structure, and union initialization, including
     brace elision, nested aggregates, string-literal arrays, omitted outer
     bounds, and zero filling.
@@ -305,6 +330,17 @@ required before claiming full C90 compatibility.
 ** Reject qualifier loss and writes through const-qualified lvalues.
 ** Add positive/negative tests for multi-level pointers and all expression
     and declaration paths.
+** Verified progress: one-level pointer-to-const reads through local, global,
+    and parameter pointers execute; stores, compound assignments, and
+    increments/decrements through those pointers are rejected. Writes and
+    updates to const-qualified scalar and bit-field record members are rejected
+    while aggregate initialization remains supported. Direct assignments and
+    updates to supported const scalar and array objects, including const
+    parameters and globals, are rejected. Qualifiers on pointer objects are
+    diagnosed as unsupported. Qualifier-dropping conversions between simple
+    pointer variables, fixed pointer arguments, and pointer returns are
+    rejected. Expression/cast conversions and multi-level qualification remain
+    incomplete.
 ** *Depends on:* B2a (+c90-function-pointer-types+).
 
 === C2. Implement bit-field accesses
@@ -319,10 +355,12 @@ required before claiming full C90 compatibility.
     updates, promotions, global integer and automatic runtime initializers,
     unions, nested members, recursive frame-local records, and volatile
     allocation-unit access counts.
-** [ ] Complete floating/wide compound conversions, qualifier enforcement,
-    and all initializer combinations through the typed backend. Direct
-    unsupported floating/wide compound assignments currently produce a
-    diagnostic instead of silently using word arithmetic.
+** [ ] Complete all C90 floating/wide compound conversions, qualifier
+    enforcement, and initializer combinations through the typed backend.
+    Floating bit-field addition, subtraction, multiplication, and division
+    compounds, plus wide-integer bit-field compounds, are execution-tested.
+    Direct assignments and updates to const-qualified scalar and bit-field
+    members are rejected; aggregate initialization of those members is tested.
 ** [x] Diagnose invalid base types and widths, address-taking, and +sizeof+
     of a bit-field.
 ** *Depends on:* +c90-bitfield-layout+ in

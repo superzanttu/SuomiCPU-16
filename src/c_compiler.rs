@@ -286,6 +286,7 @@ pub struct FunctionDeclaration {
     pub name: String,
     pub parameters: Vec<FunctionParameter>,
     pub variadic: bool,
+    pub has_prototype: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +323,7 @@ enum NativeArgumentKind {
     WideInteger,
     Binary32,
     Binary64,
+    Record(NativeRecordLayout),
 }
 
 impl NativeArgumentKind {
@@ -331,6 +333,7 @@ impl NativeArgumentKind {
             Self::Word => 2,
             Self::Pointer | Self::WideInteger | Self::Binary32 => 4,
             Self::Binary64 => 8,
+            Self::Record(layout) => layout.size,
         }
     }
 }
@@ -340,24 +343,31 @@ struct NativeStackArgument {
     kind: NativeArgumentKind,
     offset: usize,
     unsigned: bool,
+    pointer_target_is_const: bool,
 }
 
 #[derive(Clone)]
 struct NativeCallLayout {
     arguments: Vec<NativeStackArgument>,
     size: usize,
+    variadic: bool,
+    has_prototype: bool,
 }
 
 impl NativeCallLayout {
     fn new(
         parameters: &[FunctionParameter],
         records: &HashMap<String, NativeRecordLayout>,
+        variadic: bool,
+        has_prototype: bool,
     ) -> Option<Self> {
         let mut arguments = Vec::with_capacity(parameters.len());
         let mut size = 0usize;
         for parameter in parameters {
             let kind = if native_is_pointer_type(&parameter.c_type, records) {
                 NativeArgumentKind::Pointer
+            } else if let Some(layout) = records.get(native_unqualified_type(&parameter.c_type)) {
+                NativeArgumentKind::Record(layout.clone())
             } else if native_byte_type(&parameter.c_type).is_some() {
                 NativeArgumentKind::Byte
             } else if let Some(width) = native_floating_type_size(&parameter.c_type) {
@@ -382,9 +392,15 @@ impl NativeCallLayout {
                 kind,
                 offset,
                 unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                pointer_target_is_const: native_pointer_target_is_const(&parameter.c_type),
             });
         }
-        Some(Self { arguments, size })
+        Some(Self {
+            arguments,
+            size,
+            variadic,
+            has_prototype,
+        })
     }
 
     fn needs_stack_parameters(&self) -> bool {
@@ -394,6 +410,7 @@ impl NativeCallLayout {
                 NativeArgumentKind::Binary32
                     | NativeArgumentKind::Binary64
                     | NativeArgumentKind::WideInteger
+                    | NativeArgumentKind::Record(_)
             )
         })
     }
@@ -413,6 +430,7 @@ enum NativeLocation {
         register: u8,
         element_size: usize,
         element_signed: bool,
+        element_is_const: bool,
         element_floating_size: usize,
         record_layout: Option<NativeRecordLayout>,
     },
@@ -420,6 +438,7 @@ enum NativeLocation {
         offset: usize,
         element_size: usize,
         element_signed: bool,
+        element_is_const: bool,
         element_floating_size: usize,
         record_layout: Option<NativeRecordLayout>,
     },
@@ -455,6 +474,7 @@ enum NativeLocation {
     GlobalPointer {
         element_size: usize,
         element_signed: bool,
+        element_is_const: bool,
         element_floating_size: usize,
         record_layout: Option<NativeRecordLayout>,
     },
@@ -479,6 +499,8 @@ enum NativeLocation {
         float_return_size: usize,
         wide_return_unsigned: Option<bool>,
         word_return_unsigned: bool,
+        returns_pointer: bool,
+        pointer_return_target_is_const: bool,
     },
     StackArray {
         offset: usize,
@@ -495,6 +517,8 @@ struct NativeRecordField {
     offset: usize,
     size: usize,
     signed: bool,
+    is_const: bool,
+    floating_size: usize,
     bit_field: Option<(usize, usize)>,
     record_layout: Option<Box<NativeRecordLayout>>,
     dimensions: Vec<usize>,
@@ -618,6 +642,93 @@ fn emit_native_pointer_push(label_counter: &mut usize, assembly: &mut String) {
     ));
 }
 
+fn emit_native_variadic_argument(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<usize> {
+    let kind = if native_expression_floating_size(expression, locals).is_some() {
+        NativeArgumentKind::Binary64
+    } else if let Some(layout) = native_expression_record_layout(expression, locals) {
+        NativeArgumentKind::Record(layout.clone())
+    } else if native_expression_pointer_element_size(expression, locals).is_some()
+        || matches!(&expression.kind, ExpressionKind::Atom(token) if native_string_label(token).is_some())
+    {
+        NativeArgumentKind::Pointer
+    } else if native_expression_is_wide_integer(expression, locals) {
+        NativeArgumentKind::WideInteger
+    } else {
+        NativeArgumentKind::Word
+    };
+    match kind {
+        NativeArgumentKind::Binary64 => {
+            if !emit_native_floating_conversion(expression, 8, locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str("    PUSH R7\n    PUSH R6\n    PUSH R5\n    PUSH R4\n");
+            Some(8)
+        }
+        NativeArgumentKind::Record(layout) => {
+            if layout.size % 2 != 0 {
+                return None;
+            }
+            let address = Expression {
+                kind: ExpressionKind::Unary {
+                    operator: "&".to_owned(),
+                    operand: Box::new(expression.clone()),
+                },
+                line: expression.line,
+                filename: expression.filename.clone(),
+            };
+            if !emit_native_expression(&address, 0, &[4, 5, 6], locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str("    MOV R7, R0\n");
+            for offset in (0..layout.size).step_by(2).rev() {
+                if offset == 0 {
+                    assembly.push_str("    LDW R5, R7\n");
+                } else {
+                    assembly.push_str(&format!(
+                        "    MOV R0, R7\n    LDI R6, {offset}\n\
+                         ADD R0, R6\n    LDW R5, R0\n"
+                    ));
+                }
+                assembly.push_str("    PUSH R5\n");
+            }
+            Some(layout.size)
+        }
+        NativeArgumentKind::Pointer => {
+            if !emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly) {
+                return None;
+            }
+            emit_native_pointer_push(label_counter, assembly);
+            Some(4)
+        }
+        NativeArgumentKind::WideInteger => {
+            if !emit_native_wide_conversion(
+                expression,
+                native_expression_is_unsigned(expression, locals),
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str("    PUSH R5\n    PUSH R4\n");
+            Some(4)
+        }
+        NativeArgumentKind::Word => {
+            if !emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str("    PUSH R4\n");
+            Some(2)
+        }
+        NativeArgumentKind::Byte | NativeArgumentKind::Binary32 => unreachable!(),
+    }
+}
+
 fn native_library_pointer_element_size(function: &str, index: usize) -> usize {
     match (function, index) {
         ("gfx3d_draw", 0) => 2,
@@ -667,6 +778,23 @@ fn native_unqualified_type(c_type: &str) -> &str {
         c_type = unqualified.trim();
     }
     c_type
+}
+
+fn native_type_is_const_qualified(c_type: &str) -> bool {
+    c_type
+        .split('*')
+        .next()
+        .unwrap_or(c_type)
+        .split_whitespace()
+        .any(|word| word == "const")
+}
+
+fn native_pointer_target_is_const(c_type: &str) -> bool {
+    c_type.matches('*').count() == 1 && native_type_is_const_qualified(c_type)
+}
+
+fn native_object_is_const_qualified(c_type: &str) -> bool {
+    !c_type.contains('*') && native_type_is_const_qualified(c_type)
 }
 
 fn is_native_word_type(c_type: &str) -> bool {
@@ -741,11 +869,12 @@ fn native_is_pointer_type(c_type: &str, records: &HashMap<String, NativeRecordLa
     native_pointer_element(c_type).is_some() || native_record_pointer(c_type, records).is_some()
 }
 
-fn is_native_parameter_type(c_type: &str) -> bool {
+fn is_native_parameter_type(c_type: &str, records: &HashMap<String, NativeRecordLayout>) -> bool {
     is_native_word_type(c_type)
         || native_byte_type(c_type).is_some()
         || native_pointer_element(c_type).is_some()
         || native_floating_type_size(c_type).is_some()
+        || records.contains_key(native_unqualified_type(c_type))
         || c_type
             .trim()
             .strip_suffix('*')
@@ -773,14 +902,44 @@ fn native_function_types_match(left: &FunctionDeclaration, right: &FunctionDecla
             _ => c_type.to_owned(),
         }
     };
-    parameter_type(&left.return_type) == parameter_type(&right.return_type)
-        && left.variadic == right.variadic
-        && left.parameters.len() == right.parameters.len()
-        && left
-            .parameters
-            .iter()
-            .zip(&right.parameters)
-            .all(|(left, right)| parameter_type(&left.c_type) == parameter_type(&right.c_type))
+    if parameter_type(&left.return_type) != parameter_type(&right.return_type) {
+        return false;
+    }
+    match (left.has_prototype, right.has_prototype) {
+        (true, true) => {
+            left.variadic == right.variadic
+                && left.parameters.len() == right.parameters.len()
+                && left
+                    .parameters
+                    .iter()
+                    .zip(&right.parameters)
+                    .all(|(left, right)| {
+                        parameter_type(&left.c_type) == parameter_type(&right.c_type)
+                    })
+        }
+        (false, false) => true,
+        (true, false) => native_prototype_matches_default_promotions(left, &parameter_type),
+        (false, true) => native_prototype_matches_default_promotions(right, &parameter_type),
+    }
+}
+
+fn native_prototype_matches_default_promotions(
+    prototype: &FunctionDeclaration,
+    parameter_type: &impl Fn(&str) -> String,
+) -> bool {
+    !prototype.variadic
+        && prototype.parameters.iter().all(|parameter| {
+            let promoted_type = if native_byte_type(&parameter.c_type).is_some() {
+                Some("int")
+            } else if native_floating_type_size(&parameter.c_type) == Some(4) {
+                Some("double")
+            } else {
+                None
+            };
+            promoted_type.is_none_or(|promoted_type| {
+                parameter_type(&parameter.c_type) == parameter_type(promoted_type)
+            })
+        })
 }
 
 pub struct ExpressionParser {
@@ -1088,7 +1247,7 @@ pub fn compile_minimal_program_to_assembly(
     let mut names = HashSet::new();
     let mut global_names = HashSet::new();
     let mut global_indices: HashMap<&str, usize> = HashMap::new();
-    let mut prototypes = HashMap::new();
+    let mut prototypes: HashMap<&str, (usize, bool, bool, bool)> = HashMap::new();
     for declaration in &unit.declarations {
         match declaration {
             ExternalDeclaration::FunctionDefinition(function) => {
@@ -1097,11 +1256,9 @@ pub fn compile_minimal_program_to_assembly(
                     || function.declaration.variadic
                     || function.declaration.parameters.len() > 32_767
                     || global_names.contains(function.declaration.name.as_str())
-                    || function
-                        .declaration
-                        .parameters
-                        .iter()
-                        .any(|parameter| !is_native_parameter_type(&parameter.c_type))
+                    || function.declaration.parameters.iter().any(|parameter| {
+                        !is_native_parameter_type(&parameter.c_type, &unit.records)
+                    })
                     || !names.insert(function.declaration.name.as_str())
                 {
                     eprintln!(
@@ -1125,13 +1282,11 @@ pub fn compile_minimal_program_to_assembly(
                 let unsupported_prototype = ((!matches!(function.return_type.trim(), "void")
                     && !is_native_return_type(&function.return_type))
                     && !is_library_function)
-                    || (function.variadic && function.name != "printf")
                     || function.parameters.len() > if is_library_function { 8 } else { 32_767 }
                     || (!is_library_function
-                        && function
-                            .parameters
-                            .iter()
-                            .any(|parameter| !is_native_parameter_type(&parameter.c_type)));
+                        && function.parameters.iter().any(|parameter| {
+                            !is_native_parameter_type(&parameter.c_type, &unit.records)
+                        }));
                 if global_names.contains(function.name.as_str()) {
                     eprintln!(
                         "function prototype {} conflicts with a global variable",
@@ -1142,23 +1297,23 @@ pub fn compile_minimal_program_to_assembly(
                 if unsupported_prototype {
                     continue;
                 }
-                if prototypes
-                    .insert(
-                        function.name.as_str(),
-                        (
-                            function.parameters.len(),
-                            function.return_type.trim() == "void",
-                        ),
-                    )
-                    .is_some_and(|previous| {
-                        previous
-                            != (
-                                function.parameters.len(),
-                                function.return_type.trim() == "void",
-                            )
-                    })
-                {
-                    return Ok(None);
+                let signature = (
+                    function.parameters.len(),
+                    function.return_type.trim() == "void",
+                    function.variadic,
+                    function.has_prototype,
+                );
+                if let Some(previous) = prototypes.get_mut(function.name.as_str()) {
+                    if previous.3 && !signature.3 {
+                        continue;
+                    }
+                    if !previous.3 && signature.3 {
+                        *previous = signature;
+                    } else if *previous != signature {
+                        return Ok(None);
+                    }
+                } else {
+                    prototypes.insert(function.name.as_str(), signature);
                 }
             }
             ExternalDeclaration::Global(global) => {
@@ -1408,6 +1563,8 @@ pub fn compile_minimal_program_to_assembly(
                     != (
                         function.declaration.parameters.len(),
                         function.declaration.return_type.trim() == "void",
+                        function.declaration.variadic,
+                        function.declaration.has_prototype,
                     )
             })
     }) {
@@ -1417,7 +1574,7 @@ pub fn compile_minimal_program_to_assembly(
         );
         return Ok(None);
     }
-    let mut defined_functions: HashMap<String, (usize, bool)> = functions
+    let mut defined_functions: HashMap<String, (usize, bool, bool, bool)> = functions
         .iter()
         .map(|function| {
             (
@@ -1425,16 +1582,21 @@ pub fn compile_minimal_program_to_assembly(
                 (
                     function.declaration.parameters.len(),
                     function.declaration.return_type.trim() == "void",
+                    function.declaration.variadic,
+                    function.declaration.has_prototype,
                 ),
             )
         })
         .collect();
-    for (name, (arity, returns_void)) in &prototypes {
-        if native_library_for_symbol(name).is_some() {
-            defined_functions.insert((*name).to_owned(), (*arity, *returns_void));
+    for (name, (arity, returns_void, variadic, has_prototype)) in &prototypes {
+        if native_library_for_symbol(name).is_some() || *variadic || !has_prototype {
+            defined_functions.insert(
+                (*name).to_owned(),
+                (*arity, *returns_void, *variadic, *has_prototype),
+            );
         }
     }
-    defined_functions.insert("abs".to_owned(), (1, false));
+    defined_functions.insert("abs".to_owned(), (1, false, false, true));
     if let Some(function) = functions
         .iter()
         .find(|function| !statement_calls_are_defined(&function.body, &defined_functions))
@@ -1528,15 +1690,18 @@ pub fn compile_minimal_program_to_assembly(
         let has_excess_locals = function.declaration.parameters.len()
             + statement_scalar_local_count(&function.body)
             > 3;
-        let parameter_layout =
-            NativeCallLayout::new(&function.declaration.parameters, &unit.records).ok_or_else(
-                || {
-                    CCompilerError(format!(
-                        "{filename}: unsupported argument layout for {}",
-                        function.declaration.name
-                    ))
-                },
-            )?;
+        let parameter_layout = NativeCallLayout::new(
+            &function.declaration.parameters,
+            &unit.records,
+            false,
+            function.declaration.has_prototype,
+        )
+        .ok_or_else(|| {
+            CCompilerError(format!(
+                "{filename}: unsupported argument layout for {}",
+                function.declaration.name
+            ))
+        })?;
         let stack_required = native_stack_required_locals(&function.body);
         let stack_parameters = parameter_layout.needs_stack_parameters()
             || function.declaration.parameters.iter().any(|parameter| {
@@ -1566,7 +1731,13 @@ pub fn compile_minimal_program_to_assembly(
                 let argument = &parameter_layout.arguments[index];
                 stacked_parameter_bytes = parameter_layout.size;
                 let offset = argument.offset;
-                if let Some(size) = native_floating_type_size(&parameter.c_type) {
+                if let Some(layout) = unit.records.get(native_unqualified_type(&parameter.c_type)) {
+                    NativeLocation::StackRecord {
+                        offset,
+                        dimensions: Vec::new(),
+                        layout: layout.clone(),
+                    }
+                } else if let Some(size) = native_floating_type_size(&parameter.c_type) {
                     NativeLocation::StackFloatingPointScalar { offset, size }
                 } else if is_native_wide_integer_type(&parameter.c_type) {
                     NativeLocation::StackWideScalar {
@@ -1578,6 +1749,7 @@ pub fn compile_minimal_program_to_assembly(
                         offset,
                         element_size,
                         element_signed,
+                        element_is_const: native_pointer_target_is_const(&parameter.c_type),
                         element_floating_size: native_pointer_element_floating_size(
                             &parameter.c_type,
                         ),
@@ -1605,6 +1777,7 @@ pub fn compile_minimal_program_to_assembly(
                         offset,
                         element_size,
                         element_signed,
+                        element_is_const: native_pointer_target_is_const(&parameter.c_type),
                         element_floating_size: native_pointer_element_floating_size(
                             &parameter.c_type,
                         ),
@@ -1623,6 +1796,7 @@ pub fn compile_minimal_program_to_assembly(
                     register: index as u8 + 1,
                     element_size,
                     element_signed,
+                    element_is_const: native_pointer_target_is_const(&parameter.c_type),
                     element_floating_size: native_pointer_element_floating_size(&parameter.c_type),
                     record_layout: record_layout.clone(),
                 }
@@ -1674,6 +1848,7 @@ pub fn compile_minimal_program_to_assembly(
                 NativeLocation::GlobalPointer {
                     element_size,
                     element_signed,
+                    element_is_const: native_pointer_target_is_const(&global.c_type),
                     element_floating_size: native_pointer_element_floating_size(&global.c_type),
                     record_layout: global.record_layout.clone(),
                 }
@@ -1716,20 +1891,37 @@ pub fn compile_minimal_program_to_assembly(
                 .or_insert(NativeLocation::Constant(*value));
         }
         for declaration in &unit.declarations {
-            let (name, parameters) = match declaration {
+            let (name, parameters, variadic, has_prototype) = match declaration {
                 ExternalDeclaration::FunctionDefinition(function) => (
                     function.declaration.name.as_str(),
                     function.declaration.parameters.as_slice(),
+                    function.declaration.variadic,
+                    function.declaration.has_prototype,
                 ),
-                ExternalDeclaration::FunctionPrototype(function) => {
-                    (function.name.as_str(), function.parameters.as_slice())
-                }
+                ExternalDeclaration::FunctionPrototype(function) => (
+                    function.name.as_str(),
+                    function.parameters.as_slice(),
+                    function.variadic,
+                    function.has_prototype,
+                ),
                 ExternalDeclaration::Global(_) => continue,
+            };
+            let return_type = match declaration {
+                ExternalDeclaration::FunctionDefinition(function) => {
+                    &function.declaration.return_type
+                }
+                ExternalDeclaration::FunctionPrototype(function) => &function.return_type,
+                ExternalDeclaration::Global(_) => unreachable!(),
             };
             locals
                 .entry(name.to_owned())
                 .or_insert_with(|| NativeLocation::FunctionParameters {
-                    layout: NativeCallLayout::new(parameters, &unit.records),
+                    layout: NativeCallLayout::new(
+                        parameters,
+                        &unit.records,
+                        variadic,
+                        has_prototype,
+                    ),
                     wide_return_unsigned: {
                         let return_type = match declaration {
                             ExternalDeclaration::FunctionDefinition(function) => {
@@ -1744,18 +1936,11 @@ pub fn compile_minimal_program_to_assembly(
                             .then(|| is_native_unsigned_word_type(return_type))
                     },
                     word_return_unsigned: {
-                        let return_type = match declaration {
-                            ExternalDeclaration::FunctionDefinition(function) => {
-                                &function.declaration.return_type
-                            }
-                            ExternalDeclaration::FunctionPrototype(function) => {
-                                &function.return_type
-                            }
-                            ExternalDeclaration::Global(_) => unreachable!(),
-                        };
                         native_byte_type(return_type).is_none()
                             && is_native_unsigned_word_type(return_type)
                     },
+                    returns_pointer: native_is_pointer_type(return_type, &unit.records),
+                    pointer_return_target_is_const: native_pointer_target_is_const(return_type),
                     float_return_size: match declaration {
                         ExternalDeclaration::FunctionDefinition(function) => {
                             native_floating_type_size(&function.declaration.return_type)
@@ -1893,6 +2078,32 @@ pub fn compile_minimal_program_to_assembly(
                 };
             }
         }
+        let mut object_qualifiers = HashMap::new();
+        for global in &globals {
+            object_qualifiers.insert(
+                global.name.clone(),
+                native_object_is_const_qualified(&global.c_type),
+            );
+        }
+        for parameter in &function.declaration.parameters {
+            if let Some(name) = &parameter.name {
+                object_qualifiers.insert(
+                    name.clone(),
+                    native_object_is_const_qualified(&parameter.c_type),
+                );
+            }
+        }
+        collect_native_object_qualifiers(&function.body, &mut object_qualifiers);
+        let const_objects = object_qualifiers
+            .into_iter()
+            .filter_map(|(name, is_const)| is_const.then_some(name))
+            .collect::<HashSet<_>>();
+        if let Some(line) =
+            native_const_write_line_statement(&function.body, &locals, &const_objects)
+        {
+            eprintln!("write to const-qualified object at line {line}");
+            return Ok(None);
+        }
         let returns_void = function.declaration.return_type.trim() == "void";
         let mut loop_labels = Vec::new();
         let mut returned = false;
@@ -1980,7 +2191,7 @@ pub fn compile_minimal_program_to_assembly(
 
 fn expression_calls_are_defined(
     expression: &Expression,
-    defined_functions: &HashMap<String, (usize, bool)>,
+    defined_functions: &HashMap<String, (usize, bool, bool, bool)>,
     allow_void_call: bool,
 ) -> bool {
     match &expression.kind {
@@ -1990,11 +2201,13 @@ fn expression_calls_are_defined(
         } => {
             let valid_target = match &function.kind {
                 ExpressionKind::Atom(name) => {
-                    defined_functions.get(name).is_some_and(|(arity, is_void)| {
-                        (*arity == arguments.len()
-                            || (name == "printf" && arguments.len() >= *arity))
-                            && (allow_void_call || !is_void)
-                    }) && (name != "printf" || native_printf_call_is_supported(arguments))
+                    defined_functions.get(name).is_some_and(
+                        |(arity, is_void, variadic, has_prototype)| {
+                            ((!has_prototype || *variadic) && arguments.len() >= *arity
+                                || *has_prototype && !variadic && *arity == arguments.len())
+                                && (allow_void_call || !is_void)
+                        },
+                    ) && (name != "printf" || native_printf_call_is_supported(arguments))
                 }
                 _ => false,
             };
@@ -2067,7 +2280,7 @@ fn expression_calls_are_defined(
 
 fn statement_calls_are_defined(
     statement: &Statement,
-    defined_functions: &HashMap<String, (usize, bool)>,
+    defined_functions: &HashMap<String, (usize, bool, bool, bool)>,
 ) -> bool {
     let expression_is_defined = |expression: &Expression| {
         expression_calls_are_defined(expression, defined_functions, false)
@@ -2641,7 +2854,7 @@ fn collect_native_locals(
                         if reserve_frame_register && *next_register == 3 {
                             *next_register += 1;
                         }
-                        let byte_signed = match declaration.c_type.trim() {
+                        let byte_signed = match native_unqualified_type(&declaration.c_type) {
                             "char" | "signed char" => Some(true),
                             "unsigned char" => Some(false),
                             _ => None,
@@ -2661,6 +2874,8 @@ fn collect_native_locals(
                         }
                         let location = if *next_register <= 3
                             && !stack_required.contains(&declaration.name)
+                            && (native_pointer_element_floating_size(&declaration.c_type) == 0
+                                || !reserve_frame_register)
                         {
                             let location =
                                 if let Some((element_size, element_signed)) = pointer_element {
@@ -2668,6 +2883,9 @@ fn collect_native_locals(
                                         register: *next_register,
                                         element_size,
                                         element_signed,
+                                        element_is_const: native_pointer_target_is_const(
+                                            &declaration.c_type,
+                                        ),
                                         element_floating_size: native_pointer_element_floating_size(
                                             &declaration.c_type,
                                         ),
@@ -2706,6 +2924,9 @@ fn collect_native_locals(
                                     offset,
                                     element_size,
                                     element_signed,
+                                    element_is_const: native_pointer_target_is_const(
+                                        &declaration.c_type,
+                                    ),
                                     element_floating_size: native_pointer_element_floating_size(
                                         &declaration.c_type,
                                     ),
@@ -3644,8 +3865,15 @@ fn native_expression_integer_type(
         )),
         ExpressionKind::Member { .. } => {
             let field = native_expression_record_field(expression, locals)?;
-            if let Some((_, width)) = field.bit_field {
+            if field.floating_size != 0 {
+                None
+            } else if let Some((_, width)) = field.bit_field {
                 Some(word(!field.signed && width == 16))
+            } else if field.size == 4
+                && field.dimensions.is_empty()
+                && field.record_layout.is_none()
+            {
+                Some(wide(!field.signed))
             } else if field.size <= 2
                 && field.dimensions.is_empty()
                 && field.record_layout.is_none()
@@ -3654,6 +3882,25 @@ fn native_expression_integer_type(
             } else {
                 None
             }
+        }
+        ExpressionKind::Index {
+            expression: base, ..
+        } => {
+            let mut base = base.as_ref();
+            let mut index_count = 1;
+            while let ExpressionKind::Index {
+                expression: parent, ..
+            } = &base.kind
+            {
+                base = parent;
+                index_count += 1;
+            }
+            let field = native_expression_record_field(base, locals)?;
+            (field.floating_size == 0
+                && field.dimensions.len() == index_count
+                && field.element_size == 4
+                && field.record_layout.is_none())
+            .then(|| wide(!field.signed))
         }
         ExpressionKind::Call { function, .. } => {
             let ExpressionKind::Atom(name) = &function.kind else {
@@ -3762,6 +4009,71 @@ fn emit_native_i32_source_inner(
                 emit_native_i32_source(operand, locals, label_counter, assembly)
             }
         }
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } if native_expression_is_wide_integer(expression, locals) => {
+            if native_array_index_is_partial(base, index, locals) {
+                return false;
+            }
+            let Some((element_size, _)) = emit_native_indexed_element_address(
+                expression,
+                base,
+                index,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if element_size != 4 {
+                return false;
+            }
+            assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+            true
+        }
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } => {
+            let Some(field) = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if field.bit_field.is_some() {
+                if !emit_native_expression(
+                    expression,
+                    0,
+                    &[4, 5, 6],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                assembly.push_str("    MOV R5, R0\n    AND R5, 0xFFFF\n    LDI R4, 0\n");
+                if !native_expression_is_unsigned(expression, locals) {
+                    assembly.push_str("    MOV R4, R5\n    ASR R4, 15\n");
+                }
+                return true;
+            }
+            if field.size != 4 || field.record_layout.is_some() || !field.dimensions.is_empty() {
+                return false;
+            }
+            assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+            true
+        }
         ExpressionKind::Unary { operator, operand }
             if matches!(operator.as_str(), "+" | "-" | "~")
                 && native_expression_is_wide_integer(expression, locals) =>
@@ -3805,6 +4117,7 @@ fn emit_native_i32_source_inner(
                 locals,
                 label_counter,
                 assembly,
+                false,
             ) {
                 return false;
             }
@@ -3904,7 +4217,14 @@ fn emit_native_i32_source_inner(
         ExpressionKind::Assignment { .. }
             if native_expression_is_wide_integer(expression, locals) =>
         {
-            emit_native_assignment_store(expression, &[4, 5, 6], locals, label_counter, assembly)
+            emit_native_assignment_store(
+                expression,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+                false,
+            )
         }
         _ if !native_expression_is_wide_integer(expression, locals) => {
             if !emit_native_expression(expression, 0, &[4, 5, 6], locals, label_counter, assembly) {
@@ -4204,25 +4524,330 @@ fn native_expression_record_field<'a>(
         .get(name)
 }
 
+fn native_location_pointer_target_is_const(location: &NativeLocation) -> bool {
+    native_location_pointer_qualifier(location).unwrap_or(false)
+}
+
+fn native_location_pointer_qualifier(location: &NativeLocation) -> Option<bool> {
+    match location {
+        NativeLocation::PointerRegister {
+            element_is_const, ..
+        }
+        | NativeLocation::PointerStack {
+            element_is_const, ..
+        }
+        | NativeLocation::GlobalPointer {
+            element_is_const, ..
+        } => Some(*element_is_const),
+        _ => None,
+    }
+}
+
+fn native_expression_pointer_target_is_const(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    let ExpressionKind::Atom(name) = &expression.kind else {
+        return false;
+    };
+    locals
+        .get(name)
+        .is_some_and(native_location_pointer_target_is_const)
+}
+
+fn native_assignment_discards_pointer_const(
+    target: &Expression,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    let ExpressionKind::Atom(name) = &target.kind else {
+        return false;
+    };
+    let Some(target_is_const) = locals.get(name).and_then(native_location_pointer_qualifier) else {
+        return false;
+    };
+    !target_is_const && native_expression_pointer_target_is_const(value, locals)
+}
+
+fn native_expression_is_const_lvalue(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            ..
+        } => {
+            native_expression_record_field(expression, locals).is_some_and(|field| field.is_const)
+                || if operator == "->" {
+                    native_expression_pointer_target_is_const(base, locals)
+                } else {
+                    native_expression_is_const_lvalue(base, locals)
+                }
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            native_expression_pointer_target_is_const(operand, locals)
+        }
+        ExpressionKind::Index {
+            expression: base, ..
+        } => {
+            native_expression_pointer_target_is_const(base, locals)
+                || native_expression_is_const_lvalue(base, locals)
+        }
+        _ => false,
+    }
+}
+
+fn collect_native_object_qualifiers(statement: &Statement, qualifiers: &mut HashMap<String, bool>) {
+    match &statement.kind {
+        StatementKind::Compound(statements) => {
+            for statement in statements {
+                collect_native_object_qualifiers(statement, qualifiers);
+            }
+        }
+        StatementKind::Declaration(declarations) => {
+            for declaration in declarations {
+                qualifiers.insert(
+                    declaration.name.clone(),
+                    native_object_is_const_qualified(&declaration.c_type),
+                );
+            }
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_native_object_qualifiers(then_branch, qualifiers);
+            if let Some(else_branch) = else_branch {
+                collect_native_object_qualifiers(else_branch, qualifiers);
+            }
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Label {
+            statement: body, ..
+        } => collect_native_object_qualifiers(body, qualifiers),
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            if let Some(initializer) = initializer {
+                collect_native_object_qualifiers(initializer, qualifiers);
+            }
+            collect_native_object_qualifiers(body, qualifiers);
+        }
+        StatementKind::Switch { cases, .. } => {
+            for (_, statements) in cases {
+                for statement in statements {
+                    collect_native_object_qualifiers(statement, qualifiers);
+                }
+            }
+        }
+        StatementKind::Expression(_)
+        | StatementKind::Return(_)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => {}
+    }
+}
+
+fn native_expression_is_const_lvalue_with_objects(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> bool {
+    if native_expression_is_const_lvalue(expression, locals) {
+        return true;
+    }
+    match &expression.kind {
+        ExpressionKind::Atom(name) => const_objects.contains(name),
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            ..
+        } => {
+            operator != "->"
+                && native_expression_is_const_lvalue_with_objects(base, locals, const_objects)
+        }
+        ExpressionKind::Index {
+            expression: base, ..
+        } => native_expression_is_const_lvalue_with_objects(base, locals, const_objects),
+        _ => false,
+    }
+}
+
+fn native_const_write_line_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Assignment { target, value, .. } => {
+            if native_expression_is_const_lvalue_with_objects(target, locals, const_objects) {
+                return Some(target.line);
+            }
+            native_const_write_line_expression(target, locals, const_objects)
+                .or_else(|| native_const_write_line_expression(value, locals, const_objects))
+        }
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "++" | "--") => {
+            if native_expression_is_const_lvalue_with_objects(operand, locals, const_objects) {
+                Some(operand.line)
+            } else {
+                native_const_write_line_expression(operand, locals, const_objects)
+            }
+        }
+        ExpressionKind::Postfix {
+            operator,
+            expression,
+        } if matches!(operator.as_str(), "++" | "--") => {
+            if native_expression_is_const_lvalue_with_objects(expression, locals, const_objects) {
+                Some(expression.line)
+            } else {
+                native_const_write_line_expression(expression, locals, const_objects)
+            }
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            native_const_write_line_expression(operand, locals, const_objects)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_const_write_line_expression(left, locals, const_objects)
+                .or_else(|| native_const_write_line_expression(right, locals, const_objects))
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => native_const_write_line_expression(condition, locals, const_objects)
+            .or_else(|| native_const_write_line_expression(when_true, locals, const_objects))
+            .or_else(|| native_const_write_line_expression(when_false, locals, const_objects)),
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => native_const_write_line_expression(function, locals, const_objects).or_else(|| {
+            arguments.iter().find_map(|argument| {
+                native_const_write_line_expression(argument, locals, const_objects)
+            })
+        }),
+        ExpressionKind::Index { expression, index } => {
+            native_const_write_line_expression(expression, locals, const_objects)
+                .or_else(|| native_const_write_line_expression(index, locals, const_objects))
+        }
+        ExpressionKind::Member { expression, .. } => {
+            native_const_write_line_expression(expression, locals, const_objects)
+        }
+        ExpressionKind::InitializerList(values) => values
+            .iter()
+            .find_map(|value| native_const_write_line_expression(value, locals, const_objects)),
+        ExpressionKind::Atom(_)
+        | ExpressionKind::SizeofType(_)
+        | ExpressionKind::Postfix { .. } => None,
+    }
+}
+
+fn native_const_write_line_statement(
+    statement: &Statement,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> Option<usize> {
+    match &statement.kind {
+        StatementKind::Compound(statements) => statements.iter().find_map(|statement| {
+            native_const_write_line_statement(statement, locals, const_objects)
+        }),
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .filter_map(|declaration| declaration.initializer.as_ref())
+            .find_map(|initializer| {
+                native_const_write_line_expression(initializer, locals, const_objects)
+            }),
+        StatementKind::Expression(Some(expression)) | StatementKind::Return(Some(expression)) => {
+            native_const_write_line_expression(expression, locals, const_objects)
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => native_const_write_line_expression(condition, locals, const_objects)
+            .or_else(|| native_const_write_line_statement(then_branch, locals, const_objects))
+            .or_else(|| {
+                else_branch.as_ref().and_then(|branch| {
+                    native_const_write_line_statement(branch, locals, const_objects)
+                })
+            }),
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            native_const_write_line_expression(condition, locals, const_objects)
+                .or_else(|| native_const_write_line_statement(body, locals, const_objects))
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => initializer
+            .as_ref()
+            .and_then(|initializer| {
+                native_const_write_line_statement(initializer, locals, const_objects)
+            })
+            .or_else(|| {
+                condition.as_ref().and_then(|condition| {
+                    native_const_write_line_expression(condition, locals, const_objects)
+                })
+            })
+            .or_else(|| {
+                update.as_ref().and_then(|update| {
+                    native_const_write_line_expression(update, locals, const_objects)
+                })
+            })
+            .or_else(|| native_const_write_line_statement(body, locals, const_objects)),
+        StatementKind::Switch { expression, cases } => {
+            native_const_write_line_expression(expression, locals, const_objects).or_else(|| {
+                cases.iter().find_map(|(value, statements)| {
+                    value
+                        .as_ref()
+                        .and_then(|value| {
+                            native_const_write_line_expression(value, locals, const_objects)
+                        })
+                        .or_else(|| {
+                            statements.iter().find_map(|statement| {
+                                native_const_write_line_statement(statement, locals, const_objects)
+                            })
+                        })
+                })
+            })
+        }
+        StatementKind::Label { statement, .. } => {
+            native_const_write_line_statement(statement, locals, const_objects)
+        }
+        StatementKind::Expression(None)
+        | StatementKind::Return(None)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => None,
+    }
+}
+
 fn validate_native_bitfield_expression(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
 ) -> Result<(), CCompilerError> {
-    if let ExpressionKind::Assignment {
-        operator,
-        target,
-        value,
+    if let ExpressionKind::Cast {
+        c_type,
+        expression: operand,
     } = &expression.kind
-        && operator != "="
-        && native_expression_record_field(target, locals)
-            .is_some_and(|field| field.bit_field.is_some())
-        && (native_expression_floating_size(value, locals).is_some()
-            || native_sizeof_expression(value, locals).is_some_and(|size| size > 2))
+        && ((c_type.trim().ends_with('*')
+            && native_expression_floating_size(operand, locals).is_some())
+            || (native_floating_type_size(c_type).is_some()
+                && native_expression_pointer_element_size(operand, locals).is_some()))
     {
         return Err(error(
             expression.filename.as_deref().unwrap_or("<source>"),
             expression.line,
-            "floating and wide integer bit-field compound assignments are not supported",
+            "conversion between floating-point and pointer types is not supported",
         ));
     }
     let prohibited_operand = match &expression.kind {
@@ -4900,6 +5525,40 @@ fn emit_native_f32_expression_inner(
         return emit_native_floating_conversion(expression, 4, locals, label_counter, assembly);
     }
     match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "++" | "--") => {
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                4,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            emit_native_f32_expression(operand, locals, label_counter, assembly)
+        }
+        ExpressionKind::Postfix {
+            operator,
+            expression: operand,
+        } => {
+            if !emit_native_f32_expression(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n");
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                4,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    POP R5\n    POP R4\n");
+            true
+        }
         ExpressionKind::Atom(value) => {
             if let Some(location) = locals.get(value) {
                 let (offset, global) = match location {
@@ -5001,9 +5660,14 @@ fn emit_native_f32_expression_inner(
                 emit_native_f32_expression(expression, locals, label_counter, assembly)
             }
         }
-        ExpressionKind::Assignment { .. } => {
-            emit_native_assignment_store(expression, &[4, 5, 6, 7], locals, label_counter, assembly)
-        }
+        ExpressionKind::Assignment { .. } => emit_native_assignment_store(
+            expression,
+            &[4, 5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+            false,
+        ),
         ExpressionKind::Binary {
             operator,
             left,
@@ -5134,6 +5798,33 @@ fn emit_native_f32_expression_inner(
             assembly.push_str("    LDW R4, R7\n    LDI R6, 2\n    ADD R7, R6\n    LDW R5, R7\n");
             true
         }
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } => {
+            let Some(field) = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if field.floating_size != 4
+                || field.bit_field.is_some()
+                || field.record_layout.is_some()
+                || !field.dimensions.is_empty()
+            {
+                return false;
+            }
+            assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+            true
+        }
         ExpressionKind::Unary { operator, operand } if operator == "*" => {
             if native_expression_pointer_element_size(operand, locals) != Some(4)
                 || !emit_native_expression(
@@ -5218,8 +5909,10 @@ fn emit_native_f64_expression(
         emit_native_save_frame_pointer(assembly);
     }
     let wide_pointer = emit_native_save_r1(locals, assembly);
+    assembly.push_str("    PUSH R2\n    PUSH R3\n");
     let emitted = emit_native_f64_expression_inner(expression, locals, label_counter, assembly);
     if emitted {
+        assembly.push_str("    POP R3\n    POP R2\n");
         if wide_pointer {
             assembly.push_str("    MOV R0, R7\n");
         }
@@ -5244,6 +5937,40 @@ fn emit_native_f64_expression_inner(
         return false;
     }
     match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "++" | "--") => {
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                8,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            emit_native_f64_expression(operand, locals, label_counter, assembly)
+        }
+        ExpressionKind::Postfix {
+            operator,
+            expression: operand,
+        } => {
+            if !emit_native_f64_expression(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n    PUSH R6\n    PUSH R7\n");
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                8,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    POP R7\n    POP R6\n    POP R5\n    POP R4\n");
+            true
+        }
         ExpressionKind::Atom(value) => {
             if let Some(location) = locals.get(value) {
                 let (offset, global) = match location {
@@ -5321,9 +6048,14 @@ fn emit_native_f64_expression_inner(
             Some(8) => emit_native_f64_operand(expression, locals, label_counter, assembly),
             _ => false,
         },
-        ExpressionKind::Assignment { .. } => {
-            emit_native_assignment_store(expression, &[4, 5, 6, 7], locals, label_counter, assembly)
-        }
+        ExpressionKind::Assignment { .. } => emit_native_assignment_store(
+            expression,
+            &[4, 5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+            false,
+        ),
         ExpressionKind::Binary {
             operator,
             left,
@@ -5401,6 +6133,37 @@ fn emit_native_f64_expression_inner(
             assembly.push_str(
                 "    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n\
                  INC R7\n    INC R7\n    LDW R6, R7\n    INC R7\n    INC R7\n    LDW R7, R7\n",
+            );
+            true
+        }
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } => {
+            let Some(field) = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if field.floating_size != 8
+                || field.bit_field.is_some()
+                || field.record_layout.is_some()
+                || !field.dimensions.is_empty()
+            {
+                return false;
+            }
+            assembly.push_str(
+                "    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n\
+                 INC R7\n    INC R7\n    LDW R6, R7\n\
+                 INC R7\n    INC R7\n    LDW R7, R7\n",
             );
             true
         }
@@ -5565,7 +6328,8 @@ fn emit_native_f64_comparison(
     if frame_pointer {
         emit_native_save_frame_pointer(assembly);
     }
-    let saved_register = (destination != 1).then(|| emit_native_save_r1(locals, assembly));
+    let saved_register = emit_native_save_r1(locals, assembly);
+    assembly.push_str("    PUSH R2\n    PUSH R3\n");
     let reverse_operands = matches!(operator, ">" | ">=");
     let (first, second) = if reverse_operands {
         (right, left)
@@ -5594,17 +6358,19 @@ fn emit_native_f64_comparison(
     *label_counter += 1;
     assembly.push_str(&format!(
         "    {branch} __c_f64cmp_{label}_true\n\
-         LDI R{destination}, 0\n\
+         LDI R4, 0\n\
          JMPX __c_f64cmp_{label}_end\n\
          __c_f64cmp_{label}_true:\n\
-         LDI R{destination}, 1\n\
+         LDI R4, 1\n\
          __c_f64cmp_{label}_end:\n"
     ));
-    if let Some(wide_pointer) = saved_register {
-        emit_native_restore_r1(wide_pointer, assembly);
-    }
+    assembly.push_str("    POP R3\n    POP R2\n");
+    emit_native_restore_r1(saved_register, assembly);
     if frame_pointer {
         emit_native_restore_frame_pointer(6, assembly);
+    }
+    if destination != 4 {
+        assembly.push_str(&format!("    MOV R{destination}, R4\n"));
     }
     true
 }
@@ -5695,23 +6461,20 @@ fn emit_native_truth_value(
         ));
         true
     } else if native_expression_is_f64(expression, locals) {
-        if !emit_native_f64_expression(expression, locals, label_counter, assembly) {
-            return false;
-        }
-        let label = *label_counter;
-        *label_counter += 1;
-        assembly.push_str(&format!(
-            "    LDI R0, 0\n    LDI R1, 0\n    LDI R2, 0\n    LDI R3, 0\n\
-             F64CMP R4, R0\n\
-             BZX __c_f64truth_{label}_false\n\
-             LDI R0, 1\n    JMPX __c_f64truth_{label}_end\n\
-             __c_f64truth_{label}_false:\n\
-             LDI R0, 0\n__c_f64truth_{label}_end:\n"
-        ));
-        if destination != 0 {
-            assembly.push_str(&format!("    MOV R{destination}, R0\n"));
-        }
-        true
+        let zero = Expression {
+            kind: ExpressionKind::Atom("0.0".to_owned()),
+            line: expression.line,
+            filename: expression.filename.clone(),
+        };
+        emit_native_f64_comparison(
+            "!=",
+            expression,
+            &zero,
+            destination,
+            locals,
+            label_counter,
+            assembly,
+        )
     } else if native_expression_is_f32(expression, locals) {
         if !emit_native_f32_expression(expression, locals, label_counter, assembly) {
             return false;
@@ -5772,7 +6535,9 @@ fn native_expression_floating_size(
             }
             _ => None,
         },
-        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "+" | "-") => {
+        ExpressionKind::Unary { operator, operand }
+            if matches!(operator.as_str(), "+" | "-" | "++" | "--") =>
+        {
             native_expression_floating_size(operand, locals)
         }
         ExpressionKind::Cast { c_type, .. } => native_floating_type_size(c_type),
@@ -5793,6 +6558,10 @@ fn native_expression_floating_size(
         ExpressionKind::Assignment { target, .. } => {
             native_expression_floating_size(target, locals)
         }
+        ExpressionKind::Member { .. } => native_expression_record_field(expression, locals)
+            .filter(|field| field.dimensions.is_empty() && field.record_layout.is_none())
+            .map(|field| field.floating_size)
+            .filter(|size| *size != 0),
         ExpressionKind::Unary { operator, operand } if operator == "*" => {
             native_expression_pointer_floating_size(operand, locals)
         }
@@ -5812,11 +6581,17 @@ fn native_expression_floating_size(
         }
         ExpressionKind::Index { expression, .. } => {
             let mut base = expression;
+            let mut index_count = 1;
             while let ExpressionKind::Index {
                 expression: parent, ..
             } = &base.kind
             {
                 base = parent;
+                index_count += 1;
+            }
+            if let Some(field) = native_expression_record_field(base, locals) {
+                return (field.dimensions.len() == index_count && field.floating_size != 0)
+                    .then_some(field.floating_size);
             }
             let ExpressionKind::Atom(name) = &base.kind else {
                 return None;
@@ -5932,6 +6707,105 @@ fn emit_native_f32_scalar_store(
     }
 }
 
+fn emit_native_floating_scalar_update(
+    target: &Expression,
+    operator: &str,
+    size: usize,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let supported_lvalue = match &target.kind {
+        ExpressionKind::Atom(name) => matches!(
+            locals.get(name),
+            Some(NativeLocation::StackFloatingPointScalar { size: target_size, .. })
+                | Some(NativeLocation::FloatingPointScalar { size: target_size })
+                if *target_size == size
+        ),
+        ExpressionKind::Index { expression, index } => {
+            !native_expression_has_side_effects(expression)
+                && !native_expression_has_side_effects(index)
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            !native_expression_has_side_effects(operand)
+        }
+        ExpressionKind::Member {
+            expression,
+            operator: _,
+            ..
+        } => !native_expression_has_side_effects(expression),
+        _ => false,
+    };
+    let compound_operator = match operator {
+        "++" => "+=",
+        "--" => "-=",
+        _ => return false,
+    };
+    if !supported_lvalue || native_expression_floating_size(target, locals) != Some(size) {
+        return false;
+    }
+    let value = Expression {
+        kind: ExpressionKind::Atom(if size == 4 {
+            "1.0f".to_owned()
+        } else {
+            "1.0".to_owned()
+        }),
+        line: target.line,
+        filename: target.filename.clone(),
+    };
+    let assignment = Expression {
+        kind: ExpressionKind::Assignment {
+            operator: compound_operator.to_owned(),
+            target: Box::new(target.clone()),
+            value: Box::new(value),
+        },
+        line: target.line,
+        filename: target.filename.clone(),
+    };
+    emit_native_assignment_store(
+        &assignment,
+        &[4, 5, 6, 7],
+        locals,
+        label_counter,
+        assembly,
+        false,
+    )
+}
+
+fn native_expression_has_side_effects(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Call { .. }
+        | ExpressionKind::Assignment { .. }
+        | ExpressionKind::Postfix { .. } => true,
+        ExpressionKind::Unary { operator, operand } => {
+            matches!(operator.as_str(), "++" | "--") || native_expression_has_side_effects(operand)
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Index {
+            expression: left,
+            index: right,
+        } => native_expression_has_side_effects(left) || native_expression_has_side_effects(right),
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            native_expression_has_side_effects(condition)
+                || native_expression_has_side_effects(when_true)
+                || native_expression_has_side_effects(when_false)
+        }
+        ExpressionKind::Member { expression, .. }
+        | ExpressionKind::Cast { expression, .. }
+        | ExpressionKind::SizeofExpression(expression) => {
+            native_expression_has_side_effects(expression)
+        }
+        ExpressionKind::InitializerList(values) => {
+            values.iter().any(native_expression_has_side_effects)
+        }
+        ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => false,
+    }
+}
+
 fn emit_native_f64_scalar_store(
     name: &str,
     locals: &HashMap<String, NativeLocation>,
@@ -5991,28 +6865,6 @@ fn native_expression_pointer_element_size(
         } if operator == "+" => native_expression_pointer_element_size(left, locals)
             .or_else(|| native_expression_pointer_element_size(right, locals)),
         _ => None,
-    }
-}
-
-fn native_expression_pointer_element_is_f32(
-    expression: &Expression,
-    locals: &HashMap<String, NativeLocation>,
-) -> bool {
-    match &expression.kind {
-        ExpressionKind::Atom(name) => matches!(
-            locals.get(name),
-            Some(location) if native_location_floating_element_size(location) == Some(4)
-        ),
-        ExpressionKind::Cast { c_type, .. } => native_pointer_element_floating_size(c_type) == 4,
-        ExpressionKind::Binary {
-            operator,
-            left,
-            right,
-        } if operator == "+" => {
-            native_expression_pointer_element_is_f32(left, locals)
-                || native_expression_pointer_element_is_f32(right, locals)
-        }
-        _ => false,
     }
 }
 
@@ -6675,6 +7527,29 @@ fn emit_native_expression(
         ExpressionKind::Cast { c_type, expression }
             if let Some(signed) = native_byte_type(c_type) =>
         {
+            if let Some(size) = native_expression_floating_size(expression, locals) {
+                if !emit_native_floating_conversion(
+                    expression,
+                    size,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                assembly.push_str(&format!(
+                    "    {} R{destination}, R4\n",
+                    match (size, signed) {
+                        (4, true) => "F32TOI16",
+                        (4, false) => "F32TOU16",
+                        (8, true) => "F64TOI16",
+                        (8, false) => "F64TOU16",
+                        _ => return false,
+                    }
+                ));
+                emit_native_byte_normalization(destination, signed, assembly);
+                return true;
+            }
             if !emit_native_expression(
                 expression,
                 destination,
@@ -7170,6 +8045,7 @@ fn emit_native_expression(
                         | NativeLocation::ByteStackScalar { .. }
                         | NativeLocation::StackFloatingPointScalar { .. }
                         | NativeLocation::PointerStack { .. }
+                        | NativeLocation::StackRecord { .. }
                         | NativeLocation::StackArray { .. }
                 )
             });
@@ -7241,11 +8117,76 @@ fn emit_native_expression(
                 let Some(layout) = layout else {
                     return false;
                 };
-                if arguments.len() != layout.arguments.len() {
+                if arguments.len() < layout.arguments.len()
+                    || (layout.has_prototype
+                        && !layout.variadic
+                        && arguments.len() != layout.arguments.len())
+                {
                     return false;
                 }
-                for (expression, argument) in arguments.iter().zip(&layout.arguments).rev() {
+                for (index, expression) in arguments.iter().enumerate().rev() {
+                    if !layout.has_prototype || index >= layout.arguments.len() {
+                        let Some(size) = emit_native_variadic_argument(
+                            expression,
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) else {
+                            return false;
+                        };
+                        argument_bytes += size;
+                        if argument_bytes > u16::MAX as usize {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let argument = &layout.arguments[index];
+                    if matches!(&argument.kind, NativeArgumentKind::Pointer)
+                        && !argument.pointer_target_is_const
+                        && native_expression_pointer_target_is_const(expression, locals)
+                    {
+                        eprintln!(
+                            "argument discards pointer target const qualification at line {}",
+                            expression.line
+                        );
+                        return false;
+                    }
                     match argument.kind {
+                        NativeArgumentKind::Record(ref record_layout) => {
+                            if record_layout.size % 2 != 0 {
+                                return false;
+                            }
+                            let address = Expression {
+                                kind: ExpressionKind::Unary {
+                                    operator: "&".to_owned(),
+                                    operand: Box::new(expression.clone()),
+                                },
+                                line: expression.line,
+                                filename: expression.filename.clone(),
+                            };
+                            if !emit_native_expression(
+                                &address,
+                                0,
+                                &[4, 5, 6],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            assembly.push_str("    MOV R7, R0\n");
+                            for offset in (0..record_layout.size).step_by(2).rev() {
+                                if offset == 0 {
+                                    assembly.push_str("    LDW R5, R7\n");
+                                } else {
+                                    assembly.push_str(&format!(
+                                        "    MOV R0, R7\n    LDI R6, {offset}\n\
+                                         ADD R0, R6\n    LDW R5, R0\n"
+                                    ));
+                                }
+                                assembly.push_str("    PUSH R5\n");
+                            }
+                        }
                         NativeArgumentKind::Binary32 => {
                             if !emit_native_floating_conversion(
                                 expression,
@@ -7306,7 +8247,10 @@ fn emit_native_expression(
                         }
                     }
                 }
-                argument_bytes = layout.size;
+                argument_bytes += layout.size;
+                if argument_bytes > u16::MAX as usize {
+                    return false;
+                }
             }
             assembly.push_str(&format!(
                 "    CALLX {}\n",
@@ -7471,6 +8415,27 @@ fn emit_native_assignment(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
+    emit_native_assignment_with_const(
+        expression,
+        result_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_native_assignment_with_const(
+    expression: &Expression,
+    result_destination: Option<u8>,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+    allow_const_target: bool,
+) -> bool {
     let ExpressionKind::Assignment {
         operator,
         target,
@@ -7479,8 +8444,22 @@ fn emit_native_assignment(
     else {
         return false;
     };
-    if native_expression_record_field(target, locals).is_some_and(|field| field.bit_field.is_some())
-    {
+    if !allow_const_target && native_assignment_discards_pointer_const(target, value, locals) {
+        eprintln!(
+            "assignment discards pointer target const qualification at line {}",
+            target.line
+        );
+        return false;
+    }
+    let field = native_expression_record_field(target, locals);
+    if !allow_const_target && native_expression_is_const_lvalue(target, locals) {
+        eprintln!(
+            "assignment to const-qualified lvalue at line {}",
+            target.line
+        );
+        return false;
+    }
+    if field.is_some_and(|field| field.bit_field.is_some()) {
         return emit_native_bitfield_assignment(
             target,
             operator,
@@ -7497,6 +8476,7 @@ fn emit_native_assignment(
         locals,
         label_counter,
         assembly,
+        allow_const_target,
     ) {
         return false;
     }
@@ -7543,6 +8523,79 @@ fn emit_native_bitfield_assignment(
         return false;
     };
     assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+    if operator != "="
+        && (native_expression_floating_size(value, locals).is_some()
+            || native_expression_is_wide_integer(value, locals))
+    {
+        let compound_operator = operator.trim_end_matches('=');
+        if native_expression_floating_size(value, locals).is_some()
+            && !matches!(compound_operator, "+" | "-" | "*" | "/")
+        {
+            return false;
+        }
+        assembly.push_str("    LDW R5, R7\n    PUSH R5\n");
+        emit_native_bitfield_extract(5, &field, assembly);
+        assembly.push_str("    MOV R2, R5\n");
+        let temporary_name = "__sc16_bitfield_compound_value";
+        let mut typed_locals = locals.clone();
+        typed_locals.insert(
+            temporary_name.to_owned(),
+            NativeLocation::Register {
+                register: 2,
+                unsigned: !field.signed && field.bit_field.unwrap().1 == 16,
+            },
+        );
+        let temporary_value = Expression {
+            kind: ExpressionKind::Atom(temporary_name.to_owned()),
+            line: target.line,
+            filename: target.filename.clone(),
+        };
+        let compound = Expression {
+            kind: ExpressionKind::Binary {
+                operator: compound_operator.to_owned(),
+                left: Box::new(temporary_value),
+                right: Box::new(value.clone()),
+            },
+            line: target.line,
+            filename: target.filename.clone(),
+        };
+        if native_expression_floating_size(value, locals).is_some() {
+            let converted = Expression {
+                kind: ExpressionKind::Cast {
+                    c_type: if field.signed { "int" } else { "unsigned int" }.to_owned(),
+                    expression: Box::new(compound),
+                },
+                line: target.line,
+                filename: target.filename.clone(),
+            };
+            if !emit_native_expression(
+                &converted,
+                4,
+                &[5, 6],
+                &typed_locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    MOV R0, R4\n");
+        } else {
+            if !emit_native_i32_source(&compound, &typed_locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOV R0, R5\n");
+        }
+        assembly.push_str(
+            "    PUSH R0\n    POP R0\n    POP R5\n    MOVSP R6\n    LDP R7, R6\n    ADJSP 4\n",
+        );
+        emit_native_bitfield_store(&field, assembly);
+        if let Some(destination) = destination
+            && destination != 0
+        {
+            assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+        }
+        return true;
+    }
     let converted_value;
     let value = if native_expression_floating_size(value, locals).is_some() {
         converted_value = Expression {
@@ -7632,12 +8685,83 @@ fn emit_native_bitfield_update(
     true
 }
 
+fn emit_native_f32_member_assignment_store(
+    operator: &str,
+    target: &Expression,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let ExpressionKind::Member {
+        expression: base,
+        operator: member_operator,
+        name,
+    } = &target.kind
+    else {
+        return false;
+    };
+    let wide_pointer = emit_native_save_r1(locals, assembly);
+    let Some(field) = emit_native_member_address(
+        base,
+        member_operator,
+        name,
+        0,
+        &[4, 5, 6],
+        locals,
+        label_counter,
+        assembly,
+    ) else {
+        return false;
+    };
+    if field.floating_size != 4
+        || field.bit_field.is_some()
+        || field.record_layout.is_some()
+        || !field.dimensions.is_empty()
+    {
+        return false;
+    }
+    assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+    let instruction = if operator == "=" {
+        None
+    } else {
+        Some(match operator {
+            "+=" => "F32ADD",
+            "-=" => "F32SUB",
+            "*=" => "F32MUL",
+            "/=" => "F32DIV",
+            _ => return false,
+        })
+    };
+    if instruction.is_some() {
+        assembly.push_str(
+            "    MOVSP R7\n    LDP R6, R7\n    LDW R4, R6\n\
+             LDI R7, 2\n    ADD R6, R7\n    LDW R5, R6\n\
+             PUSH R4\n    PUSH R5\n",
+        );
+    }
+    if !emit_native_f32_expression(value, locals, label_counter, assembly) {
+        return false;
+    }
+    if let Some(instruction) = instruction {
+        assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n    POP R5\n    POP R4\n");
+        assembly.push_str(&format!("    {instruction} R4, R0\n"));
+    }
+    assembly.push_str(
+        "    MOVSP R7\n    LDP R6, R7\n    ADJSP 4\n\
+         STW R6, R4\n    LDI R7, 2\n    ADD R6, R7\n    STW R6, R5\n",
+    );
+    emit_native_restore_r1(wide_pointer, assembly);
+    true
+}
+
 fn emit_native_assignment_store(
     expression: &Expression,
     temporary_registers: &[u8],
     locals: &HashMap<String, NativeLocation>,
     label_counter: &mut usize,
     assembly: &mut String,
+    allow_const_target: bool,
 ) -> bool {
     let ExpressionKind::Assignment {
         operator,
@@ -7647,7 +8771,91 @@ fn emit_native_assignment_store(
     else {
         return false;
     };
+    if !allow_const_target && native_expression_is_const_lvalue(target, locals) {
+        eprintln!(
+            "assignment to const-qualified lvalue at line {}",
+            target.line
+        );
+        return false;
+    }
     if native_expression_is_wide_integer(target, locals) {
+        let wide_field_size = match &target.kind {
+            ExpressionKind::Member {
+                expression: base,
+                operator: member_operator,
+                name,
+            } => emit_native_member_address(
+                base,
+                member_operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            )
+            .filter(|field| {
+                field.bit_field.is_none()
+                    && field.record_layout.is_none()
+                    && field.dimensions.is_empty()
+            })
+            .map(|field| field.size),
+            ExpressionKind::Index {
+                expression: base,
+                index,
+            } => emit_native_indexed_element_address(
+                target,
+                base,
+                index,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            )
+            .map(|(size, _)| size),
+            _ => None,
+        };
+        if let Some(field_size) = wide_field_size {
+            if field_size != 4 || (operator != "=" && native_expression_has_side_effects(target)) {
+                return false;
+            }
+            assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+            let unsigned = native_expression_integer_type(target, locals)
+                .is_some_and(|integer_type| integer_type.unsigned);
+            let compound;
+            let converted_value = if operator == "=" {
+                value.as_ref()
+            } else {
+                let Some(binary_operator) = operator.strip_suffix('=') else {
+                    return false;
+                };
+                compound = Expression {
+                    kind: ExpressionKind::Binary {
+                        operator: binary_operator.to_owned(),
+                        left: target.clone(),
+                        right: value.clone(),
+                    },
+                    line: expression.line,
+                    filename: expression.filename.clone(),
+                };
+                &compound
+            };
+            if !emit_native_wide_conversion(
+                converted_value,
+                unsigned,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(
+                "    MOVSP R7\n    LDP R7, R7\n    ADJSP 4\n\
+                 STW R7, R4\n    INC R7\n    INC R7\n    STW R7, R5\n",
+            );
+            return true;
+        }
         let ExpressionKind::Atom(name) = &target.kind else {
             return false;
         };
@@ -7698,6 +8906,18 @@ fn emit_native_assignment_store(
             operator,
             value,
             None,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    if matches!(target.kind, ExpressionKind::Member { .. })
+        && native_expression_is_f32(target, locals)
+    {
+        return emit_native_f32_member_assignment_store(
+            operator,
+            target,
+            value,
             locals,
             label_counter,
             assembly,
@@ -8175,6 +9395,7 @@ fn emit_native_f64_assignment_store(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
+    let wide_pointer = emit_native_save_r1(locals, assembly);
     let scalar_name = match &target.kind {
         ExpressionKind::Atom(name)
             if matches!(
@@ -8224,6 +9445,32 @@ fn emit_native_f64_assignment_store(
                 }
                 assembly.push_str("    MOV R0, R7\n");
             }
+            ExpressionKind::Member {
+                expression: base,
+                operator: member_operator,
+                name,
+            } => {
+                let Some(field) = emit_native_member_address(
+                    base,
+                    member_operator,
+                    name,
+                    0,
+                    &[4, 5, 6],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) else {
+                    return false;
+                };
+                if field.floating_size != 8
+                    || field.bit_field.is_some()
+                    || field.record_layout.is_some()
+                    || !field.dimensions.is_empty()
+                {
+                    return false;
+                }
+                assembly.push_str("    MOV R0, R7\n");
+            }
             _ => return false,
         }
         assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R0, R6\n");
@@ -8245,8 +9492,12 @@ fn emit_native_f64_assignment_store(
                 return false;
             }
         } else {
+            assembly.push_str("    MOVSP R6\n");
+            if frame_pointer {
+                assembly.push_str("    LDI R7, 4\n    ADD R6, R7\n");
+            }
             assembly.push_str(
-                "    MOVSP R6\n    LDP R0, R6\n    LDW R4, R0\n    INC R0\n    INC R0\n\
+                "    LDP R0, R6\n    LDW R4, R0\n    INC R0\n    INC R0\n\
                  LDW R5, R0\n    INC R0\n    INC R0\n    LDW R6, R0\n\
                  INC R0\n    INC R0\n    LDW R7, R0\n",
             );
@@ -8266,7 +9517,7 @@ fn emit_native_f64_assignment_store(
     } else if !emit_native_f64_operand(value, locals, label_counter, assembly) {
         return false;
     }
-    if let Some(name) = scalar_name {
+    let stored = if let Some(name) = scalar_name {
         emit_native_f64_scalar_store(name, locals, assembly)
     } else {
         assembly.push_str(
@@ -8275,7 +9526,11 @@ fn emit_native_f64_assignment_store(
              INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n",
         );
         true
+    };
+    if stored {
+        emit_native_restore_r1(wide_pointer, assembly);
     }
+    stored
 }
 
 fn emit_native_record_initializer(
@@ -8325,17 +9580,69 @@ fn emit_native_record_initializer(
                 line: value.line,
                 filename: value.filename.clone(),
             };
-            if !emit_native_assignment(
+            if !emit_native_assignment_with_const(
                 &assignment,
                 None,
                 &[4, 5, 6],
                 locals,
                 label_counter,
                 assembly,
+                true,
             ) {
                 return None;
             }
         }
+    }
+    Some(())
+}
+
+fn emit_native_record_array_initializer(
+    target: &Expression,
+    layout: &NativeRecordLayout,
+    dimensions: &[usize],
+    initializer: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<()> {
+    if dimensions.is_empty() {
+        return emit_native_record_initializer(
+            target,
+            layout,
+            initializer,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    let ExpressionKind::InitializerList(values) = &initializer.kind else {
+        return None;
+    };
+    if values.len() > dimensions[0] {
+        return None;
+    }
+    for (index, value) in values.iter().enumerate() {
+        let element = Expression {
+            kind: ExpressionKind::Index {
+                expression: Box::new(target.clone()),
+                index: Box::new(Expression {
+                    kind: ExpressionKind::Atom(index.to_string()),
+                    line: value.line,
+                    filename: value.filename.clone(),
+                }),
+            },
+            line: value.line,
+            filename: value.filename.clone(),
+        };
+        emit_native_record_array_initializer(
+            &element,
+            layout,
+            &dimensions[1..],
+            value,
+            locals,
+            label_counter,
+            assembly,
+        )?;
     }
     Some(())
 }
@@ -8380,37 +9687,15 @@ fn emit_native_statement(
                                 assembly,
                             )?;
                         } else {
-                            if dimensions.len() != 1 {
-                                return None;
-                            }
-                            let ExpressionKind::InitializerList(values) = &initializer.kind else {
-                                return None;
-                            };
-                            if values.len() > count {
-                                return None;
-                            }
-                            for (index, value) in values.iter().enumerate() {
-                                let element = Expression {
-                                    kind: ExpressionKind::Index {
-                                        expression: Box::new(target.clone()),
-                                        index: Box::new(Expression {
-                                            kind: ExpressionKind::Atom(index.to_string()),
-                                            line: statement.line,
-                                            filename: statement.filename.clone(),
-                                        }),
-                                    },
-                                    line: statement.line,
-                                    filename: statement.filename.clone(),
-                                };
-                                emit_native_record_initializer(
-                                    &element,
-                                    layout,
-                                    value,
-                                    locals,
-                                    label_counter,
-                                    assembly,
-                                )?;
-                            }
+                            emit_native_record_array_initializer(
+                                &target,
+                                layout,
+                                dimensions,
+                                initializer,
+                                locals,
+                                label_counter,
+                                assembly,
+                            )?;
                         }
                     }
                     continue;
@@ -8705,14 +9990,32 @@ fn emit_native_statement(
             if returns_void {
                 return None;
             }
-            let (return_size, wide_return) = match locals.get(function_name) {
-                Some(NativeLocation::FunctionParameters {
-                    float_return_size,
-                    wide_return_unsigned,
-                    ..
-                }) => (*float_return_size, *wide_return_unsigned),
-                _ => (0, None),
-            };
+            let (return_size, wide_return, returns_pointer, pointer_return_target_is_const) =
+                match locals.get(function_name) {
+                    Some(NativeLocation::FunctionParameters {
+                        float_return_size,
+                        wide_return_unsigned,
+                        returns_pointer,
+                        pointer_return_target_is_const,
+                        ..
+                    }) => (
+                        *float_return_size,
+                        *wide_return_unsigned,
+                        *returns_pointer,
+                        *pointer_return_target_is_const,
+                    ),
+                    _ => (0, None, false, false),
+                };
+            if returns_pointer
+                && !pointer_return_target_is_const
+                && native_expression_pointer_target_is_const(expression, locals)
+            {
+                eprintln!(
+                    "return discards pointer target const qualification at line {}",
+                    expression.line
+                );
+                return None;
+            }
             if let Some(unsigned) = wide_return {
                 if !emit_native_wide_conversion(
                     expression,
@@ -9101,10 +10404,7 @@ fn emit_native_update(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
-    if native_expression_is_wide_integer(expression, locals) {
-        return emit_native_i32_source(expression, locals, label_counter, assembly);
-    }
-    let (operator, expression) = match &expression.kind {
+    let (operator, target) = match &expression.kind {
         ExpressionKind::Postfix {
             operator,
             expression,
@@ -9112,19 +10412,25 @@ fn emit_native_update(
         | ExpressionKind::Unary {
             operator,
             operand: expression,
-        } if matches!(operator.as_str(), "++" | "--") => (operator, expression),
+        } if matches!(operator.as_str(), "++" | "--") => (operator, expression.as_ref()),
         _ => return false,
     };
+    if native_expression_is_const_lvalue(target, locals) {
+        eprintln!("update of const-qualified lvalue at line {}", target.line);
+        return false;
+    }
+    if native_expression_is_wide_integer(target, locals) {
+        return emit_native_i32_source(expression, locals, label_counter, assembly);
+    }
     let instruction = match operator.as_str() {
         "++" => "INC",
         "--" => "DEC",
         _ => return false,
     };
-    if native_expression_record_field(expression, locals)
-        .is_some_and(|field| field.bit_field.is_some())
+    if native_expression_record_field(target, locals).is_some_and(|field| field.bit_field.is_some())
     {
         return emit_native_bitfield_update(
-            expression,
+            target,
             operator,
             false,
             None,
@@ -9137,7 +10443,7 @@ fn emit_native_update(
         expression: base,
         operator,
         name,
-    } = &expression.kind
+    } = &target.kind
     {
         let Some(field) = emit_native_member_address(
             base,
@@ -9173,7 +10479,7 @@ fn emit_native_update(
     if let ExpressionKind::Unary {
         operator: dereference,
         operand,
-    } = &expression.kind
+    } = &target.kind
         && dereference == "*"
     {
         let ExpressionKind::Atom(name) = &operand.kind else {
@@ -9223,10 +10529,10 @@ fn emit_native_update(
     if let ExpressionKind::Index {
         expression: base,
         index,
-    } = &expression.kind
+    } = &target.kind
     {
         let Some((element_size, element_signed)) = emit_native_indexed_element_address(
-            expression,
+            target,
             base,
             index,
             0,
@@ -9253,7 +10559,7 @@ fn emit_native_update(
         assembly.push_str(&format!("    {store} R7, R0\n"));
         return true;
     }
-    let ExpressionKind::Atom(name) = &expression.kind else {
+    let ExpressionKind::Atom(name) = &target.kind else {
         return false;
     };
     let Some(location) = locals.get(name) else {
@@ -10070,13 +11376,28 @@ impl StatementParser {
 
     fn parse_declaration(&mut self) -> Result<Statement, CCompilerError> {
         let start = self.expressions.token().clone();
+        let mut unsupported_storage_class = None;
+        let mut type_qualifiers = Vec::new();
         while matches!(
             self.expressions.token().value.as_str(),
             "static" | "extern" | "register" | "auto" | "const" | "volatile" | "restrict"
         ) {
-            self.expressions.advance();
+            let specifier = self.expressions.advance().value;
+            if matches!(specifier.as_str(), "static" | "extern") {
+                unsupported_storage_class = Some(specifier);
+            } else if matches!(specifier.as_str(), "const" | "volatile" | "restrict") {
+                type_qualifiers.push(specifier);
+            }
         }
-        let base_type = if matches!(self.expressions.token().value.as_str(), "struct" | "union") {
+        if let Some(storage_class) = unsupported_storage_class {
+            return Err(error(
+                start.filename.as_deref().unwrap_or("<source>"),
+                start.line,
+                &format!("block-scope {storage_class} declarations are not supported"),
+            ));
+        }
+        let mut base_type = if matches!(self.expressions.token().value.as_str(), "struct" | "union")
+        {
             let kind = self.expressions.advance().value;
             let tag = self.expect_identifier("expected a record tag")?;
             format!("{kind} {}", tag.value)
@@ -10106,16 +11427,33 @@ impl StatementParser {
             }
             type_words.join(" ")
         };
+        let mut unqualified_words = Vec::new();
+        for word in base_type.split_whitespace() {
+            if matches!(word, "const" | "volatile" | "restrict") {
+                type_qualifiers.push(word.to_owned());
+            } else {
+                unqualified_words.push(word);
+            }
+        }
+        if !type_qualifiers.is_empty() {
+            base_type = format!(
+                "{} {}",
+                type_qualifiers.join(" "),
+                unqualified_words.join(" ")
+            );
+        }
         let mut declarations = Vec::new();
         loop {
             let mut c_type = base_type.clone();
             while self.accept("*").is_some() {
                 c_type.push('*');
-                while matches!(
+                if matches!(
                     self.expressions.token().value.as_str(),
                     "const" | "volatile" | "restrict"
                 ) {
-                    self.expressions.advance();
+                    return Err(self
+                        .expressions
+                        .fail("qualifiers on pointer objects are not supported"));
                 }
             }
             let name = self.expect_identifier("expected a variable name")?;
@@ -10237,12 +11575,13 @@ impl TranslationUnitParser {
                     .expressions
                     .fail("function typedefs are not supported"));
             }
-            let (parameters, variadic) = self.parse_parameters()?;
+            let (parameters, variadic, has_prototype) = self.parse_parameters()?;
             let declaration = FunctionDeclaration {
                 return_type: declarator_type,
                 name: name.value,
                 parameters,
                 variadic,
+                has_prototype,
             };
             if self.statements.accept(";").is_some() {
                 return Ok(vec![ExternalDeclaration::FunctionPrototype(declaration)]);
@@ -10635,6 +11974,8 @@ impl TranslationUnitParser {
                                         offset: unit_offset,
                                         size: 2,
                                         signed,
+                                        is_const: native_type_is_const_qualified(field_type),
+                                        floating_size: 0,
                                         bit_field: Some((bit_offset, width)),
                                         record_layout: None,
                                         dimensions: Vec::new(),
@@ -10712,6 +12053,9 @@ impl TranslationUnitParser {
                                         member_size
                                     },
                                     signed,
+                                    is_const: native_type_is_const_qualified(field_type),
+                                    floating_size: native_floating_type_size(field_type)
+                                        .unwrap_or(0),
                                     bit_field: None,
                                     record_layout: self
                                         .records
@@ -10846,11 +12190,14 @@ impl TranslationUnitParser {
         let mut c_type = base_type.to_owned();
         while self.statements.accept("*").is_some() {
             c_type.push('*');
-            while matches!(
+            if matches!(
                 self.statements.expressions.token().value.as_str(),
                 "const" | "volatile"
             ) {
-                self.statements.expressions.advance();
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("qualifiers on pointer objects are not supported"));
             }
         }
         let name = self
@@ -10880,16 +12227,16 @@ impl TranslationUnitParser {
         Ok(dimensions)
     }
 
-    fn parse_parameters(&mut self) -> Result<(Vec<FunctionParameter>, bool), CCompilerError> {
+    fn parse_parameters(&mut self) -> Result<(Vec<FunctionParameter>, bool, bool), CCompilerError> {
         let mut parameters = Vec::new();
         let mut variadic = false;
         if self.statements.accept(")").is_some() {
-            return Ok((parameters, variadic));
+            return Ok((parameters, variadic, false));
         }
         if self.statements.at("void") && self.statements.peek_value(1) == ")" {
             self.statements.expressions.advance();
             self.statements.expect(")")?;
-            return Ok((parameters, variadic));
+            return Ok((parameters, variadic, true));
         }
         loop {
             if self.statements.at(".") && self.statements.peek_value(1) == "." {
@@ -10918,7 +12265,7 @@ impl TranslationUnitParser {
             }
         }
         self.statements.expect(")")?;
-        Ok((parameters, variadic))
+        Ok((parameters, variadic, true))
     }
 }
 
@@ -12873,6 +14220,7 @@ mod tests {
                             },
                         ],
                         variadic: false,
+                        has_prototype: true,
                     }),
                 ],
                 enumerators: HashMap::new(),
@@ -13207,25 +14555,51 @@ mod tests {
     #[test]
     fn parses_function_definitions_and_variadic_signatures() {
         let unit = translation_unit(
-            "int log_value(const char *format, ...); \
+            "int old_style(); \
+             int fixed(void); \
+             int log_value(const char *format, ...); \
              int add(int left, int right) { return left + right; }",
         );
         assert!(matches!(
             &unit.declarations[0],
             ExternalDeclaration::FunctionPrototype(function)
+                if function.name == "old_style" && !function.has_prototype
+        ));
+        assert!(matches!(
+            &unit.declarations[1],
+            ExternalDeclaration::FunctionPrototype(function)
+                if function.name == "fixed"
+                    && function.has_prototype
+                    && function.parameters.is_empty()
+        ));
+        assert!(matches!(
+            &unit.declarations[2],
+            ExternalDeclaration::FunctionPrototype(function)
                 if function.name == "log_value"
                     && function.variadic
+                    && function.has_prototype
                     && function.parameters.len() == 1
                     && function.parameters[0].c_type == "const char*"
                     && function.parameters[0].name.as_deref() == Some("format")
         ));
         assert!(matches!(
-            &unit.declarations[1],
+            &unit.declarations[3],
             ExternalDeclaration::FunctionDefinition(definition)
                 if definition.declaration.name == "add"
+                    && definition.declaration.has_prototype
                     && definition.declaration.parameters.len() == 2
                     && matches!(definition.body.kind, StatementKind::Compound(_))
         ));
+        assert!(
+            compile_minimal_program(
+                "int no_arguments(void); \
+                 int main(void) { return no_arguments(1); }",
+                "prototype-arity.c"
+            )
+            .unwrap()
+            .is_none(),
+            "a void prototype must retain its fixed zero-argument contract"
+        );
     }
 
     #[test]

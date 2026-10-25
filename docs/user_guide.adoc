@@ -1066,19 +1066,22 @@ minimum requirements:
   declarators and general C function-pointer calls are not supported.
 * +static+, +extern+, +auto+, +register+, and +volatile+ specifiers do not have
   their full C linkage, storage-duration, or volatile-access semantics.
+  Block-scope +static+ and +extern+ declarations are diagnosed as unsupported;
+  they are not treated as automatic locals.
   The address-of constraint is enforced for local objects declared +register+,
   and +auto+/+register+ file-scope declarations and storage classes on record
   members are diagnosed. Named +register+ parameters in supported prototypes
   and definitions also reject address-taking.
-  +const+ objects, one-level const-qualified pointer targets, named function
-  parameters, and one-level const-qualified pointer returns are supported for
-  the implemented forms. Reads through const pointers, including casts to
-  +const T *+, are allowed; writes are rejected, and assignment, function
-  arguments, and return statements prevent discarding the target's const
-  qualifier. Function declarations also diagnose conflicting one-level
-  pointer-target qualifications. Const qualification through multiple pointer
-  levels and const-qualified pointer objects are not supported; do not treat
-  other accepted pointer qualifier combinations as strictly conforming.
+  One-level const-qualified pointer targets are supported for reads through
+  local, global, and parameter pointers; writes and updates through them are
+  rejected. Const-qualified scalar and bit-field record members support
+  aggregate initialization, and writes to those members are rejected.
+  Function declarations diagnose conflicting one-level pointer-target
+  qualifications. Qualifier-dropping conversions between simple pointer
+  variables, fixed pointer arguments, and pointer returns are diagnosed;
+  expression/cast conversions and multi-level qualification remain
+  incomplete. Qualifiers on pointer objects are diagnosed as unsupported
+  instead of being silently discarded.
 * Global/static storage begins at +0x80000+ (+GLOBAL_BASE+ in the Rust C
   compiler); uninitialized globals are zeroed. The current compiler allocates
   static data through +0xFFFFF+.

@@ -1,9 +1,14 @@
 use suomicpu16::{Cpu, assembler::assemble, c_compiler::compile_minimal_program_to_assembly};
 
 fn run_c(source: &str) -> Cpu {
-    let assembly = compile_minimal_program_to_assembly(source, "target-abi.c")
+    run_c_with_assembly(source, "")
+}
+
+fn run_c_with_assembly(source: &str, linked_assembly: &str) -> Cpu {
+    let mut assembly = compile_minimal_program_to_assembly(source, "target-abi.c")
         .expect("parse C")
         .expect("compile C");
+    assembly.push_str(linked_assembly);
     let image = assemble(&assembly, 0).expect("assemble generated code");
     let mut cpu = Cpu::with_memory_size(1 << 20).expect("allocate CPU");
     cpu.load_program(&image.segments, image.entry_point)
@@ -225,6 +230,35 @@ fn integer_to_floating_conversions_use_full_width_and_independent_ieee_results()
 }
 
 #[test]
+fn floating_to_byte_integer_casts_truncate_before_byte_normalization() {
+    let cpu = run_c(
+        "int main(void) { signed char positive=(signed char)123.75f; \
+         signed char negative=(signed char)-127.75; \
+         unsigned char maximum=(unsigned char)255.75f; \
+         if (positive != 123 || negative != -127 || maximum != 255) return 1; \
+         return (signed char)0.99 == 0 && (unsigned char)17.99 == 17 ? 0 : 2; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn floating_pointer_casts_are_rejected_with_a_diagnostic() {
+    for source in [
+        "int main(void) { int *pointer=(int *)1.5; return 0; }",
+        "int main(void) { double value=(double)(int *)0; return 0; }",
+    ] {
+        let error = compile_minimal_program_to_assembly(source, "invalid-float-pointer-cast.c")
+            .unwrap_err();
+        assert!(
+            error
+                .0
+                .contains("conversion between floating-point and pointer types"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn floating_to_wide_integers_convert_initializers_assignments_arguments_and_returns() {
     for (expression, c_type, expected) in [
         ("-2147483648.0", "long", i32::MIN as u32),
@@ -248,6 +282,451 @@ fn floating_to_wide_integers_convert_initializers_assignments_arguments_and_retu
             .collect::<Vec<_>>();
         assert_eq!(bytes, expected.to_be_bytes(), "{expression}");
     }
+}
+
+#[test]
+fn mixed_precision_and_unsigned_binary64_conversions_match_ieee_references() {
+    let source = "double observed_real; float observed_single; \
+                  int main(void) { unsigned long maximum=4294967295UL; \
+                  double promoted=0.1f+0.1; \
+                  float rounded=(float)(16777216.0+1.0); \
+                  double widened=(double)rounded; \
+                  double unsigned_real=(double)maximum; \
+                  unsigned long restored=(unsigned long)unsigned_real; \
+                  unsigned int word=(unsigned int)65535.75; \
+                  unsigned int single_word=(unsigned int)65535.75f; \
+                  float word_mix=0.5f+1U; double wide_mix=0.5f+1UL; \
+                  long truncated=(long)-3.75; \
+                  unsigned int comparison=(wide_mix == 1.5); \
+                  if (promoted != (double)0.1f+0.1 || \
+                      widened != 16777216.0 || \
+                      unsigned_real != 4294967295.0 || \
+                      restored != maximum || word != 65535U || \
+                      single_word != 65535U || word_mix != 1.5f || \
+                      wide_mix != 1.5 || truncated != -3L || \
+                      comparison != 1U) return 1; \
+                  if (!promoted || !widened || !unsigned_real || !wide_mix) return 2; \
+                  observed_real=promoted; observed_single=rounded; return 0; }";
+    let mut cpu = run_c(source);
+    assert_eq!(cpu.registers[0], 0);
+    let real_bytes = (0..8)
+        .map(|offset| cpu.read(0x80000 + offset))
+        .collect::<Vec<_>>();
+    let single_bytes = (0..4)
+        .map(|offset| cpu.read(0x80008 + offset))
+        .collect::<Vec<_>>();
+    assert_eq!(real_bytes, ((0.1f32 as f64) + 0.1f64).to_be_bytes());
+    assert_eq!(single_bytes, 16_777_216.0f32.to_be_bytes());
+}
+
+#[test]
+fn floating_pointer_dereferences_support_load_store_and_compound_updates() {
+    let mut cpu = run_c(
+        "float observed_single; double observed_real; \
+         int main(void) { float single=1.5f; double real=2.25; \
+         float *single_pointer=&single; double *real_pointer=&real; \
+         *single_pointer=2.5f; *real_pointer=3.75; \
+         if (*single_pointer != 2.5f || *real_pointer != 3.75) return 1; \
+         *single_pointer+=0.25f; *real_pointer*=2.0; \
+         if (*single_pointer != 2.75f || *real_pointer != 7.5) return 2; \
+         if ((*single_pointer)++ != 2.75f || *single_pointer != 3.75f) return 3; \
+         if (++(*real_pointer) != 8.5 || *real_pointer != 8.5) return 4; \
+         observed_single=*single_pointer; observed_real=*real_pointer; return 0; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0x80000..0x80004)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        3.75f32.to_be_bytes()
+    );
+    assert_eq!(
+        (0x80004..0x8000c)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        8.5f64.to_be_bytes()
+    );
+}
+
+#[test]
+fn automatic_nested_record_initializers_evaluate_runtime_expressions_in_order() {
+    let cpu = run_c(
+        "struct Inner { int first; int second; }; \
+         struct Outer { int before; struct Inner nested; int after; }; \
+         int main(void) { int source=3; \
+         struct Outer value={source++, {source++, source+4}}; \
+         if (value.before != 3 || value.nested.first != 4 || \
+             value.nested.second != 9 || value.after != 0 || source != 5) return 1; \
+         return 0; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn automatic_multidimensional_record_arrays_initialize_nested_elements() {
+    let cpu = run_c(
+        "struct Pair { int left; int right; }; \
+         int main(void) { int next=1; \
+         struct Pair grid[2][2]={{{next++,next++},{next++,next++}}, \
+                                  {{next++,next++}}}; \
+         if (grid[0][0].left != 1 || grid[0][0].right != 2 || \
+             grid[0][1].left != 3 || grid[0][1].right != 4 || \
+             grid[1][0].left != 5 || grid[1][0].right != 6 || \
+             grid[1][1].left != 0 || grid[1][1].right != 0 || next != 7) return 1; \
+         return 0; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn unsupported_block_storage_classes_are_diagnosed() {
+    for (declaration, storage_class) in [
+        ("static int value=1;", "static"),
+        ("extern int value;", "extern"),
+    ] {
+        let source = format!("int main(void) {{ {declaration} return 0; }}");
+        let error = compile_minimal_program_to_assembly(&source, "storage.c").unwrap_err();
+        assert!(
+            error.0.contains(&format!(
+                "block-scope {storage_class} declarations are not supported"
+            )),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn const_qualified_record_member_writes_are_rejected() {
+    let cpu = run_c(
+        "struct Flags { const unsigned int ready:1; }; \
+         int main(void) { struct Flags flags={1}; return flags.ready ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "struct Value { const float number; }; \
+         int main(void) { struct Value value={2.5f}; return value.number == 2.5f ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "struct Value { const int number; }; \
+         int main(void) { struct Value value={6}; return value.number == 6 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "const int value=1; int main(void) { int value=2; value=3; \
+         return value == 3 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+
+    for source in [
+        "struct Flags { const unsigned int ready:1; }; \
+         int main(void) { struct Flags flags={0}; flags.ready=1; return 0; }",
+        "struct Flags { const unsigned int ready:1; }; \
+         int main(void) { struct Flags flags={0}; flags.ready+=1; return 0; }",
+        "struct Flags { const unsigned int ready:1; }; \
+         int main(void) { struct Flags flags={0}; flags.ready++; return 0; }",
+        "struct Flags { const int ready; }; \
+         int main(void) { struct Flags flags={0}; flags.ready=1; return 0; }",
+        "struct Flags { const float ready; }; \
+         int main(void) { struct Flags flags={0.0f}; flags.ready=1.0f; return 0; }",
+    ] {
+        assert!(
+            compile_minimal_program_to_assembly(source, "const-member.c")
+                .unwrap()
+                .is_none(),
+            "compiler accepted a write to a const-qualified member: {source}"
+        );
+    }
+}
+
+#[test]
+fn writes_through_pointers_to_const_objects_are_rejected() {
+    let cpu = run_c(
+        "int main(void) { int value=1; const int *pointer=&value; \
+         return *pointer == 1 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "int read_value(const int *pointer) { return *pointer; } \
+         int main(void) { int value=9; return read_value(&value) == 9 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "const int *preserve(int *pointer) { return pointer; } \
+         int main(void) { int value=6; const int *result=preserve(&value); \
+         return *result == 6 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "const int *pointer; int main(void) { int value=7; pointer=&value; \
+         return *pointer == 7 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "int main(void) { int value=4; int *source=&value; const int *target; \
+         target=source; return *target == 4 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+
+    for write in ["*pointer=2", "*pointer+=1", "(*pointer)++"] {
+        let source = format!(
+            "int main(void) {{ int value=1; const int *pointer=&value; {write}; return 0; }}"
+        );
+        assert!(
+            compile_minimal_program_to_assembly(&source, "const-pointer.c")
+                .unwrap()
+                .is_none(),
+            "compiler accepted a write through a pointer to const: {write}"
+        );
+    }
+    for source in [
+        "int write_value(const int *pointer) { *pointer=2; return 0; } \
+         int main(void) { int value=1; return write_value(&value); }",
+        "const int *pointer; int main(void) { int value=1; pointer=&value; \
+         *pointer=2; return 0; }",
+        "int main(void) { int value=1; const int *source=&value; \
+         int *target=&value; target=source; return 0; }",
+        "int read_value(int *pointer) { return *pointer; } \
+         int main(void) { int value=1; const int *source=&value; \
+         return read_value(source); }",
+        "int *drop_const(const int *pointer) { return pointer; } \
+         int main(void) { int value=1; const int *source=&value; \
+         return drop_const(source) == &value ? 0 : 1; }",
+    ] {
+        assert!(
+            compile_minimal_program_to_assembly(source, "const-pointer.c")
+                .unwrap()
+                .is_none(),
+            "compiler accepted a const-pointer violation: {source}"
+        );
+    }
+}
+
+#[test]
+fn const_qualified_pointer_objects_are_diagnosed() {
+    for source in [
+        "int * const pointer;",
+        "int main(void) { int * const pointer; return 0; }",
+    ] {
+        let error =
+            compile_minimal_program_to_assembly(source, "const-pointer-object.c").unwrap_err();
+        assert!(
+            error
+                .0
+                .contains("qualifiers on pointer objects are not supported"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn const_qualified_scalar_and_array_writes_are_rejected() {
+    let cpu = run_c(
+        "const int global_value=3; const int global_array[2]={4,5}; \
+         int read_value(const int parameter) { return parameter; } \
+         int main(void) { const int local_value=6; const int local_array[2]={7,8}; \
+         return global_value + global_array[1] + local_value + local_array[0] \
+         + read_value(1) == 22 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+
+    for source in [
+        "int main(void) { const int value=1; value=2; return 0; }",
+        "int main(void) { const int value=1; value+=1; return 0; }",
+        "int main(void) { const int value=1; value++; return 0; }",
+        "const int value=1; int main(void) { value=2; return 0; }",
+        "const int values[2]={1,2}; int main(void) { values[0]=3; return 0; }",
+        "int main(void) { const int values[2]={1,2}; values[1]++; return 0; }",
+        "int update(const int value) { value=2; return value; } \
+         int main(void) { return update(1); }",
+    ] {
+        assert!(
+            compile_minimal_program_to_assembly(source, "const-object.c")
+                .unwrap()
+                .is_none(),
+            "compiler accepted a write to a const-qualified object: {source}"
+        );
+    }
+}
+
+#[test]
+fn floating_scalar_prefix_and_postfix_updates_preserve_old_and_new_values() {
+    let source = "float global_single=1.25f; double global_double=4.5; \
+                  int main(void) { float single=1.5f; double real=2.25; \
+                  float old_single=single++; \
+                  if (old_single != 1.5f || single != 2.5f) return 1; \
+                  if (++single != 3.5f || single != 3.5f) return 2; \
+                  if (single-- != 3.5f || single != 2.5f) return 3; \
+                  if (--single != 1.5f || single != 1.5f) return 4; \
+                  double old_real=real--; \
+                  if (old_real != 2.25 || real != 1.25) return 5; \
+                  if (++real != 2.25 || real != 2.25) return 6; \
+                  if (real++ != 2.25 || real != 3.25) return 7; \
+                  if (--real != 2.25 || real != 2.25) return 8; \
+                  if (global_single++ != 1.25f || global_single != 2.25f) return 9; \
+                  if (--global_double != 3.5 || global_double != 3.5) return 10; \
+                  return 0; }";
+    let mut cpu = run_c(source);
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>(),
+        2.25f32.to_be_bytes()
+    );
+    assert_eq!(
+        (0..8)
+            .map(|offset| cpu.read(0x80004 + offset))
+            .collect::<Vec<_>>(),
+        3.5f64.to_be_bytes()
+    );
+}
+
+#[test]
+fn floating_array_element_updates_preserve_old_and_new_values() {
+    let source = "float singles[2]={1.25f,2.5f}; \
+                  double doubles[2]={3.5,4.75}; \
+                  int main(void) { int index=1; \
+                  float old_single=singles[index]++; \
+                  if (old_single != 2.5f || singles[index] != 3.5f) return 1; \
+                  if (++singles[0] != 2.25f || singles[0] != 2.25f) return 2; \
+                  double old_double=doubles[index]--; \
+                  if (old_double != 4.75 || doubles[index] != 3.75) return 3; \
+                  if (--doubles[0] != 2.5 || doubles[0] != 2.5) return 4; \
+                  return 0; }";
+    let mut cpu = run_c(source);
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>(),
+        2.25f32.to_be_bytes()
+    );
+    assert_eq!(
+        (0..4)
+            .map(|offset| cpu.read(0x80004 + offset))
+            .collect::<Vec<_>>(),
+        3.5f32.to_be_bytes()
+    );
+    assert_eq!(
+        (0..8)
+            .map(|offset| cpu.read(0x80008 + offset))
+            .collect::<Vec<_>>(),
+        2.5f64.to_be_bytes()
+    );
+    assert_eq!(
+        (0..8)
+            .map(|offset| cpu.read(0x80010 + offset))
+            .collect::<Vec<_>>(),
+        3.75f64.to_be_bytes()
+    );
+}
+
+#[test]
+fn variadic_calls_apply_default_promotions_and_stack_object_layout() {
+    let source = "struct Pair { unsigned int first; unsigned int second; }; \
+                  unsigned int datum; \
+                  struct Pair pair={0xABCDU,0x1234U}; \
+                  int probe(int marker, ...); \
+                  int main(void) { signed char negative=-2; \
+                  unsigned char positive=250; \
+                  return probe(7,negative,positive,1.5f,&datum,pair,0x12345678UL); }";
+    let linked_assembly = ".address 0x70000\n\
+                           __c_function_probe:\n\
+                               LDWS R4, 4\n    LDI R5, 7\n    CMP R4, R5\n\
+                               BNZX __probe_fail_1\n\
+                               LDWS R4, 6\n    LDI R5, 0xFFFE\n    CMP R4, R5\n\
+                               BNZX __probe_fail_2\n\
+                               LDWS R4, 8\n    LDI R5, 250\n    CMP R4, R5\n\
+                               BNZX __probe_fail_3\n\
+                               LDWS R4, 10\n    LDI R5, 0x3FF8\n    CMP R4, R5\n\
+                               BNZX __probe_fail_4\n\
+                               LDWS R4, 12\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __probe_fail_5\n\
+                               LDWS R4, 14\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __probe_fail_6\n\
+                               LDWS R4, 16\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __probe_fail_7\n\
+                               LDWS R4, 18\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __probe_fail_8\n\
+                               LDWS R4, 20\n    LDI R5, 8\n    CMP R4, R5\n\
+                               BNZX __probe_fail_9\n\
+                               LDWS R4, 22\n    LDI R5, 0xABCD\n    CMP R4, R5\n\
+                               BNZX __probe_fail_10\n\
+                               LDWS R4, 24\n    LDI R5, 0x1234\n    CMP R4, R5\n\
+                               BNZX __probe_fail_11\n\
+                               LDWS R4, 26\n    LDI R5, 0x1234\n    CMP R4, R5\n\
+                               BNZX __probe_fail_12\n\
+                               LDWS R4, 28\n    LDI R5, 0x5678\n    CMP R4, R5\n\
+                               BNZX __probe_fail_13\n\
+                               LDI R0, 0\n    RET\n\
+                           __probe_fail_1:\n    LDI R0, 1\n    RET\n\
+                           __probe_fail_2:\n    LDI R0, 2\n    RET\n\
+                           __probe_fail_3:\n    LDI R0, 3\n    RET\n\
+                           __probe_fail_4:\n    LDI R0, 4\n    RET\n\
+                           __probe_fail_5:\n    LDI R0, 5\n    RET\n\
+                           __probe_fail_6:\n    LDI R0, 6\n    RET\n\
+                           __probe_fail_7:\n    LDI R0, 7\n    RET\n\
+                           __probe_fail_8:\n    LDI R0, 8\n    RET\n\
+                           __probe_fail_9:\n    LDI R0, 9\n    RET\n\
+                           __probe_fail_10:\n    LDI R0, 10\n    RET\n\
+                           __probe_fail_11:\n    LDI R0, 11\n    RET\n\
+                           __probe_fail_12:\n    LDI R0, 12\n    RET\n\
+                           __probe_fail_13:\n    LDI R0, 13\n    RET\n";
+    let cpu = run_c_with_assembly(source, linked_assembly);
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn unprototyped_calls_apply_default_promotions_and_stack_object_layout() {
+    let source = "struct Pair { unsigned int first; unsigned int second; }; \
+                  unsigned int datum; \
+                  struct Pair pair={0xABCDU,0x1234U}; \
+                  int probe(); \
+                  int main(void) { signed char negative=-2; \
+                  unsigned char positive=250; \
+                  return probe(negative,positive,1.5f,&datum,pair,0x12345678UL); }";
+    let linked_assembly = ".address 0x70000\n\
+                           __c_function_probe:\n\
+                               LDWS R4, 4\n    LDI R5, 0xFFFE\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_1\n\
+                               LDWS R4, 6\n    LDI R5, 250\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_2\n\
+                               LDWS R4, 8\n    LDI R5, 0x3FF8\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_3\n\
+                               LDWS R4, 10\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_4\n\
+                               LDWS R4, 12\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_5\n\
+                               LDWS R4, 14\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_6\n\
+                               LDWS R4, 16\n    LDI R5, 0\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_7\n\
+                               LDWS R4, 18\n    LDI R5, 8\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_8\n\
+                               LDWS R4, 20\n    LDI R5, 0xABCD\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_9\n\
+                               LDWS R4, 22\n    LDI R5, 0x1234\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_10\n\
+                               LDWS R4, 24\n    LDI R5, 0x1234\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_11\n\
+                               LDWS R4, 26\n    LDI R5, 0x5678\n    CMP R4, R5\n\
+                               BNZX __unprototyped_fail_12\n\
+                               LDI R0, 0\n    RET\n\
+                           __unprototyped_fail_1:\n    LDI R0, 1\n    RET\n\
+                           __unprototyped_fail_2:\n    LDI R0, 2\n    RET\n\
+                           __unprototyped_fail_3:\n    LDI R0, 3\n    RET\n\
+                           __unprototyped_fail_4:\n    LDI R0, 4\n    RET\n\
+                           __unprototyped_fail_5:\n    LDI R0, 5\n    RET\n\
+                           __unprototyped_fail_6:\n    LDI R0, 6\n    RET\n\
+                           __unprototyped_fail_7:\n    LDI R0, 7\n    RET\n\
+                           __unprototyped_fail_8:\n    LDI R0, 8\n    RET\n\
+                           __unprototyped_fail_9:\n    LDI R0, 9\n    RET\n\
+                           __unprototyped_fail_10:\n    LDI R0, 10\n    RET\n\
+                           __unprototyped_fail_11:\n    LDI R0, 11\n    RET\n\
+                           __unprototyped_fail_12:\n    LDI R0, 12\n    RET\n";
+    let cpu = run_c_with_assembly(source, linked_assembly);
+    assert_eq!(cpu.registers[0], 0);
 }
 
 #[test]
@@ -490,6 +969,32 @@ fn large_argument_lists_preserve_offsets_and_split_caller_cleanup() {
 }
 
 #[test]
+fn aggregate_arguments_use_object_bytes_and_recursive_copies() {
+    let cpu = run_c(
+        "struct Pair { signed char left; int right; }; \
+         struct Outer { unsigned char prefix; struct Pair nested; }; \
+         union Overlay { int word; unsigned char byte; }; \
+         int combine(int before, struct Pair pair, unsigned char after) { \
+         pair.left++; pair.right+=before; \
+         return pair.left+pair.right+after; } \
+         int inspect(struct Outer outer, union Overlay overlay, int after) { \
+         outer.nested.right++; overlay.word+=after; \
+         return outer.prefix+outer.nested.right+overlay.word; } \
+         int recurse(int depth, struct Pair pair) { \
+         if (!depth) return pair.left+pair.right; \
+         pair.right+=depth; return recurse(depth-1,pair)+pair.right; } \
+         int main(void) { struct Pair pair={-3,1000}; \
+         struct Outer outer={9,{-3,1000}}; union Overlay overlay={1200}; \
+         if (combine(7,pair,250) != 1255) return 1; \
+         if (pair.left != -3 || pair.right != 1000) return 2; \
+         if (inspect(outer,overlay,7) != 2217) return 3; \
+         if (outer.nested.right != 1000 || overlay.word != 1200) return 4; \
+         return recurse(3,pair) == 4017 ? 0 : 5; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
 fn incompatible_function_types_are_diagnosed_before_call_lowering() {
     for declarations in [
         "float f(float a); float f(double a) { return a; }",
@@ -509,6 +1014,49 @@ fn incompatible_function_types_are_diagnosed_before_call_lowering() {
          int main(void) { return f(-7); }",
     );
     assert_eq!(cpu.registers[0], -7);
+}
+
+#[test]
+fn no_prototype_declarations_merge_with_promotion_compatible_prototypes() {
+    for (source, expected) in [
+        (
+            "int f(); int f(int); int f(int value) { return value; } \
+             int main(void) { return f(-9); }",
+            -9,
+        ),
+        (
+            "int f(int); int f(); int f(int value) { return value; } \
+             int main(void) { return f(13); }",
+            13,
+        ),
+        (
+            "int f(); int f(double); int f(double value) { return value == 1.5 ? 7 : 1; } \
+             int main(void) { return f(1.5f) == 7 ? 0 : 1; }",
+            0,
+        ),
+        (
+            "int f(double); int f(); int f(double value) { return value == 2.5 ? 8 : 1; } \
+             int main(void) { return f(2.5f) == 8 ? 0 : 1; }",
+            0,
+        ),
+    ] {
+        let cpu = run_c(source);
+        assert_eq!(cpu.registers[0], expected);
+    }
+
+    for declarations in [
+        "int f(); int f(char);",
+        "int f(); int f(float);",
+        "int f(); int f(int, ...);",
+        "int f(); int f(unsigned char);",
+    ] {
+        let source = format!("{declarations} int main(void) {{ return 0; }}");
+        let error = compile_minimal_program_to_assembly(&source, "prototype-compat.c").unwrap_err();
+        assert!(
+            error.0.contains("conflicting function type for f"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -704,45 +1252,39 @@ fn bitfield_address_sizeof_and_invalid_declarations_are_diagnosed() {
     let source = "#include <stddef.h>\nstruct V { unsigned int bits:3; }; \
                   int main(void) { return offsetof(struct V, bits); }";
     assert!(compile_minimal_program_to_assembly(source, "invalid-offset.c").is_err());
-    for (c_type, value) in [("double", "2.5"), ("long", "65536L")] {
-        let source = format!(
-            "struct V {{ unsigned int bits:3; }} v; \
-             int main(void) {{ {c_type} rhs={value}; v.bits+=rhs; return 0; }}"
-        );
-        let error =
-            compile_minimal_program_to_assembly(&source, "pending-conversion.c").unwrap_err();
-        assert!(
-            error
-                .0
-                .contains("bit-field compound assignments are not supported"),
-            "{error}"
-        );
-    }
-    for source in [
-        "struct V { double real; }; int main(void) { struct V v={1.5}; return 0; }",
-        "struct V { long wide; }; int main(void) { struct V v; v.wide=1234; return 0; }",
-        "struct V { double real; } v; int main(void) { v.real++; return 0; }",
-    ] {
-        assert!(
-            !matches!(
-                compile_minimal_program_to_assembly(source, "pending-record-member.c"),
-                Ok(Some(_))
-            ),
-            "{source}"
-        );
-    }
 }
 
 #[test]
 fn bitfield_assignment_converts_floating_values_before_narrowing() {
     let cpu = run_c(
-        "struct V { signed int s:5; unsigned int u:4; } global; \
+        "struct V { signed int s:5; unsigned int u:4; } global={1,2}; \
          int main(void) { double real=-3.75; float single=12.5f; \
          struct V local = {real, single}; \
          global.s=real; global.u=single; \
          if (local.s != -3 || local.u != 12) return 1; \
          return global.s == -3 && global.u == 12 ? 0 : 2; }",
     );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn bitfield_compound_assignments_convert_floating_and_wide_values_before_narrowing() {
+    let source = "struct V { signed int s:5; unsigned int u:4; } global; \
+         struct V records[2]; int index_calls; \
+         int next_index(void) { index_calls++; return 1; } \
+         int main(void) { struct V local={1,2}; \
+         struct V *pointer=&global; double real=4.75; long wide=65538L; \
+         local.s+=real; local.u+=real; \
+         global.s=1; global.u=2; \
+         if ((pointer->s+=wide)!=3 || (pointer->u+=wide)!=4) return 2; \
+         records[1].s=1; \
+         if ((records[next_index()].s+=wide)!=3 || index_calls!=1) return 5; \
+         if (local.s != 5 || local.u != 6) return 1; \
+         if (global.s != 3 || global.u != 4) return 4; \
+         local.s-=2.5; local.u*=2.5; \
+         if (local.s != 2 || local.u != 15) return 3; \
+         return 0; }";
+    let cpu = run_c(source);
     assert_eq!(cpu.registers[0], 0);
 }
 
@@ -756,6 +1298,118 @@ fn record_scalar_layout_uses_target_widths_without_enabling_word_only_accesses()
          return sizeof(global) == 18 && sizeof(local) == 18 && sizeof(overlay) == 8 ? 0 : 1; }",
     );
     assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn floating_record_members_load_store_and_update_their_object_bytes() {
+    let mut cpu = run_c(
+        "struct Inner { float single; double real; }; \
+         struct Outer { int tag; struct Inner inner; }; \
+         struct Outer global; \
+         int main(void) { struct Outer local={0,{1.5f,-3.5}}; \
+         struct Inner *pointer=&local.inner; \
+         if (pointer != &local.inner) return 8; \
+         if (local.inner.single != 1.5f || local.inner.real != -3.5) return 13; \
+         local.inner.single+=2.25f; if (pointer != &local.inner) return 10; \
+         if (local.inner.single++ != 3.75f) return 1; \
+         if (pointer != &local.inner) return 11; \
+         local.inner.real=-3.5; local.inner.real+=1.25; \
+         if (pointer != &local.inner) return 12; \
+         if (pointer->single != 4.75f) return 2; \
+         pointer->single+=0.25f; if (pointer->single != 5.0f) return 3; \
+         pointer->real++; \
+         global.inner.single=pointer->single; global.inner.real=pointer->real; \
+         if (pointer->real != -1.25) return 4; \
+         return global.inner.single == 5.0f && global.inner.real == -1.25 ? 0 : 7; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0x80002..0x80006)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        [0x40, 0xA0, 0x00, 0x00]
+    );
+    assert_eq!(
+        (0x80006..0x8000E)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        [0xBF, 0xF4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
+}
+
+#[test]
+fn floating_arrays_in_records_support_indexed_updates_and_stores() {
+    let mut cpu = run_c(
+        "struct Samples { float singles[2]; double reals[2]; }; \
+         struct Samples global; \
+         int main(void) { struct Samples local; struct Samples *pointer=&local; \
+         pointer->singles[0]=1.5f; local.singles[1]=2.5f; \
+         pointer->reals[0]=-1.25; local.reals[1]=0.5; \
+         pointer->singles[1]+=1.25f; \
+         if (local.singles[0]++ != 1.5f || local.singles[1] != 3.75f) return 1; \
+         local.reals[0]-=0.75; \
+         if (local.reals[1]++ != 0.5 || local.reals[0] != -2.0) return 2; \
+         global.singles[0]=local.singles[1]; global.reals[1]=local.reals[0]; \
+         return global.singles[0] == 3.75f && global.reals[1] == -2.0 ? 0 : 3; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0x80000..0x80004)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        [0x40, 0x70, 0x00, 0x00]
+    );
+    assert_eq!(
+        (0x80010..0x80018)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
+}
+
+#[test]
+fn wide_integer_record_members_load_store_and_update_all_bytes() {
+    let mut cpu = run_c(
+        "struct Pair { long signed_value; unsigned long unsigned_value; long samples[2]; }; \
+         struct Wrapper { int tag; struct Pair pair; }; \
+         struct Wrapper global; \
+         int main(void) { struct Wrapper local; struct Pair *pointer=&local.pair; \
+         local.pair.signed_value=-65537L; \
+         if (pointer->signed_value != -65537L) return 1; \
+         pointer->signed_value+=70000L; \
+         if (pointer->signed_value != 4463L || pointer->signed_value++ != 4463L) return 2; \
+         if (local.pair.signed_value != 4464L) return 3; \
+         pointer->unsigned_value=0xFEDCBA98UL; \
+         pointer->unsigned_value-=0x10000000UL; \
+         if (local.pair.unsigned_value != 0xEEDCBA98UL) return 4; \
+         local.pair.samples[1]=-3L; local.pair.samples[1]+=8L; \
+         if (pointer->samples[1] != 5L) return 6; \
+         global.pair.signed_value=local.pair.signed_value; \
+         global.pair.unsigned_value=pointer->unsigned_value; \
+         global.pair.samples[1]=local.pair.samples[1]; \
+         return global.pair.signed_value == 4464L && \
+                global.pair.unsigned_value == 0xEEDCBA98UL && \
+                global.pair.samples[1] == 5L ? 0 : 5; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0x80002..0x80006)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        4464i32.to_be_bytes()
+    );
+    assert_eq!(
+        (0x80006..0x8000A)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        0xEEDC_BA98u32.to_be_bytes()
+    );
+    assert_eq!(
+        (0x8000E..0x80012)
+            .map(|address| cpu.read(address))
+            .collect::<Vec<_>>(),
+        5i32.to_be_bytes()
+    );
 }
 
 #[test]

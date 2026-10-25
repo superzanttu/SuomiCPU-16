@@ -151,6 +151,14 @@ offsets. Explicit pointer-to-integer conversions preserve the complete address
 in a 32-bit +long+ and the low 16 bits in a 16-bit +int+. Explicit integer-to-
 pointer conversions use the low 30 bits. These conversion choices are
 implementation-defined.
+Runtime tests verify reads through one-level pointer-to-const locals, globals,
+and parameters, and reject assignments, compound assignments, and updates
+through those pointers. Const-qualified scalar and bit-field record members,
+standalone scalar objects, and arrays are initialized and reject later writes.
+Qualifier-dropping conversions between simple pointer variables, fixed
+pointer arguments, and pointer returns are also rejected. Multi-level
+qualifier conversions and const-qualified pointer objects remain outside this
+verified subset.
 
 == Alignment and aggregates
 
@@ -202,14 +210,21 @@ diagnosed.
 
 Scalar record layout uses the target four-byte +long+ and +float+ widths and
 eight-byte +double+ width for global and frame-local objects. This size/layout
-coverage does not enable runtime accesses to wide or floating record members;
-unsupported accesses are rejected rather than emitted as word-sized stores.
+coverage accompanies tested runtime accesses to binary32/binary64 members and
+indexed floating array fields, as well as signed/unsigned long scalar members
+and indexed long arrays through nested and pointer-member expressions.
+Automatic nested-brace initialization of records and multidimensional record
+arrays executes side-effecting scalar expressions in declaration order and
+zero-fills omitted fields and array elements.
 
-This is a verified subset, not complete C90 bit-field support. Floating and
-wide-integer compound conversions, complete qualifier enforcement, and the
-remaining general aggregate initializer semantics still require the typed
-backend work. Direct floating/wide compound assignments are diagnosed rather
-than lowered as word operations.
+This is a verified subset, not complete C90 bit-field support. Floating
+compound assignments for addition, subtraction, multiplication, and division,
+and wide-integer compound assignments are execution-tested. Direct writes and
+updates to const-qualified scalar and bit-field members and standalone scalar and array
+objects are rejected, while aggregate initialization of const members and
+objects is tested. One-level pointer qualifier conversions remain a verified
+subset; complete qualifier enforcement and the remaining general aggregate
+initializer semantics still require the typed backend work.
 
 == Function calls
 
@@ -260,6 +275,35 @@ Precision conversions at fixed floating parameters and returns are checked
 against independent IEEE bit patterns and Rust reference results. Integer
 subexpressions retain integer evaluation before conversion at these boundaries.
 Conflicting function parameter or return types are rejected before lowering.
+Fixed-signature structure and union parameters are copied as complete object
+representations. Execution tests cover mixed scalar offsets, nested records,
+recursive aggregate calls, and isolation of the caller's objects.
+Binary32 and binary64 scalar record members and indexed floating array fields
+support tested loads, assignments, compound assignments, increments, nested
+member access, and pointer-member access; global object bytes are checked
+against the target representations.
+Local pointers to binary32 and binary64 scalar objects support tested
+dereference loads, stores, compound assignments, and prefix/postfix updates;
+the regression keeps both pointers live together and checks the final global
+object bytes.
+Variadic calls apply the default promotions for tested signed/unsigned byte
+arguments and binary32-to-binary64 arguments. An executing linked probe checks
+the promoted bytes, pointer and aggregate representations, a following
+wide-integer argument, fixed-parameter offsets, and caller stack restoration.
+The compiler preserves the distinction between an empty parameter list (no
+prototype) and a fixed +void+ prototype. Unprototyped calls use the tested
+default promotions and stack representations; calls with extra arguments to a
+fixed zero-parameter prototype are rejected. No-prototype declarations are
+merged with compatible nonvariadic prototypes by checking parameter types
+against the default-promoted types; incompatible mixtures are diagnosed.
+K&R identifier-list definitions are not implemented.
+Mixed binary32/binary64 arithmetic and narrowing/widening conversions are
+checked against IEEE reference bytes, including unsigned conversion limits.
+In-range floating-to-byte casts truncate toward zero before signed or unsigned
+byte normalization; conversions between floating-point and pointer types are
+diagnosed instead of being lowered as ordinary scalar casts.
+Binary64 expressions and comparisons preserve live integer locals in R1-R3;
+runtime tests exercise comparisons and truth conditions around those values.
 
 === Verified wide-integer scalar subset
 
@@ -281,6 +325,9 @@ the CPU's out-of-range conversion extensions are not C90 guarantees.
 Locals whose writes produce expression values, and address-taken parameters,
 use frame storage so evaluation and call register saves cannot undo writes.
 Tests cover assignments and updates inside conversions and call arguments.
+Binary32 and binary64 prefix/postfix increments and decrements execute for
+local/global scalars and indexed array elements; tests verify pre-update and
+post-update values and exact global object bytes.
 Explicit scalar long/pointer casts retain all 30 address bits and discard
 integer bits above bit 29. CPU address-value instructions retain the
 architectural width even with a smaller configured RAM allocation; only
