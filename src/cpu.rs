@@ -897,8 +897,7 @@ impl Cpu {
         if operation == 7 {
             let high = self.read_u16(self.pc) & 0x3fff;
             let low = self.read_u16(self.pc.wrapping_add(2));
-            self.registers[destination] =
-                i64::from(((u32::from(high) << 16) | u32::from(low)) & self.memory_mask);
+            self.registers[destination] = i64::from((u32::from(high) << 16) | u32::from(low));
             self.pc = self.pc.wrapping_add(4) & self.memory_mask;
             return;
         }
@@ -911,13 +910,13 @@ impl Cpu {
         }
         if operation == 9 {
             let address = self.registers[source] as u32 & self.memory_mask;
-            let value = self.registers[destination] as u32 & self.memory_mask;
+            let value = self.registers[destination] as u32 & ADDRESS_MASK;
             self.write_u16(address, (value >> 16) as u16);
             self.write_u16(address.wrapping_add(2), value as u16);
             return;
         }
         if operation == 10 {
-            let value = self.registers[destination] as u32 & self.memory_mask;
+            let value = self.registers[destination] as u32 & ADDRESS_MASK;
             self.registers[destination] = i64::from(value >> 16);
             self.registers[source] = i64::from(value & 0xffff);
             return;
@@ -1086,7 +1085,7 @@ impl Cpu {
         };
         self.flags.zero = result == 0;
         self.flags.negative = result & 0x8000_0000 != 0;
-        if operation >= 3 {
+        if (3..=5).contains(&operation) {
             self.flags.carry = false;
             self.flags.overflow = false;
         }
@@ -3276,6 +3275,69 @@ mod tests {
             assert!(
                 crate::assembler::assemble(source, 0).is_err(),
                 "expected invalid pair instruction to be rejected: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn address_values_keep_thirty_bits_independently_of_configured_ram_size() {
+        let image = crate::assembler::assemble(
+            "LDI30 R0, 0x12345678\nSPLIT30 R0, R1\nJOIN30 R0, R1\n\
+             LDI30 R2, 0x100\nSTP R0, R2\nLDP R3, R2\n\
+             STP R7, R2\nLDP R6, R2\nSPLIT30 R7, R4\n\
+             LDI30 R5, 0x3FFFFFFF\nHALT",
+            0,
+        )
+        .unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.registers[7] = i64::from(u32::MAX);
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0x1234_5678);
+        assert_eq!(cpu.registers[1], 0x5678);
+        assert_eq!(cpu.registers[3], 0x1234_5678);
+        assert_eq!(cpu.registers[4], 0xffff);
+        assert_eq!(cpu.registers[5], 0x3fff_ffff);
+        assert_eq!(cpu.registers[6], 0x3fff_ffff);
+        assert_eq!(cpu.registers[7], 0x3fff);
+        assert_eq!(&cpu.memory[0x100..0x104], &[0x3f, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn wide_shifts_preserve_the_last_shifted_bit_and_zero_count_carry() {
+        for (instruction, input, expected, carry) in [
+            ("SHL32 R0, 1", 0x8000_0001u32, 2u32, true),
+            ("SHL32 R0, 1", 0x4000_0000, 0x8000_0000, false),
+            ("LSR32 R0, 1", 0x8000_0001, 0x4000_0000, true),
+            ("ASR32 R0, 1", 0x8000_0001, 0xc000_0000, true),
+            ("LSR32 R0, 31", 0x4000_0000, 0, true),
+            ("SHL32 R0, 31", 2, 0, true),
+            ("SHL32 R0, 0", 1, 1, true),
+            ("LSR32 R0, 0", 0x8000_0001, 0x8000_0001, true),
+            ("ASR32 R0, 0", 0x8000_0001, 0x8000_0001, true),
+            ("SHL32 R0, R2", 0x8000_0001, 2, true),
+            ("LSR32 R0, R2", 3, 1, true),
+        ] {
+            let image = crate::assembler::assemble(&format!("{instruction}\nHALT"), 0).unwrap();
+            let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.set_pair(0, input);
+            cpu.registers[2] = 1;
+            cpu.flags.carry = true;
+            cpu.flags.overflow = true;
+            cpu.run(2).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.register_pair_u32(0), expected, "{instruction}");
+            assert_eq!(cpu.flags.carry, carry, "{instruction}");
+            assert!(!cpu.flags.overflow, "{instruction}");
+            assert_eq!(cpu.flags.zero, expected == 0, "{instruction}");
+            assert_eq!(
+                cpu.flags.negative,
+                expected & 0x8000_0000 != 0,
+                "{instruction}"
             );
         }
     }

@@ -64,9 +64,11 @@ conformance work.
   single binary32 parameter and binary32 result are supported. Binary64 runtime
   coverage now includes tested scalar/pointer-array access, arithmetic,
   comparisons, signed 16-bit conversion, and a single-parameter call/result.
-  Binary32 conversions involving 32-bit integers, complete binary64
-  conversions, multi-argument, nested, or recursive floating calls, and full
-  C90 usual arithmetic conversions remain unsupported.
+  Fixed multi-argument, nested, and recursive floating calls are tested.
+  Scalar signed/unsigned 32-bit expressions and conversions to/from both
+  floating widths now execute at assignments and fixed call boundaries,
+  including wide results, recursion, range edges, and binary32 rounding.
+  Full typed lvalue and C90 usual arithmetic conversions remain incomplete.
   Constant casts to +float+, +double+, and +long double+ are supported in
   these initializers.
   Tests verify +float.h+ limit macros,
@@ -197,6 +199,13 @@ C90 requirements listed under C.
    calls, recursion, and tested prototype/return precision conversions.
    Runtime tests inspect argument bytes, stack cleanup, and independent IEEE
    results. Full typed conversions and default argument promotions remain open.
+** Verified progress: signed/unsigned long scalars now retain both words in
+   arithmetic, comparisons, conditions, updates, fixed arguments, and results.
+   Runtime conversions to/from binary32 and binary64 cover in-range edges,
+   truncation, and rounding against independent Rust/IEEE references.
+   Frame-backed expression writes prevent conversion/call register saves from
+   restoring stale local or parameter values. General long lvalues, pointer
+   conversions, qualifiers, and constant-expression semantics remain open.
 ** *Depends on:* +c90-float-model+ and +c90-float-isa+ in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+].
 

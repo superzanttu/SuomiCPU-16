@@ -16,6 +16,241 @@ fn run_c(source: &str) -> Cpu {
 }
 
 #[test]
+fn wide_integer_arithmetic_calls_and_returns_preserve_both_words() {
+    let cpu = run_c(
+        "long observed; unsigned long bits=305419896UL; \
+         long combine(long a, unsigned int b, long c) { return a+b+c; } \
+         long recur(int n, long value) { if (!n) return value; \
+         return recur(n-1,value+65537L); } \
+         int main(void) { long local=-70000L; \
+         observed=combine(local,65535U,131072L); \
+         if (observed != 126607L) return 1; \
+         if (recur(4,65536L) != 327684L) return 2; \
+         local*=3; local/=7; local%=1000; \
+         if (local != -0L) return 3; \
+         bits^=4294901760UL; bits&=16777215UL; bits|=16777216UL; \
+         if (bits != 0x01CB5678UL) return 4; \
+         return sizeof(65536L) == 4 && sizeof(bits+1) == 4 ? 0 : 5; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn wide_integer_conditions_comparisons_and_shift_signedness() {
+    let cpu = run_c(
+        "int main(void) { long negative=-65536L; unsigned long high=2147483648UL; \
+         long zero=0L; \
+         if (!high || !negative || zero || !(high && negative) || (zero && high)) return 1; \
+         if (negative >= 0L || negative == 0 || negative != -65536L) return 2; \
+         if (!(negative < 65535U) || !(high > 2147483647L)) return 3; \
+         if (negative >> 16 != -1L || high >> 31 != 1UL) return 4; \
+         if ((1UL << 31) != high || (~0UL) != 4294967295UL) return 5; \
+         if ((negative+3L) >= (negative+4L)) return 6; \
+         return (high ? negative : 1L) == -65536L ? 0 : 7; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn wide_updates_and_word_call_conversions_preserve_signedness() {
+    let cpu = run_c(
+        "unsigned long global=4294967295UL; \
+         unsigned int word(void) { return 65535U; } \
+         long widen(long value) { return value; } \
+         int main(void) { long local=65535L; long old=local++; \
+         if (old != 65535L || local != 65536L) return 1; \
+         if (++local != 65537L || local-- != 65537L || --local != 65535L) return 2; \
+         if (global++ != 4294967295UL || global != 0UL) return 3; \
+         global--; if (global != 4294967295UL) return 4; \
+         if (widen(word()) != 65535L || (long)word() != 65535L) return 5; \
+         local+=0.75; if (local != 65535L) return 6; \
+         return (int)(global=65537UL) == 1 ? 0 : 7; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn wide_integer_object_results_match_independent_rust_arithmetic() {
+    for (left, right) in [
+        (0u32, 1u32),
+        (u32::MAX, 65_537),
+        (0x8000_0000, 31),
+        (0x1234_5678, 0x1020_3040),
+    ] {
+        for (operator, expected) in [
+            ("+", left.wrapping_add(right)),
+            ("-", left.wrapping_sub(right)),
+            ("*", left.wrapping_mul(right)),
+            ("/", left / right),
+            ("%", left % right),
+            ("&", left & right),
+            ("|", left | right),
+            ("^", left ^ right),
+        ] {
+            let mut cpu = run_c(&format!(
+                "unsigned long observed; int main(void) {{ \
+                 unsigned long a={left}UL; unsigned long b={right}UL; \
+                 observed=a{operator}b; return 0; }}"
+            ));
+            let bytes = (0..4)
+                .map(|offset| cpu.read(0x80000 + offset))
+                .collect::<Vec<_>>();
+            assert_eq!(bytes, expected.to_be_bytes(), "{left} {operator} {right}");
+        }
+    }
+    for (expression, expected) in [
+        ("-2147483647L/17L", (-2_147_483_647i32 / 17) as u32),
+        ("-2147483647L%17L", (-2_147_483_647i32 % 17) as u32),
+        ("(long)(int)65535U", u32::MAX),
+        ("(long)(unsigned int)-1", 65_535),
+        ("(long)(signed char)255", u32::MAX),
+        ("(long)(unsigned char)-1", 255),
+    ] {
+        let mut cpu = run_c(&format!(
+            "unsigned long observed; int main(void) {{ observed={expression}; return 0; }}"
+        ));
+        let bytes = (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, expected.to_be_bytes(), "{expression}");
+    }
+}
+
+#[test]
+fn wide_comparisons_and_calls_preserve_live_word_and_pointer_values() {
+    let cpu = run_c(
+        "long identity(long x) { return x; } \
+         int compare(int *pointer, int sentinel, long value) { \
+         if (value < 0L && identity(value) != 0L) *pointer=sentinel; \
+         return sentinel; } \
+         int main(void) { int result[1]; result[0]=0; \
+         if (compare(result,12345,-65536L) != 12345) return 1; \
+         return result[0] == 12345 ? 0 : 2; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn widening_keeps_word_expression_side_effects_and_promoted_signedness() {
+    let cpu = run_c(
+        "long identity(long value) { return value; } \
+         int main(void) { int word=5; unsigned int unsigned_word=65535U; \
+         unsigned int values[1]; values[0]=65535U; \
+         long result=(long)(word=17); \
+         if (result != 17L || word != 17) return 1; \
+         result=(long)word++; if (result != 17L || word != 18) return 2; \
+         result=(long)++word; if (result != 19L) return 3; \
+         result=identity(word ? -1 : unsigned_word); \
+         if (result != 65535L) return 4; \
+         result=identity(values[0]); return result == 65535L ? 0 : 5; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn expression_and_call_register_saves_do_not_undo_parameter_or_local_writes() {
+    let cpu = run_c(
+        "long previous(int value) { long result=(long)value++; \
+         return value == 18 ? result : -1L; } \
+         float single(float value) { return value; } \
+         int word_identity(int value) { return value; } \
+         int parameter_address(int value) { int *pointer=&value; *pointer=21; return value; } \
+         int main(void) { int word=5; float rounded=(float)(word=13); \
+         if (word != 13 || rounded != 13.0f) return 1; \
+         rounded=single((float)word++); if (rounded != 13.0f || word != 14) return 2; \
+         if (word_identity(word=23) != 23 || word != 23) return 3; \
+         if (previous(17) != 17L || parameter_address(9) != 21) return 4; \
+         return 0; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn wide_integer_pointer_casts_preserve_all_thirty_address_bits() {
+    let mut cpu = run_c(
+        "unsigned long observed; int main(void) { unsigned long address=589824UL; \
+         int *pointer=(int *)address; int *next=(int *)(address+2UL); \
+         *pointer=1234; *next=5678; \
+         if ((long)pointer != 589824L || (unsigned long)next != 589826UL) return 1; \
+         if (*pointer != 1234 || *next != 5678 || *((int *)(address+2UL)) != 5678) return 2; \
+         pointer=(int *)4294967295UL; \
+         observed=(unsigned long)pointer; \
+         if ((unsigned long)pointer != 1073741823UL) return 3; \
+         pointer=(int *)65536L; return (long)pointer == 65536L ? 0 : 4; }",
+    );
+    let bytes = (0..4)
+        .map(|offset| cpu.read(0x80000 + offset))
+        .collect::<Vec<_>>();
+    assert_eq!(bytes, 0x3fff_ffffu32.to_be_bytes());
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn integer_to_floating_conversions_use_full_width_and_independent_ieee_results() {
+    for (integer, expected) in [
+        ("-2147483647L-1L", i32::MIN as f64),
+        ("2147483647L", i32::MAX as f64),
+        ("4294967295UL", u32::MAX as f64),
+        ("16777217L", 16_777_217.0f64),
+        ("-65537L", -65_537.0f64),
+    ] {
+        for (c_type, size) in [("float", 4), ("double", 8)] {
+            let source = format!(
+                "{c_type} observed; long signed_id(long x) {{ return x; }} \
+                 unsigned long unsigned_id(unsigned long x) {{ return x; }} \
+                 int main(void) {{ \
+                 observed=({c_type})({integer}); return 0; }}"
+            );
+            let mut cpu = run_c(&source);
+            let bytes = (0..size)
+                .map(|offset| cpu.read(0x80000 + offset))
+                .collect::<Vec<_>>();
+            let expected = if size == 4 {
+                (expected as f32).to_be_bytes().to_vec()
+            } else {
+                expected.to_be_bytes().to_vec()
+            };
+            assert_eq!(bytes, expected, "{c_type}: {integer}");
+        }
+    }
+    let mut cpu = run_c(
+        "double observed; long identity(long value) { return value; } \
+         int main(void) { long local=65537L; \
+         observed=identity(local*3L)-65536L; return 0; }",
+    );
+    let bytes = (0..8)
+        .map(|offset| cpu.read(0x80000 + offset))
+        .collect::<Vec<_>>();
+    assert_eq!(bytes, 131_075.0f64.to_be_bytes());
+}
+
+#[test]
+fn floating_to_wide_integers_convert_initializers_assignments_arguments_and_returns() {
+    for (expression, c_type, expected) in [
+        ("-2147483648.0", "long", i32::MIN as u32),
+        ("2147483647.75", "long", i32::MAX as u32),
+        ("4294967295.0", "unsigned long", u32::MAX),
+        ("65537.75f", "long", 65_537),
+        ("-65537.75f", "long", (-65_537i32) as u32),
+    ] {
+        let source = format!(
+            "{c_type} observed; {c_type} identity({c_type} x) {{ return x; }} \
+             {c_type} converted(double x) {{ return x; }} \
+             int main(void) {{ double input={expression}; \
+             {c_type} local=input; observed=identity(input); \
+             if (observed != local || converted(input) != local) return 1; \
+             observed=({c_type})input; return 0; }}"
+        );
+        let mut cpu = run_c(&source);
+        assert_eq!(cpu.registers[0], 0, "{expression}");
+        let bytes = (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, expected.to_be_bytes(), "{expression}");
+    }
+}
+
+#[test]
 fn far_and_register_pair_calls_save_exact_big_endian_return_addresses() {
     for call in ["CALLX 0x12340", "CALLRP R0, R1"] {
         let image = assemble(

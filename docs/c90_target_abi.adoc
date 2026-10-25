@@ -261,9 +261,39 @@ against independent IEEE bit patterns and Rust reference results. Integer
 subexpressions retain integer evaluation before conversion at these boundaries.
 Conflicting function parameter or return types are rejected before lowering.
 
+=== Verified wide-integer scalar subset
+
+Execution tests verify four-byte global and automatic +long+ / +unsigned long+
+objects, scalar assignments and compound assignments, prefix/postfix updates,
+arithmetic, bitwise operators, signed/unsigned division and remainder, shifts,
+comparisons, conditions, short-circuit logic, and conditional expressions.
+Wide expressions retain both words; narrowing conversions select the low
+destination bits. Integer promotions distinguish signed 32-bit values from
+unsigned 16-bit operands. Fixed long parameters and results use the documented
+stack and register representations, including nested calls and recursion.
+
+Runtime conversions between signed/unsigned 32-bit integers and binary32 /
+binary64 are tested at initializers, assignments, casts, parameters, and
+returns. Tests compare object bytes with independent Rust arithmetic and IEEE
+references, including integer range edges and binary32 rounding at +16777217+.
+Floating-to-integer cases stay within the destination's representable range;
+the CPU's out-of-range conversion extensions are not C90 guarantees.
+Locals whose writes produce expression values, and address-taken parameters,
+use frame storage so evaluation and call register saves cannot undo writes.
+Tests cover assignments and updates inside conversions and call arguments.
+Explicit scalar long/pointer casts retain all 30 address bits and discard
+integer bits above bit 29. CPU address-value instructions retain the
+architectural width even with a smaller configured RAM allocation; only
+memory-access addresses are reduced to that allocation.
+
+This scalar coverage does not establish complete wide-integer array, pointer,
+aggregate-member, qualifier, or constant-expression semantics. Full typed
+conversion analysis and general pointer/integer expression combinations remain
+acceptance work.
+
 These tests do not establish complete C90 call compatibility. Default argument
 promotions, old-style function compatibility, complete typed expression
-conversions, wide integer expressions/results, aggregate call combinations,
+conversions, general wide-integer lvalues, aggregate call combinations,
 and all pointer object encodings remain acceptance work. The historical
 assembly-library calling paths are separate and retain their existing
 conventions; their binary16 math routines are not binary64 C90 implementations.

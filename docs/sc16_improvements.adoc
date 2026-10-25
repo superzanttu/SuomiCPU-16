@@ -74,6 +74,9 @@ Checklist status: [x] completed; [ ] planned.
    30-bit addresses.
 ** Add +LDI30+ (with +LDI19+ / +LDA+ compatibility aliases) for full-width
    addresses.
+** [x] Preserve architectural address values independently of configured RAM
+   size in +LDI30+, +STP+, and +SPLIT30+; verify high-bit round trips and explicit
+   scalar long/pointer casts without changing memory-access wrapping.
 
 * [ ] *Implement the C stack argument ABI* (+c90-stack-call-abi+)
 ** [x] Pass one 16-bit scalar parameter at +SP \+ 4+; test signed values and
@@ -90,6 +93,10 @@ Checklist status: [x] completed; [ ] planned.
    test compact mixed byte/word parameters, fixed mixed integer/pointer/
    floating signatures, wide integer object arguments, nested and recursive
    floating calls, and cleanup beyond a single +ADJSP+ immediate.
+** [x] Execute signed/unsigned long scalar expressions, updates, fixed
+   parameter conversions, and +R0:R1+ results across nested/recursive calls;
+   verify exact object bytes, word-to-long promotions, live values, and caller
+   cleanup against independent arithmetic references.
 ** [ ] Pass all supported C argument types using their documented stack object
    representations; cover other arities, byte, pointer, wide integer,
    aggregate, and floating arguments, callee offsets, promotions, nested calls,
@@ -145,6 +152,11 @@ Checklist status: [x] completed; [ ] planned.
    between integer types and binary64, and binary32/binary64 conversions in
    both directions. Test range edges and C90's undefined conversion cases
    without relying on CPU extensions.
+** [x] Verify scalar signed/unsigned 32-bit conversions in both directions
+   with binary32 and binary64 at initializers, assignments, casts, fixed
+   arguments, and returns. Cover representable range edges, truncation,
+   binary32 rounding, and expression side effects using independent references.
+   General typed lvalues and undefined-conversion diagnostics remain open.
 ** [x] Move verified binary32 arithmetic and comparisons from automatic
    initializer-only code paths into general expressions, including conditions,
    assignments, compound assignments, conditional expressions, and discarded
@@ -189,6 +201,9 @@ Checklist status: [x] completed; [ ] planned.
 ** Verify data types, representations, alignment, pointers, conversions,
    stack frames, and calling conventions.
 ** Test C-visible memory, control flow, and floating-point behavior.
+** [x] Repair and execute wide shift carry-out tests: +SHL32+, +LSR32+, and
+   +ASR32+ retain the last shifted-out bit, preserve carry for a zero count,
+   and clear overflow for immediate and register-count forms.
 ** Update +c90_target_abi.adoc+ only from verified results.
 ** *Depends on:* +c90-float-validation+ and the C compiler tasks
    +c90-indirect-calls+, +c90-pointer-qualifiers+, +c90-bitfield-codegen+,

@@ -339,6 +339,7 @@ impl NativeArgumentKind {
 struct NativeStackArgument {
     kind: NativeArgumentKind,
     offset: usize,
+    unsigned: bool,
 }
 
 #[derive(Clone)]
@@ -377,7 +378,11 @@ impl NativeCallLayout {
             if size > u16::MAX as usize {
                 return None;
             }
-            arguments.push(NativeStackArgument { kind, offset });
+            arguments.push(NativeStackArgument {
+                kind,
+                offset,
+                unsigned: is_native_unsigned_word_type(&parameter.c_type),
+            });
         }
         Some(Self { arguments, size })
     }
@@ -441,6 +446,9 @@ enum NativeLocation {
     GlobalScalar {
         unsigned: bool,
     },
+    GlobalWideScalar {
+        unsigned: bool,
+    },
     GlobalByteScalar {
         signed: bool,
     },
@@ -469,6 +477,8 @@ enum NativeLocation {
     FunctionParameters {
         layout: Option<NativeCallLayout>,
         float_return_size: usize,
+        wide_return_unsigned: Option<bool>,
+        word_return_unsigned: bool,
     },
     StackArray {
         offset: usize,
@@ -1168,8 +1178,10 @@ pub fn compile_minimal_program_to_assembly(
                     })
                 });
                 let (element_size, element_signed) = match global_type {
-                    "int" | "long" => (2, true),
-                    "unsigned int" | "unsigned long" => (2, false),
+                    "int" => (2, true),
+                    "unsigned int" => (2, false),
+                    "long" | "signed long" => (4, true),
+                    "unsigned long" => (4, false),
                     "unsigned char" => (1, false),
                     "char" | "signed char" => (1, true),
                     "float" => (4, false),
@@ -1312,6 +1324,9 @@ pub fn compile_minimal_program_to_assembly(
                                 data[index * 4 + 3] = value as u8;
                             } else if element_size == 1 {
                                 data[index] = value as u8;
+                            } else if element_size == 4 {
+                                data[index * 4..index * 4 + 4]
+                                    .copy_from_slice(&(value as u32).to_be_bytes());
                             } else {
                                 let value = value as u16;
                                 data[index * 2] = (value >> 8) as u8;
@@ -1522,30 +1537,22 @@ pub fn compile_minimal_program_to_assembly(
                     ))
                 },
             )?;
-        let stack_parameters = parameter_layout.needs_stack_parameters();
-        let spill_third_parameter = !stack_parameters && function.declaration.parameters.len() >= 3;
-        let address_taken = native_address_taken_locals(&function.body);
-        if !stack_parameters
-            && function.declaration.parameters.iter().any(|parameter| {
+        let stack_required = native_stack_required_locals(&function.body);
+        let stack_parameters = parameter_layout.needs_stack_parameters()
+            || function.declaration.parameters.iter().any(|parameter| {
                 parameter
                     .name
                     .as_ref()
-                    .is_some_and(|name| address_taken.contains(name))
-            })
-        {
-            eprintln!(
-                "address of function parameter is not supported in {}",
-                function.declaration.name
-            );
-            return Ok(None);
-        }
+                    .is_some_and(|name| stack_required.contains(name))
+            });
+        let spill_third_parameter = !stack_parameters && function.declaration.parameters.len() >= 3;
         let reserve_frame_register = has_local_array
             || has_local_floating_scalar
             || has_local_wide_integer
             || has_excess_locals
             || stack_parameters
             || function.declaration.parameters.len() >= 3
-            || !address_taken.is_empty();
+            || !stack_required.is_empty();
         let mut locals = HashMap::new();
         let mut stacked_parameter_bytes = 0usize;
         for (index, parameter) in function.declaration.parameters.iter().enumerate() {
@@ -1653,7 +1660,7 @@ pub fn compile_minimal_program_to_assembly(
             &mut next_local_register,
             &mut frame_size,
             reserve_frame_register,
-            &address_taken,
+            &stack_required,
             &unit.records,
         ) {
             eprintln!("unsupported locals in {}", function.declaration.name);
@@ -1692,6 +1699,10 @@ pub fn compile_minimal_program_to_assembly(
                 NativeLocation::FloatingPointScalar {
                     size: global.element_size,
                 }
+            } else if is_native_wide_integer_type(&global.c_type) {
+                NativeLocation::GlobalWideScalar {
+                    unsigned: is_native_unsigned_word_type(&global.c_type),
+                }
             } else {
                 NativeLocation::GlobalScalar {
                     unsigned: is_native_unsigned_word_type(&global.c_type),
@@ -1719,6 +1730,32 @@ pub fn compile_minimal_program_to_assembly(
                 .entry(name.to_owned())
                 .or_insert_with(|| NativeLocation::FunctionParameters {
                     layout: NativeCallLayout::new(parameters, &unit.records),
+                    wide_return_unsigned: {
+                        let return_type = match declaration {
+                            ExternalDeclaration::FunctionDefinition(function) => {
+                                &function.declaration.return_type
+                            }
+                            ExternalDeclaration::FunctionPrototype(function) => {
+                                &function.return_type
+                            }
+                            ExternalDeclaration::Global(_) => unreachable!(),
+                        };
+                        is_native_wide_integer_type(return_type)
+                            .then(|| is_native_unsigned_word_type(return_type))
+                    },
+                    word_return_unsigned: {
+                        let return_type = match declaration {
+                            ExternalDeclaration::FunctionDefinition(function) => {
+                                &function.declaration.return_type
+                            }
+                            ExternalDeclaration::FunctionPrototype(function) => {
+                                &function.return_type
+                            }
+                            ExternalDeclaration::Global(_) => unreachable!(),
+                        };
+                        native_byte_type(return_type).is_none()
+                            && is_native_unsigned_word_type(return_type)
+                    },
                     float_return_size: match declaration {
                         ExternalDeclaration::FunctionDefinition(function) => {
                             native_floating_type_size(&function.declaration.return_type)
@@ -2300,23 +2337,67 @@ fn rewrite_native_local_scopes(
     valid
 }
 
-fn native_address_taken_locals(statement: &Statement) -> HashSet<String> {
+fn native_stack_required_locals(statement: &Statement) -> HashSet<String> {
+    fn collect_discarded_expression(expression: &Expression, names: &mut HashSet<String>) {
+        match &expression.kind {
+            ExpressionKind::Assignment { target, value, .. } => {
+                collect_expression(target, names);
+                collect_expression(value, names);
+            }
+            ExpressionKind::Unary { operator, operand }
+            | ExpressionKind::Postfix {
+                operator,
+                expression: operand,
+            } if matches!(operator.as_str(), "++" | "--") => {
+                collect_expression(operand, names);
+            }
+            ExpressionKind::Binary {
+                operator,
+                left,
+                right,
+            } if operator == "," => {
+                collect_discarded_expression(left, names);
+                collect_discarded_expression(right, names);
+            }
+            ExpressionKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                collect_expression(condition, names);
+                collect_discarded_expression(when_true, names);
+                collect_discarded_expression(when_false, names);
+            }
+            _ => collect_expression(expression, names),
+        }
+    }
+
     fn collect_expression(expression: &Expression, names: &mut HashSet<String>) {
         match &expression.kind {
-            ExpressionKind::Unary { operator, operand } => {
-                if operator == "&"
+            ExpressionKind::Unary { operator, operand }
+            | ExpressionKind::Postfix {
+                operator,
+                expression: operand,
+            } => {
+                if matches!(operator.as_str(), "&" | "++" | "--")
                     && let ExpressionKind::Atom(name) = &operand.kind
                 {
                     names.insert(name.clone());
                 }
                 collect_expression(operand, names);
             }
-            ExpressionKind::Binary { left, right, .. }
-            | ExpressionKind::Assignment {
+            ExpressionKind::Assignment {
                 target: left,
                 value: right,
                 ..
             } => {
+                if let ExpressionKind::Atom(name) = &left.kind {
+                    names.insert(name.clone());
+                }
+                collect_expression(left, names);
+                collect_expression(right, names);
+            }
+            ExpressionKind::Binary { left, right, .. } => {
                 collect_expression(left, names);
                 collect_expression(right, names);
             }
@@ -2343,7 +2424,6 @@ fn native_address_taken_locals(statement: &Statement) -> HashSet<String> {
                 collect_expression(index, names);
             }
             ExpressionKind::Member { expression, .. }
-            | ExpressionKind::Postfix { expression, .. }
             | ExpressionKind::Cast { expression, .. }
             | ExpressionKind::SizeofExpression(expression) => collect_expression(expression, names),
             ExpressionKind::InitializerList(expressions) => {
@@ -2369,7 +2449,12 @@ fn native_address_taken_locals(statement: &Statement) -> HashSet<String> {
                     }
                 }
             }
-            StatementKind::Expression(expression) | StatementKind::Return(expression) => {
+            StatementKind::Expression(expression) => {
+                if let Some(expression) = expression {
+                    collect_discarded_expression(expression, names);
+                }
+            }
+            StatementKind::Return(expression) => {
                 if let Some(expression) = expression {
                     collect_expression(expression, names);
                 }
@@ -2403,7 +2488,7 @@ fn native_address_taken_locals(statement: &Statement) -> HashSet<String> {
                     collect_expression(condition, names);
                 }
                 if let Some(update) = update {
-                    collect_expression(update, names);
+                    collect_discarded_expression(update, names);
                 }
                 collect_statement(body, names);
             }
@@ -2434,7 +2519,7 @@ fn collect_native_locals(
     next_register: &mut u8,
     frame_size: &mut usize,
     reserve_frame_register: bool,
-    address_taken: &HashSet<String>,
+    stack_required: &HashSet<String>,
     records: &HashMap<String, NativeRecordLayout>,
 ) -> bool {
     for statement in statements {
@@ -2575,7 +2660,7 @@ fn collect_native_locals(
                             return false;
                         }
                         let location = if *next_register <= 3
-                            && !address_taken.contains(&declaration.name)
+                            && !stack_required.contains(&declaration.name)
                         {
                             let location =
                                 if let Some((element_size, element_signed)) = pointer_element {
@@ -2647,7 +2732,7 @@ fn collect_native_locals(
                     next_register,
                     frame_size,
                     reserve_frame_register,
-                    address_taken,
+                    stack_required,
                     records,
                 ) {
                     return false;
@@ -2664,7 +2749,7 @@ fn collect_native_locals(
                     next_register,
                     frame_size,
                     reserve_frame_register,
-                    address_taken,
+                    stack_required,
                     records,
                 ) || else_branch.as_ref().is_some_and(|branch| {
                     !collect_native_locals(
@@ -2673,7 +2758,7 @@ fn collect_native_locals(
                         next_register,
                         frame_size,
                         reserve_frame_register,
-                        address_taken,
+                        stack_required,
                         records,
                     )
                 }) {
@@ -2689,7 +2774,7 @@ fn collect_native_locals(
                     next_register,
                     frame_size,
                     reserve_frame_register,
-                    address_taken,
+                    stack_required,
                     records,
                 ) {
                     return false;
@@ -2704,7 +2789,7 @@ fn collect_native_locals(
                         next_register,
                         frame_size,
                         reserve_frame_register,
-                        address_taken,
+                        stack_required,
                         records,
                     )
                 {
@@ -2719,7 +2804,7 @@ fn collect_native_locals(
                         next_register,
                         frame_size,
                         reserve_frame_register,
-                        address_taken,
+                        stack_required,
                         records,
                     ) {
                         return false;
@@ -2733,7 +2818,7 @@ fn collect_native_locals(
                     next_register,
                     frame_size,
                     reserve_frame_register,
-                    address_taken,
+                    stack_required,
                     records,
                 ) =>
             {
@@ -3159,6 +3244,9 @@ fn native_sizeof_expression(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
 ) -> Option<u16> {
+    if native_expression_is_wide_integer(expression, locals) {
+        return Some(4);
+    }
     match &expression.kind {
         ExpressionKind::Atom(value) if parse_integer_constant(value).is_some() => Some(2),
         ExpressionKind::Atom(name) => match locals.get(name) {
@@ -3441,42 +3529,413 @@ fn emit_native_stack_offset(register: u8, offset: usize, assembly: &mut String) 
     }
 }
 
+#[derive(Clone, Copy)]
+struct NativeIntegerType {
+    wide: bool,
+    unsigned: bool,
+}
+
+fn native_expression_integer_type(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<NativeIntegerType> {
+    let word = |unsigned| NativeIntegerType {
+        wide: false,
+        unsigned,
+    };
+    let wide = |unsigned| NativeIntegerType {
+        wide: true,
+        unsigned,
+    };
+    let combine = |left: NativeIntegerType, right: NativeIntegerType| NativeIntegerType {
+        wide: left.wide || right.wide,
+        unsigned: if left.wide != right.wide {
+            if left.wide {
+                left.unsigned
+            } else {
+                right.unsigned
+            }
+        } else {
+            left.unsigned || right.unsigned
+        },
+    };
+    match &expression.kind {
+        ExpressionKind::Atom(name) => match locals.get(name) {
+            Some(NativeLocation::StackWideScalar { unsigned, .. })
+            | Some(NativeLocation::GlobalWideScalar { unsigned }) => Some(wide(*unsigned)),
+            Some(NativeLocation::Register { unsigned, .. })
+            | Some(NativeLocation::StackScalar { unsigned, .. })
+            | Some(NativeLocation::GlobalScalar { unsigned }) => Some(word(*unsigned)),
+            Some(NativeLocation::ByteRegister { .. })
+            | Some(NativeLocation::ByteStackScalar { .. })
+            | Some(NativeLocation::GlobalByteScalar { .. })
+            | Some(NativeLocation::Constant(_)) => Some(word(false)),
+            _ => {
+                let value = parse_integer_constant(name)?;
+                let unsigned = name.ends_with(['u', 'U'])
+                    || name.to_ascii_lowercase().ends_with("ul")
+                    || value > i64::from(i32::MAX);
+                let explicitly_long = name.contains(['l', 'L']);
+                let nondecimal = name.starts_with('0') && name.len() > 1;
+                let is_wide = explicitly_long
+                    || value > i64::from(u16::MAX)
+                    || (!unsigned && !nondecimal && value > i64::from(i16::MAX));
+                Some(if is_wide {
+                    wide(unsigned)
+                } else {
+                    word(unsigned || value > i64::from(i16::MAX))
+                })
+            }
+        },
+        ExpressionKind::Cast { c_type, .. } if is_native_wide_integer_type(c_type) => {
+            Some(wide(is_native_unsigned_word_type(c_type)))
+        }
+        ExpressionKind::Cast { c_type, .. }
+            if native_floating_type_size(c_type).is_none() && !c_type.contains('*') =>
+        {
+            Some(word(
+                native_byte_type(c_type).is_none() && is_native_unsigned_word_type(c_type),
+            ))
+        }
+        ExpressionKind::Unary { operator, operand } => {
+            if operator == "!" {
+                Some(word(false))
+            } else if matches!(operator.as_str(), "+" | "-" | "~" | "++" | "--") {
+                native_expression_integer_type(operand, locals)
+            } else {
+                None
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            if operator == "," {
+                native_expression_integer_type(right, locals)
+            } else if matches!(
+                operator.as_str(),
+                "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
+            ) {
+                Some(word(false))
+            } else {
+                let left = native_expression_integer_type(left, locals)?;
+                if matches!(operator.as_str(), "<<" | ">>") {
+                    Some(left)
+                } else {
+                    Some(combine(
+                        left,
+                        native_expression_integer_type(right, locals)?,
+                    ))
+                }
+            }
+        }
+        ExpressionKind::Assignment { target, .. }
+        | ExpressionKind::Postfix {
+            expression: target, ..
+        } => native_expression_integer_type(target, locals),
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => Some(combine(
+            native_expression_integer_type(when_true, locals)?,
+            native_expression_integer_type(when_false, locals)?,
+        )),
+        ExpressionKind::Member { .. } => {
+            let field = native_expression_record_field(expression, locals)?;
+            if let Some((_, width)) = field.bit_field {
+                Some(word(!field.signed && width == 16))
+            } else if field.size <= 2
+                && field.dimensions.is_empty()
+                && field.record_layout.is_none()
+            {
+                Some(word(field.size == 2 && !field.signed))
+            } else {
+                None
+            }
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return None;
+            };
+            match locals.get(name)? {
+                NativeLocation::FunctionParameters {
+                    wide_return_unsigned: Some(unsigned),
+                    ..
+                } => Some(wide(*unsigned)),
+                NativeLocation::FunctionParameters {
+                    float_return_size: 0,
+                    word_return_unsigned,
+                    ..
+                } => Some(word(*word_return_unsigned)),
+                _ => None,
+            }
+        }
+        ExpressionKind::SizeofType(_) | ExpressionKind::SizeofExpression(_) => Some(word(true)),
+        _ => None,
+    }
+}
+
+fn native_expression_is_wide_integer(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    native_expression_integer_type(expression, locals).is_some_and(|c_type| c_type.wide)
+}
+
 fn emit_native_i32_source(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let saved_r1 = emit_native_save_r1(locals, assembly);
+    let emitted = emit_native_i32_source_inner(expression, locals, label_counter, assembly);
+    if emitted {
+        emit_native_restore_r1(saved_r1, assembly);
+    }
+    emitted
+}
+
+fn emit_native_i32_source_inner(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
     match &expression.kind {
-        ExpressionKind::Atom(name) => match locals.get(name) {
-            Some(NativeLocation::StackWideScalar { offset, .. }) => {
+        ExpressionKind::Atom(name) if native_expression_is_wide_integer(expression, locals) => {
+            if let Some(NativeLocation::StackWideScalar { offset, .. }) = locals.get(name) {
                 assembly.push_str("    MOV R7, R3\n");
                 emit_native_stack_offset(7, *offset, assembly);
                 assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
                 true
+            } else if matches!(
+                locals.get(name),
+                Some(NativeLocation::GlobalWideScalar { .. })
+            ) {
+                assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+                assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+                true
+            } else {
+                parse_integer_constant(name).is_some_and(|value| {
+                    let Ok(bits) = u32::try_from(value) else {
+                        return false;
+                    };
+                    assembly.push_str(&format!(
+                        "    LDI R4, 0x{:04X}\n    LDI R5, 0x{:04X}\n",
+                        bits >> 16,
+                        bits & 0xffff
+                    ));
+                    true
+                })
             }
-            _ => parse_integer_constant(name).is_some_and(|value| {
-                let Ok(bits) = u32::try_from(value) else {
+        }
+        ExpressionKind::Cast {
+            c_type,
+            expression: operand,
+        } if is_native_wide_integer_type(c_type) => {
+            if let Some(size) = native_expression_floating_size(operand, locals) {
+                if !emit_native_floating_conversion(operand, size, locals, label_counter, assembly)
+                {
                     return false;
-                };
+                }
                 assembly.push_str(&format!(
-                    "    LDI R4, 0x{:04X}\n    LDI R5, 0x{:04X}\n",
-                    bits >> 16,
-                    bits & 0xffff
+                    "    F{bits}TO{signed}32 R4, R4\n",
+                    bits = size * 8,
+                    signed = if is_native_unsigned_word_type(c_type) {
+                        "U"
+                    } else {
+                        "I"
+                    }
                 ));
                 true
-            }),
-        },
-        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "+" | "-") => {
-            if !emit_native_i32_source(operand, locals, assembly) {
+            } else if native_expression_pointer_element_size(operand, locals).is_some() {
+                if !emit_native_expression(operand, 0, &[4, 5, 6], locals, label_counter, assembly)
+                {
+                    return false;
+                }
+                assembly.push_str("    MOV R4, R0\n    SPLIT30 R4, R5\n");
+                true
+            } else {
+                emit_native_i32_source(operand, locals, label_counter, assembly)
+            }
+        }
+        ExpressionKind::Unary { operator, operand }
+            if matches!(operator.as_str(), "+" | "-" | "~")
+                && native_expression_is_wide_integer(expression, locals) =>
+        {
+            if !emit_native_i32_source(operand, locals, label_counter, assembly) {
                 return false;
             }
             if operator == "-" {
                 assembly.push_str("    NEG32 R4\n");
+            } else if operator == "~" {
+                assembly.push_str("    NOT R4\n    NOT R5\n");
+            }
+            true
+        }
+        ExpressionKind::Unary {
+            operator,
+            operand: target,
+        }
+        | ExpressionKind::Postfix {
+            operator,
+            expression: target,
+        } if matches!(operator.as_str(), "++" | "--")
+            && native_expression_is_wide_integer(expression, locals) =>
+        {
+            let assignment = Expression {
+                kind: ExpressionKind::Assignment {
+                    operator: if operator == "++" { "+=" } else { "-=" }.to_owned(),
+                    target: target.clone(),
+                    value: Box::new(Expression {
+                        kind: ExpressionKind::Atom("1".to_owned()),
+                        line: expression.line,
+                        filename: expression.filename.clone(),
+                    }),
+                },
+                line: expression.line,
+                filename: expression.filename.clone(),
+            };
+            if !emit_native_assignment_store(
+                &assignment,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            if matches!(expression.kind, ExpressionKind::Postfix { .. }) {
+                assembly.push_str("    LDI R0, 0\n    LDI R1, 1\n");
+                assembly.push_str(if operator == "++" {
+                    "    SUB32 R4, R0\n"
+                } else {
+                    "    ADD32 R4, R0\n"
+                });
+            }
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if native_expression_is_wide_integer(expression, locals) && operator != "," => {
+            if !emit_native_i32_source(left, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n");
+            if matches!(operator.as_str(), "<<" | ">>") {
+                if !emit_native_expression(right, 0, &[4, 5, 6], locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    POP R5\n    POP R4\n");
+                let instruction = if operator == "<<" {
+                    "SHL32"
+                } else if native_expression_integer_type(left, locals)
+                    .is_some_and(|c_type| c_type.unsigned)
+                {
+                    "LSR32"
+                } else {
+                    "ASR32"
+                };
+                assembly.push_str(&format!("    {instruction} R4, R0\n"));
+            } else {
+                if !emit_native_i32_source(right, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    MOV32 R0, R4\n    POP R5\n    POP R4\n");
+                let unsigned = native_expression_integer_type(expression, locals)
+                    .unwrap()
+                    .unsigned;
+                let instruction = match operator.as_str() {
+                    "+" => "ADD32",
+                    "-" => "SUB32",
+                    "*" => "MUL32",
+                    "/" if unsigned => "DIV32",
+                    "/" => "DIV32S",
+                    "%" if unsigned => "MOD32",
+                    "%" => "MOD32S",
+                    "&" => "AND32",
+                    "|" => "OR32",
+                    "^" => "XOR32",
+                    _ => return false,
+                };
+                assembly.push_str(&format!("    {instruction} R4, R0\n"));
+            }
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "," => {
+            emit_native_discarded_expression(left, 0, &[4, 5, 6], locals, label_counter, assembly)
+                && emit_native_i32_source(right, locals, label_counter, assembly)
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } if native_expression_is_wide_integer(expression, locals) => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_condition(condition, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("    CMP R0, 0\n    BZX __c_i32_{label}_false\n"));
+            if !emit_native_i32_source(when_true, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_i32_{label}_end\n__c_i32_{label}_false:\n"
+            ));
+            if !emit_native_i32_source(when_false, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("__c_i32_{label}_end:\n"));
+            true
+        }
+        ExpressionKind::Call { .. } if native_expression_is_wide_integer(expression, locals) => {
+            emit_native_expression(expression, 0, &[4, 5, 6], locals, label_counter, assembly)
+        }
+        ExpressionKind::Assignment { .. }
+            if native_expression_is_wide_integer(expression, locals) =>
+        {
+            emit_native_assignment_store(expression, &[4, 5, 6], locals, label_counter, assembly)
+        }
+        _ if !native_expression_is_wide_integer(expression, locals) => {
+            if !emit_native_expression(expression, 0, &[4, 5, 6], locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOV R5, R0\n    AND R5, 0xFFFF\n    LDI R4, 0\n");
+            if !native_expression_is_unsigned(expression, locals) {
+                assembly.push_str("    MOV R4, R5\n    ASR R4, 15\n");
             }
             true
         }
         _ => false,
     }
+}
+
+fn emit_native_wide_conversion(
+    expression: &Expression,
+    unsigned: bool,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let converted = Expression {
+        kind: ExpressionKind::Cast {
+            c_type: if unsigned { "unsigned long" } else { "long" }.to_owned(),
+            expression: Box::new(expression.clone()),
+        },
+        line: expression.line,
+        filename: expression.filename.clone(),
+    };
+    emit_native_i32_source(&converted, locals, label_counter, assembly)
 }
 
 fn emit_native_byte_normalization(register: u8, signed: bool, assembly: &mut String) {
@@ -4437,6 +4896,9 @@ fn emit_native_f32_expression_inner(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
+    if native_expression_integer_type(expression, locals).is_some() {
+        return emit_native_floating_conversion(expression, 4, locals, label_counter, assembly);
+    }
     match &expression.kind {
         ExpressionKind::Atom(value) => {
             if let Some(location) = locals.get(value) {
@@ -5002,12 +5464,8 @@ fn emit_native_f64_operand(
         true
     } else if native_expression_is_f64(expression, locals) {
         emit_native_f64_expression(expression, locals, label_counter, assembly)
-    } else if matches!(
-        &expression.kind,
-        ExpressionKind::Atom(name)
-            if matches!(locals.get(name), Some(NativeLocation::StackWideScalar { .. }))
-    ) {
-        if !emit_native_i32_source(expression, locals, assembly) {
+    } else if native_expression_is_wide_integer(expression, locals) {
+        if !emit_native_i32_source(expression, locals, label_counter, assembly) {
             return false;
         }
         let conversion = if native_expression_is_unsigned(expression, locals) {
@@ -5062,12 +5520,16 @@ fn emit_native_floating_conversion(
             return emit_native_f32_expression(expression, locals, label_counter, assembly);
         }
         None => {
-            if matches!(
-                &expression.kind,
-                ExpressionKind::Atom(name)
-                    if matches!(locals.get(name), Some(NativeLocation::StackWideScalar { .. }))
-            ) {
-                return emit_native_f32_expression(expression, locals, label_counter, assembly);
+            if native_expression_is_wide_integer(expression, locals) {
+                if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str(if native_expression_is_unsigned(expression, locals) {
+                    "    U32TOF32 R4, R4\n"
+                } else {
+                    "    I32TOF32 R4, R4\n"
+                });
+                return true;
             }
             if !emit_native_expression(
                 expression,
@@ -5219,7 +5681,20 @@ fn emit_native_truth_value(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
-    if native_expression_is_f64(expression, locals) {
+    if native_expression_is_wide_integer(expression, locals) {
+        if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        let label = *label_counter;
+        *label_counter += 1;
+        assembly.push_str(&format!(
+            "    OR R4, R5\n    CMP R4, 0\n    BZX __c_wide_truth_{label}_false\n\
+             LDI R{destination}, 1\n    JMPX __c_wide_truth_{label}_end\n\
+             __c_wide_truth_{label}_false:\n    LDI R{destination}, 0\n\
+             __c_wide_truth_{label}_end:\n"
+        ));
+        true
+    } else if native_expression_is_f64(expression, locals) {
         if !emit_native_f64_expression(expression, locals, label_counter, assembly) {
             return false;
         }
@@ -5545,6 +6020,9 @@ fn native_expression_is_unsigned(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
 ) -> bool {
+    if let Some(c_type) = native_expression_integer_type(expression, locals) {
+        return c_type.unsigned;
+    }
     match &expression.kind {
         ExpressionKind::Member { .. } => native_expression_record_field(expression, locals)
             .is_some_and(|field| {
@@ -5666,6 +6144,13 @@ fn emit_native_expression(
     if native_expression_is_f64(expression, locals) && !is_call && !is_comma {
         return emit_native_f64_expression(expression, locals, label_counter, assembly);
     }
+    if native_expression_is_wide_integer(expression, locals) && !is_call && !is_comma {
+        if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str(&format!("    MOV R{destination}, R5\n"));
+        return true;
+    }
     match &expression.kind {
         ExpressionKind::Atom(value) => {
             if let Some(value) = parse_integer_constant(value) {
@@ -5686,6 +6171,7 @@ fn emit_native_expression(
                     NativeLocation::GlobalScalar { .. } => assembly.push_str(&format!(
                         "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
                     )),
+                    NativeLocation::GlobalWideScalar { .. } => return false,
                     NativeLocation::FloatingPointScalar { .. } => return false,
                     NativeLocation::StackFloatingPointScalar { .. } => return false,
                     NativeLocation::GlobalByteScalar { signed } => {
@@ -5947,6 +6433,7 @@ fn emit_native_expression(
                         emit_native_stack_offset(7, *offset, assembly);
                     }
                     Some(NativeLocation::GlobalScalar { .. })
+                    | Some(NativeLocation::GlobalWideScalar { .. })
                     | Some(NativeLocation::GlobalPointer { .. }) => {
                         assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
                     }
@@ -6029,20 +6516,12 @@ fn emit_native_expression(
                     };
                     pointer_element
                 }
-                ExpressionKind::Cast {
-                    c_type,
-                    expression: pointer,
-                } => {
+                ExpressionKind::Cast { c_type, .. } => {
                     let Some(pointer_element) = native_pointer_element(c_type) else {
                         return false;
                     };
-                    if let ExpressionKind::Atom(value) = &pointer.kind
-                        && let Some(address) = parse_integer_constant(value)
-                        && (0..0x1000000).contains(&address)
-                    {
-                        assembly.push_str(&format!("    LDI30 R0, 0x{address:X}\n"));
-                    } else if !emit_native_expression(
-                        pointer,
+                    if !emit_native_expression(
+                        operand,
                         0,
                         temporary_registers,
                         locals,
@@ -6071,7 +6550,11 @@ fn emit_native_expression(
             true
         }
         ExpressionKind::Unary { operator, operand } => {
-            if operator == "!" && native_expression_is_f32(operand, locals) {
+            if operator == "!"
+                && (native_expression_is_f32(operand, locals)
+                    || native_expression_is_f64(operand, locals)
+                    || native_expression_is_wide_integer(operand, locals))
+            {
                 if !emit_native_condition(operand, locals, label_counter, assembly) {
                     return false;
                 }
@@ -6124,6 +6607,16 @@ fn emit_native_expression(
             label_counter,
             assembly,
         ),
+        ExpressionKind::Cast { c_type, expression }
+            if c_type.trim().ends_with('*')
+                && native_expression_is_wide_integer(expression, locals) =>
+        {
+            if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("    JOIN30 R4, R5\n    MOV R{destination}, R4\n"));
+            true
+        }
         ExpressionKind::Cast { c_type, expression }
             if matches!(c_type.trim(), "signed" | "unsigned")
                 || is_native_word_type(c_type)
@@ -6271,7 +6764,7 @@ fn emit_native_expression(
                 && let ExpressionKind::Atom(value) = &right.kind
                 && parse_integer_constant(value).is_some_and(|value| value > u16::MAX as i64)
             {
-                if !emit_native_truth_value(
+                if !emit_native_expression(
                     left,
                     destination,
                     temporary_registers,
@@ -6393,6 +6886,56 @@ fn emit_native_expression(
             left,
             right,
         } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") => {
+            if native_expression_is_wide_integer(left, locals)
+                || native_expression_is_wide_integer(right, locals)
+            {
+                let (Some(left_type), Some(right_type)) = (
+                    native_expression_integer_type(left, locals),
+                    native_expression_integer_type(right, locals),
+                ) else {
+                    return false;
+                };
+                let saved_r1 = (destination != 1).then(|| emit_native_save_r1(locals, assembly));
+                if !emit_native_i32_source(left, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    PUSH R4\n    PUSH R5\n");
+                if !emit_native_i32_source(right, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    MOV32 R0, R4\n    POP R5\n    POP R4\n    CMP32 R4, R0\n");
+                let unsigned = if left_type.wide == right_type.wide {
+                    left_type.unsigned || right_type.unsigned
+                } else if left_type.wide {
+                    left_type.unsigned
+                } else {
+                    right_type.unsigned
+                };
+                let branch = match operator.as_str() {
+                    "==" => "BZX",
+                    "!=" => "BNZX",
+                    "<" if unsigned => "BCX",
+                    "<" => "BLTX",
+                    "<=" if unsigned => "BLSX",
+                    "<=" => "BLEX",
+                    ">" if unsigned => "BHIX",
+                    ">" => "BGTX",
+                    ">=" if unsigned => "BNCX",
+                    ">=" => "BGEX",
+                    _ => unreachable!(),
+                };
+                let label = *label_counter;
+                *label_counter += 1;
+                assembly.push_str(&format!(
+                    "    {branch} __c_wide_cmp_{label}_true\n    LDI R{destination}, 0\n\
+                     JMPX __c_wide_cmp_{label}_end\n__c_wide_cmp_{label}_true:\n\
+                     LDI R{destination}, 1\n__c_wide_cmp_{label}_end:\n"
+                ));
+                if let Some(wide_pointer) = saved_r1 {
+                    emit_native_restore_r1(wide_pointer, assembly);
+                }
+                return true;
+            }
             let pointer_comparison = native_expression_pointer_element_size(left, locals).is_some()
                 || native_expression_pointer_element_size(right, locals).is_some();
             let (right_register, remaining_registers) =
@@ -6475,7 +7018,7 @@ fn emit_native_expression(
         } if matches!(operator.as_str(), "&&" | "||") => {
             let label = *label_counter;
             *label_counter += 1;
-            if !emit_native_expression(
+            if !emit_native_truth_value(
                 left,
                 destination,
                 temporary_registers,
@@ -6570,12 +7113,18 @@ fn emit_native_expression(
             let ExpressionKind::Atom(name) = &function.kind else {
                 return false;
             };
-            let (float_return_size, layout) = match locals.get(name) {
+            let (float_return_size, wide_return, layout) = match locals.get(name) {
                 Some(NativeLocation::FunctionParameters {
                     layout,
                     float_return_size,
-                }) => (*float_return_size, layout.as_ref()),
-                _ => (0, None),
+                    wide_return_unsigned,
+                    ..
+                }) => (
+                    *float_return_size,
+                    wide_return_unsigned.is_some(),
+                    layout.as_ref(),
+                ),
+                _ => (0, false, None),
             };
             if name == "abs" {
                 if arguments.len() != 1
@@ -6640,7 +7189,11 @@ fn emit_native_expression(
             if preserve_frame_pointer {
                 assembly.push_str("    MOVSPH R7\n    PUSH R7\n");
             }
-            let floating_return_registers = (float_return_size / 2).min(4);
+            let floating_return_registers = if wide_return {
+                2
+            } else {
+                (float_return_size / 2).min(4)
+            };
             for register in 1..=6 {
                 if (4..4 + floating_return_registers).contains(&register) {
                     continue;
@@ -6719,7 +7272,13 @@ fn emit_native_expression(
                                 .push_str("    PUSH R7\n    PUSH R6\n    PUSH R5\n    PUSH R4\n");
                         }
                         NativeArgumentKind::WideInteger => {
-                            if !emit_native_i32_source(expression, locals, assembly) {
+                            if !emit_native_wide_conversion(
+                                expression,
+                                argument.unsigned,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
                                 return false;
                             }
                             assembly.push_str("    PUSH R5\n    PUSH R4\n");
@@ -6757,7 +7316,7 @@ fn emit_native_expression(
                     format!("__c_function_{name}")
                 }
             ));
-            if float_return_size == 4 {
+            if float_return_size == 4 || wide_return {
                 assembly.push_str("    MOV R4, R0\n    MOV R5, R1\n");
             } else if float_return_size == 8 {
                 assembly
@@ -6792,7 +7351,9 @@ fn emit_native_expression(
                     assembly.push_str("    MOV R7, R0\n");
                 }
             }
-            if destination != 0 && float_return_size == 0 {
+            if wide_return {
+                assembly.push_str(&format!("    MOV R{destination}, R5\n"));
+            } else if destination != 0 && float_return_size == 0 {
                 assembly.push_str(&format!("    MOV R{destination}, R0\n"));
             }
             true
@@ -7086,6 +7647,50 @@ fn emit_native_assignment_store(
     else {
         return false;
     };
+    if native_expression_is_wide_integer(target, locals) {
+        let ExpressionKind::Atom(name) = &target.kind else {
+            return false;
+        };
+        let Some(location) = locals.get(name) else {
+            return false;
+        };
+        let unsigned = native_expression_integer_type(target, locals)
+            .unwrap()
+            .unsigned;
+        let compound;
+        let value = if operator == "=" {
+            value.as_ref()
+        } else {
+            let Some(binary_operator) = operator.strip_suffix('=') else {
+                return false;
+            };
+            compound = Expression {
+                kind: ExpressionKind::Binary {
+                    operator: binary_operator.to_owned(),
+                    left: target.clone(),
+                    right: value.clone(),
+                },
+                line: expression.line,
+                filename: expression.filename.clone(),
+            };
+            &compound
+        };
+        if !emit_native_wide_conversion(value, unsigned, locals, label_counter, assembly) {
+            return false;
+        }
+        match location {
+            NativeLocation::StackWideScalar { offset, .. } => {
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, *offset, assembly);
+            }
+            NativeLocation::GlobalWideScalar { .. } => {
+                assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+            }
+            _ => return false,
+        }
+        assembly.push_str("    STW R7, R4\n    INC R7\n    INC R7\n    STW R7, R5\n");
+        return true;
+    }
     if native_expression_record_field(target, locals).is_some_and(|field| field.bit_field.is_some())
     {
         return emit_native_bitfield_assignment(
@@ -7419,7 +8024,9 @@ fn emit_native_assignment_store(
         NativeLocation::Constant(_) => return false,
         NativeLocation::FloatingPointScalar { .. } => return false,
         NativeLocation::StackFloatingPointScalar { .. } => return false,
-        NativeLocation::StackWideScalar { .. } => return false,
+        NativeLocation::StackWideScalar { .. } | NativeLocation::GlobalWideScalar { .. } => {
+            return false;
+        }
         NativeLocation::GlobalScalar { .. } => (0, true, None),
         NativeLocation::GlobalByteScalar { signed } => (0, false, Some(*signed)),
         NativeLocation::GlobalPointer { .. } => (0, true, None),
@@ -7996,8 +8603,14 @@ fn emit_native_statement(
                             emit_native_stack_offset(7, *offset, assembly);
                             assembly.push_str("    STW R7, R4\n");
                         }
-                        NativeLocation::StackWideScalar { offset, .. } => {
-                            if !emit_native_i32_source(initializer, locals, assembly) {
+                        NativeLocation::StackWideScalar { offset, unsigned } => {
+                            if !emit_native_wide_conversion(
+                                initializer,
+                                *unsigned,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
                                 return None;
                             }
                             assembly.push_str("    MOV R7, R3\n");
@@ -8092,13 +8705,26 @@ fn emit_native_statement(
             if returns_void {
                 return None;
             }
-            let return_size = match locals.get(function_name) {
+            let (return_size, wide_return) = match locals.get(function_name) {
                 Some(NativeLocation::FunctionParameters {
-                    float_return_size, ..
-                }) => *float_return_size,
-                _ => 0,
+                    float_return_size,
+                    wide_return_unsigned,
+                    ..
+                }) => (*float_return_size, *wide_return_unsigned),
+                _ => (0, None),
             };
-            if return_size != 0 {
+            if let Some(unsigned) = wide_return {
+                if !emit_native_wide_conversion(
+                    expression,
+                    unsigned,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return None;
+                }
+                assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n");
+            } else if return_size != 0 {
                 if !emit_native_floating_conversion(
                     expression,
                     return_size,
@@ -8475,6 +9101,9 @@ fn emit_native_update(
     label_counter: &mut usize,
     assembly: &mut String,
 ) -> bool {
+    if native_expression_is_wide_integer(expression, locals) {
+        return emit_native_i32_source(expression, locals, label_counter, assembly);
+    }
     let (operator, expression) = match &expression.kind {
         ExpressionKind::Postfix {
             operator,
@@ -8721,6 +9350,7 @@ fn emit_native_update(
         }
         NativeLocation::Constant(_)
         | NativeLocation::StackWideScalar { .. }
+        | NativeLocation::GlobalWideScalar { .. }
         | NativeLocation::FloatingPointScalar { .. }
         | NativeLocation::StackFloatingPointScalar { .. }
         | NativeLocation::GlobalArray { .. }
@@ -12810,9 +13440,12 @@ mod tests {
             .is_none()
         );
         assert!(
-            compile_minimal_program("int main(void) { return 70000; }", "needs-full-compiler.c",)
-                .unwrap()
-                .is_none()
+            compile_minimal_program(
+                "int main(void) { return 4294967296UL; }",
+                "needs-full-compiler.c",
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
