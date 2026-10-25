@@ -1078,11 +1078,13 @@ minimum requirements:
   aggregate initialization, and writes to those members are rejected.
   Function declarations diagnose conflicting one-level pointer-target
   qualifications. Qualifier-dropping conversions between simple pointer
-  variables, fixed pointer arguments, and pointer returns are diagnosed.
-  Conditional and comma expressions, pointer casts, and direct function-call
-  results are checked for qualifier loss and writes. Other expression paths
-  and multi-level qualification remain incomplete. Qualifiers on pointer
-  objects are diagnosed as unsupported instead of being silently discarded.
+  variables, addresses of const objects, fixed pointer arguments, and pointer
+  returns are diagnosed, including local pointer initializers and call
+  arguments. Conditional and comma expressions, pointer casts, and direct
+  function-call results are checked for qualifier loss and writes. Other
+  expression paths and multi-level qualification remain incomplete. Qualifiers
+  on pointer objects are diagnosed as unsupported instead of being silently
+  discarded.
 * Global/static storage begins at +0x80000+ (+GLOBAL_BASE+ in the Rust C
   compiler); uninitialized globals are zeroed. The current compiler allocates
   static data through +0xFFFFF+.

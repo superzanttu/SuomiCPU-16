@@ -467,6 +467,11 @@ fn writes_through_pointers_to_const_objects_are_rejected() {
          target=source; return *target == 4 ? 0 : 1; }",
     );
     assert_eq!(cpu.registers[0], 0);
+    let cpu = run_c(
+        "int main(void) { const int value=4; const int *pointer=&value; \
+         return *pointer == 4 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
 
     for write in ["*pointer=2", "*pointer+=1", "(*pointer)++"] {
         let source = format!(
@@ -506,6 +511,13 @@ fn writes_through_pointers_to_const_objects_are_rejected() {
         "const int *preserve(int *pointer) { return pointer; } \
          int take(int *pointer) { return *pointer; } \
          int main(void) { int value=1; return take(1 ? preserve(&value) : &value); }",
+        "int main(void) { const int value=1; int *pointer=&value; return 0; }",
+        "const int value=1; int main(void) { int *pointer=&value; return 0; }",
+        "int main(void) { const int values[2]={1,2}; int *pointer=&values[0]; return 0; }",
+        "int take(int *pointer) { return *pointer; } \
+         int main(void) { const int value=1; return take(&value); }",
+        "int *escape(void) { const int value=1; return &value; } \
+         int main(void) { return escape() != 0; }",
     ] {
         assert!(
             compile_minimal_program_to_assembly(source, "const-pointer.c")

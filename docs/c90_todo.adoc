@@ -339,10 +339,12 @@ required before claiming full C90 compatibility.
     parameters and globals, are rejected. Qualifiers on pointer objects are
     diagnosed as unsupported. Qualifier-dropping conversions between simple
     pointer variables, fixed pointer arguments, and pointer returns are
-    rejected. Provenance through conditional and comma expressions, pointer
-    casts, and direct function-call results is also checked for qualifier loss
-    and writes. Other expression paths and multi-level qualification remain
-    incomplete.
+    rejected. Addressing const objects and arrays cannot be assigned to
+    unqualified pointers, passed to unqualified pointer parameters, or returned
+    through unqualified pointer results. Provenance through conditional and
+    comma expressions, pointer casts, and direct function-call results is also
+    checked for qualifier loss and writes. Other expression paths and
+    multi-level qualification remain incomplete.
 ** *Depends on:* B2a (+c90-function-pointer-types+).
 
 === C2. Implement bit-field accesses

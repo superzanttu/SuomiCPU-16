@@ -2104,6 +2104,15 @@ pub fn compile_minimal_program_to_assembly(
             eprintln!("write to const-qualified object at line {line}");
             return Ok(None);
         }
+        if let Some(line) = native_pointer_qualifier_loss_line_statement(
+            &function.body,
+            &locals,
+            &const_objects,
+            &function.declaration.name,
+        ) {
+            eprintln!("pointer conversion discards const qualification at line {line}");
+            return Ok(None);
+        }
         let returns_void = function.declaration.return_type.trim() == "void";
         let mut loop_labels = Vec::new();
         let mut returned = false;
@@ -4547,30 +4556,50 @@ fn native_expression_pointer_target_is_const(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
 ) -> bool {
+    native_expression_pointer_target_is_const_with_objects(expression, locals, None)
+}
+
+fn native_expression_pointer_target_is_const_with_objects(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: Option<&HashSet<String>>,
+) -> bool {
     match &expression.kind {
         ExpressionKind::Atom(name) => locals
             .get(name)
             .is_some_and(native_location_pointer_target_is_const),
         ExpressionKind::Cast { c_type, expression } if c_type.trim().ends_with('*') => {
             native_pointer_target_is_const(c_type)
-                || native_expression_pointer_target_is_const(expression, locals)
+                || native_expression_pointer_target_is_const_with_objects(
+                    expression,
+                    locals,
+                    const_objects,
+                )
         }
-        ExpressionKind::Unary { operator, operand } if operator == "&" => {
-            native_expression_is_const_lvalue(operand, locals)
-        }
+        ExpressionKind::Unary { operator, operand } if operator == "&" => const_objects
+            .map_or_else(
+                || native_expression_is_const_lvalue(operand, locals),
+                |objects| native_expression_is_const_lvalue_with_objects(operand, locals, objects),
+            ),
         ExpressionKind::Conditional {
             when_true,
             when_false,
             ..
         } => {
-            native_expression_pointer_target_is_const(when_true, locals)
-                || native_expression_pointer_target_is_const(when_false, locals)
+            native_expression_pointer_target_is_const_with_objects(when_true, locals, const_objects)
+                || native_expression_pointer_target_is_const_with_objects(
+                    when_false,
+                    locals,
+                    const_objects,
+                )
         }
         ExpressionKind::Binary {
             operator, right, ..
-        } if operator == "," => native_expression_pointer_target_is_const(right, locals),
+        } if operator == "," => {
+            native_expression_pointer_target_is_const_with_objects(right, locals, const_objects)
+        }
         ExpressionKind::Assignment { target, .. } => {
-            native_expression_pointer_target_is_const(target, locals)
+            native_expression_pointer_target_is_const_with_objects(target, locals, const_objects)
         }
         ExpressionKind::Call { function, .. } => {
             let ExpressionKind::Atom(name) = &function.kind else {
@@ -4586,10 +4615,34 @@ fn native_expression_pointer_target_is_const(
             )
         }
         ExpressionKind::Postfix { expression, .. } => {
-            native_expression_pointer_target_is_const(expression, locals)
+            native_expression_pointer_target_is_const_with_objects(
+                expression,
+                locals,
+                const_objects,
+            )
         }
         _ => false,
     }
+}
+
+fn native_assignment_discards_pointer_const_with_objects(
+    target: &Expression,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> bool {
+    let ExpressionKind::Atom(name) = &target.kind else {
+        return false;
+    };
+    let Some(target_is_const) = locals.get(name).and_then(native_location_pointer_qualifier) else {
+        return false;
+    };
+    !target_is_const
+        && native_expression_pointer_target_is_const_with_objects(
+            value,
+            locals,
+            Some(const_objects),
+        )
 }
 
 fn native_assignment_discards_pointer_const(
@@ -4784,6 +4837,258 @@ fn native_const_write_line_expression(
         ExpressionKind::Atom(_)
         | ExpressionKind::SizeofType(_)
         | ExpressionKind::Postfix { .. } => None,
+    }
+}
+
+fn native_pointer_qualifier_loss_line_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Assignment { target, value, .. } => {
+            native_assignment_discards_pointer_const_with_objects(
+                target,
+                value,
+                locals,
+                const_objects,
+            )
+            .then_some(target.line)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(target, locals, const_objects)
+            })
+            .or_else(|| native_pointer_qualifier_loss_line_expression(value, locals, const_objects))
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            let argument_loss =
+                match &function.kind {
+                    ExpressionKind::Atom(name) => match locals.get(name) {
+                        Some(NativeLocation::FunctionParameters {
+                            layout: Some(layout),
+                            ..
+                        }) => arguments.iter().zip(&layout.arguments).find_map(
+                            |(argument, parameter)| {
+                                (matches!(parameter.kind, NativeArgumentKind::Pointer)
+                                    && !parameter.pointer_target_is_const
+                                    && native_expression_pointer_target_is_const_with_objects(
+                                        argument,
+                                        locals,
+                                        Some(const_objects),
+                                    ))
+                                .then_some(argument.line)
+                            },
+                        ),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            argument_loss
+                .or_else(|| {
+                    native_pointer_qualifier_loss_line_expression(function, locals, const_objects)
+                })
+                .or_else(|| {
+                    arguments.iter().find_map(|argument| {
+                        native_pointer_qualifier_loss_line_expression(
+                            argument,
+                            locals,
+                            const_objects,
+                        )
+                    })
+                })
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            native_pointer_qualifier_loss_line_expression(operand, locals, const_objects)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_pointer_qualifier_loss_line_expression(left, locals, const_objects).or_else(
+                || native_pointer_qualifier_loss_line_expression(right, locals, const_objects),
+            )
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => native_pointer_qualifier_loss_line_expression(condition, locals, const_objects)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(when_true, locals, const_objects)
+            })
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(when_false, locals, const_objects)
+            }),
+        ExpressionKind::Index { expression, index } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                .or_else(|| {
+                    native_pointer_qualifier_loss_line_expression(index, locals, const_objects)
+                })
+        }
+        ExpressionKind::Member { expression, .. } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+        }
+        ExpressionKind::InitializerList(values) => values.iter().find_map(|value| {
+            native_pointer_qualifier_loss_line_expression(value, locals, const_objects)
+        }),
+        ExpressionKind::Postfix { expression, .. } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+        }
+        ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => None,
+    }
+}
+
+fn native_pointer_qualifier_loss_line_statement(
+    statement: &Statement,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+    function_name: &str,
+) -> Option<usize> {
+    match &statement.kind {
+        StatementKind::Return(Some(expression)) => {
+            let drops_const = matches!(
+                locals.get(function_name),
+                Some(NativeLocation::FunctionParameters {
+                    returns_pointer: true,
+                    pointer_return_target_is_const: false,
+                    ..
+                })
+            ) && native_expression_pointer_target_is_const_with_objects(
+                expression,
+                locals,
+                Some(const_objects),
+            );
+            drops_const.then_some(expression.line).or_else(|| {
+                native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+            })
+        }
+        StatementKind::Compound(statements) => statements.iter().find_map(|statement| {
+            native_pointer_qualifier_loss_line_statement(
+                statement,
+                locals,
+                const_objects,
+                function_name,
+            )
+        }),
+        StatementKind::Declaration(declarations) => declarations.iter().find_map(|declaration| {
+            let initializer = declaration.initializer.as_ref()?;
+            let target = Expression {
+                kind: ExpressionKind::Atom(declaration.name.clone()),
+                line: initializer.line,
+                filename: initializer.filename.clone(),
+            };
+            native_assignment_discards_pointer_const_with_objects(
+                &target,
+                initializer,
+                locals,
+                const_objects,
+            )
+            .then_some(initializer.line)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(initializer, locals, const_objects)
+            })
+        }),
+        StatementKind::Expression(Some(expression)) => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => native_pointer_qualifier_loss_line_expression(condition, locals, const_objects)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_statement(
+                    then_branch,
+                    locals,
+                    const_objects,
+                    function_name,
+                )
+            })
+            .or_else(|| {
+                else_branch.as_ref().and_then(|branch| {
+                    native_pointer_qualifier_loss_line_statement(
+                        branch,
+                        locals,
+                        const_objects,
+                        function_name,
+                    )
+                })
+            }),
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            native_pointer_qualifier_loss_line_expression(condition, locals, const_objects).or_else(
+                || {
+                    native_pointer_qualifier_loss_line_statement(
+                        body,
+                        locals,
+                        const_objects,
+                        function_name,
+                    )
+                },
+            )
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => initializer
+            .as_ref()
+            .and_then(|statement| {
+                native_pointer_qualifier_loss_line_statement(
+                    statement,
+                    locals,
+                    const_objects,
+                    function_name,
+                )
+            })
+            .or_else(|| {
+                condition.as_ref().and_then(|expression| {
+                    native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                })
+            })
+            .or_else(|| {
+                update.as_ref().and_then(|expression| {
+                    native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                })
+            })
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_statement(
+                    body,
+                    locals,
+                    const_objects,
+                    function_name,
+                )
+            }),
+        StatementKind::Switch { expression, cases } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                .or_else(|| {
+                    cases.iter().find_map(|(_, statements)| {
+                        statements.iter().find_map(|statement| {
+                            native_pointer_qualifier_loss_line_statement(
+                                statement,
+                                locals,
+                                const_objects,
+                                function_name,
+                            )
+                        })
+                    })
+                })
+        }
+        StatementKind::Label { statement, .. } => native_pointer_qualifier_loss_line_statement(
+            statement,
+            locals,
+            const_objects,
+            function_name,
+        ),
+        StatementKind::Expression(None)
+        | StatementKind::Return(None)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => None,
     }
 }
 

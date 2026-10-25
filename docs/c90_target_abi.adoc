@@ -224,7 +224,8 @@ updates to const-qualified scalar and bit-field members and standalone scalar an
 objects are rejected, while aggregate initialization of const members and
 objects is tested. One-level pointer qualifier conversions remain a verified
 subset, including qualifier-loss checks through conditional and comma
-expressions, pointer casts, and direct call results. Complete qualifier
+expressions, pointer casts, direct call results, and addresses of const objects
+assigned, passed, or returned through unqualified pointers. Complete qualifier
 enforcement and the remaining general aggregate initializer semantics still
 require the typed backend work.
 
