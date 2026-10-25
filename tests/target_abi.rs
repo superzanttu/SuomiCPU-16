@@ -492,6 +492,20 @@ fn writes_through_pointers_to_const_objects_are_rejected() {
         "int *drop_const(const int *pointer) { return pointer; } \
          int main(void) { int value=1; const int *source=&value; \
          return drop_const(source) == &value ? 0 : 1; }",
+        "int main(void) { int value=1; const int *source=&value; int *target; \
+         target = 1 ? source : &value; return 0; }",
+        "int main(void) { int value=1; const int *source=&value; int *target; \
+         target = (0, source); return 0; }",
+        "int main(void) { int value=1; const int *source=&value; int *target; \
+         target = (int *)source; return 0; }",
+        "int main(void) { int value=1; const int *source=&value; \
+         *(1 ? source : &value)=2; return 0; }",
+        "int *drop_const(const int *pointer) { return (int *)pointer; } \
+         int main(void) { int value=1; const int *source=&value; \
+         return drop_const(source) == &value ? 0 : 1; }",
+        "const int *preserve(int *pointer) { return pointer; } \
+         int take(int *pointer) { return *pointer; } \
+         int main(void) { int value=1; return take(1 ? preserve(&value) : &value); }",
     ] {
         assert!(
             compile_minimal_program_to_assembly(source, "const-pointer.c")

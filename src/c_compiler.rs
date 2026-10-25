@@ -4547,12 +4547,49 @@ fn native_expression_pointer_target_is_const(
     expression: &Expression,
     locals: &HashMap<String, NativeLocation>,
 ) -> bool {
-    let ExpressionKind::Atom(name) = &expression.kind else {
-        return false;
-    };
-    locals
-        .get(name)
-        .is_some_and(native_location_pointer_target_is_const)
+    match &expression.kind {
+        ExpressionKind::Atom(name) => locals
+            .get(name)
+            .is_some_and(native_location_pointer_target_is_const),
+        ExpressionKind::Cast { c_type, expression } if c_type.trim().ends_with('*') => {
+            native_pointer_target_is_const(c_type)
+                || native_expression_pointer_target_is_const(expression, locals)
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "&" => {
+            native_expression_is_const_lvalue(operand, locals)
+        }
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            native_expression_pointer_target_is_const(when_true, locals)
+                || native_expression_pointer_target_is_const(when_false, locals)
+        }
+        ExpressionKind::Binary {
+            operator, right, ..
+        } if operator == "," => native_expression_pointer_target_is_const(right, locals),
+        ExpressionKind::Assignment { target, .. } => {
+            native_expression_pointer_target_is_const(target, locals)
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return false;
+            };
+            matches!(
+                locals.get(name),
+                Some(NativeLocation::FunctionParameters {
+                    returns_pointer: true,
+                    pointer_return_target_is_const: true,
+                    ..
+                })
+            )
+        }
+        ExpressionKind::Postfix { expression, .. } => {
+            native_expression_pointer_target_is_const(expression, locals)
+        }
+        _ => false,
+    }
 }
 
 fn native_assignment_discards_pointer_const(

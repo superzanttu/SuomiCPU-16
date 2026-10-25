@@ -223,8 +223,10 @@ and wide-integer compound assignments are execution-tested. Direct writes and
 updates to const-qualified scalar and bit-field members and standalone scalar and array
 objects are rejected, while aggregate initialization of const members and
 objects is tested. One-level pointer qualifier conversions remain a verified
-subset; complete qualifier enforcement and the remaining general aggregate
-initializer semantics still require the typed backend work.
+subset, including qualifier-loss checks through conditional and comma
+expressions, pointer casts, and direct call results. Complete qualifier
+enforcement and the remaining general aggregate initializer semantics still
+require the typed backend work.
 
 == Function calls
 
