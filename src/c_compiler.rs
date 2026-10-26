@@ -8,6 +8,7 @@ pub struct Token {
     pub value: String,
     pub line: usize,
     pub filename: Option<String>,
+    pub leading_space: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11925,6 +11926,7 @@ impl ExpressionParser {
                 value: "<eof>".to_owned(),
                 line: 1,
                 filename: None,
+                leading_space: false,
             }]
         } else {
             tokens
@@ -13917,6 +13919,50 @@ fn parse_line_marker(
     Ok((parsed_line, marked_filename))
 }
 
+fn parse_line_directive(
+    argument: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    filename: &str,
+    line: usize,
+) -> Result<(usize, Option<String>), CCompilerError> {
+    let mut tokens = lex_unexpanded(argument, filename)?;
+    tokens.pop();
+    set_preprocessor_token_location(&mut tokens, filename, line);
+    let tokens = expand_object_macros(&tokens, macros, &mut Vec::new())?;
+    let Some(line_token) = tokens.first() else {
+        return Err(error(filename, line, "expected a line number after #line"));
+    };
+    if line_token.value.is_empty()
+        || !line_token
+            .value
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return Err(error(filename, line, "invalid line number after #line"));
+    }
+    let line_number = line_token
+        .value
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number > 0 && *number <= u32::MAX as usize)
+        .ok_or_else(|| error(filename, line, "line number after #line is out of range"))?;
+    let marked_filename = match tokens.get(1) {
+        None => None,
+        Some(token) => {
+            let bytes = decode_string_token(&token.value)
+                .ok_or_else(|| error(filename, line, "expected a filename after #line"))?;
+            if tokens.len() != 2 {
+                return Err(error(filename, line, "unexpected tokens after #line"));
+            }
+            Some(
+                String::from_utf8(bytes)
+                    .map_err(|_| error(filename, line, "invalid filename after #line"))?,
+            )
+        }
+    };
+    Ok((line_number, marked_filename))
+}
+
 pub fn lex_raw(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerError> {
     let mut macros = HashMap::new();
     let mut macro_snapshots: HashMap<(String, usize), HashMap<String, MacroDefinition>> =
@@ -13989,14 +14035,16 @@ fn preprocess_source(
             "include nesting exceeds the supported limit",
         ));
     }
+    let translated_source = translate_c90_trigraphs(source);
     let mut filtered_source = String::with_capacity(source.len());
     let mut conditionals = Vec::new();
     let mut active = true;
     let mut in_block_comment = false;
-    let physical_lines: Vec<_> = source.split_inclusive('\n').collect();
+    let mut logical_filename = filename.to_owned();
+    let mut logical_line_number = 1;
+    let physical_lines: Vec<_> = translated_source.split_inclusive('\n').collect();
     let mut physical_index = 0;
     while physical_index < physical_lines.len() {
-        let line_number = physical_index + 1;
         let mut logical_line = String::new();
         let mut output_newlines = 0;
         loop {
@@ -14023,9 +14071,9 @@ fn preprocess_source(
             output_newlines += usize::from(has_newline);
             break;
         }
-        let line_without_newline = logical_line.as_str();
-        let trimmed = line_without_newline.trim_start();
-        if !in_block_comment && trimmed.starts_with('#') {
+        let directive_line = strip_comments_for_directive(&logical_line, &mut in_block_comment);
+        let trimmed = directive_line.trim_start();
+        if trimmed.starts_with('#') {
             let directive = trimmed[1..].trim_start();
             let directive_end = directive
                 .find(char::is_whitespace)
@@ -14033,17 +14081,22 @@ fn preprocess_source(
             let directive_name = &directive[..directive_end];
             let argument = directive[directive_end..].trim_start();
             match directive_name {
+                "" => {}
                 "ifdef" | "ifndef" => {
                     let Some((name, trailing)) = split_preprocessor_identifier(argument) else {
-                        return Err(error(filename, line_number, "expected a macro name"));
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "expected a macro name",
+                        ));
                     };
                     if !trailing.trim().is_empty()
                         && !trailing.trim_start().starts_with("//")
                         && !trailing.trim_start().starts_with("/*")
                     {
                         return Err(error(
-                            filename,
-                            line_number,
+                            &logical_filename,
+                            logical_line_number,
                             "unexpected tokens after conditional macro name",
                         ));
                     }
@@ -14051,28 +14104,59 @@ fn preprocess_source(
                     if directive_name == "ifndef" {
                         branch_active = !branch_active;
                     }
-                    conditionals.push((active, branch_active, false, line_number));
+                    conditionals.push((
+                        active,
+                        branch_active,
+                        false,
+                        logical_filename.clone(),
+                        logical_line_number,
+                    ));
                     active &= branch_active;
                 }
                 "if" => {
                     let branch_active = if active {
-                        evaluate_preprocessor_condition(argument, macros, filename, line_number)?
+                        evaluate_preprocessor_condition(
+                            argument,
+                            macros,
+                            &logical_filename,
+                            logical_line_number,
+                        )?
                     } else {
                         false
                     };
-                    conditionals.push((active, branch_active, false, line_number));
+                    conditionals.push((
+                        active,
+                        branch_active,
+                        false,
+                        logical_filename.clone(),
+                        logical_line_number,
+                    ));
                     active &= branch_active;
                 }
                 "elif" => {
-                    let Some((parent_active, branch_taken, else_seen, _)) = conditionals.last_mut()
+                    let Some((parent_active, branch_taken, else_seen, _, _)) =
+                        conditionals.last_mut()
                     else {
-                        return Err(error(filename, line_number, "#elif without matching #if"));
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#elif without matching #if",
+                        ));
                     };
                     if *else_seen {
-                        return Err(error(filename, line_number, "#elif after #else"));
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#elif after #else",
+                        ));
                     }
                     let branch_active = if *parent_active && !*branch_taken {
-                        evaluate_preprocessor_condition(argument, macros, filename, line_number)?
+                        evaluate_preprocessor_condition(
+                            argument,
+                            macros,
+                            &logical_filename,
+                            logical_line_number,
+                        )?
                     } else {
                         false
                     };
@@ -14085,17 +14169,26 @@ fn preprocess_source(
                         && !argument.trim_start().starts_with("/*")
                     {
                         return Err(error(
-                            filename,
-                            line_number,
+                            &logical_filename,
+                            logical_line_number,
                             "unexpected tokens after #else",
                         ));
                     }
-                    let Some((parent_active, branch_taken, else_seen, _)) = conditionals.last_mut()
+                    let Some((parent_active, branch_taken, else_seen, _, _)) =
+                        conditionals.last_mut()
                     else {
-                        return Err(error(filename, line_number, "#else without matching #if"));
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#else without matching #if",
+                        ));
                     };
                     if *else_seen {
-                        return Err(error(filename, line_number, "duplicate #else"));
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "duplicate #else",
+                        ));
                     }
                     active = *parent_active && !*branch_taken;
                     *branch_taken = true;
@@ -14107,13 +14200,17 @@ fn preprocess_source(
                         && !argument.trim_start().starts_with("/*")
                     {
                         return Err(error(
-                            filename,
-                            line_number,
+                            &logical_filename,
+                            logical_line_number,
                             "unexpected tokens after #endif",
                         ));
                     }
-                    let Some((parent_active, _, _, _)) = conditionals.pop() else {
-                        return Err(error(filename, line_number, "#endif without matching #if"));
+                    let Some((parent_active, _, _, _, _)) = conditionals.pop() else {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#endif without matching #if",
+                        ));
                     };
                     active = parent_active;
                 }
@@ -14124,14 +14221,18 @@ fn preprocess_source(
                         .unwrap_or(definition.len());
                     let name = &definition[..name_end];
                     if !is_preprocessor_identifier(name) {
-                        return Err(error(filename, line_number, "expected a macro name"));
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "expected a macro name",
+                        ));
                     }
                     let tail = &definition[name_end..];
                     let (parameters, replacement) = if let Some(tail) = tail.strip_prefix('(') {
                         let Some(close) = tail.find(')') else {
                             return Err(error(
-                                filename,
-                                line_number,
+                                &logical_filename,
+                                logical_line_number,
                                 "unterminated function-like macro parameter list",
                             ));
                         };
@@ -14144,8 +14245,8 @@ fn preprocess_source(
                                     || parameters.iter().any(|existing| existing == parameter)
                                 {
                                     return Err(error(
-                                        filename,
-                                        line_number,
+                                        &logical_filename,
+                                        logical_line_number,
                                         "invalid function-like macro parameter list",
                                     ));
                                 }
@@ -14156,8 +14257,13 @@ fn preprocess_source(
                     } else {
                         (None, tail.trim_start())
                     };
-                    let mut tokens = lex_unexpanded(replacement, filename)?;
+                    let mut tokens = lex_unexpanded(replacement, &logical_filename)?;
                     tokens.pop();
+                    set_preprocessor_token_location(
+                        &mut tokens,
+                        &logical_filename,
+                        logical_line_number,
+                    );
                     let definition = MacroDefinition {
                         parameters,
                         replacement: tokens,
@@ -14167,8 +14273,8 @@ fn preprocess_source(
                         .is_some_and(|previous| !macros_equivalent(previous, &definition))
                     {
                         return Err(error(
-                            filename,
-                            line_number,
+                            &logical_filename,
+                            logical_line_number,
                             &format!("incompatible redefinition of macro {name}"),
                         ));
                     }
@@ -14176,35 +14282,43 @@ fn preprocess_source(
                 }
                 "undef" if active => {
                     let Some((name, trailing)) = split_preprocessor_identifier(argument) else {
-                        return Err(error(filename, line_number, "expected a macro name"));
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "expected a macro name",
+                        ));
                     };
                     if !trailing.trim().is_empty()
                         && !trailing.trim_start().starts_with("//")
                         && !trailing.trim_start().starts_with("/*")
                     {
                         return Err(error(
-                            filename,
-                            line_number,
+                            &logical_filename,
+                            logical_line_number,
                             "unexpected tokens after macro name",
                         ));
                     }
                     macros.remove(name);
                 }
                 "include" if active => {
-                    let (target, quoted) =
-                        parse_include_target(argument, macros, filename, line_number)?;
+                    let (target, quoted) = parse_include_target(
+                        argument,
+                        macros,
+                        &logical_filename,
+                        logical_line_number,
+                    )?;
                     let included_path = resolve_include_path(&target, quoted, filename)
                         .ok_or_else(|| {
                             error(
-                                filename,
-                                line_number,
+                                &logical_filename,
+                                logical_line_number,
                                 &format!("cannot find include file {target:?}"),
                             )
                         })?;
                     let included = fs::read_to_string(&included_path).map_err(|io_error| {
                         error(
-                            filename,
-                            line_number,
+                            &logical_filename,
+                            logical_line_number,
                             &format!("cannot read include file {target:?}: {io_error}"),
                         )
                     })?;
@@ -14222,16 +14336,60 @@ fn preprocess_source(
                     )?);
                     filtered_source.push_str(&format!(
                         "\n\0SC16_LINE:{}:{}",
-                        line_number + 1,
-                        hex_encode(filename.as_bytes())
+                        logical_line_number + output_newlines,
+                        hex_encode(logical_filename.as_bytes())
                     ));
                 }
+                "line" if active => {
+                    let (marked_line, marked_filename) = parse_line_directive(
+                        argument,
+                        macros,
+                        &logical_filename,
+                        logical_line_number,
+                    )?;
+                    let mut marker_filename = logical_filename.clone();
+                    if let Some(marked_filename) = marked_filename {
+                        marker_filename = marked_filename;
+                    }
+                    for _ in 0..output_newlines {
+                        filtered_source.push('\n');
+                    }
+                    filtered_source.push_str(&format!(
+                        "\0SC16_LINE:{marked_line}:{}\n",
+                        hex_encode(marker_filename.as_bytes())
+                    ));
+                    logical_line_number = marked_line;
+                    logical_filename = marker_filename;
+                    continue;
+                }
+                "error" if active => {
+                    let mut tokens = lex_unexpanded(argument, &logical_filename)?;
+                    tokens.pop();
+                    set_preprocessor_token_location(
+                        &mut tokens,
+                        &logical_filename,
+                        logical_line_number,
+                    );
+                    let expanded = expand_object_macros(&tokens, macros, &mut Vec::new())?;
+                    let message = expanded
+                        .iter()
+                        .map(|token| token.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let message = if message.is_empty() {
+                        "#error directive triggered".to_owned()
+                    } else {
+                        format!("#error {message}")
+                    };
+                    return Err(error(&logical_filename, logical_line_number, &message));
+                }
+                "pragma" if active => {}
                 "define" | "undef" => {}
                 _ if !active => {}
                 _ => {
                     let message =
                         format!("#{directive_name} is not supported by the Rust C preprocessor");
-                    return Err(error(filename, line_number, &message));
+                    return Err(error(&logical_filename, logical_line_number, &message));
                 }
             }
             for _ in 0..output_newlines {
@@ -14239,18 +14397,21 @@ fn preprocess_source(
             }
         } else {
             if active {
-                macro_snapshots.insert((filename.to_owned(), line_number), macros.clone());
-                filtered_source.push_str(line_without_newline);
+                macro_snapshots.insert(
+                    (logical_filename.clone(), logical_line_number),
+                    macros.clone(),
+                );
+                filtered_source.push_str(&logical_line);
             }
             for _ in 0..output_newlines {
                 filtered_source.push('\n');
             }
         }
-        update_block_comment_state(line_without_newline, &mut in_block_comment);
+        logical_line_number += output_newlines;
     }
-    if let Some((_, _, _, opening_line)) = conditionals.last() {
+    if let Some((_, _, _, opening_filename, opening_line)) = conditionals.last() {
         return Err(error(
-            filename,
+            opening_filename,
             *opening_line,
             "unterminated preprocessor conditional",
         ));
@@ -14289,6 +14450,13 @@ fn macros_equivalent(left: &MacroDefinition, right: &MacroDefinition) -> bool {
             .all(|(left, right)| left.value == right.value)
 }
 
+fn set_preprocessor_token_location(tokens: &mut [Token], filename: &str, line: usize) {
+    for token in tokens {
+        token.line = line;
+        token.filename = Some(filename.to_owned());
+    }
+}
+
 fn parse_include_target(
     argument: &str,
     macros: &HashMap<String, MacroDefinition>,
@@ -14297,6 +14465,7 @@ fn parse_include_target(
 ) -> Result<(String, bool), CCompilerError> {
     let mut tokens = lex_unexpanded(argument, filename)?;
     tokens.pop();
+    set_preprocessor_token_location(&mut tokens, filename, line);
     let expanded = expand_object_macros(&tokens, macros, &mut Vec::new())?;
     if expanded.len() == 1
         && let Some(hex) = expanded[0]
@@ -14371,6 +14540,7 @@ fn evaluate_preprocessor_condition(
 ) -> Result<bool, CCompilerError> {
     let mut tokens = lex_unexpanded(source, filename)?;
     tokens.pop();
+    set_preprocessor_token_location(&mut tokens, filename, line);
     let mut defined_tokens = Vec::new();
     let mut position = 0;
     while position < tokens.len() {
@@ -14407,6 +14577,7 @@ fn evaluate_preprocessor_condition(
             value: i32::from(is_defined).to_string(),
             line: directive_token.line,
             filename: directive_token.filename.clone(),
+            leading_space: directive_token.leading_space,
         });
     }
     let mut expanded = expand_object_macros(&defined_tokens, macros, &mut Vec::new())?;
@@ -14421,6 +14592,7 @@ fn evaluate_preprocessor_condition(
         value: "<eof>".to_owned(),
         line,
         filename: Some(filename.to_owned()),
+        leading_space: false,
     });
     let mut parser = ExpressionParser::new(expanded);
     let expression = parser.parse_expression(0).map_err(|_| {
@@ -14448,21 +14620,29 @@ fn evaluate_preprocessor_condition(
     Ok(value != 0)
 }
 
-fn update_block_comment_state(line: &str, in_block_comment: &mut bool) {
+fn strip_comments_for_directive(line: &str, in_block_comment: &mut bool) -> String {
+    let characters: Vec<_> = line.chars().collect();
+    let mut directive_line = String::with_capacity(line.len());
     let mut position = 0;
     let mut quote = None;
     let mut escaped = false;
-    while position < line.len() {
-        let remaining = &line[position..];
-        let character = remaining.chars().next().expect("valid character boundary");
+    if *in_block_comment {
+        directive_line.push(' ');
+    }
+    while position < characters.len() {
+        let character = characters[position];
         if *in_block_comment {
-            if remaining.starts_with("*/") {
+            if position + 1 < characters.len()
+                && character == '*'
+                && characters[position + 1] == '/'
+            {
                 *in_block_comment = false;
                 position += 2;
             } else {
-                position += character.len_utf8();
+                position += 1;
             }
         } else if let Some(quoted) = quote {
+            directive_line.push(character);
             if escaped {
                 escaped = false;
             } else if character == '\\' {
@@ -14470,19 +14650,62 @@ fn update_block_comment_state(line: &str, in_block_comment: &mut bool) {
             } else if character == quoted {
                 quote = None;
             }
-            position += character.len_utf8();
-        } else if remaining.starts_with("//") {
+            position += 1;
+        } else if position + 1 < characters.len()
+            && character == '/'
+            && characters[position + 1] == '/'
+        {
+            directive_line.push(' ');
             break;
-        } else if remaining.starts_with("/*") {
+        } else if position + 1 < characters.len()
+            && character == '/'
+            && characters[position + 1] == '*'
+        {
+            directive_line.push(' ');
             *in_block_comment = true;
             position += 2;
         } else {
             if matches!(character, '"' | '\'') {
                 quote = Some(character);
             }
-            position += character.len_utf8();
+            directive_line.push(character);
+            position += 1;
         }
     }
+    directive_line
+}
+
+fn translate_c90_trigraphs(source: &str) -> String {
+    let characters: Vec<_> = source.chars().collect();
+    let mut translated = String::with_capacity(source.len());
+    let mut position = 0;
+    while position < characters.len() {
+        if position + 2 < characters.len()
+            && characters[position] == '?'
+            && characters[position + 1] == '?'
+        {
+            let replacement = match characters[position + 2] {
+                '=' => Some('#'),
+                '/' => Some('\\'),
+                '\'' => Some('^'),
+                '(' => Some('['),
+                ')' => Some(']'),
+                '!' => Some('|'),
+                '<' => Some('{'),
+                '>' => Some('}'),
+                '-' => Some('~'),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                translated.push(replacement);
+                position += 3;
+                continue;
+            }
+        }
+        translated.push(characters[position]);
+        position += 1;
+    }
+    translated
 }
 
 fn expand_object_macros(
@@ -14494,6 +14717,27 @@ fn expand_object_macros(
     let mut position = 0;
     while position < tokens.len() {
         let token = &tokens[position];
+        if token.value == "__LINE__" {
+            expanded.push(Token {
+                value: token.line.to_string(),
+                line: token.line,
+                filename: token.filename.clone(),
+                leading_space: token.leading_space,
+            });
+            position += 1;
+            continue;
+        }
+        if token.value == "__FILE__" {
+            let filename = token.filename.as_deref().unwrap_or("<source>");
+            expanded.push(Token {
+                value: format!("<string:{}>", hex_encode(filename.as_bytes())),
+                line: token.line,
+                filename: token.filename.clone(),
+                leading_space: token.leading_space,
+            });
+            position += 1;
+            continue;
+        }
         let Some(definition) = macros.get(&token.value) else {
             expanded.push(token.clone());
             position += 1;
@@ -14584,11 +14828,7 @@ fn expand_object_macros(
                 && let Some(parameter) = definition.replacement.get(replacement_index + 1)
                 && let Some(argument) = raw_arguments.get(&parameter.value)
             {
-                let spelling = argument
-                    .iter()
-                    .map(token_spelling)
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let spelling = stringify_macro_argument(argument);
                 let escaped = spelling.replace('\\', "\\\\").replace('"', "\\\"");
                 let mut string_tokens = lex_unexpanded(&format!("\"{escaped}\""), "<macro>")?;
                 string_tokens.pop();
@@ -14624,6 +14864,7 @@ fn expand_object_macros(
                     value: replacement_token.value.clone(),
                     line: token.line,
                     filename: token.filename.clone(),
+                    leading_space: replacement_token.leading_space,
                 });
             }
             replacement_index += 1;
@@ -14673,6 +14914,17 @@ fn token_spelling(token: &Token) -> String {
     token.value.clone()
 }
 
+fn stringify_macro_argument(argument: &[Token]) -> String {
+    let mut spelling = String::new();
+    for (index, token) in argument.iter().enumerate() {
+        if index > 0 && token.leading_space {
+            spelling.push(' ');
+        }
+        spelling.push_str(&token_spelling(token));
+    }
+    spelling
+}
+
 fn paste_macro_tokens(
     tokens: Vec<Token>,
     invocation: &Token,
@@ -14710,6 +14962,7 @@ fn paste_macro_tokens(
         let mut joined = joined.pop().expect("one token");
         joined.line = invocation.line;
         joined.filename = invocation.filename.clone();
+        joined.leading_space = left.leading_space;
         pasted.push(joined);
         position += 2;
     }
@@ -14721,6 +14974,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
     let mut position = 0;
     let mut line = 1;
     let mut token_filename = filename.to_owned();
+    let mut leading_space = false;
 
     while position < source.len() {
         let remaining = &source[position..];
@@ -14732,6 +14986,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
             if character == '\n' {
                 line += 1;
             }
+            leading_space = true;
             position += character.len_utf8();
             continue;
         }
@@ -14753,6 +15008,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
         }
 
         if remaining.starts_with("//") {
+            leading_space = true;
             position += remaining.find('\n').unwrap_or(remaining.len());
             continue;
         }
@@ -14761,6 +15017,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 return Err(error(&token_filename, line, "unterminated comment"));
             };
             line += source[position..end + 2].matches('\n').count();
+            leading_space = true;
             position = end + 2;
             continue;
         }
@@ -14770,7 +15027,9 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 value: source[position..end].to_owned(),
                 line,
                 filename: Some(token_filename.clone()),
+                leading_space,
             });
+            leading_space = false;
             position = end;
             continue;
         }
@@ -14845,6 +15104,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                         previous
                             .value
                             .push_str(value.strip_prefix("<string:").unwrap_or_default());
+                        leading_space = false;
                         closed = true;
                         break;
                     }
@@ -14852,7 +15112,9 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                         value,
                         line: start_line,
                         filename: Some(token_filename.clone()),
+                        leading_space,
                     });
+                    leading_space = false;
                     closed = true;
                     break;
                 }
@@ -14889,7 +15151,9 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 value: source[start..position].to_owned(),
                 line,
                 filename: Some(token_filename.clone()),
+                leading_space,
             });
+            leading_space = false;
             continue;
         }
 
@@ -14910,7 +15174,9 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 value: source[start..position].to_owned(),
                 line,
                 filename: Some(token_filename.clone()),
+                leading_space,
             });
+            leading_space = false;
             continue;
         }
 
@@ -14922,7 +15188,9 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 value: (*operator).to_owned(),
                 line,
                 filename: Some(token_filename.clone()),
+                leading_space,
             });
+            leading_space = false;
             position += operator.len();
             continue;
         }
@@ -14931,7 +15199,9 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 value: character.to_string(),
                 line,
                 filename: Some(token_filename.clone()),
+                leading_space,
             });
+            leading_space = false;
             position += character.len_utf8();
             continue;
         }
@@ -14946,6 +15216,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
         value: "<eof>".to_owned(),
         line,
         filename: Some(token_filename),
+        leading_space: false,
     });
     Ok(tokens)
 }
@@ -15042,6 +15313,37 @@ mod tests {
     }
 
     #[test]
+    fn translates_c90_trigraphs_before_directives_and_line_splicing() {
+        assert_eq!(
+            translate_c90_trigraphs(r"??= ??/ ??' ??( ??) ??! ??< ??> ??-"),
+            r"# \ ^ [ ] | { } ~"
+        );
+        assert_eq!(
+            values(
+                r#"??=define VALUE 2 + ??/
+3
+int main(void) { return VALUE; }"#
+            ),
+            [
+                "int", "main", "(", "void", ")", "{", "return", "2", "+", "3", ";", "}", "<eof>"
+            ]
+        );
+        assert_eq!(
+            values(r#"const char *text = "??=";"#),
+            [
+                "const",
+                "char",
+                "*",
+                "text",
+                "=",
+                "<string:23>",
+                ";",
+                "<eof>"
+            ]
+        );
+    }
+
+    #[test]
     fn expands_function_like_macros_with_nested_and_prescanned_arguments() {
         assert_eq!(
             values(
@@ -15075,6 +15377,19 @@ mod tests {
             tokens,
             ["<string:68656c6c6f20776f726c64>", "item7", "5U", "<eof>"]
         );
+        assert_eq!(
+            values(
+                "#define TEXT(value) #value\n\
+                 TEXT(a+b) TEXT(a + b) TEXT(a/**/+b) TEXT(  a   +   b  )"
+            ),
+            [
+                "<string:612b62>",
+                "<string:61202b2062>",
+                "<string:61202b62>",
+                "<string:61202b2062>",
+                "<eof>"
+            ]
+        );
     }
 
     #[test]
@@ -15091,12 +15406,20 @@ mod tests {
     }
 
     #[test]
-    fn reports_unsupported_preprocessor_directives_explicitly() {
+    fn handles_error_and_pragma_preprocessor_directives() {
         assert_eq!(
-            lex_raw("#pragma once\n", "include.c")
+            values("#pragma once\nint value;\n"),
+            ["int", "value", ";", "<eof>"]
+        );
+        assert_eq!(
+            lex_raw("#define FAILURE stop now\n#error FAILURE\n", "directive.c")
                 .unwrap_err()
                 .to_string(),
-            "include.c:1: #pragma is not supported by the Rust C preprocessor"
+            "directive.c:2: #error stop now"
+        );
+        assert_eq!(
+            values("#if 0\n#error inactive\n#endif\nint value;\n"),
+            ["int", "value", ";", "<eof>"]
         );
         assert_eq!(
             lex_raw("#define VALUE 1\n#define VALUE 2\n", "macro.c")
@@ -15107,10 +15430,167 @@ mod tests {
     }
 
     #[test]
+    fn line_directive_maps_tokens_and_macro_snapshots() {
+        let tokens = lex_raw(
+            "#define SOURCE_LINE 37\n#define CURRENT_LINE __LINE__\n\
+             #line SOURCE_LINE \"generated.c\"\nint value = CURRENT_LINE;\n\
+             const char *file = __FILE__;\n",
+            "original.c",
+        )
+        .unwrap();
+        let value = tokens.iter().find(|token| token.value == "value").unwrap();
+        assert_eq!(value.line, 37);
+        assert_eq!(value.filename.as_deref(), Some("generated.c"));
+        let line_literal = tokens.iter().find(|token| token.value == "37").unwrap();
+        assert_eq!(line_literal.line, 37);
+        assert_eq!(line_literal.filename.as_deref(), Some("generated.c"));
+        let file_literal = tokens
+            .iter()
+            .find(|token| token.value == "<string:67656e6572617465642e63>")
+            .unwrap();
+        assert_eq!(file_literal.line, 38);
+        assert_eq!(file_literal.filename.as_deref(), Some("generated.c"));
+        assert_eq!(
+            values("#if __LINE__ == 1\nint enabled;\n#endif"),
+            ["int", "enabled", ";", "<eof>"]
+        );
+        assert_eq!(
+            values("#line 30\n#if __LINE__ == 30\nint enabled;\n#endif"),
+            ["int", "enabled", ";", "<eof>"]
+        );
+        assert_eq!(
+            lex_raw("#line 9 \"virtual.c\"\n#error failed\n", "original.c")
+                .unwrap_err()
+                .to_string(),
+            "virtual.c:9: #error failed"
+        );
+        assert_eq!(
+            lex_raw(
+                "#line 20 \"mapped.c\"\n#define BAD(parameter, parameter) value\n",
+                "original.c"
+            )
+            .unwrap_err()
+            .to_string(),
+            "mapped.c:20: invalid function-like macro parameter list"
+        );
+        assert_eq!(
+            lex_raw("#line 30 \"mapped.c\"\n#if 1\n", "original.c")
+                .unwrap_err()
+                .to_string(),
+            "mapped.c:30: unterminated preprocessor conditional"
+        );
+    }
+
+    #[test]
+    fn line_directive_rejects_invalid_numbers_and_trailing_tokens() {
+        for directive in ["#line 0\n", "#line 4 \"file.c\" extra\n", "#line value\n"] {
+            assert!(
+                lex_raw(directive, "line.c").is_err(),
+                "invalid directive accepted: {directive:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_c90_preprocessing_translation_limit_minima() {
+        let mut nested_conditionals = "#if 1\n".repeat(63);
+        nested_conditionals.push_str("enabled\n");
+        nested_conditionals.push_str(&"#endif\n".repeat(63));
+        assert_eq!(values(&nested_conditionals), ["enabled", "<eof>"]);
+
+        let parameters = (0..127)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let arguments = (1..=127)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            values(&format!(
+                "#define LAST({parameters}) p126\nLAST({arguments})"
+            )),
+            ["127", "<eof>"]
+        );
+
+        let logical_line = format!("/*{}*/\nint value;", "x".repeat(4091));
+        assert_eq!(values(&logical_line), ["int", "value", ";", "<eof>"]);
+        let string_literal = format!("\"{}\"", "x".repeat(4095));
+        let tokens = lex_raw(&string_literal, "limits.c").unwrap();
+        assert_eq!(decode_string_token(&tokens[0].value).unwrap().len(), 4095);
+        assert_eq!(
+            values("#\nint after_directive;"),
+            ["int", "after_directive", ";", "<eof>"]
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("sc16-c90-include-limits-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("root.c");
+        for index in 0..15 {
+            let content = if index == 14 {
+                "included_token\n".to_owned()
+            } else {
+                format!("#include \"nested_{}.h\"\n", index + 1)
+            };
+            fs::write(directory.join(format!("nested_{index}.h")), content).unwrap();
+        }
+        let tokens = lex_raw("#include \"nested_0.h\"\n", source_path.to_str().unwrap()).unwrap();
+        assert!(tokens.iter().any(|token| token.value == "included_token"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reports_preprocessor_resource_limit_exhaustion() {
+        let mut recursive_macros = String::new();
+        for index in 0..=128 {
+            recursive_macros.push_str(&format!("#define M{index} M{}\n", index + 1));
+        }
+        recursive_macros.push_str("M0\n");
+        assert!(
+            lex_raw(&recursive_macros, "macro-depth.c")
+                .unwrap_err()
+                .to_string()
+                .contains("macro expansion exceeds the supported nesting limit")
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("sc16-c90-include-depth-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("root.c");
+        for index in 0..65 {
+            let content = if index == 64 {
+                "included_token\n".to_owned()
+            } else {
+                format!("#include \"nested_{}.h\"\n", index + 1)
+            };
+            fs::write(directory.join(format!("nested_{index}.h")), content).unwrap();
+        }
+        let error = lex_raw("#include \"nested_0.h\"\n", source_path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("include nesting exceeds the supported limit"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn ignores_directive_text_inside_block_comments() {
         assert_eq!(
             values("/*\n#define HIDDEN 4\n*/\nHIDDEN"),
             ["HIDDEN", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn recognizes_directives_after_comments_and_keeps_comment_markers_in_strings() {
+        assert_eq!(values("/* lead */ #define VALUE 4\nVALUE"), ["4", "<eof>"]);
+        assert_eq!(
+            values("# /* empty directive */\nint value;"),
+            ["int", "value", ";", "<eof>"]
+        );
+        assert_eq!(
+            values("#define TEXT \"/* not a comment */\"\nTEXT"),
+            ["<string:2f2a206e6f74206120636f6d6d656e74202a2f>", "<eof>"]
         );
     }
 

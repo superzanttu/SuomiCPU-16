@@ -412,6 +412,17 @@ required before claiming full C90 compatibility.
 === C3. Complete preprocessing semantics
 
 * [ ] *Complete C90 preprocessing semantics* (+c90-preprocessor+)
+** Verified progress: active +#error+ directives now fail preprocessing with
+   macro-expanded diagnostic text, inactive +#error+ directives are ignored,
+   and +#pragma+ directives are ignored because this implementation defines
+   no pragmas. Null directives and directives following comments are
+   recognized. +#line+ updates token locations and macro snapshots, including
+   macro-expanded line numbers and filenames; +__LINE__+ and +__FILE__+ expand
+   at their use locations. Function-macro argument prescan, stringification
+   whitespace, token pasting, and rescanning have focused tests. Other
+   predefined macro requirements and remaining translation phases are still
+   incomplete. C90 trigraphs are translated before line splicing, directives,
+   and tokenization.
 ** Audit preprocessing translation phases and directives against C90.
 ** Implement macro argument prescan, stringification, token pasting,
     rescanning, and +defined+ behavior.
@@ -423,6 +434,11 @@ required before claiming full C90 compatibility.
 
 * [ ] *Enforce C90 translation limits and constraints*
   (+c90-translation-limits+)
+** Verified preprocessor coverage accepts 63 nested conditional levels, 127
+   macro parameters, a 4095-character logical line and string literal, and 15
+   nested include files. This does not yet verify all C90 language translation
+   limits; excessive include and macro-expansion nesting also produces
+   explicit resource-limit diagnostics.
 ** Audit limits for identifiers, nested blocks/declarations, parameters and
     arguments, macro/include nesting, expressions, strings, records, and
     source lines.
