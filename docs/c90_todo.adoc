@@ -200,6 +200,9 @@ C90 requirements listed under C.
    calls, recursion, and tested prototype/return precision conversions.
    Runtime tests inspect argument bytes, stack cleanup, and independent IEEE
    results. Full typed conversions remain open.
+** Verified progress: binary32 and binary64 scalar truth conversions treat
+   NaNs as true and positive or negative zero as false in conditions, logical
+   expressions, and conditional expressions.
 ** Verified progress: supported variadic prototypes apply integer promotions
    to tested signed/unsigned byte arguments and promote binary32 arguments to
    binary64. An executing linked probe verifies stack offsets, promoted bytes,
@@ -225,6 +228,25 @@ C90 requirements listed under C.
    access and updates; scalar member initialization and global object bytes are
    tested. Typed conversion analysis and broader floating-lvalue coverage
    remain open.
+** Verified progress: binary64 expressions now narrow to binary32 for scalar,
+   indexed, record-member, and pointer-dereference assignments and compound
+   assignments. All four compound operators execute across those lvalue forms;
+   regressions also verify halfway rounding and preservation of the local
+   frame pointer after mixed-precision compound operations. Conditional
+   binary64 expressions convert at binary32 assignment, indexed lvalue
+   side-effects are evaluated once, and unsigned 32-bit integer operands
+   convert correctly in binary32 compound assignments. Invalid mixed
+   floating-point/pointer arithmetic, comparisons, conditional operands, and
+   assignments now produce compiler diagnostics rather than scalar lowering.
+   These diagnostics also classify pointer-returning calls, floating-pointer
+   return types, and string literals as pointer operands. Pointer-returning
+   integer calls retain their element signedness and width when dereferenced.
+   Taking the address of a global binary32/binary64 scalar is supported,
+   including returning and dereferencing that pointer.
+   Floating operands to remainder, shifts, bitwise operators, and bitwise
+   compound assignments are likewise rejected with integer-operand
+   diagnostics. Binary32 function results are accepted as compound operands
+   for binary32 and binary64 lvalues.
 ** *Depends on:* +c90-float-model+ and +c90-float-isa+ in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+].
 
@@ -238,6 +260,15 @@ C90 requirements listed under C.
 ** Preserve prototypes, variadic status, and type compatibility rather than
     flattening semantically distinct types.
 ** Add parser, diagnostic, and compatibility tests.
+** Verified parser progress: function-pointer typedefs and objects,
+   function-pointer parameters including pointer-returning function types,
+   abstract function-pointer type names in casts and +sizeof+, nested pointer
+   indirection, variadic signatures, and arrays declared directly or through
+   function-pointer typedefs retain their dimensions and signatures. Named
+   and abstract pointers to arrays retain array bounds, and pointer type
+   +sizeof+ expressions return four bytes. Code generation rejects
+   function-pointer objects, parameters, and casts, and pointer-to-array
+   objects, until indirect-call and pointer-to-array lowering are implemented.
 
 * [ ] *Implement function-pointer conversions and calls*
   (+c90-indirect-calls+)
@@ -258,6 +289,11 @@ C90 requirements listed under C.
     metadata.
 ** The Rust native subset resolves block-scope local names, including shadowed
     locals and the scope of +for+ initializers.
+** Verified progress: one-dimensional array parameters adjust to pointers;
+   function parameter types adjust to pointers to functions. End-to-end
+   execution verifies indexing through an array parameter. Multidimensional
+   array parameters preserve their adjusted pointer-to-array types; code
+   generation diagnoses them until pointer-to-array lowering is implemented.
 ** Preserve supported structure/union assignment, by-value argument copies,
     and caller-owned returns.
 ** Diagnose unsupported or invalid forms rather than silently miscompiling.

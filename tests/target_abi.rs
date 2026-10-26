@@ -21,6 +21,90 @@ fn run_c_with_assembly(source: &str, linked_assembly: &str) -> Cpu {
 }
 
 #[test]
+fn nested_record_member_assignment_copies_full_record_contents() {
+    let cpu = run_c(
+        "struct Position { int x; long y; }; \
+         struct Building { struct Position position; }; \
+         struct State { struct Building buildings[1]; }; \
+         struct Robot { struct Position position; }; \
+         struct State state_object; struct State *state; \
+         struct Robot robot_object; struct Robot *robot; \
+         int main(void) { state=&state_object; robot=&robot_object; \
+         state->buildings[0].position.x=1234; \
+         state->buildings[0].position.y=-123456L; \
+         robot->position=state->buildings[0].position; \
+         return robot->position.x == 1234 && \
+         robot->position.y == -123456L ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn record_assignment_copies_padding_and_member_bytes() {
+    let cpu = run_c(
+        "struct Padded { unsigned char byte; int word; }; \
+         struct Padded source; struct Padded destination; \
+         int main(void) { unsigned char *source_bytes=(unsigned char *)&source; \
+         unsigned char *destination_bytes=(unsigned char *)&destination; \
+         source.byte=7; source.word=4660; source_bytes[1]=165; \
+         destination=source; \
+         return sizeof(source)==4 && destination_bytes[1]==165 && \
+         destination.byte==7 && destination.word==4660 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn pointer_subtraction_returns_a_signed_wide_element_difference() {
+    for (difference, expected) in [
+        ("&state_object.items[2]-state_object.items", 2i32),
+        ("&state_object.items[0]-&state_object.items[2]", -2i32),
+    ] {
+        let mut cpu = run_c(&format!(
+            "struct Item {{ int value; long tag; }}; \
+             struct State {{ struct Item items[3]; }}; \
+             long observed; struct State state_object; \
+             int main(void) {{ observed={difference}; \
+             return observed == {expected}L && \
+             (int)({difference}) == {expected} ? 0 : 1; }}"
+        ));
+        let bytes = (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, expected.to_be_bytes(), "{difference}");
+        assert_eq!(cpu.registers[0], 0);
+    }
+}
+
+#[test]
+fn pointer_subtraction_with_different_element_sizes_is_rejected() {
+    let assembly = compile_minimal_program_to_assembly(
+        "int main(void) { int *narrow; long *wide; return narrow-wide; }",
+        "pointer-difference.c",
+    )
+    .expect("parse C");
+    assert!(assembly.is_none());
+}
+
+#[test]
+fn long_pointer_arithmetic_advances_by_four_byte_elements() {
+    let cpu = run_c(
+        "long values[2]; long *first; long *second; \
+         unsigned long unsigned_values[2]; unsigned long *unsigned_pointer; \
+         long distance; \
+         int main(void) { first=values; second=first+1; \
+         *first=123456L; second[0]=-654321L; \
+         if (*first != 123456L || second[0] != -654321L) return 1; \
+         unsigned_pointer=unsigned_values; unsigned_pointer[1]=4294967295UL; \
+         if (unsigned_pointer[1] != 4294967295UL) return 2; \
+         distance=second-first; \
+         if (distance != 1L) return 3; \
+         return second == &values[1] ? 0 : 4; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
 fn wide_integer_arithmetic_calls_and_returns_preserve_both_words() {
     let cpu = run_c(
         "long observed; unsigned long bits=305419896UL; \
@@ -259,6 +343,46 @@ fn floating_pointer_casts_are_rejected_with_a_diagnostic() {
 }
 
 #[test]
+fn mixed_floating_pointer_operations_are_rejected() {
+    for source in [
+        "int main(void) { int *pointer=0; double value=pointer+1.5; return 0; }",
+        "int main(void) { int *pointer=0; return pointer<1.5; }",
+        "int main(void) { int *pointer=0; double value=1.5; pointer=value; return 0; }",
+        "int main(void) { int *pointer=0; double value=1.5; return (pointer ? value : pointer); }",
+        "int *pointer(void) { return 0; } \
+         int main(void) { double value=pointer()+1.5; return 0; }",
+        "float *pointer(void) { return 0; } \
+         int main(void) { double value=pointer()+1.5; return 0; }",
+        "int main(void) { double value=1.5+\"text\"; return 0; }",
+    ] {
+        let error =
+            compile_minimal_program_to_assembly(source, "invalid-float-pointer-op.c").unwrap_err();
+        assert!(
+            error.0.contains("floating-point and pointer types"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn floating_operands_are_rejected_for_integer_only_operators() {
+    for source in [
+        "int main(void) { double value=5.0%2; return 0; }",
+        "int main(void) { double value=5.0&2; return 0; }",
+        "int main(void) { double value=5.0<<2; return 0; }",
+        "int main(void) { double value=5.0; value%=2; return 0; }",
+        "int main(void) { double value=5.0; return ~value; }",
+    ] {
+        let error =
+            compile_minimal_program_to_assembly(source, "invalid-float-integer-op.c").unwrap_err();
+        assert!(
+            error.0.contains("operator requires integer operands"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn floating_to_wide_integers_convert_initializers_assignments_arguments_and_returns() {
     for (expression, c_type, expected) in [
         ("-2147483648.0", "long", i32::MIN as u32),
@@ -317,6 +441,19 @@ fn mixed_precision_and_unsigned_binary64_conversions_match_ieee_references() {
         .collect::<Vec<_>>();
     assert_eq!(real_bytes, ((0.1f32 as f64) + 0.1f64).to_be_bytes());
     assert_eq!(single_bytes, 16_777_216.0f32.to_be_bytes());
+}
+
+#[test]
+fn automatic_floating_arrays_initialize_from_runtime_expressions() {
+    let cpu = run_c(
+        "int main(void) { int seed=4; \
+         float singles[2]={1.25f, seed++ + 0.5f}; \
+         double doubles[2]={seed + 0.25, singles[1] + 0.125}; \
+         if (seed != 5 || singles[0] != 1.25f || singles[1] != 4.5f) return 1; \
+         if (doubles[0] != 5.25 || doubles[1] != 4.625) return 2; \
+         return sizeof(singles)==8 && sizeof(doubles)==16 ? 0 : 3; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
 }
 
 #[test]
@@ -503,6 +640,8 @@ fn writes_through_pointers_to_const_objects_are_rejected() {
          target = (0, source); return 0; }",
         "int main(void) { int value=1; const int *source=&value; int *target; \
          target = (int *)source; return 0; }",
+        "int main(void) { const int **source=0; int **target=0; \
+         target=source; return 0; }",
         "int main(void) { int value=1; const int *source=&value; \
          *(1 ? source : &value)=2; return 0; }",
         "int *drop_const(const int *pointer) { return (int *)pointer; } \
@@ -925,6 +1064,163 @@ fn prototype_and_return_conversions_match_independent_ieee_results() {
     ] {
         assert_eq!(run_c(source).registers[0], 0, "{source}");
     }
+}
+
+#[test]
+fn floating_truth_conversions_treat_nan_as_true_and_both_zeros_as_false() {
+    let cpu = run_c(
+        "int main(void) { \
+         float single_nan=0.0f/0.0f; double double_nan=0.0/0.0; \
+         float single_zero=-0.0f; double double_zero=-0.0; \
+         if (!single_nan || !double_nan) return 1; \
+         if (single_zero || double_zero) return 2; \
+         if (!(single_nan && double_nan)) return 3; \
+         if (single_zero || double_zero) return 4; \
+         return (single_nan ? 0 : 5) + (double_nan ? 0 : 6); }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn implicit_binary64_to_binary32_assignments_convert_and_round() {
+    let mut cpu = run_c(
+        "struct Holder { float item; }; float observed; \
+         double exact_step(void) { return 16777217.0; } \
+         int main(void) { double exact=16777217.0; float value=1.0f; \
+         float mixed=1.0f+2.0; float values[2]={1.0f, 1.0f}; int index=0; \
+         float pointed=1.0f; float *pointer=&pointed; \
+         struct Holder holder={1.0f}; \
+         value=exact; observed=exact+0.5; \
+         if (value != 16777216.0f || observed != 16777218.0f || mixed != 3.0f) return 1; \
+         value=index++ ? exact : 16777217.0; \
+         if (value != 16777216.0f || index != 1) return 2; \
+         value=1.0f; value+=exact; \
+         if (value != 16777218.0f) return 3; \
+         value=1.0f; value+=exact_step(); \
+         if (value != 16777218.0f) return 4; \
+         values[index++]+=exact; \
+         if (values[1] != 16777218.0f || index != 2) return 5; \
+         holder.item+=exact; \
+         if (holder.item != 16777218.0f) return 6; \
+         *pointer+=exact; \
+         if (pointed != 16777218.0f) return 7; \
+         return 0; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>(),
+        16_777_218.0f32.to_be_bytes()
+    );
+}
+
+#[test]
+fn binary64_compound_operators_narrow_for_all_float_lvalue_kinds() {
+    let cpu = run_c(
+        "struct Holder { float item; }; \
+         float step(void) { return 0.5f; } \
+         int main(void) { double two=2.0; unsigned long wide=16777217UL; \
+         float wide_value=1.0f; float value=8.0f; \
+         float values[1]={8.0f}; float pointed=8.0f; \
+         float *pointer=&pointed; struct Holder holder={8.0f}; \
+         wide_value+=wide; \
+         value+=two; value-=two; value*=two; value/=two; \
+         value+=step(); value-=step(); \
+         values[0]+=two; values[0]-=two; values[0]*=two; values[0]/=two; \
+         holder.item+=two; holder.item-=two; holder.item*=two; holder.item/=two; \
+         *pointer+=two; *pointer-=two; *pointer*=two; *pointer/=two; \
+         return wide_value!=16777216.0f || value!=8.0f || values[0]!=8.0f || \
+         holder.item!=8.0f || pointed!=8.0f; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn binary32_rhs_promotes_for_binary64_compound_lvalues() {
+    let cpu = run_c(
+        "struct Holder { double item; }; \
+         float next_step(void) { return 0.1f; } \
+         int main(void) { float step=0.1f; \
+         double value=1.0; double values[1]={1.0}; \
+         double pointed=1.0; double *pointer=&pointed; \
+         struct Holder holder={1.0}; double all_ops=4.0; \
+         value+=step; values[0]+=step; holder.item+=step; *pointer+=step; \
+         all_ops+=step; all_ops-=step; all_ops*=step; all_ops/=step; \
+         if (value!=1.0+(double)step || values[0]!=value || \
+         holder.item!=value || pointed!=value || all_ops!=4.0) return 1; \
+         value+=next_step(); \
+         return value==1.0+(double)step+(double)next_step() ? 0 : 2; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn binary64_compound_lvalues_preserve_addresses_across_function_calls() {
+    let cpu = run_c(
+        "struct Holder { double item; }; \
+         double next_step(void) { return 0.125; } \
+         int main(void) { double value=1.0; double values[1]={1.0}; \
+         double pointed=1.0; double *pointer=&pointed; \
+         struct Holder holder={1.0}; \
+         value+=next_step(); values[0]+=next_step(); \
+         holder.item+=next_step(); *pointer+=next_step(); \
+         return value!=1.125 || values[0]!=value || \
+         holder.item!=value || pointed!=value; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn pointer_return_types_survive_call_expression_analysis() {
+    let mut cpu = run_c(
+        "long object; long *get_object(void) { return &object; } \
+         int main(void) { *get_object()=123456L; \
+         return *get_object()==123456L ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>(),
+        123_456i32.to_be_bytes()
+    );
+}
+
+#[test]
+fn array_parameters_adjust_to_pointers_and_execute() {
+    let cpu = run_c(
+        "int total(int values[3]); \
+         int total(int values[4]) { return values[0]+values[1]+values[2]; } \
+         int main(void) { int values[3]={11,22,33}; \
+         return total(values)==66 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn sizeof_function_and_array_pointers_uses_target_pointer_size() {
+    let cpu = run_c(
+        "int main(void) { return sizeof(int (*)(int)) == 4 && \
+         sizeof(int (*)[3]) == 4 ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+}
+
+#[test]
+fn returned_float_pointers_support_dereference_load_store_and_compound_update() {
+    let mut cpu = run_c(
+        "float object; float *get_object(void) { return &object; } \
+         int main(void) { *get_object()=1.5f; *get_object()+=0.25f; \
+         return *get_object()==1.75f ? 0 : 1; }",
+    );
+    assert_eq!(cpu.registers[0], 0);
+    assert_eq!(
+        (0..4)
+            .map(|offset| cpu.read(0x80000 + offset))
+            .collect::<Vec<_>>(),
+        1.75f32.to_be_bytes()
+    );
 }
 
 #[test]

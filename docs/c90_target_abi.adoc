@@ -119,6 +119,8 @@ propagation is not part of the ABI. NaNs do not trap: ordered comparisons with
 a NaN are false, and NaN compares unequal to itself. Positive and negative
 zero compare equal. Floating exceptions do not trap and no floating status
 flags are exposed to C.
+In scalar truth contexts, either signed zero is false and every nonzero value,
+including NaN, is true; binary32 and binary64 execution tests cover these cases.
 
 The ISA implements binary32 and binary64 add, subtract, multiply, divide,
 ordered comparison, integer conversions, format conversion, negation, and
@@ -302,9 +304,26 @@ against the default-promoted types; incompatible mixtures are diagnosed.
 K&R identifier-list definitions are not implemented.
 Mixed binary32/binary64 arithmetic and narrowing/widening conversions are
 checked against IEEE reference bytes, including unsigned conversion limits.
+Binary64-to-binary32 assignments and all four compound operators are execution
+tested for scalar, indexed, record-member, and pointer-dereference lvalues,
+including halfway rounding and preservation of local frame state. A conditional
+binary64 source is narrowed on binary32 assignment; indexed lvalue side effects
+are evaluated once, and unsigned 32-bit integer operands convert correctly in
+binary32 compound assignments.
 In-range floating-to-byte casts truncate toward zero before signed or unsigned
 byte normalization; conversions between floating-point and pointer types are
-diagnosed instead of being lowered as ordinary scalar casts.
+diagnosed instead of being lowered as ordinary scalar casts. Mixed
+floating-point/pointer arithmetic, comparisons, conditional operands, and
+assignments are diagnosed instead of being lowered as scalar operations.
+Pointer-returning calls, including floating-pointer returns, and string
+literals are recognized as pointer operands in these checks. Pointer-returning
+integer calls retain the element width and signedness for dereference analysis.
+Taking the address of a global binary32 or binary64 scalar supports returning
+and dereferencing that pointer.
+Remainder, shifts, bitwise operations, and bitwise compound assignments reject
+floating operands with an integer-operand diagnostic.
+Binary32 function results are execution tested as compound operands for both
+binary32 and binary64 lvalues.
 Binary64 expressions and comparisons preserve live integer locals in R1-R3;
 runtime tests exercise comparisons and truth conditions around those values.
 
