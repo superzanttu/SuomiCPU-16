@@ -261,6 +261,26 @@ temporaries in the caller's stack frame, so recursive calls do not share
 scratch storage. Runtime regressions cover nested return/argument expressions
 and recursive returns.
 
+== Freestanding image entry
+
+The `SC16IMG2` entry point is an image/loader contract, not the hosted C
+`main` interface. The loader begins execution at the image entry point with
+R0-R7 zeroed, flags clear, interrupts disabled, and SP pointing to a valid
+writable stack region that grows toward lower addresses. The loader also
+establishes a valid kernel-stack pointer. The current compatibility runtime
+uses the configured-memory top for both stack pointers; isolated per-process
+stacks are part of the later MMU/task work. The loader supplies no argument
+vector, environment, synthetic return address, or C call frame.
+The selected fixed boot filename determines privilege mode: `kernel.bin`
+starts in supervisor mode and `main.bin` starts in user mode. Image permissions
+describe segment mappings but do not select privilege.
+
+The current native C build emits a freestanding entry stub that calls
+`main(void)` and halts after it returns. This does not implement the hosted C
+startup contract for `argc`, `argv`, environment, standard streams, or process
+exit status; those belong to the hosted-runtime work in C6 and the syscall ABI.
+An image entry must not be treated as a normal C function call from a caller.
+
 === Verified scalar call subset
 
 The Rust compiler now shares scalar stack sizes and offsets between call

@@ -1372,6 +1372,7 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
                 cpu.console.log_error("bios", &error);
                 RuntimeError::Window(error)
             })?;
+        cpu.prepare_image_entry();
         cpu.load_program(&boot.image.segments, boot.image.entry_point)
             .map_err(|error| {
                 cpu.console.log_error("bios", &error.to_string());
@@ -1406,6 +1407,7 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
             .log_error("emulator", &format!("Loading {name} failed: {error}"));
         error
     })?;
+    cpu.prepare_image_entry();
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| {
             cpu.console
@@ -2169,13 +2171,28 @@ mod tests {
             boot_target(&mut cpu, &target).unwrap();
             assert_eq!(cpu.pc, 0x100);
             assert_eq!(cpu.privilege_mode, mode);
+            assert_eq!(cpu.loaded_image_segments.len(), 1);
+            assert_eq!(
+                cpu.loaded_image_segments[0].permissions,
+                crate::image::SegmentPermissions::READ_WRITE_EXECUTE
+            );
             assert_eq!(cpu.run(10).unwrap(), 2);
             assert_eq!(cpu.registers[0], 42);
             assert!(!cpu.running);
+            cpu.registers[1] = 99;
+            cpu.flags.zero = true;
+            cpu.sp = 0x100;
+            cpu.memory[crate::cpu::ICR_ADDR as usize] = 1;
             boot_target(&mut cpu, &target).unwrap();
             assert!(cpu.running);
             assert_eq!(cpu.pc, 0x100);
             assert_eq!(cpu.privilege_mode, mode);
+            assert_eq!(cpu.registers, [0; 8]);
+            assert_eq!(cpu.flags, crate::cpu::Flags::default());
+            assert_eq!(cpu.sp, cpu.memory.len() as u32 - 1);
+            assert_eq!(cpu.kernel_sp, cpu.memory.len() as u32 - 1);
+            assert_eq!(cpu.memory[crate::cpu::ICR_ADDR as usize], 0);
+            assert_eq!(cpu.loaded_image_segments.len(), 1);
             fs::remove_dir_all(disk.parent().unwrap()).unwrap();
         }
     }

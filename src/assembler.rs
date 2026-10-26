@@ -1,5 +1,4 @@
-use crate::MemorySegment;
-use crate::image::ProgramImage;
+use crate::image::{ImageSegment, ProgramImage};
 use crate::isa::{
     ALU_IMMEDIATE_FLAG, ALU_MISC_OPERATION, ALU_OPERATIONS, ALU_PREFIX, BASE_OPCODES,
     CLASSIC_EXTENSIONS, FAR_BRANCH_PREFIX, FAR_CONTROL_OPERATIONS, FAR_CONTROL_PREFIX,
@@ -1141,7 +1140,7 @@ fn assemble_expanded(source: &str, origin: u32) -> Result<ProgramImage, Assembly
             }
         }
     }
-    let mut segments: Vec<MemorySegment> = Vec::new();
+    let mut segments: Vec<ImageSegment> = Vec::new();
     for (address, byte) in bytes {
         if let Some(segment) = segments.last_mut()
             && segment.address + segment.data.len() as u32 == address
@@ -1149,10 +1148,7 @@ fn assemble_expanded(source: &str, origin: u32) -> Result<ProgramImage, Assembly
             segment.data.push(byte);
             continue;
         }
-        segments.push(MemorySegment {
-            address,
-            data: vec![byte],
-        });
+        segments.push(ImageSegment::new(address, vec![byte]));
     }
     Ok(ProgramImage {
         entry_point: entry_instruction.or(first_emitted).unwrap_or(origin),

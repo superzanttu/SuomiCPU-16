@@ -49,6 +49,12 @@ are logged; select another disk to retry. Reset rescans the disk collection.
 Press Escape to exit the BIOS. BIOS never compiles guest source; package
 programs beforehand with +sc16build package-disk+. See
 +sc16_disk_format.adoc+ for the manifest and image requirements.
+Offline images use the version 2 +SC16IMG2+ container, with fixed load
+addresses, an executable entry point, and explicit segment alignment and
+permissions. +sc16asm+ and +sc16build+ emit this format; the loader rejects
+older +SC16IMG1+ files. Generated images currently mark segments readable,
+writable, and executable because code and mutable data may share a segment;
+the permissions are not enforced until MMU support is implemented.
 The game fills the emulator's main window after BIOS startup. The optional
 80×25 *Bug Monitor* runs in a separate window and displays emulator logs and
 guest serial output. Its *RESET* button returns to BIOS disk selection;
@@ -102,7 +108,10 @@ cargo run --bin sc16build -- examples/factorial.c examples/factorial.sc16img
 cargo run -- examples/factorial.bin
 ----
 
-The Rust emulator accepts +.asm+, supported +.c+, and flat +.bin+ inputs.
+The Rust emulator accepts +.asm+, supported +.c+, flat +.bin+, and
++SC16IMG2+ images with +.img+ or +.sc16img+ extensions. A +.bin+ file
+starting with the +SC16IMG2+ signature is read as an image container; the
+replaced +SC16IMG1+ signature is rejected rather than executed as flat code.
 
 The input file argument is optional. Without it, the BIOS loads a prebuilt
 image from a selected folder disk. Use +--disk ID+ to preselect a boot disk

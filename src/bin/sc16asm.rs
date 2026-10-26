@@ -14,7 +14,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     if source == "--help" || source == "-h" {
         println!("Usage: sc16asm <source.asm> [output.img]");
-        println!("Assemble SC-16 source to a segmented SC16IMG1 image.");
+        println!("Assemble SC-16 source to a version 2 SC-16 executable image.");
         return Ok(());
     }
     if source.to_string_lossy().starts_with('-') {

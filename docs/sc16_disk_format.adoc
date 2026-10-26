@@ -77,6 +77,13 @@ A selected +kernel.bin+ is trusted kernel code. This rule is not secure boot and
 does not authenticate the disk or image. Disk metadata and user programs cannot
 override executable selection or mode.
 
+Boot executables use the version 2 +SC16IMG2+ container specified in
+link:sc16_architecture.adoc[+sc16_architecture.adoc+]. The loader rejects the
+previous +SC16IMG1+ format; disks containing v1 images must be rebuilt with
++sc16build+ or otherwise migrated. Segment permissions and alignment are
+validated as image metadata, but per-segment permission enforcement awaits the
+MMU implementation.
+
 Without an explicit program path, the runtime discovers real, ID-named
 directories under +disks/+ in stable ID order. The text-mode selector lists
 disk IDs, including disks with missing or invalid metadata. Metadata is
@@ -88,9 +95,9 @@ Use Up/Down and Enter, or click and double-click, to boot; the mouse wheel
 scrolls the list. +--disk ID+ preselects a boot disk without bypassing checks.
 Failures are logged to the Bug Monitor and remain on the selection screen.
 Reset rescans the collection. The runtime loads the SC-16 image container
-directly, preserving its entry point and segments, and never compiles or
-assembles guest source during BIOS selection. KERNEL maps to the CPU's
-+Supervisor+ privilege mode; USER maps to +User+.
+directly, preserving its entry point, segment permissions, and alignment, and
+never compiles or assembles guest source during BIOS selection. KERNEL maps to
+the CPU's +Supervisor+ privilege mode; USER maps to +User+.
 
 This selector is currently host-implemented. Common +bios.bin+ firmware
 execution and the guest folder-filesystem API are separate roadmap items;
@@ -100,14 +107,16 @@ workflow and legacy data-disk option.
 
 == Implementation status
 
-The Rust parser validates version 1 fields and protected paths. `FolderDisk`
-validates and opens individual folders, discovers ID-named disks, lists and
+The Rust parser validates version 1 disk-manifest fields and protected paths.
+`FolderDisk` validates and opens individual folders, discovers ID-named disks, lists and
 reads regular files, lists directories, creates directories, writes, copies,
 renames, and deletes files and empty directories, accounts regular-file bytes,
 enforces disk-wide read-only mode, protected paths, and write/copy capacity,
 rejects over-capacity disks at mount, and selects/validates the fixed-name boot
-image. `sc16build import-block-disk` exports legacy JSON blocks as regular files
-without modifying the source. `sc16build package-disk` builds one program into
+image. Image parsing accepts only `SC16IMG2`, checks segment ranges, overlap,
+alignment, permissions, entry-point execution permission, reserved fields, and
+exact file length. `sc16build import-block-disk` exports legacy JSON blocks as
+regular files without modifying the source. `sc16build package-disk` builds one program into
 a new boot-disk folder with `main.bin` or `kernel.bin`. Guest/syscall
 integration, module asset migration, package validation for all applications,
 remain to be implemented and tested. Folder-disk BIOS discovery, selection,

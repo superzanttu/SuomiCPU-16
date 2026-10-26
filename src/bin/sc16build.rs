@@ -11,17 +11,17 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let Some(source) = arguments.next() else {
-        return Err("usage: sc16build <source.asm|source.c|source.bin> [output.img] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel]".into());
+        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel]".into());
     };
     if source == "--help" || source == "-h" {
-        println!("Usage: sc16build <source.asm|source.c|source.bin> [output.img]");
-        println!("Build SC-16 source or wrap a flat binary as a segmented image.");
+        println!("Usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img]");
+        println!("Build SC-16 source, wrap a flat binary, or validate an existing image.");
         println!("       sc16build smoke-modules");
         println!("Compile every bootable BIOS module as a smoke check.");
         println!("       sc16build import-block-disk <legacy.json> <destination-folder>");
         println!("Import a legacy JSON block disk without modifying its source.");
         println!(
-            "       sc16build package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel]"
+            "       sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel]"
         );
         println!("Build a source program into a new folder-backed boot disk.");
         return Ok(());
@@ -61,7 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if source == "package-disk" {
-        let usage = "usage: sc16build package-disk <source.asm|source.c|source.bin> <disk-folder> <label> <capacity-bytes> [--kernel]";
+        let usage = "usage: sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel]";
         let Some(program_source) = arguments.next() else {
             return Err(usage.into());
         };
@@ -106,7 +106,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| source.with_extension("sc16img"));
     if arguments.next().is_some() {
-        return Err("usage: sc16build <source.asm|source.c|source.bin> [output.img]".into());
+        return Err(
+            "usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img]".into(),
+        );
     }
     if output.exists() && source == output.canonicalize()? {
         return Err("output path must not overwrite the source".into());
@@ -114,6 +116,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let image = match source.extension().and_then(|extension| extension.to_str()) {
         Some(extension) if extension.eq_ignore_ascii_case("bin") => {
             suomicpu16::image::load_binary(&source)?
+        }
+        Some(extension)
+            if extension.eq_ignore_ascii_case("img")
+                || extension.eq_ignore_ascii_case("sc16img") =>
+        {
+            suomicpu16::image::read_image(&source)?
         }
         Some(extension) if extension.eq_ignore_ascii_case("json") => {
             suomicpu16::image::load_program(&source)?
@@ -163,6 +171,12 @@ fn package_disk(
     let image = match source.extension().and_then(|extension| extension.to_str()) {
         Some(extension) if extension.eq_ignore_ascii_case("bin") => {
             suomicpu16::image::load_binary(source)?
+        }
+        Some(extension)
+            if extension.eq_ignore_ascii_case("img")
+                || extension.eq_ignore_ascii_case("sc16img") =>
+        {
+            suomicpu16::image::read_image(source)?
         }
         _ => suomicpu16::image::build_source(source)?,
     };
@@ -397,6 +411,30 @@ mod tests {
         assert!(user_disk.root().join("main.bin").is_file());
         assert!(!user_disk.root().join("kernel.bin").exists());
         assert!(source.exists());
+        let boot_image = user_disk.load_boot_image().unwrap();
+        let mut cpu = suomicpu16::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&boot_image.image.segments, boot_image.image.entry_point)
+            .unwrap();
+        cpu.run(16).unwrap();
+        assert_eq!(cpu.registers[0], 42);
+
+        let prebuilt_image_path = root.join("prebuilt.sc16img");
+        let prebuilt_image = suomicpu16::image::build_source(&source).unwrap();
+        suomicpu16::image::write_image(&prebuilt_image_path, &prebuilt_image).unwrap();
+        let packaged_image_path = root.join("PACK0001");
+        package_disk(
+            &prebuilt_image_path,
+            &packaged_image_path,
+            "Prebuilt image",
+            4096,
+            false,
+        )
+        .unwrap();
+        let packaged_image = suomicpu16::disk::FolderDisk::open(&packaged_image_path).unwrap();
+        assert_eq!(
+            packaged_image.load_boot_image().unwrap().image,
+            prebuilt_image
+        );
 
         let kernel_disk_path = root.join("KERN0001");
         package_disk(&source, &kernel_disk_path, "Kernel disk", 4096, true).unwrap();

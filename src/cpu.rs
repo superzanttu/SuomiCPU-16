@@ -184,6 +184,32 @@ pub struct MemorySegment {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadedSegmentMetadata {
+    pub address: u32,
+    pub length: usize,
+    pub alignment: u32,
+    pub permissions: crate::image::SegmentPermissions,
+}
+
+pub trait LoadableSegment {
+    fn address(&self) -> u32;
+    fn data(&self) -> &[u8];
+    fn image_metadata(&self) -> Option<(u32, crate::image::SegmentPermissions)> {
+        None
+    }
+}
+
+impl LoadableSegment for MemorySegment {
+    fn address(&self) -> u32 {
+        self.address
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuTriangle {
     pub points: [(i32, i32); 3],
     pub color: u8,
@@ -256,6 +282,7 @@ pub struct Cpu {
     pub pc: u32,
     pub sp: u32,
     pub kernel_sp: u32,
+    pub loaded_image_segments: Vec<LoadedSegmentMetadata>,
     pub privilege_mode: PrivilegeMode,
     pub flags: Flags,
     pub running: bool,
@@ -364,6 +391,7 @@ impl Cpu {
             pc: 0,
             sp: memory_mask,
             kernel_sp: memory_mask,
+            loaded_image_segments: Vec::new(),
             privilege_mode: PrivilegeMode::Supervisor,
             flags: Flags::default(),
             running: true,
@@ -400,32 +428,57 @@ impl Cpu {
         })
     }
 
-    pub fn load_program(
+    pub fn load_program<S: LoadableSegment>(
         &mut self,
-        segments: &[MemorySegment],
+        segments: &[S],
         entry_point: u32,
     ) -> Result<(), CpuError> {
+        let mut loaded_image_segments = Vec::new();
         for segment in segments {
-            let start = segment.address as usize;
-            let Some(end) = start.checked_add(segment.data.len()) else {
+            let address = segment.address();
+            let data = segment.data();
+            let start = address as usize;
+            let Some(end) = start.checked_add(data.len()) else {
                 return Err(CpuError::SegmentOutOfBounds {
-                    address: segment.address,
-                    length: segment.data.len(),
+                    address,
+                    length: data.len(),
                 });
             };
             if end > self.memory.len() {
                 return Err(CpuError::SegmentOutOfBounds {
-                    address: segment.address,
-                    length: segment.data.len(),
+                    address,
+                    length: data.len(),
                 });
             }
-            self.memory[start..end].copy_from_slice(&segment.data);
+            self.memory[start..end].copy_from_slice(data);
+            if let Some((alignment, permissions)) = segment.image_metadata() {
+                loaded_image_segments.push(LoadedSegmentMetadata {
+                    address,
+                    length: data.len(),
+                    alignment,
+                    permissions,
+                });
+            }
         }
         if entry_point as usize >= self.memory.len() {
             return Err(CpuError::InvalidEntryPoint(entry_point));
         }
         self.pc = entry_point;
+        self.loaded_image_segments = loaded_image_segments;
         Ok(())
+    }
+
+    pub fn prepare_image_entry(&mut self) {
+        self.registers.fill(0);
+        self.flags = Flags::default();
+        self.sp = self.memory_mask;
+        self.kernel_sp = self.memory_mask;
+        self.loaded_image_segments.clear();
+        self.privilege_mode = PrivilegeMode::Supervisor;
+        self.running = true;
+        if let Some(interrupt_control) = self.memory.get_mut(ICR_ADDR as usize) {
+            *interrupt_control = 0;
+        }
     }
 
     pub fn read(&mut self, address: u32) -> u8 {

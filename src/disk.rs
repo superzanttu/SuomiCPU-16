@@ -1497,10 +1497,7 @@ mod tests {
             .unwrap();
             let image = crate::image::ProgramImage {
                 entry_point: 0,
-                segments: vec![crate::MemorySegment {
-                    address: 0,
-                    data: vec![0, 0],
-                }],
+                segments: vec![crate::image::ImageSegment::new(0, vec![0, 0])],
             };
             for executable in executables {
                 crate::image::write_image(&disk_root.join(executable), &image).unwrap();

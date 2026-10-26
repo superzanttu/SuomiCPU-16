@@ -150,8 +150,11 @@ does not establish language feature parity.
 * [ ] Type checking and diagnostics for C90 semantics, including compiler
   conformance to the target ABI defined in +c90_target_abi.adoc+.
 * [ ] Expand C90 assembly generation to cover the language and runtime features
-  listed in this roadmap. The target executable-image format, linking pipeline,
-  and disk packaging are tracked in link:sc16_improvements.adoc[+sc16_improvements.adoc+].
+  listed in this roadmap. The version 2 +SC16IMG2+ executable container and
+  current single-translation-unit offline build/package path are tracked in
+  link:sc16_improvements.adoc[+sc16_improvements.adoc+]. Multi-translation-unit
+  C linkage remains part of B4; the image format contains fixed-address
+  segments and no runtime relocation records.
 * [x] Remove the legacy runtime, compiler, assembler, network tool, test suite,
   and non-Rust dependency installation from CI.
 * [x] Restore useful integration coverage as Rust tests.

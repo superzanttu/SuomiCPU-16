@@ -34,6 +34,62 @@ instruction exception. Arithmetic, branch, load/store, and flag behavior is
 defined by the individual ISA operation; privileged behavior is additionally
 constrained by the rules below.
 
+== Executable image format
+
+Offline build tools emit the version 2 `SC16IMG2` container. All multibyte
+container fields are unsigned big-endian values. The 20-byte header contains:
+
+[cols="1,1,2"]
+|===
+|Offset |Size |Value
+
+|0 |8 bytes |ASCII magic `SC16IMG2`
+|8 |2 bytes |Format version, exactly 2
+|10 |2 bytes |Reserved header flags, required to be zero
+|12 |4 bytes |30-bit entry-point address
+|16 |4 bytes |Load-segment count, from 1 through 65,536
+|===
+
+Each segment is encoded as a 20-byte header followed by exactly the declared
+number of data bytes:
+
+[cols="1,1,2"]
+|===
+|Offset |Size |Value
+
+|0 |4 bytes |Fixed load address
+|4 |8 bytes |Data length in bytes; zero is invalid
+|12 |4 bytes |Required alignment, a power of two from 1 through 1 GiB
+|16 |1 byte |Permissions: bit 0 read, bit 1 write, bit 2 execute
+|17 |3 bytes |Reserved; required to be zero
+|===
+
+At least one permission bit must be set. Every segment address must satisfy
+its alignment. Segment ranges must fit in the 30-bit address space, must not
+overlap, and their combined data length must not exceed 1 GiB. The entry point
+must lie inside an executable segment. Unknown permission bits, invalid
+alignment, unknown versions, nonzero reserved fields, truncated data, excess
+segments, and trailing bytes are errors. There is no BSS or relocation table:
+segments are loaded at their encoded addresses, and the offline assembler and
+compiler must resolve every reference before emitting the image. An unresolved
+reference is a build error. Current C builds are single translation units;
+multi-translation-unit linkage remains tracked separately in the C90 roadmap.
+`SC16IMG1` is intentionally rejected; no v1 reader compatibility is provided.
+
+Image permissions describe the intended mapping. The current loader preserves
+them but does not enforce per-segment access; enforcement begins with the MMU
+work in Phase 4. Existing generated assembly/C images use read/write/execute
+permissions because their current layout can combine code and mutable data.
+The container does not select privilege: the fixed folder-disk rule selects
+`kernel.bin` as supervisor code or `main.bin` as user code.
+
+`sc16asm` assembles an assembly source to this container. `sc16build` compiles
+the currently supported C subset, assembles source, or wraps a flat binary,
+then writes the same container; `sc16build package-disk` additionally creates
+a version 1 folder-disk manifest and its fixed-name executable. These are
+offline developer tools. BIOS selection reads only the prebuilt image and
+never invokes a compiler or assembler.
+
 == Reset and firmware entry
 
 On cold reset, hardware initialization loads the emulator-wide `bios.bin` at

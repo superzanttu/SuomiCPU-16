@@ -277,15 +277,20 @@ Checklist status: [x] completed; [ ] planned.
   optional fields, encoding, path rules, capacity semantics, disk-wide and
   per-file read-only behavior, version handling, and the fixed executable rule.
   The manifest cannot select the executable or its privilege mode.
-* [ ] Define a standard executable image format and offline build pipeline.
-** [x] Validate existing +SC16IMG1+ segment memory ranges and reject entry
-  points outside loaded segment bytes and overlapping load segments when
-  reading or writing images.
-** [ ] Specify a versioned format with entry point, load segments, permissions,
-  alignment, relocation policy, and rejected malformed-image cases.
-* [ ] Coordinate executable-image, calling-convention, and process-entry
-  decisions with the target ABI in +c90_target_abi.adoc+. Update the ABI
-  document only after implementation and conformance tests confirm behavior.
+* [x] Define a standard executable image format and offline build pipeline.
+** [x] Validate +SC16IMG2+ segment ranges and reject entry points outside
+  executable segment bytes, overlapping segments, and malformed containers
+  when reading or writing images.
+** [x] Specify the versioned format with entry point, load segments,
+  permissions, alignment, fixed-address loading, offline-resolved references,
+  and rejected malformed-image cases.
+** [x] Emit the format from +sc16asm+ and +sc16build+; preserve segment
+  metadata through disk packaging and boot loading. +SC16IMG1+ is rejected.
+** [x] Verify image round trips, malformed-file rejection, source build and
+  package flow, entry-point execution, and clean entry state with runtime tests.
+* [x] Coordinate executable-image, calling-convention, and freestanding
+  process-entry decisions with the target ABI in +c90_target_abi.adoc+.
+  Hosted C startup remains tracked under C6.
 * [x] Document the current architecture and migration incompatibilities in the
   baseline above.
   Keep this specification authoritative for implementation and tests.
