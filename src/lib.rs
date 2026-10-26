@@ -1,4 +1,5 @@
 pub mod assembler;
+pub mod bios_settings;
 pub mod c_compiler;
 pub mod console;
 pub mod cpu;

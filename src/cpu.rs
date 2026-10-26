@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::bios_settings::{BiosSettings, StartupBehavior};
 use crate::console::ConsoleDevice;
 use crate::disk::{FolderBootMode, FolderDisk};
 use crate::guest_text::GuestTextDisplay;
@@ -13,6 +14,7 @@ pub const MEMORY_SIZE: usize = 1 << 30;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
 
 pub const ICR_ADDR: u32 = 0x43002;
+const GPU_SPEED_ADDR: u32 = 0x43003;
 pub const VSYNC_ADDR: usize = 0x43013;
 const EXCEPTION_ILLEGAL_INSTRUCTION: u16 = 0;
 const EXCEPTION_PRIVILEGE_VIOLATION: u16 = 1;
@@ -31,7 +33,7 @@ const GPU_LAYER_ORDER: u32 = GPU_BASE + 23;
 const GPU_LAYER_COUNT: usize = 5;
 const GPU_PALETTE: u8 = 27;
 const RTC_START: u32 = 0x43010;
-pub const TIMER_PERIOD_ADDR: u32 = 0x43014;
+pub const TIMER_PERIOD_ADDR: u32 = 0x4301e;
 const PIT_CONTROL_ADDR: u32 = 0x43016;
 const PAGE_FAULT_ADDRESS_ADDR: u32 = 0x43018;
 const PAGE_FAULT_INFO_ADDR: u32 = 0x4301c;
@@ -351,6 +353,8 @@ pub struct Cpu {
     sound_commands: [Option<GpuSoundCommand>; 4],
     disk_root: PathBuf,
     bios_preselected_disk: Option<String>,
+    bios_settings_path: Option<PathBuf>,
+    bios_settings: BiosSettings,
     booted_disk_path: Option<PathBuf>,
     module_folder_disk: Option<FolderDisk>,
     folder_disk: Option<FolderDisk>,
@@ -470,6 +474,8 @@ impl Cpu {
             sound_commands: [None; 4],
             disk_root: PathBuf::from("disks"),
             bios_preselected_disk: None,
+            bios_settings_path: None,
+            bios_settings: BiosSettings::default(),
             booted_disk_path: None,
             module_folder_disk: None,
             folder_disk: None,
@@ -500,6 +506,16 @@ impl Cpu {
 
     pub fn set_bios_preselected_disk(&mut self, disk_id: Option<&str>) {
         self.bios_preselected_disk = disk_id.map(str::to_owned);
+    }
+
+    pub fn configure_bios_settings(&mut self, path: PathBuf) -> Result<(), String> {
+        self.bios_settings = BiosSettings::load(&path)?;
+        self.bios_settings_path = Some(path);
+        Ok(())
+    }
+
+    pub fn bios_settings(&self) -> &BiosSettings {
+        &self.bios_settings
     }
 
     pub fn take_booted_disk_path(&mut self) -> Option<PathBuf> {
@@ -538,6 +554,7 @@ impl Cpu {
             1 => self.bios_list_count(),
             2 => self.bios_list_id(),
             3 => self.bios_boot_disk(),
+            4 => self.bios_save_settings(),
             _ => Err("unsupported firmware operation".to_owned()),
         };
         if let Err(error) = result {
@@ -554,22 +571,44 @@ impl Cpu {
         let paths = self.bios_disk_paths()?;
         let count = u16::try_from(paths.len())
             .map_err(|_| "firmware disk list exceeds 65535 entries".to_owned())?;
-        let selected = if let Some(id) = self.bios_preselected_disk.take() {
-            match paths.iter().position(|path| {
+        let preselected = self.bios_preselected_disk.take();
+        let find_disk = |id: &str| {
+            paths.iter().position(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name == id)
-            }) {
-                Some(index) => index,
-                None => {
-                    self.console
-                        .log_error("bios", &format!("preselected disk {id} was not found"));
-                    0
-                }
-            }
-        } else {
-            0
+            })
         };
+        let selected_by_cli = preselected.as_deref().and_then(find_disk);
+        if let Some(id) = preselected.as_deref().filter(|_| selected_by_cli.is_none()) {
+            self.console
+                .log_error("bios", &format!("preselected disk {id} was not found"));
+        }
+        let selected_by_settings = self
+            .bios_settings
+            .preferred_disk
+            .as_deref()
+            .and_then(find_disk);
+        if let Some(id) = self
+            .bios_settings
+            .preferred_disk
+            .as_deref()
+            .filter(|_| selected_by_settings.is_none())
+        {
+            self.console
+                .log_warning("bios", &format!("preferred disk {id} was not found"));
+        }
+        let selected = if preselected.is_some() {
+            selected_by_cli.unwrap_or(0)
+        } else {
+            selected_by_settings.unwrap_or(0)
+        };
+        let auto_boot = self.bios_settings.startup_behavior == StartupBehavior::BootPreferred
+            && if preselected.is_some() {
+                selected_by_cli.is_some()
+            } else {
+                selected_by_settings.is_some()
+            };
         let [index_high, index_low] = u16::try_from(selected)
             .map_err(|_| "selected firmware disk index exceeds 65535".to_owned())?
             .to_be_bytes();
@@ -578,6 +617,11 @@ impl Cpu {
         self.memory[BIOS_BASE as usize + 3] = index_low;
         self.memory[BIOS_BASE as usize + 4] = count_high;
         self.memory[BIOS_BASE as usize + 5] = count_low;
+        self.memory[BIOS_BASE as usize + 6] = u8::from(auto_boot);
+        self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x21].fill(0);
+        let network_name = self.bios_settings.network_name.as_bytes();
+        self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x10 + network_name.len()]
+            .copy_from_slice(network_name);
         Ok(())
     }
 
@@ -651,6 +695,51 @@ impl Cpu {
             "bios",
             &format!("Booting {} in {mode} mode", path.display()),
         );
+        Ok(())
+    }
+
+    fn bios_save_settings(&mut self) -> Result<(), String> {
+        let path = self
+            .bios_settings_path
+            .as_ref()
+            .ok_or_else(|| "BIOS settings file path is not configured".to_owned())?;
+        let paths = self.bios_disk_paths()?;
+        let selected = usize::from(self.bios_register_u16(2));
+        if selected >= paths.len() && !paths.is_empty() {
+            return Err(format!("firmware disk index {selected} is out of range"));
+        }
+        let preferred_disk = paths
+            .get(selected)
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| "selected disk ID is not valid text".to_owned())
+            })
+            .transpose()?;
+        let startup_behavior = match self.memory[BIOS_BASE as usize + 6] {
+            0 => StartupBehavior::Selector,
+            1 => StartupBehavior::BootPreferred,
+            _ => return Err("BIOS startup behavior value is invalid".to_owned()),
+        };
+        let mut network_name = Vec::with_capacity(16);
+        for byte in &self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x20] {
+            if *byte == 0 {
+                break;
+            }
+            network_name.push(*byte);
+        }
+        if !network_name.is_ascii() {
+            return Err("BIOS network name must be ASCII".to_owned());
+        }
+        let network_name = String::from_utf8(network_name)
+            .map_err(|_| "BIOS network name is not valid UTF-8".to_owned())?;
+        let mut settings = self.bios_settings.clone();
+        settings.preferred_disk = preferred_disk;
+        settings.startup_behavior = startup_behavior;
+        settings.set_network_name(network_name)?;
+        settings.save(path)?;
+        self.bios_settings = settings;
         Ok(())
     }
 
@@ -1092,6 +1181,11 @@ impl Cpu {
                 self.console.status()
             }
             CONSOLE_CONTROL => self.console.control(),
+            KEYBOARD_ADDR => {
+                let key = self.memory[address as usize];
+                self.memory[address as usize] = 0;
+                key
+            }
             MOUSE_EVENTS_ADDR => {
                 let events = self.memory[address as usize];
                 self.memory[address as usize] = 0;
@@ -1643,7 +1737,10 @@ impl Cpu {
         }
         let write = access == crate::mmu::MemoryAccess::Write;
         let user_service = access != crate::mmu::MemoryAccess::Fetch
-            && (self.guest_range_contains(address, DISK_BASE, 0x40)
+            && (self.guest_range_contains(address, GPU_SPEED_ADDR, 1)
+                || self.guest_range_contains(address, VSYNC_ADDR as u32, 1)
+                || self.guest_range_contains(address, GPU_MODE_ADDR, 1)
+                || self.guest_range_contains(address, DISK_BASE, 0x40)
                 || self.guest_range_contains(address, GPU_BASE, 0x80)
                 || self.guest_range_contains(address, CONSOLE_DATA, 3)
                 || self.guest_range_contains(address, GUEST_TEXT_BASE, 6)
@@ -4317,6 +4414,27 @@ mod tests {
     }
 
     #[test]
+    fn user_instruction_can_set_safe_gpu_controls_without_accessing_interrupt_control() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write_u16(0, (OP_ST << 11) | (1 << 5));
+        cpu.write_u16(2, (OP_ST << 11) | (1 << 5));
+        cpu.write_u16(4, (OP_ST << 11) | (1 << 5));
+        cpu.registers[0] = 1;
+        cpu.registers[1] = i64::from(GPU_SPEED_ADDR);
+        cpu.enter_user_mode(0, 0x7000).unwrap();
+
+        cpu.step().unwrap();
+        cpu.registers[1] = VSYNC_ADDR as i64;
+        cpu.step().unwrap();
+        cpu.registers[1] = i64::from(GPU_MODE_ADDR);
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.read(GPU_SPEED_ADDR), 1);
+        assert_eq!(cpu.memory[VSYNC_ADDR], 1);
+        assert_eq!(cpu.screen_size(), (640, 480));
+    }
+
+    #[test]
     fn software_call_enters_supervisor_handler_and_returns_to_user() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         let image = crate::assembler::assemble("SVC\nHALT", 0x100).unwrap();
@@ -6119,6 +6237,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_guest_network_title_is_not_replaced_by_the_bios_node_name() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.set_network_port(0);
+        cpu.bios_settings.network_name = "SC16-0123456789A".to_owned();
+        cpu.write_u16(GPU_BASE + 10, 0x1000);
+
+        cpu.write(GPU_BASE, GPU_NET_OPEN);
+
+        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
+        cpu.write(GPU_BASE, GPU_NET_CLOSE);
+    }
+
+    #[test]
     fn gpu_3d_projects_scene_triangles_for_macroquad() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         let scene = [
@@ -6205,6 +6336,8 @@ mod tests {
         cpu.frame_yield = false;
         cpu.signal_keyboard_event(b'B');
         assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], b'B');
+        assert_eq!(cpu.read(KEYBOARD_ADDR), b'B');
+        assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], 0);
         assert_eq!(cpu.read(ICR_ADDR) & 2, 2);
     }
 
@@ -6402,6 +6535,17 @@ mod tests {
         assert_eq!(cpu.pc, 0x200);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 4);
+    }
+
+    #[test]
+    fn pit_period_register_does_not_overlap_gpu_mode_register() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write_u16(TIMER_PERIOD_ADDR, 2);
+
+        cpu.write(GPU_MODE_ADDR, 1);
+
+        assert_eq!(cpu.read_u16(TIMER_PERIOD_ADDR), 2);
+        assert_eq!(cpu.screen_size(), (640, 480));
     }
 
     #[test]

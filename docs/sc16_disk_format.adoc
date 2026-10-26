@@ -77,8 +77,8 @@ A selected +kernel.bin+ is trusted kernel code. This rule is not secure boot and
 does not authenticate the disk or image. Disk metadata and user programs cannot
 override executable selection or mode.
 
-The common +bios.bin+ image is always counted as trusted firmware and starts
-in Supervisor mode. This is a fixed emulator policy, not a signature check:
+The common +bios.bin+ image is always counted as trusted firmware and runs in
+kernel (Supervisor) mode. This is a fixed emulator policy, not a signature check:
 the image is not authenticated, and the trust assumption does not imply secure
 boot.
 
@@ -103,7 +103,7 @@ permissions, and alignment, and never compiles or assembles guest source.
 KERNEL maps to the CPU's +Supervisor+ privilege mode; USER maps to +User+.
 
 The common +bios.bin+ image is required, trusted by policy, and executes in
-Supervisor mode before disk selection.
+kernel (Supervisor) mode before disk selection.
 The guest BIOS renders through the character-cell display and uses the
 supervisor-only firmware service at +0x43400+ for disk discovery and image
 loading. This service is a firmware boundary, not a general syscall or
@@ -126,6 +126,9 @@ Supervisor mode. All multi-byte values are big-endian.
 |Writes the default selection index to +0x43402+ and the candidate count to
   +0x43404+. +--disk ID+ selects the initial index when it matches a
   discovered ID; otherwise index zero is used and the missing ID is logged.
+  +0x43406+ is nonzero when automatic startup is enabled and a preferred disk
+  was found. The SC-NET node ID is written at +0x43410+ in a 17-byte
+  NUL-terminated buffer (maximum 16 printable ASCII bytes).
 
 |+2+
 |Read disk ID
@@ -139,10 +142,45 @@ Supervisor mode. All multi-byte values are big-endian.
   manifest and boot image, loads the fixed +main.bin+ or +kernel.bin+ image,
   mounts the selected folder, and transfers control in the corresponding
   privilege mode.
+
+|+4+
+|Save BIOS settings
+|The selected disk index is at +0x43402+, startup behavior at +0x43406+
+  (+0+ selector, +1+ boot preferred disk), and the NUL-terminated SC-NET node
+  ID at +0x43410+ in a 17-byte NUL-terminated buffer (maximum 16 printable
+  ASCII bytes). Saves the settings to the emulator-root +bios.json+, preserving
+  additional integer/string settings.
 |===
 
 Status at +0x4340c+ is zero on success and one on failure. Failures are also
 logged to the Bug Monitor; a failed boot leaves the BIOS available to retry.
+The BIOS menu saves with +S+, toggles startup behavior with +A+, and edits the
+SC-NET node ID with +N+ (Backspace edits; Enter accepts the ID). The ID
+identifies the emulator on SC-NET and is independent of guest application
+network titles.
+
+The root settings file has this versioned shape:
+
+[source,json]
+----
+{
+  "version": 1,
+  "preferred_disk": "APP00001",
+  "startup_behavior": "selector",
+  "network_name": "SC16-0123456789A",
+  "settings": {
+    "example_integer": 42,
+    "example_string": "value"
+  }
+}
+----
+
++preferred_disk+ may be +null+ when no disk is selected. Startup behavior is
++selector+ or +boot_preferred+. +network_name+ is a 1-16 character printable
+ASCII SC-NET node ID. When omitted, the BIOS generates an ID in the
++SC16-+ plus 11 hexadecimal digit form. Missing +bios.json+ uses these
+defaults; invalid JSON or unsupported field types are reported rather than
+silently replaced.
 
 == Guest folder-filesystem service
 

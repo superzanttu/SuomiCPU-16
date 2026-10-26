@@ -315,15 +315,15 @@ Checklist status: [x] completed; [ ] planned.
   DEBUG, INFO, WARN, and ERROR records over the serial output in
   +lib/bug_monitor.h+. Route emulator lifecycle and device errors to the Bug
   Monitor; preserve raw guest serial output and the existing serial input path.
-* [x] Use one emulator-wide +bios.bin+ as firmware; do not require a BIOS or
-  +boot.bin+ on each disk. Separate emulator hardware initialization from
-  firmware execution, then transfer control to the BIOS at the documented
+* [x] Use one emulator-wide +bios.bin+ as firmware. Separate emulator
+  hardware initialization from firmware execution, then transfer control to
+  the BIOS at the documented
   kernel-mode entry point. BIOS must not compile or assemble guest programs.
 ** [x] Require +bios.bin+ at the emulator root, load its executable image at
    address zero, execute its entry point on startup and cold reset, and show
-   missing or invalid firmware in the BIOS startup UI. The emulator always
-   counts this common image as trusted supervisor firmware by policy; it does
-   not authenticate the image or claim secure boot.
+   missing or invalid firmware in the BIOS startup UI. The BIOS always runs
+   in kernel (Supervisor) mode and is counted as trusted firmware by policy;
+   this does not authenticate the image or claim secure boot.
 ** [x] Replace the current firmware handoff stub and host-side selector with
    the finalized guest BIOS boot flow.
 * [x] Implement BIOS disk discovery and text-mode disk selection. After
@@ -342,6 +342,10 @@ Checklist status: [x] completed; [ ] planned.
 * [x] Add boot tests for cold reset, common BIOS startup, text-mode rendering
   and selection, direct executable loading, both launch modes, both
   +NOT_BOOT+ cases, invalid images, and recoverable boot failures.
+* [x] Add BIOS settings persistence in root +bios.json+: preferred disk,
+  selector/automatic-start behavior, an editable up-to-16-character SC-NET
+  node ID, and
+  extensible integer/string settings. Saving is explicit from the BIOS menu.
 
 === Phase 3 — Replace block disks with folder-backed filesystems
 
@@ -492,8 +496,7 @@ Checklist status: [x] completed; [ ] planned.
 
 * [ ] Convert each runnable module into a disk folder/image containing
   +disk.json+, exactly one of +main.bin+ or +kernel.bin+, and its runtime
-  assets/data. Use the emulator-wide BIOS; do not package per-disk +bios.bin+
-  or +boot.bin+.
+  assets/data. Use the emulator-wide BIOS; do not package per-disk firmware.
 ** [x] Add +sc16build package-disk+ to build one source into a new v1 disk
   folder with +main.bin+ or +kernel.bin+ and a manifest, without overwriting
   the source or an existing destination.
@@ -528,6 +531,8 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Create helpper tools and script need to to test and compile programs, including disk upadtes
 * [ ] Update neworking so that SuomiCPU-emulators discovers each other and can communicate over the network. Target is build private network (SC-NET) between running SC-16 instances. Programs runing in SC-16 can then use SC-NET to communicate. SC-NET is completelly invisible for programs. SC-16 have functions to discover and communicate. Each SC-16 uses unique name to identify itself. User can set own name in BIOS, so it's needed to have way to store BIOS settings. SC-16 check name at every boot for collisions, and prevents to boot if there is same name in use.
 * [ ] Make sure that SC-NET is compatible with next phases.
+* [ ] GPU shoud run as fast as possbile. It's speed is not linked to CPU speed. Itt's independent device. Keep it compatible with VSYNC implementation.
+
 
 === Phase 9 — Verify a protected multitasking OS
 

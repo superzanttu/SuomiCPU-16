@@ -329,56 +329,18 @@ gfx_rtc:
     LD R0, R7
     RET
 
-; Interrupt support.  gfx_irq_init() just executes EI.  Handlers live at fixed
-; addresses 0x0020 (RTC, vector 0x0006, once per display frame) and 0x0040
-; (keyboard, vector 0x0002).  The handlers preserve R6/R7 and the flags, so they are
-; invisible to the interrupted program.  Counters live at 0x4340 and 0x4342.
+; User-mode interrupt services remain unavailable until the guest syscall ABI
+; provides a safe kernel interface.
 gfx_irq_init:
-    EI
     RET
 
 gfx_irq_ticks:
-    LDI R7, 0x4340
-    LDW R0, R7
+    LDI R0, 0
     RET
 
 gfx_irq_keys:
-    LDI R7, 0x4342
-    LDW R0, R7
+    LDI R0, 0
     RET
-
-.address 0x0002
-.data hex 00, 00, 00, 40
-.address 0x0006
-.data hex 00, 00, 00, 20
-.address 0x0020
-irq_timer:
-    ADJSP -4
-    STWS R6, 0
-    STWS R7, 2
-    LDI R7, 0x4340
-    LDW R6, R7
-    INC R6
-    STW R7, R6
-    LDWS R6, 0
-    LDWS R7, 2
-    ADJSP 4
-    EI
-    RTI
-.address 0x0040
-irq_key:
-    ADJSP -4
-    STWS R6, 0
-    STWS R7, 2
-    LDI R7, 0x4342
-    LDW R6, R7
-    INC R6
-    STW R7, R6
-    LDWS R6, 0
-    LDWS R7, 2
-    ADJSP 4
-    EI
-    RTI
 
 ; ---- LAN networking: GPU commands 16-20 (implemented by the Rust runtime) ----
 ; Pointer argument at sp+N: word at N, high byte at N+2.

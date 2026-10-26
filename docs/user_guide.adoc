@@ -9,14 +9,21 @@ code and places instructions or data at the addresses specified in the source.
 
 The emulator loads the required guest-resident +bios.bin+ before launching a
 program. The emulator always counts +bios.bin+ as trusted firmware and runs
-it in supervisor mode. This is a trust-policy assumption, not a signature
-check or secure-boot guarantee. The BIOS presents a text-mode selector in the
-main window using bright green fixed-width characters on black, enlarged
-pixels, and no glow or post-processing. It discovers folder disks under
+it in kernel (Supervisor) mode. This is a trust-policy assumption, not a signature
+check or secure-boot guarantee. The BIOS presents a classic text-mode setup
+screen in the main window with a blue background, cyan headings, and highlighted
+selection text. It discovers folder disks under
 +disks/+ and loads a prebuilt
 boot image after validating the selected disk's +disk.json+. Exactly one of
 +kernel.bin+ (KERNEL mode) or +main.bin+ (USER mode) must exist; both or
 neither reports +NOT_BOOT+. Metadata cannot override the executable or mode.
+The selector uses +bios.json+ beside +bios.bin+ to remember the preferred
+disk, startup behavior, and an editable 1-16 character SC-NET node ID. When
+not configured, the BIOS generates a full-length +SC16-+ name with a random
+hexadecimal suffix. This identifies the emulator to SC-NET only; guest
+applications use their own network titles. Press +A+ to toggle selector versus
+automatic boot of the preferred disk, +N+ to edit the node ID, and +S+ to save.
+Additional named integer and string settings are retained in the JSON file.
 Once started, CPU
 reset begins execution at the loaded image's entry point. The first instruction
 in the source determines that entry point, regardless of the numeric order of
@@ -802,7 +809,7 @@ instruction, in keyboard, timer, RTC priority order. It clears only the source
 being serviced; other pending sources remain set. A pending bit coalesces
 repeated events of the same source until serviced.
 
-The 16-bit instruction-timer period is stored big-endian at +0x43014+-+0x43015+.
+The 16-bit instruction-timer period is stored big-endian at +0x4301e+-+0x4301f+.
 Writing zero disables it; a nonzero period raises the timer interrupt every
 that many executed instructions and writing a new period restarts its countdown.
 The timer is independent of rendering and also runs during headless execution.
@@ -882,12 +889,20 @@ memory ranges:
 |+0x43003+
 |1 byte
 
+|Frame-synchronization control
+|+0x43013+
+|1 byte
+
+|GPU mode
+|+0x43014+
+|1 byte
+
 |Held-key bitmask
 |+0x43004+
 |1 byte
 
 |Instruction-timer period
-|+0x43014+-+0x43015+
+|+0x4301e+-+0x4301f+
 |2 bytes
 
 |Disk storage device
@@ -917,8 +932,9 @@ finish without requiring a separate screen update for every CPU instruction.
 When the CPU halts, the window remains open with the final frame displayed;
 press any key to close it, or close the window using its title-bar control.
 Keyboard key presses write the character byte to the keyboard address and mark
-a keyboard interrupt pending. The RTC writes seconds, minutes, and hours to its
-three declared byte addresses.
+a keyboard interrupt pending. Reading the keyboard address returns and clears
+the pending character. The RTC writes seconds, minutes, and hours to its three
+declared byte addresses.
 
 Guest filesystem requests use the byte-register gateway at +0x43100+, with
 commands and C helpers defined in +lib/folder_fs.h+. It supports directory
@@ -1463,7 +1479,7 @@ The third byte (+0x43006+, +gfx_keys_ext2()+) uses +KEYX2_*+ constants; Tank-16
 assigns bit 0 C, 1 J, 2 L, 3 I, 4 K, and 5 period. The mouse register block
 starts at +0x43008+.
 
-Speed register (+0x43003+): 0 = fixed speed (30 frames/s, 30000 instructions per frame), nonzero = maximum speed: the emulator drops the frame cap, skips most display refreshes and runs up to 300000 instructions per pass. Use it from C with +gfx_speed(1)+ / +gfx_speed(0)+; time maximum-speed runs with the real-time clock (+gfx_rtc+), since frame ticks no longer match wall time. Page 9 of the showcase uses it to measure the SC-16 for 3 seconds.
+Speed register (+0x43003+): 0 = fixed speed (30 frames/s, 30000 instructions per frame), nonzero = maximum speed: the emulator drops the frame cap, skips most display refreshes and runs up to 300000 instructions per pass. User programs may write this register and the frame-synchronization register at +0x43013+; the adjacent interrupt-control register remains supervisor-only. Use it from C with +gfx_speed(1)+ / +gfx_speed(0)+; time maximum-speed runs with the real-time clock (+gfx_rtc+), since frame ticks no longer match wall time. Page 9 of the showcase uses it to measure the SC-16 for 3 seconds.
 
 Mouse registers (base +0x43008+): +\+0+ X word, +\+2+ Y word, +\+4+ held buttons, +\+5+ events.
 A double click is a second press of the same button within 400 ms and 4 pixels; it raises
@@ -1780,13 +1796,12 @@ GPU commands 11 and 12 (in addition to 1-10):
 |RTC register selected by COLOR (0 sec, 1 min, 2 hour) to RESULT (+14)
 |===
 
-C builtins: +gfx_ticks()+, +gfx_rtc(field)+, +gfx_irq_init()+ (executes EI),
-+gfx_irq_ticks()+ (timer interrupt count, word at 0x4340) and
-+gfx_irq_keys()+ (key interrupt count, word at 0x4342).
-
-Interrupt handlers live in +lib_cgfx.asm+ at fixed addresses: +irq_timer+ at
-0x0010 (vector 0x0004) and +irq_key+ at 0x0030 (vector 0x0002). The C entry stub
-is +JMP __c_boot+ at 0 with the boot code at 6. +RTI+ restores both Z and C flags.
+C builtins include +gfx_ticks()+ and +gfx_rtc(field)+. Until a guest kernel
+provides an interrupt/syscall service, +gfx_irq_init()+ is a no-op and
++gfx_irq_ticks()+ / +gfx_irq_keys()+ return zero; USER programs cannot install
+interrupt handlers or execute +EI+. See
+link:sc16_architecture.adoc[+sc16_architecture.adoc+] for the IDT and interrupt
+frame contract. The C entry stub is +JMP __c_boot+ at 0 with boot code at 6.
 C globals start at 0x80000.
 
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):

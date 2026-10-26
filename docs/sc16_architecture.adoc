@@ -116,10 +116,19 @@ executable rule, loads the prebuilt image, mounts the disk, and transfers
 execution in the mode selected by the executable name. The host does not
 render or drive the disk selector. Neither firmware nor the service compiles
 or assembles guest source during boot. KERNEL images are trusted supervisor
-code. `bios.bin` is always counted as trusted firmware and runs in supervisor
-mode; this is a trust-policy assumption, not a signature check. The current
+code. `bios.bin` is always counted as trusted firmware and runs in kernel
+(Supervisor) mode; this is a trust-policy assumption, not a signature check. The current
 design does not claim authenticated boot or memory isolation. Firmware may
 enable interrupts only after its handlers and kernel stack are ready.
+
+The BIOS reads persistent settings from emulator-root `bios.json`. Missing
+settings use defaults; malformed settings are reported rather than overwritten.
+The BIOS menu can remember a preferred disk, choose selector or automatic
+startup, and edit a 1-16 character SC-NET node ID. If unset, a random
+`SC16-`-prefixed hexadecimal ID is generated. This ID identifies the emulator
+on SC-NET; it is separate from network titles supplied by guest applications.
+Additional named integer and string settings are preserved for future firmware
+features. Settings are written only after an explicit save action.
 
 == Privilege and control state
 
@@ -129,8 +138,11 @@ switching, and kernel mapping operations are supervisor-only. A user attempt
 raises a protection exception without applying the requested mutation.
 Interrupt-control, timer-control, BIOS, and other protected MMIO accesses are
 rejected in user mode. The explicit user-safe console, disk, text, input, and
-basic graphics ranges are filtered by the CPU; pointer-bearing GPU commands
-are rejected for MMU-enabled user tasks until a validated guest-buffer ABI is
+basic graphics ranges are filtered by the CPU. The GPU speed selector at
+`0x43003`, frame-synchronization control at `0x43013`, and display mode
+selector at `0x43014` are also user-writeable; the interrupt-control register
+at `0x43002` remains supervisor-only. Pointer-bearing GPU commands are
+rejected for MMU-enabled user tasks until a validated guest-buffer ABI is
 available.
 
 User instruction fetches, loads, and stores may access only user-permitted
@@ -197,7 +209,7 @@ there. Events from supervisor mode use the current supervisor stack. The
 frame layout above is implemented. Missing handlers are not replaced by
 legacy fixed-vector words.
 
-The PIT period is a 16-bit value at `0x43014`; zero disables periodic
+The PIT period is a 16-bit value at `0x4301e`; zero disables periodic
 generation. One timer tick is one completed emulator instruction, including
 headless execution, so no host wall clock is involved. The mask/enable bit is
 bit 0 at `0x43016`; timer pending is bit `0x10` in the interrupt-control

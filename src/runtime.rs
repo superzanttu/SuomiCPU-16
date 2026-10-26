@@ -1242,6 +1242,8 @@ fn fresh_runtime_cpu(
         cpu.configure_disk(root.join("disks"), root.join("disks"))
             .map_err(RuntimeError::Window)?;
     }
+    cpu.configure_bios_settings(root.join("bios.json"))
+        .map_err(RuntimeError::Window)?;
     if let Some(disk_id) = disk_id.filter(|_| source.is_some()) {
         cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
     } else if source.is_none() {
@@ -1267,8 +1269,9 @@ fn fresh_runtime_cpu(
     cpu.prepare_image_entry();
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| RuntimeError::Window(format!("invalid common BIOS: {error}")))?;
+    cpu.privilege_mode = PrivilegeMode::Supervisor;
     cpu.console
-        .log_info("emulator", "trusted common BIOS loaded in supervisor mode");
+        .log_info("emulator", "trusted BIOS started in kernel mode");
     Ok(cpu)
 }
 
@@ -2233,7 +2236,7 @@ mod tests {
             &cpu.memory[..firmware.segments[0].data.len()],
             firmware.segments[0].data.as_slice()
         );
-        cpu.run(1000).unwrap();
+        cpu.run(5000).unwrap();
         assert!(cpu.guest_text.enabled);
         let text = cpu
             .guest_text
@@ -2251,8 +2254,18 @@ mod tests {
             &cpu.memory[0x43402..0x4340c],
             cpu.console.text_snapshot()
         );
+        assert!(text.contains("BIOS SETUP UTILITY"), "{text:?}");
+        assert!(text.contains("BOOT SELECTION"), "{text:?}");
+        assert!(text.contains("SC-NET node ID"), "{text:?}");
+        assert!(text.contains(&cpu.bios_settings().network_name), "{text:?}");
+        let title_position = text.find("BIOS SETUP UTILITY").unwrap();
+        let title_cell = cpu.guest_text.cells[title_position];
+        assert_eq!(title_cell.foreground, 6);
+        assert_eq!(title_cell.background, 4);
+        let selected_position = text.find("DISK0001").unwrap();
+        assert_eq!(cpu.guest_text.cells[selected_position].foreground, 5);
         cpu.signal_keyboard_event(0x81);
-        cpu.run(1000).unwrap();
+        cpu.run(5000).unwrap();
         let text = cpu
             .guest_text
             .cells
@@ -2261,15 +2274,17 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("DISK0002"), "{text:?}");
         cpu.signal_keyboard_event(13);
-        cpu.run(1000).unwrap();
+        cpu.run(5000).unwrap();
         assert_eq!(
             cpu.registers[0],
             84,
-            "pc={:#x} mode={:?} running={} status={} text={:?}",
+            "pc={:#x} mode={:?} running={} status={} key={} regs={:?} text={:?}",
             cpu.pc,
             cpu.privilege_mode,
             cpu.running,
             cpu.memory[0x4340c],
+            cpu.memory[0x43000],
+            cpu.registers,
             cpu.console.text_snapshot()
         );
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
@@ -2288,7 +2303,7 @@ mod tests {
             &reset.memory[..firmware.segments[0].data.len()],
             firmware.segments[0].data.as_slice()
         );
-        reset.run(1000).unwrap();
+        reset.run(5000).unwrap();
         let text = reset
             .guest_text
             .cells
@@ -2297,10 +2312,95 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("DISK0002"), "{text:?}");
         reset.signal_keyboard_event(13);
-        reset.run(1000).unwrap();
+        reset.run(5000).unwrap();
         assert_eq!(reset.privilege_mode, PrivilegeMode::User);
         assert_eq!(reset.registers[0], 84);
         drop(reset);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bios_settings_persist_preferred_disk_startup_and_network_name() {
+        let disk = boot_test_disk("settings");
+        let root = disk.parent().unwrap();
+        let disks_root = root.join("disks");
+        fs::create_dir(&disks_root).unwrap();
+        let packaged_disk = disks_root.join("DISK0001");
+        fs::rename(&disk, &packaged_disk).unwrap();
+        let image = crate::assembler::assemble("LDI R0, 42\nHALT", 0x100).unwrap();
+        crate::image::write_image(&packaged_disk.join("main.bin"), &image).unwrap();
+        let firmware = crate::assembler::assemble(include_str!("../bios.asm"), 0).unwrap();
+        crate::image::write_image(root.join("bios.bin").as_path(), &firmware).unwrap();
+        fs::write(
+            root.join("bios.json"),
+            r#"{"version":1,"settings":{"score":12,"region":"eu"}}"#,
+        )
+        .unwrap();
+
+        let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        cpu.run(5000).unwrap();
+        let node_id = String::from_utf8(
+            cpu.memory[0x43410..0x43420]
+                .iter()
+                .copied()
+                .take_while(|byte| *byte != 0)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(node_id, cpu.bios_settings().network_name);
+        assert_eq!(node_id.len(), 16);
+        assert!(node_id.starts_with("SC16-"));
+        cpu.signal_keyboard_event(b'n');
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(8);
+        cpu.run(5000).unwrap();
+        for _ in 1..16 {
+            cpu.signal_keyboard_event(8);
+            cpu.run(5000).unwrap();
+        }
+        for character in b"NODE-0123456789A" {
+            cpu.signal_keyboard_event(*character);
+            cpu.run(5000).unwrap();
+        }
+        cpu.signal_keyboard_event(13);
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(b'a');
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(b's');
+        cpu.run(5000).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("bios.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved["preferred_disk"],
+            "DISK0001",
+            "saved settings: {saved}; BIOS status: {}; CPU: PC={:#x} mode={:?} registers={:?} logs={:?}",
+            cpu.memory[0x4340c],
+            cpu.pc,
+            cpu.privilege_mode,
+            cpu.registers,
+            cpu.console.text_snapshot()
+        );
+        assert_eq!(saved["startup_behavior"], "boot_preferred");
+        assert_eq!(saved["network_name"], "NODE-0123456789A");
+        assert_eq!(saved["settings"]["score"], 12);
+        assert_eq!(saved["settings"]["region"], "eu");
+        drop(cpu);
+
+        let mut rebooted = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        assert_eq!(
+            rebooted.bios_settings().startup_behavior,
+            crate::bios_settings::StartupBehavior::BootPreferred
+        );
+        assert_eq!(
+            rebooted.bios_settings().preferred_disk.as_deref(),
+            Some("DISK0001")
+        );
+        assert_eq!(rebooted.bios_settings().network_name, "NODE-0123456789A");
+        rebooted.run(5000).unwrap();
+        assert_eq!(rebooted.privilege_mode, PrivilegeMode::User);
+        assert_eq!(rebooted.registers[0], 42);
+        drop(rebooted);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2335,14 +2435,19 @@ mod tests {
             assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
             boot_target(&mut cpu, &target).unwrap();
             assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-            let executed = cpu.run(1000).unwrap_or_else(|error| {
+            let mut executed = 0;
+            while executed < 1000 && cpu.running && !cpu.frame_yield {
                 let pc = cpu.pc;
-                let instruction = cpu.read_u16(pc);
-                panic!(
-                    "APP{index:05} failed at PC 0x{:08x}, instruction 0x{:04x}: {error}",
-                    pc, instruction
-                )
-            });
+                let sp = cpu.sp;
+                if let Err(error) = cpu.step() {
+                    let instruction = cpu.read_u16(pc);
+                    panic!(
+                        "APP{index:05} failed at PC 0x{pc:08x}, \
+                         instruction 0x{instruction:04x}, SP 0x{sp:08x}: {error}"
+                    );
+                }
+                executed += 1;
+            }
             assert!(executed > 0, "no guest code ran for APP{index:05}");
         }
     }
