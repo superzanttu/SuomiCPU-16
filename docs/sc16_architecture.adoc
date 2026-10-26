@@ -127,8 +127,12 @@ The BIOS menu can remember a preferred disk, choose selector or automatic
 startup, and edit a 1-16 character SC-NET node ID. If unset, a random
 `SC16-`-prefixed hexadecimal ID is generated. This ID identifies the emulator
 on SC-NET; it is separate from network titles supplied by guest applications.
-Additional named integer and string settings are preserved for future firmware
-features. Settings are written only after an explicit save action.
+Up to eight additional named settings support boolean, signed integer, and
+up-to-16-byte printable ASCII string values. They are shown in the BIOS list
+and are written only after an explicit save action.
+When automatic startup is enabled and the preferred disk exists, firmware
+provides a five-second startup window; pressing Space during it enters setup
+instead of booting the disk.
 
 == Privilege and control state
 

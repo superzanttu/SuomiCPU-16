@@ -14,12 +14,20 @@ if (!(Get-Command cargo -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-$RustArgs = @()
+Write-Host "Building the SC-16 BIOS firmware."
+& cargo run --quiet --bin sc16asm -- bios.asm bios.bin
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+$CargoArgs = @("run", "--quiet", "--bin", "suomicpu16", "--")
 if ($Fullscreen) {
-    $RustArgs += "--fullscreen"
+    $CargoArgs += "--fullscreen"
 }
 if (![string]::IsNullOrWhiteSpace($ProgramFile)) {
-    $RustArgs += $ProgramFile
+    $CargoArgs += $ProgramFile
+} else {
+    Write-Host "Starting SC-16 in BIOS."
 }
-cargo run --quiet --bin suomicpu16 -- @RustArgs
+& cargo @CargoArgs
 exit $LASTEXITCODE

@@ -42,9 +42,9 @@ In windowed mode, the emulator toolbar appears at the top left with
 *PAUSE/CONTINUE*, *RESET*, *REBOOT*, and *CONSOLE* buttons. RESET returns
 to the BIOS selector when launched through BIOS, or restarts a directly launched
 program; REBOOT restarts the active program. *CONSOLE* opens the small-font
-console in its own resizable OS window. Press *F2* to toggle the console,
-*F10* to pause or resume,
-or _Shift+Ctrl+F_ to toggle windowed/fullscreen mode (*F11* is also
+console in its own resizable OS window. Press *F1* to pause or resume,
+*F2* to toggle the console, *F3* to reset, *F4* to reboot, and *F5* to stop.
+Use _Shift+Ctrl+F_ to toggle windowed/fullscreen mode (*F11* is also
 supported). The toolbar and console window are closed in fullscreen mode.
 Start directly in fullscreen with
 +cargo run -- --fullscreen+ or +.\run.ps1 -Fullscreen+.

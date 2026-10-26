@@ -6,8 +6,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const MAX_ADDITIONAL_SETTINGS: usize = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BiosSettingValue {
+    Boolean(bool),
     Integer(i64),
     String(String),
 }
@@ -95,14 +98,30 @@ impl BiosSettings {
         {
             return Err("SC-NET node name must contain 1-16 printable ASCII bytes".to_owned());
         }
-        for name in self.additional.keys() {
+        if self.additional.len() > MAX_ADDITIONAL_SETTINGS {
+            return Err(format!(
+                "at most {MAX_ADDITIONAL_SETTINGS} additional BIOS settings are supported"
+            ));
+        }
+        for (name, value) in &self.additional {
             if name.is_empty()
+                || name.len() > 16
+                || !name.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
                 || matches!(
                     name.as_str(),
                     "version" | "preferred_disk" | "startup_behavior" | "network_name" | "settings"
                 )
             {
-                return Err(format!("invalid additional BIOS setting name {name:?}"));
+                return Err(format!(
+                    "additional BIOS setting names must be 1-16 printable ASCII bytes: {name:?}"
+                ));
+            }
+            if let BiosSettingValue::String(value) = value {
+                if value.len() > 16 || !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+                    return Err(format!(
+                        "additional BIOS setting {name:?} must be at most 16 printable ASCII bytes"
+                    ));
+                }
             }
         }
         Ok(())
@@ -153,11 +172,13 @@ impl BiosSettings {
             for (name, value) in values {
                 let typed_value = if let Some(integer) = value.as_i64() {
                     BiosSettingValue::Integer(integer)
+                } else if let Some(boolean) = value.as_bool() {
+                    BiosSettingValue::Boolean(boolean)
                 } else if let Some(string) = value.as_str() {
                     BiosSettingValue::String(string.to_owned())
                 } else {
                     return Err(format!(
-                        "additional setting {name:?} must be an integer or string"
+                        "additional setting {name:?} must be a boolean, integer, or string"
                     ));
                 };
                 additional.insert(name.clone(), typed_value);
@@ -177,6 +198,7 @@ impl BiosSettings {
         let mut additional = serde_json::Map::new();
         for (name, value) in &self.additional {
             let value = match value {
+                BiosSettingValue::Boolean(boolean) => serde_json::Value::from(*boolean),
                 BiosSettingValue::Integer(integer) => serde_json::Value::from(*integer),
                 BiosSettingValue::String(string) => serde_json::Value::from(string.clone()),
             };
@@ -286,6 +308,9 @@ mod tests {
         settings
             .additional
             .insert("integer_option".to_owned(), BiosSettingValue::Integer(12));
+        settings
+            .additional
+            .insert("boolean_option".to_owned(), BiosSettingValue::Boolean(true));
         settings.additional.insert(
             "string_option".to_owned(),
             BiosSettingValue::String("value".to_owned()),
@@ -298,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_network_names_and_setting_types_are_rejected() {
+    fn invalid_network_names_and_setting_values_are_rejected() {
         let mut settings = BiosSettings::default();
         assert!(
             settings
@@ -311,9 +336,51 @@ mod tests {
                 .set_network_name("SC16-0123456789A".to_owned())
                 .is_ok()
         );
+        let parsed = BiosSettings::from_json(serde_json::json!({
+            "settings": {
+                "enabled": true,
+                "attempts": 42,
+                "label": "example"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed.additional.get("enabled"),
+            Some(&BiosSettingValue::Boolean(true))
+        );
+        assert_eq!(
+            parsed.additional.get("attempts"),
+            Some(&BiosSettingValue::Integer(42))
+        );
+        assert_eq!(
+            parsed.additional.get("label"),
+            Some(&BiosSettingValue::String("example".to_owned()))
+        );
         assert!(
             BiosSettings::from_json(serde_json::json!({
-                "settings": { "enabled": true }
+                "settings": { "label": "a string that is longer than sixteen" }
+            }))
+            .is_err()
+        );
+        assert!(
+            BiosSettings::from_json(serde_json::json!({
+                "settings": { "enabled": null }
+            }))
+            .is_err()
+        );
+        assert!(
+            BiosSettings::from_json(serde_json::json!({
+                "settings": {
+                    "one": true,
+                    "two": true,
+                    "three": true,
+                    "four": true,
+                    "five": true,
+                    "six": true,
+                    "seven": true,
+                    "eight": true,
+                    "nine": true
+                }
             }))
             .is_err()
         );

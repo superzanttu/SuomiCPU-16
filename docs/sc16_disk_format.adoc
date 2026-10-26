@@ -91,8 +91,10 @@ translation is enabled; normal BIOS USER boot does not yet enable translation
 and is not an isolation boundary.
 
 Without an explicit program path, the guest BIOS discovers ID-named folder
-directories under +disks/+ in stable order. It displays one candidate ID at a
-time; Up/Down changes the selection and Enter boots it. Escape exits.
+directories under +disks/+ in stable order. It presents the disk, automatic
+startup, and SC-NET node ID as selectable settings. Up/Down changes the
+selection, Left/Right changes the selected option, and Enter edits a setting
+or boots the selected disk. Escape cancels an edit.
 +--disk ID+ preselects a boot disk without bypassing checks. Metadata is
 validated only when a disk is selected, so an invalid manifest cannot hide
 other boot choices. Invalid metadata, images, and +NOT_BOOT+ cases are logged
@@ -127,8 +129,11 @@ Supervisor mode. All multi-byte values are big-endian.
   +0x43404+. +--disk ID+ selects the initial index when it matches a
   discovered ID; otherwise index zero is used and the missing ID is logged.
   +0x43406+ is nonzero when automatic startup is enabled and a preferred disk
-  was found. The SC-NET node ID is written at +0x43410+ in a 17-byte
-  NUL-terminated buffer (maximum 16 printable ASCII bytes).
+  was found. With that value set, the BIOS waits five seconds for Space before
+  booting; the startup wait marker at +0x4342e+ is nonzero during this window.
+  The SC-NET node ID is written at +0x43410+ in a 17-byte
+  NUL-terminated buffer (maximum 16 printable ASCII bytes). The number of
+  custom settings is at +0x4340e+.
 
 |+2+
 |Read disk ID
@@ -149,15 +154,34 @@ Supervisor mode. All multi-byte values are big-endian.
   (+0+ selector, +1+ boot preferred disk), and the NUL-terminated SC-NET node
   ID at +0x43410+ in a 17-byte NUL-terminated buffer (maximum 16 printable
   ASCII bytes). Saves the settings to the emulator-root +bios.json+, preserving
-  additional integer/string settings.
+  additional boolean, integer, and string settings.
+
+|+5+
+|Reload BIOS settings
+|Reloads +bios.json+ and returns the selected disk index, disk count, startup
+  behavior, and SC-NET node ID in the same fields as command +1+.
+
+|+6+
+|Read custom setting
+|The zero-based index in the sorted settings list is at +0x43402+. The result
+  record starts at +0x43430+: a 17-byte NUL-terminated name, a type byte
+  (+0+ boolean, +1+ string, +2+ integer), and a 24-byte NUL-terminated value.
+  Boolean values are +Yes+/+No+ and integer values use signed decimal text.
+
+|+7+
+|Write custom setting
+|Writes the same record layout returned by command +6+. The name and type
+  must match an existing setting. String values are limited to 16 printable
+  ASCII bytes; integer values must parse as signed 64-bit decimal values.
 |===
 
 Status at +0x4340c+ is zero on success and one on failure. Failures are also
 logged to the Bug Monitor; a failed boot leaves the BIOS available to retry.
-The BIOS menu saves with +S+, toggles startup behavior with +A+, and edits the
-SC-NET node ID with +N+ (Backspace edits; Enter accepts the ID). The ID
-identifies the emulator on SC-NET and is independent of guest application
-network titles.
+The BIOS menu uses F9 to reload settings and F10 to save. During automatic
+startup, press Space within five seconds to enter BIOS setup. The emulator uses
+F1 to pause/resume, F2 for the Bug Monitor, F3 to reset, F4 to reboot, and F5
+to stop. The SC-NET node ID identifies the emulator on SC-NET and is
+independent of guest application network titles.
 
 The root settings file has this versioned shape:
 
@@ -169,11 +193,17 @@ The root settings file has this versioned shape:
   "startup_behavior": "selector",
   "network_name": "SC16-0123456789A",
   "settings": {
+    "example_enabled": true,
     "example_integer": 42,
     "example_string": "value"
   }
 }
 ----
+
+Up to eight additional setting values are JSON booleans (Yes/No), signed
+integers, or printable ASCII strings of at most 16 bytes. Example values are
++true+, +42+, and +"value"+. These appear in the BIOS settings list and can be
+edited there; changes are saved only with F10.
 
 +preferred_disk+ may be +null+ when no disk is selected. Startup behavior is
 +selector+ or +boot_preferred+. +network_name+ is a 1-16 character printable

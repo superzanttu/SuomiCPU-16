@@ -21,9 +21,16 @@ The selector uses +bios.json+ beside +bios.bin+ to remember the preferred
 disk, startup behavior, and an editable 1-16 character SC-NET node ID. When
 not configured, the BIOS generates a full-length +SC16-+ name with a random
 hexadecimal suffix. This identifies the emulator to SC-NET only; guest
-applications use their own network titles. Press +A+ to toggle selector versus
-automatic boot of the preferred disk, +N+ to edit the node ID, and +S+ to save.
-Additional named integer and string settings are retained in the JSON file.
+applications use their own network titles. Use Up/Down to select a setting.
+Left/Right changes the boot device or toggles the selected BOOL; Enter edits
+the selected setting or starts the selected boot device. Escape cancels an
+edit, F9 reloads +bios.json+, and F10 saves it. Unsaved changes are shown as a
+warning and prevent booting until saved. BOOL values are Yes/No, STRING values
+are limited to 16 printable ASCII characters, and NUMBER values are signed
+integers. Up to eight named custom settings from +bios.json+ appear in the
+list and can be edited with the same controls. When automatic startup of a
+preferred disk is enabled, the BIOS waits five seconds before booting and
+shows a prompt; press Space during the countdown to enter setup instead.
 Once started, CPU
 reset begins execution at the loaded image's entry point. The first instruction
 in the source determines that entry point, regardless of the numeric order of
@@ -52,11 +59,12 @@ subset handles multiple +int+ functions with up to three parameters and local
 expressions, conditional expressions, nested blocks, +if+/+else+, and
 +while+/+do+/+for+ loops with +break+ and +continue+, including recursion.
 Other C programs are rejected until their required features are ported. At
-startup without an explicit program path, the BIOS displays ID-named disk
-directories in stable order, one at a time. Use Up/Down to change the selection
-and Enter to boot. Invalid metadata, invalid images, and +NOT_BOOT+ errors are
-logged; the BIOS remains available to retry another disk. Reset restarts the
-firmware and rescans the disk collection. Press Escape to exit the BIOS. The
+startup without an explicit program path, the BIOS displays the settings list
+and available ID-named disk directories in stable order. Use Up/Down to select
+a row and Enter to edit or boot. Invalid metadata, invalid images, and
++NOT_BOOT+ errors are logged; the BIOS remains available to retry another
+disk. Reset restarts the firmware and rescans the disk collection. Press F5
+to stop emulation. The
 emulator requires the shared root
 +bios.bin+ and displays a BIOS startup error if it is missing or invalid.
 Package one program with +sc16build package-disk+ or all runnable C modules
@@ -76,8 +84,9 @@ guest serial output. Its *RESET* button returns to BIOS disk selection;
 *REBOOT* restarts the current program. Select text and press Ctrl+C to copy it;
 the *COPY* button copies selected text or the visible monitor screen. The Bug
 Monitor keeps a 1,000-row scrollback buffer, navigated with the mouse wheel.
-Press F2 in the emulator window to hide/show the Bug Monitor, and F11 to toggle
-fullscreen and windowed game display. Start in fullscreen with
+Press F1 to pause/resume, F2 to hide/show the Bug Monitor, F3 to reset, F4 to
+reboot, and F5 to stop emulation. F11 toggles fullscreen and windowed game
+display. Start in fullscreen with
 +cargo run -- --fullscreen+ or
 +.\run.ps1 -Fullscreen+.
 

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::bios_settings::{BiosSettings, StartupBehavior};
+use crate::bios_settings::{BiosSettingValue, BiosSettings, StartupBehavior};
 use crate::console::ConsoleDevice;
 use crate::disk::{FolderBootMode, FolderDisk};
 use crate::guest_text::GuestTextDisplay;
@@ -41,6 +41,9 @@ const DISK_BASE: u32 = 0x43100;
 const DISK_STATUS: u32 = DISK_BASE + 16;
 const BIOS_BASE: u32 = 0x43400;
 const BIOS_STATUS: u32 = BIOS_BASE + 12;
+const BIOS_SETTING_RECORD: usize = BIOS_BASE as usize + 0x30;
+pub const BIOS_FIRMWARE_MARKER: u32 = BIOS_BASE + 0x2f;
+pub const BIOS_AUTOBOOT_WAIT_MARKER: u32 = BIOS_BASE + 0x2e;
 const CONSOLE_DATA: u32 = 0x43200;
 const CONSOLE_STATUS: u32 = 0x43201;
 const CONSOLE_CONTROL: u32 = 0x43202;
@@ -555,6 +558,9 @@ impl Cpu {
             2 => self.bios_list_id(),
             3 => self.bios_boot_disk(),
             4 => self.bios_save_settings(),
+            5 => self.bios_reload_settings(),
+            6 => self.bios_read_setting(),
+            7 => self.bios_write_setting(),
             _ => Err("unsupported firmware operation".to_owned()),
         };
         if let Err(error) = result {
@@ -618,6 +624,8 @@ impl Cpu {
         self.memory[BIOS_BASE as usize + 4] = count_high;
         self.memory[BIOS_BASE as usize + 5] = count_low;
         self.memory[BIOS_BASE as usize + 6] = u8::from(auto_boot);
+        self.memory[BIOS_BASE as usize + 0x0e] = u8::try_from(self.bios_settings.additional.len())
+            .map_err(|_| "too many additional BIOS settings".to_owned())?;
         self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x21].fill(0);
         let network_name = self.bios_settings.network_name.as_bytes();
         self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x10 + network_name.len()]
@@ -675,6 +683,7 @@ impl Cpu {
         self.prepare_image_entry();
         self.load_program(&boot.image.segments, boot.image.entry_point)
             .map_err(|error| format!("cannot load selected firmware disk: {error}"))?;
+        self.memory[BIOS_FIRMWARE_MARKER as usize] = 0;
         self.booted_disk_path = Some(path.clone());
         self.folder_disk = Some(disk);
         match boot.mode {
@@ -739,6 +748,89 @@ impl Cpu {
         settings.startup_behavior = startup_behavior;
         settings.set_network_name(network_name)?;
         settings.save(path)?;
+        self.bios_settings = settings;
+        Ok(())
+    }
+
+    fn bios_reload_settings(&mut self) -> Result<(), String> {
+        let path = self
+            .bios_settings_path
+            .as_ref()
+            .ok_or_else(|| "BIOS settings file path is not configured".to_owned())?;
+        self.bios_settings = BiosSettings::load(path)?;
+        self.bios_list_count()
+    }
+
+    fn bios_read_setting(&mut self) -> Result<(), String> {
+        let index = usize::from(self.bios_register_u16(2));
+        let (name, value) = self
+            .bios_settings
+            .additional
+            .iter()
+            .nth(index)
+            .ok_or_else(|| format!("additional BIOS setting index {index} is out of range"))?;
+        let record = BIOS_SETTING_RECORD;
+        self.memory[record..record + 0x2a].fill(0);
+        self.memory[record..record + name.len()].copy_from_slice(name.as_bytes());
+        self.memory[record + 17] = match value {
+            BiosSettingValue::Boolean(_) => 0,
+            BiosSettingValue::String(_) => 1,
+            BiosSettingValue::Integer(_) => 2,
+        };
+        let encoded_value = match value {
+            BiosSettingValue::Boolean(value) => {
+                if *value {
+                    "Yes".to_owned()
+                } else {
+                    "No".to_owned()
+                }
+            }
+            BiosSettingValue::String(value) => value.clone(),
+            BiosSettingValue::Integer(value) => value.to_string(),
+        };
+        self.memory[record + 18..record + 18 + encoded_value.len()]
+            .copy_from_slice(encoded_value.as_bytes());
+        Ok(())
+    }
+
+    fn bios_write_setting(&mut self) -> Result<(), String> {
+        let record = BIOS_SETTING_RECORD;
+        let name_bytes = &self.memory[record..record + 17];
+        let name_end = name_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| "additional BIOS setting name is not terminated".to_owned())?;
+        let name = std::str::from_utf8(&name_bytes[..name_end])
+            .map_err(|_| "additional BIOS setting name is not valid UTF-8".to_owned())?;
+        let value_bytes = &self.memory[record + 18..record + 0x2a];
+        let value_end = value_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| "additional BIOS setting value is not terminated".to_owned())?;
+        let value = std::str::from_utf8(&value_bytes[..value_end])
+            .map_err(|_| "additional BIOS setting value is not valid UTF-8".to_owned())?;
+        let existing = self
+            .bios_settings
+            .additional
+            .get(name)
+            .ok_or_else(|| format!("additional BIOS setting {name:?} was not found"))?;
+        let new_value = match (self.memory[record + 17], existing) {
+            (0, BiosSettingValue::Boolean(_)) => match value {
+                "Yes" => BiosSettingValue::Boolean(true),
+                "No" => BiosSettingValue::Boolean(false),
+                _ => return Err("boolean BIOS setting must be Yes or No".to_owned()),
+            },
+            (1, BiosSettingValue::String(_)) => BiosSettingValue::String(value.to_owned()),
+            (2, BiosSettingValue::Integer(_)) => BiosSettingValue::Integer(
+                value
+                    .parse()
+                    .map_err(|_| "number BIOS setting must be a signed integer".to_owned())?,
+            ),
+            _ => return Err("additional BIOS setting type cannot be changed".to_owned()),
+        };
+        let mut settings = self.bios_settings.clone();
+        settings.additional.insert(name.to_owned(), new_value);
+        settings.validate()?;
         self.bios_settings = settings;
         Ok(())
     }
@@ -6247,6 +6339,199 @@ mod tests {
 
         assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
         cpu.write(GPU_BASE, GPU_NET_CLOSE);
+    }
+
+    #[test]
+    fn bios_additional_settings_can_be_read_and_updated_with_typed_values() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.bios_settings
+            .additional
+            .insert("enabled".to_owned(), BiosSettingValue::Boolean(false));
+        cpu.bios_settings
+            .additional
+            .insert("retries".to_owned(), BiosSettingValue::Integer(5));
+        cpu.bios_settings.additional.insert(
+            "label".to_owned(),
+            BiosSettingValue::String("demo".to_owned()),
+        );
+
+        for (index, name, kind, value) in [
+            (0, "enabled", 0, "No"),
+            (1, "label", 1, "demo"),
+            (2, "retries", 2, "5"),
+        ] {
+            cpu.memory[BIOS_BASE as usize + 2] = 0;
+            cpu.memory[BIOS_BASE as usize + 3] = index;
+            cpu.bios_read_setting().unwrap();
+            let record = BIOS_SETTING_RECORD;
+            let name_end = cpu.memory[record..record + 17]
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap();
+            assert_eq!(&cpu.memory[record..record + name_end], name.as_bytes());
+            assert_eq!(cpu.memory[record + 17], kind);
+            let value_bytes = &cpu.memory[record + 18..record + 42];
+            let value_end = value_bytes.iter().position(|byte| *byte == 0).unwrap();
+            assert_eq!(&value_bytes[..value_end], value.as_bytes());
+        }
+
+        let record = BIOS_SETTING_RECORD;
+        cpu.memory[BIOS_BASE as usize + 3] = 0;
+        cpu.bios_read_setting().unwrap();
+        cpu.memory[record + 17] = 0;
+        cpu.memory[record + 18..record + 42].fill(0);
+        cpu.memory[record + 18..record + 21].copy_from_slice(b"Yes");
+        cpu.bios_write_setting().unwrap();
+        assert_eq!(
+            cpu.bios_settings.additional.get("enabled"),
+            Some(&BiosSettingValue::Boolean(true))
+        );
+
+        cpu.memory[BIOS_BASE as usize + 3] = 2;
+        cpu.bios_read_setting().unwrap();
+        cpu.memory[record + 17] = 2;
+        cpu.memory[record + 18..record + 42].fill(0);
+        cpu.memory[record + 18..record + 20].copy_from_slice(b"-9");
+        cpu.bios_write_setting().unwrap();
+        assert_eq!(
+            cpu.bios_settings.additional.get("retries"),
+            Some(&BiosSettingValue::Integer(-9))
+        );
+    }
+
+    #[test]
+    fn bios_firmware_renders_dynamic_typed_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-bios-ui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("CUSTOM01")).unwrap();
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.disk_root = root.clone();
+        let settings_path = root.join("bios.json");
+        cpu.configure_bios_settings(settings_path.clone()).unwrap();
+        cpu.bios_settings.additional.insert(
+            "feature_enabled".to_owned(),
+            BiosSettingValue::Boolean(true),
+        );
+        cpu.bios_settings
+            .additional
+            .insert("retry_count".to_owned(), BiosSettingValue::Integer(42));
+        cpu.bios_settings.additional.insert(
+            "display_name".to_owned(),
+            BiosSettingValue::String("example".to_owned()),
+        );
+        let image = crate::assembler::assemble(include_str!("../bios.asm"), 0).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+
+        for _ in 0..30_000 {
+            cpu.step().unwrap();
+        }
+
+        let text = cpu
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| cell.character as char)
+            .collect::<String>();
+        assert!(text.contains("feature_enabled [BOOL] Yes"), "{text}");
+        assert!(text.contains("retry_count [NUMBER] 42"), "{text}");
+        assert!(text.contains("display_name [STRING] example"), "{text}");
+        assert_eq!(cpu.registers[0], 0, "disk register after initial render");
+
+        let send_key = |cpu: &mut Cpu, key| {
+            cpu.signal_keyboard_event(key);
+            for _ in 0..5_000 {
+                cpu.step().unwrap();
+                if cpu.memory[KEYBOARD_ADDR as usize] == 0 {
+                    break;
+                }
+            }
+            for _ in 0..2_000 {
+                cpu.step().unwrap();
+            }
+        };
+        for selected in 1u8..=5 {
+            send_key(&mut cpu, 0x81);
+            assert_eq!(cpu.memory[0x5021], selected, "selection after down key");
+        }
+        assert_eq!(cpu.memory[0x5021], 5);
+        send_key(&mut cpu, 13);
+        assert_eq!(cpu.memory[BIOS_SETTING_RECORD + 17], 2);
+        send_key(&mut cpu, 8);
+        send_key(&mut cpu, 8);
+        send_key(&mut cpu, b'9');
+        send_key(&mut cpu, 13);
+        assert_eq!(
+            cpu.bios_settings.additional.get("retry_count"),
+            Some(&BiosSettingValue::Integer(9))
+        );
+        send_key(&mut cpu, 0x80);
+        send_key(&mut cpu, 0x80);
+        send_key(&mut cpu, 13);
+        send_key(&mut cpu, 8);
+        send_key(&mut cpu, b'X');
+        send_key(&mut cpu, 13);
+        assert_eq!(
+            cpu.bios_settings.additional.get("display_name"),
+            Some(&BiosSettingValue::String("examplX".to_owned()))
+        );
+        send_key(&mut cpu, 0x81);
+        send_key(&mut cpu, 13);
+        send_key(&mut cpu, 0x83);
+        send_key(&mut cpu, 13);
+        assert_eq!(
+            cpu.bios_settings.additional.get("feature_enabled"),
+            Some(&BiosSettingValue::Boolean(false))
+        );
+        assert_eq!(cpu.memory[0x5022], 1);
+        for _ in 0..4 {
+            send_key(&mut cpu, 0x80);
+        }
+        assert_eq!(cpu.memory[0x5021], 0);
+        send_key(&mut cpu, 13);
+        assert_eq!(cpu.memory[BIOS_FIRMWARE_MARKER as usize], 1);
+        assert!(cpu.booted_disk_path.is_none());
+        assert_eq!(cpu.bios_register_u16(2), 0);
+        send_key(&mut cpu, 0x89);
+        assert_eq!(
+            cpu.memory[BIOS_STATUS as usize],
+            0,
+            "{:?}",
+            cpu.console.text_snapshot()
+        );
+        assert_eq!(cpu.memory[0x5022], 0);
+        assert_eq!(
+            BiosSettings::load(&settings_path)
+                .unwrap()
+                .additional
+                .get("retry_count"),
+            Some(&BiosSettingValue::Integer(9))
+        );
+
+        for _ in 0..5 {
+            send_key(&mut cpu, 0x81);
+        }
+        send_key(&mut cpu, 13);
+        send_key(&mut cpu, b'8');
+        send_key(&mut cpu, 13);
+        assert_eq!(
+            cpu.bios_settings.additional.get("retry_count"),
+            Some(&BiosSettingValue::Integer(98))
+        );
+        send_key(&mut cpu, 0x88);
+        assert_eq!(cpu.memory[0x5022], 0);
+        assert_eq!(
+            cpu.bios_settings.additional.get("retry_count"),
+            Some(&BiosSettingValue::Integer(9))
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

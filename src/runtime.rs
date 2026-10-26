@@ -1,4 +1,7 @@
-use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle, PrivilegeMode, VSYNC_ADDR};
+use crate::cpu::{
+    BIOS_AUTOBOOT_WAIT_MARKER, BIOS_FIRMWARE_MARKER, Cpu, GpuLine, GpuSoundCommand, GpuTriangle,
+    PrivilegeMode, VSYNC_ADDR,
+};
 #[cfg(test)]
 use crate::cpu::{
     GUEST_TEXT_BACKGROUND, GUEST_TEXT_CONTROL, GUEST_TEXT_DATA, GUEST_TEXT_FOREGROUND,
@@ -10,7 +13,7 @@ use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, Rect, Texture2D,
     WHITE, clear_background, draw_line, draw_rectangle, draw_text as draw_ui_text, draw_texture_ex,
-    draw_triangle, get_char_pressed, get_keys_down, get_keys_pressed, is_key_down, is_key_pressed,
+    draw_triangle, get_char_pressed, get_keys_down, get_keys_pressed, is_key_pressed,
     is_mouse_button_pressed, is_mouse_button_released, mouse_position, mouse_wheel, next_frame,
     screen_height, screen_width, set_fullscreen, vec2,
 };
@@ -328,6 +331,7 @@ enum RuntimeControl {
     ConsoleToggled(bool),
     ResetRequested,
     RebootRequested,
+    StopRequested,
 }
 
 #[derive(Clone, Copy)]
@@ -350,7 +354,7 @@ impl ConsoleWindow {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let window = NativeWindow::new(
-                "SC-16 Bug Monitor | F2 close  F5 reset  F6 reboot  F10 pause",
+                "SC-16 Bug Monitor | F1 pause  F2 close  F3 reset  F4 reboot  F5 stop",
                 CONSOLE_WINDOW_WIDTH,
                 CONSOLE_WINDOW_HEIGHT,
                 WindowOptions {
@@ -395,14 +399,20 @@ impl ConsoleWindow {
             if !self.window.is_open() {
                 return Some(RuntimeControl::ConsoleToggled(false));
             }
-            let keyboard_control = [NativeKey::F2, NativeKey::F5, NativeKey::F6, NativeKey::F10]
-                .into_iter()
-                .find_map(|key| {
-                    self.window
-                        .is_key_pressed(key, KeyRepeat::No)
-                        .then_some(key)
-                        .and_then(|key| console_runtime_control(key, paused))
-                });
+            let keyboard_control = [
+                NativeKey::F1,
+                NativeKey::F2,
+                NativeKey::F3,
+                NativeKey::F4,
+                NativeKey::F5,
+            ]
+            .into_iter()
+            .find_map(|key| {
+                self.window
+                    .is_key_pressed(key, KeyRepeat::No)
+                    .then_some(key)
+                    .and_then(|key| console_runtime_control(key, paused))
+            });
             let mouse_down = self.window.get_mouse_down(NativeMouseButton::Left);
             let mouse_clicked = mouse_down && !self.left_mouse_down;
             self.left_mouse_down = mouse_down;
@@ -449,10 +459,11 @@ impl ConsoleWindow {
 #[cfg(not(target_arch = "wasm32"))]
 fn console_runtime_control(key: NativeKey, paused: bool) -> Option<RuntimeControl> {
     match key {
+        NativeKey::F1 => Some(RuntimeControl::PauseToggled(!paused)),
         NativeKey::F2 => Some(RuntimeControl::ConsoleToggled(false)),
-        NativeKey::F5 => Some(RuntimeControl::ResetRequested),
-        NativeKey::F6 => Some(RuntimeControl::RebootRequested),
-        NativeKey::F10 => Some(RuntimeControl::PauseToggled(!paused)),
+        NativeKey::F3 => Some(RuntimeControl::ResetRequested),
+        NativeKey::F4 => Some(RuntimeControl::RebootRequested),
+        NativeKey::F5 => Some(RuntimeControl::StopRequested),
         _ => None,
     }
 }
@@ -536,8 +547,19 @@ pub async fn run_with_devices(
     let mut presented_lines = Vec::new();
     let mut presented_palette = cpu.palette;
     let runtime_started = Instant::now();
-    while !is_key_down(KeyCode::Escape) {
+    let mut bios_autoboot_wait_started = None;
+    let mut bios_autoboot_timeout_sent = false;
+    loop {
         let pressed_keys = get_keys_pressed();
+        if bios_autoboot_timeout_due(
+            cpu.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize] == 1,
+            pressed_keys.contains(&KeyCode::Space),
+            &mut bios_autoboot_wait_started,
+            &mut bios_autoboot_timeout_sent,
+            Instant::now(),
+        ) {
+            cpu.signal_keyboard_event(0x8a);
+        }
         let keys = get_keys_down();
         let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
         let controlled =
@@ -546,6 +568,25 @@ pub async fn run_with_devices(
         let mut control_key_count = 0;
         let mut handled_control_keys = HashSet::new();
         for key in pressed_keys.iter().copied() {
+            if cpu.privilege_mode == PrivilegeMode::Supervisor
+                && cpu.guest_text.enabled
+                && cpu.memory[BIOS_FIRMWARE_MARKER as usize] == 1
+            {
+                let bios_key = match key {
+                    KeyCode::Escape => Some(27),
+                    KeyCode::F9 => Some(0x88),
+                    KeyCode::F10 => Some(0x89),
+                    _ => None,
+                };
+                if let Some(bios_key) = bios_key {
+                    cpu.signal_keyboard_event(bios_key);
+                    control_key_count += 1;
+                    handled_control_keys.insert(key);
+                    continue;
+                }
+            } else if key == KeyCode::Escape {
+                return Ok(());
+            }
             if let Some(control) = apply_runtime_control(
                 key,
                 &mut paused,
@@ -564,6 +605,7 @@ pub async fn run_with_devices(
                     RuntimeControl::RebootRequested => {
                         pending_action = Some(RuntimeControl::RebootRequested)
                     }
+                    RuntimeControl::StopRequested => cpu.running = false,
                     RuntimeControl::PauseToggled(paused) => {
                         cpu.console.log_info(
                             "emulator",
@@ -600,6 +642,7 @@ pub async fn run_with_devices(
                 }
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
                 RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
+                RuntimeControl::StopRequested => cpu.running = false,
             }
             last_frame = Instant::now();
         }
@@ -624,6 +667,7 @@ pub async fn run_with_devices(
                 }
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
                 RuntimeControl::FullscreenToggled(_) => {}
+                RuntimeControl::StopRequested => cpu.running = false,
             }
         }
         if fullscreen {
@@ -803,7 +847,11 @@ pub async fn run_with_devices(
                 last_frame = Instant::now();
             }
         }
-        if should_capture_display_frame(cpu.memory[VSYNC_ADDR] != 0, cpu.frame_presented) {
+        if should_capture_display_frame(
+            cpu.memory[VSYNC_ADDR] != 0,
+            cpu.frame_presented,
+            cpu.guest_text.enabled,
+        ) {
             render_cpu(&cpu, &mut pixels, &font);
             presented_size = screen_size(&cpu);
             presented_triangles.clone_from(&cpu.gpu_triangles);
@@ -822,7 +870,7 @@ pub async fn run_with_devices(
                 rgb(10, 14, 24),
             );
             let status = if paused {
-                "PAUSED - F10 TO RESUME"
+                "PAUSED - F1 TO RESUME"
             } else {
                 "PROGRAM HALTED - PRESS ANY KEY TO CLOSE"
             };
@@ -1554,6 +1602,29 @@ fn rate_budget(rate: f64, elapsed: f64, remainder: &mut f64) -> usize {
     result
 }
 
+fn bios_autoboot_timeout_due(
+    waiting: bool,
+    space_pressed: bool,
+    started_at: &mut Option<Instant>,
+    timeout_sent: &mut bool,
+    now: Instant,
+) -> bool {
+    if !waiting {
+        *started_at = None;
+        *timeout_sent = false;
+        return false;
+    }
+    if *timeout_sent {
+        return false;
+    }
+    let started_at = *started_at.get_or_insert(now);
+    if !space_pressed && now.duration_since(started_at) >= Duration::from_secs(5) {
+        *timeout_sent = true;
+        return true;
+    }
+    false
+}
+
 fn run_instruction_slice(
     cpu: &mut Cpu,
     budget_remaining: &mut usize,
@@ -1624,10 +1695,13 @@ fn apply_runtime_control(
     controlled: bool,
 ) -> Option<RuntimeControl> {
     match key {
-        KeyCode::F10 => {
+        KeyCode::F1 => {
             *paused = !*paused;
             Some(RuntimeControl::PauseToggled(*paused))
         }
+        KeyCode::F3 => Some(RuntimeControl::ResetRequested),
+        KeyCode::F4 => Some(RuntimeControl::RebootRequested),
+        KeyCode::F5 => Some(RuntimeControl::StopRequested),
         KeyCode::F11 => {
             *fullscreen = !*fullscreen;
             Some(RuntimeControl::FullscreenToggled(*fullscreen))
@@ -1861,8 +1935,12 @@ fn draw_guest_text(
     }
 }
 
-fn should_capture_display_frame(vsync_enabled: bool, frame_presented: bool) -> bool {
-    !vsync_enabled || frame_presented
+fn should_capture_display_frame(
+    vsync_enabled: bool,
+    frame_presented: bool,
+    guest_text_enabled: bool,
+) -> bool {
+    !vsync_enabled || frame_presented || guest_text_enabled
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
@@ -2255,7 +2333,7 @@ mod tests {
             cpu.console.text_snapshot()
         );
         assert!(text.contains("BIOS SETUP UTILITY"), "{text:?}");
-        assert!(text.contains("BOOT SELECTION"), "{text:?}");
+        assert!(text.contains("SETTINGS"), "{text:?}");
         assert!(text.contains("SC-NET node ID"), "{text:?}");
         assert!(text.contains(&cpu.bios_settings().network_name), "{text:?}");
         let title_position = text.find("BIOS SETUP UTILITY").unwrap();
@@ -2264,7 +2342,7 @@ mod tests {
         assert_eq!(title_cell.background, 4);
         let selected_position = text.find("DISK0001").unwrap();
         assert_eq!(cpu.guest_text.cells[selected_position].foreground, 5);
-        cpu.signal_keyboard_event(0x81);
+        cpu.signal_keyboard_event(0x83);
         cpu.run(5000).unwrap();
         let text = cpu
             .guest_text
@@ -2273,6 +2351,8 @@ mod tests {
             .map(|cell| char::from(cell.character))
             .collect::<String>();
         assert!(text.contains("DISK0002"), "{text:?}");
+        cpu.signal_keyboard_event(0x89);
+        cpu.run(5000).unwrap();
         cpu.signal_keyboard_event(13);
         cpu.run(5000).unwrap();
         assert_eq!(
@@ -2350,11 +2430,13 @@ mod tests {
         assert_eq!(node_id, cpu.bios_settings().network_name);
         assert_eq!(node_id.len(), 16);
         assert!(node_id.starts_with("SC16-"));
-        cpu.signal_keyboard_event(b'n');
+        for _ in 0..2 {
+            cpu.signal_keyboard_event(0x81);
+            cpu.run(5000).unwrap();
+        }
+        cpu.signal_keyboard_event(13);
         cpu.run(5000).unwrap();
-        cpu.signal_keyboard_event(8);
-        cpu.run(5000).unwrap();
-        for _ in 1..16 {
+        for _ in 0..16 {
             cpu.signal_keyboard_event(8);
             cpu.run(5000).unwrap();
         }
@@ -2364,9 +2446,15 @@ mod tests {
         }
         cpu.signal_keyboard_event(13);
         cpu.run(5000).unwrap();
-        cpu.signal_keyboard_event(b'a');
+        cpu.signal_keyboard_event(0x80);
         cpu.run(5000).unwrap();
-        cpu.signal_keyboard_event(b's');
+        cpu.signal_keyboard_event(13);
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(0x83);
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(13);
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(0x89);
         cpu.run(5000).unwrap();
 
         let saved: serde_json::Value =
@@ -2387,6 +2475,20 @@ mod tests {
         assert_eq!(saved["settings"]["region"], "eu");
         drop(cpu);
 
+        let mut setup_entry = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        setup_entry.signal_keyboard_event(b' ');
+        setup_entry.run(5000).unwrap();
+        assert_eq!(setup_entry.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(setup_entry.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize], 0);
+        let setup_text = setup_entry
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| char::from(cell.character))
+            .collect::<String>();
+        assert!(setup_text.contains("SETTINGS"), "{setup_text}");
+        drop(setup_entry);
+
         let mut rebooted = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
         assert_eq!(
             rebooted.bios_settings().startup_behavior,
@@ -2397,6 +2499,10 @@ mod tests {
             Some("DISK0001")
         );
         assert_eq!(rebooted.bios_settings().network_name, "NODE-0123456789A");
+        rebooted.run(5000).unwrap();
+        assert_eq!(rebooted.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(rebooted.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize], 1);
+        rebooted.signal_keyboard_event(0x8a);
         rebooted.run(5000).unwrap();
         assert_eq!(rebooted.privilege_mode, PrivilegeMode::User);
         assert_eq!(rebooted.registers[0], 42);
@@ -2585,6 +2691,57 @@ mod tests {
     }
 
     #[test]
+    fn bios_autoboot_wait_requires_five_seconds_and_gives_space_priority() {
+        let now = Instant::now();
+        let mut started_at = None;
+        let mut timeout_sent = false;
+
+        assert!(!bios_autoboot_timeout_due(
+            true,
+            false,
+            &mut started_at,
+            &mut timeout_sent,
+            now,
+        ));
+        assert!(!bios_autoboot_timeout_due(
+            true,
+            false,
+            &mut started_at,
+            &mut timeout_sent,
+            now + Duration::from_millis(4_999),
+        ));
+        assert!(!bios_autoboot_timeout_due(
+            true,
+            true,
+            &mut started_at,
+            &mut timeout_sent,
+            now + Duration::from_secs(5),
+        ));
+        assert!(bios_autoboot_timeout_due(
+            true,
+            false,
+            &mut started_at,
+            &mut timeout_sent,
+            now + Duration::from_secs(5),
+        ));
+        assert!(!bios_autoboot_timeout_due(
+            true,
+            false,
+            &mut started_at,
+            &mut timeout_sent,
+            now + Duration::from_secs(6),
+        ));
+        assert!(!bios_autoboot_timeout_due(
+            false,
+            false,
+            &mut started_at,
+            &mut timeout_sent,
+            now + Duration::from_secs(6),
+        ));
+        assert!(!timeout_sent);
+    }
+
+    #[test]
     fn halted_display_waits_for_a_keypress_without_closing_a_running_cpu() {
         assert!(!halted_window_should_close(false, false));
         assert!(halted_window_should_close(false, true));
@@ -2596,7 +2753,7 @@ mod tests {
         let (mut paused, mut fullscreen, mut console_visible) = (false, false, false);
         assert_eq!(
             apply_runtime_control(
-                KeyCode::F10,
+                KeyCode::F1,
                 &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
@@ -2620,7 +2777,7 @@ mod tests {
         );
         assert_eq!(
             apply_runtime_control(
-                KeyCode::F10,
+                KeyCode::F1,
                 &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
@@ -2642,6 +2799,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn runtime_function_keys_one_through_five_match_emulator_controls() {
+        let (mut paused, mut fullscreen, mut console_visible) = (false, false, false);
+        let mut control = |key| {
+            apply_runtime_control(
+                key,
+                &mut paused,
+                &mut fullscreen,
+                &mut console_visible,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(
+            control(KeyCode::F1),
+            Some(RuntimeControl::PauseToggled(true))
+        );
+        assert_eq!(
+            control(KeyCode::F2),
+            Some(RuntimeControl::ConsoleToggled(true))
+        );
+        assert_eq!(control(KeyCode::F3), Some(RuntimeControl::ResetRequested));
+        assert_eq!(control(KeyCode::F4), Some(RuntimeControl::RebootRequested));
+        assert_eq!(control(KeyCode::F5), Some(RuntimeControl::StopRequested));
     }
 
     #[test]
@@ -2787,10 +2971,11 @@ mod tests {
 
     #[test]
     fn vsync_refreshes_only_after_a_gpu_present_command() {
-        assert!(should_capture_display_frame(false, false));
-        assert!(should_capture_display_frame(false, true));
-        assert!(!should_capture_display_frame(true, false));
-        assert!(should_capture_display_frame(true, true));
+        assert!(should_capture_display_frame(false, false, false));
+        assert!(should_capture_display_frame(false, true, false));
+        assert!(!should_capture_display_frame(true, false, false));
+        assert!(should_capture_display_frame(true, true, false));
+        assert!(should_capture_display_frame(true, false, true));
     }
 
     #[test]
@@ -3120,20 +3305,24 @@ mod tests {
             Some(RuntimeControl::ConsoleToggled(false))
         );
         assert_eq!(
-            console_runtime_control(NativeKey::F5, false),
+            console_runtime_control(NativeKey::F3, false),
             Some(RuntimeControl::ResetRequested)
         );
         assert_eq!(
-            console_runtime_control(NativeKey::F6, false),
+            console_runtime_control(NativeKey::F4, false),
             Some(RuntimeControl::RebootRequested)
         );
         assert_eq!(
-            console_runtime_control(NativeKey::F10, false),
+            console_runtime_control(NativeKey::F1, false),
             Some(RuntimeControl::PauseToggled(true))
         );
         assert_eq!(
-            console_runtime_control(NativeKey::F10, true),
+            console_runtime_control(NativeKey::F1, true),
             Some(RuntimeControl::PauseToggled(false))
+        );
+        assert_eq!(
+            console_runtime_control(NativeKey::F5, false),
+            Some(RuntimeControl::StopRequested)
         );
     }
 
