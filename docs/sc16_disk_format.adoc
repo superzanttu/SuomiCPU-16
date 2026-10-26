@@ -84,26 +84,119 @@ previous +SC16IMG1+ format; disks containing v1 images must be rebuilt with
 validated as image metadata, but per-segment permission enforcement awaits the
 MMU implementation.
 
-Without an explicit program path, the runtime discovers real, ID-named
-directories under +disks/+ in stable ID order. The text-mode selector lists
-disk IDs, including disks with missing or invalid metadata. Metadata is
-validated only when a disk is selected for boot, so a broken disk cannot hide
-other boot choices. Boot and reboot reopen +disk.json+ and validate the image;
-metadata cached during discovery never authorizes execution.
+Without an explicit program path, the guest BIOS discovers ID-named folder
+directories under +disks/+ in stable order. It displays one candidate ID at a
+time; Up/Down changes the selection and Enter boots it. Escape exits.
++--disk ID+ preselects a boot disk without bypassing checks. Metadata is
+validated only when a disk is selected, so an invalid manifest cannot hide
+other boot choices. Invalid metadata, images, and +NOT_BOOT+ cases are logged
+to the Bug Monitor and leave the selector available for another choice. Reset
+restarts firmware and rescans the collection. The BIOS service loads the
+SC-16 image container directly, preserving its entry point, segment
+permissions, and alignment, and never compiles or assembles guest source.
+KERNEL maps to the CPU's +Supervisor+ privilege mode; USER maps to +User+.
 
-Use Up/Down and Enter, or click and double-click, to boot; the mouse wheel
-scrolls the list. +--disk ID+ preselects a boot disk without bypassing checks.
-Failures are logged to the Bug Monitor and remain on the selection screen.
-Reset rescans the collection. The runtime loads the SC-16 image container
-directly, preserving its entry point, segment permissions, and alignment, and
-never compiles or assembles guest source during BIOS selection. KERNEL maps to
-the CPU's +Supervisor+ privilege mode; USER maps to +User+.
+The common +bios.bin+ image is required and executes before disk selection.
+The guest BIOS renders through the character-cell display and uses the
+supervisor-only firmware service at +0x43400+ for disk discovery and image
+loading. This service is a firmware boundary, not a general syscall or
+authenticated boot mechanism. The guest folder-filesystem service is exposed
+through the separate register gateway below; it does not use the retired
+block-disk API. Explicit source or flat-binary launches retain their developer
+workflow and can mount a folder disk with +--disk ID+.
 
-This selector is currently host-implemented. Common +bios.bin+ firmware
-execution and the guest folder-filesystem API are separate roadmap items;
-booting a folder disk does not mount it through the legacy block-disk API.
-Explicit source or flat-binary launches retain their existing developer
-workflow and legacy data-disk option.
+== Guest BIOS disk service
+
+The service is invoked by writing a command byte to +0x43400+ while in
+Supervisor mode. All multi-byte values are big-endian.
+
+[cols="1,2,3"]
+|===
+|Command |Operation |Request and result
+
+|+1+
+|Count disks
+|Writes the default selection index to +0x43402+ and the candidate count to
+  +0x43404+. +--disk ID+ selects the initial index when it matches a
+  discovered ID; otherwise index zero is used and the missing ID is logged.
+
+|+2+
+|Read disk ID
+|The 16-bit candidate index is at +0x43402+. Output pointer and capacity are
+  at +0x43406+ and +0x4340a+. The selected ID is written as ASCII followed by
+  NUL.
+
+|+3+
+|Boot disk
+|The candidate index is at +0x43402+. The service validates the folder
+  manifest and boot image, loads the fixed +main.bin+ or +kernel.bin+ image,
+  mounts the selected folder, and transfers control in the corresponding
+  privilege mode.
+|===
+
+Status at +0x4340c+ is zero on success and one on failure. Failures are also
+logged to the Bug Monitor; a failed boot leaves the BIOS available to retry.
+
+== Guest folder-filesystem service
+
+Booting a folder disk mounts that disk for the guest. The current compatibility
+service is selected by writing one command to +0x43100+ while in USER mode.
+Path and buffer addresses are big-endian 32-bit values; paths are null
+terminated ASCII, at most 128 bytes, and use the normalized relative-path
+syntax above. Guest buffer ranges must fit in configured memory and must not
+overlap memory-mapped devices. Transfers are limited to 4096 bytes. Service
+failure sets status at +0x43110+ to 1 and writes the diagnostic to the Bug
+Monitor; success sets status to 0.
+
+[cols="1,2,3"]
+|===
+|Command |Operation |Request and result
+
+|+0x41+
+|List directory entry
+|+0x43116+ points to a directory path; an empty string selects the disk root.
+  The 16-bit entry index is at +0x4310a+. The output pointer and capacity are
+  at +0x4311a+ and +0x4311e+. An entry encodes name plus NUL, a type byte
+  (+1+ for directory, +0+ for file), and a 32-bit big-endian size. Result at
+  +0x4310e+ is the total entry count; an index past the end returns an empty
+  name.
+
+|+0x42+
+|Read file
+|Path pointer at +0x43116+, 32-bit file offset at +0x43112+, output pointer
+  at +0x4311a+, and requested length at +0x4311e+. Result is bytes read;
+  32-bit file size is returned at +0x43120+.
+
+|+0x43+
+|Replace file
+|Path and input buffer pointers at +0x43116+ and +0x4311a+; input length at
+  +0x4311e+. The operation replaces the whole file and returns bytes written.
+
+|+0x44+
+|Create directory
+|Path pointer at +0x43116+.
+
+|+0x45+
+|Delete file or empty directory
+|Path pointer at +0x43116+.
+
+|+0x46+
+|Rename file or directory
+|Source path pointer at +0x43116+; destination path pointer at +0x43112+.
+
+|+0x47+
+|Query entry metadata
+|Path pointer at +0x43116+; output pointer at +0x4311a+. Output is a type
+  byte (+1+ for directory, +0+ for file) followed by 32-bit big-endian size.
+|===
+
+The 16-bit result register is at +0x4310e+ and status is at +0x43110+.
+Guest mutations obey disk-wide read-only mode and manifest protected paths.
+Guest code cannot create, replace, remove, or rename the root boot filenames
++main.bin+ and +kernel.bin+. This narrow register gateway is not the finalized
+general syscall ABI and does not provide general MMIO or process isolation.
+Command +0x80+ remains as a read-only recursive file-list compatibility shim
+for +lib/disk.h+; legacy block commands are rejected.
 
 == Implementation status
 
@@ -116,8 +209,14 @@ rejects over-capacity disks at mount, and selects/validates the fixed-name boot
 image. Image parsing accepts only `SC16IMG2`, checks segment ranges, overlap,
 alignment, permissions, entry-point execution permission, reserved fields, and
 exact file length. `sc16build import-block-disk` exports legacy JSON blocks as
-regular files without modifying the source. `sc16build package-disk` builds one program into
-a new boot-disk folder with `main.bin` or `kernel.bin`. Guest/syscall
-integration, module asset migration, package validation for all applications,
-remain to be implemented and tested. Folder-disk BIOS discovery, selection,
-image validation, and launch-mode transfer are implemented in the runtime.
+regular files without modifying the source. `sc16build package-disk` builds
+one program into a new boot-disk folder with `main.bin` or `kernel.bin`.
+Guest integration includes a bounded user-mode register gateway for directory
+listing, reads, writes, directory creation, deletion, rename, and metadata.
+All 17 runnable applications and their local assets have validated folder
+packages. DiskEditor is a USER-mode folder-file editor, and guest block-level
+disk commands and the emulator's block device are removed. Original JSON
+images remain only as import inputs. Folder-disk BIOS discovery, selection,
+image validation, common firmware startup, and launch-mode transfer are
+implemented in the runtime; the final guest-resident BIOS and selector remain
+open architecture work.

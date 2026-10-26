@@ -6,6 +6,9 @@ emulator, compiler, build, and developer-tool workflows. There are no +.py+,
 repository. Runtime, compiler, tools, tests, and CI use Rust; unsupported C
 syntax or semantics produce a Rust diagnostic, with no compatibility-compiler
 fallback.
+The runtime requires the checked-in emulator-wide +bios.bin+ image. The
+supported application disks are prebuilt with the Rust build tool and contain
+their compiled images and local runtime assets.
 
 Migration completion does not imply full C90 conformance. The C compiler
 remains a partial C90 implementation; see link:c90_todo.adoc[+c90_todo.adoc+] and
@@ -27,4 +30,5 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo check --locked --target wasm32-unknown-unknown
 cargo run --locked --bin sc16build -- smoke-modules
+cargo run --locked --bin sc16build -- package-modules build\module-disks 67108864
 ----

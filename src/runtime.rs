@@ -1,4 +1,8 @@
 use crate::cpu::{Cpu, GpuLine, GpuSoundCommand, GpuTriangle, PrivilegeMode, VSYNC_ADDR};
+#[cfg(test)]
+use crate::cpu::{
+    GUEST_TEXT_BACKGROUND, GUEST_TEXT_CONTROL, GUEST_TEXT_DATA, GUEST_TEXT_FOREGROUND,
+};
 use crate::disk::{FolderBootMode, FolderDisk};
 use crate::image::{ImageError, load_program};
 use crate::net::DEFAULT_PORT;
@@ -43,8 +47,11 @@ const BIOS_TEXT_CELL_WIDTH: usize = 12;
 const BIOS_TEXT_CELL_HEIGHT: usize = 16;
 const BIOS_TEXT_LEFT: usize = (640 - BIOS_TEXT_COLUMNS * BIOS_TEXT_CELL_WIDTH) / 2;
 const BIOS_TEXT_TOP: usize = (480 - BIOS_TEXT_ROWS * BIOS_TEXT_CELL_HEIGHT) / 2;
+#[cfg(test)]
 const BIOS_MODULE_ROW_TOP: usize = BIOS_TEXT_TOP + 6 * BIOS_TEXT_CELL_HEIGHT;
+#[cfg(test)]
 const BIOS_MODULE_ROW_HEIGHT: usize = BIOS_TEXT_CELL_HEIGHT;
+#[cfg(test)]
 const BIOS_VISIBLE_MODULES: usize = 12;
 const BIOS_PHOSPHOR: u32 = 0xff75ff9a;
 const BIOS_PHOSPHOR_BRIGHT: u32 = 0xffc8ffd5;
@@ -301,12 +308,14 @@ impl Canvas {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct BootDisk {
     name: String,
     path: PathBuf,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum BiosMouseAction {
     SelectDisk(usize),
@@ -452,7 +461,6 @@ fn console_runtime_control(key: NativeKey, paused: bool) -> Option<RuntimeContro
 #[derive(Clone)]
 struct BootTarget {
     source: PathBuf,
-    disk_id: Option<String>,
     folder_disk: bool,
 }
 
@@ -488,7 +496,20 @@ pub async fn run_with_devices(
     let mut pixels = vec![0u32; 640 * 480];
     let mut canvas = Canvas::new();
     let mut audio = AudioEngine::new();
-    let mut cpu = fresh_runtime_cpu(root, program, program.and(disk_id), network_port, None)?;
+    let mut cpu = match fresh_runtime_cpu(root, program, disk_id, network_port, None) {
+        Ok(cpu) => cpu,
+        Err(error) => {
+            show_bios_startup_error(
+                &error.to_string(),
+                &font,
+                &mut pixels,
+                &mut canvas,
+                fullscreen,
+            )
+            .await;
+            return Ok(());
+        }
+    };
     cpu.console.log_info("emulator", "BIOS started");
     let mut paused = false;
     let mut console_visible = false;
@@ -497,26 +518,12 @@ pub async fn run_with_devices(
     let mut target = if let Some(source) = program {
         let target = BootTarget {
             source: source.to_path_buf(),
-            disk_id: disk_id.map(str::to_owned),
             folder_disk: false,
         };
         boot_target(&mut cpu, &target)?;
         Some(target)
     } else {
-        let Some(target) = select_boot_disk(
-            root,
-            &mut cpu,
-            &font,
-            &mut pixels,
-            &mut canvas,
-            &mut fullscreen,
-            disk_id,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        Some(target)
+        None
     };
 
     let mut old_keys = HashSet::new();
@@ -633,71 +640,68 @@ pub async fn run_with_devices(
             audio.stop_all();
             let previous_console = cpu.console.clone();
             if action == RuntimeControl::ResetRequested {
+                target = None;
                 console_window = None;
                 console_visible = false;
-                cpu = fresh_runtime_cpu(
+                cpu = match fresh_runtime_cpu(
                     root,
                     program,
-                    program.and(disk_id),
+                    disk_id,
                     network_port,
                     Some(&previous_console),
-                )?;
+                ) {
+                    Ok(cpu) => cpu,
+                    Err(error) => {
+                        show_bios_startup_error(
+                            &error.to_string(),
+                            &font,
+                            &mut pixels,
+                            &mut canvas,
+                            fullscreen,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                };
 
-                let Some(new_target) = (if let Some(source) = program {
-                    let target = BootTarget {
+                if let Some(source) = program {
+                    let reset_target = BootTarget {
                         source: source.to_path_buf(),
-                        disk_id: disk_id.map(str::to_owned),
                         folder_disk: false,
                     };
-                    boot_target(&mut cpu, &target)?;
-                    Some(target)
-                } else {
-                    select_boot_disk(
-                        root,
-                        &mut cpu,
-                        &font,
-                        &mut pixels,
-                        &mut canvas,
-                        &mut fullscreen,
-                        disk_id,
-                    )
-                    .await?
-                }) else {
-                    return Ok(());
-                };
-                target = Some(new_target);
+                    boot_target(&mut cpu, &reset_target)?;
+                    target = Some(reset_target);
+                }
             } else {
-                let Some(active_target) = target.as_ref() else {
-                    return Ok(());
-                };
-                cpu = fresh_runtime_cpu(
+                let restart_target = target.clone();
+                cpu = match fresh_runtime_cpu(
                     root,
-                    (!active_target.folder_disk).then_some(active_target.source.as_path()),
-                    active_target.disk_id.as_deref(),
+                    program,
+                    disk_id,
                     network_port,
                     Some(&previous_console),
-                )?;
-                let result = boot_target(
-                    &mut cpu,
-                    target.as_ref().expect("active program target exists"),
-                );
-                if let Err(error) = result {
-                    if !active_target.folder_disk {
-                        return Err(error);
-                    }
-                    let Some(new_target) = select_boot_disk(
-                        root,
-                        &mut cpu,
-                        &font,
-                        &mut pixels,
-                        &mut canvas,
-                        &mut fullscreen,
-                        disk_id,
-                    )
-                    .await?
-                    else {
+                ) {
+                    Ok(cpu) => cpu,
+                    Err(error) => {
+                        show_bios_startup_error(
+                            &error.to_string(),
+                            &font,
+                            &mut pixels,
+                            &mut canvas,
+                            fullscreen,
+                        )
+                        .await;
                         return Ok(());
+                    }
+                };
+                if let Some(restart_target) = restart_target {
+                    boot_target(&mut cpu, &restart_target)?;
+                } else if let Some(source) = program {
+                    let new_target = BootTarget {
+                        source: source.to_path_buf(),
+                        folder_disk: false,
                     };
+                    boot_target(&mut cpu, &new_target)?;
                     target = Some(new_target);
                 }
             }
@@ -780,6 +784,12 @@ pub async fn run_with_devices(
                     };
                 }
                 run_instruction_slice(&mut cpu, &mut cpu_budget_remaining)?;
+                if let Some(path) = cpu.take_booted_disk_path() {
+                    target = Some(BootTarget {
+                        source: path,
+                        folder_disk: true,
+                    });
+                }
                 if cpu_budget_remaining == 0 || cpu.frame_yield || !cpu.running {
                     cpu_budget_remaining = 0;
                     cpu_frame_started = false;
@@ -794,7 +804,7 @@ pub async fn run_with_devices(
             }
         }
         if should_capture_display_frame(cpu.memory[VSYNC_ADDR] != 0, cpu.frame_presented) {
-            render_cpu(&cpu, &mut pixels);
+            render_cpu(&cpu, &mut pixels, &font);
             presented_size = screen_size(&cpu);
             presented_triangles.clone_from(&cpu.gpu_triangles);
             presented_lines.clone_from(&cpu.gpu_lines);
@@ -879,6 +889,7 @@ pub fn run_headless_with_devices(
     }
     Ok(executed)
 }
+#[cfg(test)]
 fn discover_boot_disks(root: &Path) -> Result<Vec<BootDisk>, RuntimeError> {
     FolderDisk::discover_paths(root)
         .map_err(RuntimeError::Window)?
@@ -894,166 +905,48 @@ fn discover_boot_disks(root: &Path) -> Result<Vec<BootDisk>, RuntimeError> {
         .collect()
 }
 
-async fn select_boot_disk(
-    root: &Path,
-    cpu: &mut Cpu,
+async fn show_bios_startup_error(
+    error: &str,
     font: &[[u8; 8]],
     pixels: &mut [u32],
     canvas: &mut Canvas,
-    fullscreen: &mut bool,
-    disk_id: Option<&str>,
-) -> Result<Option<BootTarget>, RuntimeError> {
-    'restart: loop {
-        let mut message = None;
-        let disks = match discover_boot_disks(&root.join("disks")) {
-            Ok(disks) => disks,
-            Err(error) => {
-                cpu.console.log_error("bios", &error.to_string());
-                message = Some(error.to_string());
-                Vec::new()
-            }
-        };
-        let mut selected = 0;
-        if let Some(id) = disk_id {
-            if let Some(index) = disks.iter().position(|disk| disk.name == id) {
-                selected = index;
-            } else {
-                let error = format!("disk {id} not found");
-                cpu.console.log_error("bios", &error);
-                message = Some(error);
-            }
-        }
-        let mut offset = bios_scroll_offset(selected, 0, disks.len());
-        let mut last_click = None;
-        let mut paused = false;
-        let mut console_visible = false;
-        let mut console_window: Option<ConsoleWindow> = None;
-        loop {
-            draw_bios_selector(pixels, font, &disks, (selected, offset), message.as_deref());
-            canvas
-                .present(
-                    pixels,
-                    (640, 480),
-                    &[],
-                    &[],
-                    &cpu.palette,
-                    (!*fullscreen).then_some(ToolbarState { paused }),
-                )
-                .await;
-            let toolbar_height = if *fullscreen { 0.0 } else { TOOLBAR_HEIGHT };
-            let keys = get_keys_down();
-            let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
-            let controlled =
-                keys.contains(&KeyCode::LeftControl) || keys.contains(&KeyCode::RightControl);
-            let mut action = None;
-            for key in get_keys_pressed() {
-                if let Some(control) = apply_runtime_control(
-                    key,
-                    &mut paused,
-                    fullscreen,
-                    &mut console_visible,
-                    shifted,
-                    controlled,
-                ) {
-                    action = Some(control);
-                }
-            }
-            if !*fullscreen && is_mouse_button_pressed(MouseButton::Left) {
-                action = toolbar_control(mouse_position(), paused, console_visible).or(action);
-            }
-            if let Some(window) = console_window.as_mut() {
-                action = window
-                    .runtime_control_pressed(paused, console_visible)
-                    .or(action);
-            }
-            let mut launch = false;
-            match action {
-                Some(RuntimeControl::FullscreenToggled(value)) => set_fullscreen(value),
-                Some(RuntimeControl::PauseToggled(value)) => paused = value,
-                Some(RuntimeControl::ConsoleToggled(value)) => console_visible = value,
-                Some(RuntimeControl::ResetRequested) => {
-                    continue 'restart;
-                }
-                Some(RuntimeControl::RebootRequested) => launch = true,
-                None => {}
-            }
-            if *fullscreen {
-                console_visible = false;
-            }
-            if console_visible && console_window.is_none() {
-                console_window = Some(ConsoleWindow::new()?);
-            } else if !console_visible {
-                console_window = None;
-            }
-            if let Some(window) = console_window.as_mut() {
-                if window.is_open() {
-                    window.present(&cpu.console.text_snapshot(), font, paused)?;
-                } else {
-                    console_window = None;
-                    console_visible = false;
-                }
-            }
-            if paused {
-                continue;
-            }
-            if is_key_pressed(KeyCode::Escape) {
-                return Ok(None);
-            }
-            let direction = if is_key_pressed(KeyCode::Up) {
-                -1
-            } else if is_key_pressed(KeyCode::Down) {
-                1
-            } else {
-                0
-            };
-            if direction != 0 {
-                selected = bios_move_selection(selected, direction, disks.len());
-                offset = bios_scroll_offset(selected, offset, disks.len());
-                message = None;
-                last_click = None;
-            }
-            let wheel = mouse_wheel().1;
-            if wheel != 0.0 {
-                (selected, offset) = bios_scroll_modules(
-                    selected,
-                    offset,
-                    -(wheel.signum() as isize) * 3,
-                    disks.len(),
-                );
-                message = None;
-                last_click = None;
-            }
-            if is_mouse_button_pressed(MouseButton::Left)
-                && let Some(BiosMouseAction::SelectDisk(index)) = bios_mouse_action(
-                    (mouse_position().0, mouse_position().1 - toolbar_height),
-                    (screen_width(), screen_height() - toolbar_height),
-                    disks.len(),
-                    offset,
-                )
-            {
-                selected = index;
-                launch = bios_register_module_click(&mut last_click, index, Instant::now());
-                message = None;
-            }
-            launch |= is_key_pressed(KeyCode::Enter);
-            if launch && let Some(disk) = disks.get(selected) {
-                let target = BootTarget {
-                    source: disk.path.clone(),
-                    disk_id: None,
-                    folder_disk: true,
-                };
-                match boot_target(cpu, &target) {
-                    Ok(()) => return Ok(Some(target)),
-                    Err(error) => {
-                        message = Some(error.to_string());
-                        last_click = None;
-                    }
-                }
-            }
+    fullscreen: bool,
+) {
+    loop {
+        draw_bios_error(pixels, font, error);
+        canvas
+            .present(
+                pixels,
+                (640, 480),
+                &[],
+                &[],
+                &[[0; 3]; 256],
+                (!fullscreen).then_some(ToolbarState { paused: false }),
+            )
+            .await;
+        if is_key_pressed(KeyCode::Escape) {
+            return;
         }
     }
 }
 
+fn draw_bios_error(pixels: &mut [u32], font: &[[u8; 8]], error: &str) {
+    pixels.fill(0);
+    draw_bios_text(pixels, font, 1, 2, "SUOMICPU-16 BIOS", BIOS_PHOSPHOR_BRIGHT);
+    draw_bios_text(pixels, font, 4, 2, "FIRMWARE STARTUP ERROR", BIOS_PHOSPHOR);
+    draw_bios_text(pixels, font, 6, 2, error, BIOS_PHOSPHOR_BRIGHT);
+    draw_bios_text(
+        pixels,
+        font,
+        20,
+        2,
+        "RESTART AFTER CORRECTING THE BIOS IMAGE",
+        BIOS_PHOSPHOR,
+    );
+    draw_bios_text(pixels, font, 21, 2, "PRESS ESCAPE TO EXIT", BIOS_PHOSPHOR);
+}
+
+#[cfg(test)]
 fn draw_bios_selector(
     pixels: &mut [u32],
     font: &[[u8; 8]],
@@ -1155,6 +1048,7 @@ fn draw_bios_selector(
     }
 }
 
+#[cfg(test)]
 fn bios_scroll_offset(selected: usize, current_offset: usize, module_count: usize) -> usize {
     let max_offset = module_count.saturating_sub(BIOS_VISIBLE_MODULES);
     let offset = current_offset.min(max_offset);
@@ -1167,6 +1061,7 @@ fn bios_scroll_offset(selected: usize, current_offset: usize, module_count: usiz
     }
 }
 
+#[cfg(test)]
 fn bios_scroll_modules(
     selected: usize,
     current_offset: usize,
@@ -1195,6 +1090,7 @@ fn bios_scroll_modules(
     (selected, offset)
 }
 
+#[cfg(test)]
 fn bios_move_selection(selected: usize, direction: isize, module_count: usize) -> usize {
     if module_count == 0 {
         return 0;
@@ -1206,6 +1102,7 @@ fn bios_move_selection(selected: usize, direction: isize, module_count: usize) -
     }
 }
 
+#[cfg(test)]
 fn bios_register_module_click(
     last_clicked_module: &mut Option<(usize, Instant)>,
     module_index: usize,
@@ -1223,6 +1120,7 @@ fn bios_register_module_click(
     is_double_click
 }
 
+#[cfg(test)]
 fn screen_to_logical(
     position: (f32, f32),
     screen_size: (f32, f32),
@@ -1284,6 +1182,7 @@ fn screen_to_logical_clamped_with_toolbar(
     Some((logical_x as usize, logical_y as usize))
 }
 
+#[cfg(test)]
 fn bios_mouse_action(
     position: (f32, f32),
     screen_size: (f32, f32),
@@ -1343,24 +1242,32 @@ fn fresh_runtime_cpu(
         cpu.configure_disk(root.join("disks"), root.join("disks"))
             .map_err(RuntimeError::Window)?;
     }
-    if let Some(disk_id) = disk_id {
+    if let Some(disk_id) = disk_id.filter(|_| source.is_some()) {
         cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
+    } else if source.is_none() {
+        cpu.set_bios_preselected_disk(disk_id);
     }
     if let Some(previous_console) = previous_console {
         cpu.console = previous_console.clone();
         cpu.console.reset(true);
     }
     let bios_path = root.join("bios.bin");
-    if bios_path.try_exists()? {
-        let image = crate::image::load_binary(&bios_path)?;
-        cpu.load_program(&image.segments, image.entry_point)
-            .map_err(|error| RuntimeError::Window(error.to_string()))?;
-        cpu.console
-            .log_info("emulator", "BIOS loaded from bios.bin");
-    } else {
-        cpu.console
-            .log_warning("emulator", "bios.bin not found; using host BIOS selector");
+    if !bios_path.try_exists()? {
+        return Err(RuntimeError::Window(format!(
+            "required common BIOS is missing: {}",
+            bios_path.display()
+        )));
     }
+    let image = crate::image::read_image(&bios_path)?;
+    if image.entry_point != 0 {
+        return Err(RuntimeError::Window(
+            "common BIOS entry point must be address 0".to_owned(),
+        ));
+    }
+    cpu.prepare_image_entry();
+    cpu.load_program(&image.segments, image.entry_point)
+        .map_err(|error| RuntimeError::Window(format!("invalid common BIOS: {error}")))?;
+    cpu.console.log_info("emulator", "common BIOS loaded");
     Ok(cpu)
 }
 
@@ -1378,6 +1285,10 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
                 cpu.console.log_error("bios", &error.to_string());
                 RuntimeError::Window(error.to_string())
             })?;
+        cpu.mount_folder_disk(&target.source).map_err(|error| {
+            cpu.console.log_error("bios", &error);
+            RuntimeError::Window(error)
+        })?;
         cpu.privilege_mode = match boot.mode {
             FolderBootMode::Kernel => PrivilegeMode::Supervisor,
             FolderBootMode::User => PrivilegeMode::User,
@@ -1468,6 +1379,10 @@ fn key_masks() -> [(KeyCode, u32); 25] {
 
 fn key_to_ascii(key: KeyCode, shifted: bool) -> Option<u8> {
     let byte = match key {
+        KeyCode::Up => 0x80,
+        KeyCode::Down => 0x81,
+        KeyCode::Left => 0x82,
+        KeyCode::Right => 0x83,
         KeyCode::A => b'a',
         KeyCode::B => b'b',
         KeyCode::C => b'c',
@@ -1867,7 +1782,7 @@ fn screen_size(cpu: &Cpu) -> (usize, usize) {
     }
 }
 
-fn render_cpu(cpu: &Cpu, pixels: &mut [u32]) {
+fn render_cpu(cpu: &Cpu, pixels: &mut [u32], font: &[[u8; 8]]) {
     let (width, height) = screen_size(cpu);
     let framebuffer = cpu.composited_framebuffer();
     for y in 0..height {
@@ -1876,6 +1791,63 @@ fn render_cpu(cpu: &Cpu, pixels: &mut [u32]) {
             let [red, green, blue] = cpu.palette_color(color);
             pixels[y * width + x] = rgb(red, green, blue);
         }
+    }
+    if cpu.guest_text.enabled {
+        draw_guest_text(
+            pixels,
+            width,
+            height,
+            &cpu.guest_text.cells,
+            &cpu.palette,
+            font,
+        );
+    }
+}
+
+fn draw_guest_text(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cells: &[crate::guest_text::GuestTextCell],
+    palette: &[[u8; 3]; 256],
+    font: &[[u8; 8]],
+) {
+    let scale = if width >= 640 { 2 } else { 1 };
+    let cell_width = 6 * scale;
+    let cell_height = 8 * scale;
+    let left = width.saturating_sub(crate::guest_text::GUEST_TEXT_COLUMNS * cell_width) / 2;
+    let top = height.saturating_sub(crate::guest_text::GUEST_TEXT_ROWS * cell_height) / 2;
+
+    for (index, cell) in cells.iter().enumerate() {
+        let row = index / crate::guest_text::GUEST_TEXT_COLUMNS;
+        let column = index % crate::guest_text::GUEST_TEXT_COLUMNS;
+        let x = left + column * cell_width;
+        let y = top + row * cell_height;
+        let [red, green, blue] = palette[cell.background as usize];
+        let background = rgb(red, green, blue);
+        for pixel_y in y..y + cell_height {
+            for pixel_x in x..x + cell_width {
+                if let Some(pixel) = pixels.get_mut(pixel_y * width + pixel_x) {
+                    *pixel = background;
+                }
+            }
+        }
+
+        let character = if (32..=126).contains(&cell.character) {
+            cell.character
+        } else {
+            b'?'
+        };
+        let [red, green, blue] = palette[cell.foreground as usize];
+        draw_glyph_scaled(
+            pixels,
+            width,
+            (x + scale / 2, y + scale / 2),
+            character,
+            rgb(red, green, blue),
+            font,
+            scale,
+        );
     }
 }
 
@@ -1970,23 +1942,42 @@ fn draw_text_scaled(
     scale: usize,
 ) {
     for (character_index, byte) in text.bytes().enumerate() {
-        let glyph_index = byte.saturating_sub(32) as usize;
-        let Some(glyph) = font.get(glyph_index) else {
-            continue;
-        };
-        let glyph_x = x + character_index * 6 * scale;
-        for (row, bits) in glyph.iter().copied().enumerate().take(7) {
-            for column in 0..5 {
-                if bits & (0x80 >> column) != 0 {
-                    for scale_y in 0..scale {
-                        for scale_x in 0..scale {
-                            let pixel_x = glyph_x + column * scale + scale_x;
-                            let pixel_y = y + row * scale + scale_y;
-                            if pixel_x < width
-                                && let Some(pixel) = pixels.get_mut(pixel_y * width + pixel_x)
-                            {
-                                *pixel = color;
-                            }
+        draw_glyph_scaled(
+            pixels,
+            width,
+            (x + character_index * 6 * scale, y),
+            byte,
+            color,
+            font,
+            scale,
+        );
+    }
+}
+
+fn draw_glyph_scaled(
+    pixels: &mut [u32],
+    width: usize,
+    (x, y): (usize, usize),
+    byte: u8,
+    color: u32,
+    font: &[[u8; 8]],
+    scale: usize,
+) {
+    let glyph_index = byte.saturating_sub(32) as usize;
+    let Some(glyph) = font.get(glyph_index) else {
+        return;
+    };
+    for (row, bits) in glyph.iter().copied().enumerate().take(7) {
+        for column in 0..5 {
+            if bits & (0x80 >> column) != 0 {
+                for scale_y in 0..scale {
+                    for scale_x in 0..scale {
+                        let pixel_x = x + column * scale + scale_x;
+                        let pixel_y = y + row * scale + scale_y;
+                        if pixel_x < width
+                            && let Some(pixel) = pixels.get_mut(pixel_y * width + pixel_x)
+                        {
+                            *pixel = color;
                         }
                     }
                 }
@@ -2164,7 +2155,6 @@ mod tests {
             fs::write(disk.join("main.c"), "not valid C").unwrap();
             let target = BootTarget {
                 source: disk.clone(),
-                disk_id: None,
                 folder_disk: true,
             };
             let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
@@ -2201,36 +2191,143 @@ mod tests {
     fn bios_cold_reset_preloads_common_firmware_and_clears_the_previous_guest() {
         let disk = boot_test_disk("cold-reset");
         let root = disk.parent().unwrap();
-        let firmware = crate::assembler::assemble("HALT", 0).unwrap();
-        fs::write(root.join("bios.bin"), &firmware.segments[0].data).unwrap();
-        let image = crate::assembler::assemble("LDI R0, 42\nHALT", 0x100).unwrap();
-        crate::image::write_image(&disk.join("main.bin"), &image).unwrap();
-        let target = BootTarget {
-            source: disk.clone(),
-            disk_id: None,
-            folder_disk: true,
-        };
+        fs::create_dir(root.join("disks")).unwrap();
+        let packaged_disk = root.join("disks").join("DISK0001");
+        fs::rename(&disk, &packaged_disk).unwrap();
+        let second_disk = root.join("disks").join("DISK0002");
+        fs::create_dir(&second_disk).unwrap();
+        fs::write(
+            second_disk.join("disk.json"),
+            r#"{"version":1,"id":"DISK0002","label":"Second","capacity_bytes":65536,"read_only":true}"#,
+        )
+        .unwrap();
+        let firmware = crate::assembler::assemble(include_str!("../bios.asm"), 0).unwrap();
+        crate::image::write_image(root.join("bios.bin").as_path(), &firmware).unwrap();
+        let first_image = crate::assembler::assemble("LDI R0, 42\nHALT", 0x100).unwrap();
+        crate::image::write_image(&packaged_disk.join("main.bin"), &first_image).unwrap();
+        let second_image = crate::assembler::assemble("LDI R0, 84\nHALT", 0x100).unwrap();
+        crate::image::write_image(&second_disk.join("main.bin"), &second_image).unwrap();
+        assert_eq!(
+            FolderDisk::discover_paths(&root.join("disks"))
+                .unwrap()
+                .len(),
+            2
+        );
         let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
-        assert_eq!(cpu.pc, 0);
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
-        assert_eq!(&cpu.memory[..2], firmware.segments[0].data.as_slice());
-        boot_target(&mut cpu, &target).unwrap();
-        cpu.run(10).unwrap();
-        assert_eq!(cpu.registers[0], 42);
+        assert!(cpu.running);
+        assert_eq!(cpu.pc, 0);
+        assert_eq!(cpu.memory[0x43000], 0);
+        assert_eq!(
+            &cpu.memory[..firmware.segments[0].data.len()],
+            firmware.segments[0].data.as_slice()
+        );
+        cpu.run(1000).unwrap();
+        assert!(cpu.guest_text.enabled);
+        let text = cpu
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| char::from(cell.character))
+            .collect::<String>();
+        assert!(
+            text.contains("DISK0001"),
+            "{text:?} pc={:#x} regs={:?} key={} id={:?} registers={:?} console={:?}",
+            cpu.pc,
+            cpu.registers,
+            cpu.memory[0x43000],
+            &cpu.memory[0x5000..0x5009],
+            &cpu.memory[0x43402..0x4340c],
+            cpu.console.text_snapshot()
+        );
+        cpu.signal_keyboard_event(0x81);
+        cpu.run(1000).unwrap();
+        let text = cpu
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| char::from(cell.character))
+            .collect::<String>();
+        assert!(text.contains("DISK0002"), "{text:?}");
+        cpu.signal_keyboard_event(13);
+        cpu.run(1000).unwrap();
+        assert_eq!(
+            cpu.registers[0],
+            84,
+            "pc={:#x} mode={:?} running={} status={} text={:?}",
+            cpu.pc,
+            cpu.privilege_mode,
+            cpu.running,
+            cpu.memory[0x4340c],
+            cpu.console.text_snapshot()
+        );
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert!(!cpu.guest_text.enabled);
+        cpu.write(0x43400, 1);
+        assert_eq!(cpu.memory[0x4340c], 1);
         let console = cpu.console.clone();
         drop(cpu);
-        let mut reset = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, Some(&console)).unwrap();
+        let mut reset =
+            fresh_runtime_cpu(root, None, Some("DISK0002"), DEFAULT_PORT, Some(&console)).unwrap();
         assert_eq!(reset.pc, 0);
         assert_eq!(reset.privilege_mode, PrivilegeMode::Supervisor);
+        assert!(reset.running);
         assert_eq!(reset.registers, [0; 8]);
-        assert_eq!(&reset.memory[0x100..0x104], &[0; 4]);
-        assert_eq!(&reset.memory[..2], firmware.segments[0].data.as_slice());
-        boot_target(&mut reset, &target).unwrap();
+        assert_eq!(
+            &reset.memory[..firmware.segments[0].data.len()],
+            firmware.segments[0].data.as_slice()
+        );
+        reset.run(1000).unwrap();
+        let text = reset
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| char::from(cell.character))
+            .collect::<String>();
+        assert!(text.contains("DISK0002"), "{text:?}");
+        reset.signal_keyboard_event(13);
+        reset.run(1000).unwrap();
         assert_eq!(reset.privilege_mode, PrivilegeMode::User);
-        reset.run(10).unwrap();
-        assert_eq!(reset.registers[0], 42);
+        assert_eq!(reset.registers[0], 84);
         drop(reset);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bios_startup_rejects_missing_or_invalid_common_firmware() {
+        let disk = boot_test_disk("missing-bios");
+        let root = disk.parent().unwrap();
+        let missing = match fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("startup unexpectedly accepted missing firmware"),
+        };
+        assert!(missing.contains("required common BIOS is missing"));
+        fs::write(root.join("bios.bin"), b"invalid firmware").unwrap();
+        let invalid = match fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("startup unexpectedly accepted invalid firmware"),
+        };
+        assert!(invalid.contains("invalid SC-16 image"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packaged_modules_boot_through_the_runtime_and_execute_guest_code() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for index in 1..=17 {
+            let source = root.join("disks").join(format!("APP{index:05}"));
+            let target = BootTarget {
+                source,
+                folder_disk: true,
+            };
+            let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+            boot_target(&mut cpu, &target).unwrap();
+            assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+            assert!(
+                cpu.run(1000).unwrap() > 0,
+                "no guest code ran for APP{index:05}"
+            );
+        }
     }
 
     #[test]
@@ -2238,7 +2335,6 @@ mod tests {
         let disk = boot_test_disk("not-boot");
         let target = BootTarget {
             source: disk.clone(),
-            disk_id: None,
             folder_disk: true,
         };
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
@@ -2268,7 +2364,6 @@ mod tests {
         let disk = boot_test_disk("validation");
         let target = BootTarget {
             source: disk.clone(),
-            disk_id: None,
             folder_disk: true,
         };
         let disks = discover_boot_disks(disk.parent().unwrap()).unwrap();
@@ -2338,6 +2433,8 @@ mod tests {
             assert_eq!(key_to_ascii(key, false), Some(unshifted));
             assert_eq!(key_to_ascii(key, true), Some(shifted));
         }
+        assert_eq!(key_to_ascii(KeyCode::Up, false), Some(0x80));
+        assert_eq!(key_to_ascii(KeyCode::Down, false), Some(0x81));
         assert_eq!(key_to_ascii(KeyCode::Space, true), Some(b' '));
         assert_eq!(key_to_ascii(KeyCode::F10, false), None);
     }
@@ -2549,7 +2646,7 @@ mod tests {
         cpu.palette[25] = [0, 0, 255];
         let mut pixels = vec![0; 640 * 480];
 
-        render_cpu(&cpu, &mut pixels);
+        render_cpu(&cpu, &mut pixels, &load_font());
         assert_eq!(pixels[0], 0x00ff_ffff);
         assert_eq!(pixels[1], 0x0000_00ff);
         assert_eq!(pixels.len(), 640 * 480);
@@ -2557,7 +2654,7 @@ mod tests {
         cpu.memory[GFX_MODE_ADDR] = 1;
         cpu.memory[0x50000] = 0x12;
         let mut high_resolution_pixels = vec![0; 640 * 480];
-        render_cpu(&cpu, &mut high_resolution_pixels);
+        render_cpu(&cpu, &mut high_resolution_pixels, &load_font());
         assert_eq!(high_resolution_pixels[0], 0x00ff_ffff);
         assert_eq!(high_resolution_pixels[1], 0x0000_00ff);
         assert_eq!(screen_size(&cpu), (640, 480));
@@ -2589,13 +2686,51 @@ mod tests {
         cpu.write(0x43020, 2);
 
         let mut pixels = vec![0; 640 * 480];
-        render_cpu(&cpu, &mut pixels);
+        render_cpu(&cpu, &mut pixels, &load_font());
         assert_eq!(pixels[0], rgb(12, 34, 56));
         assert_eq!(pixels[1], rgb(78, 90, 123));
 
         cpu.write(0x43031, 1);
-        render_cpu(&cpu, &mut pixels);
+        render_cpu(&cpu, &mut pixels, &load_font());
         assert_eq!(pixels[1], rgb(12, 34, 56));
+    }
+
+    #[test]
+    fn guest_text_overlays_graphics_at_both_display_resolutions() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GFX_MODE_ADDR as u32, 1);
+        cpu.memory[0x50000] = 0x10;
+        cpu.palette[1] = [0, 255, 0];
+        cpu.palette[2] = [0, 0, 255];
+        cpu.palette[3] = [255, 0, 0];
+        cpu.write(GUEST_TEXT_FOREGROUND, 3);
+        cpu.write(GUEST_TEXT_BACKGROUND, 2);
+        cpu.write(GUEST_TEXT_DATA, b'A');
+        cpu.write(GUEST_TEXT_CONTROL, 2);
+
+        let font = load_font();
+        let mut high_resolution_pixels = vec![0; 640 * 480];
+        render_cpu(&cpu, &mut high_resolution_pixels, &font);
+        assert_eq!(high_resolution_pixels[0], rgb(0, 255, 0));
+        assert_eq!(
+            high_resolution_pixels[BIOS_TEXT_TOP * 640 + BIOS_TEXT_LEFT],
+            rgb(0, 0, 255)
+        );
+        assert!(
+            high_resolution_pixels
+                [BIOS_TEXT_TOP * 640 + BIOS_TEXT_LEFT..(BIOS_TEXT_TOP + 16) * 640]
+                .contains(&rgb(255, 0, 0))
+        );
+
+        cpu.write(GFX_MODE_ADDR as u32, 0);
+        cpu.memory[0x50000] = 1;
+        let mut low_resolution_pixels = vec![0; 640 * 480];
+        render_cpu(&cpu, &mut low_resolution_pixels, &font);
+        let x = (320 - crate::guest_text::GUEST_TEXT_COLUMNS * 6) / 2;
+        let y = (240 - crate::guest_text::GUEST_TEXT_ROWS * 8) / 2;
+        assert_eq!(low_resolution_pixels[0], rgb(0, 255, 0));
+        assert_eq!(low_resolution_pixels[y * 320 + x], rgb(0, 0, 255));
+        assert!(low_resolution_pixels[y * 320 + x..(y + 8) * 320].contains(&rgb(255, 0, 0)));
     }
 
     #[test]
@@ -2960,7 +3095,6 @@ mod tests {
         let source = root.join("modules").join("Elite").join("elitedemo.c");
         let target = BootTarget {
             source: source.clone(),
-            disk_id: None,
             folder_disk: false,
         };
         let mut cpu = fresh_runtime_cpu(root, Some(&source), None, DEFAULT_PORT, None).unwrap();
@@ -3002,16 +3136,19 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir_all(temp.join("disks")).unwrap();
-        fs::copy(
-            root.join("disks").join("DISK0001.json"),
-            temp.join("disks").join("DISK0001.json"),
+        let disk = temp.join("disks").join("TEST0001");
+        fs::create_dir_all(&disk).unwrap();
+        fs::write(
+            disk.join("disk.json"),
+            r#"{"version":1,"id":"TEST0001","label":"Disk Editor Test","capacity_bytes":4096,"read_only":false,"protected_files":[]}"#,
         )
-        .expect("existing virtual disk should be copied into test storage");
+        .unwrap();
+        fs::write(disk.join("notes.txt"), b"test").unwrap();
         let mut cpu = Cpu::new();
         cpu.configure_disk(temp.join("disks"), source.parent().unwrap().join("disks"))
             .expect("DiskEditor disk paths should configure");
-        assert_eq!(cpu.available_disks().unwrap(), ["DISK0001"]);
+        assert_eq!(cpu.available_disks().unwrap(), ["TEST0001"]);
+        cpu.mount_data_disk("TEST0001").unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .expect("DiskEditor should load");
         cpu.begin_frame();
@@ -3023,29 +3160,19 @@ mod tests {
         }
         let presents_frame = cpu.frame_yield;
         let remains_running = cpu.running;
-        let listed_disk = &cpu.memory[0x40200..0x40208];
+        let listed_file = &cpu.memory[0x40200..0x4020a];
         fs::remove_dir_all(&temp).unwrap();
-
         assert!(remains_running, "DiskEditor halted during startup");
         assert!(presents_frame, "DiskEditor did not present its first frame");
-        assert_eq!(
-            &cpu.memory[0x4310e..0x43110],
-            &[0, 1],
-            "Disk directory command should report one disk"
-        );
-        assert_eq!(
-            listed_disk, b"DISK0001",
-            "DiskEditor should receive existing disk IDs in its directory buffer"
-        );
+        assert_eq!(listed_file, b"notes.txt\0");
     }
 
     #[test]
-    fn c_guest_can_issue_disk_directory_command() {
-        let source = "unsigned char *dk = 0x43100; unsigned int *dw = 0x43100; int main(void) { dw[5] = 0; dw[6] = 0x200; dk[0] = 0x10; return 0; }";
+    fn c_guest_can_list_mounted_folder_filesystem() {
+        let source = "unsigned char *r = 0x43100; char *path = 0x1000; int main(void) { path[0] = 0; r[10] = 0; r[11] = 0; r[22] = 0; r[23] = 0; r[24] = 0x10; r[25] = 0; r[26] = 0; r[27] = 0; r[28] = 0x20; r[29] = 0; r[30] = 0; r[31] = 128; r[0] = 0x41; return 0; }";
         let image = crate::c_compiler::compile_minimal_program(source, "disk-list-test.c")
             .unwrap()
             .expect("disk-list test should compile");
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let temp = std::env::temp_dir().join(format!(
             "sc16-disk-list-{}-{}",
             std::process::id(),
@@ -3054,21 +3181,22 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir_all(temp.join("disks")).unwrap();
-        fs::copy(
-            root.join("disks").join("DISK0001.json"),
-            temp.join("disks").join("DISK0001.json"),
+        let disk = temp.join("TEST0001");
+        fs::create_dir_all(&disk).unwrap();
+        fs::write(
+            disk.join("disk.json"),
+            r#"{"version":1,"id":"TEST0001","label":"Listing Test","capacity_bytes":4096,"read_only":true,"protected_files":[]}"#,
         )
         .unwrap();
+        fs::write(disk.join("notes.txt"), b"test").unwrap();
         let mut cpu = Cpu::new();
-        cpu.configure_disk(temp.join("disks"), temp.join("module-disks"))
-            .unwrap();
+        cpu.mount_folder_disk(&disk).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
         cpu.run(10_000).unwrap();
 
-        assert_eq!(&cpu.memory[0x4310e..0x43110], &[0, 1]);
-        assert_eq!(&cpu.memory[0x40200..0x40208], b"DISK0001");
+        assert_eq!(&cpu.memory[0x43110..0x43111], &[0]);
+        assert_eq!(&cpu.memory[0x2000..0x200a], b"notes.txt\0");
         fs::remove_dir_all(temp).unwrap();
     }
 

@@ -7,13 +7,14 @@ eight general-purpose registers and a 16-bit instruction format. Assembly source
 files use the +.asm+ extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
 
-The emulator presents a text-mode BIOS startup screen in its main window before
-launching a program. It uses bright green fixed-width characters on black with
-enlarged pixels and no glow or post-processing. The BIOS discovers folder
-disks under +disks/+ and loads a prebuilt boot image after validating the
-selected disk's +disk.json+. Exactly one of +kernel.bin+ (KERNEL mode) or
-+main.bin+ (USER mode) must exist; both or neither reports +NOT_BOOT+.
-Metadata cannot override the executable or mode. Once started, CPU
+The emulator loads the required guest-resident +bios.bin+ before launching a
+program. The BIOS presents a text-mode selector in the main window using
+bright green fixed-width characters on black, enlarged pixels, and no glow or
+post-processing. It discovers folder disks under +disks/+ and loads a prebuilt
+boot image after validating the selected disk's +disk.json+. Exactly one of
++kernel.bin+ (KERNEL mode) or +main.bin+ (USER mode) must exist; both or
+neither reports +NOT_BOOT+. Metadata cannot override the executable or mode.
+Once started, CPU
 reset begins execution at the loaded image's entry point. The first instruction
 in the source determines that entry point, regardless of the numeric order of
 the image's memory segments.
@@ -41,13 +42,15 @@ subset handles multiple +int+ functions with up to three parameters and local
 expressions, conditional expressions, nested blocks, +if+/+else+, and
 +while+/+do+/+for+ loops with +break+ and +continue+, including recursion.
 Other C programs are rejected until their required features are ported. At
-startup without an explicit program path, the BIOS lists ID-named disk
-directories in stable order. Use Up/Down to select a disk and Enter to boot,
-or click to select and double-click to boot. The mouse wheel scrolls the list.
-Invalid metadata, invalid images, and +NOT_BOOT+ errors remain visible and
-are logged; select another disk to retry. Reset rescans the disk collection.
-Press Escape to exit the BIOS. BIOS never compiles guest source; package
-programs beforehand with +sc16build package-disk+. See
+startup without an explicit program path, the BIOS displays ID-named disk
+directories in stable order, one at a time. Use Up/Down to change the selection
+and Enter to boot. Invalid metadata, invalid images, and +NOT_BOOT+ errors are
+logged; the BIOS remains available to retry another disk. Reset restarts the
+firmware and rescans the disk collection. Press Escape to exit the BIOS. The
+emulator requires the shared root
++bios.bin+ and displays a BIOS startup error if it is missing or invalid.
+Package one program with +sc16build package-disk+ or all runnable C modules
+and their local disk assets with +sc16build package-modules+. See
 +sc16_disk_format.adoc+ for the manifest and image requirements.
 Offline images use the version 2 +SC16IMG2+ container, with fixed load
 addresses, an executable entry point, and explicit segment alignment and
@@ -115,7 +118,7 @@ replaced +SC16IMG1+ signature is rejected rather than executed as flat code.
 
 The input file argument is optional. Without it, the BIOS loads a prebuilt
 image from a selected folder disk. Use +--disk ID+ to preselect a boot disk
-in BIOS, or to mount a legacy data disk with an explicit program path.
+in BIOS, or to mount that folder filesystem with an explicit program path.
 The Rust emulator uses
 Macroquad for its window, display, and input.
 
@@ -912,30 +915,20 @@ Keyboard key presses write the character byte to the keyboard address and mark
 a keyboard interrupt pending. The RTC writes seconds, minutes, and hours to its
 three declared byte addresses.
 
-The disk storage device is accessible starting at +0x43100+. It uses JSON files
-to store data blocks of 256 characters.
-* Write +0x01+ to +0x43100+ to load a disk; the 8-character disk ID must be placed
-  at +0x43101+ through +0x43108+.
-* Write +0x02+ to +0x43100+ to unload and save the current disk.
-* Write +0x04+ to +0x43100+ to read a block; the 16-bit block pointer is at
-  +0x4310A+ and the RAM destination offset is at +0x4310C+. The block is copied
-  to +0x40000 \+ offset+.
-* Write +0x08+ to +0x43100+ to write a block; the 16-bit block pointer is at
-  +0x4310A+ and the RAM source offset is at +0x4310C+. Data is read from
-  +0x40000 \+ offset+.
-* Write +0x10+ to +0x43100+ to read the disk directory: the disk number (0-based)
-  is taken from +0x4310A+, and the ID of that disk (zero terminated, empty when
-  out of range) is copied to +0x40000 \+ offset+ (offset at +0x4310C+). The number
-  of disks in the +disks/+ folder is returned in the word at +0x4310E+. The byte
-  after the terminating zero (offset 9) is +1+ if that disk is write protected.
-* Write +0x20+ to +0x43100+ to set write protection of the loaded disk: +0+ (off)
-  or +1+ (on) in +0x4310A+. The flag is saved immediately to the disk's JSON file
-  as +"protected": true+, and writes to a protected disk are ignored. After a
-  load (+0x01+) or +0x20+, the word at +0x4310E+ holds the protection state.
+Guest filesystem requests use the byte-register gateway at +0x43100+, with
+commands and C helpers defined in +lib/folder_fs.h+. It supports directory
+listing, file reads and replacement writes, directory creation, deletion,
+rename, and metadata queries. Paths are normalized relative to the mounted
+folder disk; transfers are bounded and failures set an explicit status. See
++docs/sc16_disk_format.adoc+ for the request layout and access policies.
 
-+modules/DiskEditor/disk_editor.c+ is a disk editor built on this interface: it
-lists the disks, creates new ones, and lets you edit and save blocks with the
-keyboard.
+The former guest block interface is removed. Original JSON block-disk files
+remain as import sources and can be converted with
++sc16build import-block-disk+. +modules/DiskEditor/disk_editor.c+ is now a
+USER-mode text-file editor for the mounted folder disk; it creates or updates
+files up to 256 bytes and leaves protected files unchanged. Tank-16's
++lib/disk.h+ file-list helper retains recursive directory listing for legacy
+module code; file reads use the folder-filesystem read command.
 
 == 8. Bitmap font
 
@@ -1168,17 +1161,17 @@ work or assume C90 numerical accuracy.
 
 === BIOS, Bug Monitor, and virtual disks
 
-The emulator starts with a text-mode BIOS selection screen in its main window.
-The BIOS uses bright green characters on black, with a fixed-width, enlarged
-font and no glow or post-processing effects. It lists ID-named folder disks
+The guest-resident BIOS starts with a text-mode selection screen in the main
+window. It uses bright green characters on black, with a fixed-width, enlarged
+font and no glow or post-processing effects. It selects ID-named folder disks
 from +disks/+; metadata is checked after selection. Exactly one regular
 +kernel.bin+ or +main.bin+ is required. +kernel.bin+ authorizes KERNEL-mode
 execution and must be trusted; this is not authenticated or secure boot.
 +main.bin+ starts in USER mode. Both or neither produces +NOT_BOOT+.
-BIOS loads the selected SC-16 image directly, without compiling source.
-Use Up/Down and Enter, or click and double-click; the mouse wheel scrolls.
+The BIOS loads the selected SC-16 image directly, without compiling source.
+Use Up/Down and Enter to select and boot.
 The optional +--disk ID+ preselects a boot disk. With an explicit program
-path, that option still mounts a legacy JSON data disk instead.
+path, that option mounts the same folder filesystem for guest file operations.
 
 The BIOS information block starts at +0x43040+: bytes +0..3+ are the +SC16+
 signature, bytes +4..5+ are the BIOS version, bytes +6..8+ contain the memory
@@ -1230,7 +1223,7 @@ the message and a newline to the serial output. The serial input path remains
 available to guest programs. *RESET*
 returns to BIOS disk selection, while *REBOOT* restarts the current program.
 The status line below
-shows local time, uptime, mounted data disk, and loaded module. It also displays
+shows local time, uptime, mounted folder disk, and loaded module. It also displays
 host lifecycle messages such as emulator startup, program loading, disk
 operations, and errors. Type into the monitor text area to send serial input;
 Enter and Backspace are supported. Press F2 in the emulator window
@@ -1238,30 +1231,23 @@ to hide/show the Bug Monitor. An empty serial-status poll yields the current
 instruction frame to the host event loop, so a C +getchar+ wait does not prevent
 keyboard events from being processed.
 
-The virtual disk device retains its JSON-backed, 256-byte block format.
-+0x43100+ is the command register; the command bits load/unload a disk,
-read/write a block, list disk IDs, and set write protection. The 16-bit block
-index is at +\+10+, the RAM buffer offset at +\+12+, and command results are at
-+\+14+; +\+16+ reports status (+0+ success, +1+ operation error). Invalid IDs,
-absent media, malformed images, and write-protected writes set the error
-status. Disk IDs are exactly eight ASCII letters, digits, +_+, or +-+.
+The guest filesystem is rooted at the folder disk selected by the BIOS or
++--disk ID+. The register service at +0x43100+ supports bounded listing, file
+reads and replacement writes, directory creation, deletion, rename, and
+metadata queries. Its command IDs and C register helpers are defined in
++lib/folder_fs.h+; +lib/disk.h+ provides file-reading and recursive-list
+helpers for existing modules. Status at +\+16+ is +0+ on success and +1+ on
+error. Paths are normalized, relative ASCII paths confined to the mounted
+folder; transfers are limited to 4096 bytes. Filesystem operations cannot
+access other disks or host paths.
 
-Programs can also read host files from their own module's +disks/+ directory,
-for example +modules/Tank-16/disks/maps/FINLAND.json+. File commands are
-independent of the mounted block disk and cannot access another module's files
-or paths outside this directory. Add +#include "disk.h"+ to use
-+disk_read_file(path, offset, buffer, capacity, &file_size)+ for byte chunks
-of up to 256 bytes, and
-+disk_list_files(index, path_buffer, capacity)+ to enumerate
-files. The register protocol uses command +0x40+ for a file-read chunk and
-+0x80+ to list files. File offset is a 32-bit byte offset at +\+18..\+21+,
-absolute SC-16 path and buffer addresses are at +\+22..\+25+ and +\+26..\+29+,
-transfer capacity is at +\+30..\+31+, and file size is returned at +\+32..\+35+.
-The returned byte count is at +\+14+.
-Paths use +/+, are relative to the module disk folder, and are limited to 128
-ASCII characters. Chunk reads allow JSON documents of any size without
-requiring the whole file in guest memory. This does not add file-backed
-+stdio+ streams; programs can process JSON incrementally with the chunk API.
+Source-launched programs without +--disk+ can read their own module's
++disks/+ directory through a host-configured read-only mount. When a folder
+disk is selected, its data and policies take precedence. Tank-16 reads maps
+and tile assets from its packaged folder disk; standalone source launches
+continue to find the module-local files. The old JSON block format is no
+longer a guest device; original JSON files remain available to
++sc16build import-block-disk+.
 
 Tank-16 uses this generic API to load map JSON from
 +modules/Tank-16/disks/maps/+ at round start. The first round prefers
@@ -1272,6 +1258,16 @@ obstacle density and tile IDs; terrain and obstacles are generated
 deterministically from tile coordinates. Only graphics atlases are included in
 the Tank-16 executable, not map data. The map editor mirrors saved maps into
 the module's +disks/maps/+ folder.
+
+Programs booted from a folder disk can access that selected disk through the
+bounded USER-mode filesystem service in +#include "folder_fs.h"+. It supports
+directory listing, file reads and replacement writes, directory creation,
+entry deletion/rename, and metadata queries. Transfers are limited to 4096
+bytes, paths are normalized disk-relative ASCII paths, and read-only disks,
+protected paths, and boot executable names are enforced by the service. See
+link:sc16_disk_format.adoc[+sc16_disk_format.adoc+] for the request registers
+and result format. The older +disk.h+ file helpers remain for direct-source
+developer launches and are not a substitute for the folder-disk service.
 
 +<stdio.h>+ currently provides console +getchar+, +putchar+, +puts+, +gets+,
 +fgetc+, +fgets+, +fputc+, +fputs+, +printf+, +fprintf+, +vprintf+, and +vfprintf+.

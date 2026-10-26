@@ -1,0 +1,10 @@
+{
+  "capacity_bytes": 67108864,
+  "id": "APP00004",
+  "label": "Elite",
+  "protected_files": [
+    "main.bin"
+  ],
+  "read_only": false,
+  "version": 1
+}

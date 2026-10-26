@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::console::ConsoleDevice;
-use crate::disk::DiskDevice;
+use crate::disk::{FolderBootMode, FolderDisk};
 use crate::guest_text::GuestTextDisplay;
 use crate::net::{DEFAULT_PORT, NetNode};
 
@@ -32,10 +32,21 @@ const RTC_START: u32 = 0x43010;
 pub const TIMER_PERIOD_ADDR: u32 = 0x43014;
 const DISK_BASE: u32 = 0x43100;
 const DISK_STATUS: u32 = DISK_BASE + 16;
+const BIOS_BASE: u32 = 0x43400;
+const BIOS_STATUS: u32 = BIOS_BASE + 12;
 const CONSOLE_DATA: u32 = 0x43200;
 const CONSOLE_STATUS: u32 = 0x43201;
 const CONSOLE_CONTROL: u32 = 0x43202;
-const RAM_START: u32 = 0x40000;
+pub const GUEST_TEXT_BASE: u32 = 0x43300;
+pub const GUEST_TEXT_DATA: u32 = GUEST_TEXT_BASE;
+pub const GUEST_TEXT_FOREGROUND: u32 = GUEST_TEXT_BASE + 1;
+pub const GUEST_TEXT_BACKGROUND: u32 = GUEST_TEXT_BASE + 2;
+pub const GUEST_TEXT_CONTROL: u32 = GUEST_TEXT_BASE + 3;
+pub const GUEST_TEXT_ROW: u32 = GUEST_TEXT_BASE + 4;
+pub const GUEST_TEXT_COLUMN: u32 = GUEST_TEXT_BASE + 5;
+const GUEST_TEXT_CLEAR: u8 = 1;
+const GUEST_TEXT_ENABLE: u8 = 2;
+const GUEST_TEXT_DISABLE: u8 = 3;
 const VRAM_START: u32 = 0x50000;
 const GPU_CLEAR: u8 = 1;
 const GPU_PIXEL: u8 = 2;
@@ -86,8 +97,16 @@ const GPU_TILE_COUNT: usize = 256;
 const GPU_TILE_MAX_SIZE: usize = 64;
 const GPU_TILEMAP_MAX_SIZE: usize = 1024;
 const GPU_SPRITE_MAX_SIZE: i32 = 64;
-const DISK_BLOCK_SIZE: usize = 256;
 const DISK_MAX_FILE_READ_SIZE: usize = 4096;
+const FOLDER_FS_LIST: u8 = 0x41;
+const FOLDER_FS_READ: u8 = 0x42;
+const FOLDER_FS_WRITE: u8 = 0x43;
+const FOLDER_FS_CREATE_DIR: u8 = 0x44;
+const FOLDER_FS_DELETE: u8 = 0x45;
+const FOLDER_FS_RENAME: u8 = 0x46;
+const FOLDER_FS_STAT: u8 = 0x47;
+const MMIO_START: u32 = 0x43000;
+const MMIO_END: u32 = 0x44000;
 const GPU3D_FILL: u16 = 1;
 const GPU3D_WIREFRAME: u16 = 2;
 const GPU3D_SIN_8_8: [i32; 64] = [
@@ -298,7 +317,11 @@ pub struct Cpu {
     pub gpu_triangles: Vec<GpuTriangle>,
     pub gpu_lines: Vec<GpuLine>,
     sound_commands: [Option<GpuSoundCommand>; 4],
-    disk: DiskDevice,
+    disk_root: PathBuf,
+    bios_preselected_disk: Option<String>,
+    booted_disk_path: Option<PathBuf>,
+    module_folder_disk: Option<FolderDisk>,
+    folder_disk: Option<FolderDisk>,
     network: Option<NetNode>,
     network_port: u16,
     last_mouse_click: [Option<(u64, u16, u16)>; 2],
@@ -407,7 +430,11 @@ impl Cpu {
             gpu_triangles: Vec::new(),
             gpu_lines: Vec::new(),
             sound_commands: [None; 4],
-            disk: DiskDevice::new(PathBuf::from("disks")),
+            disk_root: PathBuf::from("disks"),
+            bios_preselected_disk: None,
+            booted_disk_path: None,
+            module_folder_disk: None,
+            folder_disk: None,
             network: None,
             network_port: DEFAULT_PORT,
             last_mouse_click: [None; 2],
@@ -426,6 +453,158 @@ impl Cpu {
             timer_period: 0,
             timer_countdown: 0,
         })
+    }
+
+    pub fn set_bios_preselected_disk(&mut self, disk_id: Option<&str>) {
+        self.bios_preselected_disk = disk_id.map(str::to_owned);
+    }
+
+    pub fn take_booted_disk_path(&mut self) -> Option<PathBuf> {
+        self.booted_disk_path.take()
+    }
+
+    fn bios_register_u16(&self, offset: usize) -> u16 {
+        u16::from_be_bytes([
+            self.memory[BIOS_BASE as usize + offset],
+            self.memory[BIOS_BASE as usize + offset + 1],
+        ])
+    }
+
+    fn bios_register_u32(&self, offset: usize) -> u32 {
+        u32::from_be_bytes([
+            self.memory[BIOS_BASE as usize + offset],
+            self.memory[BIOS_BASE as usize + offset + 1],
+            self.memory[BIOS_BASE as usize + offset + 2],
+            self.memory[BIOS_BASE as usize + offset + 3],
+        ])
+    }
+
+    fn bios_status(&mut self, status: u8) {
+        self.memory[BIOS_STATUS as usize] = status;
+    }
+
+    fn bios_control(&mut self, command: u8) {
+        self.bios_status(0);
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            self.bios_status(1);
+            self.console
+                .log_error("bios", "user-mode firmware operation was rejected");
+            return;
+        }
+        let result = match command {
+            1 => self.bios_list_count(),
+            2 => self.bios_list_id(),
+            3 => self.bios_boot_disk(),
+            _ => Err("unsupported firmware operation".to_owned()),
+        };
+        if let Err(error) = result {
+            self.bios_status(1);
+            self.console.log_error("bios", &error);
+        }
+    }
+
+    fn bios_disk_paths(&self) -> Result<Vec<PathBuf>, String> {
+        FolderDisk::discover_paths(&self.disk_root)
+    }
+
+    fn bios_list_count(&mut self) -> Result<(), String> {
+        let paths = self.bios_disk_paths()?;
+        let count = u16::try_from(paths.len())
+            .map_err(|_| "firmware disk list exceeds 65535 entries".to_owned())?;
+        let selected = if let Some(id) = self.bios_preselected_disk.take() {
+            match paths.iter().position(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == id)
+            }) {
+                Some(index) => index,
+                None => {
+                    self.console
+                        .log_error("bios", &format!("preselected disk {id} was not found"));
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        let [index_high, index_low] = u16::try_from(selected)
+            .map_err(|_| "selected firmware disk index exceeds 65535".to_owned())?
+            .to_be_bytes();
+        let [count_high, count_low] = count.to_be_bytes();
+        self.memory[BIOS_BASE as usize + 2] = index_high;
+        self.memory[BIOS_BASE as usize + 3] = index_low;
+        self.memory[BIOS_BASE as usize + 4] = count_high;
+        self.memory[BIOS_BASE as usize + 5] = count_low;
+        Ok(())
+    }
+
+    fn bios_list_id(&mut self) -> Result<(), String> {
+        let index = usize::from(self.bios_register_u16(2));
+        let capacity = usize::from(self.bios_register_u16(10));
+        let output = self.guest_range(self.bios_register_u32(6), capacity)?;
+        let paths = self.bios_disk_paths()?;
+        let path = paths
+            .get(index)
+            .ok_or_else(|| format!("firmware disk index {index} is out of range"))?;
+        let id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "firmware disk ID is not valid text".to_owned())?;
+        let encoded = id.as_bytes();
+        let required = encoded.len() + 1;
+        if required > capacity {
+            return Err(format!(
+                "firmware disk ID output buffer at {:#x} has capacity {capacity}; {required} required",
+                output.start
+            ));
+        }
+        let start = output.start;
+        self.memory[start..start + encoded.len()].copy_from_slice(encoded);
+        self.memory[start + encoded.len()] = 0;
+        Ok(())
+    }
+
+    fn bios_boot_disk(&mut self) -> Result<(), String> {
+        let index = usize::from(self.bios_register_u16(2));
+        let paths = self.bios_disk_paths()?;
+        let path = paths
+            .get(index)
+            .ok_or_else(|| format!("firmware disk index {index} is out of range"))?;
+        let disk = FolderDisk::open(path)?;
+        let boot = disk.load_boot_image()?;
+        for segment in &boot.image.segments {
+            let start = usize::try_from(segment.address)
+                .map_err(|_| "boot image segment address exceeds host memory".to_owned())?;
+            let end = start
+                .checked_add(segment.data.len())
+                .ok_or_else(|| "boot image segment range overflow".to_owned())?;
+            if end > self.memory.len() {
+                return Err("boot image segment exceeds configured memory".to_owned());
+            }
+        }
+        if boot.image.entry_point as usize >= self.memory.len() {
+            return Err("boot image entry point exceeds configured memory".to_owned());
+        }
+        self.prepare_image_entry();
+        self.load_program(&boot.image.segments, boot.image.entry_point)
+            .map_err(|error| format!("cannot load selected firmware disk: {error}"))?;
+        self.booted_disk_path = Some(path.clone());
+        self.folder_disk = Some(disk);
+        self.privilege_mode = match boot.mode {
+            FolderBootMode::Kernel => PrivilegeMode::Supervisor,
+            FolderBootMode::User => PrivilegeMode::User,
+        };
+        self.guest_text.clear(0);
+        self.guest_text.enabled = false;
+        let mode = match boot.mode {
+            FolderBootMode::Kernel => "KERNEL",
+            FolderBootMode::User => "USER",
+        };
+        self.console.log_info(
+            "bios",
+            &format!("Booting {} in {mode} mode", path.display()),
+        );
+        Ok(())
     }
 
     pub fn load_program<S: LoadableSegment>(
@@ -476,6 +655,7 @@ impl Cpu {
         self.loaded_image_segments.clear();
         self.privilege_mode = PrivilegeMode::Supervisor;
         self.running = true;
+        self.booted_disk_path = None;
         if let Some(interrupt_control) = self.memory.get_mut(ICR_ADDR as usize) {
             *interrupt_control = 0;
         }
@@ -512,22 +692,41 @@ impl Cpu {
         storage_dir: PathBuf,
         module_file_root: PathBuf,
     ) -> Result<(), String> {
-        let mut disk = DiskDevice::new(storage_dir);
-        disk.set_file_root(module_file_root)?;
-        self.disk = disk;
+        self.disk_root = storage_dir;
+        self.module_folder_disk = if module_file_root.exists() {
+            Some(FolderDisk::open_read_only_directory(&module_file_root)?)
+        } else {
+            None
+        };
         Ok(())
     }
 
     pub fn available_disks(&self) -> Result<Vec<String>, String> {
-        self.disk.list_disks()
+        FolderDisk::discover(&self.disk_root).map(|disks| {
+            disks
+                .into_iter()
+                .map(|disk| disk.manifest().id.clone())
+                .collect()
+        })
     }
 
     pub fn mount_data_disk(&mut self, disk_id: &str) -> Result<(), String> {
-        if !self.disk.list_disks()?.iter().any(|id| id == disk_id) {
-            return Err(format!("virtual data disk {disk_id:?} does not exist"));
+        if !self
+            .available_disks()?
+            .iter()
+            .any(|available_id| available_id == disk_id)
+        {
+            return Err(format!("folder disk {disk_id:?} does not exist"));
         }
-        self.disk.load_disk(disk_id)?;
+        let disk_path = self.disk_root.join(disk_id);
+        self.folder_disk = Some(FolderDisk::open(&disk_path)?);
         self.memory[DISK_STATUS as usize] = 0;
+        Ok(())
+    }
+
+    pub fn mount_folder_disk(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let folder_disk = FolderDisk::open(path)?;
+        self.folder_disk = Some(folder_disk);
         Ok(())
     }
 
@@ -558,123 +757,210 @@ impl Cpu {
     }
 
     fn disk_control(&mut self, command: u8) {
+        let caller_mode = self.privilege_mode;
+        if !(command == 0x80 || (FOLDER_FS_LIST..=FOLDER_FS_STAT).contains(&command)) {
+            self.memory[DISK_STATUS as usize] = 1;
+            self.console
+                .log_error("disk", "unsupported disk operation was rejected");
+            return;
+        }
+        self.privilege_mode = PrivilegeMode::Supervisor;
         self.memory[DISK_STATUS as usize] = 0;
         if let Err(error) = self.disk_control_inner(command) {
             self.memory[DISK_STATUS as usize] = 1;
             self.console
                 .log_error("disk", &format!("operation failed: {error}"));
         }
+        self.privilege_mode = caller_mode;
     }
 
     fn disk_control_inner(&mut self, command: u8) -> Result<(), String> {
-        if command & 0x01 != 0 {
-            let id_bytes = &self.memory[DISK_BASE as usize + 1..DISK_BASE as usize + 9];
-            let disk_id = std::str::from_utf8(id_bytes)
-                .map_err(|_| "disk ID must be ASCII".to_owned())?
-                .to_owned();
-            self.disk.load_disk(&disk_id)?;
-            self.disk_write_result(u16::from(self.disk.is_protected(&disk_id)?));
+        match command {
+            0x80 => self.legacy_file_list(),
+            FOLDER_FS_LIST..=FOLDER_FS_STAT => self.folder_fs_control(command),
+            _ => Err("unknown disk service operation".to_owned()),
         }
-        if command & 0x20 != 0 {
-            let protected = self.disk_register_u16(10) != 0;
-            self.disk.set_protected(protected)?;
-            self.disk_write_result(u16::from(protected));
+    }
+
+    fn legacy_file_list(&mut self) -> Result<(), String> {
+        let index = usize::from(self.disk_register_u16(10));
+        let capacity = usize::from(self.disk_register_u16(30));
+        let disk = self
+            .folder_disk
+            .as_ref()
+            .or(self.module_folder_disk.as_ref())
+            .ok_or_else(|| "no folder filesystem is mounted".to_owned())?;
+        let files = disk.list_files()?;
+        let name = files.get(index).map(String::as_str).unwrap_or("");
+        let encoded = name.as_bytes();
+        let length = encoded.len() + 1;
+        if length > capacity {
+            return Err("virtual file name buffer is too small".to_owned());
         }
-        if command & 0x02 != 0 {
-            self.disk.unload_disk()?;
-        }
-        if command & 0x04 != 0 {
-            let pointer = self.disk_register_u16(10);
-            let offset = usize::from(self.disk_register_u16(12));
-            let address = RAM_START as usize + offset;
-            let block = self.disk.read_block(pointer)?;
-            for (index, byte) in block.into_iter().enumerate() {
-                self.memory[(address + index) & self.memory_mask as usize] = byte;
-            }
-        }
-        if command & 0x10 != 0 {
-            let index = usize::from(self.disk_register_u16(10));
-            let offset = usize::from(self.disk_register_u16(12));
-            let disks = self.disk.list_disks()?;
-            self.disk_write_result(disks.len().min(u16::MAX as usize) as u16);
-            let name = disks.get(index).map(String::as_str).unwrap_or("");
-            let base = (RAM_START as usize + offset) & self.memory_mask as usize;
-            for (position, byte) in name.bytes().chain([0]).enumerate() {
-                self.memory[(base + position) & self.memory_mask as usize] = byte;
-            }
-            let protected = if name.is_empty() {
-                0
-            } else {
-                u8::from(self.disk.is_protected(name)?)
-            };
-            self.memory[(base + 9) & self.memory_mask as usize] = protected;
-        }
-        if command & 0x80 != 0 {
-            let index = usize::from(self.disk_register_u16(10));
-            let buffer_address = self.disk_register_u32(26) as usize;
-            let capacity = usize::from(self.disk_register_u16(30));
-            let files = self.disk.list_files()?;
-            self.disk_write_result(files.len().min(u16::MAX as usize) as u16);
-            let name = files.get(index).map(String::as_str).unwrap_or("");
-            let encoded = name.as_bytes();
-            let length = encoded.len() + 1;
-            if length > capacity
-                || buffer_address
-                    .checked_add(length)
-                    .is_none_or(|end| end > self.memory.len())
-            {
-                return Err("virtual file name buffer is too small".to_owned());
-            }
-            self.memory[buffer_address..buffer_address + encoded.len()].copy_from_slice(encoded);
-            self.memory[buffer_address + encoded.len()] = 0;
-        }
-        if command & 0x40 != 0 {
-            let path_address = self.disk_register_u32(22) as usize;
-            let buffer_address = self.disk_register_u32(26) as usize;
-            let file_offset = self.disk_register_u32(18);
-            let length = usize::from(self.disk_register_u16(30)).min(DISK_MAX_FILE_READ_SIZE);
-            let _buffer_end = buffer_address
-                .checked_add(length)
-                .filter(|end| *end <= self.memory.len())
-                .ok_or_else(|| "virtual file address is outside memory".to_owned())?;
-            let mut path_bytes = Vec::new();
-            let mut terminated = false;
-            for offset in 0..=128usize {
-                let address = path_address
-                    .checked_add(offset)
-                    .filter(|address| *address < self.memory.len())
-                    .ok_or_else(|| "virtual file path exceeds memory".to_owned())?;
-                let byte = self.memory[address];
-                if byte == 0 {
-                    terminated = true;
-                    break;
+        let output = self.guest_range(self.disk_register_u32(26), length)?;
+        self.memory[output.start..output.start + encoded.len()].copy_from_slice(encoded);
+        self.memory[output.start + encoded.len()] = 0;
+        self.disk_write_result(u16::try_from(files.len()).unwrap_or(u16::MAX));
+        Ok(())
+    }
+
+    fn folder_fs_control(&mut self, command: u8) -> Result<(), String> {
+        let disk = self
+            .folder_disk
+            .as_ref()
+            .or(self.module_folder_disk.as_ref())
+            .ok_or_else(|| "no folder filesystem is mounted".to_owned())?;
+        match command {
+            FOLDER_FS_LIST => {
+                let directory = self.read_guest_path(self.disk_register_u32(22))?;
+                let entries = disk.list_dir(directory.as_deref())?;
+                let index = usize::from(self.disk_register_u16(10));
+                let encoded = if let Some(entry) = entries.get(index) {
+                    let size = u32::try_from(entry.size_bytes)
+                        .map_err(|_| "folder filesystem entry exceeds 32-bit size".to_owned())?;
+                    let mut encoded = entry.name.as_bytes().to_vec();
+                    encoded.push(0);
+                    encoded.push(u8::from(entry.is_directory));
+                    encoded.extend_from_slice(&size.to_be_bytes());
+                    encoded
+                } else {
+                    vec![0]
+                };
+                let capacity = usize::from(self.disk_register_u16(30));
+                if encoded.len() > capacity {
+                    return Err("folder filesystem listing buffer is too small".to_owned());
                 }
-                path_bytes.push(byte);
+                let output = self.guest_range(self.disk_register_u32(26), encoded.len())?;
+                self.memory[output].copy_from_slice(&encoded);
+                self.disk_write_result(u16::try_from(entries.len()).unwrap_or(u16::MAX));
             }
-            if !terminated {
-                return Err("virtual file path is not null-terminated".to_owned());
+            FOLDER_FS_READ => {
+                let path = self
+                    .read_guest_path(self.disk_register_u32(22))?
+                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
+                let length = usize::from(self.disk_register_u16(30));
+                if length > DISK_MAX_FILE_READ_SIZE {
+                    return Err("folder filesystem transfer exceeds 4096 bytes".to_owned());
+                }
+                let output = self.guest_range(self.disk_register_u32(26), length)?;
+                let offset = u64::from(self.disk_register_u32(18));
+                let (data, file_size) = disk.read_file(&path, offset, length)?;
+                let file_size = u32::try_from(file_size)
+                    .map_err(|_| "folder filesystem file exceeds 32-bit size".to_owned())?;
+                self.memory[output.start..output.start + data.len()].copy_from_slice(&data);
+                self.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36]
+                    .copy_from_slice(&file_size.to_be_bytes());
+                self.disk_write_result(u16::try_from(data.len()).unwrap_or(u16::MAX));
             }
-            let path = std::str::from_utf8(&path_bytes)
-                .map_err(|_| "virtual file path must be ASCII".to_owned())?;
-            if !path.is_ascii() {
-                return Err("virtual file path must be ASCII".to_owned());
+            FOLDER_FS_WRITE => {
+                let path = self
+                    .read_guest_path(self.disk_register_u32(22))?
+                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
+                Self::validate_guest_mutation_path(&path)?;
+                let length = usize::from(self.disk_register_u16(30));
+                if length > DISK_MAX_FILE_READ_SIZE {
+                    return Err("folder filesystem transfer exceeds 4096 bytes".to_owned());
+                }
+                let input = self.guest_range(self.disk_register_u32(26), length)?;
+                let data = self.memory[input].to_vec();
+                disk.write_file(&path, &data)?;
+                self.disk_write_result(u16::try_from(length).unwrap_or(u16::MAX));
             }
-            let (data, file_size) = self.disk.read_file(path, file_offset, length)?;
-            self.memory[buffer_address..buffer_address + data.len()].copy_from_slice(&data);
-            self.disk_write_result(data.len().min(u16::MAX as usize) as u16);
-            self.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36]
-                .copy_from_slice(&file_size.to_be_bytes());
-        }
-        if command & 0x08 != 0 {
-            let pointer = self.disk_register_u16(10);
-            let offset = usize::from(self.disk_register_u16(12));
-            let base = RAM_START as usize + offset;
-            let data = (0..DISK_BLOCK_SIZE)
-                .map(|index| self.memory[(base + index) & self.memory_mask as usize])
-                .collect::<Vec<_>>();
-            self.disk.write_block(pointer, &data)?;
+            FOLDER_FS_CREATE_DIR => {
+                let path = self
+                    .read_guest_path(self.disk_register_u32(22))?
+                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
+                Self::validate_guest_mutation_path(&path)?;
+                disk.create_dir(&path)?;
+                self.disk_write_result(0);
+            }
+            FOLDER_FS_DELETE => {
+                let path = self
+                    .read_guest_path(self.disk_register_u32(22))?
+                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
+                Self::validate_guest_mutation_path(&path)?;
+                disk.delete_entry(&path)?;
+                self.disk_write_result(0);
+            }
+            FOLDER_FS_RENAME => {
+                let source = self
+                    .read_guest_path(self.disk_register_u32(22))?
+                    .ok_or_else(|| "folder filesystem source path is empty".to_owned())?;
+                let destination = self
+                    .read_guest_path(self.disk_register_u32(18))?
+                    .ok_or_else(|| "folder filesystem destination path is empty".to_owned())?;
+                Self::validate_guest_mutation_path(&source)?;
+                Self::validate_guest_mutation_path(&destination)?;
+                disk.rename_entry(&source, &destination)?;
+                self.disk_write_result(0);
+            }
+            FOLDER_FS_STAT => {
+                let path = self
+                    .read_guest_path(self.disk_register_u32(22))?
+                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
+                let entry = disk.metadata(&path)?;
+                let size = u32::try_from(entry.size_bytes)
+                    .map_err(|_| "folder filesystem entry exceeds 32-bit size".to_owned())?;
+                let output = self.guest_range(self.disk_register_u32(26), 5)?;
+                self.memory[output].copy_from_slice(&[
+                    u8::from(entry.is_directory),
+                    size.to_be_bytes()[0],
+                    size.to_be_bytes()[1],
+                    size.to_be_bytes()[2],
+                    size.to_be_bytes()[3],
+                ]);
+                self.disk_write_result(5);
+            }
+            _ => return Err("unknown folder filesystem operation".to_owned()),
         }
         Ok(())
+    }
+
+    fn validate_guest_mutation_path(path: &str) -> Result<(), String> {
+        if matches!(path, "main.bin" | "kernel.bin") {
+            return Err("boot executable paths cannot be changed by guest code".to_owned());
+        }
+        Ok(())
+    }
+
+    fn guest_range(&self, address: u32, length: usize) -> Result<std::ops::Range<usize>, String> {
+        let start = usize::try_from(address)
+            .map_err(|_| "guest buffer address is outside memory".to_owned())?;
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= self.memory.len())
+            .ok_or_else(|| "guest buffer range is outside memory".to_owned())?;
+        if address < MMIO_END && end > MMIO_START as usize {
+            return Err("guest buffer overlaps memory-mapped devices".to_owned());
+        }
+        Ok(start..end)
+    }
+
+    fn read_guest_path(&self, address: u32) -> Result<Option<String>, String> {
+        let mut bytes = Vec::new();
+        for offset in 0..=128u32 {
+            let current = address
+                .checked_add(offset)
+                .ok_or_else(|| "guest path address overflow".to_owned())?;
+            let range = self.guest_range(current, 1)?;
+            let byte = self.memory[range.start];
+            if byte == 0 {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                let path =
+                    String::from_utf8(bytes).map_err(|_| "guest path must be ASCII".to_owned())?;
+                if !path.is_ascii() {
+                    return Err("guest path must be ASCII".to_owned());
+                }
+                return Ok(Some(path));
+            }
+            if !byte.is_ascii() {
+                return Err("guest path must be ASCII".to_owned());
+            }
+            bytes.push(byte);
+        }
+        Err("guest path is not null-terminated within 128 bytes".to_owned())
     }
 
     fn gpu_network(&mut self, command: u8, query: u8, argument: i16) {
@@ -758,6 +1044,7 @@ impl Cpu {
         match address {
             GPU_BASE => self.gpu_command(value),
             DISK_BASE => self.disk_control(value),
+            BIOS_BASE => self.bios_control(value),
             GPU_MODE_ADDR => {
                 if self.layer_mode != value {
                     self.layer_mode = value;
@@ -777,6 +1064,24 @@ impl Cpu {
             CONSOLE_CONTROL => {
                 self.console.set_control(value);
                 self.memory[index] = self.console.control();
+            }
+            GUEST_TEXT_DATA => self.guest_text.write_byte(
+                value,
+                self.guest_text.foreground,
+                self.guest_text.background,
+            ),
+            GUEST_TEXT_FOREGROUND => self.guest_text.foreground = value,
+            GUEST_TEXT_BACKGROUND => self.guest_text.background = value,
+            GUEST_TEXT_CONTROL => match value {
+                GUEST_TEXT_CLEAR => self.guest_text.clear(self.guest_text.background),
+                GUEST_TEXT_ENABLE => self.guest_text.enabled = true,
+                GUEST_TEXT_DISABLE => self.guest_text.enabled = false,
+                _ => {}
+            },
+            GUEST_TEXT_ROW | GUEST_TEXT_COLUMN => {
+                let row = usize::from(self.memory[GUEST_TEXT_ROW as usize]);
+                let column = usize::from(self.memory[GUEST_TEXT_COLUMN as usize]);
+                self.guest_text.set_cursor(row, column);
             }
             _ => {}
         }
@@ -2954,6 +3259,29 @@ mod tests {
         cpu
     }
 
+    fn folder_disk_for_test(name: &str, read_only: bool) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-fs-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk = root.join("DISK0001");
+        std::fs::create_dir_all(&disk).unwrap();
+        std::fs::write(
+            disk.join("disk.json"),
+            format!(
+                r#"{{"version":1,"id":"DISK0001","label":"Guest FS","capacity_bytes":65536,"read_only":{read_only}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(disk.join("main.bin"), [1, 2, 3]).unwrap();
+        std::fs::write(disk.join("kernel.bin"), [4, 5, 6]).unwrap();
+        disk
+    }
+
     #[test]
     fn reset_starts_in_supervisor_mode_with_interrupts_disabled() {
         let mut cpu = Cpu::with_memory_size(1 << 19).unwrap();
@@ -2965,6 +3293,176 @@ mod tests {
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
         assert_eq!(cpu.flags, Flags::default());
         assert_eq!(cpu.read(ICR_ADDR) & 1, 0);
+    }
+
+    #[test]
+    fn user_filesystem_services_bound_memory_and_preserve_boot_files() {
+        let root = folder_disk_for_test("operations", false);
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.mount_folder_disk(&root).unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
+        cpu.memory[0x1000..0x1009].copy_from_slice(b"note.txt\0");
+        cpu.memory[0x1100..0x1108].copy_from_slice(b"renamed\0");
+        cpu.memory[0x1200] = 0;
+        cpu.memory[0x2000..0x2003].copy_from_slice(b"abc");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u32(DISK_BASE + 26, 0x2000);
+        cpu.write_u16(DISK_BASE + 30, 3);
+        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(cpu.disk_register_u16(14), 3);
+        assert_eq!(std::fs::read(root.join("note.txt")).unwrap(), b"abc");
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+
+        cpu.write_u32(DISK_BASE + 26, 0x3000);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
+        assert_eq!(&cpu.memory[0x3000..0x3003], b"abc");
+        assert_eq!(
+            u32::from_be_bytes(
+                cpu.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36]
+                    .try_into()
+                    .unwrap()
+            ),
+            3
+        );
+
+        cpu.write_u32(DISK_BASE + 26, 0x3000);
+        cpu.write(DISK_BASE, FOLDER_FS_STAT);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(&cpu.memory[0x3000..0x3005], &[0, 0, 0, 0, 3]);
+
+        cpu.write_u32(DISK_BASE + 18, 0x1100);
+        cpu.write(DISK_BASE, FOLDER_FS_RENAME);
+        assert!(root.join("renamed").is_file());
+        assert!(!root.join("note.txt").exists());
+
+        cpu.write_u32(DISK_BASE + 22, 0x1200);
+        cpu.write_u16(DISK_BASE + 10, 2);
+        cpu.write_u32(DISK_BASE + 26, 0x3000);
+        cpu.write_u16(DISK_BASE + 30, 64);
+        cpu.write(DISK_BASE, FOLDER_FS_LIST);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(cpu.disk_register_u16(14), 3);
+        assert_eq!(&cpu.memory[0x3000..0x3009], b"renamed\0\0");
+
+        cpu.write_u32(DISK_BASE + 22, 0x1100);
+        cpu.write(DISK_BASE, FOLDER_FS_DELETE);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert!(!root.join("renamed").exists());
+
+        cpu.memory[0x1100..0x1107].copy_from_slice(b"subdir\0");
+        cpu.write(DISK_BASE, FOLDER_FS_CREATE_DIR);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert!(root.join("subdir").is_dir());
+        cpu.write(DISK_BASE, FOLDER_FS_DELETE);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert!(!root.join("subdir").exists());
+
+        cpu.memory[0x1000..0x100b].copy_from_slice(b"kernel.bin\0");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+
+        cpu.write_u32(DISK_BASE + 22, 0xffff_fffc);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+
+        cpu.memory[0x1000..0x100b].copy_from_slice(b"../outside\0");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert!(!root.parent().unwrap().join("outside").exists());
+
+        cpu.memory[0x1000..0x1009].copy_from_slice(b"main.bin\0");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u16(DISK_BASE + 30, 4097);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert_eq!(&cpu.memory[0x2000..0x2003], b"abc");
+
+        cpu.write_u16(DISK_BASE + 30, 1);
+        cpu.write_u32(DISK_BASE + 26, DISK_BASE);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+
+        cpu.write(DISK_BASE, 0x04);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn user_filesystem_service_enforces_protected_files_and_capacity() {
+        let root = folder_disk_for_test("protected-capacity", false);
+        std::fs::write(root.join("locked.txt"), b"xy").unwrap();
+        std::fs::write(
+            root.join("disk.json"),
+            r#"{"version":1,"id":"DISK0001","label":"Guest FS","capacity_bytes":8,"read_only":false,"protected_files":["locked.txt"]}"#,
+        )
+        .unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.mount_folder_disk(&root).unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
+        cpu.memory[0x1000..0x100b].copy_from_slice(b"locked.txt\0");
+        cpu.memory[0x100b..0x1014].copy_from_slice(b"note.txt\0");
+        cpu.memory[0x2000] = b'z';
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u32(DISK_BASE + 26, 0x2000);
+        cpu.write_u16(DISK_BASE + 30, 1);
+        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert_eq!(std::fs::read(root.join("locked.txt")).unwrap(), b"xy");
+
+        cpu.write_u32(DISK_BASE + 22, 0x100b);
+        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert!(!root.join("note.txt").exists());
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn user_filesystem_service_rejects_read_only_disks() {
+        let root = folder_disk_for_test("readonly", true);
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.mount_folder_disk(&root).unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
+        cpu.memory[0x1000..0x1009].copy_from_slice(b"note.txt\0");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u32(DISK_BASE + 26, 0x2000);
+        cpu.write_u16(DISK_BASE + 30, 0);
+        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
+        assert!(!root.join("note.txt").exists());
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn guest_program_executes_a_bounded_user_filesystem_read() {
+        let root = folder_disk_for_test("guest-execution", false);
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let image = crate::assembler::assemble("LDA R1, 0x43100\nLDI R0, 0x42\nST R1, R0\nHALT", 0)
+            .unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.mount_folder_disk(&root).unwrap();
+        cpu.memory[0x1000..0x1009].copy_from_slice(b"main.bin\0");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u32(DISK_BASE + 26, 0x2000);
+        cpu.write_u16(DISK_BASE + 30, 3);
+        cpu.privilege_mode = PrivilegeMode::User;
+        assert_eq!(cpu.run(10).unwrap(), 4);
+        assert!(!cpu.running);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(cpu.disk_register_u16(14), 3);
+        assert_eq!(
+            &cpu.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36],
+            &[0, 0, 0, 3]
+        );
+        assert_eq!(&cpu.memory[0x2000..0x2003], &[1, 2, 3]);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -4300,53 +4798,6 @@ mod tests {
     }
 
     #[test]
-    fn disk_mmio_loads_persists_reads_and_enforces_write_protection() {
-        let root = std::env::temp_dir().join(format!(
-            "sc16-cpu-disk-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let module_files = root.join("module");
-        std::fs::create_dir_all(&module_files).unwrap();
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.configure_disk(root.join("disks"), module_files.clone())
-            .unwrap();
-        cpu.memory[DISK_BASE as usize + 1..DISK_BASE as usize + 9].copy_from_slice(b"TEST0001");
-        cpu.write(DISK_BASE, 1);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-
-        cpu.write_u16(DISK_BASE + 10, 7);
-        cpu.write_u16(DISK_BASE + 12, 0x20);
-        let block_start = RAM_START as usize + 0x20;
-        for index in 0..DISK_BLOCK_SIZE {
-            cpu.memory[block_start + index] = index as u8;
-        }
-        cpu.write(DISK_BASE, 8);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-
-        cpu.write_u16(DISK_BASE + 12, 0x300);
-        cpu.memory[RAM_START as usize + 0x300..RAM_START as usize + 0x400].fill(0);
-        cpu.write(DISK_BASE, 4);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(
-            &cpu.memory[RAM_START as usize + 0x300..RAM_START as usize + 0x400],
-            &(0..256).map(|value| value as u8).collect::<Vec<_>>()
-        );
-
-        cpu.write_u16(DISK_BASE + 10, 1);
-        cpu.write(DISK_BASE, 0x20);
-        cpu.write(DISK_BASE, 8);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-
-        cpu.write(DISK_BASE, 2);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert!(root.join("disks").join("TEST0001.json").is_file());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn disk_mmio_reads_virtual_files_and_lists_module_disk_contents() {
         let root = std::env::temp_dir().join(format!(
             "sc16-cpu-files-{}",
@@ -4365,7 +4816,7 @@ mod tests {
         cpu.write_u32(DISK_BASE + 22, 0x1000);
         cpu.write_u32(DISK_BASE + 26, 0x1100);
         cpu.write_u16(DISK_BASE + 30, 4);
-        cpu.write(DISK_BASE, 0x40);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
         assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
         assert_eq!(cpu.disk_register_u16(14), 4);
         assert_eq!(&cpu.memory[0x1100..0x1104], b"worl");
@@ -4409,7 +4860,7 @@ mod tests {
 
         for offset in [0, 4096, 65_530, 72_704, 76_800] {
             cpu.write_u32(DISK_BASE + 18, offset);
-            cpu.write(DISK_BASE, 0x40);
+            cpu.write(DISK_BASE, FOLDER_FS_READ);
             let expected = &payload[offset as usize..(offset as usize + 4096).min(payload.len())];
             assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
             assert_eq!(
@@ -4441,7 +4892,7 @@ mod tests {
         assert_eq!(&cpu.memory[0x3000..0x3010], b"maps/world.json\0");
 
         cpu.memory[0x1000..0x100a].copy_from_slice(b"../secret\0");
-        cpu.write(DISK_BASE, 0x40);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
         assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4457,9 +4908,14 @@ mod tests {
                 .as_nanos()
         ));
         let storage = root.join("disks");
-        let mut disk = DiskDevice::new(storage.clone());
-        disk.load_disk("DATA0001").unwrap();
-        disk.write_block(0, &[0xa5; DISK_BLOCK_SIZE]).unwrap();
+        let disk_path = storage.join("DATA0001");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        std::fs::write(
+            disk_path.join("disk.json"),
+            r#"{"version":1,"id":"DATA0001","label":"Data","capacity_bytes":4096,"read_only":false,"protected_files":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(disk_path.join("payload.bin"), [0xa5; 256]).unwrap();
 
         let module_files = root.join("module");
         std::fs::create_dir_all(&module_files).unwrap();
@@ -4469,19 +4925,19 @@ mod tests {
         cpu.memory[0x1234] = 0x5a;
         assert_eq!(cpu.available_disks().unwrap(), ["DATA0001"]);
         assert!(cpu.mount_data_disk("MISSING1").is_err());
+        assert!(cpu.mount_data_disk("../DATA0001").is_err());
         cpu.mount_data_disk("DATA0001").unwrap();
         assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
         assert_eq!(cpu.pc, 0x1234);
         assert_eq!(cpu.memory[0x1234], 0x5a);
 
-        cpu.write_u16(DISK_BASE + 10, 0);
-        cpu.write_u16(DISK_BASE + 12, 0);
-        cpu.write(DISK_BASE, 0x04);
-        let ram_start = RAM_START as usize;
-        assert_eq!(
-            cpu.memory[ram_start..ram_start + DISK_BLOCK_SIZE],
-            [0xa5; DISK_BLOCK_SIZE]
-        );
+        cpu.memory[0x1000..0x100c].copy_from_slice(b"payload.bin\0");
+        cpu.write_u32(DISK_BASE + 22, 0x1000);
+        cpu.write_u32(DISK_BASE + 26, 0x2000);
+        cpu.write_u16(DISK_BASE + 30, 256);
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
+        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
+        assert_eq!(&cpu.memory[0x2000..0x2100], &[0xa5; 256]);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4601,6 +5057,39 @@ mod tests {
         cpu.signal_keyboard_event(b'B');
         assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], b'B');
         assert_eq!(cpu.read(ICR_ADDR) & 2, 2);
+    }
+
+    #[test]
+    fn guest_text_mmio_controls_display_and_writes_to_selected_cursor() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GUEST_TEXT_FOREGROUND, 3);
+        cpu.write(GUEST_TEXT_BACKGROUND, 4);
+        cpu.write(GUEST_TEXT_ROW, 1);
+        cpu.write(GUEST_TEXT_COLUMN, 2);
+        cpu.write(GUEST_TEXT_CONTROL, GUEST_TEXT_ENABLE);
+        cpu.write(GUEST_TEXT_DATA, b'A');
+
+        let cell = cpu.guest_text.cells[crate::guest_text::GUEST_TEXT_COLUMNS + 2];
+        assert_eq!(cell.character, b'A');
+        assert_eq!(cell.foreground, 3);
+        assert_eq!(cell.background, 4);
+        assert_eq!(cpu.guest_text.cursor_row, 1);
+        assert_eq!(cpu.guest_text.cursor_column, 3);
+        assert!(cpu.guest_text.enabled);
+
+        cpu.write(GUEST_TEXT_CONTROL, GUEST_TEXT_CLEAR);
+        assert_eq!(cpu.guest_text.cursor_row, 0);
+        assert_eq!(cpu.guest_text.cursor_column, 0);
+        assert!(
+            cpu.guest_text
+                .cells
+                .iter()
+                .all(|cell| cell.character == b' ')
+        );
+        assert!(cpu.guest_text.cells.iter().all(|cell| cell.background == 4));
+
+        cpu.write(GUEST_TEXT_CONTROL, GUEST_TEXT_DISABLE);
+        assert!(!cpu.guest_text.enabled);
     }
 
     #[test]

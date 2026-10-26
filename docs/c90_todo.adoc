@@ -446,10 +446,11 @@ required before claiming full C90 compatibility.
     approximations. These use the target's binary16 arithmetic and do not meet
     C90 +double+ range, precision, or exceptional-value requirements.
 ** The emulator now supplies a text console, BIOS device descriptor and
-    startup data-disk selection. This does not load programs from disk:
-    programs selected by the BIOS still come from +modules/+. This is current
-    behavior; its replacement boot and disk model is planned in
-    link:sc16_improvements.adoc[+sc16_improvements.adoc+].
+    required shared +bios.bin+ startup, folder-disk boot selection, and a
+    bounded USER-mode folder-filesystem register service. The service is not
+    the finalized general syscall ABI and does not provide file-backed C
+    streams; the remaining boot, disk-migration, and hosted-runtime work is
+    tracked in link:sc16_improvements.adoc[+sc16_improvements.adoc+].
 ** Audit all required headers: +assert.h+, +ctype.h+, +errno.h+, +float.h+,
     +limits.h+, +locale.h+, +math.h+, +setjmp.h+, +signal.h+, +stdarg.h+,
     +stddef.h+, +stdio.h+, +stdlib.h+, +string.h+, and +time.h+.
@@ -464,8 +465,9 @@ required before claiming full C90 compatibility.
     capability policy, buffering, EOF/error indicators, environment and
     command behavior, and process termination/status.
 ** Base file operations and process behavior on the folder-backed disk and
-    syscall ABI specified in link:sc16_improvements.adoc[+sc16_improvements.adoc+];
-    keep the standard C interface distinct from SC-16-specific syscalls.
+    filesystem service and syscall ABI specified in
+    link:sc16_improvements.adoc[+sc16_improvements.adoc+]; keep the standard C
+    interface distinct from SC-16-specific services.
 ** Surface unavailable resources and errors through documented C interfaces.
 ** Add tests for available and unavailable services.
 ** *Depends on:* C5 (+c90-required-headers+).

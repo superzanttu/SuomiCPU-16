@@ -25,14 +25,16 @@ contracts.
   and big-endian multi-byte values. A loaded program starts at its image entry
   point; CPU construction initializes the PC to zero and the stack pointer to
   the top of configured memory.
-* The host-implemented text-mode BIOS selects an ID-named folder disk under
-  +disks/+, validates its metadata, and loads its prebuilt boot image without
-  compiling source. Explicit source launches remain a developer workflow.
+* The required guest-resident +bios.bin+ selects an ID-named folder disk under
+  +disks/+ through a supervisor firmware service, validates its metadata, and
+  loads its prebuilt boot image without compiling source. Explicit source
+  launches remain a developer workflow.
   Applications run in the game window; the optional Bug Monitor
   displays emulator logs and guest serial output from the UART-style device.
   It is separate from the text-mode BIOS.
-* Legacy data disks are JSON-backed 256-byte block devices. Folder disks
-  provide boot images; guest filesystem integration remains incomplete.
+* Runtime storage uses folder disks with guest filesystem access. Legacy
+  JSON-backed 256-byte block images remain supported only as inputs to the
+  offline import tool.
 * The CPU has keyboard, RTC, and instruction-count timer interrupts with fixed
   vectors. Interrupts save PC and flags on the current stack; the CPU has no
   privilege modes, protected address spaces, page tables, or hardware task
@@ -303,8 +305,9 @@ Checklist status: [x] completed; [ ] planned.
 * [x] Implement the BIOS character-cell text renderer in the emulator's main
   window. Use bright green text on black with enlarged fixed-width characters
   and no glow or post-processing; do not open a separate terminal window.
-* [x] Implement a guest-visible character-cell text display for use by guest software. The
-  BIOS must continue rendering in the emulator's main window.
+* [x] Implement and wire a guest-visible character-cell text display for use
+  by guest software. The BIOS must continue rendering in the emulator's main
+  window.
 * [x] Preserve the existing game window and optional serial Bug Monitor after
   boot; switching the BIOS to text mode must not force applications into a
   text-only display mode.
@@ -312,10 +315,15 @@ Checklist status: [x] completed; [ ] planned.
   DEBUG, INFO, WARN, and ERROR records over the serial output in
   +lib/bug_monitor.h+. Route emulator lifecycle and device errors to the Bug
   Monitor; preserve raw guest serial output and the existing serial input path.
-* [ ] Use one emulator-wide +bios.bin+ as firmware; do not require a BIOS or
+* [x] Use one emulator-wide +bios.bin+ as firmware; do not require a BIOS or
   +boot.bin+ on each disk. Separate emulator hardware initialization from
   firmware execution, then transfer control to the BIOS at the documented
   kernel-mode entry point. BIOS must not compile or assemble guest programs.
+** [x] Require +bios.bin+ at the emulator root, load its executable image at
+   address zero, execute its entry point on startup and cold reset, and show
+   missing or invalid firmware in the BIOS startup UI.
+** [x] Replace the current firmware handoff stub and host-side selector with
+   the finalized guest BIOS boot flow.
 * [x] Implement BIOS disk discovery and text-mode disk selection. After
   selection, validate disk metadata and require exactly one boot
   executable: if only +kernel.bin+ exists, load it in KERNEL mode; if only
@@ -329,15 +337,16 @@ Checklist status: [x] completed; [ ] planned.
 * [x] Treat the presence of +kernel.bin+ as authorization to execute that
   disk-provided image in KERNEL mode. Document this trust model clearly; disk
   metadata and user-mode programs must not be able to change the BIOS rule.
-* [ ] Add boot tests for cold reset, common BIOS startup, text-mode rendering
+* [x] Add boot tests for cold reset, common BIOS startup, text-mode rendering
   and selection, direct executable loading, both launch modes, both
   +NOT_BOOT+ cases, invalid images, and recoverable boot failures.
 
 === Phase 3 — Replace block disks with folder-backed filesystems
 
-* [ ] Design a disk abstraction backed by one explicitly configured host folder
+* [x] Design a disk abstraction backed by one explicitly configured host folder
   per disk. A disk's files and subfolders appear as its guest-visible
   filesystem; do not emulate sectors, cylinders, blocks, or block pointers.
+** [x] Mount the selected boot folder as the guest filesystem.
 * [x] Implement folder-disk metadata parsing and discovery, including disk
   identity, label, virtual capacity, disk-wide read/write mode, and protected
   files.
@@ -349,36 +358,45 @@ Checklist status: [x] completed; [ ] planned.
   manifests on candidate disks.
 ** [x] Enforce capacity and read-only policies during host-side filesystem
   operations and reject over-capacity disks at mount time.
-* [ ] Implement guest filesystem operations for listing directories, reading
+* [x] Implement guest filesystem operations for listing directories, reading
   files, writing files, creating directories, deleting/renaming entries, and
   querying metadata, subject to the finalized syscall/device interface.
 ** [x] Implement host-side folder-disk listing, reads, writes, directory
   listing/creation, file copy, file and empty-directory deletion/rename, and
   manifest queries.
-** [ ] Expose these operations through the guest filesystem/syscall interface
-   with bounded transfers and defined errors.
-* [ ] Confine normalized guest paths to the mounted disk root. Reject traversal,
+** [x] Expose these operations through the guest filesystem register gateway
+   with bounded transfers, path validation, explicit status, and Bug Monitor
+   diagnostics; execute a guest read request through the CPU.
+* [x] Confine normalized guest paths to the mounted disk root. Reject traversal,
   invalid paths, unsupported file types, and host I/O failures explicitly.
 ** [x] Enforce path syntax, mounted-root confinement, regular-file-only access,
    and explicit host I/O errors in the host-side folder-disk API.
-* [ ] Enforce disk-wide read-only status and the metadata-listed per-file
+** [x] Validate user path and buffer ranges before filesystem requests; reject
+   traversal and MMIO-overlapping buffers without wrapping or silently
+   defaulting invalid pointers.
+* [x] Enforce disk-wide read-only status and the metadata-listed per-file
   read-only set. Protected files cannot be written, replaced, deleted, renamed,
   or otherwise mutated; do not add general user/group/owner access-control
   semantics.
 ** [x] Enforce disk-wide read-only and per-file protection for host-side write,
   create, copy, delete, and rename operations.
+** [x] Apply these policies to guest filesystem mutations and reserve the root
+   boot executable names from guest changes.
 * [x] Define used capacity as the sum of regular-file byte lengths, excluding
   root manifest and directory overhead.
 ** [x] Account file growth and enforce the declared capacity hard limit for
   host-side writes and file copies.
-* [ ] Migrate existing JSON block disks and module data into folder-backed disk
+* [x] Migrate existing JSON block disks and module data into folder-backed disk
   images with a documented conversion tool or import path; keep all source
   files and source disk images.
 ** [x] Provide +sc16build import-block-disk+ to export JSON block contents as
   +legacy-blocks/NNNNN.bin+, preserve read-only status, and refuse to overwrite
   the source or an existing destination.
-** [ ] Migrate module assets and package runnable applications as boot disks.
-* [ ] Remove block-level disk device behavior only after replacement APIs and
+** [x] Import both existing JSON disks without changing the originals, then
+   package all 17 runnable modules and their local disk assets as validated
+   boot disks. Execute all packages through the runtime; include Tank-16 maps
+   and tile assets.
+* [x] Remove block-level disk device behavior only after replacement APIs and
   migration are covered by tests. Update disk editor, BIOS selection, examples,
   and documentation to use disks rather than data-disk blocks.
 
@@ -477,8 +495,10 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Add +sc16build package-disk+ to build one source into a new v1 disk
   folder with +main.bin+ or +kernel.bin+ and a manifest, without overwriting
   the source or an existing destination.
-** [ ] Migrate all runnable modules and their runtime assets to validated disk
+** [x] Migrate all runnable modules and their runtime assets to validated disk
   folders and boot them through the emulator-wide BIOS.
+** [x] Add +sc16build package-modules+ to package every bootable C module,
+   including its local +disks/+ tree, without overwriting existing disks.
 * [ ] Move assembly and C compilation out of BIOS/emulator startup. Provide
   offline build commands that compile and link programs, produce the specified
   executable image, and package the disk manifest and files.

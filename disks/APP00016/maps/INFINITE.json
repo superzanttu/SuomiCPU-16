@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "name": "INFINITE",
+  "infinite": true,
+  "seed": 314159,
+  "terrain_tiles": [0, 1, 2, 4, 5],
+  "obstacle_density": 73,
+  "obstacle_tiles": [0, 1, 2, 3, 4, 5, 6, 7]
+}

@@ -11,13 +11,15 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let Some(source) = arguments.next() else {
-        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel]".into());
+        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel] | package-modules <disk-root> <capacity-bytes>".into());
     };
     if source == "--help" || source == "-h" {
         println!("Usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img]");
         println!("Build SC-16 source, wrap a flat binary, or validate an existing image.");
         println!("       sc16build smoke-modules");
         println!("Compile every bootable BIOS module as a smoke check.");
+        println!("       sc16build package-modules <disk-root> <capacity-bytes>");
+        println!("Package every bootable C module and its local disk assets.");
         println!("       sc16build import-block-disk <legacy.json> <destination-folder>");
         println!("Import a legacy JSON block disk without modifying its source.");
         println!(
@@ -31,6 +33,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err("usage: sc16build smoke-modules".into());
         }
         return smoke_modules();
+    }
+    if source == "package-modules" {
+        let Some(disk_root) = arguments.next() else {
+            return Err("usage: sc16build package-modules <disk-root> <capacity-bytes>".into());
+        };
+        let Some(capacity) = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Err("usage: sc16build package-modules <disk-root> <capacity-bytes>".into());
+        };
+        if arguments.next().is_some() {
+            return Err("usage: sc16build package-modules <disk-root> <capacity-bytes>".into());
+        }
+        return package_modules(Path::new(&disk_root), capacity);
     }
     if source == "import-block-disk" {
         let Some(legacy_disk) = arguments.next() else {
@@ -212,6 +230,78 @@ fn package_disk(
         let _ = fs::remove_dir_all(disk_folder);
     }
     result
+}
+
+fn package_modules(
+    disk_root: &Path,
+    capacity_bytes: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let modules = discover_boot_modules(&repository.join("modules"))?;
+    fs::create_dir_all(disk_root)?;
+    let mut index = 1u32;
+    for module in modules {
+        let Some(source) = module.source else {
+            println!(
+                "Skipped {}: {}",
+                module.name,
+                module.error.as_deref().unwrap_or("no boot source")
+            );
+            continue;
+        };
+        let disk_id = format!("APP{index:05}");
+        let disk_path = disk_root.join(&disk_id);
+        package_disk(&source, &disk_path, &module.name, capacity_bytes, false)?;
+        let package_result = (|| {
+            let asset_root = source
+                .parent()
+                .ok_or_else(|| "module source has no parent directory")?
+                .join("disks");
+            if asset_root.exists() {
+                copy_module_assets(&asset_root, &disk_path)?;
+            }
+            suomicpu16::disk::FolderDisk::open(&disk_path).map_err(std::io::Error::other)?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })();
+        if let Err(error) = package_result {
+            let _ = fs::remove_dir_all(&disk_path);
+            return Err(error);
+        }
+        println!(
+            "Packaged {} as main.bin -> {}",
+            module.name,
+            disk_path.display()
+        );
+        index += 1;
+    }
+    Ok(())
+}
+
+fn copy_module_assets(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("module asset is a symbolic link: {}", source_path.display()),
+            ));
+        }
+        if file_type.is_dir() {
+            fs::create_dir(&destination_path)?;
+            copy_module_assets(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported module asset: {}", source_path.display()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct BootModule {

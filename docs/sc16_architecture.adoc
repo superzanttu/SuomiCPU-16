@@ -7,9 +7,8 @@
 This document defines the target machine contract and records the relevant
 legacy behavior during migration. Target rules are normative for new CPU,
 firmware, and kernel work; they do not imply that the emulator already enforces
-them. The guest character-cell display contract is specified below but is not
-implemented. The BIOS renderer described below is host-side firmware UI, not a
-guest display device.
+them. The guest character-cell display and guest-resident BIOS are implemented.
+The host renders an error screen only when the firmware image cannot be loaded.
 
 == Machine model
 
@@ -92,9 +91,10 @@ never invokes a compiler or assembler.
 
 == Reset and firmware entry
 
-On cold reset, hardware initialization loads the emulator-wide `bios.bin` at
-physical address zero and initializes devices before starting instruction
-execution. CPU state is:
+On cold reset, hardware initialization resets the CPU and devices, then loads
+the required emulator-wide `bios.bin` at physical address zero. Missing or
+malformed firmware is shown as a recoverable BIOS startup error; there is no
+source-compilation or host-selector fallback. CPU state is:
 
 * PC = 0; R0-R7 = 0; flags clear.
 * Supervisor (kernel) mode; interrupts disabled.
@@ -104,11 +104,18 @@ execution. CPU state is:
 * Interrupt-pending state and device control registers are reset to their
   documented power-on values.
 
-Firmware owns initialization and boot selection. It may enable interrupts only
-after its handlers and kernel stack are ready. It transfers control to the
-selected kernel through a supervisor-mode entry; it must not compile or
-assemble guest source during boot. A user executable is entered only through
-the protected supervisor-to-user transition.
+The common firmware image starts at address zero and continues executing until
+it launches a selected image. The guest BIOS renders its selector through the
+character-cell device, polls the keyboard device, and uses the supervisor-only
+firmware service at +0x43400+ to enumerate candidate disk IDs and boot the
+selected folder. The service validates the selected manifest and fixed
+executable rule, loads the prebuilt image, mounts the disk, and transfers
+execution in the mode selected by the executable name. The host does not
+render or drive the disk selector. Neither firmware nor the service compiles
+or assembles guest source during boot. KERNEL images are trusted supervisor
+code; the current design does not claim authenticated boot or memory
+isolation. Firmware may enable interrupts only after its handlers and kernel
+stack are ready.
 
 == Privilege and control state
 
@@ -203,46 +210,55 @@ These addresses and operations remain compatibility behavior while existing
 programs use them. In the target architecture, device registers are
 supervisor-only unless a specific safe mapping is explicitly granted. Kernel
 services, not user pointers or manifest metadata, authorize access. The
-folder-disk and syscall documents define the filesystem boundary; the legacy
-block interface is not the target filesystem ABI.
+folder-disk syscall gateway is the current narrow exception: user mode may
+write only the documented folder-filesystem request commands to the disk
+control register. The emulator validates guest path and buffer ranges, runs
+the host filesystem operation in supervisor service context, and restores the
+caller mode. Legacy block commands are rejected in user mode. This gateway is
+not a general syscall instruction, does not protect unrelated MMIO or memory,
+and does not imply process isolation; the broader privilege, MMU, and syscall
+ABI work remains open.
 
-== Firmware text renderer
+== Firmware text display
 
-The current BIOS selector draws in the emulator's 640 by 480 main window. Its
-logical surface is 53 columns by 25 rows, with 12 by 16 pixel cell slots. It
-renders printable ASCII bytes 32-126 using the embedded 5 by 7 font doubled
-to 10 by 14 pixels; other input bytes render as `?`. The background is black,
-normal text is `0xff75ff9a`, and emphasized text is `0xffc8ffd5`. The BIOS
-redraws its selector frame and has no independent terminal cursor or
-scrollback. Serial diagnostics and guest pixel graphics remain separate
-surfaces.
+The guest BIOS writes its selector to the guest-visible character-cell
+surface, rendered in the emulator's 640 by 480 main window. The logical
+surface is 53 columns by 25 rows, with 12 by 16 pixel cell slots. It renders
+printable ASCII bytes 32-126 using the embedded 5 by 7 font doubled to 10 by
+14 pixels; other input bytes render as `?`. The background is black and the
+firmware selects bright green text. Serial diagnostics and guest pixel
+graphics remain separate surfaces.
 
-This renderer contract does not define a guest-visible text device. A guest
-character-cell display is a separate OS service with this contract:
+The guest-visible character-cell display uses a separate surface with this
+contract:
 
 * The surface is 53 columns by 25 rows. Each cell occupies a 12 by 16 pixel
-  slot and uses the same embedded 5 by 7 glyphs doubled to 10 by 14 pixels.
+  slot at 640 by 480, and uses the same embedded 5 by 7 glyphs doubled to 10
+  by 14 pixels. At 320 by 240 the same surface is scaled to 6 by 8 pixel cells.
 * Character data is one byte. Printable ASCII bytes 32-126 render as their
   glyph; other bytes render as `?`. Control bytes are interpreted by the text
-  service and do not occupy cells.
-* Each cell has an 8-bit foreground palette index and an 8-bit background
-  palette index. Palette changes are owned by the kernel display service.
+  service: line feed (10), carriage return (13), backspace (8), and tab (9)
+  do not occupy cells.
+* Foreground and background colors are 8-bit indexes into the current system
+  palette. Guests can select the colors applied to subsequently written cells.
 * The cursor is a row/column pair. Line feed advances one row without changing
   the column; carriage return moves to column zero; backspace moves left and
   blanks that cell; tab advances to the next multiple-of-eight column. Text
   written at the last column wraps. Advancing beyond the last row scrolls all
   rows up by one, clears the final row using the current background, and leaves
   the cursor there.
-* The BIOS owns the text surface until a successful kernel handoff. The kernel
-  then owns display-mode selection and grants a guest text service; reset or a
-  recoverable boot failure returns ownership to the BIOS. Guest text and pixel
-  graphics are distinct surfaces, and enabling text does not disable the
-  existing game graphics window.
+* The service is exposed through guest-visible byte registers at `0x43300`:
+  data at offset 0, foreground at 1, background at 2, control at 3, row at 4,
+  and column at 5. Control commands 1, 2, and 3 clear, enable, and disable the
+  surface. Cursor coordinates are zero-based and clamped to the surface. The
+  register definitions are in +lib/guest_text.h+.
+* The text surface is overlaid after pixel graphics; enabling it does not
+  disable or replace the existing game graphics window. It is disabled on
+  reset and is not the serial diagnostics/Bug Monitor channel.
 
-The guest service is kernel-mediated; user programs do not write host renderer
-memory or protected display registers directly. Its syscall numbers and
-argument encoding belong to the Phase 7 syscall ABI. The guest display is not
-the serial diagnostics/Bug Monitor channel.
+This byte-register interface is the initial guest display API; it is not a
+general syscall or memory-protection boundary. A future kernel syscall ABI
+may mediate access and enforce display ownership.
 
 == Compatibility boundary
 
