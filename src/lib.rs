@@ -13,6 +13,7 @@ pub mod net;
 pub mod runtime;
 pub mod scheduler;
 pub mod sprite_viewer;
+pub mod syscall;
 pub mod tank16_assets;
 pub mod tank16_finland;
 pub mod tank16_map;

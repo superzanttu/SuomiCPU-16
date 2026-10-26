@@ -154,9 +154,10 @@ memory when MMU translation is enabled. Page permissions apply to every byte
 of multi-byte accesses. The supervisor-only `enter_user_mode` transition
 validates the entry point and stack, and validates their page permissions when
 translation is enabled. `SVC` is encoded as `0x0080` and dispatches through
-vector 128; it is only the privilege-transition boundary, not a finalized
-general syscall ABI. Do not treat the legacy no-MMU user mode as an isolation
-boundary.
+vector 128. ABI version 1 uses this instruction for the syscall interface
+below. An `SVC` with R7 zero retains ordinary guest-handler delivery; unknown
+nonzero ABI versions are rejected. Do not treat the legacy no-MMU user mode as
+an isolation boundary.
 
 == Exceptions and interrupts
 
@@ -224,9 +225,10 @@ boundary; otherwise delivery enters the installed vector handler.
 The emulator-side scheduler context contains R0-R7, PC, SP, KSP, flags,
 privilege mode, interrupt-enable state, MMU-enabled state, and page-directory
 identity. The scheduler provides runnable, running, blocked, and exited states
-with round-robin selection, yield, exit, block, and wake operations. These are
-kernel/emulator primitives, not guest syscalls; a booted kernel and a stable
-guest task ABI remain future integration work.
+with round-robin selection, yield, exit, block, and wake operations. The
+versioned guest syscall interface below exposes the supported process and
+synchronization services; a booted general-purpose kernel and Phase 9
+end-to-end lifecycle remain future integration work.
 
 == Memory translation
 
@@ -262,9 +264,62 @@ disk, and console registers through memory-mapped addresses. User instruction
 access is filtered by safe service ranges; privileged controls and BIOS
 registers are rejected. The folder-filesystem gateway validates user pointers
 against the active MMU mappings, including noncontiguous buffers, when paging
-is enabled. Legacy block commands are rejected in user mode. This gateway is
-not a general syscall ABI. With translation disabled, ordinary RAM is not
-isolated from user code.
+is enabled. Legacy block commands are rejected in user mode. This device
+gateway remains distinct from the general syscall ABI. With translation
+disabled, ordinary RAM is not isolated from user code.
+
+== System-call ABI version 1
+
+User software invokes `SVC` (`0x0080`) with a present vector-128 IDT
+descriptor whose DPL is 3. The processor enters supervisor mode on KSP and
+validates the event frame. For ABI version 1, emulator-side kernel services
+dispatch the call in Rust and return through that frame; the configured guest
+handler is validated but its instructions are not executed for ABI calls.
+`R7` contains the ABI version, `R0` the syscall number, and `R1` through `R6`
+the arguments. `R0` is the result register. Errors are negative errno-style
+values; unknown numbers or unsupported nonzero versions return `-EINVAL`.
+Register arguments contain complete 30-bit pointers and scalar values; C
+`long` arguments use the target's high-word/low-word stack representation,
+which the native wrappers combine before `SVC`.
+
+[cols="1,1,2"]
+|===
+|Number |Name |Arguments and result
+
+|0 |`getpid` |Returns the current task ID.
+|1 |`exit` |R1 is status 0-255; terminates the current task.
+|2 |`yield` |Reschedules the current task; returns zero when resumed.
+|3 |`spawn` |R1 is a null-terminated executable path; returns child task ID.
+|4 |`mmap` |R1 length (1-16 MiB), R2 permissions, R3 aligned hint or zero;
+  a zero hint uses `0x20000000`; returns the mapped address.
+|5 |`open` |R1 path, R2 flags; returns a process-local handle.
+|6 |`read` |R1 handle, R2 writable buffer, R3 length; returns bytes read.
+|7 |`write` |R1 handle, R2 readable buffer, R3 length; returns bytes written.
+|8 |`close` |R1 handle; closes a process-local handle.
+|9 |`sleep` |R1 deterministic instruction ticks; blocks until the deadline.
+|10 |`wait` |R1 child task ID; returns exit status in R0 and child ID in R1.
+|11 |`semop` |R1 operation, R2 semaphore ID, R3 initial count for CREATE.
+|===
+
+Every user pointer is range-checked against the active address space before
+use. Paths are ASCII, null-terminated, and limited to 128 bytes; read/write
+transfers are limited to 4096 bytes. Handles 0, 1, and 2 are nonblocking
+console input, console output, and console error; allocated folder-file
+handles start at 3 and belong to one process. Open flags are READ=1, WRITE=2,
+CREATE=4, TRUNCATE=8, and APPEND=16. Append writes select the current file end
+for each write. `mmap` permission bits are READ=1, WRITE=2, EXEC=4; mapped
+pages belong to the caller's address space. Sleep advances on deterministic
+emulator instruction ticks. Wait accepts only a direct child and reaps it
+after collecting status. Semaphore CREATE returns a new ID; WAIT, POST, and
+DESTROY return zero on success.
+
+Semaphore operations are CREATE=0, WAIT=1, POST=2, and DESTROY=3. The creating
+process owns a semaphore; WAIT blocks at count zero, POST wakes one waiter, and
+owned semaphores are removed when that process exits. In the C wrapper,
+`sc16_mmap` returns the mapped address as `long` or a negative error; the
+remaining wrappers return the corresponding ABI result. The C interface in
+`lib/sc16_syscall.h` provides SC-16-specific wrappers; it does not claim that
+standard hosted C file streams are implemented.
 
 == Firmware text display
 
@@ -304,17 +359,16 @@ contract:
   reset and is not the serial diagnostics/Bug Monitor channel.
 
 This byte-register interface is the initial guest display API; it is not a
-general syscall or memory-protection boundary. User access remains limited to
-the allowed text registers, and any future kernel syscall ABI may further
-mediate access and enforce display ownership.
+memory-protection boundary. User access remains limited to the allowed text
+registers; the syscall ABI does not yet mediate display ownership.
 
 == Compatibility boundary
 
 Reset initializes PC to zero and SP/KSP to the top of configured memory,
 enters supervisor mode, and leaves interrupts and MMU translation disabled.
 Privilege transitions, IDT delivery, deterministic PIT timing, scheduler
-contexts, page translation, page faults, and frame/mapping helpers are
-implemented and tested. Normal BIOS USER boot still enters compatibility
-user mode without installing MMU mappings; it must not be described as
-process-isolated. A booted kernel, general syscall ABI, authenticated boot,
-and Phase 9 multi-process lifecycle remain open.
+contexts, page translation, page faults, frame/mapping helpers, and syscall ABI
+version 1 are implemented and tested. Normal BIOS USER boot still enters
+compatibility user mode without installing MMU mappings; it must not be
+described as process-isolated. A booted kernel, authenticated boot, and the
+Phase 9 multi-process lifecycle remain open.

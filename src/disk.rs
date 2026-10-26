@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 const BLOCK_SIZE: usize = 256;
@@ -274,6 +274,12 @@ impl FolderDisk {
         Ok(FolderBootImage { mode, image })
     }
 
+    pub fn load_executable(&self, file_path: &str) -> Result<crate::image::ProgramImage, String> {
+        let path = self.resolve_regular_file(file_path)?;
+        crate::image::read_image(&path)
+            .map_err(|error| format!("invalid executable {file_path:?}: {error}"))
+    }
+
     fn is_regular_file(&self, path: &Path, name: &str) -> Result<bool, String> {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -377,6 +383,81 @@ impl FolderDisk {
         }
         fs::write(&target, data)
             .map_err(|error| format!("cannot write folder disk file {file_path:?}: {error}"))
+    }
+
+    pub fn write_file_at(&self, file_path: &str, offset: u64, data: &[u8]) -> Result<(), String> {
+        self.ensure_mutable(file_path)?;
+        let path = self.resolve_regular_file(file_path)?;
+        let previous_length = fs::metadata(&path)
+            .map_err(|error| format!("cannot inspect folder disk file {file_path:?}: {error}"))?
+            .len();
+        if offset > previous_length {
+            return Err("folder disk writes cannot create sparse file regions".to_owned());
+        }
+        let new_length = offset
+            .checked_add(data.len() as u64)
+            .map(|length| length.max(previous_length))
+            .ok_or_else(|| "folder disk file size overflow".to_owned())?;
+        let used_bytes = self.used_bytes()?;
+        let new_usage = used_bytes
+            .checked_sub(previous_length)
+            .and_then(|usage| usage.checked_add(new_length))
+            .ok_or_else(|| "folder disk usage overflow".to_owned())?;
+        if new_usage > self.manifest.capacity_bytes {
+            return Err("folder disk capacity exceeded".to_owned());
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("cannot open folder disk file {file_path:?}: {error}"))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("cannot seek folder disk file {file_path:?}: {error}"))?;
+        file.write_all(data)
+            .map_err(|error| format!("cannot write folder disk file {file_path:?}: {error}"))
+    }
+
+    pub fn create_empty_file(&self, file_path: &str) -> Result<(), String> {
+        let relative = validate_file_path(file_path)?;
+        self.ensure_mutable(file_path)?;
+        let parent = self.resolve_parent_directory(&relative)?;
+        let target = parent.join(
+            relative
+                .file_name()
+                .ok_or_else(|| "invalid folder disk file path".to_owned())?,
+        );
+        let used_bytes = self.used_bytes()?;
+        if used_bytes > self.manifest.capacity_bytes {
+            return Err("folder disk capacity exceeded".to_owned());
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|error| format!("cannot create folder disk file {file_path:?}: {error}"))?;
+        Ok(())
+    }
+
+    pub fn ensure_regular_file(&self, file_path: &str, create: bool) -> Result<(), String> {
+        let relative = validate_file_path(file_path)?;
+        let parent = self.resolve_parent_directory(&relative)?;
+        let target = parent.join(
+            relative
+                .file_name()
+                .ok_or_else(|| "invalid folder disk file path".to_owned())?,
+        );
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err("folder disk entries must be regular files".to_owned())
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                self.create_empty_file(file_path)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err("folder disk file not found".to_owned())
+            }
+            Err(error) => Err(format!("cannot inspect folder disk file: {error}")),
+        }
     }
 
     pub fn copy_file(&self, source: &str, destination: &str) -> Result<(), String> {

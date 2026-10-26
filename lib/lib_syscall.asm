@@ -1,0 +1,193 @@
+.address 0x2800
+
+sc16_getpid:
+    LDI R0, 0
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
+sc16_exit:
+    LDWS R1, 4
+    LDI R0, 1
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_yield:
+    LDI R0, 2
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_spawn:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDI R0, 3
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
+sc16_mmap:
+    LDWS R4, 12
+    LDWS R5, 10
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R3, R4
+    LDWS R2, 8
+    AND R2, R6
+    LDWS R4, 4
+    LDWS R5, 6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDI R0, 4
+    LDI R7, 1
+    SVC
+    JMPX __sc16_mmap_result_long
+
+sc16_open:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDWS R2, 8
+    AND R2, R6
+    LDI R0, 5
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_read:
+    LDWS R1, 4
+    LDWS R4, 8
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 10
+    AND R3, R6
+    LDI R0, 6
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_write:
+    LDWS R1, 4
+    LDWS R4, 8
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 10
+    AND R3, R6
+    LDI R0, 7
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_close:
+    LDWS R1, 4
+    LDI R6, 0xFFFF
+    AND R1, R6
+    LDI R0, 8
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_sleep:
+    LDWS R4, 4
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDI R0, 9
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_wait:
+    LDWS R4, 4
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDI R0, 10
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_semop:
+    LDWS R1, 4
+    LDWS R4, 6
+    LDWS R5, 8
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 10
+    AND R3, R6
+    LDI R0, 11
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
+__sc16_id_result_long:
+    MOV R5, R0
+    SPLIT30 R5, R1
+    LDI R6, 0x3FFF
+    CMP R5, R6
+    BNZX __sc16_id_result_success
+    LDI R6, 0x8000
+    AND R1, R6
+    LDI R7, 0
+    CMP R1, R7
+    BZX __sc16_id_result_success
+__sc16_id_result_error:
+    MOV R1, R0
+    LDI R6, 0xFFFF
+    AND R1, R6
+    LDI R0, 0xFFFF
+    RET
+__sc16_id_result_success:
+    MOV R0, R5
+    RET
+
+__sc16_mmap_result_long:
+    MOV R5, R0
+    SPLIT30 R5, R1
+    LDI R6, 0x0FFF
+    AND R6, R1
+    LDI R7, 0
+    CMP R6, R7
+    BZX __sc16_mmap_result_success
+    MOV R1, R0
+    LDI R6, 0xFFFF
+    AND R1, R6
+    LDI R0, 0xFFFF
+    RET
+__sc16_mmap_result_success:
+    MOV R0, R5
+    RET

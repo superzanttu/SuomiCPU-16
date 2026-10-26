@@ -1,5 +1,5 @@
 use memmap2::MmapMut;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -9,6 +9,7 @@ use crate::disk::{FolderBootMode, FolderDisk};
 use crate::guest_text::GuestTextDisplay;
 use crate::net::{DEFAULT_PORT, NetNode};
 use crate::scheduler::{Scheduler, SchedulerError, TaskContext, TaskId, TaskState};
+use crate::syscall::{KernelState, OpenFile, SyscallNumber};
 
 pub const MEMORY_SIZE: usize = 1 << 30;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
@@ -383,6 +384,8 @@ pub struct Cpu {
     page_directory: u32,
     last_page_fault: Option<crate::mmu::PageFault>,
     scheduler: Scheduler,
+    syscall_state: KernelState,
+    page_memory_manager: Option<crate::mmu::PageMemoryManager>,
 }
 
 impl Cpu {
@@ -504,6 +507,8 @@ impl Cpu {
             page_directory: 0,
             last_page_fault: None,
             scheduler: Scheduler::default(),
+            syscall_state: KernelState::default(),
+            page_memory_manager: None,
         })
     }
 
@@ -887,6 +892,8 @@ impl Cpu {
         self.last_page_fault = None;
         self.idt_base = None;
         self.scheduler = Scheduler::default();
+        self.syscall_state = KernelState::default();
+        self.page_memory_manager = None;
         self.running = true;
         self.booted_disk_path = None;
         if let Some(interrupt_control) = self.memory.get_mut(ICR_ADDR as usize) {
@@ -1085,6 +1092,16 @@ impl Cpu {
         self.mmu_enabled = context.mmu_enabled;
         self.page_directory = context.page_directory;
         self.running = true;
+        if let Some(result) = self.syscall_state.pending_results.remove(&context.id) {
+            self.registers[crate::syscall::REGISTER_NUMBER] = result;
+        }
+        if let Some((child_id, exit_code)) =
+            self.syscall_state.pending_wait_status.remove(&context.id)
+        {
+            self.registers[crate::syscall::REGISTER_NUMBER] = i64::from(exit_code);
+            self.registers[crate::syscall::REGISTER_ARGUMENT_0] = i64::from(child_id);
+            self.reap_process(context.id, child_id);
+        }
     }
 
     pub fn load_idt(&mut self, base: u32) -> Result<(), CpuError> {
@@ -1645,6 +1662,901 @@ impl Cpu {
             bytes.push(byte);
         }
         Err("guest path is not null-terminated within 128 bytes".to_owned())
+    }
+
+    fn dispatch_user_syscall(&mut self) -> Result<(), CpuError> {
+        let version = self.registers[crate::syscall::REGISTER_ABI_VERSION];
+        let number = self.registers[crate::syscall::REGISTER_NUMBER];
+        let task_id = self.scheduler.current_task();
+        if let Some(id) = task_id {
+            self.syscall_state.register_process(id, None);
+        }
+
+        let mut scheduled_state = None;
+        let result = if version != crate::syscall::ABI_VERSION {
+            crate::syscall::error::INVALID
+        } else {
+            match SyscallNumber::try_from(number) {
+                Ok(SyscallNumber::GetPid) => task_id
+                    .map(i64::from)
+                    .unwrap_or(crate::syscall::error::INVALID),
+                Ok(SyscallNumber::Exit) => match self.registers[1] {
+                    status @ 0..=255 => {
+                        scheduled_state = Some((TaskState::Exited, status as i32));
+                        0
+                    }
+                    _ => crate::syscall::error::INVALID,
+                },
+                Ok(SyscallNumber::Yield) => {
+                    scheduled_state = Some((TaskState::Runnable, 0));
+                    0
+                }
+                Ok(SyscallNumber::Open) => self.syscall_open(task_id),
+                Ok(SyscallNumber::Read) => self.syscall_read(task_id),
+                Ok(SyscallNumber::Write) => self.syscall_write(task_id),
+                Ok(SyscallNumber::Close) => self.syscall_close(task_id),
+                Ok(SyscallNumber::Spawn) => self.syscall_spawn(task_id),
+                Ok(SyscallNumber::Mmap) => self.syscall_mmap(task_id),
+                Ok(SyscallNumber::Sleep) => self.syscall_sleep(task_id, &mut scheduled_state),
+                Ok(SyscallNumber::Wait) => self.syscall_wait(task_id, &mut scheduled_state),
+                Ok(SyscallNumber::Semaphore) => {
+                    self.syscall_semaphore(task_id, &mut scheduled_state)
+                }
+                Err(()) => crate::syscall::error::INVALID,
+            }
+        };
+
+        self.registers[crate::syscall::REGISTER_NUMBER] = result;
+        self.return_from_exception()?;
+        if let Some((state, exit_code)) = scheduled_state {
+            let Some(id) = task_id else {
+                self.registers[crate::syscall::REGISTER_NUMBER] = crate::syscall::error::INVALID;
+                return Ok(());
+            };
+            if state == TaskState::Exited {
+                self.complete_process(id, exit_code);
+            }
+            self.schedule_current_task(state, (state == TaskState::Exited).then_some(exit_code))?;
+        }
+        Ok(())
+    }
+
+    fn syscall_open(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let address = match u32::try_from(self.registers[1]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let flags = match u32::try_from(self.registers[2]) {
+            Ok(flags) if flags != 0 && flags & !crate::syscall::open_flags::ALL == 0 => flags,
+            _ => return crate::syscall::error::INVALID,
+        };
+        if flags & (crate::syscall::open_flags::READ | crate::syscall::open_flags::WRITE) == 0
+            || (flags & crate::syscall::open_flags::CREATE != 0
+                && flags & crate::syscall::open_flags::WRITE == 0)
+            || (flags & crate::syscall::open_flags::TRUNCATE != 0
+                && flags & crate::syscall::open_flags::WRITE == 0)
+            || (flags & crate::syscall::open_flags::APPEND != 0
+                && flags & crate::syscall::open_flags::WRITE == 0)
+            || (flags & crate::syscall::open_flags::APPEND != 0
+                && flags & crate::syscall::open_flags::TRUNCATE != 0)
+        {
+            return crate::syscall::error::INVALID;
+        }
+        let path = match self.read_guest_path(address, true) {
+            Ok(Some(path)) => path,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        if flags & crate::syscall::open_flags::WRITE != 0
+            && Self::validate_guest_mutation_path(&path).is_err()
+        {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Some(disk) = self
+            .folder_disk
+            .as_ref()
+            .or(self.module_folder_disk.as_ref())
+        else {
+            return crate::syscall::error::IO;
+        };
+        if flags & crate::syscall::open_flags::WRITE != 0 && disk.manifest().read_only {
+            return crate::syscall::error::PERMISSION;
+        }
+        if disk
+            .ensure_regular_file(&path, flags & crate::syscall::open_flags::CREATE != 0)
+            .is_err()
+        {
+            return crate::syscall::error::NO_ENTRY;
+        }
+        if flags & crate::syscall::open_flags::TRUNCATE != 0 && disk.write_file(&path, &[]).is_err()
+        {
+            return crate::syscall::error::PERMISSION;
+        }
+        let offset = if flags & crate::syscall::open_flags::APPEND != 0 {
+            match disk.metadata(&path) {
+                Ok(metadata) => metadata.size_bytes,
+                Err(_) => return crate::syscall::error::IO,
+            }
+        } else {
+            0
+        };
+        match self.syscall_state.allocate_file_handle(
+            task_id,
+            OpenFile {
+                path,
+                offset,
+                flags,
+            },
+        ) {
+            Ok(handle) => i64::from(handle),
+            Err(error) => error,
+        }
+    }
+
+    fn syscall_read(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let handle = match u32::try_from(self.registers[1]) {
+            Ok(handle) => handle,
+            Err(_) => return crate::syscall::error::BAD_HANDLE,
+        };
+        let destination = match u32::try_from(self.registers[2]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let length = match usize::try_from(self.registers[3]) {
+            Ok(length) if length <= crate::syscall::MAX_TRANSFER_BYTES => length,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let output = match self.guest_memory_addresses(
+            destination,
+            length,
+            crate::mmu::MemoryAccess::Write,
+            true,
+        ) {
+            Ok(addresses) => addresses,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        if handle == 0 {
+            let bytes_read = length.min(self.console.receive_buffer().len());
+            for address in output.iter().take(bytes_read) {
+                self.memory[*address] = self.console.read_data();
+            }
+            return bytes_read as i64;
+        }
+        if handle < 3 {
+            return crate::syscall::error::BAD_HANDLE;
+        }
+        let Some(file) = self.syscall_state.file(task_id, handle).cloned() else {
+            return crate::syscall::error::BAD_HANDLE;
+        };
+        if file.flags & crate::syscall::open_flags::READ == 0 {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Some(disk) = self
+            .folder_disk
+            .as_ref()
+            .or(self.module_folder_disk.as_ref())
+        else {
+            return crate::syscall::error::IO;
+        };
+        let data = match disk.read_file(&file.path, file.offset, length) {
+            Ok((data, _)) => data,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        for (address, byte) in output.into_iter().zip(data.iter().copied()) {
+            self.memory[address] = byte;
+        }
+        if let Some(file) = self.syscall_state.file_mut(task_id, handle) {
+            file.offset = file.offset.saturating_add(data.len() as u64);
+        }
+        data.len() as i64
+    }
+
+    fn syscall_write(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let handle = match u32::try_from(self.registers[1]) {
+            Ok(handle) => handle,
+            Err(_) => return crate::syscall::error::BAD_HANDLE,
+        };
+        let source = match u32::try_from(self.registers[2]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let length = match usize::try_from(self.registers[3]) {
+            Ok(length) if length <= crate::syscall::MAX_TRANSFER_BYTES => length,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let input =
+            match self.guest_memory_addresses(source, length, crate::mmu::MemoryAccess::Read, true)
+            {
+                Ok(addresses) => addresses,
+                Err(_) => return crate::syscall::error::BAD_ADDRESS,
+            };
+        let data: Vec<u8> = input
+            .into_iter()
+            .map(|address| self.memory[address])
+            .collect();
+        if handle == 1 || handle == 2 {
+            for byte in data {
+                self.console.write_data(byte);
+            }
+            return length as i64;
+        }
+        if handle == 0 {
+            return crate::syscall::error::BAD_HANDLE;
+        }
+        let Some(file) = self.syscall_state.file(task_id, handle).cloned() else {
+            return crate::syscall::error::BAD_HANDLE;
+        };
+        if file.flags & crate::syscall::open_flags::WRITE == 0 {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Some(disk) = self
+            .folder_disk
+            .as_ref()
+            .or(self.module_folder_disk.as_ref())
+        else {
+            return crate::syscall::error::IO;
+        };
+        let offset = if file.flags & crate::syscall::open_flags::APPEND != 0 {
+            match disk.metadata(&file.path) {
+                Ok(metadata) => metadata.size_bytes,
+                Err(_) => return crate::syscall::error::IO,
+            }
+        } else {
+            file.offset
+        };
+        if disk.write_file_at(&file.path, offset, &data).is_err() {
+            return crate::syscall::error::IO;
+        }
+        if let Some(file) = self.syscall_state.file_mut(task_id, handle) {
+            file.offset = offset.saturating_add(length as u64);
+        }
+        length as i64
+    }
+
+    fn syscall_close(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let handle = match u32::try_from(self.registers[1]) {
+            Ok(handle) => handle,
+            Err(_) => return crate::syscall::error::BAD_HANDLE,
+        };
+        if handle < 3 || !self.syscall_state.close_file(task_id, handle) {
+            crate::syscall::error::BAD_HANDLE
+        } else {
+            0
+        }
+    }
+
+    fn ensure_page_memory_manager(&mut self) -> Result<(), crate::mmu::PageTableError> {
+        if self.page_memory_manager.is_some() {
+            return Ok(());
+        }
+        let mut manager = crate::mmu::PageMemoryManager::new(self.memory.len(), 0x8000)?;
+        if self.memory.len() > MMIO_START as usize {
+            manager
+                .reserve_physical_range(MMIO_START as usize, (MMIO_END - MMIO_START) as usize)?;
+        }
+        for segment in &self.loaded_image_segments {
+            manager.reserve_physical_range(segment.address as usize, segment.length)?;
+        }
+        for task in self
+            .scheduler
+            .tasks()
+            .iter()
+            .filter(|task| task.mmu_enabled)
+        {
+            manager.adopt_address_space(&self.memory, task.page_directory)?;
+        }
+        if let Some(idt_base) = self.idt_base {
+            manager.reserve_physical_range(idt_base as usize, crate::interrupts::IDT_BYTES)?;
+            if let Ok(descriptor) = self.idt_descriptor(crate::isa::SVC_VECTOR) {
+                manager.reserve_physical_range(descriptor.handler as usize, 1)?;
+            }
+        }
+        let stack_end = self
+            .sp
+            .checked_add(EXCEPTION_ENTRY_BYTES)
+            .unwrap_or(self.sp)
+            .min(self.memory.len() as u32);
+        let stack_start = stack_end.saturating_sub(16 * crate::mmu::PAGE_SIZE as u32);
+        manager.reserve_physical_range(stack_start as usize, (stack_end - stack_start) as usize)?;
+        self.page_memory_manager = Some(manager);
+        Ok(())
+    }
+
+    fn map_spawn_kernel_page(
+        &mut self,
+        root: u32,
+        virtual_page: u32,
+        permissions: crate::mmu::PagePermissions,
+        mapped: &mut HashMap<u32, crate::mmu::PagePermissions>,
+    ) -> Result<(), crate::mmu::PageTableError> {
+        if let Some(existing) = mapped.get_mut(&virtual_page) {
+            existing.writable |= permissions.writable;
+            existing.executable |= permissions.executable;
+            return self
+                .page_memory_manager
+                .as_mut()
+                .ok_or(crate::mmu::PageTableError::InvalidAddressSpace)?
+                .set_permissions(&mut self.memory, root, virtual_page, *existing);
+        }
+        let frame = virtual_page / crate::mmu::PAGE_SIZE as u32;
+        self.page_memory_manager
+            .as_mut()
+            .ok_or(crate::mmu::PageTableError::InvalidAddressSpace)?
+            .map_borrowed_page(&mut self.memory, root, virtual_page, frame, permissions)?;
+        mapped.insert(virtual_page, permissions);
+        Ok(())
+    }
+
+    fn syscall_spawn(&mut self, parent: Option<TaskId>) -> i64 {
+        let Some(parent) = parent else {
+            return crate::syscall::error::INVALID;
+        };
+        if !self.mmu_enabled {
+            return crate::syscall::error::PERMISSION;
+        }
+        let path_address = match u32::try_from(self.registers[1]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let path = match self.read_guest_path(path_address, true) {
+            Ok(Some(path)) => path,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::IO;
+        };
+        let image = match disk.load_executable(&path) {
+            Ok(image) => image,
+            Err(_) => return crate::syscall::error::NO_ENTRY,
+        };
+        if image.entry_point >= crate::mmu::ADDRESS_SPACE_SIZE {
+            return crate::syscall::error::INVALID;
+        }
+        if self.ensure_page_memory_manager().is_err() {
+            return crate::syscall::error::NO_MEMORY;
+        }
+        let root = match self
+            .page_memory_manager
+            .as_mut()
+            .expect("memory manager initialized")
+            .create_address_space(&mut self.memory)
+        {
+            Ok(root) => root,
+            Err(_) => return crate::syscall::error::NO_MEMORY,
+        };
+        let mut mapped_kernel = HashMap::new();
+        let mut result = Ok(());
+        let kernel_segments = self.loaded_image_segments.clone();
+        for segment in &kernel_segments {
+            let first = segment.address & !crate::mmu::PAGE_MASK;
+            let end = match segment
+                .address
+                .checked_add(segment.length as u32)
+                .and_then(|end| end.checked_add(crate::mmu::PAGE_MASK))
+            {
+                Some(end) => end & !crate::mmu::PAGE_MASK,
+                None => {
+                    result = Err(crate::mmu::PageTableError::InvalidVirtualAddress);
+                    break;
+                }
+            };
+            let permissions = crate::mmu::PagePermissions {
+                writable: segment.permissions.write,
+                user: false,
+                executable: segment.permissions.execute,
+            };
+            let mut page = first;
+            while page < end {
+                if let Err(error) =
+                    self.map_spawn_kernel_page(root, page, permissions, &mut mapped_kernel)
+                {
+                    result = Err(error);
+                    break;
+                }
+                page += crate::mmu::PAGE_SIZE as u32;
+            }
+            if result.is_err() {
+                break;
+            }
+        }
+        if result.is_ok() {
+            if let Some(idt_base) = self.idt_base {
+                let idt_page = idt_base & !crate::mmu::PAGE_MASK;
+                let end = idt_page + crate::mmu::PAGE_SIZE as u32;
+                let mut page = idt_page;
+                while page < end {
+                    if !mapped_kernel.contains_key(&page) {
+                        result = self.map_spawn_kernel_page(
+                            root,
+                            page,
+                            crate::mmu::PagePermissions::KERNEL_DATA,
+                            &mut mapped_kernel,
+                        );
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    page += crate::mmu::PAGE_SIZE as u32;
+                }
+                if let Ok(descriptor) = self.idt_descriptor(crate::isa::SVC_VECTOR) {
+                    let page = descriptor.handler & !crate::mmu::PAGE_MASK;
+                    if result.is_ok() {
+                        result = self.map_spawn_kernel_page(
+                            root,
+                            page,
+                            crate::mmu::PagePermissions::KERNEL_CODE,
+                            &mut mapped_kernel,
+                        );
+                    }
+                }
+            } else {
+                result = Err(crate::mmu::PageTableError::InvalidAddressSpace);
+            }
+        }
+        let kernel_sp = self.sp.saturating_add(EXCEPTION_ENTRY_BYTES);
+        if result.is_ok() {
+            let kernel_start = kernel_sp.saturating_sub(16 * crate::mmu::PAGE_SIZE as u32)
+                & !crate::mmu::PAGE_MASK;
+            let kernel_end = kernel_sp
+                .checked_add(crate::mmu::PAGE_MASK)
+                .unwrap_or(kernel_sp)
+                & !crate::mmu::PAGE_MASK;
+            let mut page = kernel_start;
+            while page < kernel_end && page < self.memory.len() as u32 {
+                if !mapped_kernel.contains_key(&page) {
+                    result = self.map_spawn_kernel_page(
+                        root,
+                        page,
+                        crate::mmu::PagePermissions::KERNEL_DATA,
+                        &mut mapped_kernel,
+                    );
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                page += crate::mmu::PAGE_SIZE as u32;
+            }
+        }
+
+        let mut mapped_user = HashMap::<u32, crate::mmu::PagePermissions>::new();
+        if result.is_ok() {
+            for segment in &image.segments {
+                let segment_end = segment.address as usize + segment.data.len();
+                if (segment.address as usize) < MMIO_END as usize
+                    && segment_end > MMIO_START as usize
+                {
+                    result = Err(crate::mmu::PageTableError::InvalidVirtualAddress);
+                    break;
+                }
+                let first = segment.address & !crate::mmu::PAGE_MASK;
+                let end = match segment
+                    .address
+                    .checked_add(segment.data.len() as u32)
+                    .and_then(|end| end.checked_add(crate::mmu::PAGE_MASK))
+                {
+                    Some(end) => end & !crate::mmu::PAGE_MASK,
+                    None => {
+                        result = Err(crate::mmu::PageTableError::InvalidVirtualAddress);
+                        break;
+                    }
+                };
+                let mut page = first;
+                while page < end {
+                    if !mapped_user.contains_key(&page) {
+                        let permissions = crate::mmu::PagePermissions::USER_DATA;
+                        if self
+                            .page_memory_manager
+                            .as_mut()
+                            .expect("memory manager initialized")
+                            .allocate_and_map_page(&mut self.memory, root, page, permissions)
+                            .is_err()
+                        {
+                            result = Err(crate::mmu::PageTableError::AlreadyMapped);
+                            break;
+                        }
+                        mapped_user.insert(page, permissions);
+                    }
+                    page += crate::mmu::PAGE_SIZE as u32;
+                }
+                if result.is_err() {
+                    break;
+                }
+                for (offset, byte) in segment.data.iter().copied().enumerate() {
+                    let virtual_address = segment.address + offset as u32;
+                    match crate::mmu::translate(
+                        &self.memory,
+                        root,
+                        virtual_address,
+                        crate::mmu::MemoryAccess::Write,
+                        false,
+                    ) {
+                        Ok(physical) => self.memory[physical as usize] = byte,
+                        Err(fault) => {
+                            self.record_page_fault(fault);
+                            result = Err(crate::mmu::PageTableError::InvalidVirtualAddress);
+                            break;
+                        }
+                    }
+                }
+                if result.is_err() {
+                    break;
+                }
+                let segment_permissions = crate::mmu::PagePermissions {
+                    writable: segment.permissions.write,
+                    user: true,
+                    executable: segment.permissions.execute,
+                };
+                let mut page = first;
+                while page < end {
+                    let mut page_permissions = segment_permissions;
+                    if let Some(existing) = mapped_user.get(&page) {
+                        page_permissions.writable |= existing.writable;
+                        page_permissions.executable |= existing.executable;
+                    }
+                    if let Err(error) = self
+                        .page_memory_manager
+                        .as_mut()
+                        .expect("memory manager initialized")
+                        .set_permissions(&mut self.memory, root, page, page_permissions)
+                    {
+                        result = Err(error);
+                        break;
+                    }
+                    mapped_user.insert(page, page_permissions);
+                    page += crate::mmu::PAGE_SIZE as u32;
+                }
+                if result.is_err() {
+                    break;
+                }
+            }
+        }
+        let user_stack_top = crate::mmu::ADDRESS_SPACE_SIZE - 0x1_0000;
+        let user_stack_page = user_stack_top - crate::mmu::PAGE_SIZE as u32;
+        if result.is_ok()
+            && !mapped_user.contains_key(&user_stack_page)
+            && !mapped_kernel.contains_key(&user_stack_page)
+        {
+            result = self
+                .page_memory_manager
+                .as_mut()
+                .expect("memory manager initialized")
+                .allocate_and_map_page(
+                    &mut self.memory,
+                    root,
+                    user_stack_page,
+                    crate::mmu::PagePermissions::USER_DATA,
+                )
+                .map(|_| ());
+        } else if result.is_ok() {
+            result = Err(crate::mmu::PageTableError::AlreadyMapped);
+        }
+        if result.is_ok()
+            && self
+                .validate_user_mapping_in(root, image.entry_point, user_stack_top)
+                .is_err()
+        {
+            result = Err(crate::mmu::PageTableError::InvalidVirtualAddress);
+        }
+        if let Err(error) = result {
+            let _ = self
+                .page_memory_manager
+                .as_mut()
+                .expect("memory manager initialized")
+                .destroy_address_space(&mut self.memory, root);
+            return match error {
+                crate::mmu::PageTableError::OutOfFrames => crate::syscall::error::NO_MEMORY,
+                _ => crate::syscall::error::INVALID,
+            };
+        }
+        let mut context =
+            TaskContext::user(image.entry_point, user_stack_top, kernel_sp, true, root);
+        context.registers[1] = i64::from(parent);
+        let id = match self.scheduler.create_task(context) {
+            Ok(id) => id,
+            Err(_) => {
+                let _ = self
+                    .page_memory_manager
+                    .as_mut()
+                    .expect("memory manager initialized")
+                    .destroy_address_space(&mut self.memory, root);
+                return crate::syscall::error::NO_MEMORY;
+            }
+        };
+        self.syscall_state.register_process(id, Some(parent));
+        i64::from(id)
+    }
+
+    fn syscall_mmap(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if !self.mmu_enabled {
+            return crate::syscall::error::PERMISSION;
+        }
+        let length = match usize::try_from(self.registers[1]) {
+            Ok(length) if length > 0 && length <= 16 * 1024 * 1024 => length,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let flags = match u32::try_from(self.registers[2]) {
+            Ok(flags) if flags & !7 == 0 && flags & 1 != 0 => flags,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let page_count = length.div_ceil(crate::mmu::PAGE_SIZE);
+        let rounded_length = match page_count.checked_mul(crate::mmu::PAGE_SIZE) {
+            Some(length) => length as u32,
+            None => return crate::syscall::error::OVERFLOW,
+        };
+        let mut address = match u32::try_from(self.registers[3]) {
+            Ok(0) => {
+                self.syscall_state
+                    .processes
+                    .entry(task_id)
+                    .or_default()
+                    .next_mmap
+            }
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        if address & crate::mmu::PAGE_MASK != 0 {
+            return crate::syscall::error::INVALID;
+        }
+        let end = match address.checked_add(rounded_length) {
+            Some(end) if end <= crate::mmu::ADDRESS_SPACE_SIZE => end,
+            _ => return crate::syscall::error::OVERFLOW,
+        };
+        let root = self.page_directory;
+        if self.page_memory_manager.is_none() {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        }
+        let permissions = crate::mmu::PagePermissions {
+            writable: flags & 2 != 0,
+            user: true,
+            executable: flags & 4 != 0,
+        };
+        let mut mapped = Vec::new();
+        while address < end {
+            let allocation = self
+                .page_memory_manager
+                .as_mut()
+                .expect("manager checked")
+                .allocate_and_map_page(&mut self.memory, root, address, permissions);
+            if let Err(error) = allocation {
+                for mapped_address in mapped {
+                    let _ = self
+                        .page_memory_manager
+                        .as_mut()
+                        .expect("manager checked")
+                        .unmap_page(&mut self.memory, root, mapped_address);
+                }
+                return match error {
+                    crate::mmu::PageTableError::OutOfFrames => crate::syscall::error::NO_MEMORY,
+                    _ => crate::syscall::error::INVALID,
+                };
+            }
+            mapped.push(address);
+            address += crate::mmu::PAGE_SIZE as u32;
+        }
+        self.syscall_state
+            .processes
+            .entry(task_id)
+            .or_default()
+            .next_mmap = end;
+        i64::from(mapped[0])
+    }
+
+    fn syscall_sleep(
+        &mut self,
+        task_id: Option<TaskId>,
+        scheduled_state: &mut Option<(TaskState, i32)>,
+    ) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let ticks = match u64::try_from(self.registers[1]) {
+            Ok(ticks) if ticks <= 1_000_000_000 => ticks,
+            _ => return crate::syscall::error::INVALID,
+        };
+        if ticks == 0 {
+            return 0;
+        }
+        let Some(deadline) = self.syscall_state.ticks.checked_add(ticks) else {
+            return crate::syscall::error::OVERFLOW;
+        };
+        self.syscall_state.sleeping.insert(task_id, deadline);
+        scheduled_state.replace((TaskState::Blocked, 0));
+        0
+    }
+
+    fn syscall_wait(
+        &mut self,
+        task_id: Option<TaskId>,
+        scheduled_state: &mut Option<(TaskState, i32)>,
+    ) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let child_id = match u32::try_from(self.registers[1]) {
+            Ok(id) => id,
+            Err(_) => return crate::syscall::error::NO_CHILD,
+        };
+        let Some(parent) = self.syscall_state.processes.get(&task_id) else {
+            return crate::syscall::error::NO_CHILD;
+        };
+        if !parent.children.contains(&child_id) {
+            return crate::syscall::error::NO_CHILD;
+        }
+        let Some(child) = self.syscall_state.processes.get(&child_id) else {
+            return crate::syscall::error::NO_CHILD;
+        };
+        if child.parent != Some(task_id) {
+            return crate::syscall::error::NO_CHILD;
+        }
+        if let Some(exit_code) = child.exit_code {
+            self.registers[1] = i64::from(child_id);
+            self.reap_process(task_id, child_id);
+            return i64::from(exit_code);
+        }
+        self.syscall_state
+            .processes
+            .get_mut(&child_id)
+            .expect("child record checked")
+            .waiters
+            .push_back(task_id);
+        self.syscall_state.waiting_for.insert(task_id, child_id);
+        scheduled_state.replace((TaskState::Blocked, 0));
+        0
+    }
+
+    fn syscall_semaphore(
+        &mut self,
+        task_id: Option<TaskId>,
+        scheduled_state: &mut Option<(TaskState, i32)>,
+    ) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let operation = match u32::try_from(self.registers[1]) {
+            Ok(operation) => operation,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        let semaphore_id = match u32::try_from(self.registers[2]) {
+            Ok(id) => id,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        match operation {
+            crate::syscall::semaphore_operation::CREATE => {
+                let initial = match u32::try_from(self.registers[3]) {
+                    Ok(value) => value,
+                    Err(_) => return crate::syscall::error::INVALID,
+                };
+                self.syscall_state.next_semaphore =
+                    match self.syscall_state.next_semaphore.checked_add(1) {
+                        Some(id) => id,
+                        None => return crate::syscall::error::OVERFLOW,
+                    };
+                let id = self.syscall_state.next_semaphore;
+                self.syscall_state.semaphores.insert(
+                    id,
+                    crate::syscall::Semaphore {
+                        owner: task_id,
+                        count: initial,
+                        waiters: Default::default(),
+                    },
+                );
+                i64::from(id)
+            }
+            crate::syscall::semaphore_operation::WAIT => {
+                let Some(semaphore) = self.syscall_state.semaphores.get_mut(&semaphore_id) else {
+                    return crate::syscall::error::INVALID;
+                };
+                if semaphore.count > 0 {
+                    semaphore.count -= 1;
+                    0
+                } else {
+                    if !semaphore.waiters.contains(&task_id) {
+                        semaphore.waiters.push_back(task_id);
+                    }
+                    scheduled_state.replace((TaskState::Blocked, 0));
+                    0
+                }
+            }
+            crate::syscall::semaphore_operation::POST => {
+                let Some(semaphore) = self.syscall_state.semaphores.get_mut(&semaphore_id) else {
+                    return crate::syscall::error::INVALID;
+                };
+                if let Some(waiter) = semaphore.waiters.pop_front() {
+                    self.syscall_state.pending_results.insert(waiter, 0);
+                    let _ = self.scheduler.wake(waiter);
+                } else if let Some(count) = semaphore.count.checked_add(1) {
+                    semaphore.count = count;
+                } else {
+                    return crate::syscall::error::OVERFLOW;
+                }
+                0
+            }
+            crate::syscall::semaphore_operation::DESTROY => {
+                let Some(semaphore) = self.syscall_state.semaphores.get(&semaphore_id) else {
+                    return crate::syscall::error::INVALID;
+                };
+                if semaphore.owner != task_id {
+                    return crate::syscall::error::PERMISSION;
+                }
+                if !semaphore.waiters.is_empty() {
+                    return crate::syscall::error::BUSY;
+                }
+                self.syscall_state.semaphores.remove(&semaphore_id);
+                0
+            }
+            _ => crate::syscall::error::INVALID,
+        }
+    }
+
+    fn reap_process(&mut self, parent: TaskId, child: TaskId) {
+        if let Some(record) = self.syscall_state.processes.get_mut(&parent) {
+            record.children.retain(|id| *id != child);
+        }
+        if let Some(context) = self.scheduler.task(child) {
+            if context.mmu_enabled {
+                if let Some(manager) = self.page_memory_manager.as_mut() {
+                    let _ = manager.destroy_address_space(&mut self.memory, context.page_directory);
+                }
+            }
+        }
+        self.syscall_state.processes.remove(&child);
+        self.syscall_state.open_files.remove(&child);
+    }
+
+    fn complete_process(&mut self, id: TaskId, exit_code: i32) {
+        if let Some(record) = self.syscall_state.processes.get_mut(&id) {
+            record.exit_code = Some(exit_code);
+        }
+        let waiters: Vec<_> = self
+            .syscall_state
+            .processes
+            .get_mut(&id)
+            .map(|record| record.waiters.drain(..).collect())
+            .unwrap_or_default();
+        for waiter in waiters {
+            self.syscall_state
+                .pending_wait_status
+                .insert(waiter, (id, exit_code));
+            self.syscall_state.waiting_for.remove(&waiter);
+            let _ = self.scheduler.wake(waiter);
+        }
+        self.syscall_state.open_files.remove(&id);
+        self.syscall_state.sleeping.remove(&id);
+        self.syscall_state.waiting_for.remove(&id);
+        let owned_semaphores: Vec<_> = self
+            .syscall_state
+            .semaphores
+            .iter()
+            .filter_map(|(semaphore_id, semaphore)| {
+                (semaphore.owner == id).then_some(*semaphore_id)
+            })
+            .collect();
+        for semaphore_id in owned_semaphores {
+            if let Some(semaphore) = self.syscall_state.semaphores.remove(&semaphore_id) {
+                for waiter in semaphore.waiters {
+                    self.syscall_state
+                        .pending_results
+                        .insert(waiter, crate::syscall::error::INTERRUPTED);
+                    let _ = self.scheduler.wake(waiter);
+                }
+            }
+        }
     }
 
     fn gpu_network(&mut self, command: u8, query: u8, argument: i16) {
@@ -2536,10 +3448,15 @@ impl Cpu {
                 let vector = crate::isa::SVC_VECTOR;
                 let descriptor = self.idt_descriptor(vector)?;
                 let caller_privilege = u8::from(self.privilege_mode == PrivilegeMode::User) * 3;
+                let is_syscall = self.privilege_mode == PrivilegeMode::User
+                    && self.registers[crate::syscall::REGISTER_ABI_VERSION] != 0;
                 if caller_privilege > descriptor.privilege {
                     self.enter_exception(EXCEPTION_PRIVILEGE_VIOLATION, self.pc)?;
                 } else {
                     self.enter_event(vector, self.pc, descriptor.handler, 0, descriptor.gate_type)?;
+                    if is_syscall {
+                        self.dispatch_user_syscall()?;
+                    }
                 }
             }
             OP_HALT => return Err(CpuError::UnsupportedInstruction(instruction)),
@@ -2742,8 +3659,15 @@ impl Cpu {
 
     pub fn run(&mut self, instruction_budget: usize) -> Result<usize, CpuError> {
         let mut executed = 0;
-        while executed < instruction_budget && self.running && !self.frame_yield {
-            self.step()?;
+        while executed < instruction_budget
+            && !self.frame_yield
+            && (self.running || !self.syscall_state.sleeping.is_empty())
+        {
+            if self.running {
+                self.step()?;
+            } else {
+                self.advance_timer();
+            }
             executed += 1;
         }
         Ok(executed)
@@ -4222,6 +5146,23 @@ impl Cpu {
     }
 
     fn advance_timer(&mut self) {
+        self.syscall_state.ticks = self.syscall_state.ticks.saturating_add(1);
+        let awake: Vec<_> = self
+            .syscall_state
+            .sleeping
+            .iter()
+            .filter_map(|(id, deadline)| (*deadline <= self.syscall_state.ticks).then_some(*id))
+            .collect();
+        for id in awake {
+            self.syscall_state.sleeping.remove(&id);
+            self.syscall_state.pending_results.insert(id, 0);
+            let _ = self.scheduler.wake(id);
+            if self.scheduler.current_task().is_none() {
+                if let Ok(context) = self.scheduler.activate(id) {
+                    self.restore_task_context(&context);
+                }
+            }
+        }
         let period = self.read_u16(TIMER_PERIOD_ADDR);
         if period != self.timer_period {
             self.timer_period = period;
@@ -4370,6 +5311,26 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn cpu_with_syscall_task() -> (Cpu, TaskId) {
+        let source = "SVC\n".repeat(32) + "HALT";
+        let image = crate::assembler::assemble(&source, 0x100).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
+        let task = cpu.create_user_task(0x100, 0x7000, 0xf000, None).unwrap();
+        cpu.start_task(task).unwrap();
+        (cpu, task)
+    }
+
+    fn invoke_syscall(cpu: &mut Cpu, number: SyscallNumber, arguments: [i64; 6]) {
+        cpu.registers[crate::syscall::REGISTER_NUMBER] = number as i64;
+        cpu.registers[crate::syscall::REGISTER_ARGUMENT_0..=crate::syscall::REGISTER_ARGUMENT_5]
+            .copy_from_slice(&arguments);
+        cpu.registers[crate::syscall::REGISTER_ABI_VERSION] = crate::syscall::ABI_VERSION;
+        cpu.step().unwrap();
     }
 
     fn run_assembly(source: &str) -> Cpu {
@@ -4574,6 +5535,464 @@ mod tests {
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x102);
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+    }
+
+    #[test]
+    fn syscall_abi_returns_pid_and_rejects_unknown_numbers_and_versions() {
+        let (mut cpu, task) = cpu_with_syscall_task();
+        invoke_syscall(&mut cpu, SyscallNumber::GetPid, [0; 6]);
+        assert_eq!(cpu.registers[0], i64::from(task));
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+
+        cpu.registers[0] = 99;
+        cpu.registers[7] = crate::syscall::ABI_VERSION;
+        cpu.step().unwrap();
+        assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+        assert_eq!(cpu.pc, 0x104);
+
+        cpu.registers[0] = SyscallNumber::GetPid as i64;
+        cpu.registers[7] = crate::syscall::ABI_VERSION + 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+        assert_eq!(cpu.pc, 0x106);
+
+        invoke_syscall(&mut cpu, SyscallNumber::Exit, [256, 0, 0, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+        assert_eq!(cpu.current_task(), Some(task));
+        assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn syscall_yield_switches_to_another_user_task() {
+        let (mut cpu, first) = cpu_with_syscall_task();
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        let second = cpu.create_user_task(0x100, 0x6000, 0xe000, None).unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
+        invoke_syscall(&mut cpu, SyscallNumber::Yield, [0; 6]);
+
+        assert_eq!(cpu.current_task(), Some(second));
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.task_context(first).unwrap().state, TaskState::Runnable);
+    }
+
+    #[test]
+    fn syscall_file_handles_read_write_partial_data_and_validate_guest_memory() {
+        let root = folder_disk_for_test("syscalls", false);
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.mount_folder_disk(&root).unwrap();
+        cpu.memory[0x1000..0x1009].copy_from_slice(b"note.txt\0");
+        cpu.memory[0x2000..0x2003].copy_from_slice(b"abc");
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x1000,
+                i64::from(crate::syscall::open_flags::CREATE | crate::syscall::open_flags::WRITE),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let write_handle = cpu.registers[0] as u32;
+        assert!(write_handle >= 3);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Write,
+            [i64::from(write_handle), 0x2000, 3, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 3);
+        assert_eq!(std::fs::read(root.join("note.txt")).unwrap(), b"abc");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Read,
+            [i64::from(write_handle), 0x2100, 1, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Close,
+            [i64::from(write_handle), 0, 0, 0, 0, 0],
+        );
+        cpu.memory[0x4000..0x4009].copy_from_slice(b"note.txt\0");
+        cpu.memory[0x2003..0x2005].copy_from_slice(b"de");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x4000,
+                i64::from(crate::syscall::open_flags::APPEND),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+        let append_flags = crate::syscall::open_flags::WRITE | crate::syscall::open_flags::APPEND;
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [0x4000, i64::from(append_flags), 0, 0, 0, 0],
+        );
+        let first_append_handle = cpu.registers[0] as u32;
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [0x4000, i64::from(append_flags), 0, 0, 0, 0],
+        );
+        let second_append_handle = cpu.registers[0] as u32;
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Write,
+            [i64::from(first_append_handle), 0x2003, 1, 0, 0, 0],
+        );
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Write,
+            [i64::from(second_append_handle), 0x2004, 1, 0, 0, 0],
+        );
+        assert_eq!(std::fs::read(root.join("note.txt")).unwrap(), b"abcde");
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x4000,
+                i64::from(crate::syscall::open_flags::READ),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let read_handle = cpu.registers[0] as u32;
+        assert!(
+            read_handle >= 3 && cpu.syscall_state.file(task, read_handle).is_some(),
+            "open returned {} for task {task}; handles: {:?}",
+            cpu.registers[0],
+            cpu.syscall_state.open_files
+        );
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Read,
+            [i64::from(read_handle), 0x2100, 8, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 5);
+        assert_eq!(&cpu.memory[0x2100..0x2105], b"abcde");
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Read,
+            [i64::from(read_handle), 0xffff, 8, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Read,
+            [
+                i64::from(read_handle),
+                0x2100,
+                (crate::syscall::MAX_TRANSFER_BYTES + 1) as i64,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn syscall_sleep_uses_deterministic_idle_ticks() {
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.write_u16(0x102, 0);
+        invoke_syscall(&mut cpu, SyscallNumber::Sleep, [3, 0, 0, 0, 0, 0]);
+        assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Blocked);
+
+        let executed = cpu.run(8).unwrap();
+
+        assert_eq!(executed, 3);
+        assert_eq!(cpu.current_task(), Some(task));
+        assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Running);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn syscall_wait_blocks_for_child_exit_and_collects_status() {
+        let (mut cpu, parent) = cpu_with_syscall_task();
+        let mut child_context = TaskContext::user(0x100, 0x6000, 0xe000, false, 0);
+        child_context.registers[0] = SyscallNumber::Exit as i64;
+        child_context.registers[1] = 42;
+        child_context.registers[7] = crate::syscall::ABI_VERSION;
+        let child = cpu.scheduler.create_task(child_context).unwrap();
+        cpu.syscall_state.register_process(child, Some(parent));
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Wait,
+            [i64::from(child), 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.current_task(), Some(child));
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.current_task(), Some(parent));
+        assert_eq!(cpu.registers[0], 42);
+        assert_eq!(cpu.registers[1], i64::from(child));
+        assert!(cpu.syscall_state.processes.get(&child).is_none());
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Wait,
+            [i64::from(child), 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::NO_CHILD);
+    }
+
+    #[test]
+    fn compiled_c_syscall_wrappers_execute_through_svc() {
+        let source = "#include <sc16_syscall.h>\n\
+                      int main(void) {\n\
+                          long semaphore;\n\
+                          if (sc16_write(1, \"ok\", 2) != 2) return 7;\n\
+                          if (sc16_sleep(1UL) != 0) return 9;\n\
+                          if (sc16_getpid() < 0L) return 8;\n\
+                          if (sc16_mmap(4096UL, SC16_PROT_READ, 0) != -13L) return 14;\n\
+                          if (sc16_spawn(\"missing\") != -13L) return 12;\n\
+                          semaphore = sc16_semop(SC16_SEM_CREATE, 0UL, 1);\n\
+                          if (semaphore < 0L) return 10;\n\
+                          if (sc16_semop(SC16_SEM_DESTROY, (unsigned long)semaphore, 0) != 0L) return 11;\n\
+                          if (sc16_semop(SC16_SEM_DESTROY, 0UL, 0) != -22L) return 13;\n\
+                          return 0;\n\
+                      }";
+        let assembly =
+            crate::c_compiler::compile_minimal_program_to_assembly(source, "syscall-runtime.c")
+                .unwrap()
+                .expect("C runtime bridge should compile");
+        let image = crate::assembler::assemble(&assembly, 0).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
+        let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        cpu.start_task(task).unwrap();
+
+        cpu.run(10_000).unwrap();
+
+        assert!(!cpu.running, "compiled syscall program did not terminate");
+        assert_eq!(cpu.registers[0], 0);
+        assert_eq!(cpu.console.output(), b"ok");
+    }
+
+    #[test]
+    fn syscall_semaphore_wait_blocks_and_post_wakes_one_waiter() {
+        let (mut cpu, owner) = cpu_with_syscall_task();
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Semaphore,
+            [
+                i64::from(crate::syscall::semaphore_operation::CREATE),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let semaphore_id = cpu.registers[0] as u32;
+        assert!(semaphore_id > 0);
+
+        let mut waiter_context = TaskContext::user(0x100, 0x6000, 0xe000, false, 0);
+        waiter_context.registers[0] = SyscallNumber::Semaphore as i64;
+        waiter_context.registers[1] = i64::from(crate::syscall::semaphore_operation::WAIT);
+        waiter_context.registers[2] = i64::from(semaphore_id);
+        waiter_context.registers[7] = crate::syscall::ABI_VERSION;
+        let waiter = cpu.scheduler.create_task(waiter_context).unwrap();
+        cpu.syscall_state.register_process(waiter, None);
+
+        invoke_syscall(&mut cpu, SyscallNumber::Yield, [0; 6]);
+        assert_eq!(cpu.current_task(), Some(waiter));
+        cpu.step().unwrap();
+        assert_eq!(cpu.current_task(), Some(owner));
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Semaphore,
+            [
+                i64::from(crate::syscall::semaphore_operation::POST),
+                i64::from(semaphore_id),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        invoke_syscall(&mut cpu, SyscallNumber::Yield, [0; 6]);
+
+        assert_eq!(cpu.current_task(), Some(waiter));
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn syscall_semaphore_wait_is_interrupted_when_owner_exits() {
+        let (mut cpu, owner) = cpu_with_syscall_task();
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Semaphore,
+            [
+                i64::from(crate::syscall::semaphore_operation::CREATE),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let semaphore_id = cpu.registers[0] as u32;
+        let mut waiter_context = TaskContext::user(0x100, 0x6000, 0xe000, false, 0);
+        waiter_context.registers[0] = SyscallNumber::Semaphore as i64;
+        waiter_context.registers[1] = i64::from(crate::syscall::semaphore_operation::WAIT);
+        waiter_context.registers[2] = i64::from(semaphore_id);
+        waiter_context.registers[7] = crate::syscall::ABI_VERSION;
+        let waiter = cpu.scheduler.create_task(waiter_context).unwrap();
+        cpu.syscall_state.register_process(waiter, None);
+
+        invoke_syscall(&mut cpu, SyscallNumber::Yield, [0; 6]);
+        assert_eq!(cpu.current_task(), Some(waiter));
+        cpu.step().unwrap();
+        assert_eq!(cpu.current_task(), Some(owner));
+
+        invoke_syscall(&mut cpu, SyscallNumber::Exit, [0; 6]);
+
+        assert_eq!(cpu.current_task(), Some(waiter));
+        assert_eq!(cpu.registers[0], crate::syscall::error::INTERRUPTED);
+        assert!(cpu.syscall_state.semaphores.is_empty());
+    }
+
+    #[test]
+    fn syscall_spawn_creates_isolated_task_and_mmap_allocates_user_pages() {
+        let disk_root = folder_disk_for_test("syscall-spawn", false);
+        let child_source = "LDI R0, 4\nLDI R1, 4096\nLDI R2, 3\nLDI R3, 0\nLDI R7, 1\nSVC\nHALT";
+        let child_assembly = crate::assembler::assemble(child_source, 0x1000).unwrap();
+        let child_image = crate::image::ProgramImage {
+            entry_point: child_assembly.entry_point,
+            segments: child_assembly
+                .segments
+                .iter()
+                .map(|segment| {
+                    crate::image::ImageSegment::new(segment.address, segment.data.clone())
+                })
+                .collect(),
+        };
+        crate::image::write_image(&disk_root.join("child.img"), &child_image).unwrap();
+
+        let parent_assembly =
+            crate::assembler::assemble("SVC\nSVC\nSVC\nSVC\nHALT", 0x100).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&parent_assembly.segments, parent_assembly.entry_point)
+            .unwrap();
+        let kernel_assembly = crate::assembler::assemble("HALT", 0x3000).unwrap();
+        cpu.load_program(&kernel_assembly.segments, kernel_assembly.entry_point)
+            .unwrap();
+        cpu.loaded_image_segments.clear();
+        let mut parent_mmu = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
+        let parent_root = parent_mmu.create_address_space(&mut cpu.memory).unwrap();
+        parent_mmu
+            .map_borrowed_page(
+                &mut cpu.memory,
+                parent_root,
+                0,
+                0x40,
+                crate::mmu::PagePermissions::USER_CODE,
+            )
+            .unwrap();
+        parent_mmu
+            .map_borrowed_page(
+                &mut cpu.memory,
+                parent_root,
+                0x2000,
+                0x41,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        parent_mmu
+            .map_borrowed_page(
+                &mut cpu.memory,
+                parent_root,
+                0x3000,
+                3,
+                crate::mmu::PagePermissions::KERNEL_CODE,
+            )
+            .unwrap();
+        parent_mmu
+            .map_borrowed_page(
+                &mut cpu.memory,
+                parent_root,
+                0x7000,
+                0x42,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        cpu.memory[0x40_000 + 0x100..0x40_000 + 0x10a]
+            .copy_from_slice(&parent_assembly.segments[0].data[0..10]);
+        cpu.memory[0x41_000..0x41_00a].copy_from_slice(b"child.img\0");
+        cpu.load_idt(0x800).unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x3000, 3);
+        cpu.mount_folder_disk(&disk_root).unwrap();
+        cpu.mmu_enabled = true;
+        cpu.page_directory = parent_root;
+        let parent = cpu
+            .create_user_task(0x100, 0x8000, 0x000f_ffff, Some(parent_root))
+            .unwrap();
+        cpu.start_task(parent).unwrap();
+        cpu.registers[0] = SyscallNumber::Spawn as i64;
+        cpu.registers[1] = 0x2000;
+        cpu.registers[7] = crate::syscall::ABI_VERSION;
+
+        cpu.step().unwrap();
+        let child = cpu.registers[0] as u32;
+        assert_ne!(child, parent);
+        let child_context = cpu.task_context(child).unwrap();
+        assert!(child_context.mmu_enabled);
+        assert_ne!(child_context.page_directory, parent_root);
+        assert_eq!(
+            crate::mmu::translate(
+                &cpu.memory,
+                child_context.page_directory,
+                0x3000,
+                crate::mmu::MemoryAccess::Fetch,
+                true
+            )
+            .unwrap_err()
+            .reason,
+            crate::mmu::PageFaultReason::SupervisorOnly
+        );
+
+        invoke_syscall(&mut cpu, SyscallNumber::Write, [1, 0x3000, 1, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        invoke_syscall(&mut cpu, SyscallNumber::Mmap, [4096, 3, 0, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 0x2000_0000);
+
+        invoke_syscall(&mut cpu, SyscallNumber::Yield, [0; 6]);
+        assert_eq!(cpu.current_task(), Some(child));
+        cpu.run(20).unwrap();
+        assert_eq!(cpu.registers[0], 0x2000_0000);
+        assert!(
+            crate::mmu::translate(
+                &cpu.memory,
+                cpu.page_directory,
+                0x2000_0000,
+                crate::mmu::MemoryAccess::Write,
+                true
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(disk_root.parent().unwrap());
     }
 
     #[test]

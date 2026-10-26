@@ -552,10 +552,11 @@ struct NativeGlobal {
     has_initializer: bool,
 }
 
-const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 3] = [
+const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 4] = [
     ("lib_cgfx.asm", include_str!("../lib/lib_cgfx.asm")),
     ("lib_text.asm", include_str!("../lib/lib_text.asm")),
     ("lib_stdio.asm", include_str!("../lib/lib_stdio.asm")),
+    ("lib_syscall.asm", include_str!("../lib/lib_syscall.asm")),
 ];
 
 fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
@@ -573,6 +574,9 @@ fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
 
 fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Expression]) -> bool {
     match function {
+        "sc16_spawn" | "sc16_open" => index == 0,
+        "sc16_mmap" => index == 2,
+        "sc16_read" | "sc16_write" => index == 1,
         "gfx_sprite" | "gfx_bitmap" => index == 4,
         "gfx_poly" => index == 3,
         "gfx_sprite_upload" => index == 3,
@@ -594,6 +598,13 @@ fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Express
         }
         _ => false,
     }
+}
+
+fn native_argument_is_wide_integer(function: &str, index: usize) -> bool {
+    matches!(
+        (function, index),
+        ("sc16_mmap" | "sc16_sleep" | "sc16_wait", 0) | ("sc16_semop", 1)
+    )
 }
 
 fn native_printf_specifiers(arguments: &[Expression]) -> Option<Vec<u8>> {
@@ -630,20 +641,8 @@ fn native_printf_call_is_supported(arguments: &[Expression]) -> bool {
     native_printf_specifiers(arguments).is_some()
 }
 
-fn emit_native_pointer_push(label_counter: &mut usize, assembly: &mut String) {
-    let label = *label_counter;
-    *label_counter += 1;
-    assembly.push_str(&format!(
-        "    MOV R5, R4\n    LDI30 R6, 0x10000\n    LDI R7, 0\n\
-         __c_pointer_high_loop_{label}:\n\
-         CMP R5, R6\n    BNCX __c_pointer_high_subtract_{label}\n\
-         JMPX __c_pointer_high_done_{label}\n\
-         __c_pointer_high_subtract_{label}:\n\
-         SUB R5, R6\n    INC R7\n\
-         JMPX __c_pointer_high_loop_{label}\n\
-         __c_pointer_high_done_{label}:\n\
-         PUSH R7\n    PUSH R5\n"
-    ));
+fn emit_native_pointer_push(assembly: &mut String) {
+    assembly.push_str("    SPLIT30 R4, R5\n    PUSH R4\n    PUSH R5\n");
 }
 
 fn emit_native_variadic_argument(
@@ -706,7 +705,7 @@ fn emit_native_variadic_argument(
             if !emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly) {
                 return None;
             }
-            emit_native_pointer_push(label_counter, assembly);
+            emit_native_pointer_push(assembly);
             Some(4)
         }
         NativeArgumentKind::WideInteger => {
@@ -9152,7 +9151,19 @@ fn emit_native_expression(
                         ) {
                             return false;
                         }
-                        emit_native_pointer_push(label_counter, assembly);
+                        emit_native_pointer_push(assembly);
+                        argument_bytes += 4;
+                    } else if native_argument_is_wide_integer(name, index) {
+                        if !emit_native_wide_conversion(
+                            argument,
+                            true,
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        assembly.push_str("    PUSH R5\n    PUSH R4\n");
                         argument_bytes += 4;
                     } else {
                         if !emit_native_expression(

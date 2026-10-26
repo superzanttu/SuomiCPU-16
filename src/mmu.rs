@@ -57,6 +57,7 @@ pub enum PageTableError {
 struct AddressSpaceMappings {
     pages: HashMap<u32, Option<u32>>,
     table_frames: HashSet<u32>,
+    owns_directory: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -86,9 +87,52 @@ impl PageMemoryManager {
         }
         memory[start..start + PAGE_SIZE].fill(0);
         let directory = start as u32;
-        self.address_spaces
-            .insert(directory, AddressSpaceMappings::default());
+        self.address_spaces.insert(
+            directory,
+            AddressSpaceMappings {
+                owns_directory: true,
+                ..AddressSpaceMappings::default()
+            },
+        );
         Ok(directory)
+    }
+
+    pub fn adopt_address_space(
+        &mut self,
+        memory: &[u8],
+        directory: u32,
+    ) -> Result<(), PageTableError> {
+        if self.address_spaces.contains_key(&directory) {
+            return Ok(());
+        }
+        for frame in address_space_physical_frames(memory, directory)? {
+            self.allocator
+                .reserve_range(frame as usize * PAGE_SIZE, PAGE_SIZE)?;
+        }
+        let mut mappings = AddressSpaceMappings {
+            owns_directory: false,
+            ..AddressSpaceMappings::default()
+        };
+        for directory_index in 0..PAGE_DIRECTORY_ENTRIES {
+            let directory_entry = read_entry(memory, directory, directory_index)
+                .ok_or(PageTableError::InvalidAddressSpace)?;
+            if directory_entry & PTE_PRESENT == 0 {
+                continue;
+            }
+            let table_frame = (directory_entry & PTE_FRAME_MASK) >> 12;
+            let table = table_frame * PAGE_SIZE as u32;
+            for table_index in 0..PAGE_TABLE_ENTRIES {
+                let table_entry = read_entry(memory, table, table_index)
+                    .ok_or(PageTableError::InvalidAddressSpace)?;
+                if table_entry & PTE_PRESENT != 0 {
+                    let page = (directory_index as u32 * PAGE_DIRECTORY_ENTRIES as u32)
+                        + table_index as u32;
+                    mappings.pages.insert(page, None);
+                }
+            }
+        }
+        self.address_spaces.insert(directory, mappings);
+        Ok(())
     }
 
     pub fn reserve_physical_range(
@@ -193,8 +237,9 @@ impl PageMemoryManager {
             self.allocator.free(frame)?;
         }
         if let Some(frame) = released_table {
-            mappings.table_frames.remove(&frame);
-            self.allocator.free(frame)?;
+            if mappings.table_frames.remove(&frame) {
+                self.allocator.free(frame)?;
+            }
         }
         Ok(())
     }
@@ -208,6 +253,10 @@ impl PageMemoryManager {
             .address_spaces
             .remove(&directory)
             .ok_or(PageTableError::InvalidAddressSpace)?;
+        if !mappings.owns_directory {
+            self.address_spaces.insert(directory, mappings);
+            return Err(PageTableError::InvalidAddressSpace);
+        }
         for (page, owned_frame) in mappings.pages {
             let virtual_address = page * PAGE_SIZE as u32;
             unmap_page(memory, directory, virtual_address)?;
@@ -450,6 +499,53 @@ pub fn translate(
         return Err(fail(PageFaultReason::PhysicalOutOfRange));
     }
     Ok(physical_address)
+}
+
+pub fn address_space_physical_frames(
+    memory: &[u8],
+    directory: u32,
+) -> Result<Vec<u32>, PageTableError> {
+    if directory & 0x7ff != 0
+        || directory
+            .checked_add(PAGE_TABLE_BYTES as u32)
+            .is_none_or(|end| end as usize > memory.len())
+    {
+        return Err(PageTableError::InvalidAddressSpace);
+    }
+    let mut frames = HashSet::new();
+    frames.insert(directory / PAGE_SIZE as u32);
+    for directory_index in 0..PAGE_DIRECTORY_ENTRIES {
+        let entry = read_entry(memory, directory, directory_index)
+            .ok_or(PageTableError::InvalidAddressSpace)?;
+        validate_entry(entry, &|_| PageFault {
+            virtual_address: 0,
+            access: MemoryAccess::Read,
+            reason: PageFaultReason::MalformedEntry,
+        })
+        .map_err(|_| PageTableError::MalformedEntry)?;
+        if entry & PTE_PRESENT == 0 {
+            continue;
+        }
+        let table_frame = (entry & PTE_FRAME_MASK) >> 12;
+        frames.insert(table_frame);
+        let table = table_frame * PAGE_SIZE as u32;
+        for table_index in 0..PAGE_TABLE_ENTRIES {
+            let table_entry = read_entry(memory, table, table_index)
+                .ok_or(PageTableError::InvalidAddressSpace)?;
+            validate_entry(table_entry, &|_| PageFault {
+                virtual_address: 0,
+                access: MemoryAccess::Read,
+                reason: PageFaultReason::MalformedEntry,
+            })
+            .map_err(|_| PageTableError::MalformedEntry)?;
+            if table_entry & PTE_PRESENT != 0 {
+                frames.insert((table_entry & PTE_FRAME_MASK) >> 12);
+            }
+        }
+    }
+    let mut frames: Vec<_> = frames.into_iter().collect();
+    frames.sort_unstable();
+    Ok(frames)
 }
 
 pub fn map_page(

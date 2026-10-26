@@ -409,87 +409,88 @@ Checklist status: [x] completed; [ ] planned.
 === Phase 4 — Enforce kernel/user privilege
 
 * [x] Add a CPU privilege-state representation and a reliable kernel-mode reset.
-* [ ] Classify instructions, control registers, interrupts, and MMIO regions as
+* [x] Classify instructions, control registers, interrupts, and MMIO regions as
   privileged or user-accessible. Raise a defined exception on forbidden access.
-* [ ] Add a protected transition from kernel to user mode with a user PC and
+* [x] Add a protected transition from kernel to user mode with a user PC and
   user stack; prevent user code from forging or bypassing that transition.
-* [ ] Add a protected transition back to kernel mode for exceptions, interrupts,
+* [x] Add a protected transition back to kernel mode for exceptions, interrupts,
   and software system calls, using a kernel stack rather than trusting the
   current user stack.
-* [ ] Implement exception vectors and interrupt descriptor handling with
+* [x] Implement exception vectors and interrupt descriptor handling with
   privilege checks, nested-interrupt policy, acknowledgement, and a defined
   return-from-interrupt instruction or frame contract.
-* [ ] Add tests proving that kernel operations continue to work and that
+* [x] Add tests proving that kernel operations continue to work and that
   user-mode code cannot modify kernel state, execute privileged operations, or
   reach protected memory/devices.
 
 === Phase 5 — Add interrupts and preemptive scheduling
 
-* [ ] Specify an interrupt descriptor table (IDT): descriptor layout, vector
+* [x] Specify an interrupt descriptor table (IDT): descriptor layout, vector
   numbering, gate types, privilege rules, installation, and invalid-vector
   behavior. Migrate the existing fixed vectors to the specified table.
-* [ ] Specify and implement a programmable interval timer (PIT) with defined
+* [x] Specify and implement a programmable interval timer (PIT) with defined
   clock source, frequency/divisor behavior, interrupt generation, masking, and
   acknowledgement. Keep timer behavior deterministic in tests and headless
   execution.
-* [ ] Add timer-driven preemption and a documented complete task context,
+* [x] Add timer-driven preemption and a documented complete task context,
   including all registers, flags, PC, privilege state, address-space identity,
   and kernel/user stack state.
-* [ ] Implement kernel scheduler primitives for creating a task context,
+* [x] Implement kernel scheduler primitives for creating a task context,
   switching contexts, yielding, exiting, and selecting the next runnable task.
-* [ ] Add tests with multiple tasks that demonstrate timer preemption, explicit
+* [x] Add tests with multiple tasks that demonstrate timer preemption, explicit
   yield, register/flag preservation, blocked/woken tasks, and clean task exit.
 
 === Phase 6 — Implement the MMU and protected virtual memory
 
-* [ ] Specify an MMU with the existing 30-bit address width, 4 KiB pages, and
+* [x] Specify an MMU with the existing 30-bit address width, 4 KiB pages, and
   two-level paging with 512 32-bit entries per directory/table. Use 9 directory
   bits, 9 table bits, and 12 page-offset bits; each directory/table occupies
   2 KiB and each page-table entry contains an 18-bit physical frame number and
   flags. Define control registers, permissions, page-fault causes, and
   supervisor translation rules.
-* [ ] Define and implement the page directory and page table entry formats,
-  including present, read/write, user/supervisor, and any required execute/cache
-  bits.
-* [ ] Implement page translation and page-fault exceptions for instruction
+* [x] Define and implement the page directory and page table entry formats,
+  including present/readable, writable, user/supervisor, and execute flags.
+  Present implies readable; the format has no separate read-disable bit.
+* [x] Implement page translation and page-fault exceptions for instruction
   fetches, data reads/writes, and user/kernel permission violations.
-* [ ] Add address-space control registers and a safe address-space switch
+* [x] Add address-space control registers and a safe address-space switch
   operation. Define translation-cache/TLB behavior even if the first emulator
   implementation has no performance cache.
-* [ ] Implement kernel page-frame allocation and freeing, page-table management,
+* [x] Implement kernel page-frame allocation and freeing, page-table management,
   and memory accounting.
-* [ ] Establish and test the kernel's physical-memory identity mapping and
+* [x] Establish and test the kernel's physical-memory identity mapping and
   transition to normal virtual mappings. Specify which devices are mapped and
   ensure user mappings cannot access kernel or protected MMIO pages.
-* [ ] Add kernel mapping helpers for allocation, mapping, unmapping, and
+* [x] Add kernel mapping helpers for allocation, mapping, unmapping, and
   permission changes. Define page-fault recovery versus process termination.
-* [ ] Test isolation between processes, guard pages, invalid/unmapped accesses,
+* [x] Test isolation between processes, guard pages, invalid/unmapped accesses,
   read-only pages, user/supervisor permissions, address-space switching, and
   physical-frame reuse.
 
 === Phase 7 — Define the system-call ABI and services
 
-* [ ] Specify the software-interrupt or dedicated system-call instruction,
+* [x] Specify the software-interrupt or dedicated system-call instruction,
   syscall number and argument convention, return/error convention, privilege
   transition frame, and ABI versioning.
-* [ ] Define how the C runtime and hosted C library use the syscall ABI.
-  Preserve standard C interfaces where appropriate, document SC-16 extensions,
-  and distinguish unavailable host services from implemented file operations.
-* [ ] Implement syscall dispatch with validated user pointers, bounded
+* [x] Define how the freestanding C runtime uses the syscall ABI. Document the
+  SC-16-specific wrappers and explicitly leave hosted standard streams and
+  unavailable host services unsupported until Phase 8/C6.
+* [x] Implement syscall dispatch with validated user pointers, bounded
   transfers, defined errors, and no direct trust of user-supplied addresses.
-* [ ] Implement +sys_spawn+ to load an executable into a new protected address
+* [x] Implement +sys_spawn+ to load an executable into a new protected address
   space and create a task, enforcing the specified privilege-transition rules.
-* [ ] Implement +sys_exit+, +sys_yield+, and +sys_getpid+.
-* [ ] Implement +sys_mmap+ with page permissions and process ownership rules.
-* [ ] Implement +sys_read+ and +sys_write+ for the console and folder-backed
+* [x] Implement +sys_exit+, +sys_yield+, and +sys_getpid+.
+* [x] Implement +sys_mmap+ with page permissions and process ownership rules.
+* [x] Implement +sys_read+ and +sys_write+ for the console and folder-backed
   disk filesystem, with explicit file-handle, path, and partial-I/O behavior.
-* [ ] Implement +sys_sleep+ using timer ticks and a blocked-task wakeup queue.
-* [ ] Implement +sys_wait+ with child-process status collection and defined
+* [x] Implement +sys_sleep+ using deterministic instruction ticks and a
+  blocked-task wakeup queue.
+* [x] Implement +sys_wait+ with child-process status collection and defined
   behavior for invalid/non-child process IDs.
-* [ ] Specify and implement +sys_sep_op+ for semaphore operations, including
+* [x] Specify and implement +sys_sep_op+ for semaphore operations, including
   operation codes, semaphore ownership and lifetime, blocking/wakeup behavior,
   and error handling.
-* [ ] Add ABI-level tests for valid calls, invalid syscall numbers, invalid or
+* [x] Add ABI-level tests for valid calls, invalid syscall numbers, invalid or
   unmapped user pointers, permissions, interrupted calls, and task lifecycle.
 
 === Phase 8 — Move applications to bootable disk images

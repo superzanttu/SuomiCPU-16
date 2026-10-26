@@ -82,6 +82,10 @@ impl Scheduler {
         self.tasks.iter().find(|task| task.id == id)
     }
 
+    pub fn tasks(&self) -> &[TaskContext] {
+        &self.tasks
+    }
+
     pub fn activate(&mut self, id: TaskId) -> Result<TaskContext, SchedulerError> {
         if self.current.is_some() {
             return Err(SchedulerError::TaskNotRunnable(id));

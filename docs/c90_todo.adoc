@@ -447,12 +447,14 @@ required before claiming full C90 compatibility.
     C90 +double+ range, precision, or exceptional-value requirements.
 ** The emulator now supplies a text console, BIOS device descriptor and
     required shared +bios.bin+ startup, folder-disk boot selection, and a
-    bounded USER-mode folder-filesystem register service. The service is not
-    the finalized general syscall ABI and does not provide file-backed C
-    streams. When MMU translation is enabled, the service validates guest
-    buffers through their mappings; normal BIOS USER boot still leaves
-    translation disabled. General syscalls and hosted-runtime behavior remain
-    open in link:sc16_improvements.adoc[+sc16_improvements.adoc+].
+    bounded USER-mode folder-filesystem register service. System-call ABI
+    version 1 and SC-16-specific C wrappers are now defined in
+    link:sc16_improvements.adoc[+sc16_improvements.adoc+] and
+    link:sc16_architecture.adoc[+sc16_architecture.adoc+]. They do not provide
+    hosted C file streams. When MMU translation is enabled, filesystem and
+    syscall buffers are validated through their mappings; normal BIOS USER
+    boot still leaves translation disabled. Hosted-runtime behavior remains
+    open under C6.
 ** Audit all required headers: +assert.h+, +ctype.h+, +errno.h+, +float.h+,
     +limits.h+, +locale.h+, +math.h+, +setjmp.h+, +signal.h+, +stdarg.h+,
     +stddef.h+, +stdio.h+, +stdlib.h+, +string.h+, and +time.h+.
@@ -467,7 +469,7 @@ required before claiming full C90 compatibility.
     capability policy, buffering, EOF/error indicators, environment and
     command behavior, and process termination/status.
 ** Base file operations and process behavior on the folder-backed disk and
-    filesystem service and future syscall ABI tracked in
+    filesystem service and the syscall ABI tracked in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+]; keep the standard C
     interface distinct from SC-16-specific services.
 ** Surface unavailable resources and errors through documented C interfaces.
