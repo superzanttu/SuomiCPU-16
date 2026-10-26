@@ -11,6 +11,7 @@ pub mod isa;
 pub mod mmu;
 pub mod net;
 pub mod runtime;
+pub mod sc_net;
 pub mod scheduler;
 pub mod sprite_viewer;
 pub mod syscall;

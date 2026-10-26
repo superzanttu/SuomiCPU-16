@@ -7,7 +7,9 @@ use crate::cpu::{
     GUEST_TEXT_BACKGROUND, GUEST_TEXT_CONTROL, GUEST_TEXT_DATA, GUEST_TEXT_FOREGROUND,
 };
 use crate::disk::{FolderBootMode, FolderDisk};
-use crate::image::{ImageError, load_program};
+#[cfg(test)]
+use crate::image::load_program;
+use crate::image::{ImageError, load_prebuilt_program};
 use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
@@ -505,6 +507,7 @@ pub async fn run_with_devices(
 
     let font = load_font();
     let mut pixels = vec![0u32; 640 * 480];
+    let mut framebuffer = Vec::new();
     let mut canvas = Canvas::new();
     let mut audio = AudioEngine::new();
     let mut cpu = match fresh_runtime_cpu(root, program, disk_id, network_port, None) {
@@ -529,7 +532,7 @@ pub async fn run_with_devices(
     let mut target = if let Some(source) = program {
         let target = BootTarget {
             source: source.to_path_buf(),
-            folder_disk: false,
+            folder_disk: source.is_dir(),
         };
         boot_target(&mut cpu, &target)?;
         Some(target)
@@ -852,7 +855,7 @@ pub async fn run_with_devices(
             cpu.frame_presented,
             cpu.guest_text.enabled,
         ) {
-            render_cpu(&cpu, &mut pixels, &font);
+            render_cpu_with_framebuffer(&cpu, &mut pixels, &font, &mut framebuffer);
             presented_size = screen_size(&cpu);
             presented_triangles.clone_from(&cpu.gpu_triangles);
             presented_lines.clone_from(&cpu.gpu_lines);
@@ -920,13 +923,23 @@ pub fn run_headless_with_devices(
 ) -> Result<usize, RuntimeError> {
     let mut cpu = Cpu::new();
     cpu.set_network_port(network_port);
-    configure_disk(&mut cpu, root, program)?;
+    cpu.enable_scnet(crate::sc_net::DEFAULT_PORT);
+    if program.is_dir() {
+        cpu.configure_disk(root.join("disks"), root.join("disks"))
+            .map_err(RuntimeError::Window)?;
+    } else {
+        configure_disk(&mut cpu, root, program)?;
+    }
     if let Some(disk_id) = disk_id {
         cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
     }
-    let image = load_program(program)?;
-    cpu.load_program(&image.segments, image.entry_point)
-        .map_err(|error| RuntimeError::Window(error.to_string()))?;
+    if program.is_dir() {
+        boot_folder_disk(&mut cpu, program)?;
+    } else {
+        let image = load_prebuilt_program(program)?;
+        cpu.load_program(&image.segments, image.entry_point)
+            .map_err(|error| RuntimeError::Window(error.to_string()))?;
+    }
     let executed = cpu
         .run(budget)
         .map_err(|error| RuntimeError::Window(error.to_string()))?;
@@ -1284,7 +1297,8 @@ fn fresh_runtime_cpu(
 ) -> Result<Cpu, RuntimeError> {
     let mut cpu = Cpu::new();
     cpu.set_network_port(network_port);
-    if let Some(source) = source {
+    cpu.enable_scnet(crate::sc_net::DEFAULT_PORT);
+    if let Some(source) = source.filter(|source| !source.is_dir()) {
         configure_disk(&mut cpu, root, source)?;
     } else {
         cpu.configure_disk(root.join("disks"), root.join("disks"))
@@ -1325,39 +1339,13 @@ fn fresh_runtime_cpu(
 
 fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
     if target.folder_disk {
-        let boot = FolderDisk::open(&target.source)
-            .and_then(|disk| disk.load_boot_image())
-            .map_err(|error| {
-                cpu.console.log_error("bios", &error);
-                RuntimeError::Window(error)
-            })?;
-        cpu.prepare_image_entry();
-        cpu.load_program(&boot.image.segments, boot.image.entry_point)
-            .map_err(|error| {
-                cpu.console.log_error("bios", &error.to_string());
-                RuntimeError::Window(error.to_string())
-            })?;
-        cpu.mount_folder_disk(&target.source).map_err(|error| {
-            cpu.console.log_error("bios", &error);
-            RuntimeError::Window(error)
-        })?;
-        match boot.mode {
-            FolderBootMode::Kernel => cpu.privilege_mode = PrivilegeMode::Supervisor,
-            FolderBootMode::User => {
-                let user_stack = cpu.initial_user_stack_pointer();
-                cpu.enter_user_mode(cpu.pc, user_stack).map_err(|error| {
-                    cpu.console.log_error("bios", &error.to_string());
-                    RuntimeError::Window(error.to_string())
-                })?;
-            }
-        }
-        cpu.running = true;
+        let mode = boot_folder_disk(cpu, &target.source)?;
         cpu.console.log_info(
             "bios",
             &format!(
                 "Booting {} in {} mode",
                 target.source.display(),
-                match boot.mode {
+                match mode {
                     FolderBootMode::Kernel => "KERNEL",
                     FolderBootMode::User => "USER",
                 }
@@ -1371,7 +1359,7 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
         .and_then(|name| name.to_str())
         .unwrap_or("program");
     cpu.console.log_info("emulator", &format!("Loading {name}"));
-    let image = load_program(&target.source).map_err(|error| {
+    let image = load_prebuilt_program(&target.source).map_err(|error| {
         cpu.console
             .log_error("emulator", &format!("Loading {name} failed: {error}"));
         error
@@ -1385,6 +1373,37 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
         })?;
     cpu.console.log_info("emulator", &format!("{name} loaded"));
     Ok(())
+}
+
+fn boot_folder_disk(cpu: &mut Cpu, disk_path: &Path) -> Result<FolderBootMode, RuntimeError> {
+    let boot = FolderDisk::open(disk_path)
+        .and_then(|disk| disk.load_boot_image())
+        .map_err(|error| {
+            cpu.console.log_error("bios", &error);
+            RuntimeError::Window(error)
+        })?;
+    cpu.prepare_image_entry();
+    cpu.load_program(&boot.image.segments, boot.image.entry_point)
+        .map_err(|error| {
+            cpu.console.log_error("bios", &error.to_string());
+            RuntimeError::Window(error.to_string())
+        })?;
+    cpu.mount_folder_disk(disk_path).map_err(|error| {
+        cpu.console.log_error("bios", &error);
+        RuntimeError::Window(error)
+    })?;
+    match boot.mode {
+        FolderBootMode::Kernel => cpu.privilege_mode = PrivilegeMode::Supervisor,
+        FolderBootMode::User => {
+            let user_stack = cpu.initial_user_stack_pointer();
+            cpu.enter_user_mode(cpu.pc, user_stack).map_err(|error| {
+                cpu.console.log_error("bios", &error.to_string());
+                RuntimeError::Window(error.to_string())
+            })?;
+        }
+    }
+    cpu.running = true;
+    Ok(boot.mode)
 }
 
 fn update_keys(
@@ -1866,9 +1885,21 @@ fn screen_size(cpu: &Cpu) -> (usize, usize) {
     }
 }
 
+#[cfg(test)]
 fn render_cpu(cpu: &Cpu, pixels: &mut [u32], font: &[[u8; 8]]) {
+    let mut framebuffer = Vec::new();
+    render_cpu_with_framebuffer(cpu, pixels, font, &mut framebuffer);
+}
+
+fn render_cpu_with_framebuffer(
+    cpu: &Cpu,
+    pixels: &mut [u32],
+    font: &[[u8; 8]],
+    framebuffer: &mut Vec<u8>,
+) {
     let (width, height) = screen_size(cpu);
-    let framebuffer = cpu.composited_framebuffer();
+    framebuffer.resize(width * height, 0);
+    cpu.composited_framebuffer_into(framebuffer);
     for y in 0..height {
         for x in 0..width {
             let color = framebuffer[y * width + x];
@@ -2118,6 +2149,22 @@ fn draw_text_limited_scaled(
 mod tests {
     use super::*;
     use std::fs;
+
+    fn prebuild_test_image(source: &Path, label: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "sc16-runtime-image-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let image = crate::image::build_source(source).unwrap();
+        let path = directory.join(format!("{label}.sc16img"));
+        crate::image::write_image(&path, &image).unwrap();
+        (directory, path)
+    }
 
     #[test]
     fn console_window_renders_snapshot_with_small_font_in_a_separate_framebuffer() {
@@ -3404,11 +3451,17 @@ mod tests {
     fn elite_can_restart_between_bounded_instruction_slices() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = root.join("modules").join("Elite").join("elitedemo.c");
+        let image = crate::image::build_source(&source).unwrap();
+        let image_path = source
+            .parent()
+            .unwrap()
+            .join(format!(".sc16-test-{}.sc16img", std::process::id()));
+        crate::image::write_image(&image_path, &image).unwrap();
         let target = BootTarget {
-            source: source.clone(),
+            source: image_path.clone(),
             folder_disk: false,
         };
-        let mut cpu = fresh_runtime_cpu(root, Some(&source), None, DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(root, Some(&image_path), None, DEFAULT_PORT, None).unwrap();
         boot_target(&mut cpu, &target).unwrap();
         cpu.begin_frame();
         let mut budget_remaining = 1_000_000;
@@ -3421,7 +3474,8 @@ mod tests {
         );
 
         let console = cpu.console.clone();
-        cpu = fresh_runtime_cpu(root, Some(&source), None, DEFAULT_PORT, Some(&console)).unwrap();
+        cpu =
+            fresh_runtime_cpu(root, Some(&image_path), None, DEFAULT_PORT, Some(&console)).unwrap();
         boot_target(&mut cpu, &target).unwrap();
 
         cpu.begin_frame();
@@ -3429,6 +3483,7 @@ mod tests {
         let restarted_slice = run_instruction_slice(&mut cpu, &mut budget_remaining).unwrap();
         assert!(restarted_slice > 0);
         assert!(cpu.running, "Elite halted after reset");
+        fs::remove_file(image_path).unwrap();
     }
 
     #[test]
@@ -3547,26 +3602,33 @@ mod tests {
     fn headless_runtime_executes_retained_assembler_examples() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for name in ["commands.asm", "directives.asm", "example.asm"] {
-            let program = root.join("examples").join(name);
+            let source = root.join("examples").join(name);
+            let (directory, program) = prebuild_test_image(&source, name);
             let count = run_headless(root, &program, 50_000).unwrap_or_else(|error| {
                 panic!("{name} failed through the headless runtime: {error}")
             });
             assert!(count > 0, "{name} executed no instructions");
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[test]
     fn headless_runtime_reports_instruction_budget_exhaustion() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let program = root.join("examples").join("commands.asm");
+        let source = root.join("examples").join("commands.asm");
+        let (directory, program) = prebuild_test_image(&source, "commands");
 
         let error = run_headless(root, &program, 1).unwrap_err();
 
-        assert!(error.to_string().contains("instruction budget exhausted"));
+        assert!(
+            error.to_string().contains("instruction budget exhausted"),
+            "{error}"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn headless_runtime_loads_and_executes_supported_c_source() {
+    fn headless_runtime_executes_prebuilt_image_from_supported_c_source() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let directory = std::env::temp_dir().join(format!(
             "sc16-headless-c-{}-{}",
@@ -3579,11 +3641,54 @@ mod tests {
         fs::create_dir_all(directory.join("disks")).unwrap();
         let source = directory.join("minimal.c");
         fs::write(&source, "int main(void) { return 6 * 7; }\n").unwrap();
+        let image = crate::image::build_source(&source).unwrap();
+        let program = directory.join("minimal.sc16img");
+        crate::image::write_image(&program, &image).unwrap();
 
-        let result = run_headless(root, &source, 64);
+        let result = run_headless(root, &program, 64);
         fs::remove_dir_all(&directory).unwrap();
 
-        let executed = result.expect("supported C source should run headlessly");
+        let executed = result.expect("prebuilt C image should run headlessly");
         assert!(executed > 0);
+    }
+
+    #[test]
+    fn headless_runtime_rejects_source_compilation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = root.join("examples").join("example.asm");
+
+        let error = run_headless(root, &source, 50_000).unwrap_err();
+
+        assert!(error.to_string().contains("compile source with sc16build"));
+    }
+
+    #[test]
+    fn headless_runtime_boots_prebuilt_folder_disk_images() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = std::env::temp_dir().join(format!(
+            "sc16-headless-disk-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk = directory.join("TEST0001");
+        fs::create_dir_all(&disk).unwrap();
+        let image = crate::assembler::assemble("loop:\n    JMP loop\n", 0).unwrap();
+        crate::image::write_image(&disk.join("main.bin"), &image).unwrap();
+        fs::write(
+            disk.join("disk.json"),
+            r#"{"version":1,"id":"TEST0001","label":"Runtime test","capacity_bytes":65536,"read_only":false,"protected_files":["main.bin"]}"#,
+        )
+        .unwrap();
+
+        let error = run_headless(root, &disk, 8).unwrap_err();
+
+        fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            error.to_string().contains("instruction budget exhausted"),
+            "{error}"
+        );
     }
 }

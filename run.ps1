@@ -14,20 +14,52 @@ if (!(Get-Command cargo -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-Write-Host "Building the SC-16 BIOS firmware."
-& cargo run --quiet --bin sc16asm -- bios.asm bios.bin
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+$BiosSource = Join-Path $ScriptDir "bios.asm"
+$BiosImage = Join-Path $ScriptDir "bios.bin"
+$RebuildBios = !(Test-Path $BiosImage)
+if (!$RebuildBios) {
+    $RebuildBios = (Get-Item $BiosSource).LastWriteTimeUtc -gt (Get-Item $BiosImage).LastWriteTimeUtc
+}
+if ($RebuildBios) {
+    Write-Host "Building the SC-16 BIOS firmware."
+    & cargo run --quiet --bin sc16build -- build-bios $BiosSource $BiosImage
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 
 $CargoArgs = @("run", "--quiet", "--bin", "suomicpu16", "--")
 if ($Fullscreen) {
     $CargoArgs += "--fullscreen"
 }
+$TemporaryImage = $null
 if (![string]::IsNullOrWhiteSpace($ProgramFile)) {
-    $CargoArgs += $ProgramFile
+    $extension = [System.IO.Path]::GetExtension($ProgramFile)
+    if (($extension -ieq ".c" -or $extension -ieq ".asm") -and
+        (Test-Path -LiteralPath $ProgramFile -PathType Leaf)) {
+        $sourcePath = (Resolve-Path -LiteralPath $ProgramFile).Path
+        $temporaryName = ".sc16-run-" + [guid]::NewGuid().ToString("N") + ".sc16img"
+        $TemporaryImage = Join-Path (Split-Path -Parent $sourcePath) $temporaryName
+        & cargo run --quiet --bin sc16build -- $sourcePath $TemporaryImage
+        if ($LASTEXITCODE -ne 0) {
+            if (Test-Path -LiteralPath $TemporaryImage) {
+                Remove-Item -LiteralPath $TemporaryImage -Force
+            }
+            exit $LASTEXITCODE
+        }
+        $CargoArgs += $TemporaryImage
+    } else {
+        $CargoArgs += $ProgramFile
+    }
 } else {
     Write-Host "Starting SC-16 in BIOS."
 }
-& cargo @CargoArgs
-exit $LASTEXITCODE
+try {
+    & cargo @CargoArgs
+    $EmulatorExitCode = $LASTEXITCODE
+} finally {
+    if ($TemporaryImage -and (Test-Path -LiteralPath $TemporaryImage)) {
+        Remove-Item -LiteralPath $TemporaryImage -Force
+    }
+}
+exit $EmulatorExitCode

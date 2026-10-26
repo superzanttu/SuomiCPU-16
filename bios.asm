@@ -245,6 +245,30 @@ render_boot_color:
     CALL print_string
     LDA R6, 0x5000
     CALL print_string
+    LDI R3, 0
+    LDA R5, 0x43406
+    STW R5, R3
+    LDI R3, 0x5080
+    LDA R5, 0x43408
+    STW R5, R3
+    LDI R3, 128
+    LDA R5, 0x4340a
+    STW R5, R3
+    LDI R3, 8
+    LDA R5, 0x43400
+    ST R5, R3
+    LDA R5, 0x4340c
+    LD R3, R5
+    BNZ render_disk_info_invalid
+    LDA R6, 0x5080
+    CALL print_string
+    JMP render_disk_info_done
+render_disk_info_invalid:
+    LDA R6, invalid_disk_info
+    CALL print_string
+render_disk_info_done:
+    LDA R6, newline
+    CALL print_string
     LDA R6, boot_suffix
     CALL print_string
 
@@ -1044,5 +1068,7 @@ no_disks:
     .data string "+-------------------------------------------------+\r\n|                 NO BOOT DISKS                  |\r\n|  No boot disks found.                           |\r\n+-------------------------------------------------+\r\n\0"
 boot_failed_text:
     .data string "|  Boot failed. Select another disk.\r\n\0"
+invalid_disk_info:
+    .data string "INVALID DISK METADATA OR IMAGE\0"
 boot_error:
     .data string "|  Boot failed. Select another disk.\r\n\0"

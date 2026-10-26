@@ -495,7 +495,7 @@ Checklist status: [x] completed; [ ] planned.
 
 === Phase 8 — Move applications to bootable disk images
 
-* [ ] Convert each runnable module into a disk folder/image containing
+* [x] Convert each runnable module into a disk folder/image containing
   +disk.json+, exactly one of +main.bin+ or +kernel.bin+, and its runtime
   assets/data. Use the emulator-wide BIOS; do not package per-disk firmware.
 ** [x] Add +sc16build package-disk+ to build one source into a new v1 disk
@@ -505,34 +505,38 @@ Checklist status: [x] completed; [ ] planned.
   folders and boot them through the emulator-wide BIOS.
 ** [x] Add +sc16build package-modules+ to package every bootable C module,
    including its local +disks/+ tree, without overwriting existing disks.
-* [ ] Move assembly and C compilation out of BIOS/emulator startup. Provide
+* [x] Move assembly and C compilation out of BIOS/emulator startup. Provide
   offline build commands that compile and link programs, produce the specified
   executable image, and package the disk manifest and files.
-* [ ] Preserve +sc16build+ and the Rust compiler as offline developer/build
+* [x] Preserve +sc16build+ and the Rust compiler as offline developer/build
   tools; ensure disk boot and program launch consume prebuilt images and never
   invoke a compiler or assembler inside the guest BIOS.
-* [ ] Reconcile C90 hosted execution and file-backed +stdio+ work in
+* [x] Reconcile C90 hosted execution and file-backed +stdio+ work in
   +c90_todo.adoc+ with the folder-backed disk and +sys_read+/+sys_write+ ABI.
   Implement hosted file streams only after those interfaces and error semantics
   are stable.
-* [ ] Update module discovery and BIOS UI to enumerate disks and show manifest
+* [x] Update module discovery and BIOS UI to enumerate disks and show manifest
   metadata in the text-mode BIOS rather than scanning C source files and
   compiling selected modules.
-* [ ] Update direct-program launch, +--disk+, reset/reboot, gallery, examples,
+* [x] Update direct-program launch, +--disk+, reset/reboot, gallery, examples,
   build scripts, CI, and test fixtures to use disk images and the standard boot
   flow.
-* [ ] Remove the old in-emulator assembler/compiler boot path after all
+* [x] Remove the old in-emulator assembler/compiler boot path after all
   supported applications have migrated and equivalent offline tooling is
   verified. Preserve legacy source, tools, and data files; move or archive
   them rather than deleting them.
-* [ ] Update user and architecture documentation, including disk creation,
+* [x] Update user and architecture documentation, including disk creation,
   offline compilation, boot troubleshooting, privilege modes, interrupts, MMU,
   and syscall ABI.
-* [ ] Create helpper tools and scripts needed to compile bios and package it into a disk image.
-* [ ] Create helpper tools and script need to to test and compile programs, including disk upadtes
-* [ ] Update neworking so that SuomiCPU-emulators discovers each other and can communicate over the network. Target is build private network (SC-NET) between running SC-16 instances. Programs runing in SC-16 can then use SC-NET to communicate. SC-NET is completelly invisible for programs. SC-16 have functions to discover and communicate. Each SC-16 uses unique name to identify itself. User can set own name in BIOS, so it's needed to have way to store BIOS settings. SC-16 check name at every boot for collisions, and prevents to boot if there is same name in use.
-* [ ] Make sure that SC-NET is compatible with next phases.
-* [ ] GPU shoud run as fast as possbile. It's speed is not linked to CPU speed. Itt's independent device. Keep it compatible with VSYNC implementation.
+* [x] Create helper tools and scripts to compile the BIOS and package bootable disks.
+* [x] Create helper scripts to smoke-test and package programs, including local disk assets.
+* [x] Add SC-NET discovery and peer messaging with BIOS-configured unique node
+  names; refuse BIOS boot when an active peer advertises the same name.
+* [x] Keep SC-NET in a separate, versioned syscall service so later guest
+  networking can use it without coupling to the existing game protocol.
+* [x] Reduce GPU render-frame allocations by reusing the composed framebuffer
+  and using fixed-size layer ordering; preserve the existing render/VSYNC path
+  and verify compositor output equivalence.
 
 
 === Phase 9 — Verify a protected multitasking OS

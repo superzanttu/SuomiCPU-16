@@ -3,30 +3,118 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <ctype.h>
-
-#define CONSOLE_DATA (*(volatile unsigned char *)0x43200UL)
-#define CONSOLE_STATUS (*(volatile unsigned char *)0x43201UL)
+#include <sc16_syscall.h>
 
 static int __sc16_console_error;
 static int __sc16_pushback_character = EOF;
 
+struct __sc16_FILE {
+    int handle;
+    int flags;
+    int eof;
+    int error;
+    int pushback;
+    long position;
+};
+
+static FILE __sc16_files[FOPEN_MAX - 3];
+
+static int __stdio_file_slot(FILE *stream)
+{
+    int index;
+
+    for (index = 0; index < FOPEN_MAX - 3; ++index) {
+        if (stream == &__sc16_files[index])
+            return index;
+    }
+    return -1;
+}
+
+static void __stdio_set_error(long result)
+{
+    if (result == -2L)
+        errno = ENOENT;
+    else if (result == -4L)
+        errno = EINTR;
+    else if (result == -5L)
+        errno = EIO;
+    else if (result == -9L)
+        errno = EBADF;
+    else if (result == -10L)
+        errno = ECHILD;
+    else if (result == -12L)
+        errno = ENOMEM;
+    else if (result == -13L)
+        errno = EACCES;
+    else if (result == -14L)
+        errno = EFAULT;
+    else if (result == -16L)
+        errno = EBUSY;
+    else if (result == -22L)
+        errno = EINVAL;
+    else if (result == -24L)
+        errno = EMFILE;
+    else if (result == -38L)
+        errno = ENOSYS;
+    else if (result == -75L)
+        errno = EOVERFLOW;
+    else
+        errno = EIO;
+}
+
 int fgetc(FILE *stream)
 {
-    if (stream != stdin) {
+    unsigned char character;
+    int result;
+    int slot;
+
+    if (stream == stdin) {
+        if (__sc16_pushback_character != EOF) {
+            result = __sc16_pushback_character;
+            __sc16_pushback_character = EOF;
+            return result;
+        }
+        for (;;) {
+            result = sc16_read(0, &character, 1);
+            if (result < 0) {
+                __stdio_set_error(result);
+                __sc16_console_error = 1;
+                return EOF;
+            }
+            if (result != 0)
+                return character;
+            (void)sc16_yield();
+        }
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot < 0) {
         __sc16_console_error = 1;
         errno = EBADF;
         return EOF;
     }
-    if (__sc16_pushback_character != EOF) {
-        int character;
-
-        character = __sc16_pushback_character;
-        __sc16_pushback_character = EOF;
-        return character;
+    if (__sc16_files[slot].handle == 0 ||
+        !(__sc16_files[slot].flags & SC16_OPEN_READ)) {
+        __sc16_files[slot].error = 1;
+        errno = EBADF;
+        return EOF;
     }
-    while (!(CONSOLE_STATUS & 1))
-        ;
-    return CONSOLE_DATA;
+    if (__sc16_files[slot].pushback != EOF) {
+        result = __sc16_files[slot].pushback;
+        __sc16_files[slot].pushback = EOF;
+        return result;
+    }
+    result = sc16_read(__sc16_files[slot].handle, &character, 1);
+    if (result < 0) {
+        __stdio_set_error(result);
+        __sc16_files[slot].error = 1;
+        return EOF;
+    }
+    if (result == 0) {
+        __sc16_files[slot].eof = 1;
+        return EOF;
+    }
+    ++__sc16_files[slot].position;
+    return character;
 }
 
 char *fgets(char *text, int count, FILE *stream)
@@ -78,13 +166,36 @@ char *gets(char *text)
 
 int fputc(int character, FILE *stream)
 {
-    if (stream != stdout && stream != stderr) {
+    unsigned char byte;
+    int result;
+    int slot;
+
+    byte = (unsigned char)character;
+    if (stream == stdout || stream == stderr) {
+        result = sc16_write(stream == stdout ? 1 : 2, &byte, 1);
+        if (result == 1)
+            return byte;
+        __sc16_console_error = 1;
+        if (result < 0)
+            __stdio_set_error(result);
+        return EOF;
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot < 0 || __sc16_files[slot].handle == 0 ||
+        !(__sc16_files[slot].flags & SC16_OPEN_WRITE)) {
         __sc16_console_error = 1;
         errno = EBADF;
         return EOF;
     }
-    CONSOLE_DATA = (unsigned char)character;
-    return (unsigned char)character;
+    result = sc16_write(__sc16_files[slot].handle, &byte, 1);
+    if (result == 1) {
+        ++__sc16_files[slot].position;
+        return byte;
+    }
+    if (result < 0)
+        __stdio_set_error(result);
+    __sc16_files[slot].error = 1;
+    return EOF;
 }
 
 int fputs(const char *text, FILE *stream)
@@ -402,14 +513,29 @@ int vprintf(const char *format, va_list arguments)
 
 int ungetc(int character, FILE *stream)
 {
-    if (stream != stdin || character == EOF ||
-        __sc16_pushback_character != EOF) {
-        if (stream != stdin)
-            errno = EBADF;
+    int slot;
+
+    if (character == EOF)
+        return EOF;
+    if (stream == stdin) {
+        if (__sc16_pushback_character != EOF)
+            return EOF;
+        __sc16_pushback_character = (unsigned char)character;
+        return __sc16_pushback_character;
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot < 0 || __sc16_files[slot].handle == 0 ||
+        !(__sc16_files[slot].flags & SC16_OPEN_READ)) {
+        errno = EBADF;
         return EOF;
     }
-    __sc16_pushback_character = (unsigned char)character;
-    return __sc16_pushback_character;
+    if (__sc16_files[slot].pushback != EOF)
+        return EOF;
+    __sc16_files[slot].pushback = (unsigned char)character;
+    if (__sc16_files[slot].position > 0)
+        --__sc16_files[slot].position;
+    __sc16_files[slot].eof = 0;
+    return __sc16_files[slot].pushback;
 }
 
 int fprintf(FILE *stream, const char *format, ...)
@@ -436,7 +562,8 @@ int printf(const char *format, ...)
 
 int fflush(FILE *stream)
 {
-    if (stream == NULL || stream == stdout || stream == stderr)
+    if (stream == NULL || stream == stdout || stream == stderr ||
+        stream == stdin || __stdio_file_slot(stream) >= 0)
         return 0;
     errno = EBADF;
     __sc16_console_error = 1;
@@ -445,10 +572,77 @@ int fflush(FILE *stream)
 
 FILE *fopen(const char *filename, const char *mode)
 {
-    (void)filename;
-    (void)mode;
-    errno = ENOSYS;
-    return NULL;
+    int slot;
+    int flags;
+    int plus;
+    int binary;
+    int index;
+    int handle;
+
+    if (filename == NULL || mode == NULL || mode[0] == '\0') {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (mode[0] == 'r')
+        flags = SC16_OPEN_READ;
+    else if (mode[0] == 'w')
+        flags = SC16_OPEN_WRITE | SC16_OPEN_CREATE | SC16_OPEN_TRUNCATE;
+    else if (mode[0] == 'a')
+        flags = SC16_OPEN_WRITE | SC16_OPEN_CREATE | SC16_OPEN_APPEND;
+    else {
+        errno = EINVAL;
+        return NULL;
+    }
+    plus = 0;
+    binary = 0;
+    for (index = 1; mode[index] != '\0'; ++index) {
+        if (mode[index] == '+' && !plus)
+            plus = 1;
+        else if (mode[index] == 'b' && !binary)
+            binary = 1;
+        else {
+            errno = EINVAL;
+            return NULL;
+        }
+    }
+    if (plus)
+        flags |= SC16_OPEN_READ | SC16_OPEN_WRITE;
+    slot = -1;
+    for (index = 0; index < FOPEN_MAX - 3; ++index) {
+        if (__sc16_files[index].handle == 0) {
+            slot = index;
+            break;
+        }
+    }
+    if (slot < 0) {
+        errno = EMFILE;
+        return NULL;
+    }
+    handle = sc16_open(filename, (unsigned int)flags);
+    if (handle < 0) {
+        __stdio_set_error(handle);
+        return NULL;
+    }
+    __sc16_files[slot].handle = handle;
+    __sc16_files[slot].flags = flags;
+    __sc16_files[slot].eof = 0;
+    __sc16_files[slot].error = 0;
+    __sc16_files[slot].pushback = EOF;
+    __sc16_files[slot].position = 0L;
+    if (flags & SC16_OPEN_APPEND) {
+        long position;
+
+        position = sc16_seek(handle, 0L, SEEK_END);
+        if (position < 0L) {
+            __stdio_set_error(position);
+            __sc16_files[slot].error = 1;
+            (void)sc16_close(handle);
+            __sc16_files[slot].handle = 0;
+            return NULL;
+        }
+        __sc16_files[slot].position = position;
+    }
+    return &__sc16_files[slot];
 }
 
 FILE *freopen(const char *filename, const char *mode, FILE *stream)
@@ -462,12 +656,31 @@ FILE *freopen(const char *filename, const char *mode, FILE *stream)
 
 int fclose(FILE *stream)
 {
+    int slot;
+    int result;
+
     if (stream == stdin || stream == stdout || stream == stderr) {
         errno = EBADF;
         return EOF;
     }
-    errno = EBADF;
-    return EOF;
+    slot = __stdio_file_slot(stream);
+    if (slot < 0 || __sc16_files[slot].handle == 0) {
+        errno = EBADF;
+        return EOF;
+    }
+    result = sc16_close(__sc16_files[slot].handle);
+    if (result < 0) {
+        __stdio_set_error(result);
+        __sc16_files[slot].error = 1;
+        return EOF;
+    }
+    __sc16_files[slot].handle = 0;
+    __sc16_files[slot].flags = 0;
+    __sc16_files[slot].eof = 0;
+    __sc16_files[slot].error = 0;
+    __sc16_files[slot].pushback = EOF;
+    __sc16_files[slot].position = 0L;
+    return 0;
 }
 
 size_t fread(void *pointer, size_t size, size_t count, FILE *stream)
@@ -476,6 +689,9 @@ size_t fread(void *pointer, size_t size, size_t count, FILE *stream)
     size_t total;
     size_t index;
     int character;
+    int slot;
+    int result;
+    size_t request;
 
     if (size == 0 || count == 0)
         return 0;
@@ -483,18 +699,52 @@ size_t fread(void *pointer, size_t size, size_t count, FILE *stream)
         errno = EINVAL;
         return 0;
     }
-    if (stream != stdin) {
+    if (stream == stdin) {
+        total = size * count;
+        bytes = (unsigned char *)pointer;
+        for (index = 0; index < total; ++index) {
+            character = fgetc(stream);
+            if (character == EOF)
+                break;
+            bytes[index] = (unsigned char)character;
+        }
+        return index / size;
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot < 0 || __sc16_files[slot].handle == 0 ||
+        !(__sc16_files[slot].flags & SC16_OPEN_READ)) {
         errno = EBADF;
         __sc16_console_error = 1;
         return 0;
     }
     total = size * count;
     bytes = (unsigned char *)pointer;
-    for (index = 0; index < total; ++index) {
-        character = fgetc(stream);
-        if (character == EOF)
+    index = 0;
+    if (__sc16_files[slot].pushback != EOF && total != 0) {
+        bytes[index++] = (unsigned char)__sc16_files[slot].pushback;
+        __sc16_files[slot].pushback = EOF;
+    }
+    while (index < total) {
+        request = total - index;
+        if (request > 4096)
+            request = 4096;
+        result = sc16_read(__sc16_files[slot].handle, bytes + index,
+                           (unsigned int)request);
+        if (result < 0) {
+            __stdio_set_error(result);
+            __sc16_files[slot].error = 1;
             break;
-        bytes[index] = (unsigned char)character;
+        }
+        if (result == 0) {
+            __sc16_files[slot].eof = 1;
+            break;
+        }
+        index += (size_t)result;
+        __sc16_files[slot].position += (long)result;
+        if ((size_t)result < request) {
+            __sc16_files[slot].eof = 1;
+            break;
+        }
     }
     return index / size;
 }
@@ -504,6 +754,9 @@ size_t fwrite(const void *pointer, size_t size, size_t count, FILE *stream)
     const unsigned char *bytes;
     size_t total;
     size_t index;
+    int slot;
+    int result;
+    size_t request;
 
     if (size == 0 || count == 0)
         return 0;
@@ -511,15 +764,55 @@ size_t fwrite(const void *pointer, size_t size, size_t count, FILE *stream)
         errno = EINVAL;
         return 0;
     }
-    if (stream != stdout && stream != stderr) {
+    if (stream == stdout || stream == stderr) {
+        total = size * count;
+        bytes = (const unsigned char *)pointer;
+        index = 0;
+        while (index < total) {
+            request = total - index;
+            if (request > 4096)
+                request = 4096;
+            result = sc16_write(stream == stdout ? 1 : 2, bytes + index,
+                                (unsigned int)request);
+            if (result < 0) {
+                __stdio_set_error(result);
+                __sc16_console_error = 1;
+                break;
+            }
+            if (result == 0)
+                break;
+            index += (size_t)result;
+            if ((size_t)result < request)
+                break;
+        }
+        return index / size;
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot < 0 || __sc16_files[slot].handle == 0 ||
+        !(__sc16_files[slot].flags & SC16_OPEN_WRITE)) {
         errno = EBADF;
         __sc16_console_error = 1;
         return 0;
     }
     total = size * count;
     bytes = (const unsigned char *)pointer;
-    for (index = 0; index < total; ++index) {
-        if (fputc(bytes[index], stream) == EOF)
+    index = 0;
+    while (index < total) {
+        request = total - index;
+        if (request > 4096)
+            request = 4096;
+        result = sc16_write(__sc16_files[slot].handle, bytes + index,
+                            (unsigned int)request);
+        if (result < 0) {
+            __stdio_set_error(result);
+            __sc16_files[slot].error = 1;
+            break;
+        }
+        if (result == 0)
+            break;
+        index += (size_t)result;
+        __sc16_files[slot].position += (long)result;
+        if ((size_t)result < request)
             break;
     }
     return index / size;
@@ -527,22 +820,52 @@ size_t fwrite(const void *pointer, size_t size, size_t count, FILE *stream)
 
 int fseek(FILE *stream, long offset, int origin)
 {
-    (void)offset;
-    (void)origin;
-    if (stream == stdin || stream == stdout || stream == stderr)
+    int slot;
+    long position;
+
+    if (stream == stdin || stream == stdout || stream == stderr) {
         errno = ESPIPE;
-    else
+        return -1;
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot < 0 || __sc16_files[slot].handle == 0) {
         errno = EBADF;
-    return -1;
+        return -1;
+    }
+    position = sc16_seek(__sc16_files[slot].handle, offset, origin);
+    if (position < 0L) {
+        __stdio_set_error(position);
+        __sc16_files[slot].error = 1;
+        return -1;
+    }
+    __sc16_files[slot].position = position;
+    __sc16_files[slot].eof = 0;
+    __sc16_files[slot].pushback = EOF;
+    return 0;
 }
 
 long ftell(FILE *stream)
 {
-    if (stream == stdin || stream == stdout || stream == stderr)
+    int slot;
+    long position;
+
+    if (stream == stdin || stream == stdout || stream == stderr) {
         errno = ESPIPE;
-    else
+        return -1L;
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot < 0 || __sc16_files[slot].handle == 0) {
         errno = EBADF;
-    return -1L;
+        return -1L;
+    }
+    position = sc16_seek(__sc16_files[slot].handle, 0L, SEEK_CUR);
+    if (position < 0L) {
+        __stdio_set_error(position);
+        __sc16_files[slot].error = 1;
+        return -1L;
+    }
+    __sc16_files[slot].position = position;
+    return position;
 }
 
 void rewind(FILE *stream)
@@ -553,9 +876,17 @@ void rewind(FILE *stream)
 
 int fgetpos(FILE *stream, fpos_t *position)
 {
-    (void)position;
-    (void)ftell(stream);
-    return -1;
+    long current;
+
+    if (position == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    current = ftell(stream);
+    if (current < 0L)
+        return -1;
+    *position = current;
+    return 0;
 }
 
 int fsetpos(FILE *stream, const fpos_t *position)
@@ -569,21 +900,39 @@ int fsetpos(FILE *stream, const fpos_t *position)
 
 void clearerr(FILE *stream)
 {
-    if (stream == stdin || stream == stdout || stream == stderr)
+    int slot;
+
+    if (stream == stdin || stream == stdout || stream == stderr) {
         __sc16_console_error = 0;
+        return;
+    }
+    slot = __stdio_file_slot(stream);
+    if (slot >= 0) {
+        __sc16_files[slot].eof = 0;
+        __sc16_files[slot].error = 0;
+    }
 }
 
 int feof(FILE *stream)
 {
-    (void)stream;
+    int slot;
+
+    slot = __stdio_file_slot(stream);
+    if (slot >= 0 && __sc16_files[slot].handle != 0)
+        return __sc16_files[slot].eof;
     return 0;
 }
 
 int ferror(FILE *stream)
 {
-    if (stream != stdin && stream != stdout && stream != stderr)
-        return 1;
-    return __sc16_console_error;
+    int slot;
+
+    if (stream == stdin || stream == stdout || stream == stderr)
+        return __sc16_console_error;
+    slot = __stdio_file_slot(stream);
+    if (slot >= 0)
+        return __sc16_files[slot].error;
+    return 1;
 }
 
 void perror(const char *prefix)

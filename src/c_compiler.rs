@@ -559,6 +559,11 @@ const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 4] = [
     ("lib_syscall.asm", include_str!("../lib/lib_syscall.asm")),
 ];
 
+const HOSTED_STDIO_FILE_FUNCTIONS: [&str; 14] = [
+    "fopen", "fclose", "fgetc", "fputc", "fread", "fwrite", "fseek", "ftell", "ungetc", "clearerr",
+    "feof", "ferror", "remove", "freopen",
+];
+
 fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
     NATIVE_ASSEMBLY_LIBRARIES
         .iter()
@@ -574,9 +579,11 @@ fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
 
 fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Expression]) -> bool {
     match function {
-        "sc16_spawn" | "sc16_open" => index == 0,
+        "sc16_spawn" | "sc16_open" | "__stdio_mode_flags" => index == 0,
         "sc16_mmap" => index == 2,
         "sc16_read" | "sc16_write" => index == 1,
+        "sc16_net_discover" => index == 0,
+        "sc16_net_send" | "sc16_net_receive" => matches!(index, 0 | 1),
         "gfx_sprite" | "gfx_bitmap" => index == 4,
         "gfx_poly" => index == 3,
         "gfx_sprite_upload" => index == 3,
@@ -603,7 +610,7 @@ fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Express
 fn native_argument_is_wide_integer(function: &str, index: usize) -> bool {
     matches!(
         (function, index),
-        ("sc16_mmap" | "sc16_sleep" | "sc16_wait", 0) | ("sc16_semop", 1)
+        ("sc16_mmap" | "sc16_sleep" | "sc16_wait", 0) | ("sc16_seek" | "sc16_semop", 1)
     )
 }
 
@@ -754,14 +761,17 @@ fn emit_native_library_pointer_argument(
     } = &expression.kind
         && matches!(operator.as_str(), "+" | "-")
     {
-        if !emit_native_expression(left, 4, &[6, 7], locals, label_counter, assembly)
-            || !emit_native_expression(right, 6, &[7], locals, label_counter, assembly)
-        {
+        if !emit_native_expression(left, 4, &[6, 7], locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str("    ADJSP -4\n    MOVSP R7\n    STP R4, R7\n");
+        if !emit_native_expression(right, 6, &[7], locals, label_counter, assembly) {
             return false;
         }
         if native_library_pointer_element_size(function, index) == 2 {
             assembly.push_str("    SHL R6, 1\n");
         }
+        assembly.push_str("    MOVSP R7\n    LDP R4, R7\n    ADJSP 4\n");
         assembly.push_str(&format!(
             "    {} R4, R6\n",
             if operator == "+" { "ADD" } else { "SUB" }
@@ -837,6 +847,7 @@ fn native_pointer_element(c_type: &str) -> Option<(usize, bool)> {
     let base_type = native_unqualified_type(c_type).strip_suffix('*')?.trim();
     let base_type = native_unqualified_type(base_type);
     match base_type {
+        "void" => Some((1, false)),
         "char" | "signed char" => Some((1, true)),
         "unsigned char" => Some((1, false)),
         "int" => Some((2, true)),
@@ -867,11 +878,37 @@ fn native_record_pointer(
         .or_else(|| base_type.strip_prefix("restrict "))
         .unwrap_or(base_type)
         .trim();
-    records.get(base_type).cloned()
+    let record_name = base_type
+        .strip_prefix("struct ")
+        .or_else(|| base_type.strip_prefix("union "))
+        .unwrap_or(base_type)
+        .trim();
+    let record_key = if base_type.starts_with("union ") {
+        format!("union {record_name}")
+    } else {
+        format!("struct {record_name}")
+    };
+    records.get(&record_key).cloned()
+}
+
+fn native_is_struct_pointer_type(c_type: &str) -> bool {
+    c_type
+        .trim()
+        .strip_suffix('*')
+        .is_some_and(|base_type| base_type.trim().starts_with("struct "))
+}
+
+fn native_pointer_element_or_record(
+    c_type: &str,
+    records: &HashMap<String, NativeRecordLayout>,
+) -> Option<(usize, bool)> {
+    native_pointer_element(c_type)
+        .or_else(|| native_record_pointer(c_type, records).map(|layout| (layout.size, false)))
+        .or_else(|| native_is_struct_pointer_type(c_type).then_some((1, false)))
 }
 
 fn native_is_pointer_type(c_type: &str, records: &HashMap<String, NativeRecordLayout>) -> bool {
-    native_pointer_element(c_type).is_some() || native_record_pointer(c_type, records).is_some()
+    native_pointer_element_or_record(c_type, records).is_some()
 }
 
 fn is_native_parameter_type(c_type: &str, records: &HashMap<String, NativeRecordLayout>) -> bool {
@@ -891,6 +928,10 @@ fn is_native_return_type(c_type: &str) -> bool {
         || native_byte_type(c_type).is_some()
         || native_pointer_element(c_type).is_some()
         || native_floating_type_size(c_type).is_some()
+        || c_type
+            .trim()
+            .strip_suffix('*')
+            .is_some_and(|base_type| base_type.trim().starts_with("struct "))
 }
 
 fn native_function_types_match(left: &FunctionDeclaration, right: &FunctionDeclaration) -> bool {
@@ -1351,6 +1392,36 @@ pub fn compile_minimal_program_to_assembly(
 ) -> Result<Option<String>, CCompilerError> {
     let mut parser = TranslationUnitParser::from_source(source, filename)?;
     let unit = parser.parse()?;
+    let has_hosted_stdio_definition = unit.declarations.iter().any(|declaration| {
+        matches!(
+            declaration,
+            ExternalDeclaration::FunctionDefinition(function)
+                if HOSTED_STDIO_FILE_FUNCTIONS.contains(&function.declaration.name.as_str())
+        )
+    });
+    let uses_hosted_stdio_files = HOSTED_STDIO_FILE_FUNCTIONS.iter().any(|name| {
+        source.match_indices(name).any(|(start, _)| {
+            let end = start + name.len();
+            let before_is_identifier = source[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            let after_is_identifier = source[end..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            !before_is_identifier
+                && !after_is_identifier
+                && source[end..].trim_start().starts_with('(')
+        })
+    });
+    let unit = if uses_hosted_stdio_files && !has_hosted_stdio_definition {
+        let linked_source = format!("{source}\n{}", include_str!("../lib/stdio_file_runtime.c"));
+        let mut parser = TranslationUnitParser::from_source(&linked_source, filename)?;
+        parser.parse()?
+    } else {
+        unit
+    };
     for declaration in &unit.declarations {
         let has_pointer_to_array_type = match declaration {
             ExternalDeclaration::Global(declaration) => {
@@ -1905,8 +1976,9 @@ pub fn compile_minimal_program_to_assembly(
                 return Ok(None);
             };
             let record_layout = native_record_pointer(&parameter.c_type, &unit.records);
-            let pointer_element = native_pointer_element(&parameter.c_type)
-                .or_else(|| record_layout.as_ref().map(|layout| (layout.size, false)));
+            let pointer_element =
+                native_pointer_element_or_record(&parameter.c_type, &unit.records)
+                    .or_else(|| record_layout.as_ref().map(|layout| (layout.size, false)));
             let location = if stack_parameters {
                 let argument = &parameter_layout.arguments[index];
                 stacked_parameter_bytes = parameter_layout.size;
@@ -3060,8 +3132,10 @@ fn collect_native_locals(
                             _ => None,
                         };
                         let record_layout = native_record_pointer(&declaration.c_type, records);
-                        let pointer_element = native_pointer_element(&declaration.c_type)
-                            .or_else(|| record_layout.as_ref().map(|layout| (layout.size, false)));
+                        let pointer_element =
+                            native_pointer_element_or_record(&declaration.c_type, records).or_else(
+                                || record_layout.as_ref().map(|layout| (layout.size, false)),
+                            );
                         if !is_native_word_type(&declaration.c_type)
                             && byte_signed.is_none()
                             && pointer_element.is_none()

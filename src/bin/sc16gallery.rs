@@ -3,7 +3,11 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use suomicpu16::Cpu;
+use suomicpu16::{
+    Cpu,
+    cpu::PrivilegeMode,
+    disk::{FolderBootMode, FolderDisk},
+};
 
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
@@ -19,34 +23,33 @@ fn main() {
 }
 
 struct Options {
-    modules_dir: PathBuf,
+    disks_dir: PathBuf,
     output_dir: PathBuf,
     readme: PathBuf,
     run_seconds: f64,
     gif_seconds: f64,
     fps: usize,
     capture_fps: usize,
-    console_input: String,
+    console_input: Option<String>,
     update_readme: bool,
 }
 
 struct Module {
     name: String,
-    source: Option<PathBuf>,
-    error: Option<String>,
+    disk_path: PathBuf,
 }
 
 fn parse_options() -> Result<Option<Options>, String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut options = Options {
-        modules_dir: root.join("modules"),
+        disks_dir: root.join("disks"),
         output_dir: root.join("docs").join("module-gifs"),
         readme: root.join("README.adoc"),
         run_seconds: 10.0,
         gif_seconds: 15.0,
         fps: 30,
         capture_fps: 10,
-        console_input: "SC-16".to_owned(),
+        console_input: None,
         update_readme: true,
     };
     let mut arguments = std::env::args().skip(1);
@@ -62,7 +65,7 @@ fn parse_options() -> Result<Option<Options>, String> {
             .next()
             .ok_or_else(|| format!("missing value for {argument}"))?;
         match argument.as_str() {
-            "--modules-dir" => options.modules_dir = PathBuf::from(value),
+            "--disks-dir" | "--modules-dir" => options.disks_dir = PathBuf::from(value),
             "--output-dir" => options.output_dir = PathBuf::from(value),
             "--readme" => options.readme = PathBuf::from(value),
             "--run-seconds" => {
@@ -85,7 +88,7 @@ fn parse_options() -> Result<Option<Options>, String> {
                     .parse()
                     .map_err(|_| format!("invalid --capture-fps value: {value}"))?;
             }
-            "--console-input" => options.console_input = value,
+            "--console-input" => options.console_input = Some(value),
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
@@ -107,8 +110,11 @@ fn parse_options() -> Result<Option<Options>, String> {
 
 fn print_help() {
     println!("Usage: cargo run --bin sc16gallery -- [options]");
-    println!("Run C modules in the Rust SC-16 CPU and generate looping GIF captures.");
-    println!("  --modules-dir PATH   Module folders (default: modules/)");
+    println!(
+        "Run prebuilt folder-disk applications in the Rust SC-16 CPU and generate looping GIF captures."
+    );
+    println!("  --disks-dir PATH     Folder disk collection (default: disks/)");
+    println!("  --modules-dir PATH   Alias for --disks-dir");
     println!("  --output-dir PATH    GIF output folder (default: docs/module-gifs/)");
     println!("  --readme PATH        README gallery to update");
     println!("  --run-seconds N      Simulated runtime per module (default: 10)");
@@ -124,18 +130,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         print_help();
         return Ok(());
     };
-    if !options.modules_dir.is_dir() {
+    if !options.disks_dir.is_dir() {
         return Err(format!(
-            "modules folder does not exist: {}",
-            options.modules_dir.display()
+            "disk collection does not exist: {}",
+            options.disks_dir.display()
         )
         .into());
     }
-    let modules = discover_modules(&options.modules_dir)?;
+    let modules = discover_modules(&options.disks_dir).map_err(io::Error::other)?;
     if modules.is_empty() {
         return Err(format!(
-            "no module folders found in {}",
-            options.modules_dir.display()
+            "no bootable folder disks found in {}",
+            options.disks_dir.display()
         )
         .into());
     }
@@ -180,104 +186,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn discover_modules(directory: &Path) -> io::Result<Vec<Module>> {
-    let mut folders = fs::read_dir(directory)?
-        .map(|entry| {
-            let entry = entry?;
-            Ok(entry.file_type()?.is_dir().then(|| entry.path()))
-        })
-        .collect::<Result<Vec<_>, io::Error>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    folders.sort_by_key(|path| {
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase()
-    });
-
-    folders
-        .into_iter()
-        .map(|folder| {
-            let mut sources = fs::read_dir(&folder)?
-                .map(|entry| {
-                    let entry = entry?;
-                    let path = entry.path();
-                    Ok((entry.file_type()?.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|extension| extension.eq_ignore_ascii_case("c")))
-                    .then_some(path))
-                })
-                .collect::<Result<Vec<_>, io::Error>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            sources.sort_by_key(|path| {
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase()
-            });
-            let main = sources
-                .iter()
-                .find(|path| {
-                    path.file_name()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("main.c"))
-                })
-                .cloned();
-            let (source, error) = match sources.len() {
-                0 => (None, Some("No C source file found.".to_owned())),
-                1 => (sources.pop(), None),
-                _ => match main {
-                    Some(path) => (Some(path), None),
-                    None => (
-                        None,
-                        Some("Multiple C source files found; expected main.c.".to_owned()),
-                    ),
-                },
-            };
-            Ok(Module {
-                name: folder
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                source,
-                error,
-            })
-        })
-        .collect()
+fn discover_modules(directory: &Path) -> Result<Vec<Module>, String> {
+    let mut modules = Vec::new();
+    for disk in FolderDisk::discover(directory)? {
+        match disk.load_boot_image() {
+            Ok(_) => modules.push(Module {
+                name: disk.manifest().label.clone(),
+                disk_path: disk.root().to_path_buf(),
+            }),
+            Err(error) if error.starts_with("NOT_BOOT:") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(modules)
 }
 
 fn capture_module(module: &Module, destination: &Path, options: &Options) -> Result<usize, String> {
-    let source = module.source.as_ref().ok_or_else(|| {
-        module
-            .error
-            .clone()
-            .unwrap_or_else(|| "No source file found.".into())
-    })?;
-    let image = suomicpu16::image::build_source(source).map_err(|error| error.to_string())?;
+    let disk = FolderDisk::open(&module.disk_path)?;
+    let boot = disk.load_boot_image()?;
     let mut cpu = Cpu::new();
-    let source_disk = source
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("disks");
-    cpu.configure_disk(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("disks"),
-        source_disk,
-    )
-    .map_err(|error| format!("could not configure module storage: {error}"))?;
-    cpu.load_program(&image.segments, image.entry_point)
+    cpu.load_program(&boot.image.segments, boot.image.entry_point)
         .map_err(|error| error.to_string())?;
-    let source_text = fs::read_to_string(source).map_err(|error| error.to_string())?;
-    let text_mode = source_text.contains("SCREEN_");
-    let console_bytes = if text_mode {
-        Some(format!("{}\n", options.console_input).into_bytes())
+    cpu.mount_folder_disk(&module.disk_path)?;
+    if boot.mode == FolderBootMode::User {
+        let user_stack = cpu.initial_user_stack_pointer();
+        cpu.enter_user_mode(cpu.pc, user_stack)
+            .map_err(|error| error.to_string())?;
     } else {
-        None
-    };
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+    }
+    let console_bytes = options
+        .console_input
+        .as_ref()
+        .map(|input| format!("{input}\n").into_bytes());
     let total_frames = (options.run_seconds * options.fps as f64).ceil() as usize;
     let capture_interval = 1.0 / options.capture_fps as f64;
     let start_timestamp = SystemTime::now()
@@ -286,6 +227,7 @@ fn capture_module(module: &Module, destination: &Path, options: &Options) -> Res
         .as_secs();
     let mut next_capture = 0.0;
     let mut input_sent = false;
+    let mut text_mode = false;
     let mut frames = Vec::new();
     for frame_index in 0..total_frames {
         let elapsed = (frame_index + 1) as f64 / options.fps as f64;
@@ -299,6 +241,7 @@ fn capture_module(module: &Module, destination: &Path, options: &Options) -> Res
         cpu.begin_frame();
         cpu.run(INSTRUCTIONS_PER_FRAME)
             .map_err(|error| error.to_string())?;
+        text_mode = !cpu.console.output().is_empty();
         if elapsed + f64::EPSILON >= next_capture || frames.is_empty() {
             frames.push(capture_frame(&cpu, text_mode));
             while next_capture <= elapsed {
@@ -585,42 +528,39 @@ mod tests {
     }
 
     #[test]
-    fn discovers_bios_compatible_module_sources() {
+    fn discovers_prebuilt_bootable_disks_and_skips_data_disks() {
         let root = temp_path("sc16-gallery-discovery");
-        fs::create_dir_all(root.join("single")).unwrap();
-        fs::create_dir_all(root.join("multiple")).unwrap();
-        fs::create_dir_all(root.join("broken")).unwrap();
-        fs::create_dir_all(root.join("empty")).unwrap();
-        fs::write(root.join("single/game.c"), "").unwrap();
-        fs::write(root.join("multiple/main.c"), "").unwrap();
-        fs::write(root.join("multiple/helper.c"), "").unwrap();
-        fs::write(root.join("broken/one.c"), "").unwrap();
-        fs::write(root.join("broken/two.c"), "").unwrap();
+        for (id, label, executable) in [
+            ("APP00001", "Application A", Some("main.bin")),
+            ("APP00002", "Application B", Some("kernel.bin")),
+            ("DATA0001", "Data only", None),
+        ] {
+            let disk = root.join(id);
+            fs::create_dir_all(&disk).unwrap();
+            fs::write(
+                disk.join("disk.json"),
+                format!(
+                    r#"{{"version":1,"id":"{id}","label":"{label}","capacity_bytes":4096,"read_only":false}}"#
+                ),
+            )
+            .unwrap();
+            if let Some(executable) = executable {
+                let image = suomicpu16::assembler::assemble("start: HALT\n", 0).unwrap();
+                suomicpu16::image::write_image(&disk.join(executable), &image).unwrap();
+            }
+        }
 
         let modules = discover_modules(&root).unwrap();
         assert_eq!(
             modules
                 .iter()
-                .map(|module| (
-                    module.name.as_str(),
-                    module.source.as_ref().and_then(|path| path.file_name())
-                ))
+                .map(|module| (module.name.as_str(), module.disk_path.file_name().unwrap()))
                 .collect::<Vec<_>>(),
             vec![
-                ("broken", None),
-                ("empty", None),
-                ("multiple", Some(std::ffi::OsStr::new("main.c"))),
-                ("single", Some(std::ffi::OsStr::new("game.c"))),
+                ("Application A", std::ffi::OsStr::new("APP00001")),
+                ("Application B", std::ffi::OsStr::new("APP00002")),
             ]
         );
-        assert!(
-            modules[0]
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("expected main.c")
-        );
-        assert!(modules[1].error.as_deref().unwrap().contains("No C source"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -662,8 +602,7 @@ mod tests {
         fs::write(&readme, "= Project\n").unwrap();
         let module = Module {
             name: "Demo".to_owned(),
-            source: Some(root.join("modules").join("Demo.c")),
-            error: None,
+            disk_path: root.join("disks").join("DEMO0001"),
         };
         let results = [(module, Some(root.join("docs").join("demo.gif")), None)];
         update_readme(&readme, &results).unwrap();

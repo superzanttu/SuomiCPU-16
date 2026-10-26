@@ -8,6 +8,7 @@ use crate::console::ConsoleDevice;
 use crate::disk::{FolderBootMode, FolderDisk};
 use crate::guest_text::GuestTextDisplay;
 use crate::net::{DEFAULT_PORT, NetNode};
+use crate::sc_net::ScNetNode;
 use crate::scheduler::{Scheduler, SchedulerError, TaskContext, TaskId, TaskState};
 use crate::syscall::{KernelState, OpenFile, SyscallNumber};
 
@@ -364,6 +365,10 @@ pub struct Cpu {
     folder_disk: Option<FolderDisk>,
     network: Option<NetNode>,
     network_port: u16,
+    scnet: Option<ScNetNode>,
+    scnet_enabled: bool,
+    scnet_port: u16,
+    scnet_name: Option<String>,
     last_mouse_click: [Option<(u64, u16, u16)>; 2],
     mouse_wheel_delta: i16,
     sprites: [Option<GpuSprite>; GPU_SPRITE_SLOTS],
@@ -487,6 +492,10 @@ impl Cpu {
             folder_disk: None,
             network: None,
             network_port: DEFAULT_PORT,
+            scnet: None,
+            scnet_enabled: false,
+            scnet_port: crate::sc_net::DEFAULT_PORT,
+            scnet_name: None,
             last_mouse_click: [None; 2],
             mouse_wheel_delta: 0,
             sprites: std::array::from_fn(|_| None),
@@ -566,6 +575,7 @@ impl Cpu {
             5 => self.bios_reload_settings(),
             6 => self.bios_read_setting(),
             7 => self.bios_write_setting(),
+            8 => self.bios_disk_info(),
             _ => Err("unsupported firmware operation".to_owned()),
         };
         if let Err(error) = result {
@@ -579,6 +589,9 @@ impl Cpu {
     }
 
     fn bios_list_count(&mut self) -> Result<(), String> {
+        if self.scnet_enabled {
+            self.ensure_scnet_node(std::time::Duration::from_millis(650))?;
+        }
         let paths = self.bios_disk_paths()?;
         let count = u16::try_from(paths.len())
             .map_err(|_| "firmware disk list exceeds 65535 entries".to_owned())?;
@@ -664,7 +677,60 @@ impl Cpu {
         Ok(())
     }
 
+    fn bios_disk_info(&mut self) -> Result<(), String> {
+        let index = usize::from(self.bios_register_u16(2));
+        let capacity = usize::from(self.bios_register_u16(10));
+        let output = self.guest_range(self.bios_register_u32(6), capacity)?;
+        let paths = self.bios_disk_paths()?;
+        let path = paths
+            .get(index)
+            .ok_or_else(|| format!("firmware disk index {index} is out of range"))?;
+        let disk = FolderDisk::open(path)?;
+        let boot_mode = match disk.load_boot_image() {
+            Ok(boot) => match boot.mode {
+                FolderBootMode::Kernel => "KERNEL",
+                FolderBootMode::User => "USER",
+            },
+            Err(error) if error.starts_with("NOT_BOOT:") => "NOT_BOOT",
+            Err(error) => return Err(error),
+        };
+        let label = disk
+            .manifest()
+            .label
+            .chars()
+            .map(|character| {
+                if character.is_ascii_graphic() || character == ' ' {
+                    character
+                } else {
+                    '?'
+                }
+            })
+            .collect::<String>();
+        let summary = format!(
+            "{label} | {} B | {} | {boot_mode}",
+            disk.manifest().capacity_bytes,
+            if disk.manifest().read_only {
+                "READ-ONLY"
+            } else {
+                "READ-WRITE"
+            }
+        );
+        if summary.len() + 1 > capacity {
+            return Err(format!(
+                "firmware disk information buffer has capacity {capacity}; {} required",
+                summary.len() + 1
+            ));
+        }
+        let start = output.start;
+        self.memory[start..start + summary.len()].copy_from_slice(summary.as_bytes());
+        self.memory[start + summary.len()] = 0;
+        Ok(())
+    }
+
     fn bios_boot_disk(&mut self) -> Result<(), String> {
+        if self.scnet_enabled {
+            self.ensure_scnet_node(std::time::Duration::from_millis(650))?;
+        }
         let index = usize::from(self.bios_register_u16(2));
         let paths = self.bios_disk_paths()?;
         let path = paths
@@ -1351,6 +1417,44 @@ impl Cpu {
         self.network_port = port;
     }
 
+    pub fn enable_scnet(&mut self, port: u16) {
+        self.scnet_enabled = true;
+        self.scnet_port = port;
+    }
+
+    fn ensure_scnet_node(&mut self, settle_time: std::time::Duration) -> Result<(), String> {
+        let name = self.bios_settings.network_name.clone();
+        let new_identity = self.scnet_name.as_deref() != Some(name.as_str());
+        if new_identity {
+            self.scnet = None;
+            self.scnet_name = Some(name.clone());
+        }
+        let created = self.scnet.is_none();
+        if created {
+            self.scnet = Some(ScNetNode::new(&name, self.scnet_port)?);
+        }
+        let deadline = std::time::Instant::now()
+            + if created {
+                settle_time
+            } else {
+                std::time::Duration::ZERO
+            };
+        loop {
+            let node = self.scnet.as_mut().expect("SC-NET node initialized");
+            node.poll()?;
+            if node.has_name_collision() {
+                return Err(format!(
+                    "SC-NET node name {:?} is already in use",
+                    self.bios_settings.network_name
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn disk_register_u16(&self, offset: usize) -> u16 {
         u16::from_be_bytes([
             self.memory[DISK_BASE as usize + offset],
@@ -1702,6 +1806,8 @@ impl Cpu {
                 Ok(SyscallNumber::Semaphore) => {
                     self.syscall_semaphore(task_id, &mut scheduled_state)
                 }
+                Ok(SyscallNumber::Seek) => self.syscall_seek(task_id),
+                Ok(SyscallNumber::ScNet) => self.syscall_scnet(task_id),
                 Err(()) => crate::syscall::error::INVALID,
             }
         };
@@ -1934,6 +2040,223 @@ impl Cpu {
             crate::syscall::error::BAD_HANDLE
         } else {
             0
+        }
+    }
+
+    fn syscall_seek(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let handle = match u32::try_from(self.registers[1]) {
+            Ok(handle) if handle >= 3 => handle,
+            _ => return crate::syscall::error::BAD_HANDLE,
+        };
+        let high = match self.registers[2] {
+            value @ -32_768..=65_535 => value as u16,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let low = match self.registers[3] {
+            value @ -32_768..=65_535 => value as u16,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let origin = match self.registers[4] {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let Some(file) = self.syscall_state.file(task_id, handle).cloned() else {
+            return crate::syscall::error::BAD_HANDLE;
+        };
+        let base = match origin {
+            0 => 0,
+            1 => match i64::try_from(file.offset) {
+                Ok(offset) => offset,
+                Err(_) => return crate::syscall::error::OVERFLOW,
+            },
+            2 => {
+                let Some(disk) = self
+                    .folder_disk
+                    .as_ref()
+                    .or(self.module_folder_disk.as_ref())
+                else {
+                    return crate::syscall::error::IO;
+                };
+                match disk.metadata(&file.path) {
+                    Ok(metadata) => match i64::try_from(metadata.size_bytes) {
+                        Ok(size) => size,
+                        Err(_) => return crate::syscall::error::OVERFLOW,
+                    },
+                    Err(_) => return crate::syscall::error::IO,
+                }
+            }
+            _ => unreachable!(),
+        };
+        let offset_bits = (u32::from(high) << 16) | u32::from(low);
+        let offset = i64::from(i32::from_be_bytes(offset_bits.to_be_bytes()));
+        let Some(position) = base
+            .checked_add(offset)
+            .filter(|position| (0..=i64::from(i32::MAX)).contains(position))
+        else {
+            return crate::syscall::error::INVALID;
+        };
+        let Some(file) = self.syscall_state.file_mut(task_id, handle) else {
+            return crate::syscall::error::BAD_HANDLE;
+        };
+        file.offset = position as u64;
+        position
+    }
+
+    fn syscall_scnet(&mut self, task_id: Option<TaskId>) -> i64 {
+        if task_id.is_none() {
+            return crate::syscall::error::INVALID;
+        }
+        if self.scnet.is_none() && self.ensure_scnet_node(std::time::Duration::ZERO).is_err() {
+            return crate::syscall::error::IO;
+        }
+        let operation = self.registers[1];
+        match operation {
+            0 => {
+                let address = match u32::try_from(self.registers[2]) {
+                    Ok(address) => address,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let capacity = match usize::try_from(self.registers[3]) {
+                    Ok(capacity) if capacity <= 256 => capacity,
+                    _ => return crate::syscall::error::INVALID,
+                };
+                let byte_count = capacity * crate::sc_net::NAME_CAPACITY;
+                let destinations = match self.guest_memory_addresses(
+                    address,
+                    byte_count,
+                    crate::mmu::MemoryAccess::Write,
+                    true,
+                ) {
+                    Ok(destinations) => destinations,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let node = self.scnet.as_mut().expect("SC-NET node initialized");
+                if node.poll().is_err() {
+                    return crate::syscall::error::IO;
+                }
+                if node.has_name_collision() {
+                    return crate::syscall::error::BUSY;
+                }
+                let mut peers = node.peers();
+                peers.sort();
+                if peers.len() > capacity {
+                    return crate::syscall::error::OVERFLOW;
+                }
+                for (index, name) in peers.iter().enumerate() {
+                    let mut encoded = [0; crate::sc_net::NAME_CAPACITY];
+                    encoded[..name.len()].copy_from_slice(name.as_bytes());
+                    for (offset, byte) in encoded.into_iter().enumerate() {
+                        self.memory[destinations[index * crate::sc_net::NAME_CAPACITY + offset]] =
+                            byte;
+                    }
+                }
+                peers.len() as i64
+            }
+            1 => {
+                let name_address = match u32::try_from(self.registers[2]) {
+                    Ok(address) => address,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let data_address = match u32::try_from(self.registers[3]) {
+                    Ok(address) => address,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let length = match usize::try_from(self.registers[4]) {
+                    Ok(length) if length <= crate::sc_net::MAX_PAYLOAD => length,
+                    _ => return crate::syscall::error::INVALID,
+                };
+                let recipient = match self.read_guest_path(name_address, true) {
+                    Ok(Some(name))
+                        if name.len() <= crate::sc_net::NAME_CAPACITY && !name.is_empty() =>
+                    {
+                        name
+                    }
+                    _ => return crate::syscall::error::INVALID,
+                };
+                let sources = match self.guest_memory_addresses(
+                    data_address,
+                    length,
+                    crate::mmu::MemoryAccess::Read,
+                    true,
+                ) {
+                    Ok(sources) => sources,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let payload = sources
+                    .iter()
+                    .map(|address| self.memory[*address])
+                    .collect::<Vec<_>>();
+                let node = self.scnet.as_mut().expect("SC-NET node initialized");
+                if node.poll().is_err() {
+                    return crate::syscall::error::IO;
+                }
+                if !node.peers().iter().any(|peer| peer == &recipient) {
+                    return crate::syscall::error::NO_ENTRY;
+                }
+                match node.send(&recipient, &payload) {
+                    Ok(()) => length as i64,
+                    Err(_) => crate::syscall::error::IO,
+                }
+            }
+            2 => {
+                let name_address = match u32::try_from(self.registers[2]) {
+                    Ok(address) => address,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let data_address = match u32::try_from(self.registers[3]) {
+                    Ok(address) => address,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let capacity = match usize::try_from(self.registers[4]) {
+                    Ok(capacity) if capacity <= crate::sc_net::MAX_PAYLOAD => capacity,
+                    _ => return crate::syscall::error::INVALID,
+                };
+                let name_destinations = match self.guest_memory_addresses(
+                    name_address,
+                    crate::sc_net::NAME_CAPACITY,
+                    crate::mmu::MemoryAccess::Write,
+                    true,
+                ) {
+                    Ok(destinations) => destinations,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let data_destinations = match self.guest_memory_addresses(
+                    data_address,
+                    capacity,
+                    crate::mmu::MemoryAccess::Write,
+                    true,
+                ) {
+                    Ok(destinations) => destinations,
+                    Err(_) => return crate::syscall::error::BAD_ADDRESS,
+                };
+                let node = self.scnet.as_mut().expect("SC-NET node initialized");
+                if node.poll().is_err() {
+                    return crate::syscall::error::IO;
+                }
+                if node.has_name_collision() {
+                    return crate::syscall::error::BUSY;
+                }
+                let (sender, payload) = match node.receive(capacity) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => return crate::syscall::error::TRY_AGAIN,
+                    Err(_) => return crate::syscall::error::OVERFLOW,
+                };
+                let mut encoded_name = [0; crate::sc_net::NAME_CAPACITY];
+                encoded_name[..sender.len()].copy_from_slice(sender.as_bytes());
+                for (address, byte) in name_destinations.into_iter().zip(encoded_name) {
+                    self.memory[address] = byte;
+                }
+                for (address, byte) in data_destinations.into_iter().zip(payload.iter().copied()) {
+                    self.memory[address] = byte;
+                }
+                payload.len() as i64
+            }
+            _ => crate::syscall::error::INVALID,
         }
     }
 
@@ -4319,16 +4642,28 @@ impl Cpu {
         let (width, height) = self.screen_size();
         let width = width as usize;
         let height = height as usize;
-        let visible = self.memory[GPU_LAYER_MASK as usize] & ((1 << GPU_LAYER_COUNT) - 1);
-        let mut order = (0..GPU_LAYER_COUNT).collect::<Vec<_>>();
-        order.sort_by_key(|&layer| (self.memory[GPU_LAYER_ORDER as usize + layer], layer));
         let mut pixels = vec![0; width * height];
+        self.composited_framebuffer_into(&mut pixels);
+        pixels
+    }
+
+    pub fn composited_framebuffer_into(&self, pixels: &mut [u8]) {
+        let (width, height) = self.screen_size();
+        let width = width as usize;
+        let height = height as usize;
+        let visible = self.memory[GPU_LAYER_MASK as usize] & ((1 << GPU_LAYER_COUNT) - 1);
+        pixels[..width * height].fill(0);
+        let mut order = [0usize; GPU_LAYER_COUNT];
+        for (layer, entry) in order.iter_mut().enumerate() {
+            *entry = layer;
+        }
+        order.sort_unstable_by_key(|&layer| (self.memory[GPU_LAYER_ORDER as usize + layer], layer));
         for layer in order {
             if visible & (1 << layer) == 0 {
                 continue;
             }
             let transparent = self.memory[GPU_LAYER_TRANSPARENCY as usize + layer];
-            for (index, output) in pixels.iter_mut().enumerate() {
+            for (index, output) in pixels[..width * height].iter_mut().enumerate() {
                 let color = if layer == 0 {
                     if width == 320 {
                         self.memory[VRAM_START as usize + index]
@@ -4348,7 +4683,6 @@ impl Cpu {
                 }
             }
         }
-        pixels
     }
 
     pub fn palette_color(&self, index: u8) -> [u8; 3] {
@@ -5335,7 +5669,7 @@ mod tests {
 
     fn run_assembly(source: &str) -> Cpu {
         let image = crate::assembler::assemble(source, 0).unwrap();
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
         cpu.run(2000).unwrap();
@@ -5708,6 +6042,135 @@ mod tests {
     }
 
     #[test]
+    fn syscall_seek_handles_set_current_end_and_invalid_negative_positions() {
+        let disk = folder_disk_for_test("seek", false);
+        std::fs::write(disk.join("main.bin"), b"abc").unwrap();
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.mount_folder_disk(&disk).unwrap();
+        cpu.memory[0x4000..0x4009].copy_from_slice(b"main.bin\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x4000,
+                i64::from(crate::syscall::open_flags::READ),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let handle = cpu.registers[0] as u32;
+        assert!(handle >= 3);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Seek,
+            [i64::from(handle), 0, 2, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 2);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Seek,
+            [i64::from(handle), 0, 0, 1, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 2);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Seek,
+            [i64::from(handle), -1, -1, 2, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 2);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Seek,
+            [i64::from(handle), -1, -4, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+        assert_eq!(cpu.syscall_state.file(task, handle).unwrap().offset, 2);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Read,
+            [i64::from(handle), 0x5000, 1, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 1);
+        assert_eq!(cpu.memory[0x5000], b'c');
+        let _ = std::fs::remove_dir_all(disk.parent().unwrap());
+    }
+
+    #[test]
+    fn scnet_syscall_validates_buffers_and_reports_discovery_and_empty_receive() {
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.enable_scnet(0);
+
+        cpu.registers[1] = 0;
+        cpu.registers[2] = 0x5000;
+        cpu.registers[3] = 1;
+        assert_eq!(cpu.syscall_scnet(Some(task)), 0);
+
+        cpu.registers[1] = 0;
+        cpu.registers[2] = i64::from(CONSOLE_DATA);
+        cpu.registers[3] = 1;
+        assert_eq!(
+            cpu.syscall_scnet(Some(task)),
+            crate::syscall::error::BAD_ADDRESS
+        );
+
+        cpu.registers[1] = 2;
+        cpu.registers[2] = 0x5100;
+        cpu.registers[3] = 0x5200;
+        cpu.registers[4] = 32;
+        assert_eq!(
+            cpu.syscall_scnet(Some(task)),
+            crate::syscall::error::TRY_AGAIN
+        );
+    }
+
+    #[test]
+    fn bios_refuses_to_boot_when_scnet_name_is_in_use() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.bios_settings.network_name = "duplicate".to_owned();
+        cpu.enable_scnet(0);
+        cpu.ensure_scnet_node(std::time::Duration::ZERO).unwrap();
+        cpu.scnet
+            .as_mut()
+            .unwrap()
+            .inject_hello_for_test("duplicate");
+
+        let error = cpu
+            .ensure_scnet_node(std::time::Duration::ZERO)
+            .unwrap_err();
+        assert!(error.contains("already in use"));
+    }
+
+    #[test]
+    fn compiled_c_scnet_discovery_wrapper_executes_through_syscall_abi() {
+        let source = "#include <sc16_net.h>\n\
+                      int main(void) {\n\
+                          char names[SC16_NET_NAME_CAPACITY];\n\
+                          return sc16_net_discover(names, 1);\n\
+                      }";
+        let assembly =
+            crate::c_compiler::compile_minimal_program_to_assembly(source, "scnet-runtime.c")
+                .unwrap()
+                .expect("SC-NET C wrapper should compile");
+        let image = crate::assembler::assemble(&assembly, 0).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.enable_scnet(0);
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
+        let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        cpu.start_task(task).unwrap();
+
+        cpu.run(100_000).unwrap();
+
+        assert!(!cpu.running, "SC-NET test program did not terminate");
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
     fn syscall_sleep_uses_deterministic_idle_ticks() {
         let (mut cpu, task) = cpu_with_syscall_task();
         cpu.write_u16(0x102, 0);
@@ -5787,6 +6250,103 @@ mod tests {
         assert!(!cpu.running, "compiled syscall program did not terminate");
         assert_eq!(cpu.registers[0], 0);
         assert_eq!(cpu.console.output(), b"ok");
+    }
+
+    #[test]
+    fn compiled_c_stdio_file_streams_execute_through_syscalls() {
+        let source = "#include <stdio.h>\n\
+                      #include <errno.h>\n\
+                      int main(void) {\n\
+                          FILE *stream;\n\
+                          char output[4];\n\
+                          char input[4200];\n\
+                          char large_output[4202];\n\
+                          int index;\n\
+                          stream = fopen(\"stream.txt\", \"w+\");\n\
+                          if (stream == 0) return 1;\n\
+                          if (fwrite(\"abc\", 1, 3, stream) != 3) return 2;\n\
+                          if (ftell(stream) != 3L) return 3;\n\
+                          if (fseek(stream, 0L, SEEK_SET) != 0) return 4;\n\
+                          if (fread(output, 1, 3, stream) != 3) return 5;\n\
+                          if (output[0] != 'a' || output[1] != 'b' || output[2] != 'c') return 6;\n\
+                          if (fgetc(stream) != EOF || !feof(stream)) return 7;\n\
+                          if (fseek(stream, -1L, SEEK_END) != 0) return 8;\n\
+                          if (fgetc(stream) != 'c') return 9;\n\
+                          if (fclose(stream) != 0) return 10;\n\
+                          if (fopen(\"missing.txt\", \"r\") != 0 || errno != ENOENT) return 11;\n\
+                          if (remove(\"stream.txt\") != -1 || errno != ENOSYS) return 12;\n\
+                          for (index = 0; index < 4200; ++index)\n\
+                              input[index] = (char)index;\n\
+                          stream = fopen(\"large.bin\", \"w+\");\n\
+                          if (stream == 0) return 13;\n\
+                          if (fwrite(input, 1, 4200, stream) != 4200) return 14;\n\
+                          if (fseek(stream, 0L, SEEK_SET) != 0) return 15;\n\
+                          if (fread(large_output, 2, 2101, stream) != 2100) return 16;\n\
+                          if (!feof(stream)) return 17;\n\
+                          for (index = 0; index < 4200; ++index)\n\
+                              if (large_output[index] != input[index]) return 18;\n\
+                          stream = freopen(\"reopened.txt\", \"w\", stream);\n\
+                          if (stream == 0) return 19;\n\
+                          if (fputc('r', stream) != 'r') return 20;\n\
+                          if (fclose(stream) != 0) return 21;\n\
+                          if (fclose(stream) != EOF || errno != EBADF) return 22;\n\
+                          return 0;\n\
+                      }";
+        let assembly =
+            crate::c_compiler::compile_minimal_program_to_assembly(source, "stdio-syscall.c")
+                .unwrap()
+                .expect("stdio file runtime should compile");
+        let image = crate::assembler::assemble(&assembly, 0).unwrap();
+        let disk = folder_disk_for_test("stdio-streams", false);
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.mount_folder_disk(&disk).unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
+        let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        cpu.start_task(task).unwrap();
+
+        cpu.run(1_000_000).unwrap();
+
+        assert!(!cpu.running, "stdio program did not terminate");
+        let large_contents = std::fs::read(disk.join("large.bin")).unwrap();
+        assert_eq!(large_contents.len(), 4200);
+        assert_eq!(
+            &large_contents[4096..],
+            &(0..104).map(|value| value as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(cpu.registers[0], 0, "stdio program returned an error code");
+        assert_eq!(std::fs::read(disk.join("stream.txt")).unwrap(), b"abc");
+        assert_eq!(std::fs::read(disk.join("reopened.txt")).unwrap(), b"r");
+        let _ = std::fs::remove_dir_all(disk.parent().unwrap());
+    }
+
+    #[test]
+    fn compiled_c_struct_pointer_members_execute_correctly() {
+        let source = "typedef struct { int value; } Item;\n\
+                      int main(void) {\n\
+                          Item item;\n\
+                          Item *pointer;\n\
+                          pointer = &item;\n\
+                          pointer->value = 42;\n\
+                          return pointer->value == 42 ? 0 : 1;\n\
+                      }";
+        let assembly =
+            crate::c_compiler::compile_minimal_program_to_assembly(source, "struct-pointer.c")
+                .unwrap()
+                .expect("struct-pointer program should compile");
+        let image = crate::assembler::assemble(&assembly, 0).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
+        let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        cpu.start_task(task).unwrap();
+
+        cpu.run(20_000).unwrap();
+
+        assert!(!cpu.running, "struct-pointer program did not terminate");
+        assert_eq!(cpu.registers[0], 0);
     }
 
     #[test]
@@ -7286,6 +7846,9 @@ mod tests {
         assert_eq!(framebuffer[0], 2);
         assert_eq!(framebuffer[1], 4);
         assert_eq!(framebuffer[framebuffer.len() - 1], 4);
+        let mut reused = vec![0; framebuffer.len()];
+        cpu.composited_framebuffer_into(&mut reused);
+        assert_eq!(reused, framebuffer);
     }
 
     #[test]
@@ -7816,6 +8379,61 @@ mod tests {
             cpu.bios_settings.additional.get("retries"),
             Some(&BiosSettingValue::Integer(-9))
         );
+    }
+
+    #[test]
+    fn bios_firmware_shows_selected_disk_manifest_and_boot_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-bios-disk-info-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk_path = root.join("APP00001");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        std::fs::write(
+            disk_path.join("disk.json"),
+            r#"{"version":1,"id":"APP00001","label":"Friendly App","capacity_bytes":123456,"read_only":false,"protected_files":["main.bin"]}"#,
+        )
+        .unwrap();
+        let image = crate::assembler::assemble("start: HALT\n", 0).unwrap();
+        crate::image::write_image(&disk_path.join("main.bin"), &image).unwrap();
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.disk_root = root.clone();
+        cpu.memory[BIOS_BASE as usize + 6..BIOS_BASE as usize + 10]
+            .copy_from_slice(&0x5080u32.to_be_bytes());
+        cpu.memory[BIOS_BASE as usize + 10..BIOS_BASE as usize + 12]
+            .copy_from_slice(&128u16.to_be_bytes());
+        cpu.bios_disk_info().unwrap();
+        let firmware = crate::assembler::assemble(include_str!("../bios.asm"), 0).unwrap();
+        cpu.load_program(&firmware.segments, firmware.entry_point)
+            .unwrap();
+        for _ in 0..30_000 {
+            cpu.step().unwrap();
+        }
+
+        let disk_info = cpu.memory[0x5080..0x5100]
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(cpu.memory[BIOS_STATUS as usize], 0);
+        assert_eq!(disk_info, b"Friendly App | 123456 B | READ-WRITE | USER");
+        let text = cpu
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| cell.character as char)
+            .collect::<String>();
+        assert!(
+            text.contains("Friendly App | 123456 B | READ-WRITE | USER"),
+            "{text}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

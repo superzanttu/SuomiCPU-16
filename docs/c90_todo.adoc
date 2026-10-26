@@ -465,6 +465,13 @@ required before claiming full C90 compatibility.
 === C6. Define hosted execution behavior
 
 * [ ] *Define C90 hosted execution behavior* (+c90-hosted-runtime+)
+** The current compiler-linked file-stream subset is deliberately partial:
+   +fopen+, +freopen+, +fclose+, +fgetc+, +fputc+, +fread+, +fwrite+,
+   +fseek+, +ftell+, +ungetc+, +clearerr+, +feof+, and +ferror+ use the
+   folder-backed disk syscalls without buffering. +remove+ reports +ENOSYS+.
+   Standard console streams, +fflush+, line/string stream helpers,
+   temporary files, and complete environment/process behavior are not yet
+   implemented; do not treat this subset as C90 hosted conformance.
 ** Specify standard stream/device mapping, file operations or explicit
     capability policy, buffering, EOF/error indicators, environment and
     command behavior, and process termination/status.

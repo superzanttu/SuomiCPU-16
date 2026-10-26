@@ -2,8 +2,14 @@
 #define _SC16_ERRNO_H
 
 #define EDOM 33
+#define EINTR 4
+#define ECHILD 10
+#define EFAULT 14
+#define EBUSY 16
 #define ERANGE 34
 #define EILSEQ 35
+#define EMFILE 24
+#define EOVERFLOW 75
 #define E2BIG 7
 #define EACCES 13
 #define EBADF 9

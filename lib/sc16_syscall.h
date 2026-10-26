@@ -27,6 +27,7 @@ int sc16_open(const char *path, unsigned int flags);
 int sc16_read(int handle, void *buffer, unsigned int length);
 int sc16_write(int handle, const void *buffer, unsigned int length);
 int sc16_close(int handle);
+long sc16_seek(int handle, long offset, int origin);
 int sc16_sleep(unsigned long ticks);
 int sc16_wait(unsigned long child_pid);
 long sc16_semop(unsigned int operation, unsigned long semaphore_id,

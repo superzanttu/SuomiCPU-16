@@ -38,11 +38,12 @@ the image's memory segments.
 
 == 2. Running the emulator
 
-Run a program from the repository root:
+Build and run an image from the repository root:
 
 [source,console]
 ----
-cargo run -- examples/example.asm
+cargo run --bin sc16build -- examples/example.asm example.sc16img
+cargo run --bin suomicpu16 -- example.sc16img
 ----
 
 On Windows, run the PowerShell launcher with a source or binary path:
@@ -53,7 +54,11 @@ On Windows, run the PowerShell launcher with a source or binary path:
 ----
 
 +run.ps1+ changes to the repository directory and starts the Rust emulator
-through Cargo. It requires Rust and Cargo to be available on +PATH+. The Rust C
+through Cargo. C and assembly source paths are compiled to a temporary
++SC16IMG2+ image by +sc16build+ before the emulator starts; the temporary image
+is removed when it exits. The runtime itself accepts only prebuilt images or
+validated disk folders and does not compile or assemble source. The launcher
+requires Rust and Cargo to be available on +PATH+. The Rust C
 subset handles multiple +int+ functions with up to three parameters and local
 +int+ variables, assignments, arithmetic/bitwise/shift/logical and signed comparison
 expressions, conditional expressions, nested blocks, +if+/+else+, and
@@ -70,6 +75,11 @@ emulator requires the shared root
 Package one program with +sc16build package-disk+ or all runnable C modules
 and their local disk assets with +sc16build package-modules+. See
 +sc16_disk_format.adoc+ for the manifest and image requirements.
+Build the shared BIOS image offline with
++cargo run --bin sc16build -- build-bios bios.asm bios.bin+; validate that
+bootable C module sources still compile with
++cargo run --bin sc16build -- smoke-modules+. Use a new staging directory
+when packaging modules; existing disks are never replaced by these commands.
 Offline images use the version 2 +SC16IMG2+ container, with fixed load
 addresses, an executable entry point, and explicit segment alignment and
 permissions. +sc16asm+ and +sc16build+ emit this format; the loader rejects
@@ -95,11 +105,14 @@ and link:../examples/directives.asm[+examples/directives.asm+]:
 
 [source,console]
 ----
-cargo run -- examples/commands.asm
-cargo run -- examples/directives.asm
+cargo run --bin sc16build -- examples/commands.asm commands.sc16img
+cargo run --bin suomicpu16 -- commands.sc16img
+cargo run --bin sc16build -- examples/directives.asm directives.sc16img
+cargo run --bin suomicpu16 -- directives.sc16img
 ----
 
-The Rust emulator natively compiles a limited subset: multiple +int+ functions
+The Rust C compiler used by the offline build tool supports a limited subset:
+multiple +int+ functions
 and +void+ helper functions with up to three parameters, local +int+ variables,
 initialized and zero-initialized global +int+ variables and arrays, brace-
 initialized integer globals and arrays, and indexed access to global integer
@@ -127,19 +140,22 @@ unsupported. Compile C sources to segmented images with the Rust build tool:
 
 [source,console]
 ----
-cargo run -- examples/example.asm
+cargo run --bin sc16build -- examples/example.asm build/example.sc16img
+cargo run --bin suomicpu16 -- build/example.sc16img
 cargo run --bin sc16build -- examples/factorial.c examples/factorial.sc16img
-cargo run -- examples/factorial.bin
+cargo run --bin suomicpu16 -- examples/factorial.bin
 ----
 
-The Rust emulator accepts +.asm+, supported +.c+, flat +.bin+, and
-+SC16IMG2+ images with +.img+ or +.sc16img+ extensions. A +.bin+ file
-starting with the +SC16IMG2+ signature is read as an image container; the
-replaced +SC16IMG1+ signature is rejected rather than executed as flat code.
+The runtime accepts prebuilt flat +.bin+, +SC16IMG2+ images with +.img+ or
++.sc16img+ extensions, and validated folder disks. Source files must be built
+offline with +sc16build+ (or by +run.ps1+ before the emulator starts). A
++.bin+ file starting with the +SC16IMG2+ signature is read as an image
+container; the replaced +SC16IMG1+ signature is rejected rather than executed
+as flat code.
 
 The input file argument is optional. Without it, the BIOS loads a prebuilt
 image from a selected folder disk. Use +--disk ID+ to preselect a boot disk
-in BIOS, or to mount that folder filesystem with an explicit program path.
+in BIOS, or to mount that folder filesystem with an explicit prebuilt image.
 The Rust emulator uses
 Macroquad for its window, display, and input.
 
@@ -1271,13 +1287,20 @@ error. Paths are normalized, relative ASCII paths confined to the mounted
 folder; transfers are limited to 4096 bytes. Filesystem operations cannot
 access other disks or host paths.
 
-Source-launched programs without +--disk+ can read their own module's
-+disks/+ directory through a host-configured read-only mount. When a folder
-disk is selected, its data and policies take precedence. Tank-16 reads maps
-and tile assets from its packaged folder disk; standalone source launches
-continue to find the module-local files. The old JSON block format is no
-longer a guest device; original JSON files remain available to
-+sc16build import-block-disk+.
+The native C compiler also links an unbuffered hosted file-stream subset when
+one of its supported file APIs is used: +fopen+, +freopen+, +fclose+,
++fgetc+, +fputc+, +fread+, +fwrite+, +fseek+, +ftell+, +ungetc+,
++clearerr+, +feof+, and +ferror+. These streams access the current folder
+disk through the syscall ABI. +remove+ is explicitly unsupported and sets
++errno+ to +ENOSYS+; other standard stream, environment, and process facilities
+remain incomplete. This is not a claim of complete hosted C90 support.
+
+Images built and launched from a source path by +run.ps1+ without +--disk+
+use that source module's +disks/+ directory through a host-configured
+read-only mount. When a folder disk is selected, its data and policies take
+precedence. Tank-16 reads maps and tile assets from its packaged folder disk.
+The old JSON block format is no longer a guest device; original JSON files
+remain available to +sc16build import-block-disk+.
 
 Tank-16 uses this generic API to load map JSON from
 +modules/Tank-16/disks/maps/+ at round start. The first round prefers
@@ -1553,6 +1576,13 @@ descriptor/count/flag/focal length, or +GPU3D_ERROR_FACE+ (2) for a face
 referencing a nonexistent vertex. The renderer has no per-pixel depth buffer.
 See the SC-16 showcase's 3D flight page for an example.
 
+SC-NET is separate from the game networking API below. C programs that include
++lib/sc16_net.h+ can discover emulator node IDs, send messages to discovered
+peers, and receive messages nonblockingly. Node IDs are set in BIOS and
+collisions prevent disk boot. SC-NET uses a separate host UDP service on port
+47017; it is transport infrastructure, while game programs continue to use
+their own titles and application protocols.
+
 === LAN games (+net_*+)
 
 Games can talk to other emulator instances on the local network without any server program:
@@ -1661,7 +1691,7 @@ instructions per frame.
   split-flap flip clock. Each analog face has its own hand design, Nixie digits
   dim and re-ignite when they change, and flip cards animate each change.
   Press Tab to cycle through the seven faces. Run it with
-  +cargo run -- modules/AnaClock/anaclock.c+.
+  +cargo run -- --disk APP00001+ (BIOS preselects the bundled disk).
 * link:../modules/Elite/elitedemo.c[+modules/Elite/elitedemo.c+] is a first-person Elite-style
   space-combat prototype around a planet with two orbiting moons, drifting
   asteroids and patrolling enemy fighters that dogfight and shoot back. Flight is
@@ -1669,7 +1699,7 @@ instructions per frame.
   (Up = nose up), Q/E roll, X or Shift thrust, Z or Ctrl reverse, Space fires a
   heat-limited laser. It has regenerating shields, a hull, collisions with every
   body, a 3D radar and a HUD. It needs roughly 100,000 instructions per frame.
-  Run it with +cargo run -- modules/Elite/elitedemo.c+.
+  Run it with +cargo run -- --disk APP00004+.
 * link:../modules/Lunar%20Lander/lunarlander.c[+modules/Lunar Lander/lunarlander.c+] is a Lunar Lander game with
   gravity, inertia, limited fuel, procedural terrain with x2/x3/x5 landing pads,
   exhaust, dust and explosion particles, a starfield with the Earth, a HUD with
@@ -1679,20 +1709,19 @@ instructions per frame.
   the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
   Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
   accuracy bonus) x pad multiplier. Run it with
-  +cargo run -- "modules/Lunar Lander/lunarlander.c"+.
+  +cargo run -- --disk APP00008+.
 * link:../modules/Paint/paint.c[+modules/Paint/paint.c+] is an MS Paint style drawing program driven by the
   mouse: pen, eraser, spray, line, rectangle and filled rectangle with live shape previews,
   four brush sizes and a 16-color palette. Left button draws with the foreground color, right
   button with the background color; double-click a palette color to fill the canvas and
-  double-click CLR to clear it. Images cannot be saved. Run it with
-  +cargo run -- modules/Paint/paint.c+.
+  double-click CLR to clear it.   Images cannot be saved. Run it with +cargo run -- --disk APP00012+.
 * link:../modules/Netgame%20Demo/net_game_demo.c[+modules/Netgame Demo/net_game_demo.c+] is a LAN demo: start it in up to 8
   emulator instances on one network; each player moves a coloured square (arrows) and Space
   broadcasts a ping ring to all others. Run it with
-  +cargo run -- "modules/Netgame Demo/net_game_demo.c"+.
+  +cargo run -- --disk APP00010 --net-port 47016+.
 * link:../modules/SpaceCave/spacecave.c[+modules/SpaceCave/spacecave.c+] (SpaceCave) is an Asteroids-style LAN dogfight
   for up to 8 pilots inside a procedurally generated cave with auto-repairing defence turrets.
-  Start it in one emulator per player (+cargo run -- modules/SpaceCave/spacecave.c+), type a nickname and
+  Start it in one emulator per player (+cargo run -- --disk APP00015), type a nickname and
   press Enter. Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard. The
   lowest network slot acts as the authoritative host: clients only send their keys, the host simulates
   and broadcasts ships, bullets, turrets and scores, and the cave is rebuilt from a broadcast seed.

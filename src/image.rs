@@ -249,6 +249,21 @@ pub fn load_program(path: &Path) -> Result<ProgramImage, ImageError> {
     build_source(path)
 }
 
+pub fn load_prebuilt_program(path: &Path) -> Result<ProgramImage, ImageError> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("bin") => load_binary(path),
+        Some(extension)
+            if extension.eq_ignore_ascii_case("img")
+                || extension.eq_ignore_ascii_case("sc16img") =>
+        {
+            read_image(path)
+        }
+        _ => Err(ImageError::InvalidFormat(
+            "runtime requires a prebuilt .bin or .sc16img image; compile source with sc16build",
+        )),
+    }
+}
+
 pub fn write_image(path: &Path, image: &ProgramImage) -> Result<(), ImageError> {
     validate_image(image)?;
     let segment_count = u32::try_from(image.segments.len())

@@ -55,7 +55,8 @@ memory-loading stages. Use +--quiet+ to hide these details.
 Run an example directly from the repository root:
 [source,console]
 ----
-cargo run -- examples/example.asm
+cargo run --bin sc16build -- examples/example.asm example.sc16img
+cargo run --bin suomicpu16 -- example.sc16img
 ----
 
 For five analog clock styles, a Nixie-tube display, and a flip clock, run:
@@ -144,24 +145,31 @@ Run a program with optional persistent data-disk and LAN settings:
 
 [source,console]
 ----
-cargo run -- "modules\Netgame Demo\net_game_demo.c" --net-port 47016
-cargo run -- --headless "modules\DiskEditor\disk_editor.c"
+cargo run -- --disk APP00010 --net-port 47016
+cargo run -- --headless disks\APP00003
 ----
 
 Build an SC-16 source file into a segmented image using the Rust tools:
 
 [source,console]
 ----
+cargo run --bin sc16build -- build-bios bios.asm bios.bin
 cargo run --bin sc16build -- examples\commands.asm
 cargo run --bin sc16build -- examples\example.asm example.sc16img
 cargo run --bin sc16build -- input.bin output.sc16img
+cargo run --bin sc16build -- smoke-modules
 cargo run --bin sc16build -- package-modules build\module-disks 67108864
 cargo run --bin sc16build -- import-block-disk disks\DISK0001.json build\DISK0001
+.\scripts\build-modules.ps1 build\module-disks-staging
 ----
 
 The checked-in +disks/APP00001+ through +APP00017+ folders are validated
 prebuilt application disks, including Tank-16 runtime assets. The package
-command refuses to overwrite existing folders; use a new staging directory.
+commands refuse to overwrite existing folders; use a new staging directory.
++scripts\build-modules.ps1+ rebuilds the shared BIOS, smoke-tests bootable
+modules, and packages them into the requested new staging directory. BIOS and
+module builds are offline host tools; the guest BIOS only loads prebuilt disk
+images.
 DiskEditor is a USER-mode text-file editor for the currently mounted folder
 disk. It creates or updates files up to 256 bytes and respects disk read-only
 and protected-file policies.
@@ -172,9 +180,13 @@ it mounts the same folder filesystem for guest file operations.
 
 Original block-disk JSON files remain in +disks/+ only as import sources;
 converted folder disks are stored alongside them without modifying originals.
-Direct-source launches without +--disk+ use the source module's +disks/+ data
-folder as a read-only mount. BIOS-booted applications use the selected folder
-disk and its guest filesystem service. Networking uses UDP broadcast on the
+The emulator accepts prebuilt +.bin+ or +.sc16img+ files and validated disk
+folders; it does not compile source during launch. +run.ps1+ can accept a C or
+assembly source path and invokes +sc16build+ first to create a temporary
+prebuilt image, then removes that image after the emulator exits. Direct
+source launches through +run.ps1+ use the source module's +disks/+ data folder
+as a read-only mount. BIOS-booted applications use the selected folder disk
+and its guest filesystem service. Networking uses UDP broadcast on the
 selected port in native builds; browser builds do not provide UDP networking.
 
 // module-gif-gallery:start
@@ -234,14 +246,15 @@ Each animation captures a module running in the SC-16 emulator.
 |===
 // module-gif-gallery:end
 
-Regenerate the animations for every module folder with a runnable C entry point:
+Regenerate the animations for every bootable folder disk:
 [source,console]
 ----
 cargo run --bin sc16gallery
 ----
 Each generated GIF loops continuously with a 15-second cycle by default.
-The Rust CPU runs the source module for 10 simulated seconds during capture.
+The Rust CPU runs the prebuilt disk image for 10 simulated seconds during capture.
 Use
 +--run-seconds+ to change the capture window and +--gif-seconds+ to set the
 total GIF duration; +--fps+ and +--capture-fps+ adjust sampling. The command
-discovers modules from +modules/+ each time it runs and updates this gallery.
+discovers validated disk manifests from +disks/+ each time it runs and updates
+this gallery. It does not compile module sources.

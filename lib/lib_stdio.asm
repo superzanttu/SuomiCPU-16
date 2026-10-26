@@ -1,4 +1,4 @@
-.address 0x1800
+.address 0x3800
 
 puts:
     LDWS R4, 4
@@ -381,4 +381,72 @@ printf_string_done:
     JMPX printf_next
 printf_done:
     MOV R0, R1
+    RET
+
+__stdio_mode_flags:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    LDI R1, 0
+    CMP R4, R1
+    BZX __stdio_mode_flags_invalid
+    LD R0, R4
+    LDI R1, 114
+    CMP R0, R1
+    BZX __stdio_mode_flags_read
+    LDI R1, 119
+    CMP R0, R1
+    BZX __stdio_mode_flags_write
+    LDI R1, 97
+    CMP R0, R1
+    BZX __stdio_mode_flags_append
+    JMPX __stdio_mode_flags_invalid
+__stdio_mode_flags_read:
+    LDI R2, 1
+    JMPX __stdio_mode_flags_scan
+__stdio_mode_flags_write:
+    LDI R2, 14
+    JMPX __stdio_mode_flags_scan
+__stdio_mode_flags_append:
+    LDI R2, 22
+__stdio_mode_flags_scan:
+    LDI R6, 0
+    LDI R7, 0
+    INC R4
+__stdio_mode_flags_next:
+    LD R5, R4
+    LDI R1, 0
+    CMP R5, R1
+    BZX __stdio_mode_flags_done
+    LDI R1, 43
+    CMP R5, R1
+    BZX __stdio_mode_flags_plus
+    LDI R1, 98
+    CMP R5, R1
+    BZX __stdio_mode_flags_binary
+    JMPX __stdio_mode_flags_invalid
+__stdio_mode_flags_plus:
+    LDI R1, 0
+    CMP R6, R1
+    BNZX __stdio_mode_flags_invalid
+    LDI R6, 1
+    LDI R1, 3
+    OR R2, R1
+    INC R4
+    JMPX __stdio_mode_flags_next
+__stdio_mode_flags_binary:
+    LDI R1, 0
+    CMP R7, R1
+    BNZX __stdio_mode_flags_invalid
+    LDI R7, 1
+    INC R4
+    JMPX __stdio_mode_flags_next
+__stdio_mode_flags_done:
+    MOV R0, R2
+    RET
+__stdio_mode_flags_invalid:
+    LDI R0, 0xFFEA
     RET

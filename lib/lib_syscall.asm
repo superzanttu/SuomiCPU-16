@@ -111,6 +111,81 @@ sc16_close:
     SVC
     RET
 
+sc16_seek:
+    LDWS R1, 4
+    LDWS R2, 6
+    LDWS R3, 8
+    LDWS R4, 10
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R2, R6
+    AND R3, R6
+    AND R4, R6
+    LDI R0, 12
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
+sc16_net_discover:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 8
+    AND R3, R6
+    LDI R1, 0
+    LDI R0, 13
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_net_send:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R4, 10
+    LDWS R5, 8
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R3, R4
+    LDWS R4, 12
+    AND R4, R6
+    LDI R1, 1
+    LDI R0, 13
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_net_receive:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R4, 10
+    LDWS R5, 8
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R3, R4
+    LDWS R4, 12
+    AND R4, R6
+    LDI R1, 2
+    LDI R0, 13
+    LDI R7, 1
+    SVC
+    RET
+
 sc16_sleep:
     LDWS R4, 4
     LDWS R5, 6

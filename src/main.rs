@@ -21,10 +21,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(argument) = arguments.next() {
         if argument == "--help" || argument == "-h" {
             println!(
-                "Usage: suomicpu16 [--fullscreen] [--disk ID] [--net-port PORT] [PROGRAM.asm|PROGRAM.c|PROGRAM.bin]"
+                "Usage: suomicpu16 [--fullscreen] [--disk ID] [--net-port PORT] [IMAGE.bin|IMAGE.sc16img|DISK_FOLDER]"
             );
             println!(
-                "       suomicpu16 --headless [--disk ID] [--net-port PORT] PROGRAM.asm|PROGRAM.c|PROGRAM.bin"
+                "       suomicpu16 --headless [--disk ID] [--net-port PORT] IMAGE.bin|IMAGE.sc16img|DISK_FOLDER"
             );
             println!(
                 "Without a program, open the BIOS folder-disk selector (--disk preselects a boot disk)."
@@ -65,8 +65,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             root.join(path)
         };
-        if !path.is_file() {
-            return Err(format!("program file does not exist: {}", path.display()).into());
+        if !path.is_file() && !path.is_dir() {
+            return Err(format!("image or disk folder does not exist: {}", path.display()).into());
         }
         let path = Path::new(&path);
         if headless {

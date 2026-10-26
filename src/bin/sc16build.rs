@@ -11,11 +11,13 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let Some(source) = arguments.next() else {
-        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel] | package-modules <disk-root> <capacity-bytes>".into());
+        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | build-bios [bios.asm] [bios.bin] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel] | package-modules <disk-root> <capacity-bytes>".into());
     };
     if source == "--help" || source == "-h" {
         println!("Usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img]");
         println!("Build SC-16 source, wrap a flat binary, or validate an existing image.");
+        println!("       sc16build build-bios [bios.asm] [bios.bin]");
+        println!("Assemble the shared BIOS firmware into an SC-16 image.");
         println!("       sc16build smoke-modules");
         println!("Compile every bootable BIOS module as a smoke check.");
         println!("       sc16build package-modules <disk-root> <capacity-bytes>");
@@ -26,6 +28,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "       sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel]"
         );
         println!("Build a source program into a new folder-backed boot disk.");
+        return Ok(());
+    }
+    if source == "build-bios" {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let bios_source = arguments
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repository.join("bios.asm"));
+        let bios_output = arguments
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| bios_source.with_extension("bin"));
+        if arguments.next().is_some() {
+            return Err("usage: sc16build build-bios [bios.asm] [bios.bin]".into());
+        }
+        build_bios(&bios_source, &bios_output)?;
+        println!(
+            "Built shared BIOS firmware {} -> {}",
+            bios_source.display(),
+            bios_output.display()
+        );
         return Ok(());
     }
     if source == "smoke-modules" {
@@ -158,6 +181,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         image.entry_point,
         output.display()
     );
+    Ok(())
+}
+
+fn build_bios(source: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let source = source.canonicalize()?;
+    if output.exists() && source == output.canonicalize()? {
+        return Err("BIOS output path must not overwrite its source".into());
+    }
+    let image = suomicpu16::assembler::assemble_file(&source, 0)?;
+    if image.entry_point != 0 {
+        return Err("shared BIOS entry point must be address 0".into());
+    }
+    suomicpu16::image::write_image(output, &image)?;
     Ok(())
 }
 
@@ -533,6 +569,29 @@ mod tests {
         assert!(!kernel_disk.root().join("main.bin").exists());
 
         assert!(package_disk(&source, &user_disk_path, "Other", 4096, false).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn builds_shared_bios_image_and_refuses_to_overwrite_its_source() {
+        let root = temporary_directory();
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("bios.asm");
+        let output = root.join("bios.bin");
+        fs::write(&source, ".address 0\nstart:\n    HALT\n").unwrap();
+
+        build_bios(&source, &output).unwrap();
+
+        let image = suomicpu16::image::read_image(&output).unwrap();
+        assert_eq!(image.entry_point, 0);
+        assert_eq!(
+            image.segments,
+            suomicpu16::assembler::assemble_file(&source, 0)
+                .unwrap()
+                .segments
+        );
+        assert!(build_bios(&source, &source).is_err());
+
         fs::remove_dir_all(root).unwrap();
     }
 }

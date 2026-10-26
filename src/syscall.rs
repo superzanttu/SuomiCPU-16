@@ -30,6 +30,8 @@ pub enum SyscallNumber {
     Sleep = 9,
     Wait = 10,
     Semaphore = 11,
+    Seek = 12,
+    ScNet = 13,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -49,6 +51,8 @@ impl TryFrom<i64> for SyscallNumber {
             9 => Ok(Self::Sleep),
             10 => Ok(Self::Wait),
             11 => Ok(Self::Semaphore),
+            12 => Ok(Self::Seek),
+            13 => Ok(Self::ScNet),
             _ => Err(()),
         }
     }
@@ -57,6 +61,7 @@ impl TryFrom<i64> for SyscallNumber {
 pub mod error {
     pub const NO_ENTRY: i64 = -2;
     pub const INTERRUPTED: i64 = -4;
+    pub const TRY_AGAIN: i64 = -11;
     pub const IO: i64 = -5;
     pub const BAD_HANDLE: i64 = -9;
     pub const NO_MEMORY: i64 = -12;
@@ -169,11 +174,12 @@ mod tests {
     #[test]
     fn syscall_numbers_are_stable_and_unknown_values_are_rejected() {
         assert_eq!(
-            SyscallNumber::try_from(SyscallNumber::Semaphore as i64),
-            Ok(SyscallNumber::Semaphore)
+            SyscallNumber::try_from(SyscallNumber::Seek as i64),
+            Ok(SyscallNumber::Seek)
         );
+        assert_eq!(SyscallNumber::try_from(13), Ok(SyscallNumber::ScNet));
         assert_eq!(SyscallNumber::try_from(-1), Err(()));
-        assert_eq!(SyscallNumber::try_from(12), Err(()));
+        assert_eq!(SyscallNumber::try_from(14), Err(()));
     }
 
     #[test]

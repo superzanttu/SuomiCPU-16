@@ -110,7 +110,8 @@ source-compilation or host-selector fallback. CPU state is:
 The common firmware image starts at address zero and continues executing until
 it launches a selected image. The guest BIOS renders its selector through the
 character-cell device, polls the keyboard device, and uses the supervisor-only
-firmware service at +0x43400+ to enumerate candidate disk IDs and boot the
+firmware service at +0x43400+ to enumerate candidate disk IDs, display the
+selected manifest's label, capacity, write policy and boot mode, and boot the
 selected folder. The service validates the selected manifest and fixed
 executable rule, loads the prebuilt image, mounts the disk, and transfers
 execution in the mode selected by the executable name. The host does not
@@ -299,6 +300,11 @@ which the native wrappers combine before `SVC`.
 |9 |`sleep` |R1 deterministic instruction ticks; blocks until the deadline.
 |10 |`wait` |R1 child task ID; returns exit status in R0 and child ID in R1.
 |11 |`semop` |R1 operation, R2 semaphore ID, R3 initial count for CREATE.
+|12 |`seek` |R1 file handle, R2:R3 signed offset (high:low words), R4 origin
+  (0 start, 1 current, 2 end); returns the new file offset.
+|13 |`scnet` |R1 operation: 0 discover (R2 names buffer, R3 slot capacity),
+  1 send (R2 recipient, R3 payload, R4 length), 2 receive
+  (R2 sender buffer, R3 payload, R4 capacity).
 |===
 
 Every user pointer is range-checked against the active address space before
@@ -307,7 +313,8 @@ transfers are limited to 4096 bytes. Handles 0, 1, and 2 are nonblocking
 console input, console output, and console error; allocated folder-file
 handles start at 3 and belong to one process. Open flags are READ=1, WRITE=2,
 CREATE=4, TRUNCATE=8, and APPEND=16. Append writes select the current file end
-for each write. `mmap` permission bits are READ=1, WRITE=2, EXEC=4; mapped
+for each write. Seek is file-only, accepts signed 32-bit offsets, and rejects
+positions outside 0..2^31-1. `mmap` permission bits are READ=1, WRITE=2, EXEC=4; mapped
 pages belong to the caller's address space. Sleep advances on deterministic
 emulator instruction ticks. Wait accepts only a direct child and reaps it
 after collecting status. Semaphore CREATE returns a new ID; WAIT, POST, and
@@ -318,8 +325,21 @@ process owns a semaphore; WAIT blocks at count zero, POST wakes one waiter, and
 owned semaphores are removed when that process exits. In the C wrapper,
 `sc16_mmap` returns the mapped address as `long` or a negative error; the
 remaining wrappers return the corresponding ABI result. The C interface in
-`lib/sc16_syscall.h` provides SC-16-specific wrappers; it does not claim that
-standard hosted C file streams are implemented.
+`lib/sc16_syscall.h` provides SC-16-specific wrappers. The separate
+`lib/sc16_net.h` wrappers expose SC-NET discovery, peer messaging, and
+nonblocking receive; names occupy fixed 16-byte slots and payloads are limited
+to 1024 bytes. SC-NET uses a separate host UDP service on port 47017, distinct
+from guest application networking on port 47016. BIOS startup refuses to boot
+when another active emulator advertises the configured node name. SC-NET is a
+transport service, not the guest application's network protocol.
+
+The compiler links a file-stream runtime when a C translation unit uses one of
+its supported file APIs: `fopen`, `freopen`, `fclose`, `fgetc`, `fputc`,
+`fread`, `fwrite`, `fseek`, `ftell`, `ungetc`, `clearerr`, `feof`, and
+`ferror`. These streams use the current folder-backed disk and syscall ABI;
+they are unbuffered. `remove` is explicitly unsupported and reports `ENOSYS`.
+This is a limited hosted-C subset, not complete C90 `stdio` or a hosted
+environment; see `docs/c90_todo.adoc`.
 
 == Firmware text display
 
