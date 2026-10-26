@@ -76,11 +76,14 @@ multi-translation-unit linkage remains tracked separately in the C90 roadmap.
 `SC16IMG1` is intentionally rejected; no v1 reader compatibility is provided.
 
 Image permissions describe the intended mapping. The current loader preserves
-them but does not enforce per-segment access; enforcement begins with the MMU
-work in Phase 4. Existing generated assembly/C images use read/write/execute
-permissions because their current layout can combine code and mutable data.
-The container does not select privilege: the fixed folder-disk rule selects
-`kernel.bin` as supervisor code or `main.bin` as user code.
+them. The MMU enforces present, writable, user, and executable permissions
+when a supervisor enables translation and installs mappings. Existing
+generated assembly/C images use read/write/execute permissions because their
+current layout can combine code and mutable data. The container does not
+select privilege: the fixed folder-disk rule selects `kernel.bin` as
+supervisor code or `main.bin` as user code. The current BIOS user boot path
+does not yet build an address space automatically; user mode without MMU
+translation is compatibility mode, not memory isolation.
 
 `sc16asm` assembles an assembly source to this container. `sc16build` compiles
 the currently supported C subset, assembles source, or wraps a flat binary,
@@ -113,37 +116,54 @@ executable rule, loads the prebuilt image, mounts the disk, and transfers
 execution in the mode selected by the executable name. The host does not
 render or drive the disk selector. Neither firmware nor the service compiles
 or assembles guest source during boot. KERNEL images are trusted supervisor
-code; the current design does not claim authenticated boot or memory
-isolation. Firmware may enable interrupts only after its handlers and kernel
-stack are ready.
+code. `bios.bin` is always counted as trusted firmware and runs in supervisor
+mode; this is a trust-policy assumption, not a signature check. The current
+design does not claim authenticated boot or memory isolation. Firmware may
+enable interrupts only after its handlers and kernel stack are ready.
 
 == Privilege and control state
 
 The processor has two modes: supervisor (kernel) and user. Reset enters
-supervisor mode. The following operations are supervisor-only: changing mode,
-interrupt enable state, exception/interrupt return state, MMU registers or
-page tables, device-control registers, and kernel-only mappings. A user attempt
+supervisor mode. `EI`, `DI`, `RTI`, IDT installation, MMU control, address-space
+switching, and kernel mapping operations are supervisor-only. A user attempt
 raises a protection exception without applying the requested mutation.
+Interrupt-control, timer-control, BIOS, and other protected MMIO accesses are
+rejected in user mode. The explicit user-safe console, disk, text, input, and
+basic graphics ranges are filtered by the CPU; pointer-bearing GPU commands
+are rejected for MMU-enabled user tasks until a validated guest-buffer ABI is
+available.
 
 User instruction fetches, loads, and stores may access only user-permitted
-memory. User mode cannot access protected device registers or physical device
-pages directly. Device services intended for applications are exposed through
-kernel-controlled interfaces. The kernel-to-user transition is atomic: it
-validates the target user PC and SP, installs them, changes mode, and does not
-allow user code to forge supervisor state. The exact instruction encoding for
-this transition is an ISA implementation detail and must be added only with
-privilege checks and execution tests.
+memory when MMU translation is enabled. Page permissions apply to every byte
+of multi-byte accesses. The supervisor-only `enter_user_mode` transition
+validates the entry point and stack, and validates their page permissions when
+translation is enabled. `SVC` is encoded as `0x0080` and dispatches through
+vector 128; it is only the privilege-transition boundary, not a finalized
+general syscall ABI. Do not treat the legacy no-MMU user mode as an isolation
+boundary.
 
 == Exceptions and interrupts
 
 Synchronous faults are precise: the saved PC identifies the faulting
 instruction so the kernel can repair the condition and retry or terminate the
 task. An interrupt is taken at an instruction boundary and saves the next PC.
-Entry disables interrupts and records the prior interrupt-enable state. A
-handler may explicitly enable interrupts when nested delivery is safe. The
-target vector table and descriptor encoding are specified with the IDT work in
-Phase 5; firmware must install valid handlers before enabling an interrupt
-source.
+IDT descriptors are 8 bytes and the 256-entry IDT is aligned to 2 KiB. Bytes
+0-3 contain the big-endian 30-bit handler address; byte 4 contains present in
+bit 7, DPL in bits 1-2, and trap-gate type in bit 0; all other bits and bytes
+5-7 are reserved and must be zero. Vectors 0, 1, and 2 are illegal-instruction,
+protection, and page-fault exceptions. Hardware vectors are keyboard 32, RTC
+33, and PIT 34; vector 128 is `SVC`. Supervisor APIs install the IDT and
+descriptors. A user `SVC` requires descriptor DPL 3. Missing descriptors are
+reported as unhandled; malformed descriptors or invalid event entry stop the
+CPU as a double fault.
+
+Interrupt gates clear the global interrupt-enable bit on entry; trap gates
+preserve it. `RTI` validates the saved frame and restores the prior mode, PC,
+flags, interrupt-enable state, and stack. Pending hardware sources are
+prioritized keyboard, PIT, then RTC and the selected pending bit is
+acknowledged at delivery. Nested delivery stays disabled until a handler
+explicitly enables interrupts. Firmware must install valid handlers before
+enabling an interrupt source.
 
 Every exception or interrupt creates a 16-byte, big-endian frame on the
 supervisor stack. At the frame address, increasing offsets contain:
@@ -172,13 +192,25 @@ double fault. A double fault stops the affected CPU rather than attempting a
 second untrusted stack transition. The kernel must not resume by treating a
 double fault as an ordinary user exception.
 
-The current compatibility implementation has fixed vector words at 0x0002
-(keyboard), 0x0006 (RTC), and 0x000a (timer). If multiple sources are pending,
-it services keyboard before timer before RTC. It pushes the 4-byte PC followed
-by 2-byte flags on the current stack, clears the global interrupt-enable bit
-and selected pending bit, then loads the 30-bit handler address. `RTI` restores
-flags and PC. This legacy frame is not the target frame above and has no
-privilege or kernel-stack protection.
+Events from user mode save the user SP, switch to KSP, and build the frame
+there. Events from supervisor mode use the current supervisor stack. The
+frame layout above is implemented. Missing handlers are not replaced by
+legacy fixed-vector words.
+
+The PIT period is a 16-bit value at `0x43014`; zero disables periodic
+generation. One timer tick is one completed emulator instruction, including
+headless execution, so no host wall clock is involved. The mask/enable bit is
+bit 0 at `0x43016`; timer pending is bit `0x10` in the interrupt-control
+register. Pending state remains latched while masked and is cleared on
+delivery. A scheduler-managed task context is preempted at the validated PIT
+boundary; otherwise delivery enters the installed vector handler.
+
+The emulator-side scheduler context contains R0-R7, PC, SP, KSP, flags,
+privilege mode, interrupt-enable state, MMU-enabled state, and page-directory
+identity. The scheduler provides runnable, running, blocked, and exited states
+with round-robin selection, yield, exit, block, and wake operations. These are
+kernel/emulator primitives, not guest syscalls; a booted kernel and a stable
+guest task ABI remain future integration work.
 
 == Memory translation
 
@@ -195,29 +227,28 @@ low bits:
 * bits 4-11 and 30-31: reserved and required to be zero.
 
 Effective permissions are the intersection of the directory and table entry
-permissions. Missing mappings and read, write, execute, or privilege
-violations raise page faults with the access type and virtual address. Page
-table roots and MMU control state are supervisor-only. The first emulator
-implementation may translate without a TLB; address-space changes must still
-take effect immediately. An identity mapping is required while the kernel
-initializes physical memory and transitions to its normal mappings.
+permissions. Missing mappings and read, write, execute, or privilege violations raise page
+faults with the access type and virtual address. Page table roots and MMU
+control state are supervisor-only. Translation has no TLB; address-space
+changes take effect immediately. The Rust `FrameAllocator` and
+`PageMemoryManager` allocate and account for frames, create/destroy roots,
+allocate and map pages, map borrowed frames, change permissions, unmap pages,
+release empty page tables, and construct identity-mapped ranges. Borrowed
+physical frames remain caller-owned; allocated mappings are released on
+unmap. Unmapped pages can serve as guard pages. These are kernel primitives;
+the BIOS does not yet establish a protected address space as part of normal
+user boot.
 
 == Device access
 
-The legacy emulator exposes keyboard, mouse, interrupt control, RTC, timer,
-GPU, disk, and serial-style console registers through memory-mapped addresses.
-These addresses and operations remain compatibility behavior while existing
-programs use them. In the target architecture, device registers are
-supervisor-only unless a specific safe mapping is explicitly granted. Kernel
-services, not user pointers or manifest metadata, authorize access. The
-folder-disk syscall gateway is the current narrow exception: user mode may
-write only the documented folder-filesystem request commands to the disk
-control register. The emulator validates guest path and buffer ranges, runs
-the host filesystem operation in supervisor service context, and restores the
-caller mode. Legacy block commands are rejected in user mode. This gateway is
-not a general syscall instruction, does not protect unrelated MMIO or memory,
-and does not imply process isolation; the broader privilege, MMU, and syscall
-ABI work remains open.
+The emulator exposes keyboard, mouse, interrupt control, RTC, timer, GPU,
+disk, and console registers through memory-mapped addresses. User instruction
+access is filtered by safe service ranges; privileged controls and BIOS
+registers are rejected. The folder-filesystem gateway validates user pointers
+against the active MMU mappings, including noncontiguous buffers, when paging
+is enabled. Legacy block commands are rejected in user mode. This gateway is
+not a general syscall ABI. With translation disabled, ordinary RAM is not
+isolated from user code.
 
 == Firmware text display
 
@@ -257,15 +288,17 @@ contract:
   reset and is not the serial diagnostics/Bug Monitor channel.
 
 This byte-register interface is the initial guest display API; it is not a
-general syscall or memory-protection boundary. A future kernel syscall ABI
-may mediate access and enforce display ownership.
+general syscall or memory-protection boundary. User access remains limited to
+the allowed text registers, and any future kernel syscall ABI may further
+mediate access and enforce display ownership.
 
 == Compatibility boundary
 
-The current emulator initializes PC to zero and SP to the top of configured
-memory, but has no privilege mode, KSP, protected transition, MMU, page faults,
-or precise exception mechanism. Its fixed interrupts use the legacy frame
-described above. Existing source-program boot and block-disk behavior remain
-available during migration. Implementations must not describe user programs
-as isolated until page permissions and supervisor-only device access are
-enforced and tested.
+Reset initializes PC to zero and SP/KSP to the top of configured memory,
+enters supervisor mode, and leaves interrupts and MMU translation disabled.
+Privilege transitions, IDT delivery, deterministic PIT timing, scheduler
+contexts, page translation, page faults, and frame/mapping helpers are
+implemented and tested. Normal BIOS USER boot still enters compatibility
+user mode without installing MMU mappings; it must not be described as
+process-isolated. A booted kernel, general syscall ABI, authenticated boot,
+and Phase 9 multi-process lifecycle remain open.

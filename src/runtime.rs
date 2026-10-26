@@ -1267,7 +1267,8 @@ fn fresh_runtime_cpu(
     cpu.prepare_image_entry();
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| RuntimeError::Window(format!("invalid common BIOS: {error}")))?;
-    cpu.console.log_info("emulator", "common BIOS loaded");
+    cpu.console
+        .log_info("emulator", "trusted common BIOS loaded in supervisor mode");
     Ok(cpu)
 }
 
@@ -2331,12 +2332,18 @@ mod tests {
                 folder_disk: true,
             };
             let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+            assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
             boot_target(&mut cpu, &target).unwrap();
             assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-            assert!(
-                cpu.run(1000).unwrap() > 0,
-                "no guest code ran for APP{index:05}"
-            );
+            let executed = cpu.run(1000).unwrap_or_else(|error| {
+                let pc = cpu.pc;
+                let instruction = cpu.read_u16(pc);
+                panic!(
+                    "APP{index:05} failed at PC 0x{:08x}, instruction 0x{:04x}: {error}",
+                    pc, instruction
+                )
+            });
+            assert!(executed > 0, "no guest code ran for APP{index:05}");
         }
     }
 

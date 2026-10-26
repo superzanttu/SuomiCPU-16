@@ -77,12 +77,18 @@ A selected +kernel.bin+ is trusted kernel code. This rule is not secure boot and
 does not authenticate the disk or image. Disk metadata and user programs cannot
 override executable selection or mode.
 
+The common +bios.bin+ image is always counted as trusted firmware and starts
+in Supervisor mode. This is a fixed emulator policy, not a signature check:
+the image is not authenticated, and the trust assumption does not imply secure
+boot.
+
 Boot executables use the version 2 +SC16IMG2+ container specified in
 link:sc16_architecture.adoc[+sc16_architecture.adoc+]. The loader rejects the
 previous +SC16IMG1+ format; disks containing v1 images must be rebuilt with
 +sc16build+ or otherwise migrated. Segment permissions and alignment are
-validated as image metadata, but per-segment permission enforcement awaits the
-MMU implementation.
+validated as image metadata. The MMU enforces mapped permissions when
+translation is enabled; normal BIOS USER boot does not yet enable translation
+and is not an isolation boundary.
 
 Without an explicit program path, the guest BIOS discovers ID-named folder
 directories under +disks/+ in stable order. It displays one candidate ID at a
@@ -96,7 +102,8 @@ SC-16 image container directly, preserving its entry point, segment
 permissions, and alignment, and never compiles or assembles guest source.
 KERNEL maps to the CPU's +Supervisor+ privilege mode; USER maps to +User+.
 
-The common +bios.bin+ image is required and executes before disk selection.
+The common +bios.bin+ image is required, trusted by policy, and executes in
+Supervisor mode before disk selection.
 The guest BIOS renders through the character-cell display and uses the
 supervisor-only firmware service at +0x43400+ for disk discovery and image
 loading. This service is a firmware boundary, not a general syscall or

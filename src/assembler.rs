@@ -859,6 +859,12 @@ fn instruction(
             }
             Ok(vec![opcode << 11])
         }
+        "SVC" => {
+            if !operands.is_empty() {
+                return Err(bad_count("no operands"));
+            }
+            Ok(vec![crate::isa::SVC_VECTOR])
+        }
         "LDI" => {
             two()?;
             let rd = register(operands[0], line)?;

@@ -7,19 +7,16 @@ use crate::console::ConsoleDevice;
 use crate::disk::{FolderBootMode, FolderDisk};
 use crate::guest_text::GuestTextDisplay;
 use crate::net::{DEFAULT_PORT, NetNode};
+use crate::scheduler::{Scheduler, SchedulerError, TaskContext, TaskId, TaskState};
 
 pub const MEMORY_SIZE: usize = 1 << 30;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
 
 pub const ICR_ADDR: u32 = 0x43002;
 pub const VSYNC_ADDR: usize = 0x43013;
-const KEY_VECTOR_ADDR: u32 = 0x0002;
-const RTC_VECTOR_ADDR: u32 = 0x0006;
-const TIMER_VECTOR_ADDR: u32 = 0x000a;
 const EXCEPTION_ILLEGAL_INSTRUCTION: u16 = 0;
 const EXCEPTION_PRIVILEGE_VIOLATION: u16 = 1;
 const EXCEPTION_PAGE_FAULT: u16 = 2;
-const EXCEPTION_VECTOR_COUNT: usize = 16;
 const EXCEPTION_ENTRY_BYTES: u32 = 16;
 const KEYBOARD_ADDR: u32 = 0x43000;
 const KEYS_ADDR: u32 = 0x43004;
@@ -35,7 +32,7 @@ const GPU_LAYER_COUNT: usize = 5;
 const GPU_PALETTE: u8 = 27;
 const RTC_START: u32 = 0x43010;
 pub const TIMER_PERIOD_ADDR: u32 = 0x43014;
-const MMU_PIT_CONTROL_ADDR: u32 = 0x43016;
+const PIT_CONTROL_ADDR: u32 = 0x43016;
 const PAGE_FAULT_ADDRESS_ADDR: u32 = 0x43018;
 const PAGE_FAULT_INFO_ADDR: u32 = 0x4301c;
 const DISK_BASE: u32 = 0x43100;
@@ -272,10 +269,11 @@ pub enum CpuError {
     SegmentOutOfBounds { address: u32, length: usize },
     InvalidEntryPoint(u32),
     InvalidUserStack(u32),
-    InvalidExceptionVector(u16),
     InvalidRegisterPair(u16),
     UnsupportedInstruction(u16),
     PageFault(crate::mmu::PageFault),
+    Idt(crate::interrupts::IdtError),
+    Scheduler(SchedulerError),
     PrivilegeViolation { pc: u32, operation: &'static str },
     UnhandledException { vector: u16, cause: u16 },
     DoubleFault,
@@ -303,12 +301,6 @@ impl std::fmt::Display for CpuError {
                     "user stack pointer {address:#x} is invalid or overlaps the kernel stack"
                 )
             }
-            Self::InvalidExceptionVector(vector) => {
-                write!(
-                    f,
-                    "exception vector {vector} is outside the supported range"
-                )
-            }
             Self::InvalidRegisterPair(instruction) => {
                 write!(f, "invalid register pair in instruction {instruction:#06x}")
             }
@@ -320,6 +312,8 @@ impl std::fmt::Display for CpuError {
                 "page fault {:?} at {:#x} during {:?}",
                 fault.reason, fault.virtual_address, fault.access
             ),
+            Self::Idt(error) => write!(f, "invalid interrupt descriptor table: {error:?}"),
+            Self::Scheduler(error) => write!(f, "scheduler error: {error:?}"),
             Self::PrivilegeViolation { pc, operation } => {
                 write!(f, "user-mode {operation} at {pc:#x} is privileged")
             }
@@ -377,10 +371,11 @@ pub struct Cpu {
     layer_mode: u8,
     timer_period: u16,
     timer_countdown: u16,
-    exception_handlers: [Option<u32>; EXCEPTION_VECTOR_COUNT],
+    idt_base: Option<u32>,
     mmu_enabled: bool,
     page_directory: u32,
     last_page_fault: Option<crate::mmu::PageFault>,
+    scheduler: Scheduler,
 }
 
 impl Cpu {
@@ -420,6 +415,7 @@ impl Cpu {
                 memory[(GPU_LAYER_ORDER as usize) + layer] = layer as u8;
             }
         }
+        memory[(PIT_CONTROL_ADDR & memory_mask) as usize] = 1;
         let mut palette = [[0; 3]; 256];
         for (index, color) in palette.iter_mut().enumerate() {
             *color = [index as u8; 3];
@@ -494,10 +490,11 @@ impl Cpu {
             layer_mode: 0,
             timer_period: 0,
             timer_countdown: 0,
-            exception_handlers: [None; EXCEPTION_VECTOR_COUNT],
+            idt_base: None,
             mmu_enabled: false,
             page_directory: 0,
             last_page_fault: None,
+            scheduler: Scheduler::default(),
         })
     }
 
@@ -707,6 +704,8 @@ impl Cpu {
         self.mmu_enabled = false;
         self.page_directory = 0;
         self.last_page_fault = None;
+        self.idt_base = None;
+        self.scheduler = Scheduler::default();
         self.running = true;
         self.booted_disk_path = None;
         if let Some(interrupt_control) = self.memory.get_mut(ICR_ADDR as usize) {
@@ -726,11 +725,13 @@ impl Cpu {
                 operation: "enter user mode",
             });
         }
-        if user_pc as usize >= self.memory.len() {
+        if user_pc > self.guest_address_mask() {
             return Err(CpuError::InvalidEntryPoint(user_pc));
         }
-        if user_sp as usize >= self.memory.len() || user_sp > self.kernel_sp.saturating_sub(0x1000)
-        {
+        if user_sp == 0 || user_sp > self.guest_address_mask() {
+            return Err(CpuError::InvalidUserStack(user_sp));
+        }
+        if !self.mmu_enabled && user_sp > self.kernel_sp.saturating_sub(0x1000) {
             return Err(CpuError::InvalidUserStack(user_sp));
         }
         if !self.loaded_image_segments.is_empty()
@@ -742,6 +743,9 @@ impl Cpu {
         {
             return Err(CpuError::InvalidEntryPoint(user_pc));
         }
+        if self.mmu_enabled {
+            self.validate_user_mapping(user_pc, user_sp)?;
+        }
         self.kernel_sp = self.sp;
         self.sp = user_sp;
         self.pc = user_pc;
@@ -749,36 +753,228 @@ impl Cpu {
         Ok(())
     }
 
-    pub fn set_exception_handler(
+    pub fn create_user_task(
+        &mut self,
+        entry_point: u32,
+        user_sp: u32,
+        kernel_sp: u32,
+        page_directory: Option<u32>,
+    ) -> Result<TaskId, CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "create task",
+            });
+        }
+        if entry_point
+            > page_directory.map_or(self.memory_mask, |_| crate::mmu::ADDRESS_SPACE_SIZE - 1)
+            || (!self.loaded_image_segments.is_empty()
+                && !self.loaded_image_segments.iter().any(|segment| {
+                    segment.permissions.execute
+                        && entry_point >= segment.address
+                        && ((entry_point - segment.address) as usize) < segment.length
+                }))
+        {
+            return Err(CpuError::InvalidEntryPoint(entry_point));
+        }
+        if user_sp == 0
+            || user_sp
+                > page_directory.map_or(self.memory_mask, |_| crate::mmu::ADDRESS_SPACE_SIZE - 1)
+            || kernel_sp as usize >= self.memory.len()
+            || (page_directory.is_none()
+                && user_sp > kernel_sp.saturating_sub(crate::mmu::PAGE_SIZE as u32))
+        {
+            return Err(CpuError::InvalidUserStack(user_sp));
+        }
+        if let Some(directory) = page_directory {
+            self.validate_page_directory(directory)?;
+            self.validate_user_mapping_in(directory, entry_point, user_sp)?;
+        }
+        let context = TaskContext::user(
+            entry_point,
+            user_sp,
+            kernel_sp,
+            page_directory.is_some(),
+            page_directory.unwrap_or(0),
+        );
+        self.scheduler
+            .create_task(context)
+            .map_err(CpuError::Scheduler)
+    }
+
+    pub fn start_task(&mut self, id: TaskId) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor
+            || self.scheduler.current_task().is_some()
+        {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "start task",
+            });
+        }
+        let context = self.scheduler.activate(id).map_err(CpuError::Scheduler)?;
+        self.restore_task_context(&context);
+        Ok(())
+    }
+
+    pub fn yield_current_task(&mut self) -> Result<bool, CpuError> {
+        self.schedule_current_task(TaskState::Runnable, None)
+    }
+
+    pub fn block_current_task(&mut self) -> Result<bool, CpuError> {
+        self.schedule_current_task(TaskState::Blocked, None)
+    }
+
+    pub fn exit_current_task(&mut self, exit_code: i32) -> Result<bool, CpuError> {
+        self.schedule_current_task(TaskState::Exited, Some(exit_code))
+    }
+
+    pub fn wake_task(&mut self, id: TaskId) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "wake task",
+            });
+        }
+        self.scheduler.wake(id).map_err(CpuError::Scheduler)?;
+        if self.scheduler.current_task().is_none() {
+            let context = self.scheduler.activate(id).map_err(CpuError::Scheduler)?;
+            self.restore_task_context(&context);
+        }
+        Ok(())
+    }
+
+    pub fn task_context(&self, id: TaskId) -> Option<&TaskContext> {
+        self.scheduler.task(id)
+    }
+
+    pub fn current_task(&self) -> Option<TaskId> {
+        self.scheduler.current_task()
+    }
+
+    fn schedule_current_task(
+        &mut self,
+        state: TaskState,
+        exit_code: Option<i32>,
+    ) -> Result<bool, CpuError> {
+        let id = self
+            .scheduler
+            .current_task()
+            .ok_or(CpuError::Scheduler(SchedulerError::NoCurrentTask))?;
+        let mut context = self.capture_task_context(id);
+        context.exit_code = exit_code;
+        let next = self
+            .scheduler
+            .reschedule(context, state)
+            .map_err(CpuError::Scheduler)?;
+        if let Some(context) = next {
+            self.restore_task_context(&context);
+            Ok(true)
+        } else {
+            self.running = false;
+            Ok(false)
+        }
+    }
+
+    fn capture_task_context(&self, id: TaskId) -> TaskContext {
+        TaskContext {
+            id,
+            registers: self.registers,
+            pc: self.pc,
+            sp: self.sp,
+            kernel_sp: self.kernel_sp,
+            flags: self.flags,
+            privilege_mode: self.privilege_mode,
+            interrupt_enabled: self.memory[(ICR_ADDR & self.memory_mask) as usize] & 1 != 0,
+            mmu_enabled: self.mmu_enabled,
+            page_directory: self.page_directory,
+            state: TaskState::Running,
+            exit_code: None,
+        }
+    }
+
+    fn restore_task_context(&mut self, context: &TaskContext) {
+        self.registers = context.registers;
+        self.pc = context.pc;
+        self.sp = context.sp;
+        self.kernel_sp = context.kernel_sp;
+        self.flags = context.flags;
+        self.privilege_mode = context.privilege_mode;
+        let interrupt_control = (self.read(ICR_ADDR) & !1) | u8::from(context.interrupt_enabled);
+        self.write(ICR_ADDR, interrupt_control);
+        self.mmu_enabled = context.mmu_enabled;
+        self.page_directory = context.page_directory;
+        self.running = true;
+    }
+
+    pub fn load_idt(&mut self, base: u32) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "load IDT",
+            });
+        }
+        crate::interrupts::descriptor_address(base, 0, self.memory.len()).map_err(CpuError::Idt)?;
+        self.idt_base = Some(base);
+        Ok(())
+    }
+
+    pub fn set_idt_descriptor(
         &mut self,
         vector: u16,
-        handler: Option<u32>,
+        descriptor: crate::interrupts::IdtDescriptor,
     ) -> Result<(), CpuError> {
         if self.privilege_mode != PrivilegeMode::Supervisor {
             return Err(CpuError::PrivilegeViolation {
                 pc: self.pc,
-                operation: "set exception handler",
+                operation: "set IDT descriptor",
             });
         }
-        let Some(slot) = self.exception_handlers.get_mut(usize::from(vector)) else {
-            return Err(CpuError::InvalidExceptionVector(vector));
-        };
-        if let Some(address) = handler {
-            if address as usize >= self.memory.len() {
-                return Err(CpuError::InvalidEntryPoint(address));
-            }
+        if descriptor.handler > self.guest_address_mask()
+            || (self.mmu_enabled
+                && crate::mmu::translate(
+                    &self.memory,
+                    self.page_directory,
+                    descriptor.handler,
+                    crate::mmu::MemoryAccess::Fetch,
+                    false,
+                )
+                .is_err())
+        {
+            return Err(CpuError::InvalidEntryPoint(descriptor.handler));
         }
-        *slot = handler;
-        Ok(())
+        let base = self
+            .idt_base
+            .ok_or(CpuError::Idt(crate::interrupts::IdtError::InvalidBase))?;
+        crate::interrupts::write_descriptor(&mut self.memory, base, vector, descriptor)
+            .map_err(CpuError::Idt)
     }
 
-    pub fn enable_mmu(&mut self, page_directory: u32) -> Result<(), CpuError> {
-        if self.privilege_mode != PrivilegeMode::Supervisor {
-            return Err(CpuError::PrivilegeViolation {
-                pc: self.pc,
-                operation: "enable MMU",
+    fn idt_descriptor(&self, vector: u16) -> Result<crate::interrupts::IdtDescriptor, CpuError> {
+        let Some(base) = self.idt_base else {
+            return Err(CpuError::UnhandledException {
+                vector,
+                cause: vector,
             });
+        };
+        let descriptor =
+            crate::interrupts::read_descriptor(&self.memory, base, vector).map_err(|error| {
+                match error {
+                    crate::interrupts::IdtError::MissingDescriptor => {
+                        CpuError::UnhandledException {
+                            vector,
+                            cause: vector,
+                        }
+                    }
+                    _ => CpuError::DoubleFault,
+                }
+            })?;
+        if descriptor.handler > self.guest_address_mask() {
+            return Err(CpuError::DoubleFault);
         }
+        Ok(descriptor)
+    }
+
+    fn validate_page_directory(&self, page_directory: u32) -> Result<(), CpuError> {
         let end = page_directory
             .checked_add(crate::mmu::PAGE_TABLE_BYTES as u32)
             .ok_or(CpuError::SegmentOutOfBounds {
@@ -791,6 +987,54 @@ impl Cpu {
                 length: crate::mmu::PAGE_TABLE_BYTES,
             });
         }
+        Ok(())
+    }
+
+    fn validate_user_mapping(&self, entry_point: u32, user_sp: u32) -> Result<(), CpuError> {
+        self.validate_user_mapping_in(self.page_directory, entry_point, user_sp)
+    }
+
+    fn validate_user_mapping_in(
+        &self,
+        page_directory: u32,
+        entry_point: u32,
+        user_sp: u32,
+    ) -> Result<(), CpuError> {
+        crate::mmu::translate(
+            &self.memory,
+            page_directory,
+            entry_point,
+            crate::mmu::MemoryAccess::Fetch,
+            true,
+        )
+        .map_err(CpuError::PageFault)?;
+        crate::mmu::translate(
+            &self.memory,
+            page_directory,
+            user_sp - 1,
+            crate::mmu::MemoryAccess::Write,
+            true,
+        )
+        .map_err(CpuError::PageFault)?;
+        Ok(())
+    }
+
+    fn guest_address_mask(&self) -> u32 {
+        if self.mmu_enabled {
+            crate::mmu::ADDRESS_SPACE_SIZE - 1
+        } else {
+            self.memory_mask
+        }
+    }
+
+    pub fn enable_mmu(&mut self, page_directory: u32) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "enable MMU",
+            });
+        }
+        self.validate_page_directory(page_directory)?;
         self.page_directory = page_directory;
         self.mmu_enabled = true;
         Ok(())
@@ -803,18 +1047,7 @@ impl Cpu {
                 operation: "switch address space",
             });
         }
-        let end = page_directory
-            .checked_add(crate::mmu::PAGE_TABLE_BYTES as u32)
-            .ok_or(CpuError::SegmentOutOfBounds {
-                address: page_directory,
-                length: crate::mmu::PAGE_TABLE_BYTES,
-            })?;
-        if page_directory & 0x7ff != 0 || end as usize > self.memory.len() {
-            return Err(CpuError::SegmentOutOfBounds {
-                address: page_directory,
-                length: crate::mmu::PAGE_TABLE_BYTES,
-            });
-        }
+        self.validate_page_directory(page_directory)?;
         self.page_directory = page_directory;
         Ok(())
     }
@@ -947,7 +1180,7 @@ impl Cpu {
         }
         self.privilege_mode = PrivilegeMode::Supervisor;
         self.memory[DISK_STATUS as usize] = 0;
-        if let Err(error) = self.disk_control_inner(command) {
+        if let Err(error) = self.disk_control_inner(command, caller_mode == PrivilegeMode::User) {
             self.memory[DISK_STATUS as usize] = 1;
             self.console
                 .log_error("disk", &format!("operation failed: {error}"));
@@ -955,15 +1188,15 @@ impl Cpu {
         self.privilege_mode = caller_mode;
     }
 
-    fn disk_control_inner(&mut self, command: u8) -> Result<(), String> {
+    fn disk_control_inner(&mut self, command: u8, user_mode: bool) -> Result<(), String> {
         match command {
-            0x80 => self.legacy_file_list(),
-            FOLDER_FS_LIST..=FOLDER_FS_STAT => self.folder_fs_control(command),
+            0x80 => self.legacy_file_list(user_mode),
+            FOLDER_FS_LIST..=FOLDER_FS_STAT => self.folder_fs_control(command, user_mode),
             _ => Err("unknown disk service operation".to_owned()),
         }
     }
 
-    fn legacy_file_list(&mut self) -> Result<(), String> {
+    fn legacy_file_list(&mut self, user_mode: bool) -> Result<(), String> {
         let index = usize::from(self.disk_register_u16(10));
         let capacity = usize::from(self.disk_register_u16(30));
         let disk = self
@@ -978,14 +1211,20 @@ impl Cpu {
         if length > capacity {
             return Err("virtual file name buffer is too small".to_owned());
         }
-        let output = self.guest_range(self.disk_register_u32(26), length)?;
-        self.memory[output.start..output.start + encoded.len()].copy_from_slice(encoded);
-        self.memory[output.start + encoded.len()] = 0;
+        let output = self.guest_memory_addresses(
+            self.disk_register_u32(26),
+            length,
+            crate::mmu::MemoryAccess::Write,
+            user_mode,
+        )?;
+        for (address, byte) in output.into_iter().zip(encoded.iter().copied().chain([0])) {
+            self.memory[address] = byte;
+        }
         self.disk_write_result(u16::try_from(files.len()).unwrap_or(u16::MAX));
         Ok(())
     }
 
-    fn folder_fs_control(&mut self, command: u8) -> Result<(), String> {
+    fn folder_fs_control(&mut self, command: u8, user_mode: bool) -> Result<(), String> {
         let disk = self
             .folder_disk
             .as_ref()
@@ -993,7 +1232,7 @@ impl Cpu {
             .ok_or_else(|| "no folder filesystem is mounted".to_owned())?;
         match command {
             FOLDER_FS_LIST => {
-                let directory = self.read_guest_path(self.disk_register_u32(22))?;
+                let directory = self.read_guest_path(self.disk_register_u32(22), user_mode)?;
                 let entries = disk.list_dir(directory.as_deref())?;
                 let index = usize::from(self.disk_register_u16(10));
                 let encoded = if let Some(entry) = entries.get(index) {
@@ -1011,45 +1250,68 @@ impl Cpu {
                 if encoded.len() > capacity {
                     return Err("folder filesystem listing buffer is too small".to_owned());
                 }
-                let output = self.guest_range(self.disk_register_u32(26), encoded.len())?;
-                self.memory[output].copy_from_slice(&encoded);
+                let output = self.guest_memory_addresses(
+                    self.disk_register_u32(26),
+                    encoded.len(),
+                    crate::mmu::MemoryAccess::Write,
+                    user_mode,
+                )?;
+                for (address, byte) in output.into_iter().zip(encoded) {
+                    self.memory[address] = byte;
+                }
                 self.disk_write_result(u16::try_from(entries.len()).unwrap_or(u16::MAX));
             }
             FOLDER_FS_READ => {
                 let path = self
-                    .read_guest_path(self.disk_register_u32(22))?
+                    .read_guest_path(self.disk_register_u32(22), user_mode)?
                     .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
                 let length = usize::from(self.disk_register_u16(30));
                 if length > DISK_MAX_FILE_READ_SIZE {
                     return Err("folder filesystem transfer exceeds 4096 bytes".to_owned());
                 }
-                let output = self.guest_range(self.disk_register_u32(26), length)?;
+                let output = self.guest_memory_addresses(
+                    self.disk_register_u32(26),
+                    length,
+                    crate::mmu::MemoryAccess::Write,
+                    user_mode,
+                )?;
                 let offset = u64::from(self.disk_register_u32(18));
                 let (data, file_size) = disk.read_file(&path, offset, length)?;
                 let file_size = u32::try_from(file_size)
                     .map_err(|_| "folder filesystem file exceeds 32-bit size".to_owned())?;
-                self.memory[output.start..output.start + data.len()].copy_from_slice(&data);
+                let bytes_read = data.len();
+                for (address, byte) in output.into_iter().zip(data) {
+                    self.memory[address] = byte;
+                }
                 self.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36]
                     .copy_from_slice(&file_size.to_be_bytes());
-                self.disk_write_result(u16::try_from(data.len()).unwrap_or(u16::MAX));
+                self.disk_write_result(u16::try_from(bytes_read).unwrap_or(u16::MAX));
             }
             FOLDER_FS_WRITE => {
                 let path = self
-                    .read_guest_path(self.disk_register_u32(22))?
+                    .read_guest_path(self.disk_register_u32(22), user_mode)?
                     .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
                 Self::validate_guest_mutation_path(&path)?;
                 let length = usize::from(self.disk_register_u16(30));
                 if length > DISK_MAX_FILE_READ_SIZE {
                     return Err("folder filesystem transfer exceeds 4096 bytes".to_owned());
                 }
-                let input = self.guest_range(self.disk_register_u32(26), length)?;
-                let data = self.memory[input].to_vec();
+                let input = self.guest_memory_addresses(
+                    self.disk_register_u32(26),
+                    length,
+                    crate::mmu::MemoryAccess::Read,
+                    user_mode,
+                )?;
+                let data = input
+                    .into_iter()
+                    .map(|address| self.memory[address])
+                    .collect::<Vec<_>>();
                 disk.write_file(&path, &data)?;
                 self.disk_write_result(u16::try_from(length).unwrap_or(u16::MAX));
             }
             FOLDER_FS_CREATE_DIR => {
                 let path = self
-                    .read_guest_path(self.disk_register_u32(22))?
+                    .read_guest_path(self.disk_register_u32(22), user_mode)?
                     .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
                 Self::validate_guest_mutation_path(&path)?;
                 disk.create_dir(&path)?;
@@ -1057,7 +1319,7 @@ impl Cpu {
             }
             FOLDER_FS_DELETE => {
                 let path = self
-                    .read_guest_path(self.disk_register_u32(22))?
+                    .read_guest_path(self.disk_register_u32(22), user_mode)?
                     .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
                 Self::validate_guest_mutation_path(&path)?;
                 disk.delete_entry(&path)?;
@@ -1065,10 +1327,10 @@ impl Cpu {
             }
             FOLDER_FS_RENAME => {
                 let source = self
-                    .read_guest_path(self.disk_register_u32(22))?
+                    .read_guest_path(self.disk_register_u32(22), user_mode)?
                     .ok_or_else(|| "folder filesystem source path is empty".to_owned())?;
                 let destination = self
-                    .read_guest_path(self.disk_register_u32(18))?
+                    .read_guest_path(self.disk_register_u32(18), user_mode)?
                     .ok_or_else(|| "folder filesystem destination path is empty".to_owned())?;
                 Self::validate_guest_mutation_path(&source)?;
                 Self::validate_guest_mutation_path(&destination)?;
@@ -1077,19 +1339,26 @@ impl Cpu {
             }
             FOLDER_FS_STAT => {
                 let path = self
-                    .read_guest_path(self.disk_register_u32(22))?
+                    .read_guest_path(self.disk_register_u32(22), user_mode)?
                     .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
                 let entry = disk.metadata(&path)?;
                 let size = u32::try_from(entry.size_bytes)
                     .map_err(|_| "folder filesystem entry exceeds 32-bit size".to_owned())?;
-                let output = self.guest_range(self.disk_register_u32(26), 5)?;
-                self.memory[output].copy_from_slice(&[
+                let output = self.guest_memory_addresses(
+                    self.disk_register_u32(26),
+                    5,
+                    crate::mmu::MemoryAccess::Write,
+                    user_mode,
+                )?;
+                for (address, byte) in output.into_iter().zip([
                     u8::from(entry.is_directory),
                     size.to_be_bytes()[0],
                     size.to_be_bytes()[1],
                     size.to_be_bytes()[2],
                     size.to_be_bytes()[3],
-                ]);
+                ]) {
+                    self.memory[address] = byte;
+                }
                 self.disk_write_result(5);
             }
             _ => return Err("unknown folder filesystem operation".to_owned()),
@@ -1117,14 +1386,62 @@ impl Cpu {
         Ok(start..end)
     }
 
-    fn read_guest_path(&self, address: u32) -> Result<Option<String>, String> {
+    fn guest_memory_addresses(
+        &self,
+        address: u32,
+        length: usize,
+        access: crate::mmu::MemoryAccess,
+        user_mode: bool,
+    ) -> Result<Vec<usize>, String> {
+        let mut addresses = Vec::with_capacity(length);
+        for offset in 0..length {
+            let offset = u32::try_from(offset)
+                .map_err(|_| "guest buffer length exceeds address space".to_owned())?;
+            let virtual_address = address
+                .checked_add(offset)
+                .filter(|value| {
+                    if self.mmu_enabled {
+                        *value < crate::mmu::ADDRESS_SPACE_SIZE
+                    } else {
+                        (*value as usize) < self.memory.len()
+                    }
+                })
+                .ok_or_else(|| "guest buffer range is outside address space".to_owned())?;
+            if self.guest_range_contains(virtual_address, MMIO_START, MMIO_END - MMIO_START) {
+                return Err("guest buffer overlaps memory-mapped devices".to_owned());
+            }
+            let physical_address = if self.mmu_enabled {
+                crate::mmu::translate(
+                    &self.memory,
+                    self.page_directory,
+                    virtual_address,
+                    access,
+                    user_mode,
+                )
+                .map_err(|fault| format!("guest buffer page fault: {fault:?}"))?
+            } else {
+                virtual_address
+            };
+            if self.guest_range_contains(physical_address, MMIO_START, MMIO_END - MMIO_START)
+                || physical_address as usize >= self.memory.len()
+            {
+                return Err("guest buffer is outside accessible RAM".to_owned());
+            }
+            addresses.push(physical_address as usize);
+        }
+        Ok(addresses)
+    }
+
+    fn read_guest_path(&self, address: u32, user_mode: bool) -> Result<Option<String>, String> {
         let mut bytes = Vec::new();
         for offset in 0..=128u32 {
             let current = address
                 .checked_add(offset)
                 .ok_or_else(|| "guest path address overflow".to_owned())?;
-            let range = self.guest_range(current, 1)?;
-            let byte = self.memory[range.start];
+            let physical =
+                self.guest_memory_addresses(current, 1, crate::mmu::MemoryAccess::Read, user_mode)?
+                    [0];
+            let byte = self.memory[physical];
             if byte == 0 {
                 if bytes.is_empty() {
                     return Ok(None);
@@ -1278,6 +1595,7 @@ impl Cpu {
         self.write(address.wrapping_add(1), low);
     }
 
+    #[cfg(test)]
     fn read_u32(&mut self, address: u32) -> u32 {
         (u32::from(self.read(address)) << 24)
             | (u32::from(self.read(address.wrapping_add(1))) << 16)
@@ -1305,27 +1623,35 @@ impl Cpu {
         }
     }
 
+    fn guest_range_contains(&self, address: u32, base: u32, length: u32) -> bool {
+        if self.mmu_enabled {
+            address >= base && address < base.saturating_add(length)
+        } else {
+            self.wrapped_range_contains(address, base, length)
+        }
+    }
+
     fn check_guest_access(
         &self,
         address: u32,
         access: crate::mmu::MemoryAccess,
     ) -> Result<(), CpuError> {
         if self.privilege_mode != PrivilegeMode::User
-            || !self.wrapped_range_contains(address, MMIO_START, MMIO_END - MMIO_START)
+            || !self.guest_range_contains(address, MMIO_START, MMIO_END - MMIO_START)
         {
             return Ok(());
         }
         let write = access == crate::mmu::MemoryAccess::Write;
         let user_service = access != crate::mmu::MemoryAccess::Fetch
-            && (self.wrapped_range_contains(address, DISK_BASE, 0x40)
-                || self.wrapped_range_contains(address, GPU_BASE, 0x80)
-                || self.wrapped_range_contains(address, CONSOLE_DATA, 3)
-                || self.wrapped_range_contains(address, GUEST_TEXT_BASE, 6)
+            && (self.guest_range_contains(address, DISK_BASE, 0x40)
+                || self.guest_range_contains(address, GPU_BASE, 0x80)
+                || self.guest_range_contains(address, CONSOLE_DATA, 3)
+                || self.guest_range_contains(address, GUEST_TEXT_BASE, 6)
                 || (!write
-                    && (self.wrapped_range_contains(address, KEYBOARD_ADDR, 1)
-                        || self.wrapped_range_contains(address, KEYS_ADDR, 3)
-                        || self.wrapped_range_contains(address, MOUSE_ADDR, 8)
-                        || self.wrapped_range_contains(address, RTC_START, 4))));
+                    && (self.guest_range_contains(address, KEYBOARD_ADDR, 1)
+                        || self.guest_range_contains(address, KEYS_ADDR, 3)
+                        || self.guest_range_contains(address, MOUSE_ADDR, 8)
+                        || self.guest_range_contains(address, RTC_START, 4))));
         if user_service {
             Ok(())
         } else {
@@ -1388,8 +1714,7 @@ impl Cpu {
     }
 
     fn read_guest_u16(&mut self, address: u32) -> Result<u16, CpuError> {
-        let physical =
-            self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Read)?;
+        let physical = self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Read)?;
         Ok(u16::from_be_bytes([
             self.read(physical[0]),
             self.read(physical[1]),
@@ -1397,8 +1722,7 @@ impl Cpu {
     }
 
     fn read_guest_u32(&mut self, address: u32) -> Result<u32, CpuError> {
-        let physical =
-            self.resolve_guest_range(address, 4, crate::mmu::MemoryAccess::Read)?;
+        let physical = self.resolve_guest_range(address, 4, crate::mmu::MemoryAccess::Read)?;
         Ok(u32::from_be_bytes([
             self.read(physical[0]),
             self.read(physical[1]),
@@ -1408,8 +1732,7 @@ impl Cpu {
     }
 
     fn fetch_guest_u16(&mut self, address: u32) -> Result<u16, CpuError> {
-        let physical =
-            self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Fetch)?;
+        let physical = self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Fetch)?;
         Ok(u16::from_be_bytes([
             self.read(physical[0]),
             self.read(physical[1]),
@@ -1423,21 +1746,16 @@ impl Cpu {
     }
 
     fn write_guest_u16(&mut self, address: u32, value: u16) -> Result<(), CpuError> {
-        let physical =
-            self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Write)?;
+        let physical = self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Write)?;
         self.write(physical[0], (value >> 8) as u8);
         self.write(physical[1], value as u8);
         Ok(())
     }
 
     fn write_guest_u32(&mut self, address: u32, value: u32) -> Result<(), CpuError> {
-        let physical =
-            self.resolve_guest_range(address, 4, crate::mmu::MemoryAccess::Write)?;
+        let physical = self.resolve_guest_range(address, 4, crate::mmu::MemoryAccess::Write)?;
         for (offset, physical_address) in physical.into_iter().enumerate() {
-            self.write(
-                physical_address,
-                (value >> (24 - offset * 8)) as u8,
-            );
+            self.write(physical_address, (value >> (24 - offset * 8)) as u8);
         }
         Ok(())
     }
@@ -1598,25 +1916,23 @@ impl Cpu {
 
     fn execute_muldiv(&mut self, destination: usize) -> Result<(), CpuError> {
         let control = self.fetch_guest_u16(self.pc)?;
-        self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+        self.pc = self.pc.wrapping_add(2) & self.guest_address_mask();
         let operation = control >> 12;
         let source = (control & 7) as usize;
         if operation == 7 {
             let high = self.fetch_guest_u16(self.pc)? & 0x3fff;
             let low = self.fetch_guest_u16(self.pc.wrapping_add(2))?;
             self.registers[destination] = i64::from((u32::from(high) << 16) | u32::from(low));
-            self.pc = self.pc.wrapping_add(4) & self.memory_mask;
+            self.pc = self.pc.wrapping_add(4) & self.guest_address_mask();
             return Ok(());
         }
         if operation == 8 {
-            let address = self.registers[source] as u32 & self.memory_mask;
-            let high = self.read_guest_u16(address)? & 0x3fff;
-            let low = self.read_guest_u16(address.wrapping_add(2))?;
-            self.registers[destination] = i64::from((u32::from(high) << 16) | u32::from(low));
+            let address = self.registers[source] as u32 & self.guest_address_mask();
+            self.registers[destination] = i64::from(self.read_guest_u32(address)? & ADDRESS_MASK);
             return Ok(());
         }
         if operation == 9 {
-            let address = self.registers[source] as u32 & self.memory_mask;
+            let address = self.registers[source] as u32 & self.guest_address_mask();
             let value = self.registers[destination] as u32 & ADDRESS_MASK;
             self.write_guest_u32(address, value)?;
             return Ok(());
@@ -1635,7 +1951,7 @@ impl Cpu {
         }
         let right = if control & 0x0800 != 0 {
             let value = self.fetch_guest_u16(self.pc)?;
-            self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+            self.pc = self.pc.wrapping_add(2) & self.guest_address_mask();
             value
         } else {
             self.registers[source] as u16
@@ -1674,7 +1990,7 @@ impl Cpu {
 
     fn execute_wide(&mut self, instruction: u16, destination: usize) -> Result<(), CpuError> {
         let control = self.fetch_guest_u16(self.pc)?;
-        self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+        self.pc = self.pc.wrapping_add(2) & self.guest_address_mask();
         let operation = control >> 12;
         let immediate = control & 0x0800 != 0;
         let source = (control & 7) as usize;
@@ -1696,7 +2012,7 @@ impl Cpu {
             return Ok(());
         }
         if operation == 11 || operation == 12 {
-            let address = self.register_pair_u32(source) & self.memory_mask;
+            let address = self.register_pair_u32(source) & self.guest_address_mask();
             if operation == 11 {
                 let value = self.read_guest_u32(address)?;
                 self.set_pair(destination, value);
@@ -1862,10 +2178,10 @@ impl Cpu {
                 self.registers[destination] = i64::from(result);
                 self.set_flags(result, self.flags.carry, false);
             }
-            2 => self.pc = u32::from(value) & self.memory_mask,
+            2 => self.pc = u32::from(value) & self.guest_address_mask(),
             3 => {
                 self.push_u32(self.pc)?;
-                self.pc = u32::from(value) & self.memory_mask;
+                self.pc = u32::from(value) & self.guest_address_mask();
             }
             4 => self.push_u16(self.pack_flags())?,
             5 => {
@@ -1874,7 +2190,7 @@ impl Cpu {
             }
             6 => self.flags.carry = true,
             7 => self.flags.carry = false,
-            8 => self.sp = u32::from(value) & self.memory_mask,
+            8 => self.sp = u32::from(value) & self.guest_address_mask(),
             9 => {
                 self.registers[destination] = i64::from(value.leading_zeros());
                 self.flags.zero = value == 0;
@@ -1887,7 +2203,7 @@ impl Cpu {
                 if selector == 11 {
                     self.push_u32(self.pc)?;
                 }
-                self.pc = target & self.memory_mask;
+                self.pc = target & self.guest_address_mask();
             }
             13 => {
                 self.sp = (self.sp & 0xffff) | (u32::from(value & 0x3fff) << 16);
@@ -1899,7 +2215,7 @@ impl Cpu {
 
     fn execute_alu(&mut self, destination: usize) -> Result<(), CpuError> {
         let control = self.fetch_guest_u16(self.pc)?;
-        self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+        self.pc = self.pc.wrapping_add(2) & self.guest_address_mask();
         let operation = control >> 12;
         let left = self.registers[destination] as u16;
         if operation == 15 {
@@ -1925,7 +2241,7 @@ impl Cpu {
         }
         let right = if immediate {
             let value = self.fetch_guest_u16(self.pc)?;
-            self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+            self.pc = self.pc.wrapping_add(2) & self.guest_address_mask();
             value
         } else {
             self.registers[source] as u16
@@ -2018,7 +2334,7 @@ impl Cpu {
 
         let instruction_pc = self.pc;
         let instruction = self.fetch_guest_u16(self.pc)?;
-        self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+        self.pc = self.pc.wrapping_add(2) & self.guest_address_mask();
         let opcode = instruction >> 11;
         let rd = ((instruction >> 8) & 7) as usize;
         let rs1 = ((instruction >> 5) & 7) as usize;
@@ -2026,14 +2342,25 @@ impl Cpu {
         let immediate = (instruction & 0xff) as u32;
 
         match opcode {
-            OP_HALT => self.running = false,
+            OP_HALT if instruction == 0 => self.running = false,
+            OP_HALT if instruction == crate::isa::SVC_VECTOR => {
+                let vector = crate::isa::SVC_VECTOR;
+                let descriptor = self.idt_descriptor(vector)?;
+                let caller_privilege = u8::from(self.privilege_mode == PrivilegeMode::User) * 3;
+                if caller_privilege > descriptor.privilege {
+                    self.enter_exception(EXCEPTION_PRIVILEGE_VIOLATION, self.pc)?;
+                } else {
+                    self.enter_event(vector, self.pc, descriptor.handler, 0, descriptor.gate_type)?;
+                }
+            }
+            OP_HALT => return Err(CpuError::UnsupportedInstruction(instruction)),
             OP_LDI => self.registers[rd] = i64::from(immediate),
             OP_LD => {
-                let address = self.registers[rs1] as u32 & self.memory_mask;
+                let address = self.registers[rs1] as u32 & self.guest_address_mask();
                 self.registers[rd] = i64::from(self.read_guest(address)?);
             }
             OP_ST => {
-                let address = self.registers[rs1] as u32 & self.memory_mask;
+                let address = self.registers[rs1] as u32 & self.guest_address_mask();
                 self.write_guest(address, self.registers[rd] as u8)?;
             }
             OP_MOV => self.registers[rd] = self.registers[rs1],
@@ -2065,7 +2392,7 @@ impl Cpu {
             OP_JMP => self.pc = (instruction & 0x7ff) as u32,
             OP_JZ => {
                 if self.registers[rd] == 0 {
-                    self.pc = immediate & self.memory_mask;
+                    self.pc = immediate & self.guest_address_mask();
                 }
             }
             OP_INC => self.registers[rd] = self.registers[rd].wrapping_add(1),
@@ -2109,32 +2436,33 @@ impl Cpu {
                 self.push_u32(self.pc)?;
                 self.pc = (instruction & 0x7ff) as u32;
             }
-            OP_RET => self.pc = self.pop_u32()? & self.memory_mask,
+            OP_RET => self.pc = self.pop_u32()? & self.guest_address_mask(),
             OP_BZ => {
                 if self.flags.zero {
                     self.pc = (instruction & 0x7ff) as u32;
                 }
             }
             OP_LDW => {
-                let address = self.registers[rs1] as u32 & self.memory_mask;
+                let address = self.registers[rs1] as u32 & self.guest_address_mask();
                 self.registers[rd] = i64::from(self.read_guest_u16(address)?);
             }
             OP_STW => {
-                let address = self.registers[rs1] as u32 & self.memory_mask;
+                let address = self.registers[rs1] as u32 & self.guest_address_mask();
                 self.write_guest_u16(address, self.registers[rd] as u16)?;
             }
             OP_LDWS => {
-                self.registers[rd] = i64::from(
-                    self.read_guest_u16(self.sp.wrapping_add(immediate) & self.memory_mask)?,
-                )
+                self.registers[rd] =
+                    i64::from(self.read_guest_u16(
+                        self.sp.wrapping_add(immediate) & self.guest_address_mask(),
+                    )?)
             }
             OP_STWS => self.write_guest_u16(
-                self.sp.wrapping_add(immediate) & self.memory_mask,
+                self.sp.wrapping_add(immediate) & self.guest_address_mask(),
                 self.registers[rd] as u16,
             )?,
             OP_ADJSP => {
                 let offset = (immediate as u8 as i8) as i32;
-                self.sp = self.sp.wrapping_add_signed(offset) & self.memory_mask;
+                self.sp = self.sp.wrapping_add_signed(offset) & self.guest_address_mask();
             }
             OP_BC => {
                 if self.flags.carry {
@@ -2143,7 +2471,7 @@ impl Cpu {
             }
             OP_SHR if instruction & FLOAT_MASK == FLOAT_PREFIX => {
                 let control = self.fetch_guest_u16(self.pc)?;
-                self.pc = self.pc.wrapping_add(2) & self.memory_mask;
+                self.pc = self.pc.wrapping_add(2) & self.guest_address_mask();
                 self.execute_float((control >> 11) & 0x1f, rd, (control & 7) as usize);
             }
             OP_SHR if instruction & MULDIV_MASK == MULDIV_PREFIX => {
@@ -2159,24 +2487,24 @@ impl Cpu {
                 let condition = ((instruction >> 7) & 0xf) as u8;
                 let target = (((self.fetch_guest_u16(self.pc)? & 0x3fff) as u32) << 16)
                     | self.fetch_guest_u16(self.pc.wrapping_add(2))? as u32;
-                self.pc = self.pc.wrapping_add(4) & self.memory_mask;
+                self.pc = self.pc.wrapping_add(4) & self.guest_address_mask();
                 if branch_condition(self.flags, condition) {
-                    self.pc = target & self.memory_mask;
+                    self.pc = target & self.guest_address_mask();
                 }
             }
             OP_SHR if instruction & FAR_CONTROL_MASK == FAR_CONTROL_PREFIX => {
                 let operation = (instruction >> 9) & 3;
                 let target = (((self.fetch_guest_u16(self.pc)? & 0x3fff) as u32) << 16)
                     | self.fetch_guest_u16(self.pc.wrapping_add(2))? as u32;
-                self.pc = self.pc.wrapping_add(4) & self.memory_mask;
+                self.pc = self.pc.wrapping_add(4) & self.guest_address_mask();
                 match operation {
-                    0 => self.pc = target & self.memory_mask,
+                    0 => self.pc = target & self.guest_address_mask(),
                     1 => {
                         self.push_u32(self.pc)?;
-                        self.pc = target & self.memory_mask;
+                        self.pc = target & self.guest_address_mask();
                     }
-                    2 if self.flags.zero => self.pc = target & self.memory_mask,
-                    3 if self.flags.carry => self.pc = target & self.memory_mask,
+                    2 if self.flags.zero => self.pc = target & self.guest_address_mask(),
+                    3 if self.flags.carry => self.pc = target & self.guest_address_mask(),
                     _ => {}
                 }
             }
@@ -3076,6 +3404,28 @@ impl Cpu {
     }
 
     fn gpu_command(&mut self, command: u8) {
+        if self.mmu_enabled
+            && self.privilege_mode == PrivilegeMode::User
+            && matches!(
+                command,
+                GPU_SPRITE | GPU_BITMAP | GPU_TEXT | GPU_POLY | GPU_NET_OPEN
+                    ..=GPU_NET_INFO
+                        | GPU_TILEMAP
+                        | GPU_TILEMAP_WIDE
+                        | GPU_SPRITE_UPLOAD
+                        | GPU_TILE_UPLOAD
+                        | GPU_WORLD_EMITTERS
+                        | GPU_WORLD_EMITTERS_WIDE
+                        | GPU_3D
+            )
+        {
+            self.set_gpu_result(1);
+            self.console.log_error(
+                "gpu",
+                "MMU-backed user buffer commands require a validated buffer service",
+            );
+            return;
+        }
         let color = self.memory[(GPU_BASE + 1) as usize];
         let x = i32::from(self.gpu_word(2));
         let y = i32::from(self.gpu_word(4));
@@ -3476,7 +3826,7 @@ impl Cpu {
     }
 
     fn push_u16(&mut self, value: u16) -> Result<(), CpuError> {
-        let stack_pointer = self.sp.wrapping_sub(2) & self.memory_mask;
+        let stack_pointer = self.sp.wrapping_sub(2) & self.guest_address_mask();
         self.write_guest_u16(stack_pointer, value)?;
         self.sp = stack_pointer;
         Ok(())
@@ -3484,24 +3834,19 @@ impl Cpu {
 
     fn pop_u16(&mut self) -> Result<u16, CpuError> {
         let value = self.read_guest_u16(self.sp)?;
-        self.sp = self.sp.wrapping_add(2) & self.memory_mask;
+        self.sp = self.sp.wrapping_add(2) & self.guest_address_mask();
         Ok(value)
     }
 
     fn enter_exception(&mut self, cause: u16, saved_pc: u32) -> Result<(), CpuError> {
-        let Some(handler) = self
-            .exception_handlers
-            .get(usize::from(cause))
-            .copied()
-            .flatten()
-        else {
-            self.running = false;
-            return Err(CpuError::UnhandledException {
-                vector: cause,
-                cause,
-            });
+        let descriptor = match self.idt_descriptor(cause) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                self.running = false;
+                return Err(error);
+            }
         };
-        self.enter_event(cause, saved_pc, handler, 0)
+        self.enter_event(cause, saved_pc, descriptor.handler, 0, descriptor.gate_type)
     }
 
     fn enter_event(
@@ -3510,13 +3855,22 @@ impl Cpu {
         saved_pc: u32,
         handler: u32,
         entry_kind: u16,
+        gate_type: crate::interrupts::GateType,
     ) -> Result<(), CpuError> {
-        if handler == 0 || handler as usize >= self.memory.len() {
+        if handler > self.guest_address_mask()
+            || saved_pc > self.guest_address_mask()
+            || (self.mmu_enabled
+                && crate::mmu::translate(
+                    &self.memory,
+                    self.page_directory,
+                    handler,
+                    crate::mmu::MemoryAccess::Fetch,
+                    false,
+                )
+                .is_err())
+        {
             self.running = false;
-            return Err(CpuError::UnhandledException {
-                vector: cause,
-                cause,
-            });
+            return Err(CpuError::DoubleFault);
         }
         let old_mode = self.privilege_mode;
         let old_sp = self.sp;
@@ -3553,8 +3907,10 @@ impl Cpu {
         frame[12..14].copy_from_slice(&cause_bytes);
         frame[14..16].copy_from_slice(&kind);
 
-        let interrupt_control = self.read(ICR_ADDR) & !1;
-        self.write(ICR_ADDR, interrupt_control);
+        if gate_type == crate::interrupts::GateType::Interrupt {
+            let interrupt_control = self.read(ICR_ADDR) & !1;
+            self.write(ICR_ADDR, interrupt_control);
+        }
         self.privilege_mode = PrivilegeMode::Supervisor;
         self.sp = frame_start;
         self.kernel_sp = frame_start;
@@ -3565,7 +3921,7 @@ impl Cpu {
     fn return_from_exception(&mut self) -> Result<(), CpuError> {
         if self.privilege_mode != PrivilegeMode::Supervisor {
             return Err(CpuError::PrivilegeViolation {
-                pc: self.pc.wrapping_sub(2) & self.memory_mask,
+                pc: self.pc.wrapping_sub(2) & self.guest_address_mask(),
                 operation: "RTI",
             });
         }
@@ -3592,8 +3948,12 @@ impl Cpu {
         );
         if status & !0x3 != 0
             || entry_kind > 1
-            || saved_pc as usize >= self.memory.len()
-            || saved_sp as usize >= self.memory.len()
+            || saved_pc > self.guest_address_mask()
+            || (if status & 1 != 0 {
+                saved_sp > self.guest_address_mask()
+            } else {
+                saved_sp as usize >= self.memory.len()
+            })
         {
             self.running = false;
             return Err(CpuError::DoubleFault);
@@ -3620,7 +3980,7 @@ impl Cpu {
     }
 
     fn push_u32(&mut self, value: u32) -> Result<(), CpuError> {
-        let stack_pointer = self.sp.wrapping_sub(4) & self.memory_mask;
+        let stack_pointer = self.sp.wrapping_sub(4) & self.guest_address_mask();
         self.write_guest_u32(stack_pointer, value)?;
         self.sp = stack_pointer;
         Ok(())
@@ -3628,7 +3988,7 @@ impl Cpu {
 
     fn pop_u32(&mut self) -> Result<u32, CpuError> {
         let value = self.read_guest_u32(self.sp)?;
-        self.sp = self.sp.wrapping_add(4) & self.memory_mask;
+        self.sp = self.sp.wrapping_add(4) & self.guest_address_mask();
         Ok(value)
     }
 
@@ -3638,17 +3998,38 @@ impl Cpu {
             return Ok(());
         }
         let (pending_bit, vector) = if icr & 2 != 0 {
-            (2, KEY_VECTOR_ADDR)
-        } else if icr & 0x10 != 0 {
-            (0x10, TIMER_VECTOR_ADDR)
+            (2, u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD))
+        } else if icr & 0x10 != 0 && self.read(PIT_CONTROL_ADDR) & 1 != 0 {
+            (0x10, u16::from(crate::interrupts::IDT_VECTOR_PIT))
         } else if icr & 8 != 0 {
-            (8, RTC_VECTOR_ADDR)
+            (8, u16::from(crate::interrupts::IDT_VECTOR_RTC))
         } else {
             return Ok(());
         };
-        let handler = self.read_u32(vector) & self.memory_mask;
         self.write(ICR_ADDR, icr & !pending_bit);
-        self.enter_event(pending_bit as u16, self.pc, handler, 1)
+        let descriptor = match self.idt_descriptor(vector) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                self.running = false;
+                return Err(error);
+            }
+        };
+        if vector == u16::from(crate::interrupts::IDT_VECTOR_PIT) {
+            if let Some(task_id) = self.scheduler.current_task() {
+                let context = self.capture_task_context(task_id);
+                let next = self
+                    .scheduler
+                    .reschedule(context, TaskState::Runnable)
+                    .map_err(CpuError::Scheduler)?;
+                if let Some(context) = next {
+                    self.restore_task_context(&context);
+                } else {
+                    self.running = false;
+                }
+                return Ok(());
+            }
+        }
+        self.enter_event(vector, self.pc, descriptor.handler, 1, descriptor.gate_type)
     }
 
     fn advance_timer(&mut self) {
@@ -3786,6 +4167,22 @@ mod tests {
         cpu
     }
 
+    fn install_test_handler(cpu: &mut Cpu, vector: u16, handler: u32, privilege: u8) {
+        if cpu.idt_base.is_none() {
+            cpu.load_idt(0x800).unwrap();
+        }
+        cpu.set_idt_descriptor(
+            vector,
+            crate::interrupts::IdtDescriptor {
+                handler,
+                present: true,
+                privilege,
+                gate_type: crate::interrupts::GateType::Interrupt,
+            },
+        )
+        .unwrap();
+    }
+
     fn run_assembly(source: &str) -> Cpu {
         let image = crate::assembler::assemble(source, 0).unwrap();
         let mut cpu = Cpu::new();
@@ -3835,8 +4232,7 @@ mod tests {
     #[test]
     fn user_privilege_fault_uses_kernel_stack_and_rti_restores_user_state() {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
-        cpu.set_exception_handler(EXCEPTION_PRIVILEGE_VIOLATION, Some(0x300))
-            .unwrap();
+        install_test_handler(&mut cpu, EXCEPTION_PRIVILEGE_VIOLATION, 0x300, 0);
         cpu.write_u16(0x2000, OP_DI << 11);
         cpu.write_u16(0x300, OP_RTI << 11);
         cpu.pc = 0x2000;
@@ -3876,8 +4272,7 @@ mod tests {
     #[test]
     fn invalid_instruction_enters_the_configured_exception_handler() {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
-        cpu.set_exception_handler(EXCEPTION_ILLEGAL_INSTRUCTION, Some(0x300))
-            .unwrap();
+        install_test_handler(&mut cpu, EXCEPTION_ILLEGAL_INSTRUCTION, 0x300, 0);
         cpu.write_u16(0, 0xff1a);
         cpu.write_u16(0x300, OP_RTI << 11);
 
@@ -3892,8 +4287,7 @@ mod tests {
     #[test]
     fn user_instruction_cannot_write_or_read_interrupt_control_registers() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.set_exception_handler(EXCEPTION_PRIVILEGE_VIOLATION, Some(0x300))
-            .unwrap();
+        install_test_handler(&mut cpu, EXCEPTION_PRIVILEGE_VIOLATION, 0x300, 0);
         cpu.write_u16(0, (OP_ST << 11) | (1 << 5));
         cpu.write_u16(2, (OP_LD << 11) | (2 << 8) | (1 << 5));
         cpu.write_u16(0x300, OP_RTI << 11);
@@ -3920,6 +4314,134 @@ mod tests {
         assert_eq!(cpu.pc, 0x300);
         assert_eq!(cpu.registers[2], 0);
         assert_eq!(cpu.read_u32(cpu.sp), 2);
+    }
+
+    #[test]
+    fn software_call_enters_supervisor_handler_and_returns_to_user() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let image = crate::assembler::assemble("SVC\nHALT", 0x100).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
+        cpu.write_u16(0x300, OP_RTI << 11);
+        let user_stack = cpu.initial_user_stack_pointer();
+        cpu.enter_user_mode(0x100, user_stack).unwrap();
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.read_u32(cpu.sp), 0x102);
+        assert_eq!(cpu.read_u16(cpu.sp + 6), 1);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), crate::isa::SVC_VECTOR);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.sp, user_stack);
+        cpu.step().unwrap();
+        assert!(!cpu.running);
+    }
+
+    #[test]
+    fn user_software_call_requires_a_user_callable_idt_descriptor() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        let image = crate::assembler::assemble("SVC\nHALT", 0x100).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 0);
+        install_test_handler(&mut cpu, EXCEPTION_PRIVILEGE_VIOLATION, 0x400, 0);
+        cpu.write_u16(0x300, OP_RTI << 11);
+        cpu.write_u16(0x400, OP_RTI << 11);
+        let user_stack = cpu.initial_user_stack_pointer();
+        cpu.enter_user_mode(0x100, user_stack).unwrap();
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x400);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PRIVILEGE_VIOLATION);
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+    }
+
+    #[test]
+    fn idt_installation_is_privileged_and_missing_vectors_stop_with_an_error() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_idt(0x800).unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
+        assert!(matches!(
+            cpu.set_idt_descriptor(
+                1,
+                crate::interrupts::IdtDescriptor {
+                    handler: 0x300,
+                    present: true,
+                    privilege: 0,
+                    gate_type: crate::interrupts::GateType::Interrupt,
+                }
+            ),
+            Err(CpuError::PrivilegeViolation { .. })
+        ));
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.write_u16(0, 0xff1a);
+
+        assert_eq!(
+            cpu.step(),
+            Err(CpuError::UnhandledException {
+                vector: EXCEPTION_ILLEGAL_INSTRUCTION,
+                cause: EXCEPTION_ILLEGAL_INSTRUCTION,
+            })
+        );
+        assert!(!cpu.running);
+    }
+
+    #[test]
+    fn mmu_data_page_fault_records_address_and_enters_supervisor_handler() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        install_test_handler(&mut cpu, EXCEPTION_PAGE_FAULT, 0x300, 0);
+        let directory_flags = crate::mmu::PagePermissions {
+            writable: true,
+            user: true,
+            executable: true,
+        };
+        let directory_entry = crate::mmu::encode_entry(4, directory_flags).unwrap();
+        let code_entry = crate::mmu::encode_entry(5, directory_flags).unwrap();
+        let stack_entry =
+            crate::mmu::encode_entry(6, crate::mmu::PagePermissions::USER_DATA).unwrap();
+        cpu.memory[0x2000..0x2004].copy_from_slice(&directory_entry.to_be_bytes());
+        cpu.memory[0x4000..0x4004].copy_from_slice(&code_entry.to_be_bytes());
+        let stack_table_entry = 0x4000 + (((0xdffff >> 12) & 0x1ff) as usize) * 4;
+        cpu.memory[stack_table_entry..stack_table_entry + 4]
+            .copy_from_slice(&stack_entry.to_be_bytes());
+        cpu.memory[0x5000..0x5002].copy_from_slice(&((OP_LD << 11) | (1 << 5)).to_be_bytes());
+        cpu.memory[0x5300..0x5302].copy_from_slice(&(OP_RTI << 11).to_be_bytes());
+        cpu.enable_mmu(0x2000).unwrap();
+        cpu.sp = 0xf0000;
+        cpu.registers[1] = 0x2000;
+        cpu.enter_user_mode(0, 0xe0000).unwrap();
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(
+            cpu.last_page_fault(),
+            Some(crate::mmu::PageFault {
+                virtual_address: 0x2000,
+                access: crate::mmu::MemoryAccess::Read,
+                reason: crate::mmu::PageFaultReason::NotPresent,
+            })
+        );
+        assert_eq!(cpu.read_u32(PAGE_FAULT_ADDRESS_ADDR), 0x2000);
+        assert_eq!(cpu.read_u16(PAGE_FAULT_INFO_ADDR), 0x0102);
+        assert_eq!(cpu.read_u32(cpu.sp), 0);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0);
+        assert_eq!(cpu.sp, 0xe0000);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
     }
 
     #[test]
@@ -5740,13 +6262,21 @@ mod tests {
     fn dispatches_pending_keyboard_interrupt_after_enabling_interrupts() {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
         cpu.write_u16(0, OP_EI << 11);
-        cpu.write_u32_for_test(KEY_VECTOR_ADDR, 0x20);
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD),
+            0x20,
+            0,
+        );
         cpu.write(ICR_ADDR, 2);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x20);
         assert_eq!(cpu.read_u32(cpu.sp), 2);
         assert_eq!(cpu.read_u16(cpu.sp + 6), 2);
-        assert_eq!(cpu.read_u16(cpu.sp + 12), 2);
+        assert_eq!(
+            cpu.read_u16(cpu.sp + 12),
+            u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD)
+        );
         assert_eq!(cpu.read_u16(cpu.sp + 14), 1);
         assert_eq!(cpu.read(ICR_ADDR), 0);
     }
@@ -5756,8 +6286,18 @@ mod tests {
         for pending in [2u8, 8, 10] {
             let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
             cpu.write_u16(0, OP_EI << 11);
-            cpu.write_u32_for_test(KEY_VECTOR_ADDR, 0x300);
-            cpu.write_u32_for_test(RTC_VECTOR_ADDR, 0x400);
+            install_test_handler(
+                &mut cpu,
+                u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD),
+                0x300,
+                0,
+            );
+            install_test_handler(
+                &mut cpu,
+                u16::from(crate::interrupts::IDT_VECTOR_RTC),
+                0x400,
+                0,
+            );
             cpu.write_u16(0x300, OP_RTI << 11);
             cpu.write_u16(0x400, OP_RTI << 11);
             cpu.flags = Flags {
@@ -5799,11 +6339,52 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_gate_masks_nested_delivery_until_handler_reenables_interrupts() {
+        let mut cpu = cpu_with_program(&[(OP_EI << 11)]);
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD),
+            0x300,
+            0,
+        );
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_RTC),
+            0x400,
+            0,
+        );
+        cpu.write_u16(0x300, OP_EI << 11);
+        cpu.write_u16(0x400, OP_RTI << 11);
+        cpu.write(ICR_ADDR, 0x0a);
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(cpu.read(ICR_ADDR), 8);
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 0x400);
+        assert_eq!(
+            cpu.read_u16(cpu.sp + 12),
+            u16::from(crate::interrupts::IDT_VECTOR_RTC)
+        );
+    }
+
+    #[test]
     fn instruction_timer_interrupts_at_its_period_and_preserves_other_pending_sources() {
         let mut cpu = cpu_with_program(&[(OP_MOV << 11), (OP_MOV << 11), (OP_MOV << 11)]);
-        cpu.write_u32_for_test(TIMER_VECTOR_ADDR, 0x100);
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_PIT),
+            0x100,
+            0,
+        );
         cpu.write_u16(0x100, OP_RTI << 11);
-        cpu.write_u32_for_test(RTC_VECTOR_ADDR, 0x200);
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_RTC),
+            0x200,
+            0,
+        );
         cpu.write_u16(0x200, OP_RTI << 11);
         cpu.write_u16(TIMER_PERIOD_ADDR, 2);
         cpu.write(ICR_ADDR, 1);
@@ -5821,6 +6402,468 @@ mod tests {
         assert_eq!(cpu.pc, 0x200);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 4);
+    }
+
+    #[test]
+    fn pit_mask_latches_a_deterministic_tick_until_delivery_and_acknowledgement() {
+        let mut cpu = cpu_with_program(&[(OP_MOV << 11), (OP_MOV << 11), (OP_MOV << 11)]);
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_PIT),
+            0x100,
+            0,
+        );
+        cpu.write_u16(0x100, OP_RTI << 11);
+        cpu.write_u16(TIMER_PERIOD_ADDR, 1);
+        cpu.write(PIT_CONTROL_ADDR, 0);
+        cpu.write(ICR_ADDR, 1);
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 2);
+        assert_eq!(cpu.read(ICR_ADDR), 0x11);
+
+        cpu.write(PIT_CONTROL_ADDR, 1);
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(cpu.read(ICR_ADDR) & 0x10, 0);
+        assert_eq!(cpu.read_u32(cpu.sp), 4);
+        assert_eq!(
+            cpu.read_u16(cpu.sp + 12),
+            u16::from(crate::interrupts::IDT_VECTOR_PIT)
+        );
+        cpu.write_u16(TIMER_PERIOD_ADDR, 0);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 4);
+        assert_eq!(cpu.read(ICR_ADDR) & 1, 1);
+    }
+
+    #[test]
+    fn scheduler_switches_complete_user_contexts_on_timer_yield_and_exit() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_u16(0x100, OP_MOV << 11);
+        cpu.write_u16(0x200, OP_MOV << 11);
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_PIT),
+            0x400,
+            0,
+        );
+        let first = cpu.create_user_task(0x100, 0x7000, 0xf000, None).unwrap();
+        let second = cpu.create_user_task(0x200, 0x5000, 0xd000, None).unwrap();
+        cpu.write_u16(TIMER_PERIOD_ADDR, 1);
+        cpu.write(ICR_ADDR, 1);
+        cpu.start_task(first).unwrap();
+        cpu.registers[3] = 0x1234;
+        cpu.flags = Flags {
+            zero: true,
+            carry: false,
+            negative: true,
+            overflow: false,
+        };
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.current_task(), Some(second));
+        assert_eq!(cpu.pc, 0x200);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.sp, 0x5000);
+        cpu.registers[4] = 0x5678;
+        cpu.flags.carry = true;
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.current_task(), Some(first));
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.registers[3], 0x1234);
+        assert!(cpu.flags.zero);
+        assert!(cpu.flags.negative);
+        assert_eq!(cpu.kernel_sp, 0xf000);
+
+        assert!(cpu.yield_current_task().unwrap());
+        assert_eq!(cpu.current_task(), Some(second));
+        assert_eq!(cpu.registers[4], 0x5678);
+        assert!(cpu.flags.carry);
+        assert!(cpu.exit_current_task(7).unwrap());
+        assert_eq!(cpu.current_task(), Some(first));
+        assert_eq!(cpu.task_context(second).unwrap().state, TaskState::Exited);
+        assert_eq!(cpu.task_context(second).unwrap().exit_code, Some(7));
+    }
+
+    #[test]
+    fn timer_preemption_restores_each_tasks_mmu_address_space() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
+        let first_directory = manager.create_address_space(&mut cpu.memory).unwrap();
+        let second_directory = manager.create_address_space(&mut cpu.memory).unwrap();
+        let virtual_entry = 0x1000;
+        let first_code = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                first_directory,
+                virtual_entry,
+                crate::mmu::PagePermissions::USER_CODE,
+            )
+            .unwrap();
+        let second_code = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                second_directory,
+                virtual_entry,
+                crate::mmu::PagePermissions::USER_CODE,
+            )
+            .unwrap();
+        manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                first_directory,
+                0x2000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                second_directory,
+                0x4000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        cpu.memory[first_code as usize * crate::mmu::PAGE_SIZE
+            ..first_code as usize * crate::mmu::PAGE_SIZE + 2]
+            .copy_from_slice(&((OP_LDI << 11) | 0x11).to_be_bytes());
+        cpu.memory[second_code as usize * crate::mmu::PAGE_SIZE
+            ..second_code as usize * crate::mmu::PAGE_SIZE + 2]
+            .copy_from_slice(&((OP_LDI << 11) | 0x22).to_be_bytes());
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_PIT),
+            0x400,
+            0,
+        );
+        let first = cpu
+            .create_user_task(virtual_entry, 0x3000, 0x7000, Some(first_directory))
+            .unwrap();
+        let second = cpu
+            .create_user_task(virtual_entry, 0x5000, 0x9000, Some(second_directory))
+            .unwrap();
+        cpu.write_u16(TIMER_PERIOD_ADDR, 1);
+        cpu.write(ICR_ADDR, 1);
+        cpu.start_task(first).unwrap();
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.current_task(), Some(second));
+        assert_eq!(cpu.page_directory(), second_directory);
+        assert_eq!(cpu.registers[0], 0);
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.current_task(), Some(first));
+        assert_eq!(cpu.page_directory(), first_directory);
+        assert_eq!(cpu.registers[0], 0x11);
+        assert!(cpu.is_mmu_enabled());
+    }
+
+    #[test]
+    fn blocked_task_is_woken_and_restored_when_scheduler_has_no_runnable_task() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_u16(0x100, OP_MOV << 11);
+        let task = cpu.create_user_task(0x100, 0x7000, 0xf000, None).unwrap();
+        cpu.start_task(task).unwrap();
+
+        assert!(!cpu.block_current_task().unwrap());
+        assert!(!cpu.running);
+        assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Blocked);
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.wake_task(task).unwrap();
+        assert!(cpu.running);
+        assert_eq!(cpu.current_task(), Some(task));
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+    }
+
+    #[test]
+    fn mmu_executes_and_stacks_through_high_virtual_addresses() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
+        let directory = manager.create_address_space(&mut cpu.memory).unwrap();
+        let code_address = 0x2004_3000;
+        let stack_pointer = 0x3000_2000;
+        let code_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                code_address,
+                crate::mmu::PagePermissions::USER_CODE,
+            )
+            .unwrap();
+        let stack_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                stack_pointer - crate::mmu::PAGE_SIZE as u32,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        let handler_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x4000,
+                crate::mmu::PagePermissions::KERNEL_CODE,
+            )
+            .unwrap();
+        cpu.memory[code_frame as usize * crate::mmu::PAGE_SIZE
+            ..code_frame as usize * crate::mmu::PAGE_SIZE + 4]
+            .copy_from_slice(
+                &[
+                    (OP_PUSH << 11).to_be_bytes(),
+                    crate::isa::SVC_VECTOR.to_be_bytes(),
+                ]
+                .concat(),
+            );
+        cpu.memory[handler_frame as usize * crate::mmu::PAGE_SIZE
+            ..handler_frame as usize * crate::mmu::PAGE_SIZE + 2]
+            .copy_from_slice(&(OP_RTI << 11).to_be_bytes());
+        cpu.enable_mmu(directory).unwrap();
+        cpu.load_idt(0x800).unwrap();
+        cpu.set_idt_descriptor(
+            crate::isa::SVC_VECTOR,
+            crate::interrupts::IdtDescriptor {
+                handler: 0x4000,
+                present: true,
+                privilege: 3,
+                gate_type: crate::interrupts::GateType::Trap,
+            },
+        )
+        .unwrap();
+        cpu.registers[0] = 0x1234;
+        cpu.enter_user_mode(code_address, stack_pointer).unwrap();
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, code_address + 2);
+        assert_eq!(cpu.sp, stack_pointer - 2);
+        let stack_offset = stack_frame as usize * crate::mmu::PAGE_SIZE + crate::mmu::PAGE_SIZE - 2;
+        assert_eq!(
+            u16::from_be_bytes([cpu.memory[stack_offset], cpu.memory[stack_offset + 1]]),
+            0x1234
+        );
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x4000);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.read_u32(cpu.sp), code_address + 4);
+        assert_eq!(cpu.read_u32(cpu.sp + 8), stack_pointer - 2);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, code_address + 4);
+        assert_eq!(cpu.sp, stack_pointer - 2);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+    }
+
+    #[test]
+    fn mmu_user_gpu_commands_cannot_bypass_guest_buffer_permissions() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
+        let directory = manager.create_address_space(&mut cpu.memory).unwrap();
+        manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x1000,
+                crate::mmu::PagePermissions::USER_CODE,
+            )
+            .unwrap();
+        manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x2000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        cpu.memory[0x9000..0x9002].copy_from_slice(&0u16.to_be_bytes());
+        cpu.enable_mmu(directory).unwrap();
+        cpu.enter_user_mode(0x1000, 0x3000).unwrap();
+        cpu.memory[(GPU_BASE + 1) as usize] = 0;
+        cpu.memory[(GPU_BASE + 6) as usize] = 0;
+        cpu.memory[(GPU_BASE + 7) as usize] = 1;
+        cpu.memory[(GPU_BASE + 8) as usize] = 0;
+        cpu.memory[(GPU_BASE + 9) as usize] = 1;
+        cpu.memory[(GPU_BASE + 10) as usize] = 0x40;
+        cpu.memory[(GPU_BASE + 11) as usize] = 0;
+        cpu.memory[(GPU_BASE + 12) as usize] = 0;
+        cpu.memory[(GPU_BASE + 13) as usize] = 0;
+
+        cpu.write(GPU_BASE, GPU_SPRITE_UPLOAD);
+
+        assert!(cpu.sprites[0].is_none());
+        assert_eq!(cpu.read_u16(GPU_BASE + 14), 1);
+    }
+
+    #[test]
+    fn mmu_user_instruction_cannot_reach_mapped_protected_interrupt_registers() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
+        let directory = manager.create_address_space(&mut cpu.memory).unwrap();
+        let code_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x1000,
+                crate::mmu::PagePermissions::USER_CODE,
+            )
+            .unwrap();
+        manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x2000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        let handler_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x4000,
+                crate::mmu::PagePermissions::KERNEL_CODE,
+            )
+            .unwrap();
+        manager
+            .map_borrowed_page(
+                &mut cpu.memory,
+                directory,
+                0x43000,
+                0x43,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        cpu.memory[code_frame as usize * crate::mmu::PAGE_SIZE
+            ..code_frame as usize * crate::mmu::PAGE_SIZE + 2]
+            .copy_from_slice(&((OP_ST << 11) | (1 << 5)).to_be_bytes());
+        cpu.memory[handler_frame as usize * crate::mmu::PAGE_SIZE
+            ..handler_frame as usize * crate::mmu::PAGE_SIZE + 2]
+            .copy_from_slice(&(OP_RTI << 11).to_be_bytes());
+        cpu.enable_mmu(directory).unwrap();
+        cpu.load_idt(0x800).unwrap();
+        cpu.set_idt_descriptor(
+            EXCEPTION_PRIVILEGE_VIOLATION,
+            crate::interrupts::IdtDescriptor {
+                handler: 0x4000,
+                present: true,
+                privilege: 0,
+                gate_type: crate::interrupts::GateType::Interrupt,
+            },
+        )
+        .unwrap();
+        cpu.registers[0] = 0;
+        cpu.registers[1] = i64::from(ICR_ADDR);
+        cpu.write(ICR_ADDR, 9);
+        cpu.enter_user_mode(0x1000, 0x3000).unwrap();
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.memory[ICR_ADDR as usize], 8);
+        assert_eq!(cpu.pc, 0x4000);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PRIVILEGE_VIOLATION);
+    }
+
+    #[test]
+    fn mmu_user_filesystem_service_validates_noncontiguous_guest_buffers() {
+        let disk_path = folder_disk_for_test("mmu-guest-buffer", false);
+        let root = disk_path.parent().unwrap().to_path_buf();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.mount_folder_disk(&disk_path).unwrap();
+        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
+        let directory = manager.create_address_space(&mut cpu.memory).unwrap();
+        let path_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x1000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        let first_output_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x3000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        let second_output_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x4000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        let code_frame = manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x5000,
+                crate::mmu::PagePermissions::USER_CODE,
+            )
+            .unwrap();
+        manager
+            .allocate_and_map_page(
+                &mut cpu.memory,
+                directory,
+                0x7000,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        manager
+            .map_borrowed_page(
+                &mut cpu.memory,
+                directory,
+                0x43000,
+                0x43,
+                crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        let path_start = path_frame as usize * crate::mmu::PAGE_SIZE;
+        cpu.memory[path_start..path_start + 9].copy_from_slice(b"main.bin\0");
+        let instruction = (OP_ST << 11) | (1 << 5);
+        let code_start = code_frame as usize * crate::mmu::PAGE_SIZE;
+        cpu.memory[code_start..code_start + 2].copy_from_slice(&instruction.to_be_bytes());
+        cpu.memory[DISK_BASE as usize + 22..DISK_BASE as usize + 26]
+            .copy_from_slice(&0x1000u32.to_be_bytes());
+        cpu.memory[DISK_BASE as usize + 26..DISK_BASE as usize + 30]
+            .copy_from_slice(&0x3fffu32.to_be_bytes());
+        cpu.memory[DISK_BASE as usize + 30..DISK_BASE as usize + 32]
+            .copy_from_slice(&3u16.to_be_bytes());
+        cpu.enable_mmu(directory).unwrap();
+        cpu.registers[0] = i64::from(FOLDER_FS_READ);
+        cpu.registers[1] = i64::from(DISK_BASE);
+        cpu.enter_user_mode(0x5000, 0x8000).unwrap();
+
+        cpu.step().unwrap();
+
+        let first_output_start = first_output_frame as usize * crate::mmu::PAGE_SIZE;
+        let second_output_start = second_output_frame as usize * crate::mmu::PAGE_SIZE;
+        assert_eq!(
+            cpu.memory[first_output_start + crate::mmu::PAGE_SIZE - 1],
+            1
+        );
+        assert_eq!(cpu.memory[second_output_start], 2);
+        assert_eq!(cpu.memory[second_output_start + 1], 3);
+        assert_eq!(cpu.memory[DISK_BASE as usize + 16], 0);
+
+        cpu.memory[DISK_BASE as usize + 26..DISK_BASE as usize + 30]
+            .copy_from_slice(&0x6000u32.to_be_bytes());
+        cpu.write(DISK_BASE, FOLDER_FS_READ);
+        assert_eq!(cpu.memory[DISK_BASE as usize + 16], 1);
+        assert_eq!(cpu.memory[0x6000], 0);
+        drop(cpu);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5890,13 +6933,5 @@ mod tests {
                 length: 2
             })
         );
-    }
-
-    impl Cpu {
-        fn write_u32_for_test(&mut self, address: u32, value: u32) {
-            for offset in 0..4 {
-                self.write(address + offset, (value >> (24 - offset * 8)) as u8);
-            }
-        }
     }
 }

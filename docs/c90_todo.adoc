@@ -449,8 +449,10 @@ required before claiming full C90 compatibility.
     required shared +bios.bin+ startup, folder-disk boot selection, and a
     bounded USER-mode folder-filesystem register service. The service is not
     the finalized general syscall ABI and does not provide file-backed C
-    streams; the remaining boot, disk-migration, and hosted-runtime work is
-    tracked in link:sc16_improvements.adoc[+sc16_improvements.adoc+].
+    streams. When MMU translation is enabled, the service validates guest
+    buffers through their mappings; normal BIOS USER boot still leaves
+    translation disabled. General syscalls and hosted-runtime behavior remain
+    open in link:sc16_improvements.adoc[+sc16_improvements.adoc+].
 ** Audit all required headers: +assert.h+, +ctype.h+, +errno.h+, +float.h+,
     +limits.h+, +locale.h+, +math.h+, +setjmp.h+, +signal.h+, +stdarg.h+,
     +stddef.h+, +stdio.h+, +stdlib.h+, +string.h+, and +time.h+.
@@ -465,7 +467,7 @@ required before claiming full C90 compatibility.
     capability policy, buffering, EOF/error indicators, environment and
     command behavior, and process termination/status.
 ** Base file operations and process behavior on the folder-backed disk and
-    filesystem service and syscall ABI specified in
+    filesystem service and future syscall ABI tracked in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+]; keep the standard C
     interface distinct from SC-16-specific services.
 ** Surface unavailable resources and errors through documented C interfaces.

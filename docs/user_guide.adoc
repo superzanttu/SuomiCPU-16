@@ -8,9 +8,12 @@ files use the +.asm+ extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
 
 The emulator loads the required guest-resident +bios.bin+ before launching a
-program. The BIOS presents a text-mode selector in the main window using
-bright green fixed-width characters on black, enlarged pixels, and no glow or
-post-processing. It discovers folder disks under +disks/+ and loads a prebuilt
+program. The emulator always counts +bios.bin+ as trusted firmware and runs
+it in supervisor mode. This is a trust-policy assumption, not a signature
+check or secure-boot guarantee. The BIOS presents a text-mode selector in the
+main window using bright green fixed-width characters on black, enlarged
+pixels, and no glow or post-processing. It discovers folder disks under
++disks/+ and loads a prebuilt
 boot image after validating the selected disk's +disk.json+. Exactly one of
 +kernel.bin+ (KERNEL mode) or +main.bin+ (USER mode) must exist; both or
 neither reports +NOT_BOOT+. Metadata cannot override the executable or mode.
@@ -56,8 +59,10 @@ Offline images use the version 2 +SC16IMG2+ container, with fixed load
 addresses, an executable entry point, and explicit segment alignment and
 permissions. +sc16asm+ and +sc16build+ emit this format; the loader rejects
 older +SC16IMG1+ files. Generated images currently mark segments readable,
-writable, and executable because code and mutable data may share a segment;
-the permissions are not enforced until MMU support is implemented.
+writable, and executable because code and mutable data may share a segment.
+The MMU enforces mapped permissions when translation is enabled, but the
+normal BIOS USER boot path does not yet enable translation and is not an
+isolation boundary.
 The game fills the emulator's main window after BIOS startup. The optional
 80×25 *Bug Monitor* runs in a separate window and displays emulator logs and
 guest serial output. Its *RESET* button returns to BIOS disk selection;

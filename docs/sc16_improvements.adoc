@@ -321,7 +321,9 @@ Checklist status: [x] completed; [ ] planned.
   kernel-mode entry point. BIOS must not compile or assemble guest programs.
 ** [x] Require +bios.bin+ at the emulator root, load its executable image at
    address zero, execute its entry point on startup and cold reset, and show
-   missing or invalid firmware in the BIOS startup UI.
+   missing or invalid firmware in the BIOS startup UI. The emulator always
+   counts this common image as trusted supervisor firmware by policy; it does
+   not authenticate the image or claim secure boot.
 ** [x] Replace the current firmware handoff stub and host-side selector with
    the finalized guest BIOS boot flow.
 * [x] Implement BIOS disk discovery and text-mode disk selection. After
@@ -524,6 +526,8 @@ Checklist status: [x] completed; [ ] planned.
   and syscall ABI.
 * [ ] Create helpper tools and scripts needed to compile bios and package it into a disk image.
 * [ ] Create helpper tools and script need to to test and compile programs, including disk upadtes
+* [ ] Update neworking so that SuomiCPU-emulators discovers each other and can communicate over the network. Target is build private network (SC-NET) between running SC-16 instances. Programs runing in SC-16 can then use SC-NET to communicate. SC-NET is completelly invisible for programs. SC-16 have functions to discover and communicate. Each SC-16 uses unique name to identify itself. User can set own name in BIOS, so it's needed to have way to store BIOS settings. SC-16 check name at every boot for collisions, and prevents to boot if there is same name in use.
+* [ ] Make sure that SC-NET is compatible with next phases.
 
 === Phase 9 — Verify a protected multitasking OS
 

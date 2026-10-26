@@ -30,6 +30,7 @@ pub const OP_STWS: u16 = 0x1c;
 pub const OP_ADJSP: u16 = 0x1d;
 pub const OP_BC: u16 = 0x1e;
 pub const OP_SHR: u16 = 0x1f;
+pub const SVC_VECTOR: u16 = 0x80;
 pub const OP_MOVSP: u16 = OP_SHR;
 pub const OP_FADD: u16 = OP_SHR;
 pub const OP_FSUB: u16 = OP_SHR;
@@ -195,6 +196,7 @@ pub const BRANCH_CONDITIONS: &[(&str, u16)] = &[
 
 pub const BASE_OPCODES: &[(&str, u16)] = &[
     ("HALT", OP_HALT),
+    ("SVC", OP_HALT),
     ("LDI", OP_LDI),
     ("LDA", OP_LDI),
     ("LD", OP_LD),
