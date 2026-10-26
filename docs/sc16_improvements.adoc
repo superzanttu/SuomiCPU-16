@@ -522,6 +522,8 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Update user and architecture documentation, including disk creation,
   offline compilation, boot troubleshooting, privilege modes, interrupts, MMU,
   and syscall ABI.
+* [ ] Create helpper tools and scripts needed to compile bios and package it into a disk image.
+* [ ] Create helpper tools and script need to to test and compile programs, including disk upadtes
 
 === Phase 9 — Verify a protected multitasking OS
 
