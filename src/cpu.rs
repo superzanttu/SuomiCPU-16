@@ -16,6 +16,11 @@ pub const VSYNC_ADDR: usize = 0x43013;
 const KEY_VECTOR_ADDR: u32 = 0x0002;
 const RTC_VECTOR_ADDR: u32 = 0x0006;
 const TIMER_VECTOR_ADDR: u32 = 0x000a;
+const EXCEPTION_ILLEGAL_INSTRUCTION: u16 = 0;
+const EXCEPTION_PRIVILEGE_VIOLATION: u16 = 1;
+const EXCEPTION_PAGE_FAULT: u16 = 2;
+const EXCEPTION_VECTOR_COUNT: usize = 16;
+const EXCEPTION_ENTRY_BYTES: u32 = 16;
 const KEYBOARD_ADDR: u32 = 0x43000;
 const KEYS_ADDR: u32 = 0x43004;
 const MOUSE_ADDR: u32 = 0x43008;
@@ -30,6 +35,9 @@ const GPU_LAYER_COUNT: usize = 5;
 const GPU_PALETTE: u8 = 27;
 const RTC_START: u32 = 0x43010;
 pub const TIMER_PERIOD_ADDR: u32 = 0x43014;
+const MMU_PIT_CONTROL_ADDR: u32 = 0x43016;
+const PAGE_FAULT_ADDRESS_ADDR: u32 = 0x43018;
+const PAGE_FAULT_INFO_ADDR: u32 = 0x4301c;
 const DISK_BASE: u32 = 0x43100;
 const DISK_STATUS: u32 = DISK_BASE + 16;
 const BIOS_BASE: u32 = 0x43400;
@@ -263,8 +271,14 @@ pub enum CpuError {
     MemoryMap(String),
     SegmentOutOfBounds { address: u32, length: usize },
     InvalidEntryPoint(u32),
+    InvalidUserStack(u32),
+    InvalidExceptionVector(u16),
     InvalidRegisterPair(u16),
     UnsupportedInstruction(u16),
+    PageFault(crate::mmu::PageFault),
+    PrivilegeViolation { pc: u32, operation: &'static str },
+    UnhandledException { vector: u16, cause: u16 },
+    DoubleFault,
 }
 
 impl std::fmt::Display for CpuError {
@@ -283,12 +297,36 @@ impl std::fmt::Display for CpuError {
             Self::InvalidEntryPoint(address) => {
                 write!(f, "entry point {address:#x} is outside memory")
             }
+            Self::InvalidUserStack(address) => {
+                write!(
+                    f,
+                    "user stack pointer {address:#x} is invalid or overlaps the kernel stack"
+                )
+            }
+            Self::InvalidExceptionVector(vector) => {
+                write!(
+                    f,
+                    "exception vector {vector} is outside the supported range"
+                )
+            }
             Self::InvalidRegisterPair(instruction) => {
                 write!(f, "invalid register pair in instruction {instruction:#06x}")
             }
             Self::UnsupportedInstruction(instruction) => {
                 write!(f, "unsupported instruction {instruction:#06x}")
             }
+            Self::PageFault(fault) => write!(
+                f,
+                "page fault {:?} at {:#x} during {:?}",
+                fault.reason, fault.virtual_address, fault.access
+            ),
+            Self::PrivilegeViolation { pc, operation } => {
+                write!(f, "user-mode {operation} at {pc:#x} is privileged")
+            }
+            Self::UnhandledException { vector, cause } => {
+                write!(f, "unhandled exception {cause} at vector {vector}")
+            }
+            Self::DoubleFault => f.write_str("CPU stopped after a double fault"),
         }
     }
 }
@@ -339,6 +377,10 @@ pub struct Cpu {
     layer_mode: u8,
     timer_period: u16,
     timer_countdown: u16,
+    exception_handlers: [Option<u32>; EXCEPTION_VECTOR_COUNT],
+    mmu_enabled: bool,
+    page_directory: u32,
+    last_page_fault: Option<crate::mmu::PageFault>,
 }
 
 impl Cpu {
@@ -452,6 +494,10 @@ impl Cpu {
             layer_mode: 0,
             timer_period: 0,
             timer_countdown: 0,
+            exception_handlers: [None; EXCEPTION_VECTOR_COUNT],
+            mmu_enabled: false,
+            page_directory: 0,
+            last_page_fault: None,
         })
     }
 
@@ -590,10 +636,14 @@ impl Cpu {
             .map_err(|error| format!("cannot load selected firmware disk: {error}"))?;
         self.booted_disk_path = Some(path.clone());
         self.folder_disk = Some(disk);
-        self.privilege_mode = match boot.mode {
-            FolderBootMode::Kernel => PrivilegeMode::Supervisor,
-            FolderBootMode::User => PrivilegeMode::User,
-        };
+        match boot.mode {
+            FolderBootMode::Kernel => self.privilege_mode = PrivilegeMode::Supervisor,
+            FolderBootMode::User => {
+                let user_stack = self.initial_user_stack_pointer();
+                self.enter_user_mode(self.pc, user_stack)
+                    .map_err(|error| format!("cannot enter user mode: {error}"))?;
+            }
+        }
         self.guest_text.clear(0);
         self.guest_text.enabled = false;
         let mode = match boot.mode {
@@ -654,11 +704,142 @@ impl Cpu {
         self.kernel_sp = self.memory_mask;
         self.loaded_image_segments.clear();
         self.privilege_mode = PrivilegeMode::Supervisor;
+        self.mmu_enabled = false;
+        self.page_directory = 0;
+        self.last_page_fault = None;
         self.running = true;
         self.booted_disk_path = None;
         if let Some(interrupt_control) = self.memory.get_mut(ICR_ADDR as usize) {
             *interrupt_control = 0;
         }
+    }
+
+    pub fn initial_user_stack_pointer(&self) -> u32 {
+        self.memory_mask
+            .saturating_sub((self.memory.len() / 4).min(0x1_0000) as u32)
+    }
+
+    pub fn enter_user_mode(&mut self, user_pc: u32, user_sp: u32) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "enter user mode",
+            });
+        }
+        if user_pc as usize >= self.memory.len() {
+            return Err(CpuError::InvalidEntryPoint(user_pc));
+        }
+        if user_sp as usize >= self.memory.len() || user_sp > self.kernel_sp.saturating_sub(0x1000)
+        {
+            return Err(CpuError::InvalidUserStack(user_sp));
+        }
+        if !self.loaded_image_segments.is_empty()
+            && !self.loaded_image_segments.iter().any(|segment| {
+                segment.permissions.execute
+                    && user_pc >= segment.address
+                    && ((user_pc - segment.address) as usize) < segment.length
+            })
+        {
+            return Err(CpuError::InvalidEntryPoint(user_pc));
+        }
+        self.kernel_sp = self.sp;
+        self.sp = user_sp;
+        self.pc = user_pc;
+        self.privilege_mode = PrivilegeMode::User;
+        Ok(())
+    }
+
+    pub fn set_exception_handler(
+        &mut self,
+        vector: u16,
+        handler: Option<u32>,
+    ) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "set exception handler",
+            });
+        }
+        let Some(slot) = self.exception_handlers.get_mut(usize::from(vector)) else {
+            return Err(CpuError::InvalidExceptionVector(vector));
+        };
+        if let Some(address) = handler {
+            if address as usize >= self.memory.len() {
+                return Err(CpuError::InvalidEntryPoint(address));
+            }
+        }
+        *slot = handler;
+        Ok(())
+    }
+
+    pub fn enable_mmu(&mut self, page_directory: u32) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "enable MMU",
+            });
+        }
+        let end = page_directory
+            .checked_add(crate::mmu::PAGE_TABLE_BYTES as u32)
+            .ok_or(CpuError::SegmentOutOfBounds {
+                address: page_directory,
+                length: crate::mmu::PAGE_TABLE_BYTES,
+            })?;
+        if page_directory & 0x7ff != 0 || end as usize > self.memory.len() {
+            return Err(CpuError::SegmentOutOfBounds {
+                address: page_directory,
+                length: crate::mmu::PAGE_TABLE_BYTES,
+            });
+        }
+        self.page_directory = page_directory;
+        self.mmu_enabled = true;
+        Ok(())
+    }
+
+    pub fn switch_address_space(&mut self, page_directory: u32) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "switch address space",
+            });
+        }
+        let end = page_directory
+            .checked_add(crate::mmu::PAGE_TABLE_BYTES as u32)
+            .ok_or(CpuError::SegmentOutOfBounds {
+                address: page_directory,
+                length: crate::mmu::PAGE_TABLE_BYTES,
+            })?;
+        if page_directory & 0x7ff != 0 || end as usize > self.memory.len() {
+            return Err(CpuError::SegmentOutOfBounds {
+                address: page_directory,
+                length: crate::mmu::PAGE_TABLE_BYTES,
+            });
+        }
+        self.page_directory = page_directory;
+        Ok(())
+    }
+
+    pub fn disable_mmu(&mut self) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: "disable MMU",
+            });
+        }
+        self.mmu_enabled = false;
+        Ok(())
+    }
+
+    pub fn is_mmu_enabled(&self) -> bool {
+        self.mmu_enabled
+    }
+
+    pub fn page_directory(&self) -> u32 {
+        self.page_directory
+    }
+
+    pub fn last_page_fault(&self) -> Option<crate::mmu::PageFault> {
+        self.last_page_fault
     }
 
     pub fn read(&mut self, address: u32) -> u8 {
@@ -1113,6 +1294,174 @@ impl Cpu {
         }
     }
 
+    fn wrapped_range_contains(&self, address: u32, base: u32, length: u32) -> bool {
+        let address = address & self.memory_mask;
+        let start = base & self.memory_mask;
+        let end = base.wrapping_add(length - 1) & self.memory_mask;
+        if start <= end {
+            (start..=end).contains(&address)
+        } else {
+            address >= start || address <= end
+        }
+    }
+
+    fn check_guest_access(
+        &self,
+        address: u32,
+        access: crate::mmu::MemoryAccess,
+    ) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::User
+            || !self.wrapped_range_contains(address, MMIO_START, MMIO_END - MMIO_START)
+        {
+            return Ok(());
+        }
+        let write = access == crate::mmu::MemoryAccess::Write;
+        let user_service = access != crate::mmu::MemoryAccess::Fetch
+            && (self.wrapped_range_contains(address, DISK_BASE, 0x40)
+                || self.wrapped_range_contains(address, GPU_BASE, 0x80)
+                || self.wrapped_range_contains(address, CONSOLE_DATA, 3)
+                || self.wrapped_range_contains(address, GUEST_TEXT_BASE, 6)
+                || (!write
+                    && (self.wrapped_range_contains(address, KEYBOARD_ADDR, 1)
+                        || self.wrapped_range_contains(address, KEYS_ADDR, 3)
+                        || self.wrapped_range_contains(address, MOUSE_ADDR, 8)
+                        || self.wrapped_range_contains(address, RTC_START, 4))));
+        if user_service {
+            Ok(())
+        } else {
+            Err(CpuError::PrivilegeViolation {
+                pc: self.pc,
+                operation: match access {
+                    crate::mmu::MemoryAccess::Fetch => "MMIO instruction fetch",
+                    crate::mmu::MemoryAccess::Read => "MMIO read",
+                    crate::mmu::MemoryAccess::Write => "MMIO write",
+                },
+            })
+        }
+    }
+
+    fn resolve_guest_range(
+        &self,
+        address: u32,
+        length: u32,
+        access: crate::mmu::MemoryAccess,
+    ) -> Result<Vec<u32>, CpuError> {
+        let mut physical_addresses = Vec::with_capacity(length as usize);
+        for offset in 0..length {
+            let virtual_address = if self.mmu_enabled {
+                let virtual_address = address
+                    .checked_add(offset)
+                    .filter(|value| *value < crate::mmu::ADDRESS_SPACE_SIZE)
+                    .ok_or_else(|| {
+                        CpuError::PageFault(crate::mmu::PageFault {
+                            virtual_address: address.saturating_add(offset),
+                            access,
+                            reason: crate::mmu::PageFaultReason::AddressOutOfRange,
+                        })
+                    })?;
+                virtual_address
+            } else {
+                address.wrapping_add(offset) & self.memory_mask
+            };
+            self.check_guest_access(virtual_address, access)?;
+            let physical_address = if self.mmu_enabled {
+                crate::mmu::translate(
+                    &self.memory,
+                    self.page_directory,
+                    virtual_address,
+                    access,
+                    self.privilege_mode == PrivilegeMode::User,
+                )
+                .map_err(CpuError::PageFault)?
+            } else {
+                virtual_address & self.memory_mask
+            };
+            self.check_guest_access(physical_address, access)?;
+            physical_addresses.push(physical_address);
+        }
+        Ok(physical_addresses)
+    }
+
+    fn read_guest(&mut self, address: u32) -> Result<u8, CpuError> {
+        let physical = self.resolve_guest_range(address, 1, crate::mmu::MemoryAccess::Read)?[0];
+        Ok(self.read(physical))
+    }
+
+    fn read_guest_u16(&mut self, address: u32) -> Result<u16, CpuError> {
+        let physical =
+            self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Read)?;
+        Ok(u16::from_be_bytes([
+            self.read(physical[0]),
+            self.read(physical[1]),
+        ]))
+    }
+
+    fn read_guest_u32(&mut self, address: u32) -> Result<u32, CpuError> {
+        let physical =
+            self.resolve_guest_range(address, 4, crate::mmu::MemoryAccess::Read)?;
+        Ok(u32::from_be_bytes([
+            self.read(physical[0]),
+            self.read(physical[1]),
+            self.read(physical[2]),
+            self.read(physical[3]),
+        ]))
+    }
+
+    fn fetch_guest_u16(&mut self, address: u32) -> Result<u16, CpuError> {
+        let physical =
+            self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Fetch)?;
+        Ok(u16::from_be_bytes([
+            self.read(physical[0]),
+            self.read(physical[1]),
+        ]))
+    }
+
+    fn write_guest(&mut self, address: u32, value: u8) -> Result<(), CpuError> {
+        let physical = self.resolve_guest_range(address, 1, crate::mmu::MemoryAccess::Write)?[0];
+        self.write(physical, value);
+        Ok(())
+    }
+
+    fn write_guest_u16(&mut self, address: u32, value: u16) -> Result<(), CpuError> {
+        let physical =
+            self.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Write)?;
+        self.write(physical[0], (value >> 8) as u8);
+        self.write(physical[1], value as u8);
+        Ok(())
+    }
+
+    fn write_guest_u32(&mut self, address: u32, value: u32) -> Result<(), CpuError> {
+        let physical =
+            self.resolve_guest_range(address, 4, crate::mmu::MemoryAccess::Write)?;
+        for (offset, physical_address) in physical.into_iter().enumerate() {
+            self.write(
+                physical_address,
+                (value >> (24 - offset * 8)) as u8,
+            );
+        }
+        Ok(())
+    }
+
+    fn record_page_fault(&mut self, fault: crate::mmu::PageFault) {
+        let reason = match fault.reason {
+            crate::mmu::PageFaultReason::AddressOutOfRange => 1,
+            crate::mmu::PageFaultReason::NotPresent => 2,
+            crate::mmu::PageFaultReason::ReadOnly => 3,
+            crate::mmu::PageFaultReason::SupervisorOnly => 4,
+            crate::mmu::PageFaultReason::NotExecutable => 5,
+            crate::mmu::PageFaultReason::MalformedEntry => 6,
+            crate::mmu::PageFaultReason::PhysicalOutOfRange => 7,
+        };
+        let access = match fault.access {
+            crate::mmu::MemoryAccess::Fetch => 0,
+            crate::mmu::MemoryAccess::Read => 1,
+            crate::mmu::MemoryAccess::Write => 2,
+        };
+        self.last_page_fault = Some(fault);
+        self.write_u32(PAGE_FAULT_ADDRESS_ADDR, fault.virtual_address);
+        self.write_u16(PAGE_FAULT_INFO_ADDR, (access << 8) | reason);
+    }
+
     fn read_u64_registers(&self, register: usize) -> u64 {
         (0..4).fold(0, |value, offset| {
             (value << 16) | u64::from(self.registers[register + offset] as u16)
@@ -1247,46 +1596,45 @@ impl Cpu {
         self.write_integer_register(destination, integer_width, converted);
     }
 
-    fn execute_muldiv(&mut self, destination: usize) {
-        let control = self.read_u16(self.pc);
+    fn execute_muldiv(&mut self, destination: usize) -> Result<(), CpuError> {
+        let control = self.fetch_guest_u16(self.pc)?;
         self.pc = self.pc.wrapping_add(2) & self.memory_mask;
         let operation = control >> 12;
         let source = (control & 7) as usize;
         if operation == 7 {
-            let high = self.read_u16(self.pc) & 0x3fff;
-            let low = self.read_u16(self.pc.wrapping_add(2));
+            let high = self.fetch_guest_u16(self.pc)? & 0x3fff;
+            let low = self.fetch_guest_u16(self.pc.wrapping_add(2))?;
             self.registers[destination] = i64::from((u32::from(high) << 16) | u32::from(low));
             self.pc = self.pc.wrapping_add(4) & self.memory_mask;
-            return;
+            return Ok(());
         }
         if operation == 8 {
             let address = self.registers[source] as u32 & self.memory_mask;
-            let high = self.read_u16(address) & 0x3fff;
-            let low = self.read_u16(address.wrapping_add(2));
+            let high = self.read_guest_u16(address)? & 0x3fff;
+            let low = self.read_guest_u16(address.wrapping_add(2))?;
             self.registers[destination] = i64::from((u32::from(high) << 16) | u32::from(low));
-            return;
+            return Ok(());
         }
         if operation == 9 {
             let address = self.registers[source] as u32 & self.memory_mask;
             let value = self.registers[destination] as u32 & ADDRESS_MASK;
-            self.write_u16(address, (value >> 16) as u16);
-            self.write_u16(address.wrapping_add(2), value as u16);
-            return;
+            self.write_guest_u32(address, value)?;
+            return Ok(());
         }
         if operation == 10 {
             let value = self.registers[destination] as u32 & ADDRESS_MASK;
             self.registers[destination] = i64::from(value >> 16);
             self.registers[source] = i64::from(value & 0xffff);
-            return;
+            return Ok(());
         }
         if operation == 11 {
             self.registers[destination] = (((self.registers[destination] as u32 & 0x3fff) << 16)
                 | (self.registers[source] as u16 as u32))
                 as i64;
-            return;
+            return Ok(());
         }
         let right = if control & 0x0800 != 0 {
-            let value = self.read_u16(self.pc);
+            let value = self.fetch_guest_u16(self.pc)?;
             self.pc = self.pc.wrapping_add(2) & self.memory_mask;
             value
         } else {
@@ -1316,15 +1664,16 @@ impl Cpu {
                     0
                 }
             }
-            _ => return,
+            _ => return Ok(()),
         };
         self.registers[destination] = i64::from(result);
         self.flags.zero = result == 0;
         self.flags.carry = carry;
+        Ok(())
     }
 
     fn execute_wide(&mut self, instruction: u16, destination: usize) -> Result<(), CpuError> {
-        let control = self.read_u16(self.pc);
+        let control = self.fetch_guest_u16(self.pc)?;
         self.pc = self.pc.wrapping_add(2) & self.memory_mask;
         let operation = control >> 12;
         let immediate = control & 0x0800 != 0;
@@ -1349,10 +1698,10 @@ impl Cpu {
         if operation == 11 || operation == 12 {
             let address = self.register_pair_u32(source) & self.memory_mask;
             if operation == 11 {
-                let value = self.read_u32(address);
+                let value = self.read_guest_u32(address)?;
                 self.set_pair(destination, value);
             } else {
-                self.write_u32(address, left);
+                self.write_guest_u32(address, left)?;
             }
             return Ok(());
         }
@@ -1499,7 +1848,13 @@ impl Cpu {
         self.flags.overflow = overflow;
     }
 
-    fn execute_misc(&mut self, destination: usize, value: u16, selector: u16, control: u16) {
+    fn execute_misc(
+        &mut self,
+        destination: usize,
+        value: u16,
+        selector: u16,
+        control: u16,
+    ) -> Result<(), CpuError> {
         match selector {
             0 => self.registers[destination] = i64::from(value.rotate_left(8)),
             1 => {
@@ -1509,12 +1864,12 @@ impl Cpu {
             }
             2 => self.pc = u32::from(value) & self.memory_mask,
             3 => {
-                self.push_u32(self.pc);
+                self.push_u32(self.pc)?;
                 self.pc = u32::from(value) & self.memory_mask;
             }
-            4 => self.push_u16(self.pack_flags()),
+            4 => self.push_u16(self.pack_flags())?,
             5 => {
-                let flags = self.pop_u16();
+                let flags = self.pop_u16()?;
                 self.restore_flags(flags);
             }
             6 => self.flags.carry = true,
@@ -1530,7 +1885,7 @@ impl Cpu {
                 let target =
                     ((self.registers[high_register] as u32 & 0x3fff) << 16) | u32::from(value);
                 if selector == 11 {
-                    self.push_u32(self.pc);
+                    self.push_u32(self.pc)?;
                 }
                 self.pc = target & self.memory_mask;
             }
@@ -1539,16 +1894,17 @@ impl Cpu {
             }
             _ => {}
         }
+        Ok(())
     }
 
-    fn execute_alu(&mut self, destination: usize) {
-        let control = self.read_u16(self.pc);
+    fn execute_alu(&mut self, destination: usize) -> Result<(), CpuError> {
+        let control = self.fetch_guest_u16(self.pc)?;
         self.pc = self.pc.wrapping_add(2) & self.memory_mask;
         let operation = control >> 12;
         let left = self.registers[destination] as u16;
         if operation == 15 {
-            self.execute_misc(destination, left, control & 0x1f, control);
-            return;
+            self.execute_misc(destination, left, control & 0x1f, control)?;
+            return Ok(());
         }
         let immediate = control & 0x0800 != 0;
         let source = (control & 7) as usize;
@@ -1559,16 +1915,16 @@ impl Cpu {
                 (self.registers[source] as u32) & 0xf
             };
             self.execute_shift(destination, left, operation, count);
-            return;
+            return Ok(());
         }
         if operation == 7 {
             let result = left.wrapping_neg();
             self.set_flags(result, left != 0, left == 0x8000);
             self.registers[destination] = i64::from(result);
-            return;
+            return Ok(());
         }
         let right = if immediate {
-            let value = self.read_u16(self.pc);
+            let value = self.fetch_guest_u16(self.pc)?;
             self.pc = self.pc.wrapping_add(2) & self.memory_mask;
             value
         } else {
@@ -1608,14 +1964,60 @@ impl Cpu {
         if operation != 8 && operation != 14 {
             self.registers[destination] = i64::from(result);
         }
+        Ok(())
     }
 
     pub fn step(&mut self) -> Result<(), CpuError> {
         if !self.running {
             return Ok(());
         }
+        let saved_pc = self.pc;
+        let saved_registers = self.registers;
+        let saved_sp = self.sp;
+        let saved_kernel_sp = self.kernel_sp;
+        let saved_flags = self.flags;
+        let saved_mode = self.privilege_mode;
+        let saved_running = self.running;
+        match self.execute_instruction() {
+            Err(CpuError::PrivilegeViolation { .. }) => {
+                self.registers = saved_registers;
+                self.sp = saved_sp;
+                self.kernel_sp = saved_kernel_sp;
+                self.flags = saved_flags;
+                self.privilege_mode = saved_mode;
+                self.running = saved_running;
+                self.enter_exception(EXCEPTION_PRIVILEGE_VIOLATION, saved_pc)
+            }
+            Err(CpuError::UnsupportedInstruction(_) | CpuError::InvalidRegisterPair(_)) => {
+                self.registers = saved_registers;
+                self.sp = saved_sp;
+                self.kernel_sp = saved_kernel_sp;
+                self.flags = saved_flags;
+                self.privilege_mode = saved_mode;
+                self.running = saved_running;
+                self.enter_exception(EXCEPTION_ILLEGAL_INSTRUCTION, saved_pc)
+            }
+            Err(CpuError::PageFault(fault)) => {
+                self.registers = saved_registers;
+                self.sp = saved_sp;
+                self.kernel_sp = saved_kernel_sp;
+                self.flags = saved_flags;
+                self.privilege_mode = saved_mode;
+                self.running = saved_running;
+                self.record_page_fault(fault);
+                self.enter_exception(EXCEPTION_PAGE_FAULT, saved_pc)
+            }
+            result => result,
+        }
+    }
 
-        let instruction = self.read_u16(self.pc);
+    fn execute_instruction(&mut self) -> Result<(), CpuError> {
+        if !self.running {
+            return Ok(());
+        }
+
+        let instruction_pc = self.pc;
+        let instruction = self.fetch_guest_u16(self.pc)?;
         self.pc = self.pc.wrapping_add(2) & self.memory_mask;
         let opcode = instruction >> 11;
         let rd = ((instruction >> 8) & 7) as usize;
@@ -1628,11 +2030,11 @@ impl Cpu {
             OP_LDI => self.registers[rd] = i64::from(immediate),
             OP_LD => {
                 let address = self.registers[rs1] as u32 & self.memory_mask;
-                self.registers[rd] = i64::from(self.read(address));
+                self.registers[rd] = i64::from(self.read_guest(address)?);
             }
             OP_ST => {
                 let address = self.registers[rs1] as u32 & self.memory_mask;
-                self.write(address, self.registers[rd] as u8);
+                self.write_guest(address, self.registers[rd] as u8)?;
             }
             OP_MOV => self.registers[rd] = self.registers[rs1],
             OP_ADD => {
@@ -1681,25 +2083,33 @@ impl Cpu {
                 self.registers[rd] = (i64::from(immediate) << 8) | (self.registers[rd] & 0xff);
             }
             OP_EI => {
+                if self.privilege_mode != PrivilegeMode::Supervisor {
+                    return Err(CpuError::PrivilegeViolation {
+                        pc: instruction_pc,
+                        operation: "EI",
+                    });
+                }
                 let value = self.read(ICR_ADDR) | 1;
                 self.write(ICR_ADDR, value);
             }
             OP_DI => {
+                if self.privilege_mode != PrivilegeMode::Supervisor {
+                    return Err(CpuError::PrivilegeViolation {
+                        pc: instruction_pc,
+                        operation: "DI",
+                    });
+                }
                 let value = self.read(ICR_ADDR) & !1;
                 self.write(ICR_ADDR, value);
             }
-            OP_RTI => {
-                let saved_flags = self.pop_u16();
-                self.restore_flags(saved_flags);
-                self.pc = self.pop_u32() & self.memory_mask;
-            }
-            OP_PUSH => self.push_u16(self.registers[rd] as u16),
-            OP_POP => self.registers[rd] = i64::from(self.pop_u16()),
+            OP_RTI => self.return_from_exception()?,
+            OP_PUSH => self.push_u16(self.registers[rd] as u16)?,
+            OP_POP => self.registers[rd] = i64::from(self.pop_u16()?),
             OP_CALL => {
-                self.push_u32(self.pc);
+                self.push_u32(self.pc)?;
                 self.pc = (instruction & 0x7ff) as u32;
             }
-            OP_RET => self.pc = self.pop_u32() & self.memory_mask,
+            OP_RET => self.pc = self.pop_u32()? & self.memory_mask,
             OP_BZ => {
                 if self.flags.zero {
                     self.pc = (instruction & 0x7ff) as u32;
@@ -1707,20 +2117,21 @@ impl Cpu {
             }
             OP_LDW => {
                 let address = self.registers[rs1] as u32 & self.memory_mask;
-                self.registers[rd] = i64::from(self.read_u16(address));
+                self.registers[rd] = i64::from(self.read_guest_u16(address)?);
             }
             OP_STW => {
                 let address = self.registers[rs1] as u32 & self.memory_mask;
-                self.write_u16(address, self.registers[rd] as u16);
+                self.write_guest_u16(address, self.registers[rd] as u16)?;
             }
             OP_LDWS => {
-                self.registers[rd] =
-                    i64::from(self.read_u16(self.sp.wrapping_add(immediate) & self.memory_mask))
+                self.registers[rd] = i64::from(
+                    self.read_guest_u16(self.sp.wrapping_add(immediate) & self.memory_mask)?,
+                )
             }
-            OP_STWS => self.write_u16(
+            OP_STWS => self.write_guest_u16(
                 self.sp.wrapping_add(immediate) & self.memory_mask,
                 self.registers[rd] as u16,
-            ),
+            )?,
             OP_ADJSP => {
                 let offset = (immediate as u8 as i8) as i32;
                 self.sp = self.sp.wrapping_add_signed(offset) & self.memory_mask;
@@ -1731,23 +2142,23 @@ impl Cpu {
                 }
             }
             OP_SHR if instruction & FLOAT_MASK == FLOAT_PREFIX => {
-                let control = self.read_u16(self.pc);
+                let control = self.fetch_guest_u16(self.pc)?;
                 self.pc = self.pc.wrapping_add(2) & self.memory_mask;
                 self.execute_float((control >> 11) & 0x1f, rd, (control & 7) as usize);
             }
             OP_SHR if instruction & MULDIV_MASK == MULDIV_PREFIX => {
-                self.execute_muldiv(rd);
+                self.execute_muldiv(rd)?;
             }
             OP_SHR if instruction & WIDE_MASK == WIDE_PREFIX => {
                 self.execute_wide(instruction, rd)?;
             }
             OP_SHR if instruction & ALU_MASK == ALU_PREFIX => {
-                self.execute_alu(rd);
+                self.execute_alu(rd)?;
             }
             OP_SHR if instruction & FAR_BRANCH_MASK == FAR_BRANCH_PREFIX => {
                 let condition = ((instruction >> 7) & 0xf) as u8;
-                let target = (((self.read_u16(self.pc) & 0x3fff) as u32) << 16)
-                    | self.read_u16(self.pc.wrapping_add(2)) as u32;
+                let target = (((self.fetch_guest_u16(self.pc)? & 0x3fff) as u32) << 16)
+                    | self.fetch_guest_u16(self.pc.wrapping_add(2))? as u32;
                 self.pc = self.pc.wrapping_add(4) & self.memory_mask;
                 if branch_condition(self.flags, condition) {
                     self.pc = target & self.memory_mask;
@@ -1755,13 +2166,13 @@ impl Cpu {
             }
             OP_SHR if instruction & FAR_CONTROL_MASK == FAR_CONTROL_PREFIX => {
                 let operation = (instruction >> 9) & 3;
-                let target = (((self.read_u16(self.pc) & 0x3fff) as u32) << 16)
-                    | self.read_u16(self.pc.wrapping_add(2)) as u32;
+                let target = (((self.fetch_guest_u16(self.pc)? & 0x3fff) as u32) << 16)
+                    | self.fetch_guest_u16(self.pc.wrapping_add(2))? as u32;
                 self.pc = self.pc.wrapping_add(4) & self.memory_mask;
                 match operation {
                     0 => self.pc = target & self.memory_mask,
                     1 => {
-                        self.push_u32(self.pc);
+                        self.push_u32(self.pc)?;
                         self.pc = target & self.memory_mask;
                     }
                     2 if self.flags.zero => self.pc = target & self.memory_mask,
@@ -1807,7 +2218,7 @@ impl Cpu {
 
         self.advance_timer();
         if self.read(ICR_ADDR) & 1 != 0 {
-            self.check_interrupts();
+            self.check_interrupts()?;
         }
         Ok(())
     }
@@ -3064,40 +3475,167 @@ impl Cpu {
         self.flags.overflow = value & 8 != 0;
     }
 
-    fn push_u16(&mut self, value: u16) {
-        self.sp = self.sp.wrapping_sub(2) & self.memory_mask;
-        self.write_u16(self.sp, value);
+    fn push_u16(&mut self, value: u16) -> Result<(), CpuError> {
+        let stack_pointer = self.sp.wrapping_sub(2) & self.memory_mask;
+        self.write_guest_u16(stack_pointer, value)?;
+        self.sp = stack_pointer;
+        Ok(())
     }
 
-    fn pop_u16(&mut self) -> u16 {
-        let value = self.read_u16(self.sp);
+    fn pop_u16(&mut self) -> Result<u16, CpuError> {
+        let value = self.read_guest_u16(self.sp)?;
         self.sp = self.sp.wrapping_add(2) & self.memory_mask;
-        value
+        Ok(value)
     }
 
-    fn push_u32(&mut self, value: u32) {
-        self.sp = self.sp.wrapping_sub(4) & self.memory_mask;
-        for offset in 0..4 {
-            self.write(
-                self.sp.wrapping_add(offset),
-                (value >> (24 - offset * 8)) as u8,
-            );
-        }
+    fn enter_exception(&mut self, cause: u16, saved_pc: u32) -> Result<(), CpuError> {
+        let Some(handler) = self
+            .exception_handlers
+            .get(usize::from(cause))
+            .copied()
+            .flatten()
+        else {
+            self.running = false;
+            return Err(CpuError::UnhandledException {
+                vector: cause,
+                cause,
+            });
+        };
+        self.enter_event(cause, saved_pc, handler, 0)
     }
 
-    fn pop_u32(&mut self) -> u32 {
-        let mut value = 0;
-        for offset in 0..4 {
-            value = (value << 8) | self.read(self.sp.wrapping_add(offset)) as u32;
+    fn enter_event(
+        &mut self,
+        cause: u16,
+        saved_pc: u32,
+        handler: u32,
+        entry_kind: u16,
+    ) -> Result<(), CpuError> {
+        if handler == 0 || handler as usize >= self.memory.len() {
+            self.running = false;
+            return Err(CpuError::UnhandledException {
+                vector: cause,
+                cause,
+            });
         }
+        let old_mode = self.privilege_mode;
+        let old_sp = self.sp;
+        let stack_top = if old_mode == PrivilegeMode::User {
+            self.kernel_sp
+        } else {
+            self.sp
+        };
+        let Some(frame_start) = stack_top.checked_sub(EXCEPTION_ENTRY_BYTES) else {
+            self.running = false;
+            return Err(CpuError::DoubleFault);
+        };
+        let Some(frame_end) = frame_start.checked_add(EXCEPTION_ENTRY_BYTES) else {
+            self.running = false;
+            return Err(CpuError::DoubleFault);
+        };
+        if frame_end as usize > self.memory.len() {
+            self.running = false;
+            return Err(CpuError::DoubleFault);
+        }
+
+        let flags = self.pack_flags().to_be_bytes();
+        let interrupt_enabled = self.read(ICR_ADDR) & 1 != 0;
+        let status = (u16::from(old_mode == PrivilegeMode::User)
+            | (u16::from(interrupt_enabled) << 1))
+            .to_be_bytes();
+        let cause_bytes = cause.to_be_bytes();
+        let kind = entry_kind.to_be_bytes();
+        let frame = &mut self.memory[frame_start as usize..frame_end as usize];
+        frame[0..4].copy_from_slice(&saved_pc.to_be_bytes());
+        frame[4..6].copy_from_slice(&flags);
+        frame[6..8].copy_from_slice(&status);
+        frame[8..12].copy_from_slice(&old_sp.to_be_bytes());
+        frame[12..14].copy_from_slice(&cause_bytes);
+        frame[14..16].copy_from_slice(&kind);
+
+        let interrupt_control = self.read(ICR_ADDR) & !1;
+        self.write(ICR_ADDR, interrupt_control);
+        self.privilege_mode = PrivilegeMode::Supervisor;
+        self.sp = frame_start;
+        self.kernel_sp = frame_start;
+        self.pc = handler;
+        Ok(())
+    }
+
+    fn return_from_exception(&mut self) -> Result<(), CpuError> {
+        if self.privilege_mode != PrivilegeMode::Supervisor {
+            return Err(CpuError::PrivilegeViolation {
+                pc: self.pc.wrapping_sub(2) & self.memory_mask,
+                operation: "RTI",
+            });
+        }
+        let frame_end = self
+            .sp
+            .checked_add(EXCEPTION_ENTRY_BYTES)
+            .ok_or(CpuError::DoubleFault)?;
+        if frame_end as usize > self.memory.len() {
+            self.running = false;
+            return Err(CpuError::DoubleFault);
+        }
+        let frame = &self.memory[self.sp as usize..frame_end as usize];
+        let saved_pc =
+            u32::from_be_bytes(frame[0..4].try_into().map_err(|_| CpuError::DoubleFault)?);
+        let saved_flags =
+            u16::from_be_bytes(frame[4..6].try_into().map_err(|_| CpuError::DoubleFault)?);
+        let status = u16::from_be_bytes(frame[6..8].try_into().map_err(|_| CpuError::DoubleFault)?);
+        let saved_sp =
+            u32::from_be_bytes(frame[8..12].try_into().map_err(|_| CpuError::DoubleFault)?);
+        let entry_kind = u16::from_be_bytes(
+            frame[14..16]
+                .try_into()
+                .map_err(|_| CpuError::DoubleFault)?,
+        );
+        if status & !0x3 != 0
+            || entry_kind > 1
+            || saved_pc as usize >= self.memory.len()
+            || saved_sp as usize >= self.memory.len()
+        {
+            self.running = false;
+            return Err(CpuError::DoubleFault);
+        }
+
+        let prior_mode = if status & 1 != 0 {
+            PrivilegeMode::User
+        } else {
+            PrivilegeMode::Supervisor
+        };
+        self.restore_flags(saved_flags);
+        self.pc = saved_pc;
+        self.privilege_mode = prior_mode;
+        let interrupt_control = (self.read(ICR_ADDR) & !1) | ((status >> 1) as u8 & 1);
+        self.write(ICR_ADDR, interrupt_control);
+        if prior_mode == PrivilegeMode::User {
+            self.kernel_sp = frame_end;
+            self.sp = saved_sp;
+        } else {
+            self.sp = frame_end;
+            self.kernel_sp = frame_end;
+        }
+        Ok(())
+    }
+
+    fn push_u32(&mut self, value: u32) -> Result<(), CpuError> {
+        let stack_pointer = self.sp.wrapping_sub(4) & self.memory_mask;
+        self.write_guest_u32(stack_pointer, value)?;
+        self.sp = stack_pointer;
+        Ok(())
+    }
+
+    fn pop_u32(&mut self) -> Result<u32, CpuError> {
+        let value = self.read_guest_u32(self.sp)?;
         self.sp = self.sp.wrapping_add(4) & self.memory_mask;
-        value
+        Ok(value)
     }
 
-    fn check_interrupts(&mut self) {
+    fn check_interrupts(&mut self) -> Result<(), CpuError> {
         let icr = self.read(ICR_ADDR);
         if icr & 1 == 0 {
-            return;
+            return Ok(());
         }
         let (pending_bit, vector) = if icr & 2 != 0 {
             (2, KEY_VECTOR_ADDR)
@@ -3106,12 +3644,11 @@ impl Cpu {
         } else if icr & 8 != 0 {
             (8, RTC_VECTOR_ADDR)
         } else {
-            return;
+            return Ok(());
         };
-        self.push_u32(self.pc);
-        self.push_u16(self.pack_flags());
-        self.write(ICR_ADDR, (icr & !1) & !pending_bit);
-        self.pc = self.read_u32(vector) & self.memory_mask;
+        let handler = self.read_u32(vector) & self.memory_mask;
+        self.write(ICR_ADDR, icr & !pending_bit);
+        self.enter_event(pending_bit as u16, self.pc, handler, 1)
     }
 
     fn advance_timer(&mut self) {
@@ -3293,6 +3830,96 @@ mod tests {
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
         assert_eq!(cpu.flags, Flags::default());
         assert_eq!(cpu.read(ICR_ADDR) & 1, 0);
+    }
+
+    #[test]
+    fn user_privilege_fault_uses_kernel_stack_and_rti_restores_user_state() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.set_exception_handler(EXCEPTION_PRIVILEGE_VIOLATION, Some(0x300))
+            .unwrap();
+        cpu.write_u16(0x2000, OP_DI << 11);
+        cpu.write_u16(0x300, OP_RTI << 11);
+        cpu.pc = 0x2000;
+        cpu.sp = 0x7000;
+        cpu.kernel_sp = 0xf000;
+        cpu.privilege_mode = PrivilegeMode::User;
+        cpu.flags = Flags {
+            zero: true,
+            carry: false,
+            negative: true,
+            overflow: false,
+        };
+        cpu.write(ICR_ADDR, 1);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.sp, 0xeff0);
+        assert_eq!(cpu.read_u32(cpu.sp), 0x2000);
+        assert_eq!(cpu.read_u16(cpu.sp + 4), 0b0101);
+        assert_eq!(cpu.read_u16(cpu.sp + 6), 0b11);
+        assert_eq!(cpu.read_u32(cpu.sp + 8), 0x7000);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PRIVILEGE_VIOLATION);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x2000);
+        assert_eq!(cpu.sp, 0x7000);
+        assert_eq!(cpu.kernel_sp, 0xf000);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.flags.zero, true);
+        assert_eq!(cpu.flags.negative, true);
+        assert_eq!(cpu.read(ICR_ADDR) & 1, 1);
+    }
+
+    #[test]
+    fn invalid_instruction_enters_the_configured_exception_handler() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.set_exception_handler(EXCEPTION_ILLEGAL_INSTRUCTION, Some(0x300))
+            .unwrap();
+        cpu.write_u16(0, 0xff1a);
+        cpu.write_u16(0x300, OP_RTI << 11);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(cpu.read_u32(cpu.sp), 0);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_ILLEGAL_INSTRUCTION);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+    }
+
+    #[test]
+    fn user_instruction_cannot_write_or_read_interrupt_control_registers() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.set_exception_handler(EXCEPTION_PRIVILEGE_VIOLATION, Some(0x300))
+            .unwrap();
+        cpu.write_u16(0, (OP_ST << 11) | (1 << 5));
+        cpu.write_u16(2, (OP_LD << 11) | (2 << 8) | (1 << 5));
+        cpu.write_u16(0x300, OP_RTI << 11);
+        cpu.registers[0] = 0x10;
+        cpu.registers[1] = i64::from(ICR_ADDR);
+        cpu.sp = 0x7000;
+        cpu.kernel_sp = 0xf000;
+        cpu.privilege_mode = PrivilegeMode::User;
+        cpu.write(ICR_ADDR, 1);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(cpu.memory[ICR_ADDR as usize], 0);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PRIVILEGE_VIOLATION);
+
+        cpu.write_u32(cpu.sp, 2);
+        cpu.step().unwrap();
+        assert_eq!(cpu.pc, 2);
+        cpu.write(ICR_ADDR, 1);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(cpu.registers[2], 0);
+        assert_eq!(cpu.read_u32(cpu.sp), 2);
     }
 
     #[test]
@@ -5117,8 +5744,10 @@ mod tests {
         cpu.write(ICR_ADDR, 2);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x20);
-        assert_eq!(cpu.read_u16(cpu.sp), 0);
-        assert_eq!(cpu.read_u32(cpu.sp + 2), 2);
+        assert_eq!(cpu.read_u32(cpu.sp), 2);
+        assert_eq!(cpu.read_u16(cpu.sp + 6), 2);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), 2);
+        assert_eq!(cpu.read_u16(cpu.sp + 14), 1);
         assert_eq!(cpu.read(ICR_ADDR), 0);
     }
 
@@ -5142,14 +5771,19 @@ mod tests {
             cpu.step().unwrap();
             let handler = if pending & 2 != 0 { 0x300 } else { 0x400 };
             assert_eq!(cpu.pc, handler);
-            assert_eq!(cpu.read_u16(cpu.sp), 0b1101);
-            assert_eq!(cpu.read_u32(cpu.sp + 2), 2);
+            assert_eq!(cpu.read_u32(cpu.sp), 2);
+            assert_eq!(cpu.read_u16(cpu.sp + 4), 0b1101);
+            assert_eq!(cpu.read_u16(cpu.sp + 6), 2);
             assert_eq!(
                 cpu.read(ICR_ADDR),
                 pending & !(if pending & 2 != 0 { 2 } else { 8 })
             );
 
             cpu.step().unwrap();
+            if pending == 10 {
+                assert_eq!(cpu.pc, 0x400);
+                cpu.step().unwrap();
+            }
             assert_eq!(cpu.pc, 2);
             assert_eq!(cpu.sp, cpu.memory_mask);
             assert_eq!(
@@ -5169,6 +5803,8 @@ mod tests {
         let mut cpu = cpu_with_program(&[(OP_MOV << 11), (OP_MOV << 11), (OP_MOV << 11)]);
         cpu.write_u32_for_test(TIMER_VECTOR_ADDR, 0x100);
         cpu.write_u16(0x100, OP_RTI << 11);
+        cpu.write_u32_for_test(RTC_VECTOR_ADDR, 0x200);
+        cpu.write_u16(0x200, OP_RTI << 11);
         cpu.write_u16(TIMER_PERIOD_ADDR, 2);
         cpu.write(ICR_ADDR, 1);
 
@@ -5177,16 +5813,14 @@ mod tests {
         cpu.write(ICR_ADDR, 1 | 8);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x100);
-        assert_eq!(cpu.read_u32(cpu.sp + 2), 4);
+        assert_eq!(cpu.read_u32(cpu.sp), 4);
         assert_eq!(cpu.read(ICR_ADDR), 8);
+        cpu.write_u16(TIMER_PERIOD_ADDR, 0);
 
         cpu.step().unwrap();
-        assert_eq!(cpu.pc, 4);
-        cpu.write(ICR_ADDR, 1 | 8);
+        assert_eq!(cpu.pc, 0x200);
         cpu.step().unwrap();
-        assert_eq!(cpu.pc, 0x100);
-        assert_eq!(cpu.read_u32(cpu.sp + 2), 6);
-        assert_eq!(cpu.read(ICR_ADDR), 8);
+        assert_eq!(cpu.pc, 4);
     }
 
     #[test]

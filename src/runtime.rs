@@ -1289,10 +1289,16 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
             cpu.console.log_error("bios", &error);
             RuntimeError::Window(error)
         })?;
-        cpu.privilege_mode = match boot.mode {
-            FolderBootMode::Kernel => PrivilegeMode::Supervisor,
-            FolderBootMode::User => PrivilegeMode::User,
-        };
+        match boot.mode {
+            FolderBootMode::Kernel => cpu.privilege_mode = PrivilegeMode::Supervisor,
+            FolderBootMode::User => {
+                let user_stack = cpu.initial_user_stack_pointer();
+                cpu.enter_user_mode(cpu.pc, user_stack).map_err(|error| {
+                    cpu.console.log_error("bios", &error.to_string());
+                    RuntimeError::Window(error.to_string())
+                })?;
+            }
+        }
         cpu.running = true;
         cpu.console.log_info(
             "bios",
@@ -2162,6 +2168,10 @@ mod tests {
             assert_eq!(cpu.pc, 0x100);
             assert_eq!(cpu.privilege_mode, mode);
             assert_eq!(cpu.loaded_image_segments.len(), 1);
+            let expected_sp = match mode {
+                PrivilegeMode::Supervisor => cpu.memory.len() as u32 - 1,
+                PrivilegeMode::User => cpu.initial_user_stack_pointer(),
+            };
             assert_eq!(
                 cpu.loaded_image_segments[0].permissions,
                 crate::image::SegmentPermissions::READ_WRITE_EXECUTE
@@ -2179,7 +2189,7 @@ mod tests {
             assert_eq!(cpu.privilege_mode, mode);
             assert_eq!(cpu.registers, [0; 8]);
             assert_eq!(cpu.flags, crate::cpu::Flags::default());
-            assert_eq!(cpu.sp, cpu.memory.len() as u32 - 1);
+            assert_eq!(cpu.sp, expected_sp);
             assert_eq!(cpu.kernel_sp, cpu.memory.len() as u32 - 1);
             assert_eq!(cpu.memory[crate::cpu::ICR_ADDR as usize], 0);
             assert_eq!(cpu.loaded_image_segments.len(), 1);

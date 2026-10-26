@@ -6,6 +6,7 @@ pub mod disk;
 pub mod guest_text;
 pub mod image;
 pub mod isa;
+pub mod mmu;
 pub mod net;
 pub mod runtime;
 pub mod sprite_viewer;
