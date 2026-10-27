@@ -530,7 +530,7 @@ pub async fn run_with_devices(
             return Ok(());
         }
     };
-    cpu.console.log_info("emulator", "BIOS started");
+    cpu.debug_console.log_info("emulator", "BIOS started");
     let mut paused = false;
     let mut console_visible = false;
     let mut console_window: Option<ConsoleWindow> = None;
@@ -617,10 +617,11 @@ pub async fn run_with_devices(
                     }
                     RuntimeControl::StopRequested => {
                         cpu.running = false;
-                        cpu.console.log_info("emulator", "CPU stopped by user");
+                        cpu.debug_console
+                            .log_info("emulator", "CPU stopped by user");
                     }
                     RuntimeControl::PauseToggled(paused) => {
-                        cpu.console.log_info(
+                        cpu.debug_console.log_info(
                             "emulator",
                             if paused {
                                 "Emulation paused"
@@ -645,7 +646,7 @@ pub async fn run_with_devices(
                 }
                 RuntimeControl::PauseToggled(new_paused) => {
                     paused = new_paused;
-                    cpu.console.log_info(
+                    cpu.debug_console.log_info(
                         "emulator",
                         if paused {
                             "Emulation paused"
@@ -658,13 +659,14 @@ pub async fn run_with_devices(
                 RuntimeControl::ConsoleClosed => {
                     console_visible = false;
                     console_window = None;
-                    cpu.console
+                    cpu.debug_console
                         .log_debug("emulator", "Bug Monitor window closed");
                 }
                 RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
                 RuntimeControl::StopRequested => {
                     cpu.running = false;
-                    cpu.console.log_info("emulator", "CPU stopped by user");
+                    cpu.debug_console
+                        .log_info("emulator", "CPU stopped by user");
                 }
             }
             last_frame = Instant::now();
@@ -676,7 +678,7 @@ pub async fn run_with_devices(
             match control {
                 RuntimeControl::PauseToggled(new_paused) => {
                     paused = new_paused;
-                    cpu.console.log_info(
+                    cpu.debug_console.log_info(
                         "emulator",
                         if paused {
                             "Emulation paused"
@@ -693,7 +695,8 @@ pub async fn run_with_devices(
                 RuntimeControl::FullscreenToggled(_) => {}
                 RuntimeControl::StopRequested => {
                     cpu.running = false;
-                    cpu.console.log_info("emulator", "CPU stopped by user");
+                    cpu.debug_console
+                        .log_info("emulator", "CPU stopped by user");
                 }
             }
         }
@@ -709,7 +712,7 @@ pub async fn run_with_devices(
             pending_action
         {
             audio.stop_all();
-            cpu.console.log_debug(
+            cpu.debug_console.log_debug(
                 "emulator",
                 if action == RuntimeControl::ResetRequested {
                     "Reset requested"
@@ -717,7 +720,7 @@ pub async fn run_with_devices(
                     "Firmware reboot requested"
                 },
             );
-            let previous_console = cpu.console.clone();
+            let previous_console = (cpu.console.clone(), cpu.debug_console.clone());
             if action == RuntimeControl::ResetRequested {
                 console_window = None;
                 console_visible = false;
@@ -726,7 +729,7 @@ pub async fn run_with_devices(
                     program,
                     disk_id,
                     network_port,
-                    Some(&previous_console),
+                    Some((&previous_console.0, &previous_console.1)),
                 ) {
                     Ok(cpu) => cpu,
                     Err(error) => {
@@ -748,7 +751,7 @@ pub async fn run_with_devices(
                     program,
                     disk_id,
                     network_port,
-                    Some(&previous_console),
+                    Some((&previous_console.0, &previous_console.1)),
                 ) {
                     Ok(cpu) => cpu,
                     Err(error) => {
@@ -764,7 +767,7 @@ pub async fn run_with_devices(
                     }
                 };
             }
-            cpu.console.log_info(
+            cpu.debug_console.log_info(
                 "emulator",
                 if action == RuntimeControl::ResetRequested {
                     "System reset complete"
@@ -856,7 +859,7 @@ pub async fn run_with_devices(
                         active_boot_disk.as_deref(),
                         &error,
                     );
-                    cpu.console.log_error("emulator", &details);
+                    cpu.debug_console.log_error("emulator", &details);
                     return Err(RuntimeError::Window(details));
                 }
                 if let Some(path) = cpu.take_booted_disk_path() {
@@ -914,7 +917,7 @@ pub async fn run_with_devices(
         }
         if let Some(window) = console_window.as_mut() {
             if window.is_open() {
-                window.present(&cpu.console.text_snapshot(), &font, paused)?;
+                window.present(&cpu.debug_console.text_snapshot(), &font, paused)?;
             } else {
                 console_window = None;
                 console_visible = false;
@@ -1318,7 +1321,10 @@ fn fresh_runtime_cpu(
     source: Option<&Path>,
     disk_id: Option<&str>,
     network_port: u16,
-    previous_console: Option<&crate::console::ConsoleDevice>,
+    previous_consoles: Option<(
+        &crate::console::ConsoleDevice,
+        &crate::console::ConsoleDevice,
+    )>,
 ) -> Result<Cpu, RuntimeError> {
     let mut cpu = Cpu::new();
     cpu.set_network_port(network_port);
@@ -1336,9 +1342,11 @@ fn fresh_runtime_cpu(
     } else if source.is_none() {
         cpu.set_bios_preselected_disk(disk_id);
     }
-    if let Some(previous_console) = previous_console {
+    if let Some((previous_console, previous_debug_console)) = previous_consoles {
         cpu.console = previous_console.clone();
         cpu.console.reset(true);
+        cpu.debug_console = previous_debug_console.clone();
+        cpu.debug_console.reset(true);
     }
     let bios_path = root.join("bios.bin");
     if !bios_path.try_exists()? {
@@ -1357,7 +1365,7 @@ fn fresh_runtime_cpu(
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| RuntimeError::Window(format!("invalid common BIOS: {error}")))?;
     cpu.privilege_mode = PrivilegeMode::Supervisor;
-    cpu.console
+    cpu.debug_console
         .log_info("emulator", "trusted BIOS started in kernel mode");
     Ok(cpu)
 }
@@ -1419,7 +1427,7 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
     if target.folder_disk {
         let mode = boot_folder_disk(cpu, &target.source)?;
         let disk = FolderDisk::open(&target.source).map_err(RuntimeError::Window)?;
-        cpu.console.log_info(
+        cpu.debug_console.log_info(
             "bios",
             &format!(
                 "Loaded boot device {} id={} label={:?} program={} mode={:?} entry={:#06x} segments={}",
@@ -1439,20 +1447,21 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("program");
-    cpu.console.log_info("emulator", &format!("Loading {name}"));
+    cpu.debug_console
+        .log_info("emulator", &format!("Loading {name}"));
     let image = load_prebuilt_program(&target.source).map_err(|error| {
-        cpu.console
+        cpu.debug_console
             .log_error("emulator", &format!("Loading {name} failed: {error}"));
         error
     })?;
     cpu.prepare_image_entry();
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| {
-            cpu.console
+            cpu.debug_console
                 .log_error("emulator", &format!("Loading {name} failed: {error}"));
             RuntimeError::Window(error.to_string())
         })?;
-    cpu.console.log_info(
+    cpu.debug_console.log_info(
         "emulator",
         &format!(
             "Program loaded path={} mode={:?} entry={:#06x} segments={}",
@@ -1467,18 +1476,18 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
 
 fn boot_folder_disk(cpu: &mut Cpu, disk_path: &Path) -> Result<FolderBootMode, RuntimeError> {
     let disk = FolderDisk::open(disk_path).map_err(|error| {
-        cpu.console
+        cpu.debug_console
             .log_error("bios", &format!("Disk {}: {error}", disk_path.display()));
         RuntimeError::Window(error)
     })?;
     let boot = disk.load_boot_image().map_err(|error| {
-        cpu.console
+        cpu.debug_console
             .log_error("bios", &format!("Disk {}: {error}", disk_path.display()));
         RuntimeError::Window(error)
     })?;
     let disk_id = disk.manifest().id.clone();
     let disk_label = disk.manifest().label.clone();
-    cpu.console.log_info(
+    cpu.debug_console.log_info(
         "bios",
         &format!(
             "Boot candidate path={} id={} label={:?} program={} mode={:?} entry={:#06x} segments={}",
@@ -1494,11 +1503,11 @@ fn boot_folder_disk(cpu: &mut Cpu, disk_path: &Path) -> Result<FolderBootMode, R
     cpu.prepare_image_entry();
     cpu.load_program(&boot.image.segments, boot.image.entry_point)
         .map_err(|error| {
-            cpu.console.log_error("bios", &error.to_string());
+            cpu.debug_console.log_error("bios", &error.to_string());
             RuntimeError::Window(error.to_string())
         })?;
     cpu.mount_folder_disk(disk_path).map_err(|error| {
-        cpu.console.log_error("bios", &error);
+        cpu.debug_console.log_error("bios", &error);
         RuntimeError::Window(error)
     })?;
     match boot.mode {
@@ -1506,7 +1515,7 @@ fn boot_folder_disk(cpu: &mut Cpu, disk_path: &Path) -> Result<FolderBootMode, R
         FolderBootMode::User => {
             let user_stack = cpu.initial_user_stack_pointer();
             cpu.enter_user_mode(cpu.pc, user_stack).map_err(|error| {
-                cpu.console.log_error("bios", &error.to_string());
+                cpu.debug_console.log_error("bios", &error.to_string());
                 RuntimeError::Window(error.to_string())
             })?;
         }
@@ -2668,10 +2677,16 @@ mod tests {
         assert_eq!(fs::read(boot_disk.join("result.txt")).unwrap(), b"hello");
         assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
 
-        let console = cpu.console.clone();
+        let consoles = (cpu.console.clone(), cpu.debug_console.clone());
         drop(cpu);
-        let mut reset =
-            fresh_runtime_cpu(&root, None, Some("DISK0001"), DEFAULT_PORT, Some(&console)).unwrap();
+        let mut reset = fresh_runtime_cpu(
+            &root,
+            None,
+            Some("DISK0001"),
+            DEFAULT_PORT,
+            Some((&consoles.0, &consoles.1)),
+        )
+        .unwrap();
         reset.run(5000).unwrap();
         reset.signal_keyboard_event(13);
         reset.run(30000).unwrap();
@@ -2747,7 +2762,7 @@ mod tests {
             cpu.memory[0x43000],
             &cpu.memory[0x5000..0x5009],
             &cpu.memory[0x43402..0x4340c],
-            cpu.console.text_snapshot()
+            cpu.debug_console.text_snapshot()
         );
         assert!(text.contains("BIOS SETUP UTILITY"), "{text:?}");
         assert!(text.contains("SETTINGS"), "{text:?}");
@@ -2802,7 +2817,7 @@ mod tests {
             cpu.memory[0x4340c],
             cpu.memory[0x43000],
             cpu.registers,
-            cpu.console.text_snapshot()
+            cpu.debug_console.text_snapshot()
         );
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
         assert_eq!(
@@ -2812,10 +2827,16 @@ mod tests {
         assert!(!cpu.guest_text.enabled);
         cpu.write(0x43400, 1);
         assert_eq!(cpu.memory[0x4340c], 1);
-        let console = cpu.console.clone();
+        let consoles = (cpu.console.clone(), cpu.debug_console.clone());
         drop(cpu);
-        let mut reset =
-            fresh_runtime_cpu(root, None, Some("DISK0002"), DEFAULT_PORT, Some(&console)).unwrap();
+        let mut reset = fresh_runtime_cpu(
+            root,
+            None,
+            Some("DISK0002"),
+            DEFAULT_PORT,
+            Some((&consoles.0, &consoles.1)),
+        )
+        .unwrap();
         assert_eq!(reset.pc, 0);
         assert_eq!(reset.privilege_mode, PrivilegeMode::Supervisor);
         assert!(reset.running);
@@ -2967,7 +2988,7 @@ mod tests {
             cpu.pc,
             cpu.privilege_mode,
             cpu.registers,
-            cpu.console.text_snapshot()
+            cpu.debug_console.text_snapshot()
         );
         assert_eq!(saved["startup_behavior"], "boot_preferred");
         assert_eq!(saved["network_name"], "NODE-0123456789A");
@@ -3180,8 +3201,20 @@ mod tests {
                 .unwrap(),
             checked_in_disk.file_name().unwrap()
         );
+        cpu.receive_console_input(b"\n");
         cpu.signal_keyboard_event(13);
-        cpu.run(30_000).unwrap();
+        let mut executed = 0;
+        while executed < 30_000 && cpu.running {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            match run_instruction_slice(&mut cpu, &mut budget) {
+                Ok(frame_executed) => executed += frame_executed,
+                Err(error) => panic!(
+                    "{}",
+                    runtime_cpu_failure_details(&cpu, None, Some(&checked_in_disk), &error)
+                ),
+            }
+        }
         assert_eq!(
             cpu.privilege_mode,
             PrivilegeMode::User,
@@ -3189,13 +3222,16 @@ mod tests {
             cpu.pc,
             cpu.memory[0x4340c],
             cpu.running,
-            cpu.console.text_snapshot(),
+            cpu.debug_console.text_snapshot(),
             cpu.guest_text
                 .cells
                 .iter()
                 .map(|cell| char::from(cell.character))
                 .collect::<String>()
         );
+        update_rtc(&mut cpu);
+        cpu.run(1000).unwrap();
+        assert!(cpu.running, "SisuOS stopped after the RTC interrupt");
         cpu.receive_console_input(b"help\nlist\ninfo\nrun demo\nunknown\n");
         cpu.run(500_000).unwrap();
 
@@ -3214,6 +3250,26 @@ mod tests {
                 "missing {expected:?}; output={output}"
             );
         }
+        let screen = cpu
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| char::from(cell.character))
+            .collect::<String>();
+        assert!(screen.contains("SisuOS interactive shell"), "{screen}");
+        assert!(
+            screen.contains("Commands: help, list, run demo, info"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("[INFO]") && !screen.contains("[DEBUG]"),
+            "debug messages leaked into the guest console: {screen}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&cpu.debug_console.output())
+                .contains("SisuOS interactive shell"),
+            "guest console output leaked into Bug Monitor"
+        );
         let child_progress = output.find("demo task ran").unwrap();
         let parent_wait = output.find("Waiting for demo...").unwrap();
         assert!(
@@ -3308,7 +3364,12 @@ mod tests {
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
         cpu.run(10).unwrap();
         assert_eq!(cpu.registers[0], 27);
-        assert!(cpu.console.text_snapshot().join("\n").contains("NOT_BOOT"));
+        assert!(
+            cpu.debug_console
+                .text_snapshot()
+                .join("\n")
+                .contains("NOT_BOOT")
+        );
         fs::remove_dir_all(disk.parent().unwrap()).unwrap();
     }
 
@@ -4169,9 +4230,15 @@ mod tests {
             "Elite should still have work remaining"
         );
 
-        let console = cpu.console.clone();
-        cpu =
-            fresh_runtime_cpu(root, Some(&image_path), None, DEFAULT_PORT, Some(&console)).unwrap();
+        let consoles = (cpu.console.clone(), cpu.debug_console.clone());
+        cpu = fresh_runtime_cpu(
+            root,
+            Some(&image_path),
+            None,
+            DEFAULT_PORT,
+            Some((&consoles.0, &consoles.1)),
+        )
+        .unwrap();
         boot_target(&mut cpu, &target).unwrap();
 
         cpu.begin_frame();

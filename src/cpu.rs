@@ -348,6 +348,7 @@ pub struct Cpu {
     pub frame_presented: bool,
     pub frame_count: u16,
     pub console: ConsoleDevice,
+    pub debug_console: ConsoleDevice,
     pub guest_text: GuestTextDisplay,
     pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
@@ -475,6 +476,7 @@ impl Cpu {
             frame_presented: false,
             frame_count: 0,
             console: ConsoleDevice::new(),
+            debug_console: ConsoleDevice::new(),
             guest_text: GuestTextDisplay::new(),
             saved_video: None,
             random_state: 0x16c0_ffee,
@@ -563,7 +565,7 @@ impl Cpu {
         self.bios_status(0);
         if self.privilege_mode != PrivilegeMode::Supervisor {
             self.bios_status(1);
-            self.console
+            self.debug_console
                 .log_error("bios", "user-mode firmware operation was rejected");
             return;
         }
@@ -581,7 +583,7 @@ impl Cpu {
         };
         if let Err(error) = result {
             self.bios_status(1);
-            self.console.log_error("bios", &error);
+            self.debug_console.log_error("bios", &error);
         }
     }
 
@@ -606,7 +608,7 @@ impl Cpu {
         };
         let selected_by_cli = preselected.as_deref().and_then(find_disk);
         if let Some(id) = preselected.as_deref().filter(|_| selected_by_cli.is_none()) {
-            self.console
+            self.debug_console
                 .log_error("bios", &format!("preselected disk {id} was not found"));
         }
         let selected_by_settings = self
@@ -620,7 +622,7 @@ impl Cpu {
             .as_deref()
             .filter(|_| selected_by_settings.is_none())
         {
-            self.console
+            self.debug_console
                 .log_warning("bios", &format!("preferred disk {id} was not found"));
         }
         let selected = if preselected.is_some() {
@@ -774,7 +776,7 @@ impl Cpu {
             FolderBootMode::Kernel => "kernel.bin",
             FolderBootMode::User => "main.bin",
         };
-        self.console.log_info(
+        self.debug_console.log_info(
             "bios",
             &format!(
                 "Loaded boot device path={} id={} label={:?} program={} mode={:?} entry={:#06x} segments={}",
@@ -977,13 +979,13 @@ impl Cpu {
         }
         self.pc = entry_point;
         self.loaded_image_segments = loaded_image_segments;
-        self.console
+        self.debug_console
             .log_debug("cpu", &format!("Program image loaded at {entry_point:#x}"));
         Ok(())
     }
 
     pub fn prepare_image_entry(&mut self) {
-        self.console
+        self.debug_console
             .log_debug("cpu", "Resetting CPU state for image entry");
         self.registers.fill(0);
         self.flags = Flags::default();
@@ -1163,7 +1165,7 @@ impl Cpu {
             Ok(true)
         } else {
             self.running = false;
-            self.console
+            self.debug_console
                 .log_info("cpu", "CPU halted: no runnable tasks remain");
             Ok(false)
         }
@@ -1384,6 +1386,9 @@ impl Cpu {
         match address {
             CONSOLE_DATA => {
                 let value = self.console.read_data();
+                if self.console.control() & 1 != 0 && value != 0 {
+                    self.display_guest_console_byte(value);
+                }
                 if self.memory[CONSOLE_CONTROL as usize] & 1 != 0 && value != 0 {
                     print!("{}", char::from(value));
                 }
@@ -1521,7 +1526,7 @@ impl Cpu {
         let caller_mode = self.privilege_mode;
         if !(command == 0x80 || (FOLDER_FS_LIST..=FOLDER_FS_STAT).contains(&command)) {
             self.memory[DISK_STATUS as usize] = 1;
-            self.console
+            self.debug_console
                 .log_error("disk", "unsupported disk operation was rejected");
             return;
         }
@@ -1529,7 +1534,7 @@ impl Cpu {
         self.memory[DISK_STATUS as usize] = 0;
         if let Err(error) = self.disk_control_inner(command, caller_mode == PrivilegeMode::User) {
             self.memory[DISK_STATUS as usize] = 1;
-            self.console
+            self.debug_console
                 .log_error("disk", &format!("operation failed: {error}"));
         }
         self.privilege_mode = caller_mode;
@@ -1970,7 +1975,11 @@ impl Cpu {
         if handle == 0 {
             let bytes_read = length.min(self.console.receive_buffer().len());
             for address in output.iter().take(bytes_read) {
-                self.memory[*address] = self.console.read_data();
+                let byte = self.console.read_data();
+                self.memory[*address] = byte;
+                if self.console.control() & 1 != 0 && byte != 0 {
+                    self.display_guest_console_byte(byte);
+                }
             }
             return bytes_read as i64;
         }
@@ -2032,6 +2041,7 @@ impl Cpu {
         if handle == 1 || handle == 2 {
             for byte in data {
                 self.console.write_data(byte);
+                self.display_guest_console_byte(byte);
             }
             return length as i64;
         }
@@ -2943,7 +2953,7 @@ impl Cpu {
                 match node.open(&title) {
                     Ok(opened) => self.set_gpu_result(u16::from(opened)),
                     Err(error) => {
-                        self.console
+                        self.debug_console
                             .log_error("network", &format!("open failed: {error}"));
                         self.set_gpu_result(0);
                     }
@@ -3014,6 +3024,7 @@ impl Cpu {
             }
             CONSOLE_DATA => {
                 self.console.write_data(value);
+                self.display_guest_console_byte(value);
                 print!("{}", char::from(value));
                 if value == b'\n' {
                     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -3044,6 +3055,17 @@ impl Cpu {
             }
             _ => {}
         }
+    }
+
+    fn display_guest_console_byte(&mut self, byte: u8) {
+        if !self.guest_text.enabled {
+            self.guest_text.clear(0);
+            self.guest_text.foreground = 1;
+            self.guest_text.background = 0;
+            self.guest_text.enabled = true;
+        }
+        self.guest_text
+            .write_byte(byte, self.guest_text.foreground, self.guest_text.background);
     }
 
     pub fn read_u16(&mut self, address: u32) -> u16 {
@@ -3791,7 +3813,7 @@ impl Cpu {
         let saved_running = self.running;
         match self.execute_instruction() {
             Err(CpuError::PrivilegeViolation { operation, .. }) => {
-                self.console.log_error(
+                self.debug_console.log_error(
                     "cpu",
                     &format!("Privilege violation at {saved_pc:#x}: {operation}"),
                 );
@@ -3843,7 +3865,7 @@ impl Cpu {
         match opcode {
             OP_HALT if instruction == 0 => {
                 self.running = false;
-                self.console
+                self.debug_console
                     .log_info("cpu", &format!("CPU halted at {instruction_pc:#x}"));
             }
             OP_HALT if instruction == crate::isa::SVC_VECTOR => {
@@ -4946,7 +4968,7 @@ impl Cpu {
             )
         {
             self.set_gpu_result(1);
-            self.console.log_error(
+            self.debug_console.log_error(
                 "gpu",
                 "MMU-backed user buffer commands require a validated buffer service",
             );
@@ -6676,7 +6698,7 @@ mod tests {
         cpu.load_program(&halt_image.segments, halt_image.entry_point)
             .unwrap();
         cpu.run(10).unwrap();
-        let log = cpu.console.text_snapshot().join("\n");
+        let log = cpu.debug_console.text_snapshot().join("\n");
         assert!(
             log.contains("[DEBUG] cpu: Program image loaded at 0x100"),
             "{log}"
@@ -6689,7 +6711,7 @@ mod tests {
             .unwrap();
         cpu.privilege_mode = PrivilegeMode::User;
         assert!(cpu.step().is_err());
-        let log = cpu.console.text_snapshot().join("\n");
+        let log = cpu.debug_console.text_snapshot().join("\n");
         assert!(
             log.contains("[ERROR] cpu: Privilege violation at 0x200: load IDT"),
             "{log}"
@@ -8815,7 +8837,7 @@ mod tests {
             cpu.memory[BIOS_STATUS as usize],
             0,
             "{:?}",
-            cpu.console.text_snapshot()
+            cpu.debug_console.text_snapshot()
         );
         assert_eq!(cpu.memory[0x5022], 0);
         assert_eq!(

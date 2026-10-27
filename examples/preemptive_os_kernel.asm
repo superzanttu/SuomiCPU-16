@@ -80,6 +80,10 @@ page_fault_handler:
 
 .address 0x0810
     .data hex 00, 00, 42, 40, 80, 00, 00, 00
+.address 0x0900
+    .data hex 00, 00, 42, 00, 80, 00, 00, 00
+.address 0x0908
+    .data hex 00, 00, 42, 00, 80, 00, 00, 00
 .address 0x0910
     .data hex 00, 00, 42, 00, 80, 00, 00, 00
 .address 0x0c00
