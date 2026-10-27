@@ -553,3 +553,8 @@ Checklist status: [x] completed; [ ] planned.
 * [ ] Publish the supported machine/boot/disk/syscall versions and explicitly
   list any unimplemented features before describing the architecture as ready
   for general-purpose operating systems.
+
+=== Phase 10 - Final tasks
+* [ ] Perform a final review of all documentation, ensuring accuracy and completeness.
+* [ ] Write documentation how to compile and package the BIOS, kernel, and user programs, as well as how to create and manage bootable disks.
+* [ ] Ensure all helper tools and scripts are documented, including usage examples and expected outputs.
