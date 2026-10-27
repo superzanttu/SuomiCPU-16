@@ -22,10 +22,14 @@ disk, startup behavior, and an editable 1-16 character SC-NET node ID. When
 not configured, the BIOS generates a full-length +SC16-+ name with a random
 hexadecimal suffix. This identifies the emulator to SC-NET only; guest
 applications use their own network titles. Use Up/Down to select a setting.
-Left/Right changes the boot device or toggles the selected BOOL; Enter edits
-the selected setting or starts the selected boot device. Escape cancels an
-edit, F9 reloads +bios.json+, and F10 saves it. Unsaved changes are shown as a
-warning and prevent booting until saved. BOOL values are Yes/No, STRING values
+Left/Right changes the boot device, or toggles a BOOL while its setting is
+being edited. Enter on Boot Device saves the selection and starts that device;
+Enter on another setting begins editing it directly in the main list. Type to
+edit STRING and NUMBER values. Enter confirms an edit and Escape cancels it.
+Changes to other settings must be saved with F10 before booting. Disk details
+are clipped to one display row so long names do not wrap. F9 reloads
++bios.json+, and F10 saves it. Unsaved changes are shown as a warning and
+prevent booting until saved. BOOL values are Yes/No, STRING values
 are limited to 16 printable ASCII characters, and NUMBER values are signed
 integers. Up to eight named custom settings from +bios.json+ appear in the
 list and can be edited with the same controls. When automatic startup of a
@@ -90,8 +94,9 @@ normal BIOS USER boot path does not yet enable translation and is not an
 isolation boundary.
 The game fills the emulator's main window after BIOS startup. The optional
 80×25 *Bug Monitor* runs in a separate window and displays emulator logs and
-guest serial output. Its *RESET* button returns to BIOS disk selection;
-*REBOOT* restarts the current program. Select text and press Ctrl+C to copy it;
+guest serial output. *RESET* returns to BIOS disk selection; *REBOOT* performs
+a cold firmware boot and rebuilds +bios.asm+ if it is newer than +bios.bin+.
+Close the emulator with the window close button or Escape. Select text and press Ctrl+C to copy it;
 the *COPY* button copies selected text or the visible monitor screen. The Bug
 Monitor keeps a 1,000-row scrollback buffer, navigated with the mouse wheel.
 Press F1 to pause/resume, F2 to hide/show the Bug Monitor, F3 to reset, F4 to
@@ -109,6 +114,40 @@ cargo run --bin sc16build -- examples/commands.asm commands.sc16img
 cargo run --bin suomicpu16 -- commands.sc16img
 cargo run --bin sc16build -- examples/directives.asm directives.sc16img
 cargo run --bin suomicpu16 -- directives.sc16img
+----
+
+The link:../examples/minimal_kernel.asm[+examples/minimal_kernel.asm+] example
+builds a protected kernel disk that installs the IDT, enables the PIT and MMU,
+starts a scheduled user task, exits through the syscall ABI, and can be rebooted:
+its page tables are static image data, so it is a boot-path fixture rather than
+a general-purpose kernel.
+
+[source,console]
+----
+cargo run --bin sc16build -- package-disk examples/minimal_kernel.asm disks/KERN0001 MinimalKernel 65536 --kernel
+cargo run --bin suomicpu16
+----
+
+The link:../examples/syscall_kernel.asm[+examples/syscall_kernel.asm+] and
+link:../examples/syscall_child.asm[+examples/syscall_child.asm+] examples
+exercise the syscall lifecycle from user programs. The kernel spawns the child,
+yields, sleeps, waits for its exit status, and exits with that status. The child
+first attempts a supervisor-only read; the sample handler skips that faulting
+instruction to demonstrate isolation. It allocates a page with +sys_mmap+ for
+its file buffer, then reads +input.txt+, writes its contents to the console and
++result.txt+, and exits. This simple recovery policy and the kernel's lack of a
+guest-written frame allocator make it a verification fixture, not a
+general-purpose operating system. The syscall fixture builds its initial page
+tables during guest startup; +minimal_kernel.asm+ keeps static tables for the
+smaller boot-path example.
+
+[source,console]
+----
+cargo run --bin sc16build -- package-disk examples/syscall_kernel.asm disks/KERN0002 SyscallKernel 65536 --kernel
+cargo run --bin sc16build -- examples/syscall_child.asm target/syscall_child.img
+Copy-Item target\syscall_child.img disks\KERN0002\child.bin
+Set-Content -NoNewline -Encoding ascii disks\KERN0002\input.txt hello
+cargo run --bin suomicpu16
 ----
 
 The Rust C compiler used by the offline build tool supports a limited subset:
@@ -654,6 +693,22 @@ and the remaining compiler/backend work.
 |+SETSPH+
 |+SETSPH Rd+
 |Set the stack pointer's high 14 address bits from +Rd[13:0]+, preserving its low 16 bits.
+
+|+LIDT MMUON MMUSWITCH+
+|+LIDT Rn+ / +MMUON Rn+ / +MMUSWITCH Rn+
+|Supervisor-only. The even/odd register pair beginning at +Rn+ (high word first) holds the IDT base or page-directory root.
+
+|+MMUOFF+
+|+MMUOFF+
+|Supervisor-only. Disable address translation.
+
+|+ENTERU+
+|+ENTERU Rn, Rm+
+|Supervisor-only. Enter user mode using the entry address and stack in even/odd register pairs (high word first), starting at +Rn+ and +Rm+.
+
+|+STARTU+
+|+STARTU Rn, Rm+
+|Supervisor-only. Create and activate a scheduled user task using the entry and stack addresses in even/odd register pairs.
 
 |+NOP+
 |+NOP+
@@ -1218,6 +1273,31 @@ The BIOS loads the selected SC-16 image directly, without compiling source.
 Use Up/Down and Enter to select and boot.
 The optional +--disk ID+ preselects a boot disk. With an explicit program
 path, that option mounts the same folder filesystem for guest file operations.
+
+==== SisuOS demonstration
+
+The checked-in +disks/OS000001+ folder contains SisuOS, a small protected,
+preemptive OS demonstration. Start it with:
+[source,console]
+----
+cargo run --bin suomicpu16 -- --disk OS000001
+----
+Press Enter in the BIOS. The kernel installs its IDT, enables the MMU and
+instruction timer, and starts the user-mode shell. Available
+commands are +help+, +list+, +info+, and +run demo+. The demo runs as a child
+task; after it exits, the shell reports its status and displays the prompt
+again. The program list is fixed to +demo+ and this example is not a
+general-purpose OS.
+
+To build a fresh copy without overwriting an existing folder:
+[source,powershell]
+----
+.\scripts\build-preemptive-os.ps1 .\build\OS000001
+----
+The script packages the kernel and protected demo images from
++examples/preemptive_os_kernel.asm+, +examples/preemptive_os_shell.asm+, and
++examples/preemptive_os_demo.asm+. The BIOS integration test boots the checked-in
+disk and verifies its images match those sources.
 
 The BIOS information block starts at +0x43040+: bytes +0..3+ are the +SC16+
 signature, bytes +4..5+ are the BIOS version, bytes +6..8+ contain the memory

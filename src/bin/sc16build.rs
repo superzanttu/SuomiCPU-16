@@ -563,7 +563,17 @@ mod tests {
         );
 
         let kernel_disk_path = root.join("KERN0001");
-        package_disk(&source, &kernel_disk_path, "Kernel disk", 4096, true).unwrap();
+        let kernel_example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join("minimal_kernel.asm");
+        package_disk(
+            &kernel_example,
+            &kernel_disk_path,
+            "Kernel disk",
+            65536,
+            true,
+        )
+        .unwrap();
         let kernel_disk = suomicpu16::disk::FolderDisk::open(&kernel_disk_path).unwrap();
         assert!(kernel_disk.root().join("kernel.bin").is_file());
         assert!(!kernel_disk.root().join("main.bin").exists());

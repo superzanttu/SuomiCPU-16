@@ -109,6 +109,21 @@ print_string_next:
 print_string_done:
     RET
 
+print_string_limited:
+    LDA R5, 0x43300
+    LDI R3, 46
+print_string_limited_next:
+    LD R7, R6
+    CMP R7, R4
+    BZ print_string_limited_done
+    ST R5, R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZ print_string_limited_next
+print_string_limited_done:
+    RET
+
 render_custom_settings:
     PUSH R0
     LDI R3, 0
@@ -127,6 +142,30 @@ render_custom_loop:
     LDI R2, 6
     LDA R5, 0x43400
     ST R5, R2
+    LDI R6, 3
+    ADD R6, R3
+    LDA R5, 0x5023
+    LD R2, R5
+    CMP R2, R6
+    BNZ render_custom_value
+    PUSH R0
+    PUSH R1
+    LDA R7, 0x5120
+    LDA R6, 0x43430
+    LDI R3, 42
+render_custom_edit_overlay:
+    LD R2, R7
+    ST R6, R2
+    INC R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZ render_custom_edit_overlay
+    POP R1
+    POP R0
+render_custom_value:
+    LDA R5, 0x5026
+    LD R3, R5
     LDI R6, 3
     ADD R6, R3
     LDA R5, 0x5021
@@ -173,6 +212,27 @@ render_custom_type:
     ST R5, R3
     JMP render_custom_loop
 render_custom_done:
+    LDA R5, 0x5023
+    LD R3, R5
+    CMP R3, R4
+    BZX render_custom_done_color
+    LDI R6, 3
+    CMP R3, R6
+    BCX render_custom_done_color
+    PUSH R1
+    LDI R7, 0x5120
+    LDA R6, 0x43430
+    LDI R3, 42
+render_custom_done_restore:
+    LD R2, R7
+    ST R6, R2
+    INC R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZX render_custom_done_restore
+    POP R1
+render_custom_done_color:
     LDI R3, 1
     LDA R5, 0x43301
     ST R5, R3
@@ -245,6 +305,10 @@ render_boot_color:
     CALL print_string
     LDA R6, 0x5000
     CALL print_string
+    LDA R6, boot_close
+    CALL print_string
+    LDA R6, newline
+    CALL print_string
     LDI R3, 0
     LDA R5, 0x43406
     STW R5, R3
@@ -260,12 +324,16 @@ render_boot_color:
     LDA R5, 0x4340c
     LD R3, R5
     BNZ render_disk_info_invalid
-    LDA R6, 0x5080
+    LDA R6, disk_info_prefix
     CALL print_string
+    LDA R6, 0x5080
+    CALL print_string_limited
     JMP render_disk_info_done
 render_disk_info_invalid:
-    LDA R6, invalid_disk_info
+    LDA R6, disk_info_prefix
     CALL print_string
+    LDA R6, invalid_disk_info
+    CALL print_string_limited
 render_disk_info_done:
     LDA R6, newline
     CALL print_string
@@ -349,7 +417,15 @@ render_node_color:
     LDA R6, newline
     CALL print_string
     CALL render_custom_settings
+    LDA R5, 0x5023
+    LD R2, R5
+    CMP R2, R4
+    BNZ render_edit_help
     LDA R6, help_text
+    JMP render_help
+render_edit_help:
+    LDA R6, edit_active_help
+render_help:
     CALL print_string
 
     LDA R5, 0x5022
@@ -383,6 +459,10 @@ render_bottom:
     JMP menu_input
 
 menu_input:
+    LDA R5, 0x5023
+    LD R3, R5
+    CMP R3, R4
+    BNZ edit_input
     LDA R5, 0x43000
     LD R2, R5
     CMP R2, R4
@@ -395,13 +475,13 @@ menu_input:
     BZ select_next
     LDI R3, 0x82
     CMP R2, R3
-    BZ disk_left
+    BZX disk_left
     LDI R3, 0x83
     CMP R2, R3
-    BZ disk_right
+    BZX disk_right
     LDI R3, 13
     CMP R2, R3
-    BZ activate_row
+    BZX activate_row
     LDI R3, 0x88
     CMP R2, R3
     BZX reload_settings
@@ -445,6 +525,340 @@ select_first:
     ST R5, R3
     JMP menu_render
 
+edit_input:
+    LDA R5, 0x43000
+    LD R2, R5
+    CMP R2, R4
+    BZX menu_input
+    LDI R6, 27
+    CMP R2, R6
+    BZX edit_cancel
+    LDI R6, 13
+    CMP R2, R6
+    BZX edit_confirm
+    LDI R6, 0x82
+    CMP R2, R6
+    BZX edit_toggle
+    LDI R6, 0x83
+    CMP R2, R6
+    BZX edit_toggle
+    LDI R6, 8
+    CMP R2, R6
+    BZX edit_backspace
+    LDA R5, 0x5023
+    LD R3, R5
+    LDI R6, 1
+    CMP R3, R6
+    BZX edit_node_character
+    LDI R6, 2
+    CMP R3, R6
+    BZX edit_node_character
+    JMPX edit_custom_character
+
+edit_toggle:
+    LDA R5, 0x5023
+    LD R3, R5
+    LDI R6, 1
+    CMP R3, R6
+    BZX edit_startup_toggle
+    LDI R6, 3
+    CMP R3, R6
+    BC menu_input
+    LDA R5, 0x43441
+    LD R6, R5
+    CMP R6, R4
+    BNZX menu_input
+    LDA R7, 0x43442
+    LD R6, R7
+    LDI R5, 0x59
+    CMP R6, R5
+    BNZX edit_custom_set_yes
+    LDI R6, 0x4e
+    ST R7, R6
+    INC R7
+    LDI R6, 0x6f
+    ST R7, R6
+    INC R7
+    LDI R6, 0
+    ST R7, R6
+    JMPX edit_custom_stage
+edit_custom_set_yes:
+    LDI R6, 0x59
+    ST R7, R6
+    INC R7
+    LDI R6, 0x65
+    ST R7, R6
+    INC R7
+    LDI R6, 0x73
+    ST R7, R6
+    INC R7
+    LDI R6, 0
+    ST R7, R6
+    JMPX edit_custom_stage
+edit_startup_toggle:
+    LDA R5, 0x5020
+    LD R3, R5
+    LDI R6, 1
+    SUB R6, R3
+    ST R5, R6
+    JMP menu_render
+
+edit_backspace:
+    LDA R5, 0x5023
+    LD R3, R5
+    LDI R6, 1
+    CMP R3, R6
+    BZX menu_input
+    LDI R6, 2
+    CMP R3, R6
+    BZX edit_node_backspace
+    LDA R5, 0x43441
+    LD R6, R5
+    CMP R6, R4
+    BZX menu_input
+    LDA R5, 0x5025
+    LD R3, R5
+    CMP R3, R4
+    BZX menu_input
+    DEC R3
+    LDA R7, 0x43442
+    ADD R7, R3
+    LDI R6, 0
+    ST R7, R6
+    LDA R5, 0x5025
+    ST R5, R3
+    JMPX edit_custom_stage
+
+edit_node_backspace:
+    LDA R5, 0x5025
+    LD R3, R5
+    CMP R3, R4
+    BZX menu_input
+    DEC R3
+    LDA R7, 0x43410
+    ADD R7, R3
+    LDI R6, 0
+    ST R7, R6
+    LDA R5, 0x5025
+    ST R5, R3
+    JMP menu_render
+
+edit_node_character:
+    LDI R6, 0x20
+    CMP R2, R6
+    BC menu_input
+    LDI R6, 0x7f
+    CMP R2, R6
+    BZ menu_input
+    BCX edit_node_append
+    JMP menu_input
+edit_node_append:
+    LDA R5, 0x5025
+    LD R3, R5
+    LDI R6, 16
+    CMP R3, R6
+    BZ menu_input
+    LDA R7, 0x43410
+    ADD R7, R3
+    ST R7, R2
+    INC R3
+    INC R7
+    LDI R6, 0
+    ST R7, R6
+    LDA R5, 0x5025
+    ST R5, R3
+    JMP menu_render
+
+edit_custom_character:
+    LDA R5, 0x43441
+    LD R6, R5
+    LDI R5, 1
+    CMP R6, R5
+    BZX edit_custom_string_character
+    LDI R5, 2
+    CMP R6, R5
+    BNZ menu_input
+    LDI R6, 0x2d
+    CMP R2, R6
+    BZX edit_custom_number_minus
+    LDI R6, 0x30
+    CMP R2, R6
+    BC menu_input
+    LDI R6, 0x3a
+    CMP R2, R6
+    BCX edit_custom_append
+    JMP menu_input
+edit_custom_number_minus:
+    LDA R5, 0x5025
+    LD R3, R5
+    CMP R3, R4
+    BNZ menu_input
+    JMPX edit_custom_append
+edit_custom_string_character:
+    LDI R6, 0x20
+    CMP R2, R6
+    BC menu_input
+    LDI R6, 0x7f
+    CMP R2, R6
+    BCX edit_custom_append
+    JMP menu_input
+edit_custom_append:
+    LDA R5, 0x5025
+    LD R3, R5
+    LDA R5, 0x43441
+    LD R6, R5
+    LDI R5, 1
+    CMP R6, R5
+    BZX edit_custom_string_limit
+    LDI R6, 20
+    JMPX edit_custom_check_limit
+edit_custom_string_limit:
+    LDI R6, 16
+edit_custom_check_limit:
+    CMP R3, R6
+    BZ menu_input
+    LDA R7, 0x43442
+    ADD R7, R3
+    ST R7, R2
+    INC R3
+    INC R7
+    LDI R6, 0
+    ST R7, R6
+    LDA R5, 0x5025
+    ST R5, R3
+    JMPX edit_custom_stage
+
+edit_custom_stage:
+    PUSH R0
+    LDA R7, 0x43430
+    LDI R6, 0x5120
+    LDI R3, 42
+edit_custom_stage_loop:
+    LD R2, R7
+    ST R6, R2
+    INC R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZ edit_custom_stage_loop
+    POP R0
+    JMP menu_render
+
+edit_cancel:
+    LDA R5, 0x5023
+    LD R3, R5
+    LDI R6, 1
+    CMP R3, R6
+    BZX edit_cancel_startup
+    LDI R6, 2
+    CMP R3, R6
+    BZX edit_cancel_node
+    JMPX edit_finish
+edit_cancel_startup:
+    LDA R5, 0x5024
+    LD R3, R5
+    LDA R5, 0x5020
+    ST R5, R3
+    JMPX edit_finish
+edit_cancel_node:
+    LDA R7, 0x5030
+    LDA R6, 0x43410
+    LDI R3, 17
+edit_cancel_node_loop:
+    LD R2, R7
+    ST R6, R2
+    INC R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZ edit_cancel_node_loop
+    JMPX edit_finish
+
+edit_confirm:
+    LDA R5, 0x5023
+    LD R3, R5
+    LDI R6, 1
+    CMP R3, R6
+    BZX edit_confirm_startup
+    LDI R6, 2
+    CMP R3, R6
+    BZX edit_confirm_node
+    JMPX edit_confirm_custom
+edit_confirm_startup:
+    LDA R5, 0x5020
+    LD R3, R5
+    LDA R5, 0x5024
+    LD R2, R5
+    CMP R3, R2
+    BZX edit_finish
+    JMPX edit_mark_dirty
+edit_confirm_node:
+    LDA R7, 0x43410
+    LDI R6, 0x5030
+    LDI R3, 17
+edit_confirm_node_loop:
+    LD R2, R7
+    LD R5, R6
+    CMP R2, R5
+    BNZ edit_mark_dirty
+    INC R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZ edit_confirm_node_loop
+    JMPX edit_finish
+edit_confirm_custom:
+    LDA R7, 0x5120
+    LDI R6, 0x5050
+    LDI R3, 42
+edit_confirm_custom_compare:
+    LD R2, R7
+    LD R5, R6
+    CMP R2, R5
+    BNZ edit_confirm_custom_write
+    INC R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZ edit_confirm_custom_compare
+    JMPX edit_finish
+edit_confirm_custom_write:
+    PUSH R0
+    LDA R7, 0x5120
+    LDA R6, 0x43430
+    LDI R3, 42
+edit_confirm_custom_copy:
+    LD R2, R7
+    ST R6, R2
+    INC R7
+    INC R6
+    DEC R3
+    CMP R3, R4
+    BNZ edit_confirm_custom_copy
+    LDA R5, 0x5023
+    LD R0, R5
+    LDI R3, 3
+    SUB R0, R3
+    LDA R5, 0x43402
+    STW R5, R0
+    LDI R3, 7
+    LDA R5, 0x43400
+    ST R5, R3
+    LDA R5, 0x4340c
+    LD R3, R5
+    POP R0
+    CMP R3, R4
+    BNZ settings_failed
+edit_mark_dirty:
+    LDI R3, 1
+    LDA R5, 0x5022
+    ST R5, R3
+edit_finish:
+    LDI R3, 0
+    LDA R5, 0x5023
+    ST R5, R3
+    JMP menu_render
+
 disk_left:
     LDA R5, 0x5021
     LD R3, R5
@@ -453,13 +867,13 @@ disk_left:
     LDA R5, 0x43402
     LDW R0, R5
     CMP R0, R4
-    BZ disk_left_wrap
+    BZX disk_left_wrap
     DEC R0
-    JMP disk_changed
+    JMPX disk_changed
 disk_left_wrap:
     MOV R0, R1
     DEC R0
-    JMP disk_changed
+    JMPX disk_changed
 disk_right:
     LDA R5, 0x5021
     LD R3, R5
@@ -469,14 +883,11 @@ disk_right:
     LDW R0, R5
     INC R0
     CMP R0, R1
-    BZ disk_right_wrap
-    JMP disk_changed
+    BZX disk_right_wrap
+    JMPX disk_changed
 disk_right_wrap:
     LDI R0, 0
 disk_changed:
-    LDI R3, 1
-    LDA R5, 0x5022
-    ST R5, R3
     JMP menu_render
 
 activate_row:
@@ -502,62 +913,23 @@ activate_row:
     LDA R5, 0x4340c
     LD R3, R5
     CMP R3, R4
-    BNZ custom_read_failed
+    BNZ activate_custom_failed
+    POP R0
     JMPX edit_custom
+activate_custom_failed:
+    POP R0
+    JMPX settings_failed
 
 edit_startup:
     LDA R5, 0x5020
     LD R3, R5
     LDA R6, 0x5024
     ST R6, R3
-    LDA R6, edit_startup_screen
-    CALLX show_edit_screen
-startup_edit:
-    LDA R5, 0x43000
-    LD R2, R5
-    CMP R2, R4
-    BZ startup_edit
-    LDI R3, 27
-    CMP R2, R3
-    BZ startup_cancel
-    LDI R3, 13
-    CMP R2, R3
-    BZ startup_confirm
-    LDI R3, 0x82
-    CMP R2, R3
-    BZ startup_toggle
-    LDI R3, 0x83
-    CMP R2, R3
-    BZ startup_toggle
-    JMP startup_edit
-startup_toggle:
-    LDA R5, 0x5020
-    LD R3, R5
-    LDI R6, 1
-    SUB R6, R3
-    ST R5, R6
-    JMP startup_edit
-startup_cancel:
-    LDA R5, 0x5024
-    LD R3, R5
-    LDA R6, 0x5020
-    ST R6, R3
-    JMP menu_render
-startup_confirm:
-    LDA R5, 0x5024
-    LD R3, R5
-    LDA R6, 0x5020
-    LD R2, R6
-    CMP R2, R3
-    BZ menu_render
     LDI R3, 1
-    LDA R5, 0x5022
+    LDA R5, 0x5023
     ST R5, R3
     JMP menu_render
-
 edit_node:
-    PUSH R0
-    PUSH R1
     LDI R3, 0
     LDA R5, 0x5025
     ST R5, R3
@@ -565,10 +937,10 @@ edit_node:
 node_length:
     LD R2, R7
     CMP R2, R4
-    BZ node_length_done
+    BZX node_length_done
     INC R3
     INC R7
-    JMP node_length
+    JMPX node_length
 node_length_done:
     LDA R5, 0x5025
     ST R5, R3
@@ -582,343 +954,50 @@ node_backup_loop:
     INC R7
     INC R6
     DEC R3
-    BNZ node_backup_loop
-    LDA R5, 0x5025
-    LD R3, R5
-    LDA R6, edit_node_screen
-    CALLX show_edit_screen
-    LDA R6, node_value_prefix
-    CALL print_string
-    LDA R6, 0x43410
-    CALL print_string
-node_edit:
-    LDA R5, 0x43000
-    LD R2, R5
-    CMP R2, R4
-    BZ node_edit
-    LDI R6, 27
-    CMP R2, R6
-    BZX node_cancel
-    LDI R6, 13
-    CMP R2, R6
-    BZX node_confirm
-    LDI R6, 8
-    CMP R2, R6
-    BZX node_backspace
-    LDI R6, 16
-    CMP R2, R6
-    BZ node_edit
-    LDI R6, 0x80
-    CMP R2, R6
-    BZ node_edit
-    LDI R6, 0x81
-    CMP R2, R6
-    BZ node_edit
-    LDI R6, 0x20
-    CMP R2, R6
-    BC node_edit
-    LDI R6, 0x7f
-    CMP R2, R6
-    BZ node_edit
-    BCX node_append
-    JMPX node_edit
-node_append:
-    LDI R6, 16
-    CMP R3, R6
-    BZ node_edit
-    LDA R7, 0x43410
-    ADD R7, R3
-    ST R7, R2
-    INC R3
-    INC R7
-    LDI R6, 0
-    ST R7, R6
-    LDA R5, 0x43300
-    ST R5, R2
-    JMP node_edit
-node_backspace:
     CMP R3, R4
-    BZ node_edit
-    DEC R3
-    LDA R7, 0x43410
-    ADD R7, R3
-    LDI R6, 0
-    ST R7, R6
-    LDA R5, 0x43300
-    ST R5, R2
-    JMP node_edit
-node_cancel:
-    LDA R7, 0x43410
-    LDI R6, 0x5030
-    LDI R3, 17
-node_restore_loop:
-    LD R2, R6
-    ST R7, R2
-    INC R7
-    INC R6
-    DEC R3
-    BNZ node_restore_loop
-    POP R1
-    POP R0
-    JMP menu_render
-node_confirm:
-    LDA R7, 0x43410
-    LDI R6, 0x5030
-    LDI R3, 17
-node_confirm_compare:
-    LD R2, R7
-    LD R5, R6
-    CMP R2, R5
-    BNZ node_confirm_changed
-    INC R7
-    INC R6
-    DEC R3
-    BNZ node_confirm_compare
-    POP R1
-    POP R0
-    JMP menu_render
-node_confirm_changed:
-    POP R1
-    POP R0
-    LDI R3, 1
-    LDA R5, 0x5022
+    BNZX node_backup_loop
+    LDI R3, 2
+    LDA R5, 0x5023
     ST R5, R3
     JMP menu_render
-
 edit_custom:
+    LDA R5, 0x5021
+    LD R3, R5
+    LDA R5, 0x5023
+    ST R5, R3
+    PUSH R0
+    PUSH R1
     LDA R7, 0x43430
     LDI R6, 0x5050
+    LDI R1, 0x5120
     LDI R3, 42
 custom_backup_loop:
     LD R2, R7
     ST R6, R2
+    ST R1, R2
     INC R7
     INC R6
+    INC R1
     DEC R3
+    CMP R3, R4
     BNZ custom_backup_loop
-    LDA R6, edit_custom_screen
-    CALLX show_edit_screen
-    LDA R6, custom_value_prefix
-    CALL print_string
-    LDA R6, 0x43442
-    CALL print_string
+    POP R1
+    POP R0
+    LDA R5, 0x5025
     LDI R3, 0
+    ST R5, R3
     LDA R7, 0x43442
 custom_value_length:
     LD R2, R7
     CMP R2, R4
-    BZX custom_input
+    BZX custom_edit_ready
     INC R3
     INC R7
     JMPX custom_value_length
-custom_input:
+custom_edit_ready:
     LDA R5, 0x5025
     ST R5, R3
-    LDA R5, 0x43000
-    LD R2, R5
-    CMP R2, R4
-    BZX custom_input
-    LDI R6, 27
-    CMP R2, R6
-    BZX custom_cancel
-    LDI R6, 13
-    CMP R2, R6
-    BZX custom_confirm
-    LDI R6, 8
-    CMP R2, R6
-    BZX custom_backspace
-    LDI R6, 0x82
-    CMP R2, R6
-    BZX custom_boolean_toggle
-    LDI R6, 0x83
-    CMP R2, R6
-    BZX custom_boolean_toggle
-    LDA R5, 0x43441
-    LD R6, R5
-    LDI R5, 0
-    CMP R6, R5
-    BZX custom_input
-    LDI R5, 2
-    CMP R6, R5
-    BZX custom_number_character
-    JMPX custom_string_character
-custom_boolean_toggle:
-    LDA R5, 0x43441
-    LD R6, R5
-    CMP R6, R4
-    BNZX custom_input
-    LDA R7, 0x43442
-    LD R6, R7
-    LDI R5, 0x59
-    CMP R6, R5
-    BNZX custom_boolean_yes
-    LDI R6, 0x4e
-    ST R7, R6
-    INC R7
-    LDI R6, 0x6f
-    ST R7, R6
-    JMPX custom_boolean_terminate
-custom_boolean_yes:
-    LDI R6, 0x59
-    ST R7, R6
-    INC R7
-    LDI R6, 0x65
-    ST R7, R6
-    INC R7
-    LDI R6, 0x73
-    ST R7, R6
-custom_boolean_terminate:
-    INC R7
-    LDI R6, 0
-    ST R7, R6
-    LDA R6, newline
-    CALL print_string
-    LDA R6, custom_value_prefix
-    CALL print_string
-    LDA R6, 0x43442
-    CALL print_string
-    JMPX custom_input
-custom_string_character:
-    LDI R6, 0x20
-    CMP R2, R6
-    BCX custom_input
-    LDI R6, 0x7f
-    CMP R2, R6
-    BZX custom_input
-    BCX custom_append
-    JMPX custom_input
-custom_number_character:
-    LDI R6, 0x2d
-    CMP R2, R6
-    BZX custom_number_minus
-    LDI R6, 0x30
-    CMP R2, R6
-    BCX custom_input
-    LDI R6, 0x3a
-    CMP R2, R6
-    BCX custom_append
-    JMPX custom_input
-custom_number_minus:
-    LDA R5, 0x5025
-    LD R3, R5
-    CMP R3, R4
-    BNZX custom_input
-    JMPX custom_append
-custom_append:
-    LDA R5, 0x43441
-    LD R6, R5
-    LDI R5, 1
-    CMP R6, R5
-    BZX custom_string_limit
-    LDI R6, 20
-    JMPX custom_check_limit
-custom_string_limit:
-    LDI R6, 16
-custom_check_limit:
-    LDA R5, 0x5025
-    LD R3, R5
-    CMP R3, R6
-    BZX custom_input
-    LDA R7, 0x43442
-    ADD R7, R3
-    ST R7, R2
-    INC R3
-    INC R7
-    LDI R6, 0
-    ST R7, R6
-    LDA R5, 0x5025
-    ST R5, R3
-    LDA R5, 0x43300
-    ST R5, R2
-    JMPX custom_input
-custom_backspace:
-    LDA R5, 0x43441
-    LD R6, R5
-    CMP R6, R4
-    BZX custom_input
-    LDA R5, 0x5025
-    LD R3, R5
-    CMP R3, R4
-    BZX custom_input
-    DEC R3
-    LDA R7, 0x43442
-    ADD R7, R3
-    LDI R6, 0
-    ST R7, R6
-    LDI R2, 8
-    LDA R5, 0x43300
-    ST R5, R2
-    LDA R5, 0x5025
-    ST R5, R3
-    JMPX custom_input
-custom_cancel:
-    LDI R7, 0x5050
-    LDA R6, 0x43430
-    LDI R3, 42
-custom_restore_loop:
-    LD R2, R7
-    ST R6, R2
-    INC R7
-    INC R6
-    DEC R3
-    BNZX custom_restore_loop
-    POP R0
-    JMPX menu_render
-custom_confirm:
-    LDA R7, 0x43442
-    LDI R6, 0x5062
-    LDI R3, 24
-custom_compare_loop:
-    LD R2, R7
-    LD R5, R6
-    CMP R2, R5
-    BNZX custom_value_changed
-    INC R7
-    INC R6
-    DEC R3
-    BNZX custom_compare_loop
-    POP R0
-    JMPX menu_render
-custom_value_changed:
-    LDI R3, 7
-    LDA R5, 0x43400
-    ST R5, R3
-    LDA R5, 0x4340c
-    LD R3, R5
-    CMP R3, R4
-    BNZX custom_write_failed
-    LDI R3, 1
-    LDA R5, 0x5022
-    ST R5, R3
-    POP R0
-    JMPX menu_render
-custom_write_failed:
-    POP R0
-    JMPX settings_failed
-custom_read_failed:
-    POP R0
-    JMPX settings_failed
-
-show_edit_screen:
-    PUSH R0
-    MOV R0, R6
-    LDI R3, 1
-    LDA R5, 0x43303
-    ST R5, R3
-    LDI R3, 1
-    LDA R5, 0x43301
-    ST R5, R3
-    LDA R6, frame_top
-    CALL print_string
-    LDA R6, title
-    CALL print_string
-    LDA R6, frame_middle
-    CALL print_string
-    MOV R6, R0
-    CALL print_string
-    POP R0
-    RET
-
+    JMP menu_render
 reload_settings:
     LDI R3, 5
     LDA R5, 0x43400
@@ -937,6 +1016,8 @@ reload_settings:
     ST R5, R2
     LDI R3, 0
     LDA R5, 0x5022
+    ST R5, R3
+    LDA R5, 0x5023
     ST R5, R3
     LDA R6, settings_loaded
     CALL print_string
@@ -978,6 +1059,15 @@ boot_selected:
     BNZ menu_input
     LDA R5, 0x43402
     STW R5, R0
+    LDI R3, 9
+    LDA R5, 0x43400
+    ST R5, R3
+    LDA R5, 0x4340c
+    LD R3, R5
+    CMP R3, R4
+    BNZ settings_failed
+    LDA R5, 0x43402
+    LDW R0, R5
     LDI R3, 3
     LDA R5, 0x43400
     ST R5, R3
@@ -1011,7 +1101,11 @@ boot_label:
 boot_unselected:
     .data string "|    Boot device: [ \0"
 boot_suffix:
-    .data string " ]  LEFT/RIGHT changes\r\n\0"
+    .data string "|  LEFT/RIGHT changes device.\r\n\0"
+boot_close:
+    .data string " ]\0"
+disk_info_prefix:
+    .data string "|  \0"
 startup_label:
     .data string "|  > Automatic startup: \0"
 startup_unselected:
@@ -1037,7 +1131,9 @@ value_no:
 newline:
     .data string "\r\n\0"
 help_text:
-    .data string "|\r\n|  UP/DOWN select. ENTER edit or start.\r\n|  ESC cancels. F9 reloads; F10 saves settings.\r\n|  BOOL Yes/No, STRING max 16, NUMBER integer.\r\n\0"
+    .data string "|\r\n|  UP/DOWN select. ENTER edits or starts.\r\n|  F9 reloads; F10 saves settings.\r\n|  BOOL Yes/No, STRING max 16, NUMBER integer.\r\n\0"
+edit_active_help:
+    .data string "|\r\n|  Editing in place: LEFT/RIGHT changes BOOL.\r\n|  Type STRING/NUMBER; BACKSPACE deletes.\r\n|  ENTER confirms; ESC cancels.\r\n\0"
 start_hint:
     .data string "|  Press ENTER to start from selected device.\r\n\0"
 edit_hint:
@@ -1048,16 +1144,6 @@ unsaved_warning:
     .data string "|  WARNING: settings changed but not saved. F10 saves.\r\n\0"
 frame_bottom:
     .data string "+-------------------------------------------------+\r\n\0"
-edit_startup_screen:
-    .data string "|  Edit Automatic startup (BOOL)\r\n|  LEFT/RIGHT changes Yes/No.\r\n|  ENTER confirms; ESC cancels.\r\n\0"
-edit_node_screen:
-    .data string "|  Edit SC-NET node ID (STRING, max 16 chars)\r\n|  Type text; BACKSPACE deletes.\r\n|  ENTER confirms; ESC cancels.\r\n\0"
-node_value_prefix:
-    .data string "|  Value: \0"
-edit_custom_screen:
-    .data string "|  Edit custom setting. BOOL: LEFT/RIGHT toggles.\r\n|  Type to edit STRING/NUMBER; BACKSPACE deletes.\r\n|  ENTER confirms; ESC cancels.\r\n\0"
-custom_value_prefix:
-    .data string "|  Value: \0"
 settings_loaded:
     .data string "|  Settings reloaded from bios.json.\r\n\0"
 settings_saved:

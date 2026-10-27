@@ -1,7 +1,7 @@
 ; Instruction reference for the SC-16 assembler.
 ; Load with: cargo run -- examples/commands.asm
-; Interrupt instructions and the extended stack/control operations are placed
-; after HALT so the tour can run without enabling interrupts.
+; Interrupt, privilege, and extended stack/control operations follow HALT so
+; the tour can run without enabling interrupts or entering kernel-only paths.
 
 .address 0x0080
 start:
@@ -48,6 +48,12 @@ jump_target:
     EI                     ; Encoding example; not reached during this run
     DI                     ; Encoding example; not reached during this run
     RTI
+    LIDT R0
+    MMUON R0
+    MMUSWITCH R0
+    MMUOFF
+    ENTERU R0, R2
+    STARTU R0, R2
     CALL sample_routine    ; CALL/RET and BZ encoding examples; also unreachable
     BZ sample_routine
     BC sample_routine

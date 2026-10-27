@@ -773,9 +773,13 @@ fn extended_instruction(
 
     let misc = lookup(MISC_OPERATIONS, mnemonic);
     if let Some(operation) = misc {
-        let pair_call = matches!(mnemonic, "CALLRP" | "JMPRP");
+        let pair_registers = matches!(mnemonic, "LIDT" | "MMUON" | "MMUSWITCH");
+        let pair_call = matches!(mnemonic, "CALLRP" | "JMPRP" | "ENTERU" | "STARTU");
+        let no_operand = matches!(mnemonic, "MMUOFF");
         let expected = if pair_call {
             2
+        } else if no_operand {
+            0
         } else if matches!(mnemonic, "PUSHF" | "POPF" | "SETC" | "CLC") {
             0
         } else {
@@ -792,9 +796,24 @@ fn extended_instruction(
         } else {
             register(operands[0], line)?
         };
+        if pair_registers || matches!(mnemonic, "ENTERU" | "STARTU") {
+            if destination & 1 != 0 || destination > 6 {
+                return Err(error(
+                    line,
+                    format!("{mnemonic} requires an even register pair"),
+                ));
+            }
+        }
         let mut control = (ALU_MISC_OPERATION << 12) | operation;
         if pair_call {
-            control |= register(operands[1], line)? << 9;
+            let source = register(operands[1], line)?;
+            if matches!(mnemonic, "ENTERU" | "STARTU") && (source & 1 != 0 || source > 6) {
+                return Err(error(
+                    line,
+                    format!("{mnemonic} requires an even register pair for its stack"),
+                ));
+            }
+            control |= source << 9;
         }
         return Ok(Some(vec![
             0xf800 | (destination << 8) | ALU_PREFIX,
@@ -1001,7 +1020,8 @@ fn instruction_size(text: &str, line: usize) -> Result<u32, AssemblyError> {
             }
         }
         "SWAP" | "SEXT" | "JMPR" | "CALLR" | "PUSHF" | "POPF" | "SETC" | "CLC" | "SETSP"
-        | "CLZ" | "MOVSPH" | "CALLRP" | "JMPRP" | "SETSPH" => 4,
+        | "CLZ" | "MOVSPH" | "CALLRP" | "JMPRP" | "SETSPH" | "LIDT" | "MMUON" | "MMUSWITCH"
+        | "MMUOFF" | "ENTERU" | "STARTU" => 4,
         "ADD" | "SUB" | "AND" | "OR" | "XOR" | "CMP" => {
             if operands.len() == 2 && !is_register(operands[1]) {
                 6
@@ -1372,6 +1392,24 @@ mod tests {
             b"\xf8\x1f\xf2\x0b\xfa\x1f\xf6\x0c"
         );
         assert_eq!(
+            assemble("LIDT R0\nMMUON R2\nMMUSWITCH R4\nMMUOFF", 0)
+                .unwrap()
+                .segments[0]
+                .data,
+            b"\xf8\x1f\xf0\x0e\xfa\x1f\xf0\x0f\xfc\x1f\xf0\x10\xf8\x1f\xf0\x11"
+        );
+        assert_eq!(
+            assemble("ENTERU R0, R2", 0).unwrap().segments[0].data,
+            b"\xf8\x1f\xf4\x12"
+        );
+        assert_eq!(
+            assemble("STARTU R0, R2", 0).unwrap().segments[0].data,
+            b"\xf8\x1f\xf4\x13"
+        );
+        assert!(assemble("LIDT R7", 0).is_err());
+        assert!(assemble("ENTERU R0, R3", 0).is_err());
+        assert!(assemble("STARTU R0, R3", 0).is_err());
+        assert_eq!(
             assemble(
                 "LDW R2, R3\nSTW R2, R3\nLDWS R2, 4\nSTWS R2, 4\nADJSP -2\nBC 0x100\nSHR R3\n",
                 0,
@@ -1630,7 +1668,7 @@ mod tests {
                 .iter()
                 .map(|segment| segment.data.len())
                 .sum::<usize>(),
-            632
+            656
         );
     }
 

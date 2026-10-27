@@ -1,0 +1,11 @@
+{
+    "capacity_bytes": 16777216,
+    "id": "SisuOS-1",
+    "label": "SisuOS",
+    "protected_files": [
+        "kernel.bin",
+        "demo.bin"
+    ],
+    "read_only": false,
+    "version": 1
+}

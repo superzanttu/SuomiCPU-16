@@ -1,7 +1,7 @@
 {
   "network_name": "SC16-A8D05DB313B",
-  "preferred_disk": "DISK0002",
+  "preferred_disk": "SisuOS-1",
   "settings": {},
-  "startup_behavior": "boot_preferred",
+  "startup_behavior": "selector",
   "version": 1
 }

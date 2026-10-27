@@ -122,6 +122,14 @@ code. `bios.bin` is always counted as trusted firmware and runs in kernel
 design does not claim authenticated boot or memory isolation. Firmware may
 enable interrupts only after its handlers and kernel stack are ready.
 
+For the BIOS firmware gateway, write the operation number to byte
+`0x43400`; byte `0x4340c` reports success (0) or failure (nonzero). The
+selected disk index is the big-endian word at `0x43402`. Operation 4 saves the
+settings menu, including startup policy byte `0x43406`; operation 9 saves only
+the preferred disk and deliberately leaves startup policy and other settings
+unchanged. Enter on the Boot Device row uses operation 9 before booting, so a
+disk index cannot be mistaken for the 0/1 startup policy.
+
 The BIOS reads persistent settings from emulator-root `bios.json`. Missing
 settings use defaults; malformed settings are reported rather than overwritten.
 The BIOS menu can remember a preferred disk, choose selector or automatic
@@ -141,6 +149,15 @@ The processor has two modes: supervisor (kernel) and user. Reset enters
 supervisor mode. `EI`, `DI`, `RTI`, IDT installation, MMU control, address-space
 switching, and kernel mapping operations are supervisor-only. A user attempt
 raises a protection exception without applying the requested mutation.
+Guest supervisor code installs an IDT with `LIDT Rn`, enables translation with
+`MMUON Rn`, changes the active page-directory root with `MMUSWITCH Rn`, and
+disables translation with `MMUOFF`. `LIDT`, `MMUON`, and `MMUSWITCH` take an
+even register whose pair holds the 32-bit address/root. `ENTERU Rn, Rm`
+validates and enters user mode with each 32-bit address in an even/odd register
+pair (high word first); both starting registers must be even. These instructions use the
+same validation as the corresponding CPU control APIs.
+`STARTU Rn, Rm` creates and activates a scheduled user task with those entry
+and stack addresses, using the active address space and kernel stack.
 Interrupt-control, timer-control, BIOS, and other protected MMIO accesses are
 rejected in user mode. The explicit user-safe console, disk, text, input, and
 basic graphics ranges are filtered by the CPU. The GPU speed selector at
@@ -152,9 +169,9 @@ available.
 
 User instruction fetches, loads, and stores may access only user-permitted
 memory when MMU translation is enabled. Page permissions apply to every byte
-of multi-byte accesses. The supervisor-only `enter_user_mode` transition
-validates the entry point and stack, and validates their page permissions when
-translation is enabled. `SVC` is encoded as `0x0080` and dispatches through
+of multi-byte accesses. The supervisor-only `ENTERU` instruction validates the entry point and stack,
+including their page permissions when translation is enabled. `SVC` is
+encoded as `0x0080` and dispatches through
 vector 128. ABI version 1 uses this instruction for the syscall interface
 below. An `SVC` with R7 zero retains ordinary guest-handler delivery; unknown
 nonzero ABI versions are rejected. Do not treat the legacy no-MMU user mode as
@@ -228,8 +245,9 @@ privilege mode, interrupt-enable state, MMU-enabled state, and page-directory
 identity. The scheduler provides runnable, running, blocked, and exited states
 with round-robin selection, yield, exit, block, and wake operations. The
 versioned guest syscall interface below exposes the supported process and
-synchronization services; a booted general-purpose kernel and Phase 9
-end-to-end lifecycle remain future integration work.
+synchronization services. The Phase 9 lifecycle fixture and Phase 10 SisuOS
+demonstration boot through the common BIOS and execute guest workloads; neither
+example establishes general-purpose OS readiness.
 
 == Memory translation
 
@@ -382,13 +400,56 @@ This byte-register interface is the initial guest display API; it is not a
 memory-protection boundary. User access remains limited to the allowed text
 registers; the syscall ABI does not yet mediate display ownership.
 
-== Compatibility boundary
+== Supported versions and compatibility boundary
+
+The currently supported encoded formats and interfaces are:
+
+[cols="1,2"]
+|===
+|Interface |Supported version or status
+
+|Machine/ISA
+|This document defines the target contract; there is no separately encoded
+machine or ISA version.
+
+|Executable image
+|Version 2 (`SC16IMG2`). Version 1 images are rejected.
+
+|Folder-disk manifest
+|Version 1 (`disk.json`).
+
+|BIOS boot convention
+|Selects `kernel.bin` or `main.bin` from a version 1 folder disk. The boot
+convention has no independent version field.
+
+|System-call ABI
+|Version 1. Unknown or unsupported ABI versions return `-EINVAL`.
+|===
 
 Reset initializes PC to zero and SP/KSP to the top of configured memory,
 enters supervisor mode, and leaves interrupts and MMU translation disabled.
 Privilege transitions, IDT delivery, deterministic PIT timing, scheduler
 contexts, page translation, page faults, frame/mapping helpers, and syscall ABI
-version 1 are implemented and tested. Normal BIOS USER boot still enters
-compatibility user mode without installing MMU mappings; it must not be
-described as process-isolated. A booted kernel, authenticated boot, and the
-Phase 9 multi-process lifecycle remain open.
+version 1 are implemented and tested. The BIOS-booted SisuOS example verifies
+protected kernel startup, shell I/O, timer scheduling, child execution and
+return to its shell. The current implementation is not yet a general-purpose
+operating system:
+
+* The minimal kernel example uses static page tables. The syscall fixture builds
+  its initial tables at runtime and exercises guest-visible `sys_mmap`; frame
+  allocation and mapping are emulator-side kernel services, not a guest-written
+  allocator. Neither example is a general-purpose kernel.
+* Normal BIOS USER boot does not install MMU mappings and must not be described
+  as process-isolated.
+* A BIOS-booted guest workload verifies spawn, yield, sleep, wait, console/file
+  I/O, and exit together, but this sample does not establish general-kernel
+  robustness.
+* SisuOS is a demonstration shell with fixed `help`, `list`, `info`, and
+  `run demo` commands. Its program list is static; it does not provide a
+  general command interpreter, package manager, or persistent user accounts.
+* The BIOS-booted workload triggers a supervisor-only read and verifies that the
+  sample handler skips the faulting instruction. This single recovery policy is
+  not a general page-fault or process-termination policy.
+* Authenticated or secure boot is not implemented.
+* The syscall ABI explicitly leaves file removal unsupported; the Rust C
+  frontend is a tested subset rather than a claim of complete C90 support.

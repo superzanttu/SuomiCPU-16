@@ -52,6 +52,26 @@ Detailed stage logs are on by default and show which SC-16 component is
 processing each source file, including compiler, assembler, include, and
 memory-loading stages. Use +--quiet+ to hide these details.
 
+== SisuOS
+
+The checked-in +disks/OS000001+ folder is a small protected, preemptive OS
+demonstration. Start the emulator with +--disk OS000001+, then press Enter in
+the BIOS to boot its trusted +kernel.bin+. The kernel enables the MMU and
+instruction timer before starting the user-mode SisuOS shell. The shell
+supports +help+, +list+, +info+, and +run demo+; after the demo exits, control
+returns to the shell. This is a tested example, not a general-purpose OS.
+
+To reproduce the disk in a new staging folder without overwriting an existing
+disk:
+[source,powershell]
+----
+.\scripts\build-preemptive-os.ps1 .\build\OS000001
+----
+The script builds the kernel and user demo from +examples/+ using +sc16build+,
+packages the folder manifest and protects both executable files. Its output
+is a valid boot disk; the BIOS integration test checks the checked-in images
+against these sources and exercises the shell and preempted demo.
+
 Run an example directly from the repository root:
 [source,console]
 ----

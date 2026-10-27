@@ -576,6 +576,7 @@ impl Cpu {
             6 => self.bios_read_setting(),
             7 => self.bios_write_setting(),
             8 => self.bios_disk_info(),
+            9 => self.bios_save_preferred_disk(),
             _ => Err("unsupported firmware operation".to_owned()),
         };
         if let Err(error) = result {
@@ -737,6 +738,8 @@ impl Cpu {
             .get(index)
             .ok_or_else(|| format!("firmware disk index {index} is out of range"))?;
         let disk = FolderDisk::open(path)?;
+        let disk_id = disk.manifest().id.clone();
+        let disk_label = disk.manifest().label.clone();
         let boot = disk.load_boot_image()?;
         for segment in &boot.image.segments {
             let start = usize::try_from(segment.address)
@@ -767,13 +770,22 @@ impl Cpu {
         }
         self.guest_text.clear(0);
         self.guest_text.enabled = false;
-        let mode = match boot.mode {
-            FolderBootMode::Kernel => "KERNEL",
-            FolderBootMode::User => "USER",
+        let program = match boot.mode {
+            FolderBootMode::Kernel => "kernel.bin",
+            FolderBootMode::User => "main.bin",
         };
         self.console.log_info(
             "bios",
-            &format!("Booting {} in {mode} mode", path.display()),
+            &format!(
+                "Loaded boot device path={} id={} label={:?} program={} mode={:?} entry={:#06x} segments={}",
+                path.display(),
+                disk_id,
+                disk_label,
+                program,
+                boot.mode,
+                self.pc,
+                boot.image.segments.len(),
+            ),
         );
         Ok(())
     }
@@ -818,6 +830,28 @@ impl Cpu {
         settings.preferred_disk = preferred_disk;
         settings.startup_behavior = startup_behavior;
         settings.set_network_name(network_name)?;
+        settings.save(path)?;
+        self.bios_settings = settings;
+        Ok(())
+    }
+
+    fn bios_save_preferred_disk(&mut self) -> Result<(), String> {
+        let path = self
+            .bios_settings_path
+            .as_ref()
+            .ok_or_else(|| "BIOS settings file path is not configured".to_owned())?;
+        let paths = self.bios_disk_paths()?;
+        let selected = usize::from(self.bios_register_u16(2));
+        let disk_path = paths
+            .get(selected)
+            .ok_or_else(|| format!("firmware disk index {selected} is out of range"))?;
+        let preferred_disk = disk_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "selected disk ID is not valid text".to_owned())?
+            .to_owned();
+        let mut settings = self.bios_settings.clone();
+        settings.preferred_disk = Some(preferred_disk);
         settings.save(path)?;
         self.bios_settings = settings;
         Ok(())
@@ -943,10 +977,14 @@ impl Cpu {
         }
         self.pc = entry_point;
         self.loaded_image_segments = loaded_image_segments;
+        self.console
+            .log_debug("cpu", &format!("Program image loaded at {entry_point:#x}"));
         Ok(())
     }
 
     pub fn prepare_image_entry(&mut self) {
+        self.console
+            .log_debug("cpu", "Resetting CPU state for image entry");
         self.registers.fill(0);
         self.flags = Flags::default();
         self.sp = self.memory_mask;
@@ -1125,6 +1163,8 @@ impl Cpu {
             Ok(true)
         } else {
             self.running = false;
+            self.console
+                .log_info("cpu", "CPU halted: no runnable tasks remain");
             Ok(false)
         }
     }
@@ -3632,6 +3672,37 @@ impl Cpu {
             13 => {
                 self.sp = (self.sp & 0xffff) | (u32::from(value & 0x3fff) << 16);
             }
+            14..=16 | 18..=19 if destination & 1 != 0 || destination > 6 => {
+                return Err(CpuError::InvalidRegisterPair(control));
+            }
+            14 => self.load_idt(self.register_pair_u32(destination))?,
+            15 => self.enable_mmu(self.register_pair_u32(destination))?,
+            16 => self.switch_address_space(self.register_pair_u32(destination))?,
+            17 => self.disable_mmu()?,
+            18 => {
+                let stack_register = ((control >> 9) & 7) as usize;
+                if stack_register & 1 != 0 || stack_register > 6 {
+                    return Err(CpuError::InvalidRegisterPair(control));
+                }
+                self.enter_user_mode(
+                    self.register_pair_u32(destination),
+                    self.register_pair_u32(stack_register),
+                )?;
+            }
+            19 => {
+                let stack_register = ((control >> 9) & 7) as usize;
+                if stack_register & 1 != 0 || stack_register > 6 {
+                    return Err(CpuError::InvalidRegisterPair(control));
+                }
+                let kernel_stack = self.sp;
+                let task = self.create_user_task(
+                    self.register_pair_u32(destination),
+                    self.register_pair_u32(stack_register),
+                    kernel_stack,
+                    self.mmu_enabled.then_some(self.page_directory),
+                )?;
+                self.start_task(task)?;
+            }
             _ => {}
         }
         Ok(())
@@ -3719,7 +3790,11 @@ impl Cpu {
         let saved_mode = self.privilege_mode;
         let saved_running = self.running;
         match self.execute_instruction() {
-            Err(CpuError::PrivilegeViolation { .. }) => {
+            Err(CpuError::PrivilegeViolation { operation, .. }) => {
+                self.console.log_error(
+                    "cpu",
+                    &format!("Privilege violation at {saved_pc:#x}: {operation}"),
+                );
                 self.registers = saved_registers;
                 self.sp = saved_sp;
                 self.kernel_sp = saved_kernel_sp;
@@ -3766,7 +3841,11 @@ impl Cpu {
         let immediate = (instruction & 0xff) as u32;
 
         match opcode {
-            OP_HALT if instruction == 0 => self.running = false,
+            OP_HALT if instruction == 0 => {
+                self.running = false;
+                self.console
+                    .log_info("cpu", &format!("CPU halted at {instruction_pc:#x}"));
+            }
             OP_HALT if instruction == crate::isa::SVC_VECTOR => {
                 let vector = crate::isa::SVC_VECTOR;
                 let descriptor = self.idt_descriptor(vector)?;
@@ -6249,7 +6328,12 @@ mod tests {
 
         assert!(!cpu.running, "compiled syscall program did not terminate");
         assert_eq!(cpu.registers[0], 0);
-        assert_eq!(cpu.console.output(), b"ok");
+        assert!(
+            cpu.console
+                .output()
+                .windows(b"ok".len())
+                .any(|output| output == b"ok")
+        );
     }
 
     #[test]
@@ -6583,6 +6667,145 @@ mod tests {
             })
         );
         assert!(!cpu.running);
+    }
+
+    #[test]
+    fn cpu_logs_program_load_halt_and_privilege_events() {
+        let halt_image = crate::assembler::assemble("HALT", 0x100).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&halt_image.segments, halt_image.entry_point)
+            .unwrap();
+        cpu.run(10).unwrap();
+        let log = cpu.console.text_snapshot().join("\n");
+        assert!(
+            log.contains("[DEBUG] cpu: Program image loaded at 0x100"),
+            "{log}"
+        );
+        assert!(log.contains("[INFO] cpu: CPU halted at 0x100"), "{log}");
+
+        let privileged_image = crate::assembler::assemble("LIDT R0", 0x200).unwrap();
+        cpu.prepare_image_entry();
+        cpu.load_program(&privileged_image.segments, privileged_image.entry_point)
+            .unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
+        assert!(cpu.step().is_err());
+        let log = cpu.console.text_snapshot().join("\n");
+        assert!(
+            log.contains("[ERROR] cpu: Privilege violation at 0x200: load IDT"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn guest_supervisor_instructions_control_idt_and_mmu_state() {
+        let image = crate::assembler::assemble(
+            "LDI R0, 0\nLDI R1, 0x800\nLIDT R0\n\
+             LDI R2, 0\nLDI R3, 0x2000\nMMUON R2\n\
+             LDI R4, 0\nLDI R5, 0x2800\nMMUSWITCH R4\nMMUOFF\nHALT",
+            0x4000,
+        )
+        .unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        for (directory, table) in [(0x2000usize, 0x3000usize), (0x2800, 0x5000)] {
+            cpu.memory[directory..directory + 4]
+                .copy_from_slice(&((table as u32) | 0x0f).to_be_bytes());
+            cpu.memory[table + 4 * 4..table + 4 * 4 + 4]
+                .copy_from_slice(&(0x4000u32 | 0x0f).to_be_bytes());
+        }
+        cpu.run(32).unwrap();
+
+        assert_eq!(cpu.idt_base, Some(0x800));
+        assert_eq!(cpu.page_directory, 0x2800);
+        assert!(!cpu.mmu_enabled);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+    }
+
+    #[test]
+    fn guest_supervisor_control_instructions_reject_user_mode() {
+        let image = crate::assembler::assemble("MMUON R0\nHALT", 0x100).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.load_idt(0x800).unwrap();
+        cpu.set_idt_descriptor(
+            EXCEPTION_PRIVILEGE_VIOLATION,
+            crate::interrupts::IdtDescriptor {
+                handler: 0x300,
+                present: true,
+                privilege: 0,
+                gate_type: crate::interrupts::GateType::Interrupt,
+            },
+        )
+        .unwrap();
+        cpu.write_u16(0x300, crate::isa::OP_HALT << 11);
+        cpu.registers[0] = 0;
+        cpu.registers[1] = 0x2000;
+        cpu.enter_user_mode(0x100, 0x7000).unwrap();
+        cpu.run(4).unwrap();
+
+        assert!(!cpu.mmu_enabled);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, 0x302);
+    }
+
+    #[test]
+    fn guest_supervisor_control_instructions_reject_odd_register_pairs() {
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_u16(0x100, 0xf91f);
+        cpu.write_u16(0x102, 0xf00e);
+        cpu.pc = 0x100;
+
+        assert_eq!(
+            cpu.step(),
+            Err(CpuError::UnhandledException {
+                vector: EXCEPTION_ILLEGAL_INSTRUCTION,
+                cause: EXCEPTION_ILLEGAL_INSTRUCTION,
+            })
+        );
+    }
+
+    #[test]
+    fn guest_enter_user_instruction_validates_and_switches_context() {
+        let image = crate::assembler::assemble(
+            "LDI R0, 0\nLDI R1, 0x200\nLDI R2, 0\nLDI R3, 0x7000\nENTERU R0, R2\n\
+             .address 0x200\nHALT",
+            0x100,
+        )
+        .unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+
+        cpu.run(16).unwrap();
+
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.pc, 0x202);
+        assert_eq!(cpu.sp, 0x7000);
+        assert_eq!(cpu.kernel_sp, 0xffff);
+    }
+
+    #[test]
+    fn guest_start_user_instruction_activates_the_initial_scheduled_task() {
+        let image = crate::assembler::assemble(
+            "LDI R0, 0\nLDI R1, 0x200\nLDI R2, 0\nLDI R3, 0x7000\nSTARTU R0, R2\n\
+             .address 0x200\nHALT",
+            0x100,
+        )
+        .unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+
+        cpu.run(16).unwrap();
+
+        assert_eq!(cpu.current_task(), Some(0));
+        assert_eq!(cpu.task_context(0).unwrap().state, TaskState::Running);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.pc, 0x202);
+        assert_eq!(cpu.sp, 0x7000);
+        assert_eq!(cpu.kernel_sp, 0xffff);
     }
 
     #[test]
@@ -8382,6 +8605,57 @@ mod tests {
     }
 
     #[test]
+    fn bios_preferred_disk_save_does_not_change_startup_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-bios-preferred-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disks = root.join("disks");
+        for id in ["DISK0001", "DISK0002", "DISK0003"] {
+            std::fs::create_dir_all(disks.join(id)).unwrap();
+        }
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.disk_root = disks;
+        cpu.configure_bios_settings(root.join("bios.json")).unwrap();
+        cpu.bios_settings.preferred_disk = Some("DISK0001".to_owned());
+        cpu.bios_settings.startup_behavior = StartupBehavior::BootPreferred;
+        cpu.bios_settings.network_name = "NODE".to_owned();
+        cpu.bios_settings.save(&root.join("bios.json")).unwrap();
+        cpu.memory[BIOS_BASE as usize + 2..BIOS_BASE as usize + 4]
+            .copy_from_slice(&2u16.to_be_bytes());
+        cpu.memory[BIOS_BASE as usize + 6] = 1;
+
+        cpu.bios_save_preferred_disk().unwrap();
+
+        assert_eq!(
+            cpu.bios_settings.preferred_disk.as_deref(),
+            Some("DISK0003")
+        );
+        assert_eq!(
+            cpu.bios_settings.startup_behavior,
+            StartupBehavior::BootPreferred
+        );
+        assert_eq!(cpu.memory[BIOS_BASE as usize + 6], 1);
+        let saved = BiosSettings::load(&root.join("bios.json")).unwrap();
+        assert_eq!(saved.preferred_disk.as_deref(), Some("DISK0003"));
+        assert_eq!(saved.startup_behavior, StartupBehavior::BootPreferred);
+
+        cpu.memory[BIOS_BASE as usize + 2..BIOS_BASE as usize + 4]
+            .copy_from_slice(&3u16.to_be_bytes());
+        assert!(cpu.bios_save_preferred_disk().is_err());
+        assert_eq!(
+            cpu.bios_settings.preferred_disk.as_deref(),
+            Some("DISK0003")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bios_firmware_shows_selected_disk_manifest_and_boot_metadata() {
         let root = std::env::temp_dir().join(format!(
             "sc16-bios-disk-info-{}-{}",
@@ -9028,6 +9302,26 @@ mod tests {
         assert_eq!(cpu.page_directory(), first_directory);
         assert_eq!(cpu.registers[0], 0x11);
         assert!(cpu.is_mmu_enabled());
+        assert!(
+            crate::mmu::translate(
+                &cpu.memory,
+                first_directory,
+                0x4000,
+                crate::mmu::MemoryAccess::Read,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            crate::mmu::translate(
+                &cpu.memory,
+                second_directory,
+                0x2000,
+                crate::mmu::MemoryAccess::Read,
+                true
+            )
+            .is_err()
+        );
     }
 
     #[test]

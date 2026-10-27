@@ -177,6 +177,12 @@ pub const MISC_OPERATIONS: &[(&str, u16)] = &[
     ("CALLRP", 11),
     ("JMPRP", 12),
     ("SETSPH", 13),
+    ("LIDT", 14),
+    ("MMUON", 15),
+    ("MMUSWITCH", 16),
+    ("MMUOFF", 17),
+    ("ENTERU", 18),
+    ("STARTU", 19),
 ];
 
 pub const BRANCH_CONDITIONS: &[(&str, u16)] = &[

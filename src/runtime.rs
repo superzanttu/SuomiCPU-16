@@ -16,8 +16,8 @@ use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, Rect, Texture2D,
     WHITE, clear_background, draw_line, draw_rectangle, draw_text as draw_ui_text, draw_texture_ex,
     draw_triangle, get_char_pressed, get_keys_down, get_keys_pressed, is_key_pressed,
-    is_mouse_button_pressed, is_mouse_button_released, mouse_position, mouse_wheel, next_frame,
-    screen_height, screen_width, set_fullscreen, vec2,
+    is_mouse_button_pressed, is_mouse_button_released, is_quit_requested, mouse_position,
+    mouse_wheel, next_frame, screen_height, screen_width, set_fullscreen, vec2,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use minifb::{
@@ -26,6 +26,7 @@ use minifb::{
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPEED_ADDR: usize = 0x43003;
@@ -39,11 +40,12 @@ const CONSOLE_WINDOW_HEIGHT: usize = 200;
 const CONSOLE_TOOLBAR_HEIGHT: usize = 28;
 const RUNTIME_INSTRUCTION_CHUNK: usize = 5_000;
 const RUNTIME_CPU_SLICE: Duration = Duration::from_millis(30);
-const TOOLBAR_BUTTONS: [(&str, f32, f32); 4] = [
+const TOOLBAR_BUTTONS: [(&str, f32, f32); 5] = [
     ("PAUSE", 8.0, 104.0),
-    ("RESET", 120.0, 80.0),
-    ("REBOOT", 208.0, 88.0),
-    ("BUG MONITOR", 304.0, 112.0),
+    ("STOP", 120.0, 80.0),
+    ("RESET", 208.0, 80.0),
+    ("REBOOT", 296.0, 88.0),
+    ("BUG MONITOR", 392.0, 112.0),
 ];
 const CONSOLE_TOOLBAR_BUTTONS: [(usize, usize); 4] = [(6, 94), (106, 72), (184, 92), (282, 104)];
 const BIOS_TEXT_COLUMNS: usize = 53;
@@ -331,6 +333,7 @@ enum RuntimeControl {
     PauseToggled(bool),
     FullscreenToggled(bool),
     ConsoleToggled(bool),
+    ConsoleClosed,
     ResetRequested,
     RebootRequested,
     StopRequested,
@@ -397,9 +400,12 @@ impl ConsoleWindow {
     ) -> Option<RuntimeControl> {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if !self.window.is_open() {
+                return Some(RuntimeControl::ConsoleClosed);
+            }
             self.window.update();
             if !self.window.is_open() {
-                return Some(RuntimeControl::ConsoleToggled(false));
+                return Some(RuntimeControl::ConsoleClosed);
             }
             let keyboard_control = [
                 NativeKey::F1,
@@ -529,16 +535,13 @@ pub async fn run_with_devices(
     let mut console_visible = false;
     let mut console_window: Option<ConsoleWindow> = None;
     let mut fullscreen = fullscreen;
-    let mut target = if let Some(source) = program {
+    if let Some(source) = program {
         let target = BootTarget {
             source: source.to_path_buf(),
             folder_disk: source.is_dir(),
         };
         boot_target(&mut cpu, &target)?;
-        Some(target)
-    } else {
-        None
-    };
+    }
 
     let mut old_keys = HashSet::new();
     let mut speed_remainder = 0.0;
@@ -549,10 +552,14 @@ pub async fn run_with_devices(
     let mut presented_triangles = Vec::new();
     let mut presented_lines = Vec::new();
     let mut presented_palette = cpu.palette;
+    let mut active_boot_disk = program.filter(|path| path.is_dir()).map(Path::to_path_buf);
     let runtime_started = Instant::now();
     let mut bios_autoboot_wait_started = None;
     let mut bios_autoboot_timeout_sent = false;
     loop {
+        if runtime_should_close(is_quit_requested(), true, false) {
+            break;
+        }
         let pressed_keys = get_keys_pressed();
         if bios_autoboot_timeout_due(
             cpu.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize] == 1,
@@ -608,7 +615,10 @@ pub async fn run_with_devices(
                     RuntimeControl::RebootRequested => {
                         pending_action = Some(RuntimeControl::RebootRequested)
                     }
-                    RuntimeControl::StopRequested => cpu.running = false,
+                    RuntimeControl::StopRequested => {
+                        cpu.running = false;
+                        cpu.console.log_info("emulator", "CPU stopped by user");
+                    }
                     RuntimeControl::PauseToggled(paused) => {
                         cpu.console.log_info(
                             "emulator",
@@ -620,6 +630,7 @@ pub async fn run_with_devices(
                         );
                     }
                     RuntimeControl::ConsoleToggled(_) => {}
+                    RuntimeControl::ConsoleClosed => {}
                 }
                 last_frame = Instant::now();
             }
@@ -644,8 +655,17 @@ pub async fn run_with_devices(
                     );
                 }
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
+                RuntimeControl::ConsoleClosed => {
+                    console_visible = false;
+                    console_window = None;
+                    cpu.console
+                        .log_debug("emulator", "Bug Monitor window closed");
+                }
                 RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
-                RuntimeControl::StopRequested => cpu.running = false,
+                RuntimeControl::StopRequested => {
+                    cpu.running = false;
+                    cpu.console.log_info("emulator", "CPU stopped by user");
+                }
             }
             last_frame = Instant::now();
         }
@@ -669,8 +689,12 @@ pub async fn run_with_devices(
                     pending_action = Some(control);
                 }
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
+                RuntimeControl::ConsoleClosed => {}
                 RuntimeControl::FullscreenToggled(_) => {}
-                RuntimeControl::StopRequested => cpu.running = false,
+                RuntimeControl::StopRequested => {
+                    cpu.running = false;
+                    cpu.console.log_info("emulator", "CPU stopped by user");
+                }
             }
         }
         if fullscreen {
@@ -685,9 +709,16 @@ pub async fn run_with_devices(
             pending_action
         {
             audio.stop_all();
+            cpu.console.log_debug(
+                "emulator",
+                if action == RuntimeControl::ResetRequested {
+                    "Reset requested"
+                } else {
+                    "Firmware reboot requested"
+                },
+            );
             let previous_console = cpu.console.clone();
             if action == RuntimeControl::ResetRequested {
-                target = None;
                 console_window = None;
                 console_visible = false;
                 cpu = match fresh_runtime_cpu(
@@ -710,17 +741,8 @@ pub async fn run_with_devices(
                         return Ok(());
                     }
                 };
-
-                if let Some(source) = program {
-                    let reset_target = BootTarget {
-                        source: source.to_path_buf(),
-                        folder_disk: false,
-                    };
-                    boot_target(&mut cpu, &reset_target)?;
-                    target = Some(reset_target);
-                }
             } else {
-                let restart_target = target.clone();
+                rebuild_bios_if_stale(root)?;
                 cpu = match fresh_runtime_cpu(
                     root,
                     program,
@@ -741,23 +763,13 @@ pub async fn run_with_devices(
                         return Ok(());
                     }
                 };
-                if let Some(restart_target) = restart_target {
-                    boot_target(&mut cpu, &restart_target)?;
-                } else if let Some(source) = program {
-                    let new_target = BootTarget {
-                        source: source.to_path_buf(),
-                        folder_disk: false,
-                    };
-                    boot_target(&mut cpu, &new_target)?;
-                    target = Some(new_target);
-                }
             }
             cpu.console.log_info(
                 "emulator",
                 if action == RuntimeControl::ResetRequested {
                     "System reset complete"
                 } else {
-                    "Program restarted"
+                    "Firmware reboot complete"
                 },
             );
             paused = false;
@@ -769,7 +781,11 @@ pub async fn run_with_devices(
             continue;
         }
         let key_control_only = control_key_count == pressed_keys.len();
-        if halted_window_should_close(cpu.running, !pressed_keys.is_empty() && !key_control_only) {
+        if runtime_should_close(
+            false,
+            cpu.running,
+            !pressed_keys.is_empty() && !key_control_only,
+        ) {
             break;
         }
         if cpu.running {
@@ -830,12 +846,21 @@ pub async fn run_with_devices(
                         _ => 300_000,
                     };
                 }
-                run_instruction_slice(&mut cpu, &mut cpu_budget_remaining)?;
+                if let Err(error) = run_instruction_slice(&mut cpu, &mut cpu_budget_remaining) {
+                    if let Some(path) = cpu.take_booted_disk_path() {
+                        active_boot_disk = Some(path);
+                    }
+                    let details = runtime_cpu_failure_details(
+                        &cpu,
+                        program,
+                        active_boot_disk.as_deref(),
+                        &error,
+                    );
+                    cpu.console.log_error("emulator", &details);
+                    return Err(RuntimeError::Window(details));
+                }
                 if let Some(path) = cpu.take_booted_disk_path() {
-                    target = Some(BootTarget {
-                        source: path,
-                        folder_disk: true,
-                    });
+                    active_boot_disk = Some(path);
                 }
                 if cpu_budget_remaining == 0 || cpu.frame_yield || !cpu.running {
                     cpu_budget_remaining = 0;
@@ -1337,18 +1362,74 @@ fn fresh_runtime_cpu(
     Ok(cpu)
 }
 
+fn rebuild_bios_if_stale(root: &Path) -> Result<(), RuntimeError> {
+    let source = root.join("bios.asm");
+    let image = root.join("bios.bin");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let source_modified = source.metadata()?.modified()?;
+    let image_modified = image
+        .is_file()
+        .then(|| image.metadata()?.modified())
+        .transpose()?;
+    let needs_build = bios_needs_rebuild(Some(source_modified), image_modified);
+    if !needs_build {
+        return Ok(());
+    }
+
+    let executable = std::env::current_exe()?;
+    let tool_name = format!("sc16build{}", std::env::consts::EXE_SUFFIX);
+    let tool = executable
+        .ancestors()
+        .map(|directory| directory.join(&tool_name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            RuntimeError::Window(format!(
+                "BIOS source changed, but {tool_name} was not found beside {}",
+                executable.display()
+            ))
+        })?;
+    let status = Command::new(&tool)
+        .arg("build-bios")
+        .arg(&source)
+        .arg(&image)
+        .current_dir(root)
+        .status()?;
+    if !status.success() {
+        return Err(RuntimeError::Window(format!(
+            "BIOS rebuild failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn bios_needs_rebuild(
+    source_modified: Option<SystemTime>,
+    image_modified: Option<SystemTime>,
+) -> bool {
+    match (source_modified, image_modified) {
+        (Some(source), Some(image)) => source > image,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
     if target.folder_disk {
         let mode = boot_folder_disk(cpu, &target.source)?;
+        let disk = FolderDisk::open(&target.source).map_err(RuntimeError::Window)?;
         cpu.console.log_info(
             "bios",
             &format!(
-                "Booting {} in {} mode",
+                "Loaded boot device {} id={} label={:?} program={} mode={:?} entry={:#06x} segments={}",
                 target.source.display(),
-                match mode {
-                    FolderBootMode::Kernel => "KERNEL",
-                    FolderBootMode::User => "USER",
-                }
+                disk.manifest().id,
+                disk.manifest().label,
+                disk_boot_program(mode),
+                mode,
+                cpu.pc,
+                cpu.loaded_image_segments.len(),
             ),
         );
         return Ok(());
@@ -1371,17 +1452,45 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
                 .log_error("emulator", &format!("Loading {name} failed: {error}"));
             RuntimeError::Window(error.to_string())
         })?;
-    cpu.console.log_info("emulator", &format!("{name} loaded"));
+    cpu.console.log_info(
+        "emulator",
+        &format!(
+            "Program loaded path={} mode={:?} entry={:#06x} segments={}",
+            target.source.display(),
+            cpu.privilege_mode,
+            cpu.pc,
+            cpu.loaded_image_segments.len(),
+        ),
+    );
     Ok(())
 }
 
 fn boot_folder_disk(cpu: &mut Cpu, disk_path: &Path) -> Result<FolderBootMode, RuntimeError> {
-    let boot = FolderDisk::open(disk_path)
-        .and_then(|disk| disk.load_boot_image())
-        .map_err(|error| {
-            cpu.console.log_error("bios", &error);
-            RuntimeError::Window(error)
-        })?;
+    let disk = FolderDisk::open(disk_path).map_err(|error| {
+        cpu.console
+            .log_error("bios", &format!("Disk {}: {error}", disk_path.display()));
+        RuntimeError::Window(error)
+    })?;
+    let boot = disk.load_boot_image().map_err(|error| {
+        cpu.console
+            .log_error("bios", &format!("Disk {}: {error}", disk_path.display()));
+        RuntimeError::Window(error)
+    })?;
+    let disk_id = disk.manifest().id.clone();
+    let disk_label = disk.manifest().label.clone();
+    cpu.console.log_info(
+        "bios",
+        &format!(
+            "Boot candidate path={} id={} label={:?} program={} mode={:?} entry={:#06x} segments={}",
+            disk_path.display(),
+            disk_id,
+            disk_label,
+            disk_boot_program(boot.mode),
+            boot.mode,
+            boot.image.entry_point,
+            boot.image.segments.len(),
+        ),
+    );
     cpu.prepare_image_entry();
     cpu.load_program(&boot.image.segments, boot.image.entry_point)
         .map_err(|error| {
@@ -1647,7 +1756,7 @@ fn bios_autoboot_timeout_due(
 fn run_instruction_slice(
     cpu: &mut Cpu,
     budget_remaining: &mut usize,
-) -> Result<usize, RuntimeError> {
+) -> Result<usize, crate::cpu::CpuError> {
     let started = Instant::now();
     let mut total_executed = 0;
     while *budget_remaining > 0
@@ -1656,9 +1765,7 @@ fn run_instruction_slice(
         && !cpu.frame_yield
     {
         let chunk = (*budget_remaining).min(RUNTIME_INSTRUCTION_CHUNK);
-        let executed = cpu
-            .run(chunk)
-            .map_err(|error| RuntimeError::Window(error.to_string()))?;
+        let executed = cpu.run(chunk)?;
         *budget_remaining = budget_remaining.saturating_sub(executed);
         total_executed += executed;
         if executed == 0 {
@@ -1668,8 +1775,70 @@ fn run_instruction_slice(
     Ok(total_executed)
 }
 
+fn runtime_cpu_failure_details(
+    cpu: &Cpu,
+    program: Option<&Path>,
+    boot_disk: Option<&Path>,
+    error: &crate::cpu::CpuError,
+) -> String {
+    let launch_program = program.map_or_else(
+        || "BIOS selector".to_owned(),
+        |path| path.display().to_string(),
+    );
+    let (disk, disk_program) = match boot_disk {
+        Some(path) => match FolderDisk::open(path) {
+            Ok(disk) => {
+                let identity = format!(
+                    "{} (id={}, label={:?})",
+                    path.display(),
+                    disk.manifest().id,
+                    disk.manifest().label
+                );
+                match disk.load_boot_image() {
+                    Ok(boot) => {
+                        let filename = match boot.mode {
+                            FolderBootMode::Kernel => "kernel.bin",
+                            FolderBootMode::User => "main.bin",
+                        };
+                        (identity, format!("{filename} ({:?})", boot.mode))
+                    }
+                    Err(error) => (identity, format!("unavailable ({error})")),
+                }
+            }
+            Err(error) => (
+                path.display().to_string(),
+                format!("disk inspection failed ({error})"),
+            ),
+        },
+        None => ("none selected".to_owned(), "unknown".to_owned()),
+    };
+    format!(
+        "{error}; launch_program={launch_program}; disk={disk}; disk_program={disk_program}; execution_mode={:?}; pc={:#06x}; sp={:#06x}; kernel_sp={:#06x}; task={:?}; mmu_enabled={}; page_directory={:#06x}; last_page_fault={:?}; loaded_segments={:?}",
+        cpu.privilege_mode,
+        cpu.pc,
+        cpu.sp,
+        cpu.kernel_sp,
+        cpu.current_task(),
+        cpu.is_mmu_enabled(),
+        cpu.page_directory(),
+        cpu.last_page_fault(),
+        cpu.loaded_image_segments,
+    )
+}
+
+fn disk_boot_program(mode: FolderBootMode) -> &'static str {
+    match mode {
+        FolderBootMode::Kernel => "kernel.bin",
+        FolderBootMode::User => "main.bin",
+    }
+}
+
 fn halted_window_should_close(cpu_running: bool, has_keypress: bool) -> bool {
     !cpu_running && has_keypress
+}
+
+fn runtime_should_close(quit_requested: bool, cpu_running: bool, has_keypress: bool) -> bool {
+    quit_requested || halted_window_should_close(cpu_running, has_keypress)
 }
 
 fn update_mouse(
@@ -1750,9 +1919,10 @@ fn toolbar_control(
         if (*left..*left + *width).contains(&x) {
             return match index {
                 0 => Some(RuntimeControl::PauseToggled(!paused)),
-                1 => Some(RuntimeControl::ResetRequested),
-                2 => Some(RuntimeControl::RebootRequested),
-                3 => Some(RuntimeControl::ConsoleToggled(!console_visible)),
+                1 => Some(RuntimeControl::StopRequested),
+                2 => Some(RuntimeControl::ResetRequested),
+                3 => Some(RuntimeControl::RebootRequested),
+                4 => Some(RuntimeControl::ConsoleToggled(!console_visible)),
                 _ => None,
             };
         }
@@ -2224,6 +2394,59 @@ mod tests {
     }
 
     #[test]
+    fn cpu_failure_diagnostics_include_boot_target_and_machine_state() {
+        let cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let program = Path::new("examples").join("preemptive_os_kernel.asm");
+        let disk_root = std::env::temp_dir().join(format!(
+            "sc16-diagnostic-disk-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let disk = disk_root.join("SisuOS-1");
+        fs::create_dir_all(&disk).unwrap();
+        fs::write(
+            disk.join("disk.json"),
+            r#"{"version":1,"id":"SisuOS-1","label":"SisuOS","capacity_bytes":65536,"read_only":false,"protected_files":["kernel.bin"]}"#,
+        )
+        .unwrap();
+        let kernel = crate::assembler::assemble("HALT", 0x4000).unwrap();
+        crate::image::write_image(&disk.join("kernel.bin"), &kernel).unwrap();
+        let details = runtime_cpu_failure_details(
+            &cpu,
+            Some(&program),
+            Some(&disk),
+            &crate::cpu::CpuError::DoubleFault,
+        );
+
+        let expected_program = format!("launch_program={}", program.display());
+        let expected_disk = format!("disk={}", disk.display());
+        for expected in [
+            "CPU stopped after a double fault",
+            "id=SisuOS-1",
+            "label=\"SisuOS\"",
+            "execution_mode=Supervisor",
+            "pc=0x0000",
+            "mmu_enabled=false",
+            "loaded_segments=[]",
+        ] {
+            assert!(
+                details.contains(expected),
+                "missing {expected:?}: {details}"
+            );
+        }
+        assert!(details.contains(&expected_program), "{details}");
+        assert!(details.contains(&expected_disk), "{details}");
+        assert!(
+            details.contains("disk_program=kernel.bin (Kernel)"),
+            "{details}"
+        );
+        fs::remove_dir_all(disk_root).unwrap();
+    }
+
+    #[test]
     fn bios_disk_discovery_sorts_candidates_without_validating_unselected_metadata() {
         let directory = std::env::temp_dir().join(format!(
             "sc16-bios-discovery-{}-{}",
@@ -2327,6 +2550,153 @@ mod tests {
     }
 
     #[test]
+    fn bios_boots_kernel_disk_into_a_protected_scheduled_user_task() {
+        let disk = boot_test_disk("kernel");
+        let image =
+            crate::assembler::assemble(include_str!("../examples/minimal_kernel.asm"), 0).unwrap();
+        crate::image::write_image(&disk.join("kernel.bin"), &image).unwrap();
+        let target = BootTarget {
+            source: disk.clone(),
+            folder_disk: true,
+        };
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+
+        boot_target(&mut cpu, &target).unwrap();
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, 0x4000);
+        let run_result = cpu.run(128);
+        assert!(
+            run_result.is_ok(),
+            "kernel boot failed at {:#x}: {run_result:?}; page fault {:?}",
+            cpu.pc,
+            cpu.last_page_fault()
+        );
+
+        assert!(
+            cpu.is_mmu_enabled(),
+            "MMU disabled at {:#x} in {:?}, running={}, root={:#x}, task={:?}, regs={:?}",
+            cpu.pc,
+            cpu.privilege_mode,
+            cpu.running,
+            cpu.page_directory(),
+            cpu.task_context(0),
+            cpu.registers
+        );
+        assert_eq!(cpu.page_directory(), 0x2000);
+        assert_eq!(
+            cpu.task_context(0).unwrap().state,
+            crate::scheduler::TaskState::Exited
+        );
+        assert_eq!(cpu.current_task(), None);
+        assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
+
+        boot_target(&mut cpu, &target).unwrap();
+        assert_eq!(cpu.pc, 0x4000);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.current_task(), None);
+        assert!(!cpu.is_mmu_enabled());
+        cpu.run(128).unwrap();
+        assert_eq!(
+            cpu.task_context(0).unwrap().state,
+            crate::scheduler::TaskState::Exited
+        );
+        fs::remove_dir_all(disk.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn bios_kernel_runs_spawned_syscall_lifecycle() {
+        let disk = boot_test_disk("syscall-lifecycle");
+        fs::write(
+            disk.join("disk.json"),
+            r#"{"version":1,"id":"DISK0001","label":"Boot","capacity_bytes":65536,"read_only":false}"#,
+        )
+        .unwrap();
+        fs::write(disk.join("input.txt"), b"hello").unwrap();
+
+        for (source, output) in [
+            (
+                include_str!("../examples/syscall_kernel.asm"),
+                disk.join("kernel.bin"),
+            ),
+            (
+                include_str!("../examples/syscall_child.asm"),
+                disk.join("child.bin"),
+            ),
+        ] {
+            let image = crate::assembler::assemble(source, 0).unwrap();
+            crate::image::write_image(&output, &image).unwrap();
+        }
+
+        let root = disk.parent().unwrap().to_path_buf();
+        let disks = root.join("disks");
+        fs::create_dir(&disks).unwrap();
+        let boot_disk = disks.join("DISK0001");
+        fs::rename(&disk, &boot_disk).unwrap();
+        let firmware = crate::assembler::assemble(include_str!("../bios.asm"), 0).unwrap();
+        crate::image::write_image(&root.join("bios.bin"), &firmware).unwrap();
+
+        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(13);
+        cpu.run(30000).unwrap();
+
+        assert_eq!(
+            cpu.last_page_fault(),
+            Some(crate::mmu::PageFault {
+                virtual_address: 0x4000,
+                access: crate::mmu::MemoryAccess::Read,
+                reason: crate::mmu::PageFaultReason::SupervisorOnly
+            })
+        );
+        assert_eq!(cpu.current_task(), None);
+        assert_eq!(
+            cpu.task_context(0).unwrap().state,
+            crate::scheduler::TaskState::Exited
+        );
+        assert_eq!(cpu.task_context(0).unwrap().exit_code, Some(42));
+        assert!(
+            cpu.console
+                .output()
+                .windows(b"hello".len())
+                .any(|output| output == b"hello"),
+            "console={:?}, parent={:?}, child={:?}, page_fault={:?}",
+            cpu.console.output(),
+            cpu.task_context(0),
+            cpu.task_context(1),
+            cpu.last_page_fault()
+        );
+        assert_eq!(fs::read(boot_disk.join("result.txt")).unwrap(), b"hello");
+        assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
+
+        let console = cpu.console.clone();
+        drop(cpu);
+        let mut reset =
+            fresh_runtime_cpu(&root, None, Some("DISK0001"), DEFAULT_PORT, Some(&console)).unwrap();
+        reset.run(5000).unwrap();
+        reset.signal_keyboard_event(13);
+        reset.run(30000).unwrap();
+        assert_eq!(
+            reset.last_page_fault(),
+            Some(crate::mmu::PageFault {
+                virtual_address: 0x4000,
+                access: crate::mmu::MemoryAccess::Read,
+                reason: crate::mmu::PageFaultReason::SupervisorOnly
+            })
+        );
+        assert_eq!(reset.current_task(), None);
+        assert_eq!(reset.task_context(0).unwrap().exit_code, Some(42));
+        assert!(
+            reset
+                .console
+                .output()
+                .windows(b"hello".len())
+                .any(|output| output == b"hello")
+        );
+        assert_eq!(fs::read(boot_disk.join("result.txt")).unwrap(), b"hello");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bios_cold_reset_preloads_common_firmware_and_clears_the_previous_guest() {
         let disk = boot_test_disk("cold-reset");
         let root = disk.parent().unwrap();
@@ -2337,7 +2707,7 @@ mod tests {
         fs::create_dir(&second_disk).unwrap();
         fs::write(
             second_disk.join("disk.json"),
-            r#"{"version":1,"id":"DISK0002","label":"Second","capacity_bytes":65536,"read_only":true}"#,
+            r#"{"version":1,"id":"DISK0002","label":"Second Device Name That Must Remain On One Row 123456789","capacity_bytes":65536,"read_only":true}"#,
         )
         .unwrap();
         let firmware = crate::assembler::assemble(include_str!("../bios.asm"), 0).unwrap();
@@ -2398,8 +2768,28 @@ mod tests {
             .map(|cell| char::from(cell.character))
             .collect::<String>();
         assert!(text.contains("DISK0002"), "{text:?}");
-        cpu.signal_keyboard_event(0x89);
-        cpu.run(5000).unwrap();
+        let rows = cpu
+            .guest_text
+            .cells
+            .chunks(crate::guest_text::GUEST_TEXT_COLUMNS)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| char::from(cell.character))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let device_name_rows = rows
+            .iter()
+            .filter(|row| row.contains("Second Device Name"))
+            .count();
+        assert_eq!(device_name_rows, 1, "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("123456789")),
+            "{rows:?}"
+        );
+        assert!(text.contains("LEFT/RIGHT changes device."), "{text:?}");
+        assert!(!text.contains("WARNING"), "{text:?}");
+        assert!(!text.contains("Save changes with F10"), "{text:?}");
         cpu.signal_keyboard_event(13);
         cpu.run(5000).unwrap();
         assert_eq!(
@@ -2415,6 +2805,10 @@ mod tests {
             cpu.console.text_snapshot()
         );
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(
+            cpu.bios_settings().preferred_disk.as_deref(),
+            Some("DISK0002")
+        );
         assert!(!cpu.guest_text.enabled);
         cpu.write(0x43400, 1);
         assert_eq!(cpu.memory[0x4340c], 1);
@@ -2430,6 +2824,8 @@ mod tests {
             &reset.memory[..firmware.segments[0].data.len()],
             firmware.segments[0].data.as_slice()
         );
+        reset.run(5000).unwrap();
+        reset.signal_keyboard_event(b' ');
         reset.run(5000).unwrap();
         let text = reset
             .guest_text
@@ -2483,6 +2879,32 @@ mod tests {
         }
         cpu.signal_keyboard_event(13);
         cpu.run(5000).unwrap();
+        let editing_node = cpu
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| char::from(cell.character))
+            .collect::<String>();
+        assert!(
+            editing_node.contains("BIOS SETUP UTILITY"),
+            "{editing_node:?}"
+        );
+        assert!(
+            !editing_node.contains("Edit SC-NET node ID"),
+            "{editing_node:?}"
+        );
+        assert!(
+            editing_node.contains("Editing in place"),
+            "{editing_node:?}"
+        );
+        let original_node = cpu.memory[0x43410..0x43420].to_vec();
+        cpu.signal_keyboard_event(8);
+        cpu.run(30_000).unwrap();
+        cpu.signal_keyboard_event(27);
+        cpu.run(30_000).unwrap();
+        assert_eq!(&cpu.memory[0x43410..0x43420], original_node);
+        cpu.signal_keyboard_event(13);
+        cpu.run(30_000).unwrap();
         for _ in 0..16 {
             cpu.signal_keyboard_event(8);
             cpu.run(5000).unwrap();
@@ -2501,6 +2923,37 @@ mod tests {
         cpu.run(5000).unwrap();
         cpu.signal_keyboard_event(13);
         cpu.run(5000).unwrap();
+        for _ in 0..3 {
+            cpu.signal_keyboard_event(0x81);
+            cpu.run(5000).unwrap();
+        }
+        cpu.signal_keyboard_event(13);
+        cpu.run(5000).unwrap();
+        for _ in 0..2 {
+            cpu.signal_keyboard_event(8);
+            cpu.run(30_000).unwrap();
+        }
+        for character in b"42" {
+            cpu.signal_keyboard_event(*character);
+            cpu.run(30_000).unwrap();
+        }
+        cpu.signal_keyboard_event(13);
+        cpu.run(30_000).unwrap();
+        let edited_score = cpu
+            .guest_text
+            .cells
+            .iter()
+            .map(|cell| char::from(cell.character))
+            .collect::<String>();
+        assert!(edited_score.contains("score"), "{edited_score:?}");
+        assert!(
+            !edited_score.contains("Editing in place"),
+            "{edited_score:?}"
+        );
+        assert_eq!(
+            cpu.bios_settings().additional.get("score"),
+            Some(&crate::bios_settings::BiosSettingValue::Integer(42))
+        );
         cpu.signal_keyboard_event(0x89);
         cpu.run(5000).unwrap();
 
@@ -2518,7 +2971,7 @@ mod tests {
         );
         assert_eq!(saved["startup_behavior"], "boot_preferred");
         assert_eq!(saved["network_name"], "NODE-0123456789A");
-        assert_eq!(saved["settings"]["score"], 12);
+        assert_eq!(saved["settings"]["score"], 42);
         assert_eq!(saved["settings"]["region"], "eu");
         drop(cpu);
 
@@ -2554,6 +3007,231 @@ mod tests {
         assert_eq!(rebooted.privilege_mode, PrivilegeMode::User);
         assert_eq!(rebooted.registers[0], 42);
         drop(rebooted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bios_enter_saves_and_boots_selected_higher_index_disk() {
+        let disk = boot_test_disk("preferred-index");
+        let root = disk.parent().unwrap().to_path_buf();
+        let disks = root.join("disks");
+        fs::create_dir(&disks).unwrap();
+        for id in ["DISK0001", "DISK0002", "DISK0003"] {
+            let path = disks.join(id);
+            fs::create_dir(&path).unwrap();
+            fs::write(
+                path.join("disk.json"),
+                format!(
+                    r#"{{"version":1,"id":"{id}","label":"{id}","capacity_bytes":65536,"read_only":false}}"#
+                ),
+            )
+            .unwrap();
+            let result = if id == "DISK0003" { 84 } else { 42 };
+            let image =
+                crate::assembler::assemble(&format!("LDI R0, {result}\nHALT"), 0x100).unwrap();
+            crate::image::write_image(&path.join("main.bin"), &image).unwrap();
+        }
+        fs::remove_dir_all(&disk).unwrap();
+        fs::write(
+            root.join("bios.json"),
+            r#"{"version":1,"preferred_disk":"DISK0001","startup_behavior":"boot_preferred"}"#,
+        )
+        .unwrap();
+        let firmware = crate::assembler::assemble(include_str!("../bios.asm"), 0).unwrap();
+        crate::image::write_image(&root.join("bios.bin"), &firmware).unwrap();
+
+        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(b' ');
+        cpu.run(5000).unwrap();
+        assert_eq!(cpu.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize], 0);
+
+        for _ in 0..2 {
+            cpu.signal_keyboard_event(0x83);
+            cpu.run(5000).unwrap();
+        }
+        assert_eq!(
+            cpu.read_u16(0x43402),
+            2,
+            "BIOS disk index, row, PC, and screen: index={}, row={}, PC={:#x}, screen={}",
+            cpu.read_u16(0x43402),
+            cpu.memory[0x5021],
+            cpu.pc,
+            cpu.guest_text
+                .cells
+                .iter()
+                .map(|cell| char::from(cell.character))
+                .collect::<String>()
+        );
+        cpu.signal_keyboard_event(13);
+        cpu.run(20_000).unwrap();
+
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.registers[0], 84);
+        assert_eq!(
+            cpu.bios_settings().preferred_disk.as_deref(),
+            Some("DISK0003")
+        );
+        assert_eq!(
+            cpu.bios_settings().startup_behavior,
+            crate::bios_settings::StartupBehavior::BootPreferred
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("bios.json")).unwrap()).unwrap();
+        assert_eq!(saved["preferred_disk"], "DISK0003");
+        assert_eq!(saved["startup_behavior"], "boot_preferred");
+        drop(cpu);
+
+        let mut automatic = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        automatic.run(5000).unwrap();
+        assert_eq!(automatic.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize], 1);
+        automatic.signal_keyboard_event(0x8a);
+        automatic.run(5000).unwrap();
+        assert_eq!(automatic.privilege_mode, PrivilegeMode::User);
+        assert_eq!(automatic.registers[0], 84);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sisu_os_boots_from_bios_and_runs_preemptive_shell_commands() {
+        let root = std::env::temp_dir().join(format!(
+            "sc16-sisu-os-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let disks = root.join("disks");
+        fs::create_dir_all(&disks).unwrap();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let checked_in_disks = repository.join("disks");
+        let checked_in_disk = crate::disk::FolderDisk::discover_paths(&checked_in_disks)
+            .unwrap()
+            .into_iter()
+            .find(|path| {
+                crate::disk::FolderDisk::open(path)
+                    .is_ok_and(|disk| disk.manifest().label == "SisuOS")
+            })
+            .expect("checked-in SisuOS folder disk");
+        let boot_disk_id = checked_in_disk
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let kernel_source = repository.join("examples").join("preemptive_os_kernel.asm");
+        let demo_source = repository.join("examples").join("preemptive_os_demo.asm");
+        let kernel = crate::assembler::assemble_file(&kernel_source, 0).unwrap();
+        let demo = crate::assembler::assemble_file(&demo_source, 0).unwrap();
+        assert_eq!(
+            crate::image::read_image(&checked_in_disk.join("kernel.bin")).unwrap(),
+            kernel,
+            "checked-in kernel image is stale; run scripts\\build-preemptive-os.ps1"
+        );
+        assert_eq!(
+            crate::image::read_image(&checked_in_disk.join("demo.bin")).unwrap(),
+            demo,
+            "checked-in demo image is stale; run scripts\\build-preemptive-os.ps1"
+        );
+        let manifest = crate::disk::FolderDisk::open(&checked_in_disk).unwrap();
+        assert_eq!(manifest.manifest().id, boot_disk_id);
+        assert_eq!(manifest.manifest().label, "SisuOS");
+        assert_eq!(
+            manifest.manifest().protected_files,
+            ["kernel.bin", "demo.bin"]
+        );
+        for entry in fs::read_dir(repository.join("disks")).unwrap() {
+            let source_disk = entry.unwrap().path();
+            if !source_disk.is_dir() {
+                continue;
+            }
+            let target_disk = disks.join(source_disk.file_name().unwrap());
+            fs::create_dir_all(&target_disk).unwrap();
+            for file in fs::read_dir(source_disk).unwrap() {
+                let source_file = file.unwrap().path();
+                if source_file.is_file() {
+                    fs::copy(
+                        &source_file,
+                        target_disk.join(source_file.file_name().unwrap()),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let firmware = crate::assembler::assemble_file(&repository.join("bios.asm"), 0).unwrap();
+        assert_eq!(
+            crate::image::read_image(&repository.join("bios.bin")).unwrap(),
+            firmware,
+            "checked-in BIOS image is stale; run .\\run.ps1 to rebuild it"
+        );
+        fs::copy(repository.join("bios.bin"), root.join("bios.bin")).unwrap();
+        let mut settings = crate::bios_settings::BiosSettings::default();
+        settings.preferred_disk = Some(boot_disk_id);
+        settings.save(&root.join("bios.json")).unwrap();
+
+        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        cpu.run(5000).unwrap();
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        let selected_index = u16::from_be_bytes([cpu.memory[0x43402], cpu.memory[0x43403]]);
+        assert_eq!(
+            FolderDisk::discover_paths(&disks).unwrap()[usize::from(selected_index)]
+                .file_name()
+                .unwrap(),
+            checked_in_disk.file_name().unwrap()
+        );
+        cpu.signal_keyboard_event(13);
+        cpu.run(30_000).unwrap();
+        assert_eq!(
+            cpu.privilege_mode,
+            PrivilegeMode::User,
+            "SisuOS did not enter user mode: PC={:#x}, status={}, running={}, logs={:?}, screen={}",
+            cpu.pc,
+            cpu.memory[0x4340c],
+            cpu.running,
+            cpu.console.text_snapshot(),
+            cpu.guest_text
+                .cells
+                .iter()
+                .map(|cell| char::from(cell.character))
+                .collect::<String>()
+        );
+        cpu.receive_console_input(b"help\nlist\ninfo\nrun demo\nunknown\n");
+        cpu.run(500_000).unwrap();
+
+        let output = String::from_utf8_lossy(cpu.console.output());
+        for expected in [
+            "SisuOS interactive shell",
+            "Commands: help, list, run demo, info",
+            "Programs: demo",
+            "SisuOS | Protected mode | Syscall ABI 1 | Preemptive scheduler active",
+            "demo task ran",
+            "demo exited with status 7",
+            "Unknown command. Type help.",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected:?}; output={output}"
+            );
+        }
+        let child_progress = output.find("demo task ran").unwrap();
+        let parent_wait = output.find("Waiting for demo...").unwrap();
+        assert!(
+            child_progress < parent_wait,
+            "child did not progress while the parent was runnable: {output}"
+        );
+        assert_eq!(cpu.current_task(), Some(0));
+        assert_eq!(
+            cpu.task_context(0).unwrap().state,
+            crate::scheduler::TaskState::Running
+        );
+        assert_eq!(
+            cpu.task_context(1).unwrap().state,
+            crate::scheduler::TaskState::Exited
+        );
+        assert_eq!(cpu.task_context(1).unwrap().exit_code, Some(7));
+        assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
+        assert!(cpu.is_mmu_enabled());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2793,6 +3471,19 @@ mod tests {
         assert!(!halted_window_should_close(false, false));
         assert!(halted_window_should_close(false, true));
         assert!(!halted_window_should_close(true, true));
+        assert!(runtime_should_close(true, true, false));
+        assert!(runtime_should_close(false, false, true));
+        assert!(!runtime_should_close(false, true, false));
+    }
+
+    #[test]
+    fn bios_rebuild_is_requested_only_when_source_is_newer_or_image_is_missing() {
+        let earlier = UNIX_EPOCH + Duration::from_secs(10);
+        let later = UNIX_EPOCH + Duration::from_secs(20);
+        assert!(bios_needs_rebuild(Some(later), None));
+        assert!(bios_needs_rebuild(Some(later), Some(earlier)));
+        assert!(!bios_needs_rebuild(Some(earlier), Some(later)));
+        assert!(!bios_needs_rebuild(None, Some(later)));
     }
 
     #[test]
@@ -2935,17 +3626,22 @@ mod tests {
         );
         assert_eq!(
             toolbar_control((150.0, 18.0), false, false),
+            Some(RuntimeControl::StopRequested)
+        );
+        assert_eq!(
+            toolbar_control((240.0, 18.0), false, false),
             Some(RuntimeControl::ResetRequested)
         );
         assert_eq!(
-            toolbar_control((250.0, 18.0), false, false),
+            toolbar_control((330.0, 18.0), false, false),
             Some(RuntimeControl::RebootRequested)
         );
         assert_eq!(
-            toolbar_control((350.0, 18.0), false, false),
+            toolbar_control((440.0, 18.0), false, false),
             Some(RuntimeControl::ConsoleToggled(true))
         );
         assert_eq!(toolbar_control((115.0, 18.0), false, false), None);
+        assert_eq!(toolbar_control((200.0, 18.0), false, false), None);
         assert_eq!(toolbar_control((50.0, 34.0), false, false), None);
     }
 

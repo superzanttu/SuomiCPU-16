@@ -541,20 +541,45 @@ Checklist status: [x] completed; [ ] planned.
 
 === Phase 9 — Verify a protected multitasking OS
 
-* [ ] Build a minimal kernel disk that boots through the emulator-wide BIOS,
+* [x] Add guest supervisor instructions for IDT installation, MMU enable,
+  address-space switching, MMU disable, validated user-mode entry, and
+  activation of the initial scheduled user task. Verify assembly, execution,
+  and user-mode privilege rejection.
+* [x] Build a minimal kernel disk that boots through the emulator-wide BIOS,
   initializes protected memory and the PIT/IDT, and enters user mode.
-* [ ] Run at least two isolated user tasks that are preempted and scheduled
+* [x] Build the syscall fixture's initial page directory and table in guest
+  startup code, then enable the MMU with those mappings.
+* [x] Provide guest-visible page allocation and mapping through +sys_mmap+;
+  exercise the allocated page from a user workload and verify frame reuse
+  during address-space teardown.
+* [x] Run at least two isolated user tasks that are preempted and scheduled
   without losing register state or allowing one task to access the other's
-  memory.
-* [ ] Demonstrate the syscall lifecycle (+spawn+, +yield+, +sleep+, +wait+,
+  memory. BIOS-booted syscall-workload coverage is in
+  +runtime::tests::bios_kernel_runs_spawned_syscall_lifecycle+.
+* [x] Demonstrate the syscall lifecycle (+spawn+, +yield+, +sleep+, +wait+,
   file/console I/O, and +exit+) from user programs.
-* [ ] Add end-to-end tests for cold boot through disk selection, kernel startup,
+* [x] Add end-to-end tests for cold boot through disk selection, kernel startup,
   user launch, task switching, protection faults, and clean shutdown/reboot.
-* [ ] Publish the supported machine/boot/disk/syscall versions and explicitly
+* [x] Publish the supported machine/boot/disk/syscall versions and explicitly
   list any unimplemented features before describing the architecture as ready
   for general-purpose operating systems.
 
-=== Phase 10 - Final tasks
+=== Phase 10 — SisuOS preemptive operating-system demonstration
+* [x] Add a checked-in, reproducibly-built folder disk with a version 1
+  manifest, protected +kernel.bin+, protected user +demo.bin+, and the SisuOS
+  interactive shell.
+* [x] Boot SisuOS through the common BIOS; verify guest IDT/MMU/PIT setup,
+  isolated user tasks, timer-preempted child progress, wait/exit status, and
+  continued parent-shell execution through an end-to-end test.
+* [x] Provide the bounded shell commands +help+, +list+, +info+, and
+  +run demo+; verify visible output, unknown-command handling, and return to
+  the shell after the demo exits.
+* [x] Document how to build a fresh disk without overwriting existing output,
+  select it in BIOS, use the shell, and understand the example's limitations.
+
+=== Phase 11 - Final tasks
 * [ ] Perform a final review of all documentation, ensuring accuracy and completeness.
 * [ ] Write documentation how to compile and package the BIOS, kernel, and user programs, as well as how to create and manage bootable disks.
 * [ ] Ensure all helper tools and scripts are documented, including usage examples and expected outputs.
+* [ ] Analyze current memory-mapped control registers and suggest a better
+  architecture.
