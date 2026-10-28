@@ -222,8 +222,8 @@ Every exception or interrupt creates a 16-byte, big-endian frame on the
 supervisor stack. With the MMU enabled, SP and KSP are virtual addresses and
 event frames use supervisor translation, just like guest stack instructions.
 All frame bytes are checked before writing, including frames crossing pages;
-frames must reside in writable RAM, not MMIO. RTI reads the frame through the
-active supervisor mapping and validates the restored executable PC and writable
+frames must reside in writable RAM, not MMIO or framebuffer backing. RTI reads
+the frame through the active supervisor mapping and validates the restored executable PC and writable
 stack before changing context. Invalid frames or return targets stop the CPU
 with a double fault. At the frame address, increasing offsets contain:
 
@@ -310,6 +310,13 @@ unmap. Unmapped pages can serve as guard pages. These are kernel primitives;
 the BIOS does not yet establish a protected address space as part of normal
 user boot.
 
+The emulator-managed process allocator reserves the current MMIO backing
+`0x43000..0x43fff` and the complete framebuffer backing
+`0x50000..0x757ff` before allocating page tables or process pages. The framebuffer
+reservation covers the maximum 640x480 packed display, independent of the active
+display mode, and includes its final partial page. Allocation, teardown, and
+frame reuse must not clear or overwrite either device range.
+
 == Device access
 
 The emulator exposes keyboard, mouse, interrupt control, RTC, timer, GPU,
@@ -320,6 +327,16 @@ against the active MMU mappings, including noncontiguous buffers, when paging
 is enabled. Legacy block commands are rejected in user mode. This device
 gateway remains distinct from the general syscall ABI. With translation
 disabled, ordinary RAM is not isolated from user code.
+
+Validated buffer services reject both virtual and translated physical addresses
+in the MMIO and framebuffer backing ranges above. This applies to paths,
+arguments, console and file transfers, process reports, networking, and folder
+gateway transfers, including requests made by supervisor code through those
+buffer helpers. Checks cover every requested byte before consuming input or
+modifying output; crossing from ordinary RAM into a device range is an error,
+not a partial transfer. Direct legacy graphics/MMIO access is unchanged here:
+this buffer and allocator protection does not complete the planned supervisor-only
+device bus or make no-MMU execution isolated.
 
 == System-call ABI version 1
 

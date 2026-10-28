@@ -123,6 +123,11 @@ const FOLDER_FS_RENAME: u8 = 0x46;
 const FOLDER_FS_STAT: u8 = 0x47;
 const MMIO_START: u32 = 0x43000;
 const MMIO_END: u32 = 0x44000;
+const VRAM_BYTES: u32 = 640 * 480 / 2;
+const DEVICE_RAM_RANGES: [(u32, u32); 2] = [
+    (MMIO_START, MMIO_END - MMIO_START),
+    (VRAM_START, VRAM_BYTES),
+];
 const GPU3D_FILL: u16 = 1;
 const GPU3D_WIREFRAME: u16 = 2;
 const GPU3D_SIN_8_8: [i32; 64] = [
@@ -1771,8 +1776,11 @@ impl Cpu {
             .checked_add(length)
             .filter(|end| *end <= self.memory.len())
             .ok_or_else(|| "guest buffer range is outside memory".to_owned())?;
-        if address < MMIO_END && end > MMIO_START as usize {
-            return Err("guest buffer overlaps memory-mapped devices".to_owned());
+        if DEVICE_RAM_RANGES
+            .iter()
+            .any(|&(base, length)| address < base + length && end > base as usize)
+        {
+            return Err("guest buffer overlaps device backing memory".to_owned());
         }
         Ok(start..end)
     }
@@ -1798,8 +1806,8 @@ impl Cpu {
                     }
                 })
                 .ok_or_else(|| "guest buffer range is outside address space".to_owned())?;
-            if self.guest_range_contains(virtual_address, MMIO_START, MMIO_END - MMIO_START) {
-                return Err("guest buffer overlaps memory-mapped devices".to_owned());
+            if Self::is_device_backing_address(virtual_address) {
+                return Err("guest buffer overlaps device backing memory".to_owned());
             }
             let physical_address = if self.mmu_enabled {
                 crate::mmu::translate(
@@ -1813,7 +1821,7 @@ impl Cpu {
             } else {
                 virtual_address
             };
-            if self.guest_range_contains(physical_address, MMIO_START, MMIO_END - MMIO_START)
+            if Self::is_device_backing_address(physical_address)
                 || physical_address as usize >= self.memory.len()
             {
                 return Err("guest buffer is outside accessible RAM".to_owned());
@@ -1821,6 +1829,12 @@ impl Cpu {
             addresses.push(physical_address as usize);
         }
         Ok(addresses)
+    }
+
+    fn is_device_backing_address(address: u32) -> bool {
+        DEVICE_RAM_RANGES
+            .iter()
+            .any(|&(base, length)| address >= base && address - base < length)
     }
 
     fn read_guest_path(&self, address: u32, user_mode: bool) -> Result<Option<String>, String> {
@@ -2482,9 +2496,12 @@ impl Cpu {
             return Ok(());
         }
         let mut manager = crate::mmu::PageMemoryManager::new(self.memory.len(), 0x8000)?;
-        if self.memory.len() > MMIO_START as usize {
-            manager
-                .reserve_physical_range(MMIO_START as usize, (MMIO_END - MMIO_START) as usize)?;
+        for (base, length) in DEVICE_RAM_RANGES {
+            let start = base as usize;
+            if start < self.memory.len() {
+                let length = (length as usize).min(self.memory.len() - start);
+                manager.reserve_physical_range(start, length)?;
+            }
         }
         for segment in &self.loaded_image_segments {
             manager.reserve_physical_range(segment.address as usize, segment.length)?;
@@ -5694,8 +5711,8 @@ impl Cpu {
                 address
             };
             if translated as usize >= self.memory.len()
-                || (MMIO_START..MMIO_END).contains(&address)
-                || (MMIO_START..MMIO_END).contains(&translated)
+                || Self::is_device_backing_address(address)
+                || Self::is_device_backing_address(translated)
             {
                 return Err(CpuError::DoubleFault);
             }
@@ -6129,15 +6146,304 @@ mod tests {
     }
 
     fn cpu_with_syscall_task() -> (Cpu, TaskId) {
+        cpu_with_syscall_task_memory(1 << 16)
+    }
+
+    fn cpu_with_syscall_task_memory(memory_size: usize) -> (Cpu, TaskId) {
         let source = "SVC\n".repeat(32) + "HALT";
         let image = crate::assembler::assemble(&source, 0x100).unwrap();
-        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        let mut cpu = Cpu::with_memory_size(memory_size).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
         install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
         let task = cpu.create_user_task(0x100, 0x7000, 0xf000, None).unwrap();
         cpu.start_task(task).unwrap();
         (cpu, task)
+    }
+
+    #[test]
+    fn user_buffer_copies_reject_framebuffer_without_consuming_input_or_writing_output() {
+        let (mut cpu, task) = cpu_with_syscall_task_memory(1 << 20);
+        cpu.console.receive(b"input");
+        cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8].fill(0xa5);
+        for destination in [VRAM_START - 1, VRAM_START, VRAM_START + 153600 - 1] {
+            invoke_syscall(
+                &mut cpu,
+                SyscallNumber::Read,
+                [0, i64::from(destination), 2, 0, 0, 0],
+            );
+            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+            assert_eq!(
+                cpu.console
+                    .receive_buffer()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                b"input"
+            );
+            invoke_syscall(
+                &mut cpu,
+                SyscallNumber::Write,
+                [1, i64::from(destination), 2, 0, 0, 0],
+            );
+            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+            assert!(cpu.console.output().is_empty());
+        }
+        assert!(
+            cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        cpu.memory[VRAM_START as usize..VRAM_START as usize + 9].copy_from_slice(b"file.txt\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [i64::from(VRAM_START), 1, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .arguments = vec!["app".to_owned()];
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Argument,
+            [0, i64::from(VRAM_START - 1), 8, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        assert_eq!(cpu.memory[VRAM_START as usize - 1], 0xa5);
+        invoke_syscall(&mut cpu, SyscallNumber::Read, [0, 0x1000, 5, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 5);
+        assert_eq!(&cpu.memory[0x1000..0x1005], b"input");
+    }
+
+    #[test]
+    fn translated_user_buffers_reject_virtual_and_physical_framebuffer_aliases() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        let image = crate::assembler::assemble(&("SVC\n".repeat(32) + "HALT"), 0x100).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
+        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
+        let root = manager.create_address_space(&mut cpu.memory).unwrap();
+        for (page, permissions) in [
+            (0, crate::mmu::PagePermissions::USER_CODE),
+            (0x7000, crate::mmu::PagePermissions::USER_DATA),
+            (0xe000, crate::mmu::PagePermissions::KERNEL_DATA),
+        ] {
+            manager
+                .map_borrowed_page(
+                    &mut cpu.memory,
+                    root,
+                    page,
+                    page / crate::mmu::PAGE_SIZE as u32,
+                    permissions,
+                )
+                .unwrap();
+        }
+        for (virtual_address, frame) in [
+            (0x1000, 0x90),
+            (0x2000, VRAM_START / crate::mmu::PAGE_SIZE as u32),
+            (0x3000, (VRAM_START + 153599) / crate::mmu::PAGE_SIZE as u32),
+            (VRAM_START, 0x91),
+            (VRAM_START + 153600 - 2048, 0x92),
+        ] {
+            manager
+                .map_borrowed_page(
+                    &mut cpu.memory,
+                    root,
+                    virtual_address,
+                    frame,
+                    crate::mmu::PagePermissions::USER_DATA,
+                )
+                .unwrap();
+        }
+        cpu.enable_mmu(root).unwrap();
+        let task = cpu
+            .create_user_task(0x100, 0x8000, 0xf000, Some(root))
+            .unwrap();
+        cpu.start_task(task).unwrap();
+        cpu.console.receive(b"input");
+        cpu.memory[0x90fff] = 0xa5;
+        for access in [
+            crate::mmu::MemoryAccess::Read,
+            crate::mmu::MemoryAccess::Write,
+        ] {
+            for address in [0x2000, 0x3000, VRAM_START, VRAM_START + 153599] {
+                assert!(
+                    cpu.guest_memory_addresses(address, 1, access, true)
+                        .is_err(),
+                    "{address:#x} {access:?}"
+                );
+            }
+            assert_eq!(
+                cpu.guest_memory_addresses(0x1000, 2, access, true).unwrap(),
+                [0x90000, 0x90001]
+            );
+        }
+        for destination in [0x1fff, 0x2000, 0x3000, VRAM_START, VRAM_START + 153599] {
+            invoke_syscall(
+                &mut cpu,
+                SyscallNumber::Read,
+                [0, i64::from(destination), 2, 0, 0, 0],
+            );
+            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+            assert_eq!(cpu.console.receive_buffer().len(), 5);
+            assert_eq!(cpu.memory[0x90fff], 0xa5);
+        }
+        invoke_syscall(&mut cpu, SyscallNumber::Read, [0, 0x1000, 5, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 5);
+        assert_eq!(&cpu.memory[0x90000..0x90005], b"input");
+    }
+
+    #[test]
+    fn framebuffer_file_transfers_preserve_bytes_and_offsets_on_rejection() {
+        let disk = folder_disk_for_test("framebuffer-transfers", false);
+        std::fs::write(disk.join("note.txt"), b"original").unwrap();
+        let (mut cpu, task) = cpu_with_syscall_task_memory(1 << 20);
+        cpu.mount_folder_disk(&disk).unwrap();
+        cpu.memory[0x1000..0x1009].copy_from_slice(b"note.txt\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x1000,
+                i64::from(crate::syscall::open_flags::READ | crate::syscall::open_flags::WRITE),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let handle = cpu.registers[0];
+        assert!(handle >= 3);
+        cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8].fill(0xa5);
+        for number in [SyscallNumber::Read, SyscallNumber::Write] {
+            invoke_syscall(
+                &mut cpu,
+                number,
+                [handle, i64::from(VRAM_START - 1), 8, 0, 0, 0],
+            );
+            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+            assert_eq!(
+                cpu.syscall_state.file(task, handle as u32).unwrap().offset,
+                0
+            );
+            assert_eq!(std::fs::read(disk.join("note.txt")).unwrap(), b"original");
+            assert!(
+                cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+        invoke_syscall(&mut cpu, SyscallNumber::Read, [handle, 0x2000, 8, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 8);
+        assert_eq!(&cpu.memory[0x2000..0x2008], b"original");
+        std::fs::remove_dir_all(disk.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn device_buffer_bounds_are_independent_of_active_graphics_mode() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        for mode in [0, 1] {
+            cpu.write(GPU_MODE_ADDR, mode);
+            for (address, length) in [
+                (MMIO_START - 1, 2),
+                (MMIO_START, 1),
+                (MMIO_END - 1, 2),
+                (VRAM_START - 1, 2),
+                (VRAM_START, 1),
+                (VRAM_START + 153599, 2),
+            ] {
+                assert!(cpu.guest_range(address, length).is_err());
+                for user in [false, true] {
+                    for access in [
+                        crate::mmu::MemoryAccess::Read,
+                        crate::mmu::MemoryAccess::Write,
+                    ] {
+                        assert!(
+                            cpu.guest_memory_addresses(address, length, access, user)
+                                .is_err()
+                        );
+                    }
+                }
+            }
+            for address in [
+                MMIO_START - 1,
+                MMIO_END,
+                VRAM_START - 1,
+                VRAM_START + 153600,
+            ] {
+                assert_eq!(
+                    cpu.guest_range(address, 1).unwrap(),
+                    address as usize..address as usize + 1
+                );
+                assert_eq!(
+                    cpu.guest_memory_addresses(address, 1, crate::mmu::MemoryAccess::Read, true)
+                        .unwrap(),
+                    [address as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_allocations_never_use_device_backing_frames() {
+        for memory_size in [1 << 16, 1 << 19, 1 << 20] {
+            let mut cpu = Cpu::with_memory_size(memory_size).unwrap();
+            if memory_size > VRAM_START as usize {
+                cpu.memory[VRAM_START as usize..VRAM_START as usize + 153600].fill(0xa5);
+                cpu.memory[MMIO_START as usize..MMIO_END as usize].fill(0x5a);
+            }
+            cpu.ensure_page_memory_manager().unwrap();
+            let manager = cpu.page_memory_manager.as_mut().unwrap();
+            let free = manager.free_frames();
+            if free == 0 {
+                assert_eq!(
+                    manager.create_address_space(&mut cpu.memory),
+                    Err(crate::mmu::PageTableError::OutOfFrames)
+                );
+                continue;
+            }
+            for _ in 0..2 {
+                let root = manager.create_address_space(&mut cpu.memory).unwrap();
+                let mut virtual_address = 0x100000;
+                loop {
+                    match manager.allocate_and_map_page(
+                        &mut cpu.memory,
+                        root,
+                        virtual_address,
+                        crate::mmu::PagePermissions::USER_DATA,
+                    ) {
+                        Ok(physical) => {
+                            let physical = physical * crate::mmu::PAGE_SIZE as u32;
+                            assert!(!(MMIO_START..MMIO_END).contains(&physical));
+                            assert!(!(VRAM_START..VRAM_START + 153600).contains(&physical));
+                        }
+                        Err(crate::mmu::PageTableError::OutOfFrames) => break,
+                        Err(error) => panic!("unexpected allocation failure: {error:?}"),
+                    }
+                    virtual_address += crate::mmu::PAGE_SIZE as u32;
+                }
+                manager
+                    .destroy_address_space(&mut cpu.memory, root)
+                    .unwrap();
+                assert_eq!(manager.free_frames(), free);
+                if memory_size > VRAM_START as usize {
+                    assert!(
+                        cpu.memory[VRAM_START as usize..VRAM_START as usize + 153600]
+                            .iter()
+                            .all(|byte| *byte == 0xa5)
+                    );
+                    assert!(
+                        cpu.memory[MMIO_START as usize..MMIO_END as usize]
+                            .iter()
+                            .all(|byte| *byte == 0x5a)
+                    );
+                }
+            }
+        }
     }
 
     fn invoke_syscall(cpu: &mut Cpu, number: SyscallNumber, arguments: [i64; 6]) {
@@ -6844,7 +7150,7 @@ mod tests {
             .unwrap();
         cpu.enable_scnet(0);
         install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
-        let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        let task = cpu.create_user_task(0, 0x90000, 0xf0000, None).unwrap();
         cpu.start_task(task).unwrap();
 
         cpu.run(100_000).unwrap();
@@ -6934,7 +7240,7 @@ mod tests {
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
         install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
-        let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        let task = cpu.create_user_task(0, 0x90000, 0xf0000, None).unwrap();
         cpu.syscall_state.register_process(task, None);
         cpu.syscall_state
             .processes
@@ -7042,7 +7348,7 @@ mod tests {
             .unwrap();
         cpu.mount_folder_disk(&disk).unwrap();
         install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
-        let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        let task = cpu.create_user_task(0, 0x90000, 0xf0000, None).unwrap();
         cpu.start_task(task).unwrap();
 
         cpu.run(1_000_000).unwrap();

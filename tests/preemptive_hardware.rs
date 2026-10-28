@@ -195,6 +195,45 @@ fn event_frame_validation_prevents_partial_writes() {
 }
 
 #[test]
+fn event_frames_reject_device_backing_aliases_before_reading_or_writing() {
+    for physical in [0x43000u32, 0x50000, 0x75000] {
+        let mut cpu = translated_kernel_stack(3);
+        cpu.memory[0x3028..0x302c].copy_from_slice(&(physical | 3).to_be_bytes());
+        cpu.memory[0x20ff8..0x21000].fill(0xa5);
+        cpu.memory[physical as usize..physical as usize + 8].fill(0x5a);
+        assert_eq!(cpu.step(), Err(CpuError::DoubleFault));
+        assert!(!cpu.running);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.sp, 0x8000);
+        assert_eq!(cpu.kernel_sp, 0xa008);
+        assert!(
+            cpu.memory[0x20ff8..0x21000]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert!(
+            cpu.memory[physical as usize..physical as usize + 8]
+                .iter()
+                .all(|byte| *byte == 0x5a)
+        );
+
+        let mut cpu = translated_kernel_stack(3);
+        cpu.step().unwrap();
+        cpu.memory[0x3028..0x302c].copy_from_slice(&(physical | 3).to_be_bytes());
+        cpu.pc = 0x1102;
+        let registers = cpu.registers;
+        let flags = cpu.flags;
+        assert_eq!(cpu.step(), Err(CpuError::DoubleFault));
+        assert!(!cpu.running);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.sp, 0x9ff8);
+        assert_eq!(cpu.kernel_sp, 0x9ff8);
+        assert_eq!(cpu.registers, registers);
+        assert_eq!(cpu.flags, flags);
+    }
+}
+
+#[test]
 fn rti_rejects_invalid_user_targets_before_restoring_context() {
     for (offset, value) in [(0, 0x6000u32), (8, 0x6000)] {
         let mut cpu = translated_kernel_stack(3);

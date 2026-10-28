@@ -585,6 +585,11 @@ Checklist status: [x] completed; [ ] planned.
    machine/image versions, and user device-service ABI.
 ** [ ] Separate RAM from high-address, page-separated, supervisor-only MMIO;
    reject user aliases and device instruction fetches.
+*** [x] Exclude MMIO/framebuffer backing from validated buffers, event frames,
+    and emulator-managed frame allocations; verify translated aliases,
+    side-effect-free rejection, display-mode-independent bounds, and frame reuse.
+*** [ ] Move device registers out of RAM and implement the revised physical
+    bus, including supervisor-only access, reserved offsets, and fetch rejection.
 ** [ ] Implement validated user device services and shared protected startup
    for ordinary user programs.
 ** [ ] Version executable images and reject stale or unversioned runtime
