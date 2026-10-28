@@ -1276,28 +1276,55 @@ path, that option mounts the same folder filesystem for guest file operations.
 
 ==== SisuOS demonstration
 
-The checked-in +disks/OS000001+ folder contains SisuOS, a small protected,
-preemptive OS demonstration. Start it with:
+The checked-in +disks/SisuOS-1+ folder contains SisuOS, a small protected,
+preemptive OS demonstration. Start the emulator with the SisuOS disk
+preselected:
 [source,console]
 ----
-cargo run --bin suomicpu16 -- --disk OS000001
+cargo run --bin suomicpu16 -- --disk SisuOS-1
 ----
-Press Enter in the BIOS. The kernel installs its IDT, enables the MMU and
-instruction timer, and starts the user-mode shell. Available
-commands are +help+, +list+, +info+, and +run demo+. The demo runs as a child
-task; after it exits, the shell reports its status and displays the prompt
-again. The program list is fixed to +demo+ and this example is not a
-general-purpose OS.
+Press Enter in the BIOS to boot the selected disk. The kernel installs its
+IDT, enables the MMU and instruction timer, and starts the user-mode shell.
+At the +sc16>+ prompt, enter +run demo+ to start the preemptive demo as a child
+task. The shell reports the child's output and exit status, then returns to the
+prompt. Other commands are +help+, +list+, +info+, and +ps+. The +ps+ command
+lists all unreaped processes with their PID, parent PID, and scheduler state.
 
-To build a fresh copy without overwriting an existing folder:
+Use +run demo X+ to launch a background demo for +X+ seconds (1 through 65535).
+The shell returns immediately and accepts more commands, including additional
+background launches. Each child prints +BGP [pid] time [second]/X+ once per
+elapsed second, starting at +1/X+ and ending at +X/X+, then exits. For example:
+[source,console]
+----
+sc16> run demo 3
+Started background process 1
+sc16> ps
+PID PPID STATE
+0 - running
+1 0 runnable
+BGP 1 time 1/3
+BGP 1 time 2/3
+BGP 1 time 3/3
+----
+Background output can appear while a command is being typed. Timing uses a
+monotonic host clock, not the instruction-tick sleep service or emulation speed.
+The clock continues while paused; overdue lines are emitted when execution
+resumes. Up to 16 background children can be tracked at once; the shell reaps
+finished children while reading input. The program list is fixed to +demo+ and
+this example is not a general-purpose OS.
+
+To build a fresh, BIOS-discoverable copy without overwriting an existing disk:
 [source,powershell]
 ----
-.\scripts\build-preemptive-os.ps1 .\build\OS000001
+.\scripts\build-preemptive-os.ps1 .\disks\OS000001
 ----
-The script packages the kernel and protected demo images from
-+examples/preemptive_os_kernel.asm+, +examples/preemptive_os_shell.asm+, and
-+examples/preemptive_os_demo.asm+. The BIOS integration test boots the checked-in
-disk and verifies its images match those sources.
+The kernel's protected-mode, interrupt, and MMU setup remains in
++examples/preemptive_os_kernel.asm+. The interactive shell and preemptively
+scheduled child program are written in C in
++examples/preemptive_os_shell.c+ and +examples/preemptive_os_demo.c+.
+The build embeds the compiled shell in the kernel image and packages the
+compiled child as +demo.bin+. A BIOS-boot integration test checks the packaged
+images against those sources and verifies that the child task runs and exits.
 
 The BIOS information block starts at +0x43040+: bytes +0..3+ are the +SC16+
 signature, bytes +4..5+ are the BIOS version, bytes +6..8+ contain the memory
@@ -1327,14 +1354,22 @@ The serial device is memory-mapped at the legacy UART-like console addresses:
 |Bit 0 enables local echo; bit 1 enables host keyboard input. Both are enabled at reset.
 |===
 
-The game window and the optional *Bug Monitor* run separately. The Bug Monitor
-is an 80×25 serial output display for emulator logs and guest-program output
-written to the UART-like device; it is not the BIOS display. The monitor has
-*REBOOT*, *RESET*, *COPY*, and *PAUSE/CONTINUE* buttons in its top row.
-*COPY* copies selected text or the visible console screen; Ctrl+C copies
-selected text. The 1,000-row scrollback can be navigated with the mouse wheel.
-Emulator lifecycle and device errors are tagged by severity. Guest C programs
-can include +<bug_monitor.h>+ and call the dedicated serial logging functions:
+Guest console input and output use the main emulator display as an 80×25 text
+terminal. Guest writes to standard output/error or +0x43200+ appear there;
+keyboard input is echoed as the guest reads it. Carriage return, line feed,
+backspace, tabs, wrapping, and scrolling are supported. The terminal also
+supports ANSI CSI cursor movement, cursor positioning, line/screen erase, and
+cursor save/restore sequences. A cursor marks the current insertion position.
+The guest's existing graphics display remains available until it writes to
+the console.
+
+The optional *Bug Monitor* is separate from the guest terminal and displays
+emulator diagnostics only. It has *REBOOT*, *RESET*, *COPY*, and
+*PAUSE/CONTINUE* buttons in its top row. *COPY* copies selected text or the
+visible monitor screen; Ctrl+C copies selected text. The 1,000-row diagnostic
+scrollback can be navigated with the mouse wheel. Emulator lifecycle and
+device errors are tagged by severity. Guest C programs can include
++<bug_monitor.h>+ and call the dedicated diagnostic logging functions:
 
 [source,c]
 ----
@@ -1345,17 +1380,15 @@ bug_monitor_error("unable to load level");
 ----
 
 The functions write +[DEBUG]+, +[INFO]+, +[WARN]+, or +[ERROR]+ followed by
-the message and a newline to the serial output. The serial input path remains
-available to guest programs. *RESET*
+the message and a newline to the Bug Monitor; they do not appear in the guest
+terminal. The guest console input path remains available to guest programs.
+*RESET*
 returns to BIOS disk selection, while *REBOOT* restarts the current program.
-The status line below
-shows local time, uptime, mounted folder disk, and loaded module. It also displays
-host lifecycle messages such as emulator startup, program loading, disk
-operations, and errors. Type into the monitor text area to send serial input;
-Enter and Backspace are supported. Press F2 in the emulator window
-to hide/show the Bug Monitor. An empty serial-status poll yields the current
-instruction frame to the host event loop, so a C +getchar+ wait does not prevent
-keyboard events from being processed.
+Type into the main emulator window to send input to the guest terminal; Enter
+and Backspace are supported. Press F2 in the emulator window to hide/show the
+Bug Monitor. An empty console-status poll yields the current instruction frame
+to the host event loop, so a C +getchar+ wait does not prevent keyboard events
+from being processed.
 
 The guest filesystem is rooted at the folder disk selected by the BIOS or
 +--disk ID+. The register service at +0x43100+ supports bounded listing, file

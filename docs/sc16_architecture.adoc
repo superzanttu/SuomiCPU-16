@@ -323,6 +323,18 @@ which the native wrappers combine before `SVC`.
 |13 |`scnet` |R1 operation: 0 discover (R2 names buffer, R3 slot capacity),
   1 send (R2 recipient, R3 payload, R4 length), 2 receive
   (R2 sender buffer, R3 payload, R4 capacity).
+|14 |`process_info` |R1 zero-based process index, R2 writable buffer, R3 capacity.
+  Returns a +PID PPID STATE\n+ row's byte count (without a terminator), zero at
+  the end, or an error. Reaped processes are excluded; indices are not stable
+  across process creation/reaping.
+|15 |`startup_argument` |Returns the current process's scalar startup argument,
+  zero for ordinary +spawn+.
+|16 |`monotonic_ms` |Returns host-monotonic elapsed milliseconds modulo 2^30.
+  Queried on demand, independent of instruction speed; continues during pause.
+|17 |`spawn_arg` |Like +spawn+, with an unsigned 30-bit scalar startup argument
+  in R2. The original +spawn+ ignores R2 and supplies zero.
+|18 |`trywait` |Like +wait+, but returns +-EAGAIN+ (-11) without blocking when
+  the child has not exited. Reaps an exited child and returns its status.
 |===
 
 Every user pointer is range-checked against the active address space before
@@ -444,8 +456,8 @@ operating system:
 * A BIOS-booted guest workload verifies spawn, yield, sleep, wait, console/file
   I/O, and exit together, but this sample does not establish general-kernel
   robustness.
-* SisuOS is a demonstration shell with fixed `help`, `list`, `info`, and
-  `run demo` commands. Its program list is static; it does not provide a
+* SisuOS is a demonstration shell with fixed `help`, `list`, `info`, `ps`,
+  `run demo`, and `run demo X` commands. Its program list is static; it does not provide a
   general command interpreter, package manager, or persistent user accounts.
 * The BIOS-booted workload triggers a supervisor-only read and verifies that the
   sample handler skips the faulting instruction. This single recovery policy is

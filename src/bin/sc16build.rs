@@ -11,13 +11,15 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let Some(source) = arguments.next() else {
-        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | build-bios [bios.asm] [bios.bin] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel] | package-modules <disk-root> <capacity-bytes>".into());
+        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | build-c-at <source.c> <output.img> <base-address> | build-bios [bios.asm] [bios.bin] | smoke-modules | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel] [--kernel-user-c <source.c>] | package-modules <disk-root> <capacity-bytes>".into());
     };
     if source == "--help" || source == "-h" {
         println!("Usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img]");
         println!("Build SC-16 source, wrap a flat binary, or validate an existing image.");
         println!("       sc16build build-bios [bios.asm] [bios.bin]");
         println!("Assemble the shared BIOS firmware into an SC-16 image.");
+        println!("       sc16build build-c-at <source.c> <output.img> <base-address>");
+        println!("Compile a C program for a relocated SC-16 address space.");
         println!("       sc16build smoke-modules");
         println!("Compile every bootable BIOS module as a smoke check.");
         println!("       sc16build package-modules <disk-root> <capacity-bytes>");
@@ -25,9 +27,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("       sc16build import-block-disk <legacy.json> <destination-folder>");
         println!("Import a legacy JSON block disk without modifying its source.");
         println!(
-            "       sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel]"
+            "       sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel] [--kernel-user-c <source.c>]"
         );
-        println!("Build a source program into a new folder-backed boot disk.");
+        println!(
+            "Build a source program into a new folder-backed boot disk; embed C user code in a kernel with --kernel-user-c."
+        );
+        return Ok(());
+    }
+    if source == "build-c-at" {
+        let usage = "usage: sc16build build-c-at <source.c> <output.img> <base-address>";
+        let Some(c_source) = arguments.next().map(PathBuf::from) else {
+            return Err(usage.into());
+        };
+        let Some(output) = arguments.next().map(PathBuf::from) else {
+            return Err(usage.into());
+        };
+        let Some(base) = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| {
+                value.strip_prefix("0x").map_or_else(
+                    || value.parse().ok(),
+                    |hex| u32::from_str_radix(hex, 16).ok(),
+                )
+            })
+        else {
+            return Err(usage.into());
+        };
+        if arguments.next().is_some() {
+            return Err(usage.into());
+        }
+        let image = suomicpu16::image::build_c_program_at(&c_source, base)?;
+        suomicpu16::image::write_image(&output, &image)?;
+        println!(
+            "Built {} bytes in {} segment(s), entry point {:#x} -> {}",
+            image
+                .segments
+                .iter()
+                .map(|segment| segment.data.len())
+                .sum::<usize>(),
+            image.segments.len(),
+            image.entry_point,
+            output.display()
+        );
         return Ok(());
     }
     if source == "build-bios" {
@@ -102,7 +144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if source == "package-disk" {
-        let usage = "usage: sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel]";
+        let usage = "usage: sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel] [--kernel-user-c <source.c>]";
         let Some(program_source) = arguments.next() else {
             return Err(usage.into());
         };
@@ -119,17 +161,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         else {
             return Err(usage.into());
         };
-        let kernel = match arguments.next() {
-            None => false,
-            Some(option) if option == "--kernel" => true,
-            Some(_) => return Err(usage.into()),
-        };
-        if arguments.next().is_some() {
-            return Err(usage.into());
+        let mut kernel = false;
+        let mut kernel_user_c = None;
+        while let Some(option) = arguments.next() {
+            if option == "--kernel" {
+                kernel = true;
+            } else if option == "--kernel-user-c" {
+                let Some(path) = arguments.next() else {
+                    return Err(usage.into());
+                };
+                kernel_user_c = Some(PathBuf::from(path));
+            } else {
+                return Err(usage.into());
+            }
+        }
+        if kernel_user_c.is_some() && !kernel {
+            return Err("--kernel-user-c requires --kernel".into());
         }
         let source = PathBuf::from(program_source);
         let disk_folder = PathBuf::from(disk_folder);
-        package_disk(&source, &disk_folder, &label, capacity, kernel)?;
+        package_disk_with_embedded_c(
+            &source,
+            &disk_folder,
+            &label,
+            capacity,
+            kernel,
+            kernel_user_c.as_deref(),
+        )?;
         println!(
             "Packaged {} as {} -> {}",
             source.display(),
@@ -204,6 +262,17 @@ fn package_disk(
     capacity_bytes: u64,
     kernel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    package_disk_with_embedded_c(source, disk_folder, label, capacity_bytes, kernel, None)
+}
+
+fn package_disk_with_embedded_c(
+    source: &Path,
+    disk_folder: &Path,
+    label: &str,
+    capacity_bytes: u64,
+    kernel: bool,
+    embedded_c_user: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let id = disk_folder
         .file_name()
         .and_then(|name| name.to_str())
@@ -222,17 +291,24 @@ fn package_disk(
     let manifest_text = serde_json::to_string(&manifest)?;
     let parsed_manifest = suomicpu16::disk::parse_folder_disk_manifest(&manifest_text)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let image = match source.extension().and_then(|extension| extension.to_str()) {
-        Some(extension) if extension.eq_ignore_ascii_case("bin") => {
-            suomicpu16::image::load_binary(source)?
+    let image = if let Some(user_source) = embedded_c_user {
+        if !kernel {
+            return Err("--kernel-user-c requires --kernel".into());
         }
-        Some(extension)
-            if extension.eq_ignore_ascii_case("img")
-                || extension.eq_ignore_ascii_case("sc16img") =>
-        {
-            suomicpu16::image::read_image(source)?
+        suomicpu16::image::build_kernel_with_embedded_c_source(source, user_source)?
+    } else {
+        match source.extension().and_then(|extension| extension.to_str()) {
+            Some(extension) if extension.eq_ignore_ascii_case("bin") => {
+                suomicpu16::image::load_binary(source)?
+            }
+            Some(extension)
+                if extension.eq_ignore_ascii_case("img")
+                    || extension.eq_ignore_ascii_case("sc16img") =>
+            {
+                suomicpu16::image::read_image(source)?
+            }
+            _ => suomicpu16::image::build_source(source)?,
         }
-        _ => suomicpu16::image::build_source(source)?,
     };
     if disk_folder.exists() {
         return Err(std::io::Error::new(

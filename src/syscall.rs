@@ -32,6 +32,11 @@ pub enum SyscallNumber {
     Semaphore = 11,
     Seek = 12,
     ScNet = 13,
+    ProcessInfo = 14,
+    StartupArgument = 15,
+    MonotonicMillis = 16,
+    SpawnArgument = 17,
+    TryWait = 18,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -53,6 +58,11 @@ impl TryFrom<i64> for SyscallNumber {
             11 => Ok(Self::Semaphore),
             12 => Ok(Self::Seek),
             13 => Ok(Self::ScNet),
+            14 => Ok(Self::ProcessInfo),
+            15 => Ok(Self::StartupArgument),
+            16 => Ok(Self::MonotonicMillis),
+            17 => Ok(Self::SpawnArgument),
+            18 => Ok(Self::TryWait),
             _ => Err(()),
         }
     }
@@ -100,6 +110,7 @@ pub(crate) struct OpenFile {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProcessRecord {
+    pub startup_argument: u32,
     pub parent: Option<TaskId>,
     pub children: Vec<TaskId>,
     pub exit_code: Option<i32>,
@@ -179,7 +190,8 @@ mod tests {
         );
         assert_eq!(SyscallNumber::try_from(13), Ok(SyscallNumber::ScNet));
         assert_eq!(SyscallNumber::try_from(-1), Err(()));
-        assert_eq!(SyscallNumber::try_from(14), Err(()));
+        assert_eq!(SyscallNumber::try_from(14), Ok(SyscallNumber::ProcessInfo));
+        assert_eq!(SyscallNumber::try_from(19), Err(()));
     }
 
     #[test]

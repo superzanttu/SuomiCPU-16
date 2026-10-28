@@ -21,19 +21,20 @@ if (Test-Path $ResolvedDiskPath) {
 }
 
 $StagingRoot = Join-Path $RepositoryRoot ("build\preemptive-os-" + [Guid]::NewGuid().ToString("N"))
-$StagingDisk = Join-Path $StagingRoot "OS000001"
+$DiskId = Split-Path -Leaf $ResolvedDiskPath
+$StagingDisk = Join-Path $StagingRoot $DiskId
 $DemoImage = Join-Path $StagingRoot "demo.bin"
 New-Item -ItemType Directory -Path $StagingRoot | Out-Null
 
-& cargo run --quiet --bin sc16build -- package-disk examples\preemptive_os_kernel.asm $StagingDisk "SisuOS" $CapacityBytes --kernel
+& cargo run --quiet --bin sc16build -- package-disk examples\preemptive_os_kernel.asm $StagingDisk "SisuOS" $CapacityBytes --kernel --kernel-user-c examples\preemptive_os_shell.c
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Could not package the preemptive OS kernel."
+    Write-Error "Could not package the C-based preemptive OS."
     exit $LASTEXITCODE
 }
 
-& cargo run --quiet --bin sc16build -- examples\preemptive_os_demo.asm $DemoImage
+& cargo run --quiet --bin sc16build -- build-c-at examples\preemptive_os_demo.c $DemoImage 0x30000
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Could not build the preemptive OS demo program."
+    Write-Error "Could not build the C preemptive OS demo program."
     exit $LASTEXITCODE
 }
 
@@ -50,7 +51,22 @@ try {
     if ($DestinationParent -and !(Test-Path $DestinationParent)) {
         New-Item -ItemType Directory -Path $DestinationParent | Out-Null
     }
-    Move-Item -LiteralPath $StagingDisk -Destination $ResolvedDiskPath
+    $Installed = $false
+    for ($Attempt = 0; $Attempt -lt 5; $Attempt++) {
+        try {
+            Move-Item -LiteralPath $StagingDisk -Destination $ResolvedDiskPath -ErrorAction Stop
+            $Installed = $true
+            break
+        } catch {
+            if ($Attempt -eq 4) {
+                throw
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if (!$Installed) {
+        throw "Could not move the staged disk into place."
+    }
     Remove-Item -LiteralPath $StagingRoot
 } catch {
     Write-Error "Could not install disk at $ResolvedDiskPath. Completed staging disk: $StagingDisk. $($_.Exception.Message)"

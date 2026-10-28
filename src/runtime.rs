@@ -554,6 +554,7 @@ pub async fn run_with_devices(
     let mut presented_palette = cpu.palette;
     let mut active_boot_disk = program.filter(|path| path.is_dir()).map(Path::to_path_buf);
     let runtime_started = Instant::now();
+    let mut last_terminal_cursor_phase = true;
     let mut bios_autoboot_wait_started = None;
     let mut bios_autoboot_timeout_sent = false;
     loop {
@@ -775,6 +776,10 @@ pub async fn run_with_devices(
                     "Firmware reboot complete"
                 },
             );
+            presented_size = screen_size(&cpu);
+            presented_triangles.clear();
+            presented_lines.clear();
+            presented_palette = cpu.palette;
             paused = false;
             old_keys.clear();
             speed_remainder = 0.0;
@@ -821,13 +826,7 @@ pub async fn run_with_devices(
                 if handled_control_keys.contains(&key) {
                     continue;
                 }
-                if key == KeyCode::Enter {
-                    cpu.receive_console_input(b"\n");
-                    cpu.signal_keyboard_event(13);
-                } else if key == KeyCode::Backspace {
-                    cpu.receive_console_input(b"\x08");
-                    cpu.signal_keyboard_event(8);
-                }
+                receive_terminal_key(&mut cpu, key);
             }
             let typed_characters = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
             receive_typed_text(&mut cpu, typed_characters);
@@ -878,19 +877,34 @@ pub async fn run_with_devices(
                 last_frame = Instant::now();
             }
         }
-        if should_capture_display_frame(
-            cpu.memory[VSYNC_ADDR] != 0,
-            cpu.frame_presented,
-            cpu.guest_text.enabled,
-        ) {
-            render_cpu_with_framebuffer(&cpu, &mut pixels, &font, &mut framebuffer);
-            presented_size = screen_size(&cpu);
-            presented_triangles.clone_from(&cpu.gpu_triangles);
-            presented_lines.clone_from(&cpu.gpu_lines);
-            presented_palette = cpu.palette;
+        let cursor_phase = terminal_cursor_phase();
+        let capture_display = if cpu.terminal_active {
+            cpu.terminal_dirty || last_terminal_cursor_phase != cursor_phase
+        } else {
+            should_capture_display_frame(
+                cpu.memory[VSYNC_ADDR] != 0,
+                cpu.frame_presented,
+                cpu.guest_text.enabled,
+            )
+        };
+        if capture_display {
+            if cpu.terminal_active {
+                render_terminal(&cpu.console, &mut pixels, &font, cursor_phase);
+                presented_size = (640, 480);
+                presented_triangles.clear();
+                presented_lines.clear();
+                cpu.terminal_dirty = false;
+                last_terminal_cursor_phase = cursor_phase;
+            } else {
+                render_cpu_with_framebuffer(&cpu, &mut pixels, &font, &mut framebuffer);
+                presented_size = screen_size(&cpu);
+                presented_triangles.clone_from(&cpu.gpu_triangles);
+                presented_lines.clone_from(&cpu.gpu_lines);
+                presented_palette = cpu.palette;
+            }
         }
         let (width, height) = presented_size;
-        if !cpu.running || paused {
+        if (!cpu.running || paused) && !cpu.terminal_active {
             fill_rect(
                 &mut pixels,
                 width,
@@ -1461,6 +1475,8 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
                 .log_error("emulator", &format!("Loading {name} failed: {error}"));
             RuntimeError::Window(error.to_string())
         })?;
+    cpu.console.clear_input();
+    cpu.terminal_active = true;
     cpu.debug_console.log_info(
         "emulator",
         &format!(
@@ -1521,6 +1537,8 @@ fn boot_folder_disk(cpu: &mut Cpu, disk_path: &Path) -> Result<FolderBootMode, R
         }
     }
     cpu.running = true;
+    cpu.console.clear_input();
+    cpu.terminal_active = true;
     Ok(boot.mode)
 }
 
@@ -1877,9 +1895,37 @@ fn update_mouse(
 }
 
 fn receive_typed_text(cpu: &mut Cpu, characters: impl IntoIterator<Item = char>) {
-    let text = characters.into_iter().collect::<String>();
+    if !cpu.terminal_active {
+        return;
+    }
+    let text = characters
+        .into_iter()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
     if !text.is_empty() {
         cpu.receive_console_input(text.as_bytes());
+    }
+}
+
+fn receive_terminal_key(cpu: &mut Cpu, key: KeyCode) {
+    match key {
+        KeyCode::Enter => {
+            if cpu.terminal_active {
+                cpu.receive_console_input(b"\n");
+            }
+            cpu.signal_keyboard_event(13);
+        }
+        KeyCode::Backspace => {
+            if cpu.terminal_active {
+                cpu.receive_console_input(b"\x08");
+            }
+            cpu.signal_keyboard_event(8);
+        }
+        KeyCode::Up if cpu.terminal_active => cpu.receive_console_input(b"\x1b[A"),
+        KeyCode::Down if cpu.terminal_active => cpu.receive_console_input(b"\x1b[B"),
+        KeyCode::Right if cpu.terminal_active => cpu.receive_console_input(b"\x1b[C"),
+        KeyCode::Left if cpu.terminal_active => cpu.receive_console_input(b"\x1b[D"),
+        _ => {}
     }
 }
 
@@ -2098,6 +2144,56 @@ fn render_cpu_with_framebuffer(
     }
 }
 
+fn terminal_cursor_phase() -> bool {
+    (macroquad::prelude::get_time() * 2.0) as u64 % 2 == 0
+}
+
+fn render_terminal(
+    console: &crate::console::ConsoleDevice,
+    pixels: &mut [u32],
+    font: &[[u8; 8]],
+    cursor_phase: bool,
+) {
+    let width = 640;
+    let height = 480;
+    pixels[..width * height].fill(rgb(0, 0, 0));
+    let left = 8;
+    let top = 8;
+    for (row, line) in console.lines().enumerate() {
+        for (column, byte) in line.iter().copied().enumerate() {
+            if byte == b' ' {
+                continue;
+            }
+            let character = if (32..=126).contains(&byte) {
+                byte
+            } else {
+                b'?'
+            };
+            draw_glyph_scaled(
+                pixels,
+                width,
+                (left + column * 6, top + row * 8),
+                character,
+                rgb(220, 220, 220),
+                font,
+                1,
+            );
+        }
+    }
+    if console.cursor_visible() && cursor_phase {
+        let (column, row) = console.cursor_position();
+        fill_rect(
+            pixels,
+            width,
+            left + column.min(crate::console::COLUMNS - 1) * 6,
+            top + row.min(crate::console::ROWS - 1) * 8 + 7,
+            5,
+            1,
+            rgb(220, 220, 220),
+        );
+    }
+}
+
 fn draw_guest_text(
     pixels: &mut [u32],
     width: usize,
@@ -2148,9 +2244,9 @@ fn draw_guest_text(
 fn should_capture_display_frame(
     vsync_enabled: bool,
     frame_presented: bool,
-    guest_text_enabled: bool,
+    text_console_active: bool,
 ) -> bool {
-    !vsync_enabled || frame_presented || guest_text_enabled
+    !vsync_enabled || frame_presented || text_console_active
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
@@ -2377,6 +2473,32 @@ mod tests {
             &expected_first_row[CONSOLE_TOOLBAR_HEIGHT * CONSOLE_WINDOW_WIDTH
                 ..(CONSOLE_TOOLBAR_HEIGHT + 8) * CONSOLE_WINDOW_WIDTH]
         );
+    }
+
+    #[test]
+    fn guest_console_renders_its_full_text_surface_and_cursor_in_the_main_display() {
+        let mut console = crate::console::ConsoleDevice::new();
+        for byte in b"SC-16" {
+            console.write_data(*byte);
+        }
+        let font = load_font();
+        let mut pixels = vec![rgb(255, 0, 0); 640 * 480];
+        render_terminal(&console, &mut pixels, &font, true);
+
+        assert_eq!(pixels[0], rgb(0, 0, 0));
+        let left = 8;
+        let top = 8;
+        assert!(
+            pixels[top * 640 + left..top * 640 + left + 6]
+                .iter()
+                .any(|pixel| *pixel == rgb(220, 220, 220))
+        );
+        assert_eq!(pixels[(top + 7) * 640 + left + 5 * 6], rgb(220, 220, 220));
+        for byte in b"\x1b[?25l" {
+            console.write_data(*byte);
+        }
+        render_terminal(&console, &mut pixels, &font, true);
+        assert_eq!(pixels[(top + 7) * 640 + left + 5 * 6], rgb(0, 0, 0));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3084,6 +3206,10 @@ mod tests {
                 .map(|cell| char::from(cell.character))
                 .collect::<String>()
         );
+        assert!(
+            cpu.console.receive_buffer().is_empty(),
+            "BIOS disk-selection Enter leaked into SisuOS stdin"
+        );
         cpu.signal_keyboard_event(13);
         cpu.run(20_000).unwrap();
 
@@ -3142,9 +3268,12 @@ mod tests {
             .unwrap()
             .to_owned();
         let kernel_source = repository.join("examples").join("preemptive_os_kernel.asm");
-        let demo_source = repository.join("examples").join("preemptive_os_demo.asm");
-        let kernel = crate::assembler::assemble_file(&kernel_source, 0).unwrap();
-        let demo = crate::assembler::assemble_file(&demo_source, 0).unwrap();
+        let shell_source = repository.join("examples").join("preemptive_os_shell.c");
+        let demo_source = repository.join("examples").join("preemptive_os_demo.c");
+        let kernel =
+            crate::image::build_kernel_with_embedded_c_source(&kernel_source, &shell_source)
+                .unwrap();
+        let demo = crate::image::build_c_program_at(&demo_source, 0x30000).unwrap();
         assert_eq!(
             crate::image::read_image(&checked_in_disk.join("kernel.bin")).unwrap(),
             kernel,
@@ -3153,7 +3282,7 @@ mod tests {
         assert_eq!(
             crate::image::read_image(&checked_in_disk.join("demo.bin")).unwrap(),
             demo,
-            "checked-in demo image is stale; run scripts\\build-preemptive-os.ps1"
+            "checked-in C demo image is stale; run scripts\\build-preemptive-os.ps1"
         );
         let manifest = crate::disk::FolderDisk::open(&checked_in_disk).unwrap();
         assert_eq!(manifest.manifest().id, boot_disk_id);
@@ -3232,30 +3361,58 @@ mod tests {
         update_rtc(&mut cpu);
         cpu.run(1000).unwrap();
         assert!(cpu.running, "SisuOS stopped after the RTC interrupt");
-        cpu.receive_console_input(b"help\nlist\ninfo\nrun demo\nunknown\n");
+        let long_command = "x".repeat(80);
+        for (index, command) in [
+            "help",
+            "list",
+            "info",
+            "run demo",
+            "unknown",
+            long_command.as_str(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 0 {
+                cpu.receive_console_input(b"\x1b[A");
+                receive_typed_text(&mut cpu, "helpx".chars());
+                receive_terminal_key(&mut cpu, KeyCode::Backspace);
+            } else {
+                receive_typed_text(&mut cpu, command.chars());
+            }
+            receive_terminal_key(&mut cpu, KeyCode::Enter);
+        }
         cpu.run(500_000).unwrap();
 
         let output = String::from_utf8_lossy(cpu.console.output());
         for expected in [
             "SisuOS interactive shell",
+            "Type 'run demo' to see preemptive task switching.",
             "Commands: help, list, run demo, info",
             "Programs: demo",
             "SisuOS | Protected mode | Syscall ABI 1 | Preemptive scheduler active",
             "demo task ran",
             "demo exited with status 7",
             "Unknown command. Type help.",
+            "Command too long (79 characters maximum)",
         ] {
             assert!(
                 output.contains(expected),
-                "missing {expected:?}; output={output}"
+                "missing {expected:?}; output={output}; PC={:#x}, running={}, privilege={:?}, fault={:?}, mappings={:02x?}/{:02x?}/{:02x?}, logs={:?}, screen={:?}",
+                cpu.pc,
+                cpu.running,
+                cpu.privilege_mode,
+                cpu.last_page_fault(),
+                &cpu.memory[0x3040..0x3044],
+                &cpu.memory[0x3050..0x3054],
+                &cpu.memory[0x3240..0x3244],
+                cpu.debug_console.text_snapshot(),
+                cpu.console.text_snapshot()
             );
         }
-        let screen = cpu
-            .guest_text
-            .cells
-            .iter()
-            .map(|cell| char::from(cell.character))
-            .collect::<String>();
+        let screen = cpu.console.text_snapshot().join("\n");
+        assert!(cpu.terminal_active);
+        assert!(cpu.terminal_dirty);
         assert!(screen.contains("SisuOS interactive shell"), "{screen}");
         assert!(
             screen.contains("Commands: help, list, run demo, info"),
@@ -3288,6 +3445,81 @@ mod tests {
         assert_eq!(cpu.task_context(1).unwrap().exit_code, Some(7));
         assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
         assert!(cpu.is_mmu_enabled());
+
+        cpu.test_monotonic_ms = Some(1000);
+        for command in ["run demo 2", "run demo 3", "ps", "help"] {
+            receive_typed_text(&mut cpu, command.chars());
+            receive_terminal_key(&mut cpu, KeyCode::Enter);
+        }
+        cpu.run(500_000).unwrap();
+        let output = String::from_utf8_lossy(cpu.console.output()).into_owned();
+        assert!(output.contains("Started background process 2"), "{output}");
+        assert!(output.contains("Started background process 3"), "{output}");
+        assert!(output.contains("PID PPID STATE\n0 - running\n"), "{output}");
+        assert!(output.contains("2 0 runnable\n"), "{output}");
+        assert!(output.contains("3 0 runnable\n"), "{output}");
+        assert!(!output.contains("BGP "), "{output}");
+        assert!(output.ends_with("sc16> "), "{output}");
+
+        cpu.test_monotonic_ms = Some(1999);
+        cpu.run(100_000).unwrap();
+        assert!(!String::from_utf8_lossy(cpu.console.output()).contains("BGP "));
+        for second in 1..=3 {
+            cpu.test_monotonic_ms = Some(1000 + second * 1000);
+            cpu.run(200_000).unwrap();
+            let output = String::from_utf8_lossy(cpu.console.output());
+            for pid in [2, 3] {
+                let duration = pid;
+                if second <= duration {
+                    let line = format!("BGP {pid} time {second}/{duration}\n");
+                    assert_eq!(output.matches(&line).count(), 1, "{output}");
+                }
+            }
+        }
+        for pid in [2, 3] {
+            assert_eq!(cpu.task_context(pid).unwrap().exit_code, Some(0));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(cpu.console.output())
+                .matches("BGP ")
+                .count(),
+            5
+        );
+        let start = cpu.console.output().len();
+        for command in [
+            "ps",
+            "run demo 0",
+            "run demo -1",
+            "run demo 65536",
+            "run demo 2x",
+        ] {
+            receive_typed_text(&mut cpu, command.chars());
+            receive_terminal_key(&mut cpu, KeyCode::Enter);
+        }
+        cpu.run(300_000).unwrap();
+        let output = String::from_utf8_lossy(&cpu.console.output()[start..]);
+        assert!(output.contains("PID PPID STATE\n0 - running\n"), "{output}");
+        assert!(
+            !output.contains("2 0 ") && !output.contains("3 0 "),
+            "{output}"
+        );
+        assert_eq!(output.matches("Usage: run demo X").count(), 4, "{output}");
+        cpu.test_monotonic_ms = Some((1 << 30) - 500);
+        receive_typed_text(&mut cpu, "run demo 1".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        cpu.run(150_000).unwrap();
+        cpu.test_monotonic_ms = Some(499);
+        cpu.run(100_000).unwrap();
+        assert!(!String::from_utf8_lossy(cpu.console.output()).contains("BGP 4"));
+        cpu.test_monotonic_ms = Some(500);
+        cpu.run(150_000).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(cpu.console.output())
+                .matches("BGP 4 time 1/1\n")
+                .count(),
+            1
+        );
+        assert_eq!(cpu.task_context(4).unwrap().exit_code, Some(0));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3457,6 +3689,9 @@ mod tests {
     fn display_text_input_preserves_unicode_characters_for_console_mmio() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         receive_typed_text(&mut cpu, ['k', 'ä', '!', '🙂']);
+        assert!(cpu.console.receive_buffer().is_empty());
+        cpu.terminal_active = true;
+        receive_typed_text(&mut cpu, ['k', 'ä', '!', '\r', '\n', '🙂']);
         assert_eq!(
             cpu.console
                 .receive_buffer()
@@ -3464,6 +3699,39 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             "kä!🙂".as_bytes()
+        );
+    }
+
+    #[test]
+    fn terminal_input_ignores_bios_keys_and_routes_keys_after_guest_boot() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        receive_terminal_key(&mut cpu, KeyCode::Backspace);
+        receive_typed_text(&mut cpu, ['h', 'e', 'l', 'p']);
+        assert!(cpu.console.receive_buffer().is_empty());
+        assert_eq!(cpu.memory[0x43000], 8);
+
+        cpu.terminal_active = true;
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        receive_terminal_key(&mut cpu, KeyCode::Backspace);
+        receive_typed_text(&mut cpu, ['h', 'e', 'l', 'p']);
+        assert_eq!(
+            cpu.console
+                .receive_buffer()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"\n\x08help"
+        );
+        cpu.console.clear_input();
+        receive_terminal_key(&mut cpu, KeyCode::Left);
+        assert_eq!(
+            cpu.console
+                .receive_buffer()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"\x1b[D"
         );
     }
 

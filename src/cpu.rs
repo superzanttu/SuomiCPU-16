@@ -335,6 +335,9 @@ impl std::fmt::Display for CpuError {
 impl std::error::Error for CpuError {}
 
 pub struct Cpu {
+    monotonic_epoch: std::time::Instant,
+    #[cfg(test)]
+    pub(crate) test_monotonic_ms: Option<u32>,
     pub memory: MmapMut,
     pub registers: [i64; 8],
     pub pc: u32,
@@ -349,6 +352,8 @@ pub struct Cpu {
     pub frame_count: u16,
     pub console: ConsoleDevice,
     pub debug_console: ConsoleDevice,
+    pub terminal_active: bool,
+    pub terminal_dirty: bool,
     pub guest_text: GuestTextDisplay,
     pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
@@ -465,6 +470,9 @@ impl Cpu {
         Ok(Self {
             memory,
             registers: [0; 8],
+            monotonic_epoch: std::time::Instant::now(),
+            #[cfg(test)]
+            test_monotonic_ms: None,
             pc: 0,
             sp: memory_mask,
             kernel_sp: memory_mask,
@@ -477,6 +485,8 @@ impl Cpu {
             frame_count: 0,
             console: ConsoleDevice::new(),
             debug_console: ConsoleDevice::new(),
+            terminal_active: false,
+            terminal_dirty: false,
             guest_text: GuestTextDisplay::new(),
             saved_video: None,
             random_state: 0x16c0_ffee,
@@ -772,6 +782,8 @@ impl Cpu {
         }
         self.guest_text.clear(0);
         self.guest_text.enabled = false;
+        self.console.clear_input();
+        self.terminal_active = true;
         let program = match boot.mode {
             FolderBootMode::Kernel => "kernel.bin",
             FolderBootMode::User => "main.bin",
@@ -1002,6 +1014,8 @@ impl Cpu {
         self.page_memory_manager = None;
         self.running = true;
         self.booted_disk_path = None;
+        self.terminal_active = false;
+        self.terminal_dirty = false;
         if let Some(interrupt_control) = self.memory.get_mut(ICR_ADDR as usize) {
             *interrupt_control = 0;
         }
@@ -1387,10 +1401,8 @@ impl Cpu {
             CONSOLE_DATA => {
                 let value = self.console.read_data();
                 if self.console.control() & 1 != 0 && value != 0 {
-                    self.display_guest_console_byte(value);
-                }
-                if self.memory[CONSOLE_CONTROL as usize] & 1 != 0 && value != 0 {
-                    print!("{}", char::from(value));
+                    self.terminal_active = true;
+                    self.terminal_dirty = true;
                 }
                 value
             }
@@ -1845,14 +1857,22 @@ impl Cpu {
                 Ok(SyscallNumber::Write) => self.syscall_write(task_id),
                 Ok(SyscallNumber::Close) => self.syscall_close(task_id),
                 Ok(SyscallNumber::Spawn) => self.syscall_spawn(task_id),
+                Ok(SyscallNumber::SpawnArgument) => self.syscall_spawn(task_id),
                 Ok(SyscallNumber::Mmap) => self.syscall_mmap(task_id),
                 Ok(SyscallNumber::Sleep) => self.syscall_sleep(task_id, &mut scheduled_state),
                 Ok(SyscallNumber::Wait) => self.syscall_wait(task_id, &mut scheduled_state),
+                Ok(SyscallNumber::TryWait) => self.syscall_wait(task_id, &mut scheduled_state),
                 Ok(SyscallNumber::Semaphore) => {
                     self.syscall_semaphore(task_id, &mut scheduled_state)
                 }
                 Ok(SyscallNumber::Seek) => self.syscall_seek(task_id),
                 Ok(SyscallNumber::ScNet) => self.syscall_scnet(task_id),
+                Ok(SyscallNumber::ProcessInfo) => self.syscall_process_info(),
+                Ok(SyscallNumber::StartupArgument) => task_id
+                    .and_then(|id| self.syscall_state.processes.get(&id))
+                    .map(|record| i64::from(record.startup_argument))
+                    .unwrap_or(crate::syscall::error::INVALID),
+                Ok(SyscallNumber::MonotonicMillis) => self.monotonic_milliseconds(),
                 Err(()) => crate::syscall::error::INVALID,
             }
         };
@@ -1870,6 +1890,63 @@ impl Cpu {
             self.schedule_current_task(state, (state == TaskState::Exited).then_some(exit_code))?;
         }
         Ok(())
+    }
+
+    fn monotonic_milliseconds(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(milliseconds) = self.test_monotonic_ms {
+            return i64::from(milliseconds & ADDRESS_MASK);
+        }
+        (self.monotonic_epoch.elapsed().as_millis() & u128::from(ADDRESS_MASK)) as i64
+    }
+
+    fn syscall_process_info(&mut self) -> i64 {
+        let Ok(index) = usize::try_from(self.registers[1]) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Ok(destination) = u32::try_from(self.registers[2]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let Ok(capacity) = usize::try_from(self.registers[3]) else {
+            return crate::syscall::error::INVALID;
+        };
+        if capacity > crate::syscall::MAX_TRANSFER_BYTES {
+            return crate::syscall::error::INVALID;
+        }
+        let Some(task) = self
+            .scheduler
+            .tasks()
+            .iter()
+            .filter(|task| self.syscall_state.processes.contains_key(&task.id))
+            .nth(index)
+        else {
+            return 0;
+        };
+        let record = &self.syscall_state.processes[&task.id];
+        let state = match task.state {
+            TaskState::Runnable => "runnable",
+            TaskState::Running => "running",
+            TaskState::Blocked => "blocked",
+            TaskState::Exited => "exited",
+        };
+        let parent = record.parent.map_or("-".to_owned(), |id| id.to_string());
+        let text = format!("{} {parent} {state}\n", task.id);
+        if text.len() > capacity {
+            return crate::syscall::error::OVERFLOW;
+        }
+        let addresses = match self.guest_memory_addresses(
+            destination,
+            text.len(),
+            crate::mmu::MemoryAccess::Write,
+            true,
+        ) {
+            Ok(addresses) => addresses,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        for (address, byte) in addresses.into_iter().zip(text.bytes()) {
+            self.memory[address] = byte;
+        }
+        text.len() as i64
     }
 
     fn syscall_open(&mut self, task_id: Option<TaskId>) -> i64 {
@@ -1978,7 +2055,8 @@ impl Cpu {
                 let byte = self.console.read_data();
                 self.memory[*address] = byte;
                 if self.console.control() & 1 != 0 && byte != 0 {
-                    self.display_guest_console_byte(byte);
+                    self.terminal_active = true;
+                    self.terminal_dirty = true;
                 }
             }
             return bytes_read as i64;
@@ -2039,9 +2117,13 @@ impl Cpu {
             .map(|address| self.memory[address])
             .collect();
         if handle == 1 || handle == 2 {
+            let has_output = !data.is_empty();
             for byte in data {
                 self.console.write_data(byte);
-                self.display_guest_console_byte(byte);
+            }
+            if has_output {
+                self.terminal_active = true;
+                self.terminal_dirty = true;
             }
             return length as i64;
         }
@@ -2373,6 +2455,14 @@ impl Cpu {
     }
 
     fn syscall_spawn(&mut self, parent: Option<TaskId>) -> i64 {
+        let argument = if self.registers[0] == SyscallNumber::SpawnArgument as i64 {
+            match u32::try_from(self.registers[2]) {
+                Ok(argument) if argument <= ADDRESS_MASK => argument,
+                _ => return crate::syscall::error::INVALID,
+            }
+        } else {
+            0
+        };
         let Some(parent) = parent else {
             return crate::syscall::error::INVALID;
         };
@@ -2649,6 +2739,11 @@ impl Cpu {
             }
         };
         self.syscall_state.register_process(id, Some(parent));
+        self.syscall_state
+            .processes
+            .get_mut(&id)
+            .expect("registered child")
+            .startup_argument = argument;
         i64::from(id)
     }
 
@@ -2758,6 +2853,7 @@ impl Cpu {
         task_id: Option<TaskId>,
         scheduled_state: &mut Option<(TaskState, i32)>,
     ) -> i64 {
+        let nonblocking = self.registers[0] == SyscallNumber::TryWait as i64;
         let Some(task_id) = task_id else {
             return crate::syscall::error::INVALID;
         };
@@ -2781,6 +2877,9 @@ impl Cpu {
             self.registers[1] = i64::from(child_id);
             self.reap_process(task_id, child_id);
             return i64::from(exit_code);
+        }
+        if nonblocking {
+            return crate::syscall::error::TRY_AGAIN;
         }
         self.syscall_state
             .processes
@@ -3024,10 +3123,9 @@ impl Cpu {
             }
             CONSOLE_DATA => {
                 self.console.write_data(value);
-                self.display_guest_console_byte(value);
-                print!("{}", char::from(value));
-                if value == b'\n' {
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                if value != 0 {
+                    self.terminal_active = true;
+                    self.terminal_dirty = true;
                 }
             }
             CONSOLE_STATUS if value & 0x04 != 0 => self.console.clear_overrun(),
@@ -3055,17 +3153,6 @@ impl Cpu {
             }
             _ => {}
         }
-    }
-
-    fn display_guest_console_byte(&mut self, byte: u8) {
-        if !self.guest_text.enabled {
-            self.guest_text.clear(0);
-            self.guest_text.foreground = 1;
-            self.guest_text.background = 0;
-            self.guest_text.enabled = true;
-        }
-        self.guest_text
-            .write_byte(byte, self.guest_text.foreground, self.guest_text.background);
     }
 
     pub fn read_u16(&mut self, address: u32) -> u16 {
@@ -5766,6 +5853,85 @@ mod tests {
             .copy_from_slice(&arguments);
         cpu.registers[crate::syscall::REGISTER_ABI_VERSION] = crate::syscall::ABI_VERSION;
         cpu.step().unwrap();
+    }
+
+    #[test]
+    fn process_info_validates_buffers_and_reports_live_processes() {
+        let (mut cpu, parent) = cpu_with_syscall_task();
+        let child = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(child, Some(parent));
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::ProcessInfo,
+            [0, 0x400, 64, 0, 0, 0],
+        );
+        let length = cpu.registers[0] as usize;
+        assert_eq!(&cpu.memory[0x400..0x400 + length], b"0 - running\n");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::ProcessInfo,
+            [1, 0x400, 64, 0, 0, 0],
+        );
+        let length = cpu.registers[0] as usize;
+        assert_eq!(&cpu.memory[0x400..0x400 + length], b"1 0 runnable\n");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::ProcessInfo,
+            [2, 0x400, 64, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        invoke_syscall(&mut cpu, SyscallNumber::ProcessInfo, [0, 0x400, 1, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], crate::syscall::error::OVERFLOW);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::ProcessInfo,
+            [0, 0xffff, 64, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::ProcessInfo,
+            [0, 0x400, 4097, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+    }
+
+    #[test]
+    fn background_process_services_preserve_arguments_and_do_not_block_waiters() {
+        let (mut cpu, parent) = cpu_with_syscall_task();
+        let child = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(child, Some(parent));
+        cpu.syscall_state
+            .processes
+            .get_mut(&parent)
+            .unwrap()
+            .startup_argument = 65535;
+        invoke_syscall(&mut cpu, SyscallNumber::StartupArgument, [0; 6]);
+        assert_eq!(cpu.registers[0], 65535);
+        cpu.test_monotonic_ms = Some(123_456);
+        invoke_syscall(&mut cpu, SyscallNumber::MonotonicMillis, [0; 6]);
+        assert_eq!(cpu.registers[0], 123_456);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::TryWait,
+            [i64::from(child), 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::TRY_AGAIN);
+        assert_eq!(cpu.current_task(), Some(parent));
+        assert!(cpu.syscall_state.waiting_for.is_empty());
+        assert!(cpu.syscall_state.processes[&child].waiters.is_empty());
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::TryWait,
+            [i64::from(parent), 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::NO_CHILD);
     }
 
     fn run_assembly(source: &str) -> Cpu {

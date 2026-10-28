@@ -55,14 +55,62 @@ clear_table:
     STW R2, R0
     ADD R2, 2
     STW R2, R1
+    LDI R0, 1
+    LDI R1, 0x000f
+    LDI R2, 0x3040
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R1, 0x200f
+    LDI R2, 0x3048
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R1, 0x300f
+    LDI R2, 0x304c
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R1, 0x400f
+    LDI R2, 0x3050
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R1, 0x500f
+    LDI R2, 0x3054
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R1, 0x600f
+    LDI R2, 0x3058
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R1, 0x700f
+    LDI R2, 0x305c
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R1, 0xf007
+    LDI R2, 0x307c
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R0, 9
+    LDI R1, 0x0007
+    LDI R2, 0x3240
+    STW R2, R0
+    ADD R2, 2
+    STW R2, R1
+    LDI R0, 0
     LDI R4, 0
     LDI R5, 0x2000
     MMUON R4
     EI
-    LDI R4, 0
-    LDI R5, 0x5000
-    LDI R6, 0
-    LDI R7, 0x9000
+    LDI R4, 1
+    LDI R5, 0
+    LDI R6, 2
+    LDI R7, 0
     STARTU R4, R6
 
 .address 0x4200
@@ -88,5 +136,3 @@ page_fault_handler:
     .data hex 00, 00, 42, 00, 80, 00, 00, 00
 .address 0x0c00
     .data hex 00, 00, 42, 00, 86, 00, 00, 00
-
-.include "preemptive_os_shell.asm"

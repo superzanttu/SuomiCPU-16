@@ -312,6 +312,59 @@ pub fn build_source(source: &Path) -> Result<ProgramImage, ImageError> {
     ))
 }
 
+pub fn build_kernel_with_embedded_c_source(
+    kernel_source: &Path,
+    user_source: &Path,
+) -> Result<ProgramImage, ImageError> {
+    let kernel = fs::read_to_string(kernel_source)?;
+    let user_assembly = compile_c_assembly_at(user_source, 0x10000)?;
+    crate::assembler::assemble(&format!("{kernel}\n{user_assembly}"), 0)
+        .map_err(|error| ImageError::Assembly(error.to_string()))
+}
+
+pub fn build_c_program_at(source: &Path, base: u32) -> Result<ProgramImage, ImageError> {
+    let user_assembly = compile_c_assembly_at(source, base)?;
+    crate::assembler::assemble(&user_assembly, 0)
+        .map_err(|error| ImageError::Assembly(error.to_string()))
+}
+
+fn compile_c_assembly_at(source: &Path, base: u32) -> Result<String, ImageError> {
+    let user = fs::read_to_string(source)?;
+    let user = user.strip_prefix('\u{feff}').unwrap_or(&user);
+    let Some(user_assembly) =
+        crate::c_compiler::compile_minimal_program_to_assembly(user, &source.to_string_lossy())
+            .map_err(|error| ImageError::CCompiler(error.to_string()))?
+    else {
+        return Err(ImageError::UnsupportedC(source.display().to_string()));
+    };
+    relocate_c_assembly(&user_assembly, base).map_err(ImageError::Assembly)
+}
+
+fn relocate_c_assembly(source: &str, base: u32) -> Result<String, String> {
+    let mut relocated = String::with_capacity(source.len());
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(address) = trimmed.strip_prefix(".address ") {
+            let address = if let Some(hex) = address.strip_prefix("0x") {
+                u32::from_str_radix(hex, 16)
+            } else {
+                address.parse()
+            }
+            .map_err(|_| format!("invalid compiler address directive: {trimmed}"))?;
+            let address = address
+                .checked_add(base)
+                .ok_or_else(|| format!("embedded C address overflows: {trimmed}"))?;
+            relocated.push_str(&format!(".address {address:#x}\n"));
+        } else if trimmed == "JMP __c_boot" {
+            relocated.push_str("    JMPX __c_boot\n");
+        } else {
+            relocated.push_str(line);
+            relocated.push('\n');
+        }
+    }
+    Ok(relocated)
+}
+
 pub fn read_image(path: &Path) -> Result<ProgramImage, ImageError> {
     let mut file = fs::File::open(path)?;
     let file_length = file.metadata()?.len();

@@ -16,6 +16,11 @@ pub struct ConsoleDevice {
     row: usize,
     overrun: bool,
     control: u8,
+    escape_state: u8,
+    escape_private: bool,
+    escape_parameters: Vec<u16>,
+    saved_cursor: (usize, usize),
+    cursor_visible: bool,
 }
 
 impl Default for ConsoleDevice {
@@ -35,6 +40,11 @@ impl ConsoleDevice {
             row: 0,
             overrun: false,
             control: 0x03,
+            escape_state: 0,
+            escape_private: false,
+            escape_parameters: Vec::new(),
+            saved_cursor: (0, 0),
+            cursor_visible: true,
         }
     }
 
@@ -49,6 +59,10 @@ impl ConsoleDevice {
             self.column = 0;
             self.row = 0;
         }
+        self.escape_state = 0;
+        self.escape_private = false;
+        self.escape_parameters.clear();
+        self.cursor_visible = true;
     }
 
     pub fn status(&self) -> u8 {
@@ -76,6 +90,11 @@ impl ConsoleDevice {
         }
     }
 
+    pub fn clear_input(&mut self) {
+        self.receive_buffer.clear();
+        self.overrun = false;
+    }
+
     pub fn read_data(&mut self) -> u8 {
         let value = self.receive_buffer.pop_front().unwrap_or(0);
         if self.control & 0x01 != 0 && value != 0 {
@@ -89,7 +108,11 @@ impl ConsoleDevice {
         if self.output.len() > OUTPUT_CAPACITY {
             self.output.drain(..OUTPUT_CAPACITY / 4);
         }
+        if self.process_escape(value) {
+            return;
+        }
         match value {
+            0x1b => self.escape_state = 1,
             b'\n' => self.advance_line(),
             b'\r' => self.column = 0,
             8 => {
@@ -126,6 +149,14 @@ impl ConsoleDevice {
 
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
+    }
+
+    pub fn cursor_position(&self) -> (usize, usize) {
+        (self.column, self.row)
+    }
+
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 
     pub fn text_snapshot(&self) -> Vec<String> {
@@ -174,6 +205,149 @@ impl ConsoleDevice {
 
     fn write_log(&mut self, level: &str, source: &str, message: &str) {
         self.write_text(&format!("[{level}] {source}: {message}"));
+    }
+
+    fn process_escape(&mut self, value: u8) -> bool {
+        match self.escape_state {
+            0 => false,
+            1 => {
+                if value == b'[' {
+                    self.escape_state = 2;
+                    self.escape_private = false;
+                    self.escape_parameters.clear();
+                    self.escape_parameters.push(0);
+                } else {
+                    match value {
+                        b'7' => self.saved_cursor = (self.column, self.row),
+                        b'8' => (self.column, self.row) = self.saved_cursor,
+                        _ => {}
+                    }
+                    self.escape_state = 0;
+                }
+                true
+            }
+            2 if value == b'?' && self.escape_parameters == [0] => {
+                self.escape_private = true;
+                true
+            }
+            2 if value.is_ascii_digit() => {
+                if let Some(parameter) = self.escape_parameters.last_mut() {
+                    *parameter = parameter
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(value - b'0'));
+                }
+                true
+            }
+            2 if value == b';' => {
+                if self.escape_parameters.len() < 16 {
+                    self.escape_parameters.push(0);
+                } else {
+                    self.escape_state = 0;
+                    self.escape_parameters.clear();
+                }
+                true
+            }
+            2 if (0x40..=0x7e).contains(&value) => {
+                self.execute_escape(value);
+                self.escape_state = 0;
+                self.escape_parameters.clear();
+                true
+            }
+            2 => true,
+            _ => {
+                self.escape_state = 0;
+                self.escape_parameters.clear();
+                true
+            }
+        }
+    }
+
+    fn execute_escape(&mut self, command: u8) {
+        let parameter = |index: usize, default: usize| {
+            self.escape_parameters
+                .get(index)
+                .copied()
+                .filter(|value| *value != 0)
+                .map(usize::from)
+                .unwrap_or(default)
+        };
+        if self.escape_private {
+            if command == b'h' || command == b'l' {
+                for parameter in &self.escape_parameters {
+                    if *parameter == 25 {
+                        self.cursor_visible = command == b'h';
+                    }
+                }
+            }
+            return;
+        }
+        match command {
+            b'A' => self.row = self.row.saturating_sub(parameter(0, 1)),
+            b'B' => self.row = self.row.saturating_add(parameter(0, 1)).min(ROWS - 1),
+            b'C' => self.column = self.column.saturating_add(parameter(0, 1)).min(COLUMNS - 1),
+            b'D' => self.column = self.column.saturating_sub(parameter(0, 1)),
+            b'E' => {
+                self.row = self.row.saturating_add(parameter(0, 1)).min(ROWS - 1);
+                self.column = 0;
+            }
+            b'F' => {
+                self.row = self.row.saturating_sub(parameter(0, 1));
+                self.column = 0;
+            }
+            b'G' => self.column = parameter(0, 1).saturating_sub(1).min(COLUMNS - 1),
+            b'H' | b'f' => {
+                self.row = parameter(0, 1).saturating_sub(1).min(ROWS - 1);
+                self.column = parameter(1, 1).saturating_sub(1).min(COLUMNS - 1);
+            }
+            b'd' => self.row = parameter(0, 1).saturating_sub(1).min(ROWS - 1),
+            b'J' => self.erase_display(parameter(0, 0)),
+            b'K' => self.erase_line(parameter(0, 0)),
+            b'X' => {
+                let end = self.column.saturating_add(parameter(0, 1)).min(COLUMNS);
+                self.lines[self.row][self.column.min(COLUMNS - 1)..end].fill(b' ');
+            }
+            b's' => self.saved_cursor = (self.column, self.row),
+            b'u' => self.restore_cursor(),
+            _ => {}
+        }
+    }
+
+    fn restore_cursor(&mut self) {
+        self.column = self.saved_cursor.0.min(COLUMNS - 1);
+        self.row = self.saved_cursor.1.min(ROWS - 1);
+    }
+
+    fn erase_display(&mut self, mode: usize) {
+        match mode {
+            0 => {
+                self.lines[self.row][self.column..].fill(b' ');
+                for line in self.lines.iter_mut().skip(self.row + 1) {
+                    line.fill(b' ');
+                }
+            }
+            1 => {
+                for line in self.lines.iter_mut().take(self.row) {
+                    line.fill(b' ');
+                }
+                self.lines[self.row][..=self.column.min(COLUMNS - 1)].fill(b' ');
+            }
+            2 => {
+                for line in &mut self.lines {
+                    line.fill(b' ');
+                }
+            }
+            3 => self.scrollback.clear(),
+            _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: usize) {
+        match mode {
+            0 => self.lines[self.row][self.column..].fill(b' '),
+            1 => self.lines[self.row][..=self.column.min(COLUMNS - 1)].fill(b' '),
+            2 => self.lines[self.row].fill(b' '),
+            _ => {}
+        }
     }
 
     fn advance_line(&mut self) {
@@ -285,6 +459,52 @@ mod tests {
         console.write_data(b'y');
         assert_eq!(console.text_snapshot().last().unwrap().as_bytes()[0], b'y');
         assert_eq!(console.scrollback_len(), 1);
+    }
+
+    #[test]
+    fn handles_terminal_cursor_and_erase_sequences_without_printing_control_bytes() {
+        let mut console = ConsoleDevice::new();
+        console.write_data(b'a');
+        console.write_data(b'b');
+        console.write_data(0x1b);
+        console.write_data(b'[');
+        console.write_data(b'1');
+        console.write_data(b'D');
+        console.write_data(b'X');
+        assert!(console.text_snapshot()[0].starts_with("aX"));
+        assert_eq!(console.cursor_position(), (2, 0));
+
+        for byte in b"\x1b[3;4Hxy\x1b[1K" {
+            console.write_data(*byte);
+        }
+        assert!(console.text_snapshot()[2].starts_with("    "));
+        assert_eq!(console.cursor_position(), (5, 2));
+        for byte in b"\x1b[2J" {
+            console.write_data(*byte);
+        }
+        assert!(
+            console
+                .text_snapshot()
+                .iter()
+                .all(|line| line.bytes().all(|byte| byte == b' '))
+        );
+        assert_eq!(console.cursor_position(), (5, 2));
+        assert!(
+            console
+                .output()
+                .windows(b"\x1b[1D".len())
+                .any(|sequence| sequence == b"\x1b[1D")
+        );
+
+        for byte in b"\x1b[?25l\x1b[4;6H\x1b[s\x1b[1;1H\x1b[u\x1b[?25h" {
+            console.write_data(*byte);
+        }
+        assert_eq!(console.cursor_position(), (5, 3));
+        assert!(console.cursor_visible());
+        for byte in b"\x1b[?25l" {
+            console.write_data(*byte);
+        }
+        assert!(!console.cursor_visible());
     }
 
     #[test]

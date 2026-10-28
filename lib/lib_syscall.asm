@@ -266,3 +266,64 @@ __sc16_mmap_result_long:
 __sc16_mmap_result_success:
     MOV R0, R5
     RET
+
+sc16_spawn_arg:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDWS R4, 8
+    LDWS R5, 10
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDI R0, 17
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
+sc16_startup_argument:
+    LDI R0, 15
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
+sc16_monotonic_ms:
+    LDI R0, 16
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
+sc16_process_info:
+    LDWS R1, 4
+    LDWS R4, 8
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 10
+    AND R3, R6
+    LDI R0, 14
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_trywait:
+    LDWS R4, 4
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDI R0, 18
+    LDI R7, 1
+    SVC
+    RET
