@@ -5,6 +5,7 @@ int main(void)
     unsigned long duration;
     unsigned long started;
     unsigned long now;
+    unsigned long elapsed;
     unsigned long second = 1UL;
     unsigned long pid;
     unsigned int offset;
@@ -18,9 +19,15 @@ int main(void)
         while (second <= duration)
         {
             now = (unsigned long)sc16_monotonic_ms();
-            if (((now - started) & 1073741823UL) < second * 1000UL)
+            elapsed = (now - started) & 1073741823UL;
+            if (elapsed < second * 1000UL)
             {
-                sc16_yield();
+                if (sc16_sleep_ms(second * 1000UL - elapsed) < 0)
+                {
+                    write_text("Background timer failed.\n");
+                    sc16_exit(1);
+                    return 1;
+                }
                 continue;
             }
             message[0] = 'B';

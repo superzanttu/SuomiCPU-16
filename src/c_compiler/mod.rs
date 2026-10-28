@@ -598,7 +598,7 @@ fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Express
     match function {
         "sc16_spawn" | "sc16_spawn_arg" | "sc16_open" | "__stdio_mode_flags" => index == 0,
         "sc16_mmap" => index == 2,
-        "sc16_read" | "sc16_write" | "sc16_process_info" => index == 1,
+        "sc16_read" | "sc16_write" | "sc16_process_info" | "sc16_process_status" => index == 1,
         "sc16_net_discover" => index == 0,
         "sc16_net_send" | "sc16_net_receive" => matches!(index, 0 | 1),
         "gfx_sprite" | "gfx_bitmap" => index == 4,
@@ -627,8 +627,10 @@ fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Express
 fn native_argument_is_wide_integer(function: &str, index: usize) -> bool {
     matches!(
         (function, index),
-        ("sc16_mmap" | "sc16_sleep" | "sc16_wait" | "sc16_trywait", 0)
-            | ("sc16_seek" | "sc16_semop" | "sc16_spawn_arg", 1)
+        (
+            "sc16_mmap" | "sc16_sleep" | "sc16_sleep_ms" | "sc16_wait" | "sc16_trywait",
+            0
+        ) | ("sc16_seek" | "sc16_semop" | "sc16_spawn_arg", 1)
     )
 }
 

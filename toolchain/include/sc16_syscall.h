@@ -26,6 +26,7 @@ long sc16_spawn_arg(const char *path, unsigned long argument);
 long sc16_startup_argument(void);
 long sc16_monotonic_ms(void);
 int sc16_process_info(unsigned int index, char *buffer, unsigned int capacity);
+int sc16_process_status(unsigned int index, char *buffer, unsigned int capacity);
 long sc16_mmap(unsigned long length, unsigned int permissions, void *hint);
 int sc16_open(const char *path, unsigned int flags);
 int sc16_read(int handle, void *buffer, unsigned int length);
@@ -33,6 +34,7 @@ int sc16_write(int handle, const void *buffer, unsigned int length);
 int sc16_close(int handle);
 long sc16_seek(int handle, long offset, int origin);
 int sc16_sleep(unsigned long ticks);
+int sc16_sleep_ms(unsigned long milliseconds);
 int sc16_wait(unsigned long child_pid);
 int sc16_trywait(unsigned long child_pid);
 long sc16_semop(unsigned int operation, unsigned long semaphore_id,

@@ -23,15 +23,15 @@ static void reap_background(void)
 static void show_processes(void)
 {
     unsigned int index;
-    char row[64];
+    char row[192];
     int length;
 
-    write_text("PID PPID STATE\n");
+    write_text("PID PPID STATE PROGRAM\n");
     for (index = 0; ; index++)
     {
-        length = sc16_process_info(index, row, sizeof(row) - 1);
+        length = sc16_process_status(index, row, sizeof(row) - 1);
         if (length == 0)
-            return;
+            break;
         if (length < 0)
         {
             write_text("Unable to list processes.\n");
@@ -40,6 +40,8 @@ static void show_processes(void)
         row[length] = 0;
         write_text(row);
     }
+    write_text("running=on CPU, ready=waiting for CPU\n");
+    write_text("sleeping=timer wait, waiting=child wait\n");
 }
 
 static void start_background(const char *duration)

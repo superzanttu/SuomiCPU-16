@@ -1854,6 +1854,17 @@ impl Cpu {
         let task_id = self.scheduler.current_task();
         if let Some(id) = task_id {
             self.syscall_state.register_process(id, None);
+            let record = self
+                .syscall_state
+                .processes
+                .get_mut(&id)
+                .expect("registered process");
+            if record.name.is_empty() {
+                record.name = self
+                    .folder_disk
+                    .as_ref()
+                    .map_or_else(|| "init".to_owned(), |disk| disk.manifest().id.clone());
+            }
         }
 
         let mut scheduled_state = None;
@@ -1883,6 +1894,9 @@ impl Cpu {
                 Ok(SyscallNumber::SpawnArgument) => self.syscall_spawn(task_id),
                 Ok(SyscallNumber::Mmap) => self.syscall_mmap(task_id),
                 Ok(SyscallNumber::Sleep) => self.syscall_sleep(task_id, &mut scheduled_state),
+                Ok(SyscallNumber::SleepMillis) => {
+                    self.syscall_sleep_millis(task_id, &mut scheduled_state)
+                }
                 Ok(SyscallNumber::Wait) => self.syscall_wait(task_id, &mut scheduled_state),
                 Ok(SyscallNumber::TryWait) => self.syscall_wait(task_id, &mut scheduled_state),
                 Ok(SyscallNumber::Semaphore) => {
@@ -1890,7 +1904,9 @@ impl Cpu {
                 }
                 Ok(SyscallNumber::Seek) => self.syscall_seek(task_id),
                 Ok(SyscallNumber::ScNet) => self.syscall_scnet(task_id),
-                Ok(SyscallNumber::ProcessInfo) => self.syscall_process_info(),
+                Ok(SyscallNumber::ProcessInfo | SyscallNumber::ProcessStatus) => {
+                    self.syscall_process_info()
+                }
                 Ok(SyscallNumber::StartupArgument) => task_id
                     .and_then(|id| self.syscall_state.processes.get(&id))
                     .map(|record| i64::from(record.startup_argument))
@@ -1946,14 +1962,47 @@ impl Cpu {
             return 0;
         };
         let record = &self.syscall_state.processes[&task.id];
+        let detailed = self.registers[0] == SyscallNumber::ProcessStatus as i64;
         let state = match task.state {
+            TaskState::Runnable if detailed => "ready",
+            TaskState::Blocked
+                if detailed
+                    && (self.syscall_state.sleeping.contains_key(&task.id)
+                        || self.syscall_state.sleeping_millis.contains_key(&task.id)) =>
+            {
+                "sleeping"
+            }
+            TaskState::Blocked
+                if detailed && self.syscall_state.waiting_for.contains_key(&task.id) =>
+            {
+                "waiting"
+            }
             TaskState::Runnable => "runnable",
             TaskState::Running => "running",
             TaskState::Blocked => "blocked",
             TaskState::Exited => "exited",
         };
         let parent = record.parent.map_or("-".to_owned(), |id| id.to_string());
-        let text = format!("{} {parent} {state}\n", task.id);
+        let text = if detailed {
+            let name = if record.name.is_empty() {
+                "init"
+            } else {
+                &record.name
+            };
+            let name: String = name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_graphic() {
+                        character
+                    } else {
+                        '?'
+                    }
+                })
+                .collect();
+            format!("{} {parent} {state} {name}\n", task.id)
+        } else {
+            format!("{} {parent} {state}\n", task.id)
+        };
         if text.len() > capacity {
             return crate::syscall::error::OVERFLOW;
         }
@@ -2762,11 +2811,13 @@ impl Cpu {
             }
         };
         self.syscall_state.register_process(id, Some(parent));
-        self.syscall_state
+        let record = self
+            .syscall_state
             .processes
             .get_mut(&id)
-            .expect("registered child")
-            .startup_argument = argument;
+            .expect("registered child");
+        record.startup_argument = argument;
+        record.name = path;
         i64::from(id)
     }
 
@@ -2867,6 +2918,29 @@ impl Cpu {
             return crate::syscall::error::OVERFLOW;
         };
         self.syscall_state.sleeping.insert(task_id, deadline);
+        scheduled_state.replace((TaskState::Blocked, 0));
+        0
+    }
+
+    fn syscall_sleep_millis(
+        &mut self,
+        task_id: Option<TaskId>,
+        scheduled_state: &mut Option<(TaskState, i32)>,
+    ) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let milliseconds = match u32::try_from(self.registers[1]) {
+            Ok(milliseconds) if milliseconds <= 1_000_000_000 => milliseconds,
+            _ => return crate::syscall::error::INVALID,
+        };
+        if milliseconds == 0 {
+            return 0;
+        }
+        let started = self.monotonic_milliseconds() as u32;
+        self.syscall_state
+            .sleeping_millis
+            .insert(task_id, (started, milliseconds));
         scheduled_state.replace((TaskState::Blocked, 0));
         0
     }
@@ -3033,6 +3107,7 @@ impl Cpu {
         }
         self.syscall_state.open_files.remove(&id);
         self.syscall_state.sleeping.remove(&id);
+        self.syscall_state.sleeping_millis.remove(&id);
         self.syscall_state.waiting_for.remove(&id);
         let owned_semaphores: Vec<_> = self
             .syscall_state
@@ -4192,12 +4267,15 @@ impl Cpu {
         Ok(())
     }
 
+    pub fn has_pending_work(&self) -> bool {
+        self.running
+            || !self.syscall_state.sleeping.is_empty()
+            || !self.syscall_state.sleeping_millis.is_empty()
+    }
+
     pub fn run(&mut self, instruction_budget: usize) -> Result<usize, CpuError> {
         let mut executed = 0;
-        while executed < instruction_budget
-            && !self.frame_yield
-            && (self.running || !self.syscall_state.sleeping.is_empty())
-        {
+        while executed < instruction_budget && !self.frame_yield && self.has_pending_work() {
             if self.running {
                 self.step()?;
             } else {
@@ -5508,6 +5586,34 @@ impl Cpu {
         self.enter_event(cause, saved_pc, descriptor.handler, 0, descriptor.gate_type)
     }
 
+    fn resolve_event_frame(
+        &self,
+        start: u32,
+        access: crate::mmu::MemoryAccess,
+    ) -> Result<[usize; EXCEPTION_ENTRY_BYTES as usize], CpuError> {
+        let mut addresses = [0; EXCEPTION_ENTRY_BYTES as usize];
+        for (offset, physical) in addresses.iter_mut().enumerate() {
+            let address = start
+                .checked_add(offset as u32)
+                .filter(|address| *address <= self.guest_address_mask())
+                .ok_or(CpuError::DoubleFault)?;
+            let translated = if self.mmu_enabled {
+                crate::mmu::translate(&self.memory, self.page_directory, address, access, false)
+                    .map_err(|_| CpuError::DoubleFault)?
+            } else {
+                address
+            };
+            if translated as usize >= self.memory.len()
+                || (MMIO_START..MMIO_END).contains(&address)
+                || (MMIO_START..MMIO_END).contains(&translated)
+            {
+                return Err(CpuError::DoubleFault);
+            }
+            *physical = translated as usize;
+        }
+        Ok(addresses)
+    }
+
     fn enter_event(
         &mut self,
         cause: u16,
@@ -5542,14 +5648,14 @@ impl Cpu {
             self.running = false;
             return Err(CpuError::DoubleFault);
         };
-        let Some(frame_end) = frame_start.checked_add(EXCEPTION_ENTRY_BYTES) else {
-            self.running = false;
-            return Err(CpuError::DoubleFault);
+        let addresses = match self.resolve_event_frame(frame_start, crate::mmu::MemoryAccess::Write)
+        {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                self.running = false;
+                return Err(error);
+            }
         };
-        if frame_end as usize > self.memory.len() {
-            self.running = false;
-            return Err(CpuError::DoubleFault);
-        }
 
         let flags = self.pack_flags().to_be_bytes();
         let interrupt_enabled = self.read(ICR_ADDR) & 1 != 0;
@@ -5558,13 +5664,16 @@ impl Cpu {
             .to_be_bytes();
         let cause_bytes = cause.to_be_bytes();
         let kind = entry_kind.to_be_bytes();
-        let frame = &mut self.memory[frame_start as usize..frame_end as usize];
+        let mut frame = [0; EXCEPTION_ENTRY_BYTES as usize];
         frame[0..4].copy_from_slice(&saved_pc.to_be_bytes());
         frame[4..6].copy_from_slice(&flags);
         frame[6..8].copy_from_slice(&status);
         frame[8..12].copy_from_slice(&old_sp.to_be_bytes());
         frame[12..14].copy_from_slice(&cause_bytes);
         frame[14..16].copy_from_slice(&kind);
+        for (address, byte) in addresses.into_iter().zip(frame) {
+            self.memory[address] = byte;
+        }
 
         if gate_type == crate::interrupts::GateType::Interrupt {
             let interrupt_control = self.read(ICR_ADDR) & !1;
@@ -5584,15 +5693,18 @@ impl Cpu {
                 operation: "RTI",
             });
         }
-        let frame_end = self
-            .sp
-            .checked_add(EXCEPTION_ENTRY_BYTES)
-            .ok_or(CpuError::DoubleFault)?;
-        if frame_end as usize > self.memory.len() {
+        let addresses = match self.resolve_event_frame(self.sp, crate::mmu::MemoryAccess::Read) {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                self.running = false;
+                return Err(error);
+            }
+        };
+        let Some(frame_end) = self.sp.checked_add(EXCEPTION_ENTRY_BYTES) else {
             self.running = false;
             return Err(CpuError::DoubleFault);
-        }
-        let frame = &self.memory[self.sp as usize..frame_end as usize];
+        };
+        let frame = addresses.map(|address| self.memory[address]);
         let saved_pc =
             u32::from_be_bytes(frame[0..4].try_into().map_err(|_| CpuError::DoubleFault)?);
         let saved_flags =
@@ -5608,11 +5720,8 @@ impl Cpu {
         if status & !0x3 != 0
             || entry_kind > 1
             || saved_pc > self.guest_address_mask()
-            || (if status & 1 != 0 {
-                saved_sp > self.guest_address_mask()
-            } else {
-                saved_sp as usize >= self.memory.len()
-            })
+            || saved_sp == 0
+            || saved_sp > self.guest_address_mask()
         {
             self.running = false;
             return Err(CpuError::DoubleFault);
@@ -5623,6 +5732,26 @@ impl Cpu {
         } else {
             PrivilegeMode::Supervisor
         };
+        if self.mmu_enabled {
+            let user_mode = prior_mode == PrivilegeMode::User;
+            for (address, access) in [
+                (saved_pc, crate::mmu::MemoryAccess::Fetch),
+                (saved_sp - 1, crate::mmu::MemoryAccess::Write),
+            ] {
+                if crate::mmu::translate(
+                    &self.memory,
+                    self.page_directory,
+                    address,
+                    access,
+                    user_mode,
+                )
+                .is_err()
+                {
+                    self.running = false;
+                    return Err(CpuError::DoubleFault);
+                }
+            }
+        }
         self.restore_flags(saved_flags);
         self.pc = saved_pc;
         self.privilege_mode = prior_mode;
@@ -5693,14 +5822,21 @@ impl Cpu {
 
     fn advance_timer(&mut self) {
         self.syscall_state.ticks = self.syscall_state.ticks.saturating_add(1);
+        let now = self.monotonic_milliseconds() as u32;
         let awake: Vec<_> = self
             .syscall_state
             .sleeping
             .iter()
             .filter_map(|(id, deadline)| (*deadline <= self.syscall_state.ticks).then_some(*id))
+            .chain(self.syscall_state.sleeping_millis.iter().filter_map(
+                |(id, (started, duration))| {
+                    ((now.wrapping_sub(*started) & ADDRESS_MASK) >= *duration).then_some(*id)
+                },
+            ))
             .collect();
         for id in awake {
             self.syscall_state.sleeping.remove(&id);
+            self.syscall_state.sleeping_millis.remove(&id);
             self.syscall_state.pending_results.insert(id, 0);
             let _ = self.scheduler.wake(id);
             if self.scheduler.current_task().is_none() {
@@ -5921,6 +6057,100 @@ mod tests {
             [0, 0x400, 4097, 0, 0, 0],
         );
         assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
+    }
+
+    #[test]
+    fn process_status_distinguishes_ready_sleeping_waiting_and_exited_tasks() {
+        for (state, reason, expected) in [
+            (TaskState::Runnable, "", "ready"),
+            (TaskState::Blocked, "ticks", "sleeping"),
+            (TaskState::Blocked, "millis", "sleeping"),
+            (TaskState::Blocked, "child", "waiting"),
+            (TaskState::Blocked, "", "blocked"),
+            (TaskState::Exited, "", "exited"),
+        ] {
+            let (mut cpu, parent) = cpu_with_syscall_task();
+            let child = cpu
+                .scheduler
+                .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+                .unwrap();
+            cpu.syscall_state.register_process(child, Some(parent));
+            cpu.syscall_state.processes.get_mut(&child).unwrap().name = "demo.bin".to_owned();
+            cpu.yield_current_task().unwrap();
+            cpu.schedule_current_task(state, None).unwrap();
+            match reason {
+                "ticks" => {
+                    cpu.syscall_state.sleeping.insert(child, u64::MAX);
+                }
+                "millis" => {
+                    cpu.syscall_state
+                        .sleeping_millis
+                        .insert(child, (0, 1_000_000_000));
+                }
+                "child" => {
+                    cpu.syscall_state.waiting_for.insert(child, parent);
+                }
+                _ => {}
+            }
+            cpu.registers[0] = SyscallNumber::ProcessStatus as i64;
+            cpu.registers[1..4].copy_from_slice(&[1, 0x400, 64]);
+            let length = cpu.syscall_process_info();
+            assert!(length > 0);
+            assert_eq!(
+                &cpu.memory[0x400..0x400 + length as usize],
+                format!("1 0 {expected} demo.bin\n").as_bytes(),
+            );
+            cpu.registers[1] = 0;
+            let length = cpu.syscall_process_info();
+            assert!(length > 0);
+            assert_eq!(
+                &cpu.memory[0x400..0x400 + length as usize],
+                b"0 - running init\n"
+            );
+        }
+    }
+
+    #[test]
+    fn millisecond_sleep_blocks_until_the_monotonic_deadline_including_rollover() {
+        for started in [1000, ADDRESS_MASK - 499] {
+            let (mut cpu, task) = cpu_with_syscall_task();
+            cpu.test_monotonic_ms = Some(started);
+            invoke_syscall(&mut cpu, SyscallNumber::SleepMillis, [1000, 0, 0, 0, 0, 0]);
+            assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Blocked);
+            assert_eq!(cpu.current_task(), None);
+            assert!(cpu.has_pending_work());
+            cpu.test_monotonic_ms = Some(started.wrapping_add(999) & ADDRESS_MASK);
+            cpu.run(100).unwrap();
+            assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Blocked);
+            assert_eq!(cpu.current_task(), None);
+            cpu.test_monotonic_ms = Some(started.wrapping_add(1000) & ADDRESS_MASK);
+            cpu.run(1).unwrap();
+            assert_eq!(cpu.current_task(), Some(task));
+            assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Running);
+            assert!(cpu.syscall_state.sleeping_millis.is_empty());
+        }
+    }
+
+    #[test]
+    fn millisecond_sleep_validates_duration_without_blocking() {
+        for duration in [-1, 0, 1_000_000_001, i64::MAX] {
+            let (mut cpu, task) = cpu_with_syscall_task();
+            invoke_syscall(
+                &mut cpu,
+                SyscallNumber::SleepMillis,
+                [duration, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(cpu.current_task(), Some(task));
+            assert!(cpu.syscall_state.sleeping_millis.is_empty());
+            assert_eq!(
+                cpu.registers[0],
+                if duration == 0 {
+                    0
+                } else {
+                    crate::syscall::error::INVALID
+                }
+            );
+        }
     }
 
     #[test]

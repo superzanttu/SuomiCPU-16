@@ -795,12 +795,12 @@ pub async fn run_with_devices(
         let key_control_only = control_key_count == pressed_keys.len();
         if runtime_should_close(
             false,
-            cpu.running,
+            cpu.has_pending_work(),
             !pressed_keys.is_empty() && !key_control_only,
         ) {
             break;
         }
-        if cpu.running {
+        if cpu.has_pending_work() {
             update_keys(&mut cpu, &old_keys, &keys, shifted);
             old_keys = keys;
             let (width, height) = screen_size(&cpu);
@@ -868,7 +868,7 @@ pub async fn run_with_devices(
                 if let Some(path) = cpu.take_booted_disk_path() {
                     active_boot_disk = Some(path);
                 }
-                if cpu_budget_remaining == 0 || cpu.frame_yield || !cpu.running {
+                if cpu_budget_remaining == 0 || cpu.frame_yield || !cpu.has_pending_work() {
                     cpu_budget_remaining = 0;
                     cpu_frame_started = false;
                 }
@@ -908,7 +908,7 @@ pub async fn run_with_devices(
             }
         }
         let (width, height) = presented_size;
-        if (!cpu.running || paused) && !cpu.terminal_active {
+        if (!cpu.has_pending_work() || paused) && !cpu.terminal_active {
             fill_rect(
                 &mut pixels,
                 width,
@@ -989,7 +989,7 @@ pub fn run_headless_with_devices(
     let executed = cpu
         .run(budget)
         .map_err(|error| RuntimeError::Window(error.to_string()))?;
-    if cpu.running {
+    if cpu.has_pending_work() {
         return Err(RuntimeError::Window(format!(
             "instruction budget exhausted after {executed} instructions"
         )));
@@ -1806,7 +1806,7 @@ fn run_instruction_slice(
     let mut total_executed = 0;
     while *budget_remaining > 0
         && started.elapsed() < RUNTIME_CPU_SLICE
-        && cpu.running
+        && cpu.has_pending_work()
         && !cpu.frame_yield
     {
         let chunk = (*budget_remaining).min(RUNTIME_INSTRUCTION_CHUNK);
@@ -3576,9 +3576,24 @@ mod tests {
         let output = String::from_utf8_lossy(cpu.console.output()).into_owned();
         assert!(output.contains("Started background process 2"), "{output}");
         assert!(output.contains("Started background process 3"), "{output}");
-        assert!(output.contains("PID PPID STATE\n0 - running\n"), "{output}");
-        assert!(output.contains("2 0 runnable\n"), "{output}");
-        assert!(output.contains("3 0 runnable\n"), "{output}");
+        assert!(
+            output.contains("PID PPID STATE PROGRAM\n0 - running sisuos\n"),
+            "{output}"
+        );
+        assert!(output.contains("2 0 sleeping demo.bin\n"), "{output}");
+        assert!(output.contains("3 0 sleeping demo.bin\n"), "{output}");
+        assert!(
+            output.contains("running=on CPU, ready=waiting for CPU\n"),
+            "{output}"
+        );
+        assert_eq!(
+            cpu.task_context(2).unwrap().state,
+            crate::scheduler::TaskState::Blocked
+        );
+        assert_eq!(
+            cpu.task_context(3).unwrap().state,
+            crate::scheduler::TaskState::Blocked
+        );
         assert!(!output.contains("BGP "), "{output}");
         assert!(output.ends_with("sc16> "), "{output}");
 
@@ -3619,7 +3634,10 @@ mod tests {
         }
         cpu.run(300_000).unwrap();
         let output = String::from_utf8_lossy(&cpu.console.output()[start..]);
-        assert!(output.contains("PID PPID STATE\n0 - running\n"), "{output}");
+        assert!(
+            output.contains("PID PPID STATE PROGRAM\n0 - running sisuos\n"),
+            "{output}"
+        );
         assert!(
             !output.contains("2 0 ") && !output.contains("3 0 "),
             "{output}"

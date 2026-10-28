@@ -327,3 +327,33 @@ sc16_trywait:
     LDI R7, 1
     SVC
     RET
+
+sc16_sleep_ms:
+    LDWS R4, 4
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDI R0, 19
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_process_status:
+    LDWS R1, 4
+    LDWS R4, 8
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 10
+    AND R3, R6
+    LDI R0, 20
+    LDI R7, 1
+    SVC
+    RET

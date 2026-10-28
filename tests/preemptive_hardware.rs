@@ -100,6 +100,119 @@ fn translated_user_entry_obeys_page_permissions_in_both_execution_modes() {
     }
 }
 
+fn translated_kernel_stack(second_page_flags: u32) -> Cpu {
+    let image = assemble(
+        "PUSH R4\nSVC\nPOP R4\nRTI\n.address 0x1100\nINC R5\nRTI\n.address 0x5000\nSVC\nHALT",
+        0x1000,
+    )
+    .unwrap();
+    let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.load_idt(0x800).unwrap();
+    cpu.set_idt_descriptor(
+        128,
+        suomicpu16::interrupts::IdtDescriptor {
+            handler: 0x1000,
+            present: true,
+            privilege: 3,
+            gate_type: suomicpu16::interrupts::GateType::Interrupt,
+        },
+    )
+    .unwrap();
+    cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+    for (page, physical, flags) in [
+        (1, 0x1000, 0xb),
+        (5, 0x5000, 0xd),
+        (7, 0x7000, 7),
+        (9, 0x20000, 3),
+        (10, 0x30000, second_page_flags),
+    ] {
+        let entry = 0x3000 + page * 4;
+        cpu.memory[entry..entry + 4].copy_from_slice(&(physical | flags).to_be_bytes());
+    }
+    cpu.enable_mmu(0x2000).unwrap();
+    cpu.sp = 0xa008;
+    cpu.enter_user_mode(0x5000, 0x8000).unwrap();
+    cpu.registers[4] = 0x1234;
+    cpu
+}
+
+#[test]
+fn translated_kernel_stack_preserves_cross_page_and_nested_event_frames() {
+    let mut cpu = translated_kernel_stack(3);
+    cpu.memory[0x9fe0..0xa008].fill(0xa5);
+
+    cpu.step().unwrap();
+
+    assert_eq!(cpu.sp, 0x9ff8);
+    assert_eq!(&cpu.memory[0x20ff8..0x20ffc], &0x5002u32.to_be_bytes());
+    assert_eq!(&cpu.memory[0x30000..0x30004], &0x8000u32.to_be_bytes());
+    cpu.set_idt_descriptor(
+        128,
+        suomicpu16::interrupts::IdtDescriptor {
+            handler: 0x1100,
+            present: true,
+            privilege: 3,
+            gate_type: suomicpu16::interrupts::GateType::Interrupt,
+        },
+    )
+    .unwrap();
+    cpu.run(6).unwrap();
+
+    assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+    assert_eq!(cpu.pc, 0x5002);
+    assert_eq!(cpu.sp, 0x8000);
+    assert_eq!(cpu.kernel_sp, 0xa008);
+    assert_eq!(cpu.registers[4], 0x1234);
+    assert_eq!(cpu.registers[5], 1);
+    assert!(cpu.memory[0x9fe0..0xa008].iter().all(|byte| *byte == 0xa5));
+}
+
+#[test]
+fn event_frame_validation_prevents_partial_writes() {
+    for flags in [0, 1] {
+        let mut cpu = translated_kernel_stack(flags);
+        cpu.memory[0x20ff8..0x21000].fill(0xa5);
+        cpu.memory[0x30000..0x30008].fill(0x5a);
+
+        assert_eq!(cpu.step(), Err(CpuError::DoubleFault), "flags {flags}");
+        assert!(!cpu.running);
+        assert_eq!(cpu.sp, 0x8000);
+        assert_eq!(cpu.kernel_sp, 0xa008);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert!(
+            cpu.memory[0x20ff8..0x21000]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert!(
+            cpu.memory[0x30000..0x30008]
+                .iter()
+                .all(|byte| *byte == 0x5a)
+        );
+    }
+}
+
+#[test]
+fn rti_rejects_invalid_user_targets_before_restoring_context() {
+    for (offset, value) in [(0, 0x6000u32), (8, 0x6000)] {
+        let mut cpu = translated_kernel_stack(3);
+        cpu.step().unwrap();
+        let physical = if offset == 0 { 0x20ff8 } else { 0x30000 };
+        cpu.memory[physical..physical + 4].copy_from_slice(&value.to_be_bytes());
+        cpu.pc = 0x1102;
+        let sp = cpu.sp;
+        let flags = cpu.flags;
+
+        assert_eq!(cpu.step(), Err(CpuError::DoubleFault));
+        assert!(!cpu.running);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.sp, sp);
+        assert_eq!(cpu.flags, flags);
+    }
+}
+
 #[test]
 fn guest_kernel_preempts_and_switches_isolated_address_spaces_without_host_tasks() {
     let mut source = String::from(

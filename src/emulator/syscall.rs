@@ -41,6 +41,8 @@ pub enum SyscallNumber {
     MonotonicMillis = 16,
     SpawnArgument = 17,
     TryWait = 18,
+    SleepMillis = 19,
+    ProcessStatus = 20,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -67,6 +69,8 @@ impl TryFrom<i64> for SyscallNumber {
             16 => Ok(Self::MonotonicMillis),
             17 => Ok(Self::SpawnArgument),
             18 => Ok(Self::TryWait),
+            19 => Ok(Self::SleepMillis),
+            20 => Ok(Self::ProcessStatus),
             _ => Err(()),
         }
     }
@@ -114,6 +118,7 @@ pub(crate) struct OpenFile {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProcessRecord {
+    pub name: String,
     pub startup_argument: u32,
     pub parent: Option<TaskId>,
     pub children: Vec<TaskId>,
@@ -135,6 +140,7 @@ pub(crate) struct KernelState {
     pub processes: HashMap<TaskId, ProcessRecord>,
     pub open_files: HashMap<TaskId, HashMap<u32, OpenFile>>,
     pub sleeping: HashMap<TaskId, u64>,
+    pub sleeping_millis: HashMap<TaskId, (u32, u32)>,
     pub waiting_for: HashMap<TaskId, TaskId>,
     pub semaphores: HashMap<u32, Semaphore>,
     pub next_semaphore: u32,
@@ -195,7 +201,9 @@ mod tests {
         assert_eq!(SyscallNumber::try_from(13), Ok(SyscallNumber::ScNet));
         assert_eq!(SyscallNumber::try_from(-1), Err(()));
         assert_eq!(SyscallNumber::try_from(14), Ok(SyscallNumber::ProcessInfo));
-        assert_eq!(SyscallNumber::try_from(19), Err(()));
+        assert_eq!(SyscallNumber::try_from(19), Ok(SyscallNumber::SleepMillis));
+        assert_eq!(SyscallNumber::try_from(20), Ok(SyscallNumber::ProcessStatus));
+        assert_eq!(SyscallNumber::try_from(21), Err(()));
     }
 
     #[test]

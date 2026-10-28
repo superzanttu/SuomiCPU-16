@@ -213,7 +213,13 @@ explicitly enables interrupts. Firmware must install valid handlers before
 enabling an interrupt source.
 
 Every exception or interrupt creates a 16-byte, big-endian frame on the
-supervisor stack. At the frame address, increasing offsets contain:
+supervisor stack. With the MMU enabled, SP and KSP are virtual addresses and
+event frames use supervisor translation, just like guest stack instructions.
+All frame bytes are checked before writing, including frames crossing pages;
+frames must reside in writable RAM, not MMIO. RTI reads the frame through the
+active supervisor mapping and validates the restored executable PC and writable
+stack before changing context. Invalid frames or return targets stop the CPU
+with a double fault. At the frame address, increasing offsets contain:
 
 [cols="1,1,2"]
 |===
@@ -357,6 +363,16 @@ which the native wrappers combine before `SVC`.
   in R2. The original +spawn+ ignores R2 and supplies zero.
 |18 |`trywait` |Like +wait+, but returns +-EAGAIN+ (-11) without blocking when
   the child has not exited. Reaps an exited child and returns its status.
+|19 |`sleep_ms` |R1 host-monotonic milliseconds, 0..1,000,000,000. Zero returns
+  immediately; otherwise blocks until the interval has elapsed, including
+  across the 30-bit clock rollover. Independent of instruction-tick +sleep+.
+|20 |`process_status` |Same arguments and buffer/error rules as +process_info+,
+  returning +PID PPID STATE PROGRAM\n+. States are +running+, +ready+,
+  +sleeping+, +waiting+, +blocked+, and +exited+. Program is the spawn path,
+  or the boot disk ID for its initial process (+init+ without a disk).
+  Whitespace/control characters in names are replaced by +?+.
+  Each row reflects its query instant; this is not a utilization measurement
+  or an atomic snapshot. Syscall 14 retains its original row format.
 |===
 
 Every user pointer is range-checked against the active address space before
