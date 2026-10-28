@@ -1671,7 +1671,7 @@ mod tests {
                 .iter()
                 .map(|segment| segment.data.len())
                 .sum::<usize>(),
-            656
+            658
         );
     }
 

@@ -13,7 +13,7 @@ const FORMAT_VERSION: u16 = 2;
 const HEADER_SIZE: u64 = 20;
 const SEGMENT_HEADER_SIZE: u64 = 20;
 const MAX_SEGMENTS: usize = 65_536;
-const MEMORY_SIZE: u64 = 1 << 30;
+const MEMORY_SIZE: u64 = crate::machine::DEVICE_APERTURE_START as u64;
 const PERMISSION_READ: u8 = 1;
 const PERMISSION_WRITE: u8 = 2;
 const PERMISSION_EXECUTE: u8 = 4;
@@ -150,7 +150,7 @@ fn validate_image(image: &ProgramImage) -> Result<(), ImageError> {
         }
         if segment.alignment == 0
             || !segment.alignment.is_power_of_two()
-            || u64::from(segment.alignment) > MEMORY_SIZE
+            || u64::from(segment.alignment) > u64::from(crate::machine::ADDRESS_SPACE_SIZE)
             || segment.address % segment.alignment != 0
         {
             return Err(ImageError::InvalidFormat("invalid segment alignment"));
@@ -501,6 +501,37 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_be_bytes());
         bytes.extend_from_slice(data);
         bytes
+    }
+
+    #[test]
+    fn image_boundaries_exclude_reserved_device_aperture() {
+        let aperture = crate::machine::DEVICE_APERTURE_START;
+        let path =
+            std::env::temp_dir().join(format!("sc16-aperture-image-{}.img", std::process::id()));
+        for (address, entry, data) in [
+            (aperture, aperture, vec![0, 0]),
+            (aperture - 1, aperture - 1, vec![0, 0]),
+            (aperture - 2, aperture, vec![0, 0]),
+        ] {
+            let image = ProgramImage {
+                entry_point: entry,
+                segments: vec![ImageSegment::new(address, data.clone())],
+            };
+            assert!(encode_image(&image).is_err());
+            fs::write(
+                &path,
+                raw_image(entry, &[raw_segment(address, 1, PERMISSION_MASK, &data)]),
+            )
+            .unwrap();
+            assert!(read_image(&path).is_err());
+        }
+        let image = ProgramImage {
+            entry_point: aperture - 2,
+            segments: vec![ImageSegment::new(aperture - 2, vec![0, 0])],
+        };
+        fs::write(&path, encode_image(&image).unwrap()).unwrap();
+        assert_eq!(read_image(&path).unwrap(), image);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

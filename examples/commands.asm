@@ -5,6 +5,7 @@
 
 .address 0x0080
 start:
+    ADJSP -2
     LDI R0, 0x20
     LDI R1, 5
     LDI R6, 0x34

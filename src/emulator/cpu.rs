@@ -16,7 +16,7 @@ use crate::sc_net::ScNetNode;
 use crate::scheduler::{Scheduler, SchedulerError, TaskContext, TaskId, TaskState};
 use crate::syscall::{KernelState, OpenFile, SyscallNumber};
 
-pub const MEMORY_SIZE: usize = 1 << 30;
+pub const MEMORY_SIZE: usize = crate::machine::ADDRESS_SPACE_SIZE as usize;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
 
 pub const ICR_ADDR: u32 = 0x43002;
@@ -484,8 +484,8 @@ impl Cpu {
             #[cfg(test)]
             test_monotonic_ms: None,
             pc: 0,
-            sp: memory_mask,
-            kernel_sp: memory_mask,
+            sp: crate::machine::usable_ram_size(size) as u32 - 1,
+            kernel_sp: crate::machine::usable_ram_size(size) as u32 - 1,
             loaded_image_segments: Vec::new(),
             privilege_mode: PrivilegeMode::Supervisor,
             flags: Flags::default(),
@@ -967,7 +967,8 @@ impl Cpu {
         segments: &[S],
         entry_point: u32,
     ) -> Result<(), CpuError> {
-        if entry_point as usize >= self.memory.len() {
+        let ram_size = crate::machine::usable_ram_size(self.memory.len());
+        if entry_point as usize >= ram_size {
             return Err(CpuError::InvalidEntryPoint(entry_point));
         }
         for segment in segments {
@@ -980,7 +981,7 @@ impl Cpu {
                     length: data.len(),
                 });
             };
-            if end > self.memory.len() {
+            if end > ram_size {
                 return Err(CpuError::SegmentOutOfBounds {
                     address,
                     length: data.len(),
@@ -1024,8 +1025,8 @@ impl Cpu {
             .log_debug("cpu", "Resetting CPU state for image entry");
         self.registers.fill(0);
         self.flags = Flags::default();
-        self.sp = self.memory_mask;
-        self.kernel_sp = self.memory_mask;
+        self.sp = crate::machine::usable_ram_size(self.memory.len()) as u32 - 1;
+        self.kernel_sp = self.sp;
         self.loaded_image_segments.clear();
         self.privilege_mode = PrivilegeMode::Supervisor;
         self.mmu_enabled = false;
@@ -1045,8 +1046,8 @@ impl Cpu {
     }
 
     pub fn initial_user_stack_pointer(&self) -> u32 {
-        self.memory_mask
-            .saturating_sub((self.memory.len() / 4).min(0x1_0000) as u32)
+        let ram_size = crate::machine::usable_ram_size(self.memory.len());
+        (ram_size as u32 - 1).saturating_sub((ram_size / 4).min(0x1_0000) as u32)
     }
 
     pub fn enter_user_mode(&mut self, user_pc: u32, user_sp: u32) -> Result<(), CpuError> {
@@ -1056,10 +1057,13 @@ impl Cpu {
                 operation: "enter user mode",
             });
         }
-        if user_pc > self.guest_address_mask() {
+        if user_pc > self.guest_address_mask() || crate::machine::is_device_aperture(user_pc) {
             return Err(CpuError::InvalidEntryPoint(user_pc));
         }
-        if user_sp == 0 || user_sp > self.guest_address_mask() {
+        if user_sp == 0
+            || user_sp > self.guest_address_mask()
+            || crate::machine::is_device_aperture(user_sp - 1)
+        {
             return Err(CpuError::InvalidUserStack(user_sp));
         }
         if !self.mmu_enabled && user_sp > self.kernel_sp.saturating_sub(0x1000) {
@@ -1093,6 +1097,7 @@ impl Cpu {
         }
         if entry_point
             > page_directory.map_or(self.memory_mask, |_| crate::mmu::ADDRESS_SPACE_SIZE - 1)
+            || crate::machine::is_device_aperture(entry_point)
         {
             return Err(CpuError::InvalidEntryPoint(entry_point));
         }
@@ -1103,6 +1108,8 @@ impl Cpu {
             || user_sp
                 > page_directory.map_or(self.memory_mask, |_| crate::mmu::ADDRESS_SPACE_SIZE - 1)
             || kernel_sp as usize >= self.memory.len()
+            || crate::machine::is_device_aperture(user_sp - 1)
+            || crate::machine::is_device_aperture(kernel_sp)
             || (page_directory.is_none()
                 && user_sp > kernel_sp.saturating_sub(crate::mmu::PAGE_SIZE as u32))
         {
@@ -1264,6 +1271,7 @@ impl Cpu {
             });
         }
         if descriptor.handler > self.guest_address_mask()
+            || crate::machine::is_device_aperture(descriptor.handler)
             || (self.mmu_enabled
                 && crate::mmu::translate(
                     &self.memory,
@@ -1302,7 +1310,9 @@ impl Cpu {
                     _ => CpuError::DoubleFault,
                 }
             })?;
-        if descriptor.handler > self.guest_address_mask() {
+        if descriptor.handler > self.guest_address_mask()
+            || crate::machine::is_device_aperture(descriptor.handler)
+        {
             return Err(CpuError::DoubleFault);
         }
         Ok(descriptor)
@@ -1315,7 +1325,9 @@ impl Cpu {
                 address: page_directory,
                 length: crate::mmu::PAGE_TABLE_BYTES,
             })?;
-        if page_directory & 0x7ff != 0 || end as usize > self.memory.len() {
+        if page_directory & 0x7ff != 0
+            || end as usize > crate::machine::usable_ram_size(self.memory.len())
+        {
             return Err(CpuError::SegmentOutOfBounds {
                 address: page_directory,
                 length: crate::mmu::PAGE_TABLE_BYTES,
@@ -1774,7 +1786,7 @@ impl Cpu {
             .map_err(|_| "guest buffer address is outside memory".to_owned())?;
         let end = start
             .checked_add(length)
-            .filter(|end| *end <= self.memory.len())
+            .filter(|end| *end <= crate::machine::usable_ram_size(self.memory.len()))
             .ok_or_else(|| "guest buffer range is outside memory".to_owned())?;
         if DEVICE_RAM_RANGES
             .iter()
@@ -1832,9 +1844,10 @@ impl Cpu {
     }
 
     fn is_device_backing_address(address: u32) -> bool {
-        DEVICE_RAM_RANGES
-            .iter()
-            .any(|&(base, length)| address >= base && address - base < length)
+        crate::machine::is_device_aperture(address)
+            || DEVICE_RAM_RANGES
+                .iter()
+                .any(|&(base, length)| address >= base && address - base < length)
     }
 
     fn read_guest_path(&self, address: u32, user_mode: bool) -> Result<Option<String>, String> {
@@ -2864,7 +2877,7 @@ impl Cpu {
                 }
             }
         }
-        let user_stack_top = crate::mmu::ADDRESS_SPACE_SIZE - 0x1_0000;
+        let user_stack_top = crate::machine::DEVICE_APERTURE_START - 0x1_0000;
         let user_stack_page = user_stack_top - crate::mmu::PAGE_SIZE as u32;
         if result.is_ok()
             && !mapped_user.contains_key(&user_stack_page)
@@ -2963,7 +2976,7 @@ impl Cpu {
             return crate::syscall::error::INVALID;
         }
         let end = match address.checked_add(rounded_length) {
-            Some(end) if end <= crate::mmu::ADDRESS_SPACE_SIZE => end,
+            Some(end) if end <= crate::machine::DEVICE_APERTURE_START => end,
             _ => return crate::syscall::error::OVERFLOW,
         };
         let root = self.page_directory;
@@ -3411,6 +3424,13 @@ impl Cpu {
         address: u32,
         access: crate::mmu::MemoryAccess,
     ) -> Result<(), CpuError> {
+        if crate::machine::is_device_aperture(address) {
+            return Err(CpuError::PageFault(crate::mmu::PageFault {
+                virtual_address: address,
+                access,
+                reason: crate::mmu::PageFaultReason::PhysicalOutOfRange,
+            }));
+        }
         if self.privilege_mode != PrivilegeMode::User
             || !self.guest_range_contains(address, MMIO_START, MMIO_END - MMIO_START)
         {
@@ -3452,6 +3472,7 @@ impl Cpu {
     ) -> Result<Vec<u32>, CpuError> {
         let mut physical_addresses = Vec::with_capacity(length as usize);
         for offset in 0..length {
+            self.check_guest_access(address.wrapping_add(offset), access)?;
             let virtual_address = if self.mmu_enabled {
                 let virtual_address = address
                     .checked_add(offset)
@@ -5730,6 +5751,7 @@ impl Cpu {
         gate_type: crate::interrupts::GateType,
     ) -> Result<(), CpuError> {
         if handler > self.guest_address_mask()
+            || crate::machine::is_device_aperture(handler)
             || saved_pc > self.guest_address_mask()
             || (self.mmu_enabled
                 && crate::mmu::translate(
@@ -5827,8 +5849,10 @@ impl Cpu {
         if status & !0x3 != 0
             || entry_kind > 1
             || saved_pc > self.guest_address_mask()
+            || crate::machine::is_device_aperture(saved_pc)
             || saved_sp == 0
             || saved_sp > self.guest_address_mask()
+            || crate::machine::is_device_aperture(saved_sp - 1)
         {
             self.running = false;
             return Err(CpuError::DoubleFault);
@@ -6084,6 +6108,104 @@ mod tests {
             cpu.write_u16((index * 2) as u32, *word);
         }
         cpu
+    }
+
+    #[test]
+    fn configured_full_memory_reserves_aperture_from_loading_stacks_and_roots() {
+        let mut cpu = Cpu::new();
+        let aperture = crate::machine::DEVICE_APERTURE_START;
+        assert_eq!(cpu.sp, aperture - 1);
+        assert_eq!(cpu.kernel_sp, aperture - 1);
+        for (address, entry, data) in [
+            (aperture, 0, vec![0xaa, 0xbb]),
+            (aperture - 1, 0, vec![0xaa, 0xbb]),
+            (0, aperture, vec![0xaa, 0xbb]),
+        ] {
+            assert!(
+                cpu.load_program(&[crate::image::ImageSegment::new(address, data)], entry)
+                    .is_err()
+            );
+            assert_eq!(&cpu.memory[..2], &[0, 0]);
+            assert_eq!(
+                &cpu.memory[aperture as usize - 1..aperture as usize + 2],
+                &[0, 0, 0]
+            );
+        }
+        assert!(cpu.enable_mmu(aperture).is_err());
+        assert!(!cpu.is_mmu_enabled());
+        assert!(cpu.load_idt(aperture).is_err());
+        assert_eq!(
+            cpu.enter_user_mode(aperture, 0x7000),
+            Err(CpuError::InvalidEntryPoint(aperture))
+        );
+        assert_eq!(
+            cpu.enter_user_mode(0, aperture + 16),
+            Err(CpuError::InvalidUserStack(aperture + 16))
+        );
+        assert!(
+            cpu.create_user_task(aperture, 0x7000, 0xf000, None)
+                .is_err()
+        );
+        assert!(
+            cpu.create_user_task(0, aperture + 16, 0xf000, None)
+                .is_err()
+        );
+        assert!(
+            cpu.create_user_task(0, 0x7000, aperture + 16, None)
+                .is_err()
+        );
+        cpu.load_idt(0x800).unwrap();
+        assert!(
+            cpu.set_idt_descriptor(
+                128,
+                crate::interrupts::IdtDescriptor {
+                    handler: aperture,
+                    present: true,
+                    privilege: 3,
+                    gate_type: crate::interrupts::GateType::Interrupt,
+                }
+            )
+            .is_err()
+        );
+        cpu.registers[0] = 123;
+        cpu.prepare_image_entry();
+        assert_eq!(cpu.sp, aperture - 1);
+        assert_eq!(cpu.kernel_sp, aperture - 1);
+        assert!(cpu.initial_user_stack_pointer() < aperture);
+        cpu.load_program(
+            &[crate::image::ImageSegment::new(aperture - 2, vec![0, 0])],
+            aperture - 2,
+        )
+        .unwrap();
+        cpu.run(1).unwrap();
+        assert!(!cpu.running);
+    }
+
+    #[test]
+    fn reserved_aperture_guest_access_never_aliases_small_ram() {
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
+                cpu.privilege_mode = mode;
+                for address in [crate::machine::DEVICE_APERTURE_START, ADDRESS_MASK] {
+                    let aliased = (address & cpu.memory_mask) as usize;
+                    cpu.memory[aliased] = 0xa5;
+                    assert!(cpu.read_guest(address).is_err());
+                    assert!(cpu.write_guest(address, 0x5a).is_err());
+                    assert!(
+                        cpu.resolve_guest_range(address, 2, crate::mmu::MemoryAccess::Fetch)
+                            .is_err()
+                    );
+                    assert_eq!(cpu.memory[aliased], 0xa5);
+                }
+                let address = crate::machine::DEVICE_APERTURE_START - 1;
+                let aliased = (address & cpu.memory_mask) as usize;
+                cpu.memory[aliased] = 0xa5;
+                assert!(cpu.read_guest_u16(address).is_err());
+                assert!(cpu.write_guest_u16(address, 0x5a5a).is_err());
+                assert_eq!(cpu.memory[aliased], 0xa5);
+            }
+        }
     }
 
     #[test]
@@ -7678,6 +7800,22 @@ mod tests {
 
         invoke_syscall(&mut cpu, SyscallNumber::Write, [1, 0x3000, 1, 0, 0, 0]);
         assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        let free_frames = cpu.page_memory_manager.as_ref().unwrap().free_frames();
+        for (length, address) in [
+            (4096, crate::machine::DEVICE_APERTURE_START),
+            (8192, crate::machine::DEVICE_APERTURE_START - 4096),
+        ] {
+            invoke_syscall(
+                &mut cpu,
+                SyscallNumber::Mmap,
+                [length, 3, i64::from(address), 0, 0, 0],
+            );
+            assert_eq!(cpu.registers[0], crate::syscall::error::OVERFLOW);
+            assert_eq!(
+                cpu.page_memory_manager.as_ref().unwrap().free_frames(),
+                free_frames
+            );
+        }
         invoke_syscall(&mut cpu, SyscallNumber::Mmap, [4096, 3, 0, 0, 0, 0]);
         assert_eq!(cpu.registers[0], 0x2000_0000);
 

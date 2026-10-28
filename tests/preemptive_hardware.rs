@@ -234,6 +234,39 @@ fn event_frames_reject_device_backing_aliases_before_reading_or_writing() {
 }
 
 #[test]
+fn rti_rejects_reserved_aperture_targets_even_when_user_mapped() {
+    let aperture = suomicpu16::machine::DEVICE_APERTURE_START;
+    for (offset, value) in [(0, aperture), (8, aperture + 0x1000)] {
+        let mut cpu = translated_kernel_stack(3);
+        cpu.step().unwrap();
+        cpu.memory[0x27fc..0x2800].copy_from_slice(&0x400fu32.to_be_bytes());
+        cpu.memory[0x4400..0x4404].copy_from_slice(&0x500fu32.to_be_bytes());
+        assert_eq!(
+            suomicpu16::mmu::translate(
+                &cpu.memory,
+                0x2000,
+                aperture,
+                suomicpu16::mmu::MemoryAccess::Fetch,
+                true
+            )
+            .unwrap(),
+            0x5000
+        );
+        let physical = if offset == 0 { 0x20ff8 } else { 0x30000 };
+        cpu.memory[physical..physical + 4].copy_from_slice(&value.to_be_bytes());
+        cpu.pc = 0x1102;
+        let registers = cpu.registers;
+        let flags = cpu.flags;
+        assert_eq!(cpu.step(), Err(CpuError::DoubleFault));
+        assert!(!cpu.running);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.sp, 0x9ff8);
+        assert_eq!(cpu.registers, registers);
+        assert_eq!(cpu.flags, flags);
+    }
+}
+
+#[test]
 fn rti_rejects_invalid_user_targets_before_restoring_context() {
     for (offset, value) in [(0, 0x6000u32), (8, 0x6000)] {
         let mut cpu = translated_kernel_stack(3);

@@ -20,12 +20,23 @@ extension words. The ISA opcode and encoding tables are maintained in
 architectural flags are zero, carry, negative, and overflow. The control-flow
 ABI stores return addresses as four bytes and preserves all 30 address bits.
 
-The target physical memory size is 1 GiB. Smaller emulator memories remain
+The physical address space is 1 GiB. The top 1 MiB,
+`0x3ff00000..0x3fffffff`, is reserved for device banks, never ordinary RAM.
+Usable physical RAM is `min(configured backing size, 0x3ff00000)` bytes,
+so the default 1 GiB backing provides 1023 MiB of usable RAM. The canonical
+boundary is defined in `src/emulator/machine.rs`. Images, frame allocation,
+page-table/IDT storage, and initial stacks exclude this aperture even when
+host backing exists there. Smaller emulator memories remain
 available for tests and must reject accesses outside configured memory rather
 than silently wrapping. Multi-byte memory values are big-endian; unaligned
 accesses are permitted when every byte is valid and permitted. Address
 translation and permission checks apply independently to every byte of an
 access.
+
+The aperture is currently reserved, not an implemented replacement device bus.
+Guest accesses into it fail rather than wrapping onto small configured RAM.
+The low-address legacy device banks remain in use until their coordinated
+firmware/toolchain/program migration is complete.
 
 The instruction decoder must distinguish an invalid or unavailable encoding
 from a halt. In the target architecture, an invalid encoding raises an illegal
@@ -64,8 +75,8 @@ number of data bytes:
 |===
 
 At least one permission bit must be set. Every segment address must satisfy
-its alignment. Segment ranges must fit in the 30-bit address space, must not
-overlap, and their combined data length must not exceed 1 GiB. The entry point
+its alignment. Segment ranges must fit below `0x3ff00000`, must not
+overlap, and their combined data length must not exceed 1023 MiB. The entry point
 must lie inside an executable segment. Unknown permission bits, invalid
 alignment, unknown versions, nonzero reserved fields, truncated data, excess
 segments, and trailing bytes are errors. There is no BSS or relocation table:
@@ -80,6 +91,8 @@ before copying any segment. Direct and folder-disk launch, including BIOS
 selection, perform that check before preparing image-entry state. Rejected
 bounds therefore preserve RAM, registers, privilege, MMU state, and loaded-image
 metadata; launch diagnostics may still be appended to the debug log.
+Segments crossing the high device-aperture boundary are invalid even with
+the default 1 GiB host backing.
 
 Image permissions describe the intended mapping. The current loader preserves
 them. The MMU enforces present, writable, user, and executable permissions
@@ -109,7 +122,8 @@ source-compilation or host-selector fallback. CPU state is:
 * Supervisor (kernel) mode; interrupts disabled.
 * MMU disabled, with addresses translated identically to physical addresses.
 * SP and the privileged kernel-stack pointer (KSP) point to the top byte of
-  configured memory. The stack grows toward lower addresses.
+  usable RAM (`0x3fefffff` with default backing). The stack grows toward lower
+  addresses; code must reserve space before accessing words at SP.
 * Interrupt-pending state and device control registers are reset to their
   documented power-on values.
 
@@ -361,7 +375,8 @@ which the native wrappers combine before `SVC`.
 |2 |`yield` |Reschedules the current task; returns zero when resumed.
 |3 |`spawn` |R1 is a null-terminated executable path; returns child task ID.
 |4 |`mmap` |R1 length (1-16 MiB), R2 permissions, R3 aligned hint or zero;
-  a zero hint uses `0x20000000`; returns the mapped address.
+  a zero hint uses `0x20000000`; returns the mapped address. The requested
+  virtual range must end at or below `0x3ff00000`.
 |5 |`open` |R1 path, R2 flags; returns a process-local handle.
 |6 |`read` |R1 handle, R2 writable buffer, R3 length; returns bytes read.
 |7 |`write` |R1 handle, R2 readable buffer, R3 length; returns bytes written.

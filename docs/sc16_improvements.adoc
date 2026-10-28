@@ -24,7 +24,7 @@ contracts.
   registers, and has up to 1 GiB of memory. The CPU supports 30-bit addresses
   and big-endian multi-byte values. A loaded program starts at its image entry
   point; CPU construction initializes the PC to zero and the stack pointer to
-  the top of configured memory.
+  the top of usable RAM, below the reserved high device aperture.
 * The required guest-resident +firmware/bios.bin+ selects an ID-named folder disk under
   +disks/+ through a supervisor firmware service, validates its metadata, and
   loads its prebuilt boot image without compiling source. Explicit source
@@ -590,6 +590,8 @@ Checklist status: [x] completed; [ ] planned.
     side-effect-free rejection, display-mode-independent bounds, and frame reuse.
 *** [ ] Move device registers out of RAM and implement the revised physical
     bus, including supervisor-only access, reserved offsets, and fetch rejection.
+*** [x] Reserve the high device aperture from RAM allocation, images, page
+    tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup
    for ordinary user programs.
 ** [ ] Version executable images and reject stale or unversioned runtime

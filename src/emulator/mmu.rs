@@ -7,7 +7,7 @@ pub const PAGE_MASK: u32 = (PAGE_SIZE as u32) - 1;
 pub const PAGE_DIRECTORY_ENTRIES: usize = 512;
 pub const PAGE_TABLE_ENTRIES: usize = 512;
 pub const PAGE_TABLE_BYTES: usize = PAGE_TABLE_ENTRIES * 4;
-pub const ADDRESS_SPACE_SIZE: u32 = 1 << 30;
+pub use crate::machine::ADDRESS_SPACE_SIZE;
 pub const PTE_PRESENT: u32 = 1;
 pub const PTE_WRITABLE: u32 = 1 << 1;
 pub const PTE_USER: u32 = 1 << 2;
@@ -85,7 +85,7 @@ impl PageMemoryManager {
             self.allocator.free(frame)?;
             return Err(PageTableError::OutOfMemoryRange);
         };
-        if end > memory.len() {
+        if end > crate::machine::usable_ram_size(memory.len()) {
             self.allocator.free(frame)?;
             return Err(PageTableError::OutOfMemoryRange);
         }
@@ -189,7 +189,7 @@ impl PageMemoryManager {
             self.allocator.free(frame)?;
             return Err(PageTableError::OutOfMemoryRange);
         };
-        if end > memory.len() {
+        if end > crate::machine::usable_ram_size(memory.len()) {
             self.allocator.free(frame)?;
             return Err(PageTableError::OutOfMemoryRange);
         }
@@ -290,7 +290,7 @@ impl PageMemoryManager {
             .checked_add(length)
             .filter(|end| *end <= ADDRESS_SPACE_SIZE)
             .ok_or(PageTableError::InvalidVirtualAddress)?;
-        if end as usize > memory.len() {
+        if end as usize > crate::machine::usable_ram_size(memory.len()) {
             return Err(PageTableError::OutOfMemoryRange);
         }
         let first_page = start & !PAGE_MASK;
@@ -332,7 +332,7 @@ impl FrameAllocator {
         if memory_size == 0 || memory_size > ADDRESS_SPACE_SIZE as usize {
             return Err(PageTableError::InvalidPhysicalFrame);
         }
-        let frame_count = memory_size.div_ceil(PAGE_SIZE);
+        let frame_count = crate::machine::usable_ram_size(memory_size).div_ceil(PAGE_SIZE);
         let reserved_frames = reserved_bytes.div_ceil(PAGE_SIZE).min(frame_count);
         let mut allocated = vec![false; frame_count];
         allocated[..reserved_frames].fill(true);
@@ -499,7 +499,7 @@ pub fn translate(
 
     let physical_address =
         (((table_entry & PTE_FRAME_MASK) >> 12) * PAGE_SIZE as u32) | (virtual_address & PAGE_MASK);
-    if physical_address as usize >= memory.len() {
+    if physical_address as usize >= crate::machine::usable_ram_size(memory.len()) {
         return Err(fail(PageFaultReason::PhysicalOutOfRange));
     }
     Ok(physical_address)
@@ -512,7 +512,7 @@ pub fn address_space_physical_frames(
     if directory & 0x7ff != 0
         || directory
             .checked_add(PAGE_TABLE_BYTES as u32)
-            .is_none_or(|end| end as usize > memory.len())
+            .is_none_or(|end| end as usize > crate::machine::usable_ram_size(memory.len()))
     {
         return Err(PageTableError::InvalidAddressSpace);
     }
@@ -543,7 +543,11 @@ pub fn address_space_physical_frames(
             })
             .map_err(|_| PageTableError::MalformedEntry)?;
             if table_entry & PTE_PRESENT != 0 {
-                frames.insert((table_entry & PTE_FRAME_MASK) >> 12);
+                let frame = (table_entry & PTE_FRAME_MASK) >> 12;
+                if frame as usize * PAGE_SIZE >= crate::machine::usable_ram_size(memory.len()) {
+                    return Err(PageTableError::InvalidPhysicalFrame);
+                }
+                frames.insert(frame);
             }
         }
     }
@@ -563,14 +567,14 @@ pub fn map_page(
     if directory & 0x7ff != 0
         || directory
             .checked_add(PAGE_TABLE_BYTES as u32)
-            .is_none_or(|end| end as usize > memory.len())
+            .is_none_or(|end| end as usize > crate::machine::usable_ram_size(memory.len()))
     {
         return Err(PageTableError::InvalidAddressSpace);
     }
     if virtual_address >= ADDRESS_SPACE_SIZE || virtual_address & PAGE_MASK != 0 {
         return Err(PageTableError::InvalidVirtualAddress);
     }
-    if physical_frame >= memory.len().div_ceil(PAGE_SIZE) as u32 || physical_frame >= 1 << 18 {
+    if physical_frame >= crate::machine::usable_ram_size(memory.len()).div_ceil(PAGE_SIZE) as u32 {
         return Err(PageTableError::InvalidPhysicalFrame);
     }
     let directory_index = ((virtual_address >> 21) & 0x1ff) as usize;
@@ -589,7 +593,7 @@ pub fn map_page(
             allocator.free(frame)?;
             return Err(PageTableError::InvalidAddressSpace);
         };
-        if table_end > memory.len() {
+        if table_end > crate::machine::usable_ram_size(memory.len()) {
             allocator.free(frame)?;
             return Err(PageTableError::InvalidAddressSpace);
         }
@@ -647,6 +651,9 @@ pub fn set_page_permissions(
         return Err(PageTableError::NotMapped);
     }
     let frame = (page_entry & PTE_FRAME_MASK) >> 12;
+    if frame as usize * PAGE_SIZE >= crate::machine::usable_ram_size(memory.len()) {
+        return Err(PageTableError::InvalidPhysicalFrame);
+    }
     let updated = encode_entry(frame, permissions).ok_or(PageTableError::InvalidPhysicalFrame)?;
     write_entry(memory, table_base, table_index, updated)
 }
@@ -703,7 +710,11 @@ fn read_entry(memory: &[u8], base: u32, index: usize) -> Option<u32> {
     let address = usize::try_from(base)
         .ok()?
         .checked_add(index.checked_mul(4)?)?;
-    let bytes = memory.get(address..address.checked_add(4)?)?;
+    let end = address.checked_add(4)?;
+    if end > crate::machine::usable_ram_size(memory.len()) {
+        return None;
+    }
+    let bytes = memory.get(address..end)?;
     Some(u32::from_be_bytes(bytes.try_into().ok()?))
 }
 
@@ -723,7 +734,7 @@ fn write_entry(
         .ok_or(PageTableError::InvalidAddressSpace)?;
     let end = address
         .checked_add(4)
-        .filter(|end| *end <= memory.len())
+        .filter(|end| *end <= crate::machine::usable_ram_size(memory.len()))
         .ok_or(PageTableError::InvalidAddressSpace)?;
     memory[address..end].copy_from_slice(&value.to_be_bytes());
     Ok(())
@@ -743,6 +754,119 @@ fn validate_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_allocator_never_allocates_the_high_device_aperture() {
+        let mut allocator = FrameAllocator::new(ADDRESS_SPACE_SIZE as usize, 0).unwrap();
+        let ram_frames = crate::machine::DEVICE_APERTURE_START as usize / PAGE_SIZE;
+        assert_eq!(allocator.total_frames(), ram_frames);
+        for expected in 0..ram_frames {
+            assert_eq!(allocator.allocate().unwrap(), expected as u32);
+        }
+        assert_eq!(allocator.allocate(), Err(PageTableError::OutOfFrames));
+        allocator.free(ram_frames as u32 - 1).unwrap();
+        assert_eq!(allocator.allocate().unwrap(), ram_frames as u32 - 1);
+        assert_eq!(
+            allocator.free(ram_frames as u32),
+            Err(PageTableError::InvalidPhysicalFrame)
+        );
+    }
+
+    #[test]
+    fn high_aperture_is_never_page_table_storage_or_ram_mapping() {
+        let mut memory = memmap2::MmapMut::map_anon(ADDRESS_SPACE_SIZE as usize).unwrap();
+        let aperture = crate::machine::DEVICE_APERTURE_START;
+        let mut manager = PageMemoryManager::new(memory.len(), 0x4000).unwrap();
+        let root = manager.create_address_space(&mut memory).unwrap();
+        assert_eq!(
+            manager.map_borrowed_page(
+                &mut memory,
+                root,
+                0,
+                aperture / PAGE_SIZE as u32,
+                PagePermissions::USER_DATA
+            ),
+            Err(PageTableError::InvalidPhysicalFrame)
+        );
+        assert_eq!(
+            manager.adopt_address_space(&memory, aperture),
+            Err(PageTableError::InvalidAddressSpace)
+        );
+        assert_eq!(
+            manager.identity_map_range(
+                &mut memory,
+                root,
+                aperture - PAGE_SIZE as u32,
+                PAGE_SIZE as u32 * 2,
+                PagePermissions::KERNEL_DATA
+            ),
+            Err(PageTableError::OutOfMemoryRange)
+        );
+        assert_eq!(
+            translate(
+                &memory,
+                root,
+                aperture - PAGE_SIZE as u32,
+                MemoryAccess::Read,
+                false
+            )
+            .unwrap_err()
+            .reason,
+            PageFaultReason::NotPresent
+        );
+
+        write_entry(
+            &mut memory,
+            0,
+            encode_entry(2, PagePermissions::USER_CODE).unwrap(),
+        );
+        write_entry(
+            &mut memory,
+            0x2000,
+            encode_entry(aperture / PAGE_SIZE as u32, PagePermissions::USER_CODE).unwrap(),
+        );
+        for user in [false, true] {
+            for access in [MemoryAccess::Read, MemoryAccess::Fetch] {
+                assert_eq!(
+                    translate(&memory, 0, 0, access, user).unwrap_err().reason,
+                    PageFaultReason::PhysicalOutOfRange
+                );
+            }
+        }
+        assert_eq!(
+            address_space_physical_frames(&memory, 0),
+            Err(PageTableError::InvalidPhysicalFrame)
+        );
+        assert_eq!(
+            set_page_permissions(&mut memory, 0, 0, PagePermissions::USER_DATA),
+            Err(PageTableError::InvalidPhysicalFrame)
+        );
+        write_entry(
+            &mut memory,
+            0,
+            encode_entry(aperture / PAGE_SIZE as u32, PagePermissions::USER_CODE).unwrap(),
+        );
+        assert_eq!(
+            translate(&memory, 0, 0, MemoryAccess::Read, false)
+                .unwrap_err()
+                .reason,
+            PageFaultReason::PhysicalOutOfRange
+        );
+        assert_eq!(
+            translate(&memory, aperture, 0, MemoryAccess::Read, false)
+                .unwrap_err()
+                .reason,
+            PageFaultReason::PhysicalOutOfRange
+        );
+        assert_eq!(
+            set_page_permissions(&mut memory, aperture, 0, PagePermissions::KERNEL_DATA),
+            Err(PageTableError::InvalidAddressSpace)
+        );
+        assert_eq!(
+            unmap_page(&mut memory, aperture, 0),
+            Err(PageTableError::InvalidAddressSpace)
+        );
+    }
 
     fn write_entry(memory: &mut [u8], address: usize, value: u32) {
         memory[address..address + 4].copy_from_slice(&value.to_be_bytes());

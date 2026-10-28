@@ -21,6 +21,8 @@ pub mod image;
 pub mod interrupts;
 #[path = "emulator/isa.rs"]
 pub mod isa;
+#[path = "emulator/machine.rs"]
+pub mod machine;
 #[path = "emulator/mmu.rs"]
 pub mod mmu;
 #[path = "emulator/net.rs"]

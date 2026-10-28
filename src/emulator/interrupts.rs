@@ -39,7 +39,7 @@ pub enum IdtError {
 
 impl IdtDescriptor {
     pub fn encode(self) -> Result<[u8; IDT_ENTRY_BYTES], IdtError> {
-        if self.handler >= 1 << 30 || self.privilege > 3 {
+        if self.handler >= crate::machine::ADDRESS_SPACE_SIZE || self.privilege > 3 {
             return Err(IdtError::InvalidHandler);
         }
         let mut descriptor = [0; IDT_ENTRY_BYTES];
@@ -63,7 +63,7 @@ impl IdtDescriptor {
                 .try_into()
                 .map_err(|_| IdtError::MalformedDescriptor)?,
         );
-        if handler >= 1 << 30 {
+        if handler >= crate::machine::ADDRESS_SPACE_SIZE {
             return Err(IdtError::InvalidHandler);
         }
         if attributes & PRESENT == 0 {
@@ -91,7 +91,7 @@ pub fn descriptor_address(base: u32, vector: u16, memory_size: usize) -> Result<
     }
     let start = usize::try_from(base).map_err(|_| IdtError::InvalidBase)?;
     let end = start.checked_add(IDT_BYTES).ok_or(IdtError::InvalidBase)?;
-    if end > memory_size {
+    if end > crate::machine::usable_ram_size(memory_size) {
         return Err(IdtError::InvalidBase);
     }
     Ok(start + usize::from(vector) * IDT_ENTRY_BYTES)
