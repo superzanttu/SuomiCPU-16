@@ -2,6 +2,8 @@
 #define SC16_SYSCALL_H
 
 #define SC16_SYSCALL_ABI_VERSION 1
+#define SC16_MAX_ARGUMENTS 16
+#define SC16_MAX_ARGUMENT_BYTES 1024
 
 #define SC16_PROT_READ 1
 #define SC16_PROT_WRITE 2
@@ -23,6 +25,10 @@ void sc16_exit(int status);
 int sc16_yield(void);
 long sc16_spawn(const char *path);
 long sc16_spawn_arg(const char *path, unsigned long argument);
+long sc16_spawn_exec(const char *path, const char *arguments,
+                     unsigned int length, unsigned int count);
+int sc16_argument_count(void);
+int sc16_argument(unsigned int index, char *buffer, unsigned int capacity);
 long sc16_startup_argument(void);
 long sc16_monotonic_ms(void);
 int sc16_process_info(unsigned int index, char *buffer, unsigned int capacity);

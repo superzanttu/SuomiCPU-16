@@ -767,19 +767,8 @@ impl Cpu {
         let disk_id = disk.manifest().id.clone();
         let disk_label = disk.manifest().label.clone();
         let boot = disk.load_boot_image()?;
-        for segment in &boot.image.segments {
-            let start = usize::try_from(segment.address)
-                .map_err(|_| "boot image segment address exceeds host memory".to_owned())?;
-            let end = start
-                .checked_add(segment.data.len())
-                .ok_or_else(|| "boot image segment range overflow".to_owned())?;
-            if end > self.memory.len() {
-                return Err("boot image segment exceeds configured memory".to_owned());
-            }
-        }
-        if boot.image.entry_point as usize >= self.memory.len() {
-            return Err("boot image entry point exceeds configured memory".to_owned());
-        }
+        self.validate_program(&boot.image.segments, boot.image.entry_point)
+            .map_err(|error| format!("cannot load selected firmware disk: {error}"))?;
         self.prepare_image_entry();
         self.load_program(&boot.image.segments, boot.image.entry_point)
             .map_err(|error| format!("cannot load selected firmware disk: {error}"))?;
@@ -968,12 +957,14 @@ impl Cpu {
         Ok(())
     }
 
-    pub fn load_program<S: LoadableSegment>(
-        &mut self,
+    pub fn validate_program<S: LoadableSegment>(
+        &self,
         segments: &[S],
         entry_point: u32,
     ) -> Result<(), CpuError> {
-        let mut loaded_image_segments = Vec::new();
+        if entry_point as usize >= self.memory.len() {
+            return Err(CpuError::InvalidEntryPoint(entry_point));
+        }
         for segment in segments {
             let address = segment.address();
             let data = segment.data();
@@ -990,18 +981,31 @@ impl Cpu {
                     length: data.len(),
                 });
             }
-            self.memory[start..end].copy_from_slice(data);
+        }
+        Ok(())
+    }
+
+    pub fn load_program<S: LoadableSegment>(
+        &mut self,
+        segments: &[S],
+        entry_point: u32,
+    ) -> Result<(), CpuError> {
+        self.validate_program(segments, entry_point)?;
+        let mut loaded_image_segments = Vec::new();
+        for segment in segments {
             if let Some((alignment, permissions)) = segment.image_metadata() {
                 loaded_image_segments.push(LoadedSegmentMetadata {
-                    address,
-                    length: data.len(),
+                    address: segment.address(),
+                    length: segment.data().len(),
                     alignment,
                     permissions,
                 });
             }
         }
-        if entry_point as usize >= self.memory.len() {
-            return Err(CpuError::InvalidEntryPoint(entry_point));
+        for segment in segments {
+            let start = segment.address() as usize;
+            let end = start + segment.data().len();
+            self.memory[start..end].copy_from_slice(segment.data());
         }
         self.pc = entry_point;
         self.loaded_image_segments = loaded_image_segments;
@@ -1864,6 +1868,9 @@ impl Cpu {
                     .folder_disk
                     .as_ref()
                     .map_or_else(|| "init".to_owned(), |disk| disk.manifest().id.clone());
+                if record.arguments.is_empty() {
+                    record.arguments.push(record.name.clone());
+                }
             }
         }
 
@@ -1890,8 +1897,14 @@ impl Cpu {
                 Ok(SyscallNumber::Read) => self.syscall_read(task_id),
                 Ok(SyscallNumber::Write) => self.syscall_write(task_id),
                 Ok(SyscallNumber::Close) => self.syscall_close(task_id),
-                Ok(SyscallNumber::Spawn) => self.syscall_spawn(task_id),
-                Ok(SyscallNumber::SpawnArgument) => self.syscall_spawn(task_id),
+                Ok(
+                    SyscallNumber::Spawn | SyscallNumber::SpawnArgument | SyscallNumber::SpawnExec,
+                ) => self.syscall_spawn(task_id),
+                Ok(SyscallNumber::ArgumentCount) => task_id
+                    .and_then(|id| self.syscall_state.processes.get(&id))
+                    .map(|record| record.arguments.len() as i64)
+                    .unwrap_or(crate::syscall::error::INVALID),
+                Ok(SyscallNumber::Argument) => self.syscall_argument(task_id),
                 Ok(SyscallNumber::Mmap) => self.syscall_mmap(task_id),
                 Ok(SyscallNumber::Sleep) => self.syscall_sleep(task_id, &mut scheduled_state),
                 Ok(SyscallNumber::SleepMillis) => {
@@ -2526,6 +2539,45 @@ impl Cpu {
         Ok(())
     }
 
+    fn syscall_argument(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(record) = task_id.and_then(|id| self.syscall_state.processes.get(&id)) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Ok(index) = usize::try_from(self.registers[1]) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Some(argument) = record.arguments.get(index) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Ok(capacity) = usize::try_from(self.registers[3]) else {
+            return crate::syscall::error::INVALID;
+        };
+        if capacity > crate::syscall::MAX_TRANSFER_BYTES {
+            return crate::syscall::error::INVALID;
+        }
+        if capacity <= argument.len() {
+            return crate::syscall::error::OVERFLOW;
+        }
+        let Ok(destination) = u32::try_from(self.registers[2]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let bytes: Vec<u8> = argument.bytes().chain(std::iter::once(0)).collect();
+        let addresses = match self.guest_memory_addresses(
+            destination,
+            bytes.len(),
+            crate::mmu::MemoryAccess::Write,
+            true,
+        ) {
+            Ok(addresses) => addresses,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let length = bytes.len() - 1;
+        for (address, byte) in addresses.into_iter().zip(bytes) {
+            self.memory[address] = byte;
+        }
+        length as i64
+    }
+
     fn syscall_spawn(&mut self, parent: Option<TaskId>) -> i64 {
         let argument = if self.registers[0] == SyscallNumber::SpawnArgument as i64 {
             match u32::try_from(self.registers[2]) {
@@ -2549,6 +2601,43 @@ impl Cpu {
             Ok(Some(path)) => path,
             Ok(None) => return crate::syscall::error::INVALID,
             Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let arguments = if self.registers[0] == SyscallNumber::SpawnExec as i64 {
+            let Ok(length) = usize::try_from(self.registers[3]) else {
+                return crate::syscall::error::INVALID;
+            };
+            let Ok(count) = usize::try_from(self.registers[4]) else {
+                return crate::syscall::error::INVALID;
+            };
+            if length == 0
+                || length > crate::syscall::MAX_ARGUMENT_BYTES
+                || count == 0
+                || count > crate::syscall::MAX_ARGUMENTS
+            {
+                return crate::syscall::error::INVALID;
+            }
+            let Ok(address) = u32::try_from(self.registers[2]) else {
+                return crate::syscall::error::BAD_ADDRESS;
+            };
+            let addresses = match self.guest_memory_addresses(
+                address,
+                length,
+                crate::mmu::MemoryAccess::Read,
+                true,
+            ) {
+                Ok(addresses) => addresses,
+                Err(_) => return crate::syscall::error::BAD_ADDRESS,
+            };
+            let bytes: Vec<u8> = addresses
+                .into_iter()
+                .map(|address| self.memory[address])
+                .collect();
+            match crate::syscall::decode_arguments(&bytes, count) {
+                Ok(arguments) => arguments,
+                Err(error) => return error,
+            }
+        } else {
+            vec![path.clone()]
         };
         let Some(disk) = self.folder_disk.as_ref() else {
             return crate::syscall::error::IO;
@@ -2817,6 +2906,7 @@ impl Cpu {
             .get_mut(&id)
             .expect("registered child");
         record.startup_argument = argument;
+        record.arguments = arguments;
         record.name = path;
         i64::from(id)
     }
@@ -5979,6 +6069,49 @@ mod tests {
         cpu
     }
 
+    #[test]
+    fn rejected_program_load_preserves_memory_and_running_image() {
+        let initial = crate::assembler::assemble("LDI R0, 42\nHALT", 0x100).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&initial.segments, initial.entry_point)
+            .unwrap();
+        cpu.registers[3] = 0x1234;
+        cpu.sp = 0x7000;
+        let memory = cpu.memory.to_vec();
+        let metadata = cpu.loaded_image_segments.clone();
+        let logs = cpu.debug_console.output().to_vec();
+        for (segments, entry, expected) in [
+            (
+                vec![
+                    crate::image::ImageSegment::new(0x100, vec![0xaa; 4]),
+                    crate::image::ImageSegment::new(0xffff, vec![0xbb; 2]),
+                ],
+                0x100,
+                CpuError::SegmentOutOfBounds {
+                    address: 0xffff,
+                    length: 2,
+                },
+            ),
+            (
+                vec![crate::image::ImageSegment::new(0x100, vec![0xaa; 4])],
+                0x10000,
+                CpuError::InvalidEntryPoint(0x10000),
+            ),
+        ] {
+            assert_eq!(cpu.load_program(&segments, entry), Err(expected));
+            assert_eq!(&cpu.memory[..], memory);
+            assert_eq!(cpu.loaded_image_segments, metadata);
+            assert_eq!(cpu.debug_console.output(), logs);
+            assert_eq!(cpu.pc, 0x100);
+            assert_eq!(cpu.sp, 0x7000);
+            assert_eq!(cpu.registers[3], 0x1234);
+            assert!(cpu.running);
+        }
+        cpu.run(2).unwrap();
+        assert_eq!(cpu.registers[0], 42);
+        assert!(!cpu.running);
+    }
+
     fn install_test_handler(cpu: &mut Cpu, vector: u16, handler: u32, privilege: u8) {
         if cpu.idt_base.is_none() {
             cpu.load_idt(0x800).unwrap();
@@ -6777,6 +6910,15 @@ mod tests {
                           if (sc16_getpid() < 0L) return 8;\n\
                           if (sc16_mmap(4096UL, SC16_PROT_READ, 0) != -13L) return 14;\n\
                           if (sc16_spawn(\"missing\") != -13L) return 12;\n\
+                          if (sc16_spawn_exec(\"missing\", \"app\", 4, 1) != -13L) return 15;\n\
+                          if (sc16_argument_count() != 3) return 16;\n\
+                          { char buffer[32];\n\
+                            if (sc16_argument(1, buffer, sizeof(buffer)) != 10) return 17;\n\
+                            if (buffer[0] != 'a' || buffer[1] != ' ' || buffer[10] != 0) return 18;\n\
+                            if (sc16_argument(2, buffer, sizeof(buffer)) != 0 || buffer[0] != 0) return 19;\n\
+                            if (sc16_argument(3, buffer, sizeof(buffer)) != -22) return 20;\n\
+                            if (sc16_argument(1, buffer, 10) != -75) return 21;\n\
+                          }\n\
                           semaphore = sc16_semop(SC16_SEM_CREATE, 0UL, 1);\n\
                           if (semaphore < 0L) return 10;\n\
                           if (sc16_semop(SC16_SEM_DESTROY, (unsigned long)semaphore, 0) != 0L) return 11;\n\
@@ -6793,10 +6935,52 @@ mod tests {
             .unwrap();
         install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x300, 3);
         let task = cpu.create_user_task(0, 0x70000, 0xf0000, None).unwrap();
+        cpu.syscall_state.register_process(task, None);
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .arguments = vec!["app".to_owned(), "a file.txt".to_owned(), String::new()];
         cpu.start_task(task).unwrap();
 
-        cpu.run(10_000).unwrap();
+        let mut saw_exec = false;
+        for _ in 0..10_000 {
+            if !cpu.running {
+                break;
+            }
+            if cpu.current_task() == Some(task)
+                && cpu.read_u16(cpu.pc) == 0x0080
+                && cpu.registers[0] == SyscallNumber::SpawnExec as i64
+            {
+                assert!(cpu.registers[1] > 0xffff);
+                assert!(cpu.registers[2] > 0xffff);
+                assert_eq!(
+                    cpu.read_guest_path(cpu.registers[1] as u32, true).unwrap(),
+                    Some("missing".to_owned())
+                );
+                let addresses = cpu
+                    .guest_memory_addresses(
+                        cpu.registers[2] as u32,
+                        4,
+                        crate::mmu::MemoryAccess::Read,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    addresses
+                        .into_iter()
+                        .map(|address| cpu.memory[address])
+                        .collect::<Vec<_>>(),
+                    b"app\0"
+                );
+                assert_eq!(cpu.registers[3], 4);
+                assert_eq!(cpu.registers[4], 1);
+                saw_exec = true;
+            }
+            cpu.run(1).unwrap();
+        }
 
+        assert!(saw_exec, "compiled program did not invoke spawn_exec");
         assert!(!cpu.running, "compiled syscall program did not terminate");
         assert_eq!(cpu.registers[0], 0);
         assert!(
@@ -6991,9 +7175,48 @@ mod tests {
 
     #[test]
     fn syscall_spawn_creates_isolated_task_and_mmap_allocates_user_pages() {
+        check_spawn_and_mmap(false);
+    }
+
+    #[test]
+    fn syscall_spawn_exec_copies_arguments_into_isolated_child() {
+        check_spawn_and_mmap(true);
+    }
+
+    fn check_spawn_and_mmap(with_arguments: bool) {
         let disk_root = folder_disk_for_test("syscall-spawn", false);
-        let child_source = "LDI R0, 4\nLDI R1, 4096\nLDI R2, 3\nLDI R3, 0\nLDI R7, 1\nSVC\nHALT";
-        let child_assembly = crate::assembler::assemble(child_source, 0x1000).unwrap();
+        let child_assembly = if with_arguments {
+            let source = disk_root.join("child.c");
+            std::fs::write(
+                &source,
+                "#include <sc16_syscall.h>\n\
+                int main(void) {\n\
+                    char buffer[32];\n\
+                    if (sc16_argument_count() != 3) return 1;\n\
+                    if (sc16_argument(0, buffer, sizeof(buffer)) != 5) return 2;\n\
+                    if (buffer[0] != 'c' || buffer[5] != 0) return 3;\n\
+                    if (sc16_argument(1, (char *)0x3f000000UL, 32) != -14) return 4;\n\
+                    buffer[0] = 'z';\n\
+                    if (sc16_argument(1, buffer, 10) != -75 || buffer[0] != 'z') return 5;\n\
+                    if (sc16_argument(1, buffer, 11) != 10) return 6;\n\
+                    if (sc16_write(1, buffer, 10) != 10 || buffer[10] != 0) return 7;\n\
+                    if (sc16_argument(2, buffer, 1) != 0 || buffer[0] != 0) return 8;\n\
+                    if (sc16_argument(3, buffer, 32) != -22) return 9;\n\
+                    if (sc16_mmap(4096UL, 3, 0) != 0x20000000L) return 10;\n\
+                    return 0;\n\
+                }",
+            )
+            .unwrap();
+            let image = crate::image::build_c_program_at(&source, 0x10000).unwrap();
+            std::fs::remove_file(source).unwrap();
+            image
+        } else {
+            crate::assembler::assemble(
+                "LDI R0, 4\nLDI R1, 4096\nLDI R2, 3\nLDI R3, 0\nLDI R7, 1\nSVC\nHALT",
+                0x1000,
+            )
+            .unwrap()
+        };
         let child_image = crate::image::ProgramImage {
             entry_point: child_assembly.entry_point,
             segments: child_assembly
@@ -7007,7 +7230,7 @@ mod tests {
         crate::image::write_image(&disk_root.join("child.img"), &child_image).unwrap();
 
         let parent_assembly =
-            crate::assembler::assemble("SVC\nSVC\nSVC\nSVC\nHALT", 0x100).unwrap();
+            crate::assembler::assemble(&("SVC\n".repeat(16) + "HALT"), 0x100).unwrap();
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.load_program(&parent_assembly.segments, parent_assembly.entry_point)
             .unwrap();
@@ -7062,8 +7285,9 @@ mod tests {
                 crate::mmu::PagePermissions::KERNEL_DATA,
             )
             .unwrap();
-        cpu.memory[0x40_000 + 0x100..0x40_000 + 0x10a]
-            .copy_from_slice(&parent_assembly.segments[0].data[0..10]);
+        let parent_data = &parent_assembly.segments[0].data;
+        cpu.memory[0x40_000 + 0x100..0x40_000 + 0x100 + parent_data.len()]
+            .copy_from_slice(parent_data);
         cpu.memory[0x41_000..0x41_00a].copy_from_slice(b"child.img\0");
         cpu.load_idt(0x800).unwrap();
         install_test_handler(&mut cpu, crate::isa::SVC_VECTOR, 0x3000, 3);
@@ -7074,13 +7298,62 @@ mod tests {
             .create_user_task(0x100, 0x8000, 0x000f_ffff, Some(parent_root))
             .unwrap();
         cpu.start_task(parent).unwrap();
-        cpu.registers[0] = SyscallNumber::Spawn as i64;
+        let arguments = b"child\0a file.txt\0\0";
+        if with_arguments {
+            cpu.memory[0x41_100..0x41_100 + arguments.len()].copy_from_slice(arguments);
+            for (address, length, count, expected) in [
+                (
+                    0x2100,
+                    arguments.len() as i64,
+                    17,
+                    crate::syscall::error::INVALID,
+                ),
+                (0x2100, 1025, 3, crate::syscall::error::INVALID),
+                (
+                    0x9000,
+                    arguments.len() as i64,
+                    3,
+                    crate::syscall::error::BAD_ADDRESS,
+                ),
+                (
+                    0x2100,
+                    arguments.len() as i64 - 1,
+                    3,
+                    crate::syscall::error::INVALID,
+                ),
+            ] {
+                invoke_syscall(
+                    &mut cpu,
+                    SyscallNumber::SpawnExec,
+                    [0x2000, address, length, count, 0, 0],
+                );
+                assert_eq!(cpu.registers[0], expected);
+                assert_eq!(cpu.scheduler.tasks().len(), 1);
+                assert!(cpu.syscall_state.processes[&parent].children.is_empty());
+            }
+        }
+        cpu.registers[0] = if with_arguments {
+            SyscallNumber::SpawnExec
+        } else {
+            SyscallNumber::Spawn
+        } as i64;
         cpu.registers[1] = 0x2000;
+        cpu.registers[2] = 0x2100;
+        cpu.registers[3] = arguments.len() as i64;
+        cpu.registers[4] = 3;
         cpu.registers[7] = crate::syscall::ABI_VERSION;
 
         cpu.step().unwrap();
         let child = cpu.registers[0] as u32;
         assert_ne!(child, parent);
+        assert_eq!(
+            cpu.syscall_state.processes[&child].arguments,
+            if with_arguments {
+                vec!["child".to_owned(), "a file.txt".to_owned(), String::new()]
+            } else {
+                vec!["child.img".to_owned()]
+            },
+        );
         let child_context = cpu.task_context(child).unwrap();
         assert!(child_context.mmu_enabled);
         assert_ne!(child_context.page_directory, parent_root);
@@ -7104,8 +7377,18 @@ mod tests {
 
         invoke_syscall(&mut cpu, SyscallNumber::Yield, [0; 6]);
         assert_eq!(cpu.current_task(), Some(child));
-        cpu.run(20).unwrap();
-        assert_eq!(cpu.registers[0], 0x2000_0000);
+        if with_arguments {
+            cpu.memory[0x41_100..0x41_100 + arguments.len()].fill(b'x');
+        }
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            cpu.registers[0],
+            if with_arguments { 0 } else { 0x2000_0000 }
+        );
+        if with_arguments {
+            assert!(cpu.console.output().ends_with(b"a file.txt"));
+        }
         assert!(
             crate::mmu::translate(
                 &cpu.memory,

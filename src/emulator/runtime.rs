@@ -1199,6 +1199,12 @@ fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
             .log_error("emulator", &format!("Loading {name} failed: {error}"));
         error
     })?;
+    cpu.validate_program(&image.segments, image.entry_point)
+        .map_err(|error| {
+            cpu.debug_console
+                .log_error("emulator", &format!("Loading {name} failed: {error}"));
+            RuntimeError::Window(error.to_string())
+        })?;
     cpu.prepare_image_entry();
     cpu.load_program(&image.segments, image.entry_point)
         .map_err(|error| {
@@ -1247,6 +1253,11 @@ fn boot_folder_disk(cpu: &mut Cpu, disk_path: &Path) -> Result<FolderBootMode, R
             boot.image.segments.len(),
         ),
     );
+    cpu.validate_program(&boot.image.segments, boot.image.entry_point)
+        .map_err(|error| {
+            cpu.debug_console.log_error("bios", &error.to_string());
+            RuntimeError::Window(error.to_string())
+        })?;
     cpu.prepare_image_entry();
     cpu.load_program(&boot.image.segments, boot.image.entry_point)
         .map_err(|error| {
@@ -3365,6 +3376,34 @@ mod tests {
         fs::write(disk.join("main.bin"), b"not an SC16 image").unwrap();
         assert!(boot_target(&mut cpu, &target).is_err());
         assert_eq!(cpu.pc, 0x80);
+        crate::image::write_image(&disk.join("main.bin"), &image).unwrap();
+        let oversized_image = crate::assembler::assemble("HALT", 0x200000).unwrap();
+        crate::image::write_image(&disk.join("main.bin"), &oversized_image).unwrap();
+        cpu.registers[3] = 1234;
+        cpu.sp = 0x6000;
+        cpu.enable_mmu(0x9000).unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
+        let memory = cpu.memory.to_vec();
+        assert!(boot_target(&mut cpu, &target).is_err());
+        assert_eq!(&cpu.memory[..], memory);
+        assert_eq!(cpu.pc, 0x80);
+        assert_eq!(cpu.sp, 0x6000);
+        assert_eq!(cpu.registers[3], 1234);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert!(cpu.is_mmu_enabled());
+        assert_eq!(cpu.page_directory(), 0x9000);
+        let direct_target = BootTarget {
+            source: disk.join("main.bin"),
+            folder_disk: false,
+        };
+        assert!(boot_target(&mut cpu, &direct_target).is_err());
+        assert_eq!(&cpu.memory[..], memory);
+        assert_eq!(cpu.pc, 0x80);
+        assert_eq!(cpu.sp, 0x6000);
+        assert_eq!(cpu.registers[3], 1234);
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert!(cpu.is_mmu_enabled());
+        assert_eq!(cpu.page_directory(), 0x9000);
         crate::image::write_image(&disk.join("main.bin"), &image).unwrap();
         boot_target(&mut cpu, &target).unwrap();
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);

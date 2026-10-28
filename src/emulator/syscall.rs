@@ -9,6 +9,8 @@ use crate::scheduler::TaskId;
 
 pub const ABI_VERSION: i64 = 1;
 pub const MAX_TRANSFER_BYTES: usize = 4096;
+pub const MAX_ARGUMENTS: usize = 16;
+pub const MAX_ARGUMENT_BYTES: usize = 1024;
 
 pub const REGISTER_NUMBER: usize = 0;
 pub const REGISTER_ARGUMENT_0: usize = 1;
@@ -43,6 +45,9 @@ pub enum SyscallNumber {
     TryWait = 18,
     SleepMillis = 19,
     ProcessStatus = 20,
+    SpawnExec = 21,
+    ArgumentCount = 22,
+    Argument = 23,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -71,6 +76,9 @@ impl TryFrom<i64> for SyscallNumber {
             18 => Ok(Self::TryWait),
             19 => Ok(Self::SleepMillis),
             20 => Ok(Self::ProcessStatus),
+            21 => Ok(Self::SpawnExec),
+            22 => Ok(Self::ArgumentCount),
+            23 => Ok(Self::Argument),
             _ => Err(()),
         }
     }
@@ -119,6 +127,7 @@ pub(crate) struct OpenFile {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProcessRecord {
     pub name: String,
+    pub arguments: Vec<String>,
     pub startup_argument: u32,
     pub parent: Option<TaskId>,
     pub children: Vec<TaskId>,
@@ -146,6 +155,24 @@ pub(crate) struct KernelState {
     pub next_semaphore: u32,
     pub pending_results: HashMap<TaskId, i64>,
     pub pending_wait_status: HashMap<TaskId, (TaskId, i32)>,
+}
+
+pub(crate) fn decode_arguments(bytes: &[u8], count: usize) -> Result<Vec<String>, i64> {
+    if count == 0 || count > MAX_ARGUMENTS || bytes.len() > MAX_ARGUMENT_BYTES {
+        return Err(error::INVALID);
+    }
+    let Some(payload) = bytes.strip_suffix(&[0]) else {
+        return Err(error::INVALID);
+    };
+    let arguments = payload
+        .split(|byte| *byte == 0)
+        .map(|argument| std::str::from_utf8(argument).map(str::to_owned))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| error::INVALID)?;
+    if arguments.len() != count || arguments[0].is_empty() {
+        return Err(error::INVALID);
+    }
+    Ok(arguments)
 }
 
 impl KernelState {
@@ -206,7 +233,48 @@ mod tests {
             SyscallNumber::try_from(20),
             Ok(SyscallNumber::ProcessStatus)
         );
-        assert_eq!(SyscallNumber::try_from(21), Err(()));
+        assert_eq!(SyscallNumber::try_from(21), Ok(SyscallNumber::SpawnExec));
+        assert_eq!(
+            SyscallNumber::try_from(22),
+            Ok(SyscallNumber::ArgumentCount)
+        );
+        assert_eq!(SyscallNumber::try_from(23), Ok(SyscallNumber::Argument));
+        assert_eq!(SyscallNumber::try_from(24), Err(()));
+    }
+
+    #[test]
+    fn argument_blocks_preserve_empty_and_quoted_shell_arguments() {
+        assert_eq!(
+            decode_arguments(b"nano\0a file.txt\0\0", 3).unwrap(),
+            ["nano", "a file.txt", ""],
+        );
+        let mut largest = vec![b'x'; MAX_ARGUMENT_BYTES];
+        largest[MAX_ARGUMENT_BYTES - 1] = 0;
+        assert_eq!(decode_arguments(&largest, 1).unwrap()[0].len(), 1023);
+        let mut maximum_count = b"p\0".to_vec();
+        maximum_count.extend_from_slice(&[0; MAX_ARGUMENTS - 1]);
+        assert_eq!(
+            decode_arguments(&maximum_count, MAX_ARGUMENTS)
+                .unwrap()
+                .len(),
+            MAX_ARGUMENTS
+        );
+    }
+
+    #[test]
+    fn malformed_argument_blocks_are_rejected() {
+        for (bytes, count) in [
+            (b"".as_slice(), 0),
+            (b"\0", 1),
+            (b"p", 1),
+            (b"p\0extra\0", 1),
+            (b"p\0", 2),
+            (b"p\0\xff\0", 2),
+            (b"p\0", MAX_ARGUMENTS + 1),
+            (vec![0; MAX_ARGUMENT_BYTES + 1].as_slice(), 1),
+        ] {
+            assert_eq!(decode_arguments(bytes, count), Err(error::INVALID));
+        }
     }
 
     #[test]

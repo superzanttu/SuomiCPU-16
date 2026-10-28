@@ -597,8 +597,13 @@ fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
 fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Expression]) -> bool {
     match function {
         "sc16_spawn" | "sc16_spawn_arg" | "sc16_open" | "__stdio_mode_flags" => index == 0,
+        "sc16_spawn_exec" => matches!(index, 0 | 1),
         "sc16_mmap" => index == 2,
-        "sc16_read" | "sc16_write" | "sc16_process_info" | "sc16_process_status" => index == 1,
+        "sc16_read"
+        | "sc16_write"
+        | "sc16_process_info"
+        | "sc16_process_status"
+        | "sc16_argument" => index == 1,
         "sc16_net_discover" => index == 0,
         "sc16_net_send" | "sc16_net_receive" => matches!(index, 0 | 1),
         "gfx_sprite" | "gfx_bitmap" => index == 4,

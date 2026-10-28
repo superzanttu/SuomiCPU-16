@@ -75,6 +75,12 @@ reference is a build error. Current C builds are single translation units;
 multi-translation-unit linkage remains tracked separately in the C90 roadmap.
 `SC16IMG1` is intentionally rejected; no v1 reader compatibility is provided.
 
+CPU loading validates every segment and the entry point against configured RAM
+before copying any segment. Direct and folder-disk launch, including BIOS
+selection, perform that check before preparing image-entry state. Rejected
+bounds therefore preserve RAM, registers, privilege, MMU state, and loaded-image
+metadata; launch diagnostics may still be appended to the debug log.
+
 Image permissions describe the intended mapping. The current loader preserves
 them. The MMU enforces present, writable, user, and executable permissions
 when a supervisor enables translation and installs mappings. Existing
@@ -373,7 +379,27 @@ which the native wrappers combine before `SVC`.
   Whitespace/control characters in names are replaced by +?+.
   Each row reflects its query instant; this is not a utilization measurement
   or an atomic snapshot. Syscall 14 retains its original row format.
+|21 |`spawn_exec` |R1 executable path, R2 readable argument block, R3 block
+  byte length, R4 argument count. Returns child task ID. The block contains
+  exactly 1-16 null-terminated UTF-8 strings, at most 1024 bytes including
+  terminators; argument zero must be nonempty. Empty later arguments are
+  preserved. All bytes are validated and copied before a child is created.
+|22 |`argument_count` |Returns the current process's argument count.
+|23 |`argument` |R1 zero-based argument index, R2 writable buffer, R3 capacity.
+  Copies one argument including its null terminator and returns its byte
+  length excluding that terminator. Invalid indices return `-EINVAL`;
+  insufficient capacity returns `-EOVERFLOW`, never a truncated string.
+  Capacity is limited to 4096 bytes; the entire output range is validated
+  before any bytes are written.
 |===
+
+The original `spawn` and `spawn_arg` supply the executable path as argument
+zero and retain their existing scalar startup behavior. The boot process uses
+its disk ID (or `init` without a disk) as argument zero. Argument contents are
+kernel-owned per-process copies, not aliases into the spawning process's
+address space. `sc16_spawn_exec`, `sc16_argument_count`, and `sc16_argument`
+expose this interface to guest C; the shell remains responsible for tokenizing
+quotes and constructing the argument block.
 
 Every user pointer is range-checked against the active address space before
 use. Paths are ASCII, null-terminated, and limited to 128 bytes; read/write
