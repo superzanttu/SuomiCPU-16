@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "text-demo",
+  "name": "Text Demo",
+  "legacy_disk": "APP00017",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/text_demo.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

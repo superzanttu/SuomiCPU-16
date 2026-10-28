@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "anaclock",
+  "name": "AnaClock",
+  "legacy_disk": "APP00001",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/anaclock.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

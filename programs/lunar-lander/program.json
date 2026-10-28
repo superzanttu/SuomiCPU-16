@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "lunar-lander",
+  "name": "Lunar Lander",
+  "legacy_disk": "APP00008",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/lunarlander.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

@@ -25,7 +25,7 @@ Install Rust and Cargo, then start the emulator with:
 cargo run --bin suomicpu16
 ----
 
-Start SC-16 without arguments to execute the required shared +bios.bin+ and
+Start SC-16 without arguments to execute the required shared +firmware/bios.bin+ and
 show the text-mode BIOS disk selector.
 Use *Up/Down* and *Enter*, or click and double-click, to boot an ID-named
 folder under +disks/+. The mouse wheel scrolls the list. The selected disk
@@ -52,22 +52,45 @@ Detailed stage logs are on by default and show which SC-16 component is
 processing each source file, including compiler, assembler, include, and
 memory-loading stages. Use +--quiet+ to hide these details.
 
-== SisuOS
+== Programs and repository layout
 
-The checked-in +disks/OS000001+ folder is a small protected, preemptive OS
-demonstration. Start the emulator with +--disk OS000001+, then press Enter in
-the BIOS to boot its trusted +kernel.bin+. The kernel enables the MMU and
-instruction timer before starting the user-mode SisuOS shell. The shell
-supports +help+, +list+, +info+, and +run demo+; after the demo exits, control
-returns to the shell. This is a tested example, not a general-purpose OS.
+Guest workloads live in +programs/<slug>/+, each with its own sources, tools,
+and +program.json+ build recipe. The Rust emulator is in +src/emulator/+;
+assembler/compiler implementations are in +src/assembler/+ and
++src/c_compiler/+. Shared tools are in +src/tools/+, guest libraries in
++toolchain/+, and BIOS/fonts in +firmware/+. Educational +examples/+ are
+not installed programs.
 
-To reproduce the disk in a new staging folder without overwriting an existing
-disk:
 [source,powershell]
 ----
-.\scripts\build-preemptive-os.ps1 .\build\OS000001
+.\scripts\build-programs.ps1 sisuos -Install
+.\scripts\build-programs.ps1 -Install
+.\run.ps1 .\disks\sisuos
 ----
-The script builds the kernel and user demo from +examples/+ using +sc16build+,
+
+See link:docs/programs.adoc[Building, installing, and migrating programs] for
+the per-program/all-program commands, manifests, and safe disk updates.
+Program disk names and IDs now match their slugs. Data disks +DISK0001+ and
++DISK0002+ are unchanged.
+
+== SisuOS
+
+The checked-in +disks/sisuos+ folder is a small protected, preemptive OS
+demonstration. Start the emulator with +--disk sisuos+, then press Enter in
+the BIOS to boot its trusted +kernel.bin+. The kernel enables the MMU and
+instruction timer before starting the user-mode SisuOS shell. The shell
+supports +help+, +list+, +info+, +ps+, +run demo+, and +run demo X+.
+The timed form runs a background child for X seconds, printing
++BGP [pid] time [second]/X+ each second while the shell remains responsive.
+This is a tested demonstration, not a general-purpose OS.
+
+To rebuild and install while preserving unrelated writable disk data:
+[source,powershell]
+----
+.\programs\sisuos\tools\build.ps1 -Install
+----
+The script builds the C shell, C demo and assembly bootstrap from
++programs/sisuos/src/+ using +sc16build+,
 packages the folder manifest and protects both executable files. Its output
 is a valid boot disk; the BIOS integration test checks the checked-in images
 against these sources and exercises the shell and preempted demo.
@@ -82,7 +105,7 @@ cargo run --bin suomicpu16 -- example.sc16img
 For five analog clock styles, a Nixie-tube display, and a flip clock, run:
 [source,console]
 ----
-cargo run --bin sc16build -- examples/anaclock.c anaclock.sc16img
+cargo run --bin sc16build -- programs/anaclock/src/anaclock.c anaclock.sc16img
 cargo run -- anaclock.sc16img
 ----
 Press Tab to cycle through the seven clock faces.
@@ -90,21 +113,21 @@ Press Tab to cycle through the seven clock faces.
 For a first-person Elite-style space combat demo, run:
 [source,console]
 ----
-cargo run --bin sc16build -- examples/elitedemo.c elitedemo.sc16img
+cargo run --bin sc16build -- programs/elite/src/elitedemo.c elitedemo.sc16img
 cargo run -- elitedemo.sc16img
 ----
 Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
 Space. The ship accelerates and drifts with inertia; shields regenerate and the
 laser needs time to cool.
 
-Launch *Hertta-3D* directly with +modules/Hertta-3D/hertta3d.c+, or package
+Launch *Hertta-3D* directly with +programs/hertta-3d/src/hertta3d.c+, or package
 it into a folder disk for BIOS boot, for a first-person maze game rendered with the
 SC-GPU. Use W/S to move, A/D to turn, and Space to throw treats toward Hertta;
 feed her enough treats and wait for her to reach you to advance to a harder
 maze. Each visible wall cell is rendered as one outlined surface, and a solid-cell
 minimap shows the connected maze and marks you and Hertta. Hertta wanders through
 the passages and can find a path to you after eating enough treats. Its source is
-link:modules/Hertta-3D/hertta3d.c[+modules/Hertta-3D/hertta3d.c+].
+link:programs/hertta-3d/src/hertta3d.c[+programs/hertta-3d/src/hertta3d.c+].
 
 On Windows, the PowerShell launcher can run the same programs:
 [source,powershell]
@@ -131,14 +154,14 @@ with a Rust compiler diagnostic; C sources are compiled only by Rust.
 Object-like macros, +#undef+, and
 +#if+/+#elif+/+#ifdef+/+#ifndef+ conditional branches are preprocessed.
 Quoted includes search beside the including source; angle-bracket includes
-search the repository +lib+ directory. Function-like macros support argument
+search the repository +toolchain/include/+ directory. Function-like macros support argument
 substitution, stringification, and token pasting; backslash-newline source
 continuations are also supported. Variadic macros are not implemented in Rust
 yet. To compile a C file into a segmented image:
 
 [source,console]
 ----
-cargo run --bin sc16build -- examples/asteroids.c asteroids.sc16img
+cargo run --bin sc16build -- programs/asteroids/src/asteroids.c asteroids.sc16img
 cargo run -- asteroids.sc16img
 ----
 
@@ -156,8 +179,8 @@ rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown
 ----
 
-The browser build is not yet a standalone web release: module discovery and
-module file access still rely on the host filesystem. Rust builds +.asm+
+The browser build is not yet a standalone web release: program discovery and
+program file access still rely on the host filesystem. Rust builds +.asm+
 programs with its native assembler and compiles the documented subset of +.c+
 files directly. Unsupported C programs are rejected.
 
@@ -165,31 +188,30 @@ Run a program with optional persistent data-disk and LAN settings:
 
 [source,console]
 ----
-cargo run -- --disk APP00010 --net-port 47016
-cargo run -- --headless disks\APP00003
+cargo run -- --disk netgame-demo --net-port 47016
+cargo run -- --headless disks\disk-editor
 ----
 
 Build an SC-16 source file into a segmented image using the Rust tools:
 
 [source,console]
 ----
-cargo run --bin sc16build -- build-bios bios.asm bios.bin
+cargo run --bin sc16build -- build-bios
 cargo run --bin sc16build -- examples\commands.asm
 cargo run --bin sc16build -- examples\example.asm example.sc16img
 cargo run --bin sc16build -- input.bin output.sc16img
-cargo run --bin sc16build -- smoke-modules
-cargo run --bin sc16build -- package-modules build\module-disks 67108864
+cargo run --bin sc16build -- build-programs
+cargo run --bin sc16build -- install-programs
 cargo run --bin sc16build -- import-block-disk disks\DISK0001.json build\DISK0001
-.\scripts\build-modules.ps1 build\module-disks-staging
+.\scripts\build-programs.ps1 sisuos -Install
 ----
 
-The checked-in +disks/APP00001+ through +APP00017+ folders are validated
-prebuilt application disks, including Tank-16 runtime assets. The package
-commands refuse to overwrite existing folders; use a new staging directory.
-+scripts\build-modules.ps1+ rebuilds the shared BIOS, smoke-tests bootable
-modules, and packages them into the requested new staging directory. BIOS and
-module builds are offline host tools; the guest BIOS only loads prebuilt disk
-images.
+The checked-in slug-named disks contain 18 prebuilt programs, including SisuOS
+and Tank-16's runtime assets. +build-programs+ writes staging output under
++build/programs/+; +install-programs+ updates package-owned outputs and preserves
+writable disk data, reporting conflicts instead of overwriting local edits.
+BIOS and program builds are offline host tools; the guest BIOS only loads
+prebuilt disk images.
 DiskEditor is a USER-mode text-file editor for the currently mounted folder
 disk. It creates or updates files up to 256 bytes and respects disk read-only
 and protected-file policies.
@@ -204,67 +226,67 @@ The emulator accepts prebuilt +.bin+ or +.sc16img+ files and validated disk
 folders; it does not compile source during launch. +run.ps1+ can accept a C or
 assembly source path and invokes +sc16build+ first to create a temporary
 prebuilt image, then removes that image after the emulator exits. Direct
-source launches through +run.ps1+ use the source module's +disks/+ data folder
+source launches through +run.ps1+ use the source program's +disks/+ data folder
 as a read-only mount. BIOS-booted applications use the selected folder disk
 and its guest filesystem service. Networking uses UDP broadcast on the
 selected port in native builds; browser builds do not provide UDP networking.
 
-// module-gif-gallery:start
-== Module gallery
+// program-gif-gallery:start
+== Program gallery
 
-Each animation captures a module running in the SC-16 emulator.
+Each animation captures a program running in the SC-16 emulator.
 
 [cols="1,1"]
 |===
-|Module
+|Program
 |Animation
 
 |AnaClock
-|image::docs/module-gifs/anaclock.gif[AnaClock running in SC-16,width=320]
+|image::docs/program-gifs/anaclock.gif[AnaClock running in SC-16,width=320]
 
 |Asteroids
-|image::docs/module-gifs/asteroids.gif[Asteroids running in SC-16,width=320]
+|image::docs/program-gifs/asteroids.gif[Asteroids running in SC-16,width=320]
 
 |DiskEditor
-|image::docs/module-gifs/diskeditor.gif[DiskEditor running in SC-16,width=320]
+|image::docs/program-gifs/diskeditor.gif[DiskEditor running in SC-16,width=320]
 
 |Elite
-|image::docs/module-gifs/elite.gif[Elite running in SC-16,width=320]
+|image::docs/program-gifs/elite.gif[Elite running in SC-16,width=320]
 
 |Hulio
-|image::docs/module-gifs/hulio.gif[Hulio running in SC-16,width=320]
+|image::docs/program-gifs/hulio.gif[Hulio running in SC-16,width=320]
 
 |Infinite CIty
-|image::docs/module-gifs/infinite-city.gif[Infinite CIty running in SC-16,width=320]
+|image::docs/program-gifs/infinite-city.gif[Infinite CIty running in SC-16,width=320]
 
 |Lunar Lander
-|image::docs/module-gifs/lunar-lander.gif[Lunar Lander running in SC-16,width=320]
+|image::docs/program-gifs/lunar-lander.gif[Lunar Lander running in SC-16,width=320]
 
 |MotoRobots
-|image::docs/module-gifs/motorobots.gif[MotoRobots running in SC-16,width=320]
+|image::docs/program-gifs/motorobots.gif[MotoRobots running in SC-16,width=320]
 
 |Netgame Demo
-|image::docs/module-gifs/netgame-demo.gif[Netgame Demo running in SC-16,width=320]
+|image::docs/program-gifs/netgame-demo.gif[Netgame Demo running in SC-16,width=320]
 
 |PacMan
-|image::docs/module-gifs/pacman.gif[PacMan running in SC-16,width=320]
+|image::docs/program-gifs/pacman.gif[PacMan running in SC-16,width=320]
 
 |Paint
-|image::docs/module-gifs/paint.gif[Paint running in SC-16,width=320]
+|image::docs/program-gifs/paint.gif[Paint running in SC-16,width=320]
 
 |SC-16 showcase
-|image::docs/module-gifs/sc-16-showcase.gif[SC-16 showcase running in SC-16,width=320]
+|image::docs/program-gifs/sc-16-showcase.gif[SC-16 showcase running in SC-16,width=320]
 
 |Space Invaders
-|image::docs/module-gifs/space-invaders.gif[Space Invaders running in SC-16,width=320]
+|image::docs/program-gifs/space-invaders.gif[Space Invaders running in SC-16,width=320]
 
 |SpaceCave
-|image::docs/module-gifs/spacecave.gif[SpaceCave running in SC-16,width=320]
+|image::docs/program-gifs/spacecave.gif[SpaceCave running in SC-16,width=320]
 
 |Text Demo
-|image::docs/module-gifs/text-demo.gif[Text Demo running in SC-16,width=320]
+|image::docs/program-gifs/text-demo.gif[Text Demo running in SC-16,width=320]
 |===
-// module-gif-gallery:end
+// program-gif-gallery:end
 
 Regenerate the animations for every bootable folder disk:
 [source,console]
@@ -277,4 +299,4 @@ Use
 +--run-seconds+ to change the capture window and +--gif-seconds+ to set the
 total GIF duration; +--fps+ and +--capture-fps+ adjust sampling. The command
 discovers validated disk manifests from +disks/+ each time it runs and updates
-this gallery. It does not compile module sources.
+this gallery. It does not compile program sources.

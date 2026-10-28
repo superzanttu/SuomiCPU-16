@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "paint",
+  "name": "Paint",
+  "legacy_disk": "APP00012",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/paint.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

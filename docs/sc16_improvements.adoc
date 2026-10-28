@@ -25,7 +25,7 @@ contracts.
   and big-endian multi-byte values. A loaded program starts at its image entry
   point; CPU construction initializes the PC to zero and the stack pointer to
   the top of configured memory.
-* The required guest-resident +bios.bin+ selects an ID-named folder disk under
+* The required guest-resident +firmware/bios.bin+ selects an ID-named folder disk under
   +disks/+ through a supervisor firmware service, validates its metadata, and
   loads its prebuilt boot image without compiling source. Explicit source
   launches remain a developer workflow.
@@ -313,13 +313,13 @@ Checklist status: [x] completed; [ ] planned.
   text-only display mode.
 * [x] Provide dedicated emulator logging methods and guest C functions for
   DEBUG, INFO, WARN, and ERROR records over the serial output in
-  +lib/bug_monitor.h+. Route emulator lifecycle and device errors to the Bug
+  +toolchain/include/bug_monitor.h+. Route emulator lifecycle and device errors to the Bug
   Monitor; preserve raw guest serial output and the existing serial input path.
-* [x] Use one emulator-wide +bios.bin+ as firmware. Separate emulator
+* [x] Use one emulator-wide +firmware/bios.bin+ as firmware. Separate emulator
   hardware initialization from firmware execution, then transfer control to
   the BIOS at the documented
   kernel-mode entry point. BIOS must not compile or assemble guest programs.
-** [x] Require +bios.bin+ at the emulator root, load its executable image at
+** [x] Require emulator-wide +firmware/bios.bin+, load its executable image at
    address zero, execute its entry point on startup and cold reset, and show
    missing or invalid firmware in the BIOS startup UI. The BIOS always runs
    in kernel (Supervisor) mode and is counted as trusted firmware by policy;
@@ -342,7 +342,7 @@ Checklist status: [x] completed; [ ] planned.
 * [x] Add boot tests for cold reset, common BIOS startup, text-mode rendering
   and selection, direct executable loading, both launch modes, both
   +NOT_BOOT+ cases, invalid images, and recoverable boot failures.
-* [x] Add BIOS settings persistence in root +bios.json+: preferred disk,
+* [x] Add BIOS settings persistence in +config/bios.json+: preferred disk,
   selector/automatic-start behavior, an editable up-to-16-character SC-NET
   node ID, and
   extensible integer/string settings. Saving is explicit from the BIOS menu.
@@ -392,14 +392,14 @@ Checklist status: [x] completed; [ ] planned.
   root manifest and directory overhead.
 ** [x] Account file growth and enforce the declared capacity hard limit for
   host-side writes and file copies.
-* [x] Migrate existing JSON block disks and module data into folder-backed disk
+* [x] Migrate existing JSON block disks and program data into folder-backed disk
   images with a documented conversion tool or import path; keep all source
   files and source disk images.
 ** [x] Provide +sc16build import-block-disk+ to export JSON block contents as
   +legacy-blocks/NNNNN.bin+, preserve read-only status, and refuse to overwrite
   the source or an existing destination.
 ** [x] Import both existing JSON disks without changing the originals, then
-   package all 17 runnable modules and their local disk assets as validated
+   package all 17 runnable programs and their local disk assets as validated
    boot disks. Execute all packages through the runtime; include Tank-16 maps
    and tile assets.
 * [x] Remove block-level disk device behavior only after replacement APIs and
@@ -495,15 +495,15 @@ Checklist status: [x] completed; [ ] planned.
 
 === Phase 8 — Move applications to bootable disk images
 
-* [x] Convert each runnable module into a disk folder/image containing
+* [x] Convert each runnable program into a disk folder/image containing
   +disk.json+, exactly one of +main.bin+ or +kernel.bin+, and its runtime
   assets/data. Use the emulator-wide BIOS; do not package per-disk firmware.
 ** [x] Add +sc16build package-disk+ to build one source into a new v1 disk
   folder with +main.bin+ or +kernel.bin+ and a manifest, without overwriting
   the source or an existing destination.
-** [x] Migrate all runnable modules and their runtime assets to validated disk
+** [x] Migrate all runnable programs and their runtime assets to validated disk
   folders and boot them through the emulator-wide BIOS.
-** [x] Add +sc16build package-modules+ to package every bootable C module,
+** [x] Add +sc16build install-programs+ to package every bootable C program,
    including its local +disks/+ tree, without overwriting existing disks.
 * [x] Move assembly and C compilation out of BIOS/emulator startup. Provide
   offline build commands that compile and link programs, produce the specified
@@ -515,9 +515,9 @@ Checklist status: [x] completed; [ ] planned.
   +c90_todo.adoc+ with the folder-backed disk and +sys_read+/+sys_write+ ABI.
   Implement hosted file streams only after those interfaces and error semantics
   are stable.
-* [x] Update module discovery and BIOS UI to enumerate disks and show manifest
+* [x] Update program discovery and BIOS UI to enumerate disks and show manifest
   metadata in the text-mode BIOS rather than scanning C source files and
-  compiling selected modules.
+  compiling selected programs.
 * [x] Update direct-program launch, +--disk+, reset/reboot, gallery, examples,
   build scripts, CI, and test fixtures to use disk images and the standard boot
   flow.
@@ -576,10 +576,10 @@ Checklist status: [x] completed; [ ] planned.
   the shell after the demo exits.
 * [x] Document how to build a fresh disk without overwriting existing output,
   select it in BIOS, use the shell, and understand the example's limitations.
+* [ ] Analyze current memory-mapped control registers and suggest a better
+  architecture.
 
 === Phase 11 - Final tasks
 * [ ] Perform a final review of all documentation, ensuring accuracy and completeness.
 * [ ] Write documentation how to compile and package the BIOS, kernel, and user programs, as well as how to create and manage bootable disks.
 * [ ] Ensure all helper tools and scripts are documented, including usage examples and expected outputs.
-* [ ] Analyze current memory-mapped control registers and suggest a better
-  architecture.

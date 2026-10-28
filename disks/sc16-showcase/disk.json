@@ -1,0 +1,10 @@
+{
+  "capacity_bytes": 67108864,
+  "id": "sc16-showcase",
+  "label": "SC-16 showcase",
+  "protected_files": [
+    "main.bin"
+  ],
+  "read_only": false,
+  "version": 1
+}

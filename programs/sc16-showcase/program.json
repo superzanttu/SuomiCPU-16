@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "sc16-showcase",
+  "name": "SC-16 showcase",
+  "legacy_disk": "APP00013",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/sc16_showcase.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

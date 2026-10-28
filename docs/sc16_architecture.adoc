@@ -16,7 +16,7 @@ SC-16 is byte-addressed with 30-bit addresses, for an address space of
 0x00000000 through 0x3fffffff. Multi-byte values are big-endian. Instructions
 are based on 16-bit words; prefixed instructions consume their encoded
 extension words. The ISA opcode and encoding tables are maintained in
-`src/isa.rs` and the assembler. General registers are R0 through R7; the
+`src/emulator/isa.rs` and the assembler. General registers are R0 through R7; the
 architectural flags are zero, carry, negative, and overflow. The control-flow
 ABI stores return addresses as four bytes and preserves all 30 address bits.
 
@@ -95,7 +95,7 @@ never invokes a compiler or assembler.
 == Reset and firmware entry
 
 On cold reset, hardware initialization resets the CPU and devices, then loads
-the required emulator-wide `bios.bin` at physical address zero. Missing or
+the required emulator-wide `firmware/bios.bin` at physical address zero. Missing or
 malformed firmware is shown as a recoverable BIOS startup error; there is no
 source-compilation or host-selector fallback. CPU state is:
 
@@ -117,7 +117,7 @@ executable rule, loads the prebuilt image, mounts the disk, and transfers
 execution in the mode selected by the executable name. The host does not
 render or drive the disk selector. Neither firmware nor the service compiles
 or assembles guest source during boot. KERNEL images are trusted supervisor
-code. `bios.bin` is always counted as trusted firmware and runs in kernel
+code. `firmware/bios.bin` is always counted as trusted firmware and runs in kernel
 (Supervisor) mode; this is a trust-policy assumption, not a signature check. The current
 design does not claim authenticated boot or memory isolation. Firmware may
 enable interrupts only after its handlers and kernel stack are ready.
@@ -130,7 +130,7 @@ the preferred disk and deliberately leaves startup policy and other settings
 unchanged. Enter on the Boot Device row uses operation 9 before booting, so a
 disk index cannot be mistaken for the 0/1 startup policy.
 
-The BIOS reads persistent settings from emulator-root `bios.json`. Missing
+The BIOS reads persistent settings from `config/bios.json`. Missing
 settings use defaults; malformed settings are reported rather than overwritten.
 The BIOS menu can remember a preferred disk, choose selector or automatic
 startup, and edit a 1-16 character SC-NET node ID. If unset, a random
@@ -355,8 +355,8 @@ process owns a semaphore; WAIT blocks at count zero, POST wakes one waiter, and
 owned semaphores are removed when that process exits. In the C wrapper,
 `sc16_mmap` returns the mapped address as `long` or a negative error; the
 remaining wrappers return the corresponding ABI result. The C interface in
-`lib/sc16_syscall.h` provides SC-16-specific wrappers. The separate
-`lib/sc16_net.h` wrappers expose SC-NET discovery, peer messaging, and
+`toolchain/include/sc16_syscall.h` provides SC-16-specific wrappers. The separate
+`toolchain/include/sc16_net.h` wrappers expose SC-NET discovery, peer messaging, and
 nonblocking receive; names occupy fixed 16-byte slots and payloads are limited
 to 1024 bytes. SC-NET uses a separate host UDP service on port 47017, distinct
 from guest application networking on port 47016. BIOS startup refuses to boot
@@ -403,7 +403,7 @@ contract:
   data at offset 0, foreground at 1, background at 2, control at 3, row at 4,
   and column at 5. Control commands 1, 2, and 3 clear, enable, and disable the
   surface. Cursor coordinates are zero-based and clamped to the surface. The
-  register definitions are in +lib/guest_text.h+.
+  register definitions are in +toolchain/include/guest_text.h+.
 * The text surface is overlaid after pixel graphics; enabling it does not
   disable or replace the existing game graphics window. It is disabled on
   reset and is not the serial diagnostics/Bug Monitor channel.

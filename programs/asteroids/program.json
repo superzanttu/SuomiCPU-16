@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "asteroids",
+  "name": "Asteroids",
+  "legacy_disk": "APP00002",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/asteroids.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

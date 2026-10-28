@@ -1,6 +1,6 @@
 ; Demonstrates reusable routines from lib_gfx.asm and glyph data from the font.
 ; Load with: cargo run -- examples/gfx_demo.asm
-.include "../fonts/font5x7.asm"
+.include "../firmware/fonts/font5x7.asm"
 .address 0x0100
 
 start:
@@ -44,4 +44,4 @@ start:
 ; 4x4 sprite pixels; zero bytes are transparent.
 .data hex 00, 19, 19, 00, 19, 01, 01, 19, 19, 01, 01, 19, 00, 19, 19, 00
 
-.include "../lib_gfx.asm"
+.include "../toolchain/runtime/lib_gfx.asm"

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "motorobots",
+  "name": "MotoRobots",
+  "legacy_disk": "APP00009",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/main.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

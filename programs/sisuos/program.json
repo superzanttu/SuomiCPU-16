@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "slug": "sisuos",
+  "name": "SisuOS",
+  "legacy_disk": "SisuOS-1",
+  "capacity_bytes": 16777216,
+  "boot": {
+    "source": "src/preemptive_os_kernel.asm",
+    "embedded_c": "src/preemptive_os_shell.c",
+    "output": "kernel.bin"
+  },
+  "assets": null,
+  "executables": [
+    {
+      "source": "src/preemptive_os_demo.c",
+      "output": "demo.bin",
+      "base": 196608
+    }
+  ]
+}

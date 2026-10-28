@@ -99,7 +99,7 @@ does not establish language feature parity.
 
 * [x] Make Rust the only runtime, compiler, tools, and CI path.
 * [x] Source-located tokenization and literal/operator recognition in
-  +src/c_compiler.rs+.
+  +src/c_compiler/mod.rs+.
 * [x] Expression parser for operators, assignments, conditional expressions,
   calls, indexing, member access, casts, and +sizeof+.
 * [x] Statement parser for basic declarations, compound blocks, control flow,
@@ -137,7 +137,7 @@ does not establish language feature parity.
   +#if+/+#elif+ integer expressions and +#ifdef+/+#ifndef+ conditional branches
   in Rust.
 * [x] Resolve quoted includes beside the source and angle-bracket includes
-  under +lib/+, including nested includes, shared macro definitions, and
+  under +toolchain/include/+, including nested includes, shared macro definitions, and
   include guards.
 * [x] Expand fixed-parameter function-like macros with argument substitution,
   stringification, and token pasting, including the fixed-width integer macros
@@ -158,15 +158,15 @@ does not establish language feature parity.
 * [x] Remove the legacy runtime, compiler, assembler, network tool, test suite,
   and non-Rust dependency installation from CI.
 * [x] Restore useful integration coverage as Rust tests.
-* [ ] Expand Rust compiler support until required +.c+ source and module builds
+* [ ] Expand Rust compiler support until required +.c+ source and program builds
   no longer encounter unsupported syntax or semantics.
 
 The repository uses Rust for runtime, build, tools, and CI. Some legacy
 integration coverage has not yet been recreated as Rust tests. C programs
 outside the current native subset fail with an unsupported-program diagnostic
 until their features are ported. The Rust frontend compiles Text Demo using
-console +fgets+, +puts+, and its supported +printf+ formats. The module smoke
-build compiles all 17 bootable BIOS C modules.
+console +fgets+, +puts+, and its supported +printf+ formats. The program smoke
+build compiles all 17 bootable BIOS C programs.
 
 == B — Basic C game programming
 
@@ -462,7 +462,7 @@ required before claiming full C90 compatibility.
     approximations. These use the target's binary16 arithmetic and do not meet
     C90 +double+ range, precision, or exceptional-value requirements.
 ** The emulator now supplies a text console, BIOS device descriptor and
-    required shared +bios.bin+ startup, folder-disk boot selection, and a
+    required shared +firmware/bios.bin+ startup, folder-disk boot selection, and a
     bounded USER-mode folder-filesystem register service. System-call ABI
     version 1 and SC-16-specific C wrappers are now defined in
     link:sc16_improvements.adoc[+sc16_improvements.adoc+] and

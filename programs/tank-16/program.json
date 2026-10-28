@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "tank-16",
+  "name": "Tank-16",
+  "legacy_disk": "APP00016",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/main.c",
+    "output": "main.bin"
+  },
+  "assets": "assets/disk",
+  "executables": []
+}

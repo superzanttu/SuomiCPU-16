@@ -10,8 +10,9 @@ fn repository_root() -> PathBuf {
 #[test]
 fn shared_bios_image_matches_its_offline_assembly_source() {
     let root = repository_root();
-    let source = suomicpu16::assembler::assemble_file(&root.join("bios.asm"), 0).unwrap();
-    let binary = suomicpu16::image::read_image(&root.join("bios.bin")).unwrap();
+    let source =
+        suomicpu16::assembler::assemble_file(&root.join("firmware").join("bios.asm"), 0).unwrap();
+    let binary = suomicpu16::image::read_image(&root.join("firmware").join("bios.bin")).unwrap();
     assert_eq!(binary.entry_point, 0);
     assert_eq!(binary.segments.len(), source.segments.len());
     for (actual, expected) in binary.segments.iter().zip(&source.segments) {
@@ -25,8 +26,12 @@ fn shared_bios_image_matches_its_offline_assembly_source() {
 #[test]
 fn packaged_modules_validate_and_execute_from_folder_disks() {
     let disks = repository_root().join("disks");
-    for index in 1..=17 {
-        let id = format!("APP{index:05}");
+    for program in suomicpu16::programs::catalog(&repository_root())
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.slug != "sisuos")
+    {
+        let id = program.slug;
         let path = disks.join(&id);
         let disk = FolderDisk::open(&path).unwrap();
         assert_eq!(disk.manifest().id, id);
@@ -61,7 +66,7 @@ fn imported_block_disks_preserve_the_source_and_export_all_blocks() {
 
 #[test]
 fn tank16_boot_disk_contains_runtime_maps_and_tile_assets() {
-    let tank = repository_root().join("disks").join("APP00016");
+    let tank = repository_root().join("disks").join("tank-16");
     let disk = FolderDisk::open(&tank).unwrap();
     assert!(disk.read_file("maps/FINLAND.json", 0, 64).is_ok());
     assert!(disk.read_file("assets/TANK16_TILES.bin", 0, 64).is_ok());
@@ -110,7 +115,7 @@ fn tank16_boot_disk_contains_runtime_maps_and_tile_assets() {
 #[test]
 fn folder_filesystem_header_works_from_a_cpu_executed_c_program() {
     let root = repository_root();
-    let disk_path = root.join("disks").join("APP00001");
+    let disk_path = root.join("disks").join("anaclock");
     let source = root.join("tests").join("folder_fs_read.c");
     let image = suomicpu16::image::load_program(&source).unwrap();
     let expected = FolderDisk::open(&disk_path)

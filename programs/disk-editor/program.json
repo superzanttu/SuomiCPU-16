@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "disk-editor",
+  "name": "DiskEditor",
+  "legacy_disk": "APP00003",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/disk_editor.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

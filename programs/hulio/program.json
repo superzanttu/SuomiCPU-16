@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "hulio",
+  "name": "Hulio",
+  "legacy_disk": "APP00006",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/hulio.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

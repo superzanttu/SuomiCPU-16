@@ -1,0 +1,141 @@
+= Building and installing SC-16 programs
+:toc:
+
+== Layout
+
+The repository is one Cargo package. Rust emulator implementation is in
++src/emulator/+, the assembler in +src/assembler/+, the C compiler in
++src/c_compiler/+, and shared offline command-line tools in +src/tools/+.
+Crate-level module names and command-line binary names are unchanged.
+Shared guest headers live in +toolchain/include/+ and their C/assembly
+implementations in +toolchain/runtime/+. BIOS source, image, and shared fonts
+live in +firmware/+. Writable host settings remain in +config/bios.json+.
+
+Each installable workload has a canonical lowercase +programs/<slug>/+
+directory, an explicit +program.json+, guest sources/local headers in +src/+,
+and any program-specific tools in +tools/+. Existing program documentation
+lives in its +docs/+ directory. Seed disk files are in +assets/disk/+;
+editable source artwork may live separately in +assets/gfx/+.
+Tank-16's Rust tools remain Cargo binaries in the same package.
+
+SisuOS is an ordinary catalog entry under +programs/sisuos/+, not an emulator
+component. Its C shell, C child demo, assembly bootstrap, and build wrapper are
+all there. Educational +examples/+ are fixtures, not installed programs;
+tests may compile and execute them.
+
+== Common commands
+
+Run these commands from the repository root with Rust/Cargo on PATH:
+
+[source,powershell]
+----
+cargo run --bin sc16build -- build-program sisuos
+cargo run --bin sc16build -- install-program sisuos
+cargo run --bin sc16build -- build-programs
+cargo run --bin sc16build -- install-programs
+.\run.ps1 .\disks\sisuos
+----
+
+Building writes only +build/programs/<slug>/+. Installing first builds the
+program, then installs its image and seeds into +disks/<slug>/+. Both commands
+select explicit manifest entry points, not whichever C filename sorts first.
+All-program operations include all 18 programs and stop on the first error;
+earlier successfully installed programs remain installed.
+
+PowerShell conveniences:
+
+[source,powershell]
+----
+.\scripts\build-programs.ps1 sisuos
+.\scripts\build-programs.ps1 sisuos -Install
+.\scripts\build-programs.ps1 -Install
+.\programs\sisuos\tools\build.ps1 -Install
+.\programs\motorobots\tools\run.ps1
+----
+
+For BIOS selection instead of immediate disk launch:
+
+[source,powershell]
+----
+cargo run --bin suomicpu16 -- --disk sisuos
+----
+
+Rebuild firmware separately with +cargo run --bin sc16build -- build-bios+.
+Its defaults are +firmware/bios.asm+ and +firmware/bios.bin+.
+For an educational fixture or one-off disk, the existing +sc16build <source>
+<image>+ and non-overwriting +package-disk+ commands remain available.
+
+== Manifest version 1
+
+[source,json]
+----
+{
+  "version": 1,
+  "slug": "anaclock",
+  "name": "AnaClock",
+  "legacy_disk": "APP00001",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/anaclock.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}
+----
+
+The slug must match the directory name. Program slugs use lowercase ASCII
+letters, digits, and hyphens; they begin with a letter/digit and do not end in a
+hyphen. Disk IDs allow 1-32 ASCII letters/digits, underscores, and hyphens;
+Windows device names and case-insensitive collisions are rejected.
+Human display names are separate from IDs.
+
+The boot output is +main.bin+ for USER mode or +kernel.bin+ for KERNEL mode.
+For embedded C user code in an assembly kernel, specify +embedded_c+ beside
++source+, as SisuOS does. Additional +executables+ entries specify +source+,
++output+, and optionally an integer relocation +base+. Sources, seed paths,
+and output names are validated; directory traversal and symlinks are rejected.
++assets+ may be +null+. Each executable is installed as a protected file.
+
+== Safe updates
+
+Installation stages and validates the entire resulting disk before switching
+directories. Existing disk identity, label, capacity, read-only status, protected
+paths, and unrelated writable files are preserved. A read-only disk cannot be
+updated. New executables are added to the existing protected-file list.
+Disk capacity checks include installed files and package ownership metadata.
+
+The installer records package-owned file fingerprints in +.sc16-owned.json+.
+It updates unchanged owned files, removes unchanged retired owned files, and
+rejects modified owned files or conflicting new seed paths rather than
+overwriting them. Fingerprints are length plus FNV-1a, for update bookkeeping,
+not cryptographic authenticity. On first adoption, seeds must match the
+shipped bytes; known executable outputs may be replaced. Other local files
+are never adopted implicitly. Back up or move a conflicting local file before
+retrying an intentional update.
+
+An install journal and backup directory support interruption recovery. Retry
+the same install command to restore an interrupted switch or finish cleanup.
+An interrupted build may leave +build/programs/.stage-<slug>/+; inspect and
+remove that generated staging directory before rebuilding. Errors retain
+explicit diagnostics. Windows sharing/access errors receive a bounded retry
+only in offline tooling; CPU instruction execution is unchanged.
+Do not run build/install/migration commands concurrently with one another or
+while an emulator is using the affected disks.
+
+== Migrating existing disks
+
+[source,powershell]
+----
+cargo run --bin sc16build -- migrate-program-disks --dry-run
+cargo run --bin sc16build -- migrate-program-disks --apply
+----
+
+The explicit +legacy_disk+ mapping renames +APP00001+ through +APP00017+
+to their program slugs and +SisuOS-1+ to +sisuos+. It also updates manifest IDs
+and the preferred disk in +config/bios.json+, preserving other settings and disk
+contents. +DISK0001+ and +DISK0002+ are data disks and stay unchanged.
+Both old and new paths existing is an error: migration never merges them.
+Dry-run changes nothing. Apply creates a migration journal; rerun apply to
+resume after an interrupted rename. No aliases are installed for obsolete
+source folders, disk IDs, or module build commands.

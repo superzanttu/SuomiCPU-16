@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "hertta-3d",
+  "name": "Hertta-3D",
+  "legacy_disk": "APP00005",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/hertta3d.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

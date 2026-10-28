@@ -74,9 +74,9 @@ fn editor_help_describes_rust_workflows() {
 #[test]
 fn map_load_save_round_trip_uses_rust_validation() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("modules")
-        .join("Tank-16")
-        .join("disks")
+        .join("programs")
+        .join("tank-16")
+        .join("assets/disk")
         .join("maps")
         .join("FINLAND.json");
     let loaded = load_map(&source);
@@ -104,9 +104,9 @@ fn map_load_save_round_trip_uses_rust_validation() {
 #[test]
 fn generated_maps_are_installed_in_the_runtime_folder() {
     let runtime_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("modules")
-        .join("Tank-16")
-        .join("disks")
+        .join("programs")
+        .join("tank-16")
+        .join("assets/disk")
         .join("maps");
     for name in MAP_NAMES {
         let path = runtime_dir.join(format!("{name}.json"));
@@ -118,9 +118,9 @@ fn generated_maps_are_installed_in_the_runtime_folder() {
 #[test]
 fn finland_map_has_runtime_ready_features_and_compact_encoding() {
     let map_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("modules")
-        .join("Tank-16")
-        .join("disks")
+        .join("programs")
+        .join("tank-16")
+        .join("assets/disk")
         .join("maps")
         .join("FINLAND.json");
     let map = load_map(&map_path);
@@ -275,9 +275,12 @@ fn finland_map_has_runtime_ready_features_and_compact_encoding() {
 #[test]
 fn finland_validation_and_atlas_extension_preserve_source_pixels() {
     let game_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("modules")
-        .join("Tank-16");
-    let map_path = game_dir.join("disks").join("maps").join("FINLAND.json");
+        .join("programs")
+        .join("tank-16");
+    let map_path = game_dir
+        .join("assets/disk")
+        .join("maps")
+        .join("FINLAND.json");
     let summary: Value = serde_json::from_str(&successful_stdout(run(
         "sc16tank",
         &[
@@ -292,7 +295,7 @@ fn finland_validation_and_atlas_extension_preserve_source_pixels() {
     assert_eq!(summary["height"], 100);
     assert_eq!(load_map(&map_path)["geography"]["north_up"], true);
 
-    let source = image::open(game_dir.join("gfx").join("tiles_terrain.png"))
+    let source = image::open(game_dir.join("assets/gfx").join("tiles_terrain.png"))
         .unwrap()
         .to_rgba8();
     assert_eq!(source.dimensions(), (640, 640));
@@ -323,7 +326,7 @@ fn finland_validation_and_atlas_extension_preserve_source_pixels() {
 #[test]
 fn generator_creates_ten_distinct_runtime_ready_maps() {
     let temporary = TempDir::new();
-    let runtime_dir = temporary.path().join("disks").join("maps");
+    let runtime_dir = temporary.path().join("assets/disk").join("maps");
     let output = run(
         "sc16maps",
         &[

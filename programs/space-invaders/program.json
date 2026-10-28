@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "space-invaders",
+  "name": "Space Invaders",
+  "legacy_disk": "APP00014",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/space_invaders.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

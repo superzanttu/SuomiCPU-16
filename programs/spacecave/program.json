@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "spacecave",
+  "name": "SpaceCave",
+  "legacy_disk": "APP00015",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/spacecave.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

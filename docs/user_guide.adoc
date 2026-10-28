@@ -7,8 +7,8 @@ eight general-purpose registers and a 16-bit instruction format. Assembly source
 files use the +.asm+ extension. The assembler converts instructions to machine
 code and places instructions or data at the addresses specified in the source.
 
-The emulator loads the required guest-resident +bios.bin+ before launching a
-program. The emulator always counts +bios.bin+ as trusted firmware and runs
+The emulator loads the required guest-resident +firmware/bios.bin+ before launching a
+program. The emulator always counts +firmware/bios.bin+ as trusted firmware and runs
 it in kernel (Supervisor) mode. This is a trust-policy assumption, not a signature
 check or secure-boot guarantee. The BIOS presents a classic text-mode setup
 screen in the main window with a blue background, cyan headings, and highlighted
@@ -17,7 +17,7 @@ selection text. It discovers folder disks under
 boot image after validating the selected disk's +disk.json+. Exactly one of
 +kernel.bin+ (KERNEL mode) or +main.bin+ (USER mode) must exist; both or
 neither reports +NOT_BOOT+. Metadata cannot override the executable or mode.
-The selector uses +bios.json+ beside +bios.bin+ to remember the preferred
+The selector uses +config/bios.json+ to remember the preferred
 disk, startup behavior, and an editable 1-16 character SC-NET node ID. When
 not configured, the BIOS generates a full-length +SC16-+ name with a random
 hexadecimal suffix. This identifies the emulator to SC-NET only; guest
@@ -28,10 +28,10 @@ Enter on another setting begins editing it directly in the main list. Type to
 edit STRING and NUMBER values. Enter confirms an edit and Escape cancels it.
 Changes to other settings must be saved with F10 before booting. Disk details
 are clipped to one display row so long names do not wrap. F9 reloads
-+bios.json+, and F10 saves it. Unsaved changes are shown as a warning and
++config/bios.json+, and F10 saves it. Unsaved changes are shown as a warning and
 prevent booting until saved. BOOL values are Yes/No, STRING values
 are limited to 16 printable ASCII characters, and NUMBER values are signed
-integers. Up to eight named custom settings from +bios.json+ appear in the
+integers. Up to eight named custom settings from +config/bios.json+ appear in the
 list and can be edited with the same controls. When automatic startup of a
 preferred disk is enabled, the BIOS waits five seconds before booting and
 shows a prompt; press Space during the countdown to enter setup instead.
@@ -74,16 +74,20 @@ a row and Enter to edit or boot. Invalid metadata, invalid images, and
 +NOT_BOOT+ errors are logged; the BIOS remains available to retry another
 disk. Reset restarts the firmware and rescans the disk collection. Press F5
 to stop emulation. The
-emulator requires the shared root
-+bios.bin+ and displays a BIOS startup error if it is missing or invalid.
-Package one program with +sc16build package-disk+ or all runnable C modules
-and their local disk assets with +sc16build package-modules+. See
-+sc16_disk_format.adoc+ for the manifest and image requirements.
+emulator requires the shared
++firmware/bios.bin+ and displays a BIOS startup error if it is missing or invalid.
+Build/install one catalog entry with +sc16build build-program <slug>+ or
++sc16build install-program <slug>+, or all entries with +build-programs+ and
++install-programs+. See link:programs.adoc[the program workflow] for manifests,
+disk-name migration, and updates preserving local data. One-off
++sc16build package-disk+ still refuses an existing destination.
+See +sc16_disk_format.adoc+ for the disk manifest and image requirements.
 Build the shared BIOS image offline with
-+cargo run --bin sc16build -- build-bios bios.asm bios.bin+; validate that
-bootable C module sources still compile with
-+cargo run --bin sc16build -- smoke-modules+. Use a new staging directory
-when packaging modules; existing disks are never replaced by these commands.
++cargo run --bin sc16build -- build-bios+; validate that
+all program recipes still compile with
++cargo run --bin sc16build -- build-programs+. Builds write only
++build/programs/<slug>/+; installation stages and validates updates before
+switching the disk directory.
 Offline images use the version 2 +SC16IMG2+ container, with fixed load
 addresses, an executable entry point, and explicit segment alignment and
 permissions. +sc16asm+ and +sc16build+ emit this format; the loader rejects
@@ -95,7 +99,7 @@ isolation boundary.
 The game fills the emulator's main window after BIOS startup. The optional
 80×25 *Bug Monitor* runs in a separate window and displays emulator logs and
 guest serial output. *RESET* returns to BIOS disk selection; *REBOOT* performs
-a cold firmware boot and rebuilds +bios.asm+ if it is newer than +bios.bin+.
+a cold firmware boot and rebuilds +firmware/bios.asm+ if it is newer than +firmware/bios.bin+.
 Close the emulator with the window close button or Escape. Select text and press Ctrl+C to copy it;
 the *COPY* button copies selected text or the visible monitor screen. The Bug
 Monitor keeps a 1,000-row scrollback buffer, navigated with the mouse wheel.
@@ -170,7 +174,7 @@ Only object-like macros and +#undef+ are preprocessed;
 +#if+/+#elif+ integer constant expressions and +#ifdef+/+#ifndef+ conditional
 branches are supported. Backslash-newline source continuations are spliced
 before preprocessing and tokenizing. Quoted includes search beside the
-including source; angle-bracket includes search the repository +lib+ directory.
+including source; angle-bracket includes search the repository +toolchain/include/+ directory.
 Function-like macros support argument substitution, stringification, and token
 pasting; variadic macros remain unsupported. The Rust C frontend also supports
 console +fgets+, +puts+, and a restricted +printf+ format subset: literal text,
@@ -315,7 +319,7 @@ Insert another assembler source file at the current point:
 
 [source,asm]
 ----
-.include "fonts/font5x7.asm"
+.include "firmware/fonts/font5x7.asm"
 ----
 
 The path is relative to the file containing the +.include+, so the same include
@@ -1017,7 +1021,7 @@ the pending character. The RTC writes seconds, minutes, and hours to its three
 declared byte addresses.
 
 Guest filesystem requests use the byte-register gateway at +0x43100+, with
-commands and C helpers defined in +lib/folder_fs.h+. It supports directory
+commands and C helpers defined in +toolchain/include/folder_fs.h+. It supports directory
 listing, file reads and replacement writes, directory creation, deletion,
 rename, and metadata queries. Paths are normalized relative to the mounted
 folder disk; transfers are bounded and failures set an explicit status. See
@@ -1025,21 +1029,21 @@ folder disk; transfers are bounded and failures set an explicit status. See
 
 The former guest block interface is removed. Original JSON block-disk files
 remain as import sources and can be converted with
-+sc16build import-block-disk+. +modules/DiskEditor/disk_editor.c+ is now a
++sc16build import-block-disk+. +programs/disk-editor/src/disk_editor.c+ is now a
 USER-mode text-file editor for the mounted folder disk; it creates or updates
 files up to 256 bytes and leaves protected files unchanged. Tank-16's
-+lib/disk.h+ file-list helper retains recursive directory listing for legacy
-module code; file reads use the folder-filesystem read command.
++toolchain/include/disk.h+ file-list helper retains recursive directory listing for legacy
+program code; file reads use the folder-filesystem read command.
 
 == 8. Bitmap font
 
-link:../fonts/font5x7.asm[+fonts/font5x7.asm+] contains an original 5x7 bitmap font
+link:../firmware/fonts/font5x7.asm[+firmware/fonts/font5x7.asm+] contains an original 5x7 bitmap font
 for every printable ASCII character (+0x20+-+0x7E+) plus +ÃƒÆ’Ã‚Â¶ÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¥ÃƒÆ’Ã¢â‚¬â€œÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Â¦+. Include it
 with:
 
 [source,asm]
 ----
-.include "fonts/font5x7.asm"
+.include "firmware/fonts/font5x7.asm"
 ----
 
 It places +font5x7+ at +0x4400+, clear of the graphics mask table and scratch
@@ -1133,7 +1137,7 @@ Supported language features include:
   inclusion, +#include+, +#undef+, +#error+, +#pragma+, trigraph replacement,
   and backslash-newline splicing. Quoted includes are searched relative to the
   including file; angle-bracket includes are searched in the repository's
-  +lib/+ directory.
+  +toolchain/include/+ directory.
 
 The compiler's data model is target-specific and does *not* meet all the C90
 minimum requirements:
@@ -1276,12 +1280,12 @@ path, that option mounts the same folder filesystem for guest file operations.
 
 ==== SisuOS demonstration
 
-The checked-in +disks/SisuOS-1+ folder contains SisuOS, a small protected,
+The checked-in +disks/sisuos+ folder contains SisuOS, a small protected,
 preemptive OS demonstration. Start the emulator with the SisuOS disk
 preselected:
 [source,console]
 ----
-cargo run --bin suomicpu16 -- --disk SisuOS-1
+cargo run --bin suomicpu16 -- --disk sisuos
 ----
 Press Enter in the BIOS to boot the selected disk. The kernel installs its
 IDT, enables the MMU and instruction timer, and starts the user-mode shell.
@@ -1313,15 +1317,15 @@ resumes. Up to 16 background children can be tracked at once; the shell reaps
 finished children while reading input. The program list is fixed to +demo+ and
 this example is not a general-purpose OS.
 
-To build a fresh, BIOS-discoverable copy without overwriting an existing disk:
+To build and install the SisuOS disk while preserving unrelated writable data:
 [source,powershell]
 ----
-.\scripts\build-preemptive-os.ps1 .\disks\OS000001
+.\programs\sisuos\tools\build.ps1 -Install
 ----
 The kernel's protected-mode, interrupt, and MMU setup remains in
-+examples/preemptive_os_kernel.asm+. The interactive shell and preemptively
++programs/sisuos/src/preemptive_os_kernel.asm+. The interactive shell and preemptively
 scheduled child program are written in C in
-+examples/preemptive_os_shell.c+ and +examples/preemptive_os_demo.c+.
++programs/sisuos/src/preemptive_os_shell.c+ and +programs/sisuos/src/preemptive_os_demo.c+.
 The build embeds the compiled shell in the kernel image and packages the
 compiled child as +demo.bin+. A BIOS-boot integration test checks the packaged
 images against those sources and verifies that the child task runs and exits.
@@ -1394,8 +1398,8 @@ The guest filesystem is rooted at the folder disk selected by the BIOS or
 +--disk ID+. The register service at +0x43100+ supports bounded listing, file
 reads and replacement writes, directory creation, deletion, rename, and
 metadata queries. Its command IDs and C register helpers are defined in
-+lib/folder_fs.h+; +lib/disk.h+ provides file-reading and recursive-list
-helpers for existing modules. Status at +\+16+ is +0+ on success and +1+ on
++toolchain/include/folder_fs.h+; +toolchain/include/disk.h+ provides file-reading and recursive-list
+helpers for existing programs. Status at +\+16+ is +0+ on success and +1+ on
 error. Paths are normalized, relative ASCII paths confined to the mounted
 folder; transfers are limited to 4096 bytes. Filesystem operations cannot
 access other disks or host paths.
@@ -1409,21 +1413,21 @@ disk through the syscall ABI. +remove+ is explicitly unsupported and sets
 remain incomplete. This is not a claim of complete hosted C90 support.
 
 Images built and launched from a source path by +run.ps1+ without +--disk+
-use that source module's +disks/+ directory through a host-configured
+use that source program's +disks/+ directory through a host-configured
 read-only mount. When a folder disk is selected, its data and policies take
 precedence. Tank-16 reads maps and tile assets from its packaged folder disk.
 The old JSON block format is no longer a guest device; original JSON files
 remain available to +sc16build import-block-disk+.
 
 Tank-16 uses this generic API to load map JSON from
-+modules/Tank-16/disks/maps/+ at round start. The first round prefers
++programs/tank-16/assets/disk/maps/+ at round start. The first round prefers
 +FINLAND.json+; subsequent rounds randomly select among the JSON maps in that
 folder. Finite maps use the map editor's tile-grid format. An infinite map
 uses +"infinite": true+, a seed, row-major terrain tile IDs, and optional
 obstacle density and tile IDs; terrain and obstacles are generated
 deterministically from tile coordinates. Only graphics atlases are included in
 the Tank-16 executable, not map data. The map editor mirrors saved maps into
-the module's +disks/maps/+ folder.
+the program's +disks/maps/+ folder.
 
 Programs booted from a folder disk can access that selected disk through the
 bounded USER-mode filesystem service in +#include "folder_fs.h"+. It supports
@@ -1445,8 +1449,8 @@ Unsupported conversions return +EOF+. File-backed streams and floating-point
 conversions are still unimplemented; this is a useful hosted-I/O subset, not a
 claim of complete C90 +stdio+ conformance.
 
-When a screen routine is referenced, the compiler links link:../lib/lib_text.asm[+lib/lib_text.asm+], which uses
-link:../fonts/font5x7.asm[+fonts/font5x7.asm+] to provide a 53-column by 30-row text
+When a screen routine is referenced, the compiler links link:../toolchain/runtime/lib_text.asm[+toolchain/runtime/lib_text.asm+], which uses
+link:../firmware/fonts/font5x7.asm[+firmware/fonts/font5x7.asm+] to provide a 53-column by 30-row text
 grid of 6x8 cells:
 
 [cols="1,1,1"]
@@ -1483,7 +1487,7 @@ grid of 6x8 cells:
 Screen text input accepts printable ASCII and Latin-1 keys, echoes the entered
 glyphs, and uses Enter as the line terminator. The library reserves scratch bytes near +0x4300+;
 do not use that region for application data while a screen routine is running.
-See link:../modules/Text%20Demo/text_demo.c[+modules/Text Demo/text_demo.c+] for a C example.
+See link:../programs/text-demo/src/text_demo.c[+programs/text-demo/src/text_demo.c+] for a C example.
 
 Generated C code uses the far control instructions (+JMPX+, +CALLX+, +BZX+,
 +BCX+). Address 0 holds an entry stub; +0x0002+-+0x0005+ hold interrupt
@@ -1504,10 +1508,10 @@ For shifts, +>>+ is arithmetic for +int+ and logical for unsigned types.
 
 === C graphics library (+gfx_*+)
 
-link:../lib/suomi_gfx.h[+lib/suomi_gfx.h+] declares the graphics builtins and defines color
+link:../toolchain/include/suomi_gfx.h[+toolchain/include/suomi_gfx.h+] declares the graphics builtins and defines color
 (+RED+, +GREEN+, ...), key (+KEY_LEFT+, +KEY_FIRE+, ...) and screen-size
 constants. Using any +gfx_*+ function makes the compiler link
-link:../lib/lib_cgfx.asm[+lib/lib_cgfx.asm+], which drives the graphics coprocessor, plus the
+link:../toolchain/runtime/lib_cgfx.asm[+toolchain/runtime/lib_cgfx.asm+], which drives the graphics coprocessor, plus the
 font. Five hardware layers are composited from lowest to highest priority:
 background/VRAM (0), tiles (1), sprites (2), 3D (3), and HUD (4) by default.
 Higher priorities cover lower ones; equal priorities are ordered by layer
@@ -1563,7 +1567,7 @@ space.
 |Set a layer's 8-bit composition priority; larger values are drawn on top (defaults to layer index).
 
 |+void gfx_layer_reset(unsigned int visible_layers)+
-|Reset layer selection, visibility, transparency keys, and composition priorities for a new module.
+|Reset layer selection, visibility, transparency keys, and composition priorities for a new program.
 
 |+void gfx_sprite_upload(int slot, int w, int h, unsigned char *data)+
 |Copy an indexed, zero-transparent image (up to 64x64) into one of 64 hardware sprite slots.
@@ -1690,7 +1694,7 @@ referencing a nonexistent vertex. The renderer has no per-pixel depth buffer.
 See the SC-16 showcase's 3D flight page for an example.
 
 SC-NET is separate from the game networking API below. C programs that include
-+lib/sc16_net.h+ can discover emulator node IDs, send messages to discovered
++toolchain/include/sc16_net.h+ can discover emulator node IDs, send messages to discovered
 peers, and receive messages nonblockingly. Node IDs are set in BIOS and
 collisions prevent disk boot. SC-NET uses a separate host UDP service on port
 47017; it is transport infrastructure, while game programs continue to use
@@ -1742,32 +1746,32 @@ so send state continuously rather than relying on single events.
 
 Windows may need to allow the application through the firewall for private
 networks.
-link:../modules/Netgame%20Demo/net_game_demo.c[+modules/Netgame Demo/net_game_demo.c+]
+link:../programs/netgame-demo/src/net_game_demo.c[+programs/netgame-demo/src/net_game_demo.c+]
 shows the pattern.
 
 === Games
 
-link:../modules/Asteroids/asteroids.c[+modules/Asteroids/asteroids.c+] and
-link:../modules/Space%20Invaders/space_invaders.c[+modules/Space Invaders/space_invaders.c+]
+link:../programs/asteroids/src/asteroids.c[+programs/asteroids/src/asteroids.c+] and
+link:../programs/space-invaders/src/space_invaders.c[+programs/space-invaders/src/space_invaders.c+]
 are complete playable games with score, lives, and restart.
-link:../modules/PacMan/pacman.c[+modules/PacMan/pacman.c+] is a 19x21-tile maze game
+link:../programs/pacman/src/pacman.c[+programs/pacman/src/pacman.c+] is a 19x21-tile maze game
 with four ghosts, power pellets, a wrap-around tunnel, lives, and levels. Build
 and run one from the repository root:
 
 [source]
 ----
-cargo run --bin sc16build -- "modules/Asteroids/asteroids.c" asteroids.sc16img
+cargo run --bin sc16build -- "programs/asteroids/src/asteroids.c" asteroids.sc16img
 cargo run -- asteroids.sc16img
 ----
 
 link:../examples/factorial.c[+examples/factorial.c+] and
-link:../modules/Text%20Demo/text_demo.c[+modules/Text Demo/text_demo.c+] demonstrate C
+link:../programs/text-demo/src/text_demo.c[+programs/text-demo/src/text_demo.c+] demonstrate C
 recursion and text input/output.
-link:../modules/SC-16%20showcase/sc16_showcase.c[+modules/SC-16 showcase/sc16_showcase.c+]
+link:../programs/sc16-showcase/src/sc16_showcase.c[+programs/sc16-showcase/src/sc16_showcase.c+]
 is an eight-page tour of the SC-16's CPU, memory, graphics, text, devices, and
 benchmark features.
 
-link:../modules/Hertta-3D/hertta3d.c[+modules/Hertta-3D/hertta3d.c+] is a first-person
+link:../programs/hertta-3d/src/hertta3d.c[+programs/hertta-3d/src/hertta3d.c+] is a first-person
 maze game rendered with the SC-GPU. Move with W/S, turn with A/D, and throw
 treats with Space. Hertta wanders through the maze; feed her enough treats and
 she will come to you to finish the level. Later levels add maze walls and make
@@ -1799,21 +1803,21 @@ instructions per frame.
   rectangle, sprite, and text routines.
 * link:../examples/factorial.c[+examples/factorial.c+] demonstrates the C compiler,
   recursive calls, local variables, arithmetic, and a +for+ loop.
-* link:../modules/AnaClock/anaclock.c[+modules/AnaClock/anaclock.c+] displays the emulator RTC as a
+* link:../programs/anaclock/src/anaclock.c[+programs/anaclock/src/anaclock.c+] displays the emulator RTC as a
   live clock with five classic analog faces, a Nixie-tube simulation, and a
   split-flap flip clock. Each analog face has its own hand design, Nixie digits
   dim and re-ignite when they change, and flip cards animate each change.
   Press Tab to cycle through the seven faces. Run it with
-  +cargo run -- --disk APP00001+ (BIOS preselects the bundled disk).
-* link:../modules/Elite/elitedemo.c[+modules/Elite/elitedemo.c+] is a first-person Elite-style
+  +cargo run -- --disk anaclock+ (BIOS preselects the bundled disk).
+* link:../programs/elite/src/elitedemo.c[+programs/elite/src/elitedemo.c+] is a first-person Elite-style
   space-combat prototype around a planet with two orbiting moons, drifting
   asteroids and patrolling enemy fighters that dogfight and shoot back. Flight is
   Newtonian-inspired: the ship keeps its velocity when it turns. Arrows pitch/yaw
   (Up = nose up), Q/E roll, X or Shift thrust, Z or Ctrl reverse, Space fires a
   heat-limited laser. It has regenerating shields, a hull, collisions with every
   body, a 3D radar and a HUD. It needs roughly 100,000 instructions per frame.
-  Run it with +cargo run -- --disk APP00004+.
-* link:../modules/Lunar%20Lander/lunarlander.c[+modules/Lunar Lander/lunarlander.c+] is a Lunar Lander game with
+  Run it with +cargo run -- --disk elite+.
+* link:../programs/lunar-lander/src/lunarlander.c[+programs/lunar-lander/src/lunarlander.c+] is a Lunar Lander game with
   gravity, inertia, limited fuel, procedural terrain with x2/x3/x5 landing pads,
   exhaust, dust and explosion particles, a starfield with the Earth, a HUD with
   altitude, velocity and fuel, and synthesized sound (engine, RCS, ambient drone,
@@ -1822,19 +1826,19 @@ instructions per frame.
   the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
   Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
   accuracy bonus) x pad multiplier. Run it with
-  +cargo run -- --disk APP00008+.
-* link:../modules/Paint/paint.c[+modules/Paint/paint.c+] is an MS Paint style drawing program driven by the
+  +cargo run -- --disk lunar-lander+.
+* link:../programs/paint/src/paint.c[+programs/paint/src/paint.c+] is an MS Paint style drawing program driven by the
   mouse: pen, eraser, spray, line, rectangle and filled rectangle with live shape previews,
   four brush sizes and a 16-color palette. Left button draws with the foreground color, right
   button with the background color; double-click a palette color to fill the canvas and
-  double-click CLR to clear it.   Images cannot be saved. Run it with +cargo run -- --disk APP00012+.
-* link:../modules/Netgame%20Demo/net_game_demo.c[+modules/Netgame Demo/net_game_demo.c+] is a LAN demo: start it in up to 8
+  double-click CLR to clear it.   Images cannot be saved. Run it with +cargo run -- --disk paint+.
+* link:../programs/netgame-demo/src/net_game_demo.c[+programs/netgame-demo/src/net_game_demo.c+] is a LAN demo: start it in up to 8
   emulator instances on one network; each player moves a coloured square (arrows) and Space
   broadcasts a ping ring to all others. Run it with
-  +cargo run -- --disk APP00010 --net-port 47016+.
-* link:../modules/SpaceCave/spacecave.c[+modules/SpaceCave/spacecave.c+] (SpaceCave) is an Asteroids-style LAN dogfight
+  +cargo run -- --disk netgame-demo --net-port 47016+.
+* link:../programs/spacecave/src/spacecave.c[+programs/spacecave/src/spacecave.c+] (SpaceCave) is an Asteroids-style LAN dogfight
   for up to 8 pilots inside a procedurally generated cave with auto-repairing defence turrets.
-  Start it in one emulator per player (+cargo run -- --disk APP00015), type a nickname and
+  Start it in one emulator per player (+cargo run -- --disk spacecave), type a nickname and
   press Enter. Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard. The
   lowest network slot acts as the authoritative host: clients only send their keys, the host simulates
   and broadcasts ships, bullets, turrets and scores, and the cave is rebuilt from a broadcast seed.
@@ -1845,14 +1849,14 @@ instructions per frame.
   a *beacon* (fly into it, +150), a _reactor_ (shoot it down, +300, rebuilt elsewhere) or six
   *crystals* (+40 each, +140 for the last), plus four roaming drones (+25 when shot; they chase
   pilots in line of sight and damage them on contact). An edge marker points to the nearest target.
-* link:../modules/Text%20Demo/text_demo.c[+modules/Text Demo/text_demo.c+] demonstrates C text output,
+* link:../programs/text-demo/src/text_demo.c[+programs/text-demo/src/text_demo.c+] demonstrates C text output,
   cursor positioning, buffered keyboard input, and printing.
-* link:../modules/Asteroids/asteroids.c[+modules/Asteroids/asteroids.c+] and
-  link:../modules/Space%20Invaders/space_invaders.c[+modules/Space Invaders/space_invaders.c+]
+* link:../programs/asteroids/src/asteroids.c[+programs/asteroids/src/asteroids.c+] and
+  link:../programs/space-invaders/src/space_invaders.c[+programs/space-invaders/src/space_invaders.c+]
   are playable C games.
-* link:../modules/PacMan/pacman.c[+modules/PacMan/pacman.c+] is a tile-based maze game with ghost
+* link:../programs/pacman/src/pacman.c[+programs/pacman/src/pacman.c+] is a tile-based maze game with ghost
   AI, power pellets, and tunnel wrapping.
-* link:../modules/SC-16%20showcase/sc16_showcase.c[+modules/SC-16 showcase/sc16_showcase.c+] presents an interactive
+* link:../programs/sc16-showcase/src/sc16_showcase.c[+programs/sc16-showcase/src/sc16_showcase.c+] presents an interactive
   eight-page SC-16 feature tour and benchmark. The playable games are written in C
   and use the graphics API; their controls are described in the Games section.
 
@@ -1863,7 +1867,7 @@ conventional 8-bit processor.
 
 == 11. Reusable graphics library
 
-link:../lib/lib_gfx.asm[+lib/lib_gfx.asm+] provides assembly-callable routines.
+link:../toolchain/runtime/lib_gfx.asm[+toolchain/runtime/lib_gfx.asm+] provides assembly-callable routines.
 Include it after the main code (its routines occupy addresses starting at
 +0x0400+):
 
@@ -1876,7 +1880,7 @@ start:
     LDI R2, 25
     CALL GFX_PLOT
     HALT
-.include "lib_gfx.asm"
+.include "toolchain/runtime/lib_gfx.asm"
 ----
 
 +CALL+/+RET+ and the full-width conditional branches support reusable routines.
@@ -1957,7 +1961,7 @@ C globals start at 0x80000.
 
 Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
 
-    cargo run --bin sc16build -- "modules/SC-16 showcase/sc16_showcase.c" showcase.sc16img
+    cargo run --bin sc16build -- "programs/sc16-showcase/src/sc16_showcase.c" showcase.sc16img
     cargo run -- showcase.sc16img
 
 == CPU execution

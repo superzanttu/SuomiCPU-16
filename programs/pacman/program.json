@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "pacman",
+  "name": "PacMan",
+  "legacy_disk": "APP00011",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/pacman.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

@@ -1,0 +1,10 @@
+{
+  "capacity_bytes": 1048576,
+  "id": "disk-editor",
+  "label": "DiskEditor",
+  "protected_files": [
+    "main.bin"
+  ],
+  "read_only": false,
+  "version": 1
+}

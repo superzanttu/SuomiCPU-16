@@ -1,0 +1,10 @@
+{
+  "capacity_bytes": 67108864,
+  "id": "hertta-3d",
+  "label": "Hertta-3D",
+  "protected_files": [
+    "main.bin"
+  ],
+  "read_only": false,
+  "version": 1
+}

@@ -14,3 +14,35 @@ serde_json = "1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 minifb = "0.28"
 socket2 = "0.6"
+
+[[bin]]
+name = "sc16asm"
+path = "src/tools/sc16asm.rs"
+
+[[bin]]
+name = "sc16build"
+path = "src/tools/sc16build.rs"
+
+[[bin]]
+name = "sc16gallery"
+path = "src/tools/sc16gallery.rs"
+
+[[bin]]
+name = "sc16mapedit"
+path = "programs/tank-16/tools/sc16mapedit.rs"
+
+[[bin]]
+name = "sc16maps"
+path = "programs/tank-16/tools/sc16maps.rs"
+
+[[bin]]
+name = "sc16objects"
+path = "programs/tank-16/tools/sc16objects.rs"
+
+[[bin]]
+name = "sc16sprites"
+path = "programs/tank-16/tools/sc16sprites.rs"
+
+[[bin]]
+name = "sc16tank"
+path = "programs/tank-16/tools/sc16tank.rs"

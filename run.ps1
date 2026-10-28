@@ -14,8 +14,8 @@ if (!(Get-Command cargo -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-$BiosSource = Join-Path $ScriptDir "bios.asm"
-$BiosImage = Join-Path $ScriptDir "bios.bin"
+$BiosSource = Join-Path $ScriptDir "firmware\bios.asm"
+$BiosImage = Join-Path $ScriptDir "firmware\bios.bin"
 $RebuildBios = !(Test-Path $BiosImage)
 if (!$RebuildBios) {
     $RebuildBios = (Get-Item $BiosSource).LastWriteTimeUtc -gt (Get-Item $BiosImage).LastWriteTimeUtc

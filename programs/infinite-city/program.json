@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "infinite-city",
+  "name": "Infinite CIty",
+  "legacy_disk": "APP00007",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/infinite_city.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

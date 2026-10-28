@@ -1,0 +1,19583 @@
+use crate::image::ProgramImage;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub value: String,
+    pub line: usize,
+    pub filename: Option<String>,
+    pub leading_space: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CCompilerError(pub String);
+
+impl std::fmt::Display for CCompilerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CCompilerError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expression {
+    pub kind: ExpressionKind,
+    pub line: usize,
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressionKind {
+    Atom(String),
+    Unary {
+        operator: String,
+        operand: Box<Expression>,
+    },
+    Binary {
+        operator: String,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
+    Assignment {
+        operator: String,
+        target: Box<Expression>,
+        value: Box<Expression>,
+    },
+    Conditional {
+        condition: Box<Expression>,
+        when_true: Box<Expression>,
+        when_false: Box<Expression>,
+    },
+    Call {
+        function: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
+    Index {
+        expression: Box<Expression>,
+        index: Box<Expression>,
+    },
+    Member {
+        expression: Box<Expression>,
+        operator: String,
+        name: String,
+    },
+    Postfix {
+        operator: String,
+        expression: Box<Expression>,
+    },
+    Cast {
+        c_type: String,
+        expression: Box<Expression>,
+    },
+    SizeofType(String),
+    SizeofExpression(Box<Expression>),
+    InitializerList(Vec<Expression>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    pub c_type: String,
+    pub name: String,
+    pub array_length: Option<usize>,
+    pub array_dimensions: Vec<usize>,
+    pub initializer: Option<Expression>,
+}
+
+const INCOMPLETE_ARRAY_LENGTH: usize = usize::MAX;
+
+fn infer_incomplete_array_length(c_type: &str, initializer: &Expression) -> Option<usize> {
+    match &initializer.kind {
+        ExpressionKind::InitializerList(values) => Some(values.len()),
+        ExpressionKind::Atom(value)
+            if matches!(c_type.trim(), "char" | "signed char" | "unsigned char") =>
+        {
+            decode_string_token(value)?.len().checked_add(1)
+        }
+        _ => None,
+    }
+}
+
+fn flatten_initializer_values(expression: &Expression) -> Option<Vec<&Expression>> {
+    match &expression.kind {
+        ExpressionKind::InitializerList(values) => {
+            values.iter().try_fold(Vec::new(), |mut flattened, value| {
+                flattened.extend(flatten_initializer_values(value)?);
+                Some(flattened)
+            })
+        }
+        _ => Some(vec![scalar_initializer(expression)?]),
+    }
+}
+
+fn write_native_record_initializer(
+    layout: &NativeRecordLayout,
+    expression: &Expression,
+    data: &mut [u8],
+    base_offset: usize,
+    enumerators: &HashMap<String, i64>,
+) -> Option<()> {
+    let ExpressionKind::InitializerList(values) = &expression.kind else {
+        return None;
+    };
+    if values.len() > layout.field_order.len() || (layout.is_union && values.len() > 1) {
+        return None;
+    }
+    for (name, initializer) in layout.field_order.iter().zip(values) {
+        let field = layout.fields.get(name)?;
+        let field_offset = base_offset.checked_add(field.offset)?;
+        if let Some((shift, width)) = field.bit_field {
+            let value =
+                evaluate_integer_constant_with_names(scalar_initializer(initializer)?, enumerators)
+                    .ok()? as u16;
+            let target = data.get_mut(field_offset..field_offset.checked_add(2)?)?;
+            let mask = (u16::MAX >> (16 - width)) << shift;
+            let unit = u16::from_be_bytes([target[0], target[1]]);
+            target.copy_from_slice(&((unit & !mask) | ((value << shift) & mask)).to_be_bytes());
+        } else if let Some(nested_layout) = &field.record_layout {
+            if field.dimensions.is_empty() {
+                write_native_record_initializer(
+                    nested_layout,
+                    initializer,
+                    data,
+                    field_offset,
+                    enumerators,
+                )?;
+            } else {
+                if field.dimensions.len() != 1 {
+                    return None;
+                }
+                let ExpressionKind::InitializerList(elements) = &initializer.kind else {
+                    return None;
+                };
+                if elements.len() > field.dimensions[0] {
+                    return None;
+                }
+                for (index, element) in elements.iter().enumerate() {
+                    write_native_record_initializer(
+                        nested_layout,
+                        element,
+                        data,
+                        field_offset.checked_add(index.checked_mul(field.element_size)?)?,
+                        enumerators,
+                    )?;
+                }
+            }
+        } else if !field.dimensions.is_empty() {
+            let values = if let ExpressionKind::Atom(token) = &initializer.kind
+                && let Some(bytes) = decode_string_token(token)
+            {
+                if field.element_size != 1 || bytes.len() > field.size {
+                    return None;
+                }
+                for (index, byte) in bytes.into_iter().enumerate() {
+                    *data.get_mut(field_offset.checked_add(index)?)? = byte;
+                }
+                continue;
+            } else {
+                flatten_initializer_values(initializer)?
+            };
+            if values.len() > field.size / field.element_size {
+                return None;
+            }
+            for (index, value) in values.into_iter().enumerate() {
+                let value = evaluate_integer_constant_with_names(value, enumerators).ok()?;
+                let offset = field_offset.checked_add(index.checked_mul(field.element_size)?)?;
+                if field.element_size == 1 {
+                    *data.get_mut(offset)? = value as u8;
+                } else if field.element_size == 2 {
+                    let value = value as u16;
+                    let target = data.get_mut(offset..offset.checked_add(2)?)?;
+                    target.copy_from_slice(&value.to_be_bytes());
+                } else {
+                    return None;
+                }
+            }
+        } else {
+            let value = scalar_initializer(initializer)?;
+            let value = evaluate_integer_constant_with_names(value, enumerators).ok()?;
+            if field.size == 1 {
+                *data.get_mut(field_offset)? = value as u8;
+            } else if field.size == 2 {
+                let value = value as u16;
+                let target = data.get_mut(field_offset..field_offset.checked_add(2)?)?;
+                target.copy_from_slice(&value.to_be_bytes());
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
+    pub kind: StatementKind,
+    pub line: usize,
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementKind {
+    Compound(Vec<Statement>),
+    Declaration(Vec<Declaration>),
+    Expression(Option<Expression>),
+    Return(Option<Expression>),
+    If {
+        condition: Expression,
+        then_branch: Box<Statement>,
+        else_branch: Option<Box<Statement>>,
+    },
+    While {
+        condition: Expression,
+        body: Box<Statement>,
+    },
+    DoWhile {
+        body: Box<Statement>,
+        condition: Expression,
+    },
+    For {
+        initializer: Option<Box<Statement>>,
+        condition: Option<Expression>,
+        update: Option<Expression>,
+        body: Box<Statement>,
+    },
+    Switch {
+        expression: Expression,
+        cases: Vec<(Option<Expression>, Vec<Statement>)>,
+    },
+    Break,
+    Continue,
+    Goto(String),
+    Label {
+        name: String,
+        statement: Box<Statement>,
+    },
+}
+
+fn native_statement_kind(statement: &StatementKind) -> &'static str {
+    match statement {
+        StatementKind::Compound(_) => "compound statement",
+        StatementKind::Declaration(_) => "declaration",
+        StatementKind::Expression(_) => "expression",
+        StatementKind::Return(_) => "return statement",
+        StatementKind::If { .. } => "if statement",
+        StatementKind::While { .. } => "while loop",
+        StatementKind::DoWhile { .. } => "do-while loop",
+        StatementKind::For { .. } => "for loop",
+        StatementKind::Switch { .. } => "switch statement",
+        StatementKind::Break => "break statement",
+        StatementKind::Continue => "continue statement",
+        StatementKind::Goto(_) => "goto statement",
+        StatementKind::Label { .. } => "label",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionParameter {
+    pub c_type: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDeclaration {
+    pub return_type: String,
+    pub name: String,
+    pub parameters: Vec<FunctionParameter>,
+    pub variadic: bool,
+    pub has_prototype: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDefinition {
+    pub declaration: FunctionDeclaration,
+    pub body: Statement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacroDefinition {
+    parameters: Option<Vec<String>>,
+    replacement: Vec<Token>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalDeclaration {
+    Global(Declaration),
+    FunctionPrototype(FunctionDeclaration),
+    FunctionDefinition(FunctionDefinition),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationUnit {
+    pub declarations: Vec<ExternalDeclaration>,
+    pub enumerators: HashMap<String, i64>,
+    records: HashMap<String, NativeRecordLayout>,
+}
+
+#[derive(Clone)]
+enum NativeArgumentKind {
+    Byte,
+    Word,
+    Pointer,
+    WideInteger,
+    Binary32,
+    Binary64,
+    Record(NativeRecordLayout),
+}
+
+impl NativeArgumentKind {
+    fn size(&self) -> usize {
+        match self {
+            Self::Byte => 1,
+            Self::Word => 2,
+            Self::Pointer | Self::WideInteger | Self::Binary32 => 4,
+            Self::Binary64 => 8,
+            Self::Record(layout) => layout.size,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NativeStackArgument {
+    kind: NativeArgumentKind,
+    offset: usize,
+    unsigned: bool,
+    pointer_target_is_const: bool,
+}
+
+#[derive(Clone)]
+struct NativeCallLayout {
+    arguments: Vec<NativeStackArgument>,
+    size: usize,
+    variadic: bool,
+    has_prototype: bool,
+}
+
+impl NativeCallLayout {
+    fn new(
+        parameters: &[FunctionParameter],
+        records: &HashMap<String, NativeRecordLayout>,
+        variadic: bool,
+        has_prototype: bool,
+    ) -> Option<Self> {
+        let mut arguments = Vec::with_capacity(parameters.len());
+        let mut size = 0usize;
+        for parameter in parameters {
+            let kind = if native_is_pointer_type(&parameter.c_type, records) {
+                NativeArgumentKind::Pointer
+            } else if let Some(layout) = records.get(native_unqualified_type(&parameter.c_type)) {
+                NativeArgumentKind::Record(layout.clone())
+            } else if native_byte_type(&parameter.c_type).is_some() {
+                NativeArgumentKind::Byte
+            } else if let Some(width) = native_floating_type_size(&parameter.c_type) {
+                match width {
+                    4 => NativeArgumentKind::Binary32,
+                    8 => NativeArgumentKind::Binary64,
+                    _ => return None,
+                }
+            } else if is_native_stack_word_type(&parameter.c_type) {
+                NativeArgumentKind::Word
+            } else if is_native_wide_integer_type(&parameter.c_type) {
+                NativeArgumentKind::WideInteger
+            } else {
+                return None;
+            };
+            let offset = size;
+            size = size.checked_add(kind.size())?;
+            if size > u16::MAX as usize {
+                return None;
+            }
+            arguments.push(NativeStackArgument {
+                kind,
+                offset,
+                unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                pointer_target_is_const: native_pointer_target_is_const(&parameter.c_type),
+            });
+        }
+        Some(Self {
+            arguments,
+            size,
+            variadic,
+            has_prototype,
+        })
+    }
+
+    fn needs_stack_parameters(&self) -> bool {
+        self.arguments.iter().any(|argument| {
+            matches!(
+                argument.kind,
+                NativeArgumentKind::Binary32
+                    | NativeArgumentKind::Binary64
+                    | NativeArgumentKind::WideInteger
+                    | NativeArgumentKind::Record(_)
+            )
+        })
+    }
+}
+
+#[derive(Clone)]
+enum NativeLocation {
+    Register {
+        register: u8,
+        unsigned: bool,
+    },
+    ByteRegister {
+        register: u8,
+        signed: bool,
+    },
+    PointerRegister {
+        register: u8,
+        element_size: usize,
+        element_signed: bool,
+        element_is_const: bool,
+        element_floating_size: usize,
+        record_layout: Option<NativeRecordLayout>,
+    },
+    PointerStack {
+        offset: usize,
+        element_size: usize,
+        element_signed: bool,
+        element_is_const: bool,
+        element_floating_size: usize,
+        record_layout: Option<NativeRecordLayout>,
+    },
+    StackScalar {
+        offset: usize,
+        unsigned: bool,
+    },
+    StackWideScalar {
+        offset: usize,
+        unsigned: bool,
+    },
+    FloatingPointScalar {
+        size: usize,
+    },
+    StackFloatingPointScalar {
+        offset: usize,
+        size: usize,
+    },
+    ByteStackScalar {
+        offset: usize,
+        signed: bool,
+    },
+    Constant(i64),
+    GlobalScalar {
+        unsigned: bool,
+    },
+    GlobalWideScalar {
+        unsigned: bool,
+    },
+    GlobalByteScalar {
+        signed: bool,
+    },
+    GlobalPointer {
+        element_size: usize,
+        element_signed: bool,
+        element_is_const: bool,
+        element_floating_size: usize,
+        record_layout: Option<NativeRecordLayout>,
+    },
+    GlobalArray {
+        length: usize,
+        dimensions: Vec<usize>,
+        element_size: usize,
+        element_signed: bool,
+        element_floating_size: usize,
+    },
+    GlobalRecord {
+        dimensions: Vec<usize>,
+        layout: NativeRecordLayout,
+    },
+    StackRecord {
+        offset: usize,
+        dimensions: Vec<usize>,
+        layout: NativeRecordLayout,
+    },
+    FunctionParameters {
+        layout: Option<NativeCallLayout>,
+        float_return_size: usize,
+        wide_return_unsigned: Option<bool>,
+        word_return_unsigned: bool,
+        returns_pointer: bool,
+        pointer_return_target_is_const: bool,
+        pointer_return_element_size: Option<usize>,
+        pointer_return_element_signed: bool,
+        pointer_return_floating_size: usize,
+        pointer_return_is_record: bool,
+    },
+    StackArray {
+        offset: usize,
+        length: usize,
+        dimensions: Vec<usize>,
+        element_size: usize,
+        element_signed: bool,
+        element_floating_size: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeRecordField {
+    offset: usize,
+    size: usize,
+    signed: bool,
+    is_const: bool,
+    floating_size: usize,
+    bit_field: Option<(usize, usize)>,
+    record_layout: Option<Box<NativeRecordLayout>>,
+    dimensions: Vec<usize>,
+    element_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeRecordLayout {
+    size: usize,
+    is_union: bool,
+    fields: HashMap<String, NativeRecordField>,
+    field_order: Vec<String>,
+    bit_field_units: Vec<usize>,
+}
+
+struct NativeGlobal {
+    name: String,
+    c_type: String,
+    data: Vec<u8>,
+    is_array: bool,
+    is_pointer: bool,
+    array_dimensions: Vec<usize>,
+    element_size: usize,
+    element_signed: bool,
+    pointer_element: Option<(usize, bool)>,
+    record_layout: Option<NativeRecordLayout>,
+    has_initializer: bool,
+}
+
+const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 4] = [
+    (
+        "lib_cgfx.asm",
+        include_str!("../../toolchain/runtime/lib_cgfx.asm"),
+    ),
+    (
+        "lib_text.asm",
+        include_str!("../../toolchain/runtime/lib_text.asm"),
+    ),
+    (
+        "lib_stdio.asm",
+        include_str!("../../toolchain/runtime/lib_stdio.asm"),
+    ),
+    (
+        "lib_syscall.asm",
+        include_str!("../../toolchain/runtime/lib_syscall.asm"),
+    ),
+];
+
+const HOSTED_STDIO_FILE_FUNCTIONS: [&str; 14] = [
+    "fopen", "fclose", "fgetc", "fputc", "fread", "fwrite", "fseek", "ftell", "ungetc", "clearerr",
+    "feof", "ferror", "remove", "freopen",
+];
+
+fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
+    NATIVE_ASSEMBLY_LIBRARIES
+        .iter()
+        .find(|(_, source)| {
+            source.lines().any(|line| {
+                line.trim()
+                    .strip_suffix(':')
+                    .is_some_and(|label| label == symbol)
+            })
+        })
+        .map(|(name, _)| *name)
+}
+
+fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Expression]) -> bool {
+    match function {
+        "sc16_spawn" | "sc16_spawn_arg" | "sc16_open" | "__stdio_mode_flags" => index == 0,
+        "sc16_mmap" => index == 2,
+        "sc16_read" | "sc16_write" | "sc16_process_info" => index == 1,
+        "sc16_net_discover" => index == 0,
+        "sc16_net_send" | "sc16_net_receive" => matches!(index, 0 | 1),
+        "gfx_sprite" | "gfx_bitmap" => index == 4,
+        "gfx_poly" => index == 3,
+        "gfx_sprite_upload" => index == 3,
+        "gfx_tile_upload" => index == 1,
+        "gfx_tilemap" | "gfx_tilemap_wide" | "gfx3d_draw" => index == 0,
+        "gfx_world_emitters" | "gfx_world_emitters_wide" => index == 0,
+        "gfx_text" => index == 2,
+        "puts"
+        | "bug_monitor_debug"
+        | "bug_monitor_info"
+        | "bug_monitor_warning"
+        | "bug_monitor_error" => index == 0,
+        "fgets" => matches!(index, 0 | 2),
+        "printf" if index == 0 => true,
+        "printf" => {
+            native_printf_specifiers(arguments)
+                .and_then(|specifiers| specifiers.get(index - 1).copied())
+                == Some(b's')
+        }
+        _ => false,
+    }
+}
+
+fn native_argument_is_wide_integer(function: &str, index: usize) -> bool {
+    matches!(
+        (function, index),
+        ("sc16_mmap" | "sc16_sleep" | "sc16_wait" | "sc16_trywait", 0)
+            | ("sc16_seek" | "sc16_semop" | "sc16_spawn_arg", 1)
+    )
+}
+
+fn native_printf_specifiers(arguments: &[Expression]) -> Option<Vec<u8>> {
+    if arguments.is_empty() {
+        return None;
+    }
+    let format = arguments
+        .first()
+        .and_then(|expression| match &expression.kind {
+            ExpressionKind::Atom(token) => decode_string_token(token),
+            _ => None,
+        })?;
+    let mut specifiers = Vec::new();
+    let mut position = 0;
+    while position < format.len() {
+        if format[position] != b'%' {
+            position += 1;
+            continue;
+        }
+        position += 1;
+        match format.get(position) {
+            Some(b'%') => position += 1,
+            Some(specifier @ (b's' | b'd' | b'i' | b'u' | b'c')) => {
+                specifiers.push(*specifier);
+                position += 1;
+            }
+            _ => return None,
+        }
+    }
+    (specifiers.len() + 1 == arguments.len() && arguments.len() <= 32).then_some(specifiers)
+}
+
+fn native_printf_call_is_supported(arguments: &[Expression]) -> bool {
+    native_printf_specifiers(arguments).is_some()
+}
+
+fn emit_native_pointer_push(assembly: &mut String) {
+    assembly.push_str("    SPLIT30 R4, R5\n    PUSH R4\n    PUSH R5\n");
+}
+
+fn emit_native_variadic_argument(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<usize> {
+    let kind = if native_expression_floating_size(expression, locals).is_some() {
+        NativeArgumentKind::Binary64
+    } else if let Some(layout) = native_expression_record_layout(expression, locals) {
+        NativeArgumentKind::Record(layout.clone())
+    } else if native_expression_pointer_element_size(expression, locals).is_some()
+        || matches!(&expression.kind, ExpressionKind::Atom(token) if native_string_label(token).is_some())
+    {
+        NativeArgumentKind::Pointer
+    } else if native_expression_is_wide_integer(expression, locals) {
+        NativeArgumentKind::WideInteger
+    } else {
+        NativeArgumentKind::Word
+    };
+    match kind {
+        NativeArgumentKind::Binary64 => {
+            if !emit_native_floating_conversion(expression, 8, locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str("    PUSH R7\n    PUSH R6\n    PUSH R5\n    PUSH R4\n");
+            Some(8)
+        }
+        NativeArgumentKind::Record(layout) => {
+            if layout.size % 2 != 0 {
+                return None;
+            }
+            let address = Expression {
+                kind: ExpressionKind::Unary {
+                    operator: "&".to_owned(),
+                    operand: Box::new(expression.clone()),
+                },
+                line: expression.line,
+                filename: expression.filename.clone(),
+            };
+            if !emit_native_expression(&address, 0, &[4, 5, 6], locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str("    MOV R7, R0\n");
+            for offset in (0..layout.size).step_by(2).rev() {
+                if offset == 0 {
+                    assembly.push_str("    LDW R5, R7\n");
+                } else {
+                    assembly.push_str(&format!(
+                        "    MOV R0, R7\n    LDI R6, {offset}\n\
+                         ADD R0, R6\n    LDW R5, R0\n"
+                    ));
+                }
+                assembly.push_str("    PUSH R5\n");
+            }
+            Some(layout.size)
+        }
+        NativeArgumentKind::Pointer => {
+            if !emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly) {
+                return None;
+            }
+            emit_native_pointer_push(assembly);
+            Some(4)
+        }
+        NativeArgumentKind::WideInteger => {
+            if !emit_native_wide_conversion(
+                expression,
+                native_expression_is_unsigned(expression, locals),
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str("    PUSH R5\n    PUSH R4\n");
+            Some(4)
+        }
+        NativeArgumentKind::Word => {
+            if !emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str("    PUSH R4\n");
+            Some(2)
+        }
+        NativeArgumentKind::Byte | NativeArgumentKind::Binary32 => unreachable!(),
+    }
+}
+
+fn native_library_pointer_element_size(function: &str, index: usize) -> usize {
+    match (function, index) {
+        ("gfx3d_draw", 0) => 2,
+        _ => 1,
+    }
+}
+
+fn emit_native_library_pointer_argument(
+    function: &str,
+    index: usize,
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if let ExpressionKind::Binary {
+        operator,
+        left,
+        right,
+    } = &expression.kind
+        && matches!(operator.as_str(), "+" | "-")
+    {
+        if !emit_native_expression(left, 4, &[6, 7], locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str("    ADJSP -4\n    MOVSP R7\n    STP R4, R7\n");
+        if !emit_native_expression(right, 6, &[7], locals, label_counter, assembly) {
+            return false;
+        }
+        if native_library_pointer_element_size(function, index) == 2 {
+            assembly.push_str("    SHL R6, 1\n");
+        }
+        assembly.push_str("    MOVSP R7\n    LDP R4, R7\n    ADJSP 4\n");
+        assembly.push_str(&format!(
+            "    {} R4, R6\n",
+            if operator == "+" { "ADD" } else { "SUB" }
+        ));
+        true
+    } else {
+        emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly)
+    }
+}
+
+fn native_unqualified_type(c_type: &str) -> &str {
+    let mut c_type = c_type.trim();
+    while let Some(unqualified) = ["const ", "volatile ", "restrict "]
+        .into_iter()
+        .find_map(|qualifier| c_type.strip_prefix(qualifier))
+    {
+        c_type = unqualified.trim();
+    }
+    c_type
+}
+
+fn native_type_is_const_qualified(c_type: &str) -> bool {
+    c_type
+        .split('*')
+        .next()
+        .unwrap_or(c_type)
+        .split_whitespace()
+        .any(|word| word == "const")
+}
+
+fn native_pointer_target_is_const(c_type: &str) -> bool {
+    c_type.matches('*').count() == 1 && native_type_is_const_qualified(c_type)
+}
+
+fn native_object_is_const_qualified(c_type: &str) -> bool {
+    !c_type.contains('*') && native_type_is_const_qualified(c_type)
+}
+
+fn is_native_word_type(c_type: &str) -> bool {
+    matches!(
+        native_unqualified_type(c_type),
+        "int" | "unsigned int" | "long" | "unsigned long"
+    )
+}
+
+fn is_native_wide_integer_type(c_type: &str) -> bool {
+    matches!(
+        native_unqualified_type(c_type),
+        "long" | "signed long" | "unsigned long"
+    )
+}
+
+fn is_native_stack_word_type(c_type: &str) -> bool {
+    is_native_word_type(c_type) && !is_native_wide_integer_type(c_type)
+}
+
+fn is_native_unsigned_word_type(c_type: &str) -> bool {
+    matches!(
+        native_unqualified_type(c_type),
+        "unsigned" | "unsigned int" | "unsigned long"
+    )
+}
+
+fn native_byte_type(c_type: &str) -> Option<bool> {
+    match native_unqualified_type(c_type) {
+        "char" | "signed char" => Some(true),
+        "unsigned char" => Some(false),
+        _ => None,
+    }
+}
+
+fn native_pointer_element(c_type: &str) -> Option<(usize, bool)> {
+    let base_type = native_unqualified_type(c_type).strip_suffix('*')?.trim();
+    let base_type = native_unqualified_type(base_type);
+    match base_type {
+        "void" => Some((1, false)),
+        "char" | "signed char" => Some((1, true)),
+        "unsigned char" => Some((1, false)),
+        "int" => Some((2, true)),
+        "unsigned int" => Some((2, false)),
+        "long" => Some((4, true)),
+        "unsigned long" => Some((4, false)),
+        "float" => Some((4, true)),
+        "double" | "long double" => Some((8, false)),
+        _ => None,
+    }
+}
+
+fn native_pointer_element_floating_size(c_type: &str) -> usize {
+    native_unqualified_type(c_type)
+        .strip_suffix('*')
+        .and_then(|base_type| native_floating_type_size(base_type.trim()))
+        .unwrap_or(0)
+}
+
+fn native_record_pointer(
+    c_type: &str,
+    records: &HashMap<String, NativeRecordLayout>,
+) -> Option<NativeRecordLayout> {
+    let base_type = c_type.trim().strip_suffix('*')?.trim();
+    let base_type = base_type
+        .strip_prefix("const ")
+        .or_else(|| base_type.strip_prefix("volatile "))
+        .or_else(|| base_type.strip_prefix("restrict "))
+        .unwrap_or(base_type)
+        .trim();
+    let record_name = base_type
+        .strip_prefix("struct ")
+        .or_else(|| base_type.strip_prefix("union "))
+        .unwrap_or(base_type)
+        .trim();
+    let record_key = if base_type.starts_with("union ") {
+        format!("union {record_name}")
+    } else {
+        format!("struct {record_name}")
+    };
+    records.get(&record_key).cloned()
+}
+
+fn native_is_struct_pointer_type(c_type: &str) -> bool {
+    c_type
+        .trim()
+        .strip_suffix('*')
+        .is_some_and(|base_type| base_type.trim().starts_with("struct "))
+}
+
+fn native_pointer_element_or_record(
+    c_type: &str,
+    records: &HashMap<String, NativeRecordLayout>,
+) -> Option<(usize, bool)> {
+    native_pointer_element(c_type)
+        .or_else(|| native_record_pointer(c_type, records).map(|layout| (layout.size, false)))
+        .or_else(|| native_is_struct_pointer_type(c_type).then_some((1, false)))
+}
+
+fn native_is_pointer_type(c_type: &str, records: &HashMap<String, NativeRecordLayout>) -> bool {
+    native_pointer_element_or_record(c_type, records).is_some()
+}
+
+fn is_native_parameter_type(c_type: &str, records: &HashMap<String, NativeRecordLayout>) -> bool {
+    is_native_word_type(c_type)
+        || native_byte_type(c_type).is_some()
+        || native_pointer_element(c_type).is_some()
+        || native_floating_type_size(c_type).is_some()
+        || records.contains_key(native_unqualified_type(c_type))
+        || c_type
+            .trim()
+            .strip_suffix('*')
+            .is_some_and(|base_type| base_type.trim().starts_with("struct "))
+}
+
+fn is_native_return_type(c_type: &str) -> bool {
+    is_native_word_type(c_type)
+        || native_byte_type(c_type).is_some()
+        || native_pointer_element(c_type).is_some()
+        || native_floating_type_size(c_type).is_some()
+        || c_type
+            .trim()
+            .strip_suffix('*')
+            .is_some_and(|base_type| base_type.trim().starts_with("struct "))
+}
+
+fn native_function_types_match(left: &FunctionDeclaration, right: &FunctionDeclaration) -> bool {
+    let parameter_type = |c_type: &str| {
+        let c_type = if c_type.contains('*') {
+            c_type.trim()
+        } else {
+            native_unqualified_type(c_type)
+        };
+        match c_type {
+            "signed" | "signed int" => "int".to_owned(),
+            "unsigned" => "unsigned int".to_owned(),
+            "signed long" => "long".to_owned(),
+            _ => c_type.to_owned(),
+        }
+    };
+    if parameter_type(&left.return_type) != parameter_type(&right.return_type) {
+        return false;
+    }
+    match (left.has_prototype, right.has_prototype) {
+        (true, true) => {
+            left.variadic == right.variadic
+                && left.parameters.len() == right.parameters.len()
+                && left
+                    .parameters
+                    .iter()
+                    .zip(&right.parameters)
+                    .all(|(left, right)| {
+                        parameter_type(&left.c_type) == parameter_type(&right.c_type)
+                    })
+        }
+        (false, false) => true,
+        (true, false) => native_prototype_matches_default_promotions(left, &parameter_type),
+        (false, true) => native_prototype_matches_default_promotions(right, &parameter_type),
+    }
+}
+
+fn native_prototype_matches_default_promotions(
+    prototype: &FunctionDeclaration,
+    parameter_type: &impl Fn(&str) -> String,
+) -> bool {
+    !prototype.variadic
+        && prototype.parameters.iter().all(|parameter| {
+            let promoted_type = if native_byte_type(&parameter.c_type).is_some() {
+                Some("int")
+            } else if native_floating_type_size(&parameter.c_type) == Some(4) {
+                Some("double")
+            } else {
+                None
+            };
+            promoted_type.is_none_or(|promoted_type| {
+                parameter_type(&parameter.c_type) == parameter_type(promoted_type)
+            })
+        })
+}
+
+pub struct ExpressionParser {
+    tokens: Vec<Token>,
+    position: usize,
+    typedefs: HashMap<String, String>,
+}
+
+fn evaluate_integer_constant_with_names(
+    expression: &Expression,
+    names: &HashMap<String, i64>,
+) -> Result<i64, CCompilerError> {
+    let fail = || {
+        error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "expected an integer constant expression",
+        )
+    };
+    match &expression.kind {
+        ExpressionKind::Atom(value) => parse_integer_constant(value)
+            .or_else(|| names.get(value).copied())
+            .ok_or_else(fail),
+        ExpressionKind::Unary { operator, operand } => {
+            let value = evaluate_integer_constant_with_names(operand, names)?;
+            match operator.as_str() {
+                "+" => Ok(value),
+                "-" => value.checked_neg().ok_or_else(fail),
+                "!" => Ok(i64::from(value == 0)),
+                "~" => Ok((!(value as u32)) as i32 as i64),
+                _ => Err(fail()),
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left = evaluate_integer_constant_with_names(left, names)?;
+            if operator == "&&" && left == 0 {
+                return Ok(0);
+            }
+            if operator == "||" && left != 0 {
+                return Ok(1);
+            }
+            let right = evaluate_integer_constant_with_names(right, names)?;
+            let result = match operator.as_str() {
+                "||" => i64::from(right != 0),
+                "&&" => i64::from(right != 0),
+                "|" => (left as u32 | right as u32) as i32 as i64,
+                "^" => (left as u32 ^ right as u32) as i32 as i64,
+                "&" => (left as u32 & right as u32) as i32 as i64,
+                "==" => i64::from(left == right),
+                "!=" => i64::from(left != right),
+                "<" => i64::from(left < right),
+                "<=" => i64::from(left <= right),
+                ">" => i64::from(left > right),
+                ">=" => i64::from(left >= right),
+                "<<" if (0..32).contains(&right) => {
+                    ((left as u32).wrapping_shl(right as u32)) as i32 as i64
+                }
+                ">>" if (0..32).contains(&right) => ((left as i32) >> (right as u32)) as i64,
+                "+" => left.checked_add(right).ok_or_else(fail)?,
+                "-" => left.checked_sub(right).ok_or_else(fail)?,
+                "*" => left.checked_mul(right).ok_or_else(fail)?,
+                "/" if right != 0 => left.checked_div(right).ok_or_else(fail)?,
+                "%" if right != 0 => left.checked_rem(right).ok_or_else(fail)?,
+                _ => return Err(fail()),
+            };
+            Ok(result)
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            if evaluate_integer_constant_with_names(condition, names)? != 0 {
+                evaluate_integer_constant_with_names(when_true, names)
+            } else {
+                evaluate_integer_constant_with_names(when_false, names)
+            }
+        }
+        ExpressionKind::InitializerList(_) => Err(fail()),
+        _ => Err(fail()),
+    }
+}
+
+fn scalar_initializer(expression: &Expression) -> Option<&Expression> {
+    match &expression.kind {
+        ExpressionKind::InitializerList(elements) if elements.len() == 1 => {
+            scalar_initializer(&elements[0])
+        }
+        ExpressionKind::InitializerList(_) => None,
+        _ => Some(expression),
+    }
+}
+
+fn collect_string_literals_expression(expression: &Expression, literals: &mut HashSet<String>) {
+    match &expression.kind {
+        ExpressionKind::Atom(value) if decode_string_token(value).is_some() => {
+            literals.insert(value.clone());
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            collect_string_literals_expression(operand, literals);
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Assignment {
+            target: left,
+            value: right,
+            ..
+        } => {
+            collect_string_literals_expression(left, literals);
+            collect_string_literals_expression(right, literals);
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            collect_string_literals_expression(condition, literals);
+            collect_string_literals_expression(when_true, literals);
+            collect_string_literals_expression(when_false, literals);
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            collect_string_literals_expression(function, literals);
+            for argument in arguments {
+                collect_string_literals_expression(argument, literals);
+            }
+        }
+        ExpressionKind::Index { expression, index } => {
+            collect_string_literals_expression(expression, literals);
+            collect_string_literals_expression(index, literals);
+        }
+        ExpressionKind::Member { expression, .. } => {
+            collect_string_literals_expression(expression, literals);
+        }
+        ExpressionKind::InitializerList(values) => {
+            for value in values {
+                collect_string_literals_expression(value, literals);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_string_literals_statement(statement: &Statement, literals: &mut HashSet<String>) {
+    match &statement.kind {
+        StatementKind::Compound(statements) => {
+            for statement in statements {
+                collect_string_literals_statement(statement, literals);
+            }
+        }
+        StatementKind::Declaration(declarations) => {
+            for declaration in declarations {
+                if let Some(initializer) = &declaration.initializer {
+                    collect_string_literals_expression(initializer, literals);
+                }
+            }
+        }
+        StatementKind::Expression(Some(expression)) | StatementKind::Return(Some(expression)) => {
+            collect_string_literals_expression(expression, literals);
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_string_literals_expression(condition, literals);
+            collect_string_literals_statement(then_branch, literals);
+            if let Some(else_branch) = else_branch {
+                collect_string_literals_statement(else_branch, literals);
+            }
+        }
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            collect_string_literals_expression(condition, literals);
+            collect_string_literals_statement(body, literals);
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(initializer) = initializer {
+                collect_string_literals_statement(initializer, literals);
+            }
+            if let Some(condition) = condition {
+                collect_string_literals_expression(condition, literals);
+            }
+            if let Some(update) = update {
+                collect_string_literals_expression(update, literals);
+            }
+            collect_string_literals_statement(body, literals);
+        }
+        StatementKind::Switch { expression, cases } => {
+            collect_string_literals_expression(expression, literals);
+            for (value, statements) in cases {
+                if let Some(value) = value {
+                    collect_string_literals_expression(value, literals);
+                }
+                for statement in statements {
+                    collect_string_literals_statement(statement, literals);
+                }
+            }
+        }
+        StatementKind::Label { statement, .. } => {
+            collect_string_literals_statement(statement, literals);
+        }
+        StatementKind::Expression(None)
+        | StatementKind::Return(None)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => {}
+    }
+}
+
+fn parse_integer_constant(token: &str) -> Option<i64> {
+    let suffix_start = token.find(['u', 'U', 'l', 'L']).unwrap_or(token.len());
+    let digits = &token[..suffix_start];
+    let suffix = &token[suffix_start..];
+    if !suffix
+        .chars()
+        .all(|character| matches!(character, 'u' | 'U' | 'l' | 'L'))
+        || suffix.len() > 2
+        || suffix
+            .chars()
+            .filter(|character| matches!(character, 'u' | 'U'))
+            .count()
+            > 1
+        || suffix
+            .chars()
+            .filter(|character| matches!(character, 'l' | 'L'))
+            .count()
+            > 1
+    {
+        return None;
+    }
+    let (base, number) = if let Some(number) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, number)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+    let value = if number.is_empty() && base == 8 {
+        0
+    } else {
+        i64::from_str_radix(number, base).ok()?
+    };
+    (value <= i64::from(u32::MAX)).then_some(value)
+}
+
+pub fn compile_minimal_program(
+    source: &str,
+    filename: &str,
+) -> Result<Option<ProgramImage>, CCompilerError> {
+    let Some(assembly) = compile_minimal_program_to_assembly(source, filename)? else {
+        return Ok(None);
+    };
+    crate::assembler::assemble(&assembly, 0)
+        .map(Some)
+        .map_err(|error| CCompilerError(format!("{filename}: {error}")))
+}
+
+fn native_type_is_function_pointer(c_type: &str) -> bool {
+    let characters = c_type.chars().collect::<Vec<_>>();
+    characters.windows(2).enumerate().any(|(index, pair)| {
+        if pair != ['(', '*'] {
+            return false;
+        }
+        let mut end = index + 2;
+        while characters.get(end) == Some(&'*') {
+            end += 1;
+        }
+        characters.get(end) == Some(&')') && characters.get(end + 1) == Some(&'(')
+    })
+}
+
+fn native_type_is_pointer_to_array(c_type: &str) -> bool {
+    c_type.contains("(*") && c_type.contains(")[")
+}
+
+fn native_adjust_array_parameter_type(c_type: &str) -> String {
+    if let Some(open) = c_type.find('(') {
+        let mut pointer_end = open + 1;
+        while c_type.as_bytes().get(pointer_end) == Some(&b'*') {
+            pointer_end += 1;
+        }
+        if pointer_end > open + 1 {
+            let mut adjusted = c_type.to_owned();
+            adjusted.insert(pointer_end, '*');
+            return adjusted;
+        }
+    }
+    format!("{c_type}*")
+}
+
+fn native_statement_has_function_pointer_declaration(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Compound(statements) => statements
+            .iter()
+            .any(native_statement_has_function_pointer_declaration),
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .any(|declaration| native_type_is_function_pointer(&declaration.c_type)),
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            native_statement_has_function_pointer_declaration(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| native_statement_has_function_pointer_declaration(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            native_statement_has_function_pointer_declaration(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer.as_ref().is_some_and(|statement| {
+                native_statement_has_function_pointer_declaration(statement)
+            }) || native_statement_has_function_pointer_declaration(body)
+        }
+        StatementKind::Switch { cases, .. } => cases.iter().any(|(_, statements)| {
+            statements
+                .iter()
+                .any(native_statement_has_function_pointer_declaration)
+        }),
+        StatementKind::Label { statement, .. } => {
+            native_statement_has_function_pointer_declaration(statement)
+        }
+        StatementKind::Expression(_)
+        | StatementKind::Return(_)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => false,
+    }
+}
+
+fn native_statement_has_pointer_to_array_declaration(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Compound(statements) => statements
+            .iter()
+            .any(native_statement_has_pointer_to_array_declaration),
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .any(|declaration| native_type_is_pointer_to_array(&declaration.c_type)),
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            native_statement_has_pointer_to_array_declaration(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| native_statement_has_pointer_to_array_declaration(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            native_statement_has_pointer_to_array_declaration(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer.as_ref().is_some_and(|statement| {
+                native_statement_has_pointer_to_array_declaration(statement)
+            }) || native_statement_has_pointer_to_array_declaration(body)
+        }
+        StatementKind::Switch { cases, .. } => cases.iter().any(|(_, statements)| {
+            statements
+                .iter()
+                .any(native_statement_has_pointer_to_array_declaration)
+        }),
+        StatementKind::Label { statement, .. } => {
+            native_statement_has_pointer_to_array_declaration(statement)
+        }
+        StatementKind::Expression(_)
+        | StatementKind::Return(_)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => false,
+    }
+}
+
+pub fn compile_minimal_program_to_assembly(
+    source: &str,
+    filename: &str,
+) -> Result<Option<String>, CCompilerError> {
+    let mut parser = TranslationUnitParser::from_source(source, filename)?;
+    let unit = parser.parse()?;
+    let has_hosted_stdio_definition = unit.declarations.iter().any(|declaration| {
+        matches!(
+            declaration,
+            ExternalDeclaration::FunctionDefinition(function)
+                if HOSTED_STDIO_FILE_FUNCTIONS.contains(&function.declaration.name.as_str())
+        )
+    });
+    let uses_hosted_stdio_files = HOSTED_STDIO_FILE_FUNCTIONS.iter().any(|name| {
+        source.match_indices(name).any(|(start, _)| {
+            let end = start + name.len();
+            let before_is_identifier = source[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            let after_is_identifier = source[end..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            !before_is_identifier
+                && !after_is_identifier
+                && source[end..].trim_start().starts_with('(')
+        })
+    });
+    let unit = if uses_hosted_stdio_files && !has_hosted_stdio_definition {
+        let linked_source = format!(
+            "{source}\n{}",
+            include_str!("../../toolchain/runtime/stdio_file_runtime.c")
+        );
+        let mut parser = TranslationUnitParser::from_source(&linked_source, filename)?;
+        parser.parse()?
+    } else {
+        unit
+    };
+    for declaration in &unit.declarations {
+        let has_pointer_to_array_type = match declaration {
+            ExternalDeclaration::Global(declaration) => {
+                native_type_is_pointer_to_array(&declaration.c_type)
+            }
+            ExternalDeclaration::FunctionPrototype(function) => {
+                native_type_is_pointer_to_array(&function.return_type)
+                    || function
+                        .parameters
+                        .iter()
+                        .any(|parameter| native_type_is_pointer_to_array(&parameter.c_type))
+            }
+            ExternalDeclaration::FunctionDefinition(function) => {
+                native_type_is_pointer_to_array(&function.declaration.return_type)
+                    || function
+                        .declaration
+                        .parameters
+                        .iter()
+                        .any(|parameter| native_type_is_pointer_to_array(&parameter.c_type))
+                    || native_statement_has_pointer_to_array_declaration(&function.body)
+            }
+        };
+        if has_pointer_to_array_type {
+            return Err(CCompilerError(format!(
+                "{filename}: pointer-to-array code generation is not supported"
+            )));
+        }
+        let has_function_pointer_type = match declaration {
+            ExternalDeclaration::Global(declaration) => {
+                native_type_is_function_pointer(&declaration.c_type)
+            }
+            ExternalDeclaration::FunctionPrototype(function) => {
+                native_type_is_function_pointer(&function.return_type)
+                    || function
+                        .parameters
+                        .iter()
+                        .any(|parameter| native_type_is_function_pointer(&parameter.c_type))
+            }
+            ExternalDeclaration::FunctionDefinition(function) => {
+                native_type_is_function_pointer(&function.declaration.return_type)
+                    || function
+                        .declaration
+                        .parameters
+                        .iter()
+                        .any(|parameter| native_type_is_function_pointer(&parameter.c_type))
+                    || native_statement_has_function_pointer_declaration(&function.body)
+            }
+        };
+        if has_function_pointer_type {
+            return Err(CCompilerError(format!(
+                "{filename}: function-pointer code generation is not supported"
+            )));
+        }
+    }
+    let mut signatures: HashMap<&str, &FunctionDeclaration> = HashMap::new();
+    for declaration in &unit.declarations {
+        let function = match declaration {
+            ExternalDeclaration::FunctionDefinition(function) => &function.declaration,
+            ExternalDeclaration::FunctionPrototype(function) => function,
+            ExternalDeclaration::Global(_) => continue,
+        };
+        if let Some(previous) = signatures.insert(&function.name, function)
+            && !native_function_types_match(previous, function)
+        {
+            return Err(CCompilerError(format!(
+                "{filename}: conflicting function type for {}",
+                function.name
+            )));
+        }
+    }
+    let mut functions = Vec::new();
+    let mut globals: Vec<NativeGlobal> = Vec::new();
+    let mut static_data_size = 0usize;
+    let mut names = HashSet::new();
+    let mut global_names = HashSet::new();
+    let mut global_indices: HashMap<&str, usize> = HashMap::new();
+    let mut prototypes: HashMap<&str, (usize, bool, bool, bool)> = HashMap::new();
+    for declaration in &unit.declarations {
+        match declaration {
+            ExternalDeclaration::FunctionDefinition(function) => {
+                if !matches!(function.declaration.return_type.trim(), "void")
+                    && !is_native_return_type(&function.declaration.return_type)
+                    || function.declaration.variadic
+                    || function.declaration.parameters.len() > 32_767
+                    || global_names.contains(function.declaration.name.as_str())
+                    || function.declaration.parameters.iter().any(|parameter| {
+                        !is_native_parameter_type(&parameter.c_type, &unit.records)
+                    })
+                    || !names.insert(function.declaration.name.as_str())
+                {
+                    eprintln!(
+                        "unsupported native function definition {} returning {} with parameters ({})",
+                        function.declaration.name,
+                        function.declaration.return_type,
+                        function
+                            .declaration
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.c_type.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    return Ok(None);
+                }
+                functions.push(function.clone());
+            }
+            ExternalDeclaration::FunctionPrototype(function) => {
+                let is_library_function = native_library_for_symbol(&function.name).is_some();
+                let unsupported_prototype = ((!matches!(function.return_type.trim(), "void")
+                    && !is_native_return_type(&function.return_type))
+                    && !is_library_function)
+                    || function.parameters.len() > if is_library_function { 8 } else { 32_767 }
+                    || (!is_library_function
+                        && function.parameters.iter().any(|parameter| {
+                            !is_native_parameter_type(&parameter.c_type, &unit.records)
+                        }));
+                if global_names.contains(function.name.as_str()) {
+                    eprintln!(
+                        "function prototype {} conflicts with a global variable",
+                        function.name
+                    );
+                    return Ok(None);
+                }
+                if unsupported_prototype {
+                    continue;
+                }
+                let signature = (
+                    function.parameters.len(),
+                    function.return_type.trim() == "void",
+                    function.variadic,
+                    function.has_prototype,
+                );
+                if let Some(previous) = prototypes.get_mut(function.name.as_str()) {
+                    if previous.3 && !signature.3 {
+                        continue;
+                    }
+                    if !previous.3 && signature.3 {
+                        *previous = signature;
+                    } else if *previous != signature {
+                        return Ok(None);
+                    }
+                } else {
+                    prototypes.insert(function.name.as_str(), signature);
+                }
+            }
+            ExternalDeclaration::Global(global) => {
+                let global_type = native_unqualified_type(&global.c_type);
+                let record_layout = global_type
+                    .strip_suffix('*')
+                    .and_then(|base_type| unit.records.get(native_unqualified_type(base_type)))
+                    .or_else(|| unit.records.get(global_type))
+                    .cloned();
+                let is_record_pointer = global_type.ends_with('*') && record_layout.is_some();
+                let pointer_element = native_pointer_element(&global.c_type).or_else(|| {
+                    is_record_pointer.then(|| {
+                        (
+                            record_layout.as_ref().map_or(2, |layout| layout.size),
+                            false,
+                        )
+                    })
+                });
+                let (element_size, element_signed) = match global_type {
+                    "int" => (2, true),
+                    "unsigned int" => (2, false),
+                    "long" | "signed long" => (4, true),
+                    "unsigned long" => (4, false),
+                    "unsigned char" => (1, false),
+                    "char" | "signed char" => (1, true),
+                    "float" => (4, false),
+                    "double" | "long double" => (8, false),
+                    _ if record_layout.is_some() && !is_record_pointer => {
+                        (record_layout.as_ref().unwrap().size, false)
+                    }
+                    _ if pointer_element.is_some() => (4, false),
+                    _ => {
+                        eprintln!(
+                            "unsupported native global type {} for {}",
+                            global.c_type, global.name
+                        );
+                        return Ok(None);
+                    }
+                };
+                if (pointer_element.is_some() && global.array_length.is_some())
+                    || prototypes.contains_key(global.name.as_str())
+                {
+                    eprintln!(
+                        "unsupported native global declaration {} {}",
+                        global.c_type, global.name
+                    );
+                    return Ok(None);
+                }
+                let is_array = global.array_length.is_some();
+                let element_count = global.array_length.unwrap_or(1);
+                if element_count == 0 {
+                    eprintln!("zero-length global array {}", global.name);
+                    return Ok(None);
+                }
+                let Some(byte_count) = element_count.checked_mul(element_size) else {
+                    eprintln!("global {} exceeds the supported size", global.name);
+                    return Ok(None);
+                };
+                let mut data = vec![0; byte_count];
+                if let Some(initializer) = &global.initializer {
+                    if let ExpressionKind::Atom(value) = &initializer.kind
+                        && let Some(bytes) = decode_string_token(value)
+                    {
+                        if !is_array
+                            || global.array_dimensions.len() != 1
+                            || element_size != 1
+                            || bytes.len() > element_count
+                        {
+                            eprintln!("unsupported string initializer for global {}", global.name);
+                            return Ok(None);
+                        }
+                        data[..bytes.len()].copy_from_slice(&bytes);
+                    } else if !is_record_pointer && let Some(layout) = &record_layout {
+                        let ExpressionKind::InitializerList(values) = &initializer.kind else {
+                            eprintln!("unsupported record initializer for global {}", global.name);
+                            return Ok(None);
+                        };
+                        if is_array {
+                            if values.len() > element_count {
+                                eprintln!("too many initializer values for global {}", global.name);
+                                return Ok(None);
+                            }
+                            for (index, value) in values.iter().enumerate() {
+                                if write_native_record_initializer(
+                                    layout,
+                                    value,
+                                    &mut data,
+                                    index * element_size,
+                                    &unit.enumerators,
+                                )
+                                .is_none()
+                                {
+                                    eprintln!(
+                                        "unsupported record initializer for global {}",
+                                        global.name
+                                    );
+                                    return Ok(None);
+                                }
+                            }
+                        } else if write_native_record_initializer(
+                            layout,
+                            initializer,
+                            &mut data,
+                            0,
+                            &unit.enumerators,
+                        )
+                        .is_none()
+                        {
+                            eprintln!("unsupported record initializer for global {}", global.name);
+                            return Ok(None);
+                        }
+                    } else {
+                        let values = if is_array {
+                            if !matches!(&initializer.kind, ExpressionKind::InitializerList(_)) {
+                                eprintln!(
+                                    "unsupported initializer for global array {}",
+                                    global.name
+                                );
+                                return Ok(None);
+                            }
+                            let Some(values) = flatten_initializer_values(initializer) else {
+                                eprintln!("unsupported initializer for global {}", global.name);
+                                return Ok(None);
+                            };
+                            if values.len() > element_count {
+                                eprintln!("too many initializer values for global {}", global.name);
+                                return Ok(None);
+                            }
+                            Some(values)
+                        } else {
+                            scalar_initializer(initializer).map(|value| vec![value])
+                        };
+                        let Some(values) = values else {
+                            eprintln!("unsupported initializer for global {}", global.name);
+                            return Ok(None);
+                        };
+                        for (index, expression) in values.into_iter().enumerate() {
+                            if matches!(global_type, "float" | "double" | "long double") {
+                                let Some(value) =
+                                    native_floating_initializer(expression, global_type)
+                                else {
+                                    eprintln!(
+                                        "unsupported floating initializer for global {}",
+                                        global.name
+                                    );
+                                    return Ok(None);
+                                };
+                                let offset = index * element_size;
+                                data[offset..offset + element_size].copy_from_slice(&value);
+                                continue;
+                            }
+                            let Ok(value) =
+                                evaluate_integer_constant_with_names(expression, &unit.enumerators)
+                            else {
+                                eprintln!("non-constant initializer for global {}", global.name);
+                                return Ok(None);
+                            };
+                            if pointer_element.is_some() {
+                                let value = value as u32 & 0x3fff_ffff;
+                                data[index * 4] = (value >> 24) as u8;
+                                data[index * 4 + 1] = (value >> 16) as u8;
+                                data[index * 4 + 2] = (value >> 8) as u8;
+                                data[index * 4 + 3] = value as u8;
+                            } else if element_size == 1 {
+                                data[index] = value as u8;
+                            } else if element_size == 4 {
+                                data[index * 4..index * 4 + 4]
+                                    .copy_from_slice(&(value as u32).to_be_bytes());
+                            } else {
+                                let value = value as u16;
+                                data[index * 2] = (value >> 8) as u8;
+                                data[index * 2 + 1] = value as u8;
+                            }
+                        }
+                    }
+                }
+                if let Some(index) = global_indices.get(global.name.as_str()).copied() {
+                    let existing = &mut globals[index];
+                    if existing.c_type != global.c_type
+                        || existing.array_dimensions != global.array_dimensions
+                        || (existing.element_size, existing.element_signed)
+                            != (element_size, element_signed)
+                        || (existing.has_initializer && global.initializer.is_some())
+                    {
+                        eprintln!("conflicting global declaration for {}", global.name);
+                        return Ok(None);
+                    }
+                    if global.initializer.is_some() {
+                        existing.data = data;
+                        existing.has_initializer = true;
+                    }
+                    continue;
+                }
+                if !global_names.insert(global.name.as_str()) || !names.insert(global.name.as_str())
+                {
+                    eprintln!("duplicate native global name {}", global.name);
+                    return Ok(None);
+                }
+                let Some(total_data_size) = static_data_size.checked_add(byte_count) else {
+                    eprintln!("global data exceeds the supported size at {}", global.name);
+                    return Ok(None);
+                };
+                if total_data_size > 0x1000000 - 0x80000 {
+                    eprintln!("global data exceeds available memory at {}", global.name);
+                    return Ok(None);
+                }
+                static_data_size = total_data_size;
+                global_indices.insert(global.name.as_str(), globals.len());
+                globals.push(NativeGlobal {
+                    name: global.name.clone(),
+                    c_type: global.c_type.clone(),
+                    data,
+                    is_array,
+                    is_pointer: pointer_element.is_some(),
+                    array_dimensions: global.array_dimensions.clone(),
+                    element_size,
+                    element_signed,
+                    pointer_element,
+                    record_layout,
+                    has_initializer: global.initializer.is_some(),
+                });
+            }
+        }
+    }
+    let Some(main) = functions
+        .iter()
+        .find(|function| function.declaration.name == "main")
+    else {
+        eprintln!("unsupported C program without a main function");
+        return Ok(None);
+    };
+    if let Some(enumerator) = unit.enumerators.keys().find(|enumerator| {
+        names.contains(enumerator.as_str()) || prototypes.contains_key(enumerator.as_str())
+    }) {
+        eprintln!("enumerator {enumerator} conflicts with a native declaration");
+        return Ok(None);
+    }
+    if !main.declaration.parameters.is_empty() || main.declaration.return_type.trim() != "int" {
+        eprintln!("unsupported main function signature");
+        return Ok(None);
+    }
+    if let Some(function) = functions.iter().find(|function| {
+        prototypes
+            .get(function.declaration.name.as_str())
+            .is_some_and(|signature| {
+                *signature
+                    != (
+                        function.declaration.parameters.len(),
+                        function.declaration.return_type.trim() == "void",
+                        function.declaration.variadic,
+                        function.declaration.has_prototype,
+                    )
+            })
+    }) {
+        eprintln!(
+            "function definition {} conflicts with its prototype",
+            function.declaration.name
+        );
+        return Ok(None);
+    }
+    let mut defined_functions: HashMap<String, (usize, bool, bool, bool)> = functions
+        .iter()
+        .map(|function| {
+            (
+                function.declaration.name.clone(),
+                (
+                    function.declaration.parameters.len(),
+                    function.declaration.return_type.trim() == "void",
+                    function.declaration.variadic,
+                    function.declaration.has_prototype,
+                ),
+            )
+        })
+        .collect();
+    for (name, (arity, returns_void, variadic, has_prototype)) in &prototypes {
+        if native_library_for_symbol(name).is_some() || *variadic || !has_prototype {
+            defined_functions.insert(
+                (*name).to_owned(),
+                (*arity, *returns_void, *variadic, *has_prototype),
+            );
+        }
+    }
+    defined_functions.insert("abs".to_owned(), (1, false, false, true));
+    if let Some(function) = functions
+        .iter()
+        .find(|function| !statement_calls_are_defined(&function.body, &defined_functions))
+    {
+        eprintln!("unsupported native call in {}", function.declaration.name);
+        return Ok(None);
+    }
+    let linked_libraries: HashSet<&str> = prototypes
+        .keys()
+        .filter_map(|name| native_library_for_symbol(name))
+        .collect();
+    let mut string_literals = HashSet::new();
+    for function in &functions {
+        collect_string_literals_statement(&function.body, &mut string_literals);
+    }
+    let mut assembly = String::from(
+        ".address 0\n\
+         __c_entry:\n\
+         \x20\x20\x20\x20JMP __c_boot\n\
+         .address 10\n\
+         __c_boot:\n\
+         \x20\x20\x20\x20CALLX __c_function_main\n\
+         \x20\x20\x20\x20HALT\n",
+    );
+    for (library_name, library_source) in NATIVE_ASSEMBLY_LIBRARIES {
+        if linked_libraries.contains(library_name) {
+            assembly.push_str(library_source);
+            assembly.push('\n');
+        }
+    }
+    assembly.push_str(".address 0x4800\n");
+    let mut label_counter = 0usize;
+    for function in &mut functions {
+        let mut scopes = vec![HashMap::new()];
+        let mut local_counter = 0usize;
+        for parameter in &mut function.declaration.parameters {
+            let Some(name) = parameter.name.as_mut() else {
+                eprintln!(
+                    "function definition {} has an unnamed parameter",
+                    function.declaration.name
+                );
+                return Ok(None);
+            };
+            let unique_name = native_local_name(local_counter);
+            local_counter += 1;
+            if scopes[0]
+                .insert(name.clone(), unique_name.clone())
+                .is_some()
+            {
+                eprintln!(
+                    "function definition {} has duplicate parameters",
+                    function.declaration.name
+                );
+                return Ok(None);
+            }
+            *name = unique_name;
+        }
+        let StatementKind::Compound(statements) = &mut function.body.kind else {
+            eprintln!(
+                "function definition {} has no compound body",
+                function.declaration.name
+            );
+            return Ok(None);
+        };
+        if !rewrite_native_local_scopes(statements, &mut scopes, &mut local_counter, false) {
+            eprintln!(
+                "unsupported local scope structure in {}",
+                function.declaration.name
+            );
+            return Ok(None);
+        }
+    }
+    for function in &functions {
+        let StatementKind::Compound(statements) = &function.body.kind else {
+            return Ok(None);
+        };
+        let mut function_labels = HashSet::new();
+        let mut label_references = HashSet::new();
+        if !collect_native_labels(&function.body, &mut function_labels, &mut label_references)
+            || !label_references.is_subset(&function_labels)
+        {
+            eprintln!(
+                "unsupported or unresolved label in {}",
+                function.declaration.name
+            );
+            return Ok(None);
+        }
+        let has_local_array = statement_has_local_array(&function.body);
+        let has_local_floating_scalar = statement_has_local_floating_scalar(&function.body);
+        let has_local_wide_integer = statement_has_local_wide_integer(&function.body);
+        let has_excess_locals = function.declaration.parameters.len()
+            + statement_scalar_local_count(&function.body)
+            > 3;
+        let parameter_layout = NativeCallLayout::new(
+            &function.declaration.parameters,
+            &unit.records,
+            false,
+            function.declaration.has_prototype,
+        )
+        .ok_or_else(|| {
+            CCompilerError(format!(
+                "{filename}: unsupported argument layout for {}",
+                function.declaration.name
+            ))
+        })?;
+        let stack_required = native_stack_required_locals(&function.body);
+        let stack_parameters = parameter_layout.needs_stack_parameters()
+            || function.declaration.parameters.iter().any(|parameter| {
+                parameter
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| stack_required.contains(name))
+            });
+        let spill_third_parameter = !stack_parameters && function.declaration.parameters.len() >= 3;
+        let reserve_frame_register = has_local_array
+            || has_local_floating_scalar
+            || has_local_wide_integer
+            || has_excess_locals
+            || stack_parameters
+            || function.declaration.parameters.len() >= 3
+            || !stack_required.is_empty();
+        let mut locals = HashMap::new();
+        let mut stacked_parameter_bytes = 0usize;
+        for (index, parameter) in function.declaration.parameters.iter().enumerate() {
+            let Some(name) = &parameter.name else {
+                return Ok(None);
+            };
+            let record_layout = native_record_pointer(&parameter.c_type, &unit.records);
+            let pointer_element =
+                native_pointer_element_or_record(&parameter.c_type, &unit.records)
+                    .or_else(|| record_layout.as_ref().map(|layout| (layout.size, false)));
+            let location = if stack_parameters {
+                let argument = &parameter_layout.arguments[index];
+                stacked_parameter_bytes = parameter_layout.size;
+                let offset = argument.offset;
+                if let Some(layout) = unit.records.get(native_unqualified_type(&parameter.c_type)) {
+                    NativeLocation::StackRecord {
+                        offset,
+                        dimensions: Vec::new(),
+                        layout: layout.clone(),
+                    }
+                } else if let Some(size) = native_floating_type_size(&parameter.c_type) {
+                    NativeLocation::StackFloatingPointScalar { offset, size }
+                } else if is_native_wide_integer_type(&parameter.c_type) {
+                    NativeLocation::StackWideScalar {
+                        offset,
+                        unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                    }
+                } else if let Some((element_size, element_signed)) = pointer_element {
+                    NativeLocation::PointerStack {
+                        offset,
+                        element_size,
+                        element_signed,
+                        element_is_const: native_pointer_target_is_const(&parameter.c_type),
+                        element_floating_size: native_pointer_element_floating_size(
+                            &parameter.c_type,
+                        ),
+                        record_layout: record_layout.clone(),
+                    }
+                } else if let Some(signed) = native_byte_type(&parameter.c_type) {
+                    NativeLocation::ByteStackScalar { offset, signed }
+                } else {
+                    NativeLocation::StackScalar {
+                        offset,
+                        unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                    }
+                }
+            } else if index >= 2 && reserve_frame_register {
+                let offset = stacked_parameter_bytes;
+                stacked_parameter_bytes += if native_byte_type(&parameter.c_type).is_some() {
+                    1
+                } else if pointer_element.is_some() {
+                    4
+                } else {
+                    2
+                };
+                if let Some((element_size, element_signed)) = pointer_element {
+                    NativeLocation::PointerStack {
+                        offset,
+                        element_size,
+                        element_signed,
+                        element_is_const: native_pointer_target_is_const(&parameter.c_type),
+                        element_floating_size: native_pointer_element_floating_size(
+                            &parameter.c_type,
+                        ),
+                        record_layout: record_layout.clone(),
+                    }
+                } else if let Some(signed) = native_byte_type(&parameter.c_type) {
+                    NativeLocation::ByteStackScalar { offset, signed }
+                } else {
+                    NativeLocation::StackScalar {
+                        offset,
+                        unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                    }
+                }
+            } else if let Some((element_size, element_signed)) = pointer_element {
+                NativeLocation::PointerRegister {
+                    register: index as u8 + 1,
+                    element_size,
+                    element_signed,
+                    element_is_const: native_pointer_target_is_const(&parameter.c_type),
+                    element_floating_size: native_pointer_element_floating_size(&parameter.c_type),
+                    record_layout: record_layout.clone(),
+                }
+            } else if let Some(signed) = native_byte_type(&parameter.c_type) {
+                if function.declaration.parameters.len() == 1 && index == 0 {
+                    NativeLocation::Register {
+                        register: 1,
+                        unsigned: !signed,
+                    }
+                } else {
+                    NativeLocation::ByteRegister {
+                        register: index as u8 + 1,
+                        signed,
+                    }
+                }
+            } else {
+                NativeLocation::Register {
+                    register: index as u8 + 1,
+                    unsigned: is_native_unsigned_word_type(&parameter.c_type),
+                }
+            };
+            if locals.insert(name.clone(), location).is_some() {
+                return Ok(None);
+            }
+        }
+        let mut next_local_register = if stack_parameters {
+            4
+        } else {
+            function.declaration.parameters.len().min(2) as u8 + 1
+        };
+        let mut frame_size = stacked_parameter_bytes;
+        if !collect_native_locals(
+            statements,
+            &mut locals,
+            &mut next_local_register,
+            &mut frame_size,
+            reserve_frame_register,
+            &stack_required,
+            &unit.records,
+        ) {
+            eprintln!("unsupported locals in {}", function.declaration.name);
+            return Ok(None);
+        }
+        for global in &globals {
+            let location = if global.is_pointer {
+                let Some((element_size, element_signed)) = global.pointer_element else {
+                    return Ok(None);
+                };
+                NativeLocation::GlobalPointer {
+                    element_size,
+                    element_signed,
+                    element_is_const: native_pointer_target_is_const(&global.c_type),
+                    element_floating_size: native_pointer_element_floating_size(&global.c_type),
+                    record_layout: global.record_layout.clone(),
+                }
+            } else if let Some(layout) = &global.record_layout {
+                NativeLocation::GlobalRecord {
+                    dimensions: global.array_dimensions.clone(),
+                    layout: layout.clone(),
+                }
+            } else if global.is_array {
+                NativeLocation::GlobalArray {
+                    length: global.data.len() / global.element_size,
+                    dimensions: global.array_dimensions.clone(),
+                    element_size: global.element_size,
+                    element_signed: global.element_signed,
+                    element_floating_size: native_floating_type_size(&global.c_type).unwrap_or(0),
+                }
+            } else if let Some(signed) = native_byte_type(&global.c_type) {
+                NativeLocation::GlobalByteScalar { signed }
+            } else if matches!(
+                native_unqualified_type(&global.c_type),
+                "float" | "double" | "long double"
+            ) {
+                NativeLocation::FloatingPointScalar {
+                    size: global.element_size,
+                }
+            } else if is_native_wide_integer_type(&global.c_type) {
+                NativeLocation::GlobalWideScalar {
+                    unsigned: is_native_unsigned_word_type(&global.c_type),
+                }
+            } else {
+                NativeLocation::GlobalScalar {
+                    unsigned: is_native_unsigned_word_type(&global.c_type),
+                }
+            };
+            locals.entry(global.name.clone()).or_insert(location);
+        }
+        for (name, value) in &unit.enumerators {
+            locals
+                .entry(name.clone())
+                .or_insert(NativeLocation::Constant(*value));
+        }
+        for declaration in &unit.declarations {
+            let (name, parameters, variadic, has_prototype) = match declaration {
+                ExternalDeclaration::FunctionDefinition(function) => (
+                    function.declaration.name.as_str(),
+                    function.declaration.parameters.as_slice(),
+                    function.declaration.variadic,
+                    function.declaration.has_prototype,
+                ),
+                ExternalDeclaration::FunctionPrototype(function) => (
+                    function.name.as_str(),
+                    function.parameters.as_slice(),
+                    function.variadic,
+                    function.has_prototype,
+                ),
+                ExternalDeclaration::Global(_) => continue,
+            };
+            let return_type = match declaration {
+                ExternalDeclaration::FunctionDefinition(function) => {
+                    &function.declaration.return_type
+                }
+                ExternalDeclaration::FunctionPrototype(function) => &function.return_type,
+                ExternalDeclaration::Global(_) => unreachable!(),
+            };
+            locals
+                .entry(name.to_owned())
+                .or_insert_with(|| NativeLocation::FunctionParameters {
+                    layout: NativeCallLayout::new(
+                        parameters,
+                        &unit.records,
+                        variadic,
+                        has_prototype,
+                    ),
+                    wide_return_unsigned: {
+                        let return_type = match declaration {
+                            ExternalDeclaration::FunctionDefinition(function) => {
+                                &function.declaration.return_type
+                            }
+                            ExternalDeclaration::FunctionPrototype(function) => {
+                                &function.return_type
+                            }
+                            ExternalDeclaration::Global(_) => unreachable!(),
+                        };
+                        is_native_wide_integer_type(return_type)
+                            .then(|| is_native_unsigned_word_type(return_type))
+                    },
+                    word_return_unsigned: {
+                        native_byte_type(return_type).is_none()
+                            && is_native_unsigned_word_type(return_type)
+                    },
+                    returns_pointer: native_is_pointer_type(return_type, &unit.records),
+                    pointer_return_target_is_const: native_pointer_target_is_const(return_type),
+                    pointer_return_element_size: native_pointer_element(return_type)
+                        .map(|(element_size, _)| element_size)
+                        .or_else(|| {
+                            native_record_pointer(return_type, &unit.records)
+                                .map(|layout| layout.size)
+                        }),
+                    pointer_return_element_signed: native_pointer_element(return_type)
+                        .is_some_and(|(_, signed)| signed),
+                    pointer_return_floating_size: native_pointer_element_floating_size(return_type),
+                    pointer_return_is_record: native_record_pointer(return_type, &unit.records)
+                        .is_some(),
+                    float_return_size: match declaration {
+                        ExternalDeclaration::FunctionDefinition(function) => {
+                            native_floating_type_size(&function.declaration.return_type)
+                                .unwrap_or(0)
+                        }
+                        ExternalDeclaration::FunctionPrototype(function) => {
+                            native_floating_type_size(&function.return_type).unwrap_or(0)
+                        }
+                        ExternalDeclaration::Global(_) => 0,
+                    },
+                });
+        }
+        validate_native_bitfield_statement(&function.body, &locals)?;
+        assembly.push_str(&format!("__c_function_{}:\n", function.declaration.name));
+
+        for (index, parameter) in function
+            .declaration
+            .parameters
+            .iter()
+            .take(if stack_parameters { 0 } else { 3 })
+            .enumerate()
+        {
+            let register = index + 1;
+            let c_type = &parameter.c_type;
+            let source_offset = 4 + parameter_layout.arguments[index].offset;
+
+            if native_floating_type_size(c_type).is_some() {
+                continue;
+            } else if native_is_pointer_type(c_type, &unit.records) {
+                assembly.push_str("    MOVSP R7\n");
+                emit_native_stack_offset(7, source_offset, &mut assembly);
+                assembly.push_str(&format!("    LDP R{register}, R7\n"));
+            } else if native_byte_type(c_type).is_some() {
+                assembly.push_str("    MOVSP R7\n");
+                emit_native_stack_offset(7, source_offset, &mut assembly);
+                assembly.push_str(&format!("    LD R{register}, R7\n"));
+                let signed = native_byte_type(c_type).unwrap();
+                emit_native_byte_normalization(register as u8, signed, &mut assembly);
+            } else {
+                assembly.push_str(&format!("    LDWS R{register}, {source_offset}\n"));
+                emit_native_word_normalization(
+                    register as u8,
+                    is_native_unsigned_word_type(c_type),
+                    &mut label_counter,
+                    &mut assembly,
+                );
+            }
+        }
+
+        if function.declaration.parameters.len() > 3 {
+            assembly.push_str("    MOVSP R4\n");
+        }
+
+        emit_native_stack_adjustment(frame_size, true, &mut assembly);
+        if stack_parameters {
+            assembly.push_str("    MOVSP R3\n    MOV R4, R3\n");
+            emit_native_stack_offset(4, frame_size + 4, &mut assembly);
+            let label = label_counter;
+            label_counter += 1;
+            assembly.push_str(&format!(
+                "    MOV R7, R3\n    LDI R6, {}\n    LDI R0, 0\n\
+                 __c_parameters_{label}:\n\
+                 LD R5, R4\n    ST R7, R5\n    INC R4\n    INC R7\n\
+                 DEC R6\n    CMP R6, R0\n    BNZX __c_parameters_{label}\n",
+                parameter_layout.size
+            ));
+        } else if frame_size > 0 {
+            if spill_third_parameter {
+                assembly.push_str("    MOVSP R7\n");
+                let third_parameter = &function.declaration.parameters[2].c_type;
+                assembly.push_str(if native_byte_type(third_parameter).is_some() {
+                    "    ST R7, R3\n"
+                } else if native_pointer_element(third_parameter).is_some()
+                    || native_record_pointer(third_parameter, &unit.records).is_some()
+                {
+                    "    STP R3, R7\n"
+                } else {
+                    "    STW R7, R3\n"
+                });
+            }
+            assembly.push_str("    MOVSP R3\n");
+            let mut destination_offset =
+                function
+                    .declaration
+                    .parameters
+                    .get(2)
+                    .map_or(0, |parameter| {
+                        if native_byte_type(&parameter.c_type).is_some() {
+                            1
+                        } else if native_pointer_element(&parameter.c_type).is_some()
+                            || native_record_pointer(&parameter.c_type, &unit.records).is_some()
+                        {
+                            4
+                        } else {
+                            2
+                        }
+                    });
+            for index in 3..function.declaration.parameters.len() {
+                let source_offset = 4 + parameter_layout.arguments[index].offset;
+                assembly.push_str("    MOV R7, R4\n");
+                emit_native_stack_offset(7, source_offset, &mut assembly);
+                let is_pointer = native_is_pointer_type(
+                    &function.declaration.parameters[index].c_type,
+                    &unit.records,
+                );
+                let is_byte =
+                    native_byte_type(&function.declaration.parameters[index].c_type).is_some();
+                assembly.push_str(if is_pointer {
+                    "    LDP R5, R7\n"
+                } else if is_byte {
+                    "    LD R5, R7\n"
+                } else {
+                    "    LDW R5, R7\n"
+                });
+                if let Some(signed) =
+                    native_byte_type(&function.declaration.parameters[index].c_type)
+                {
+                    emit_native_byte_normalization(5, signed, &mut assembly);
+                }
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, destination_offset, &mut assembly);
+                assembly.push_str(if is_byte {
+                    "    ST R7, R5\n"
+                } else if is_pointer {
+                    "    STP R5, R7\n"
+                } else {
+                    "    STW R7, R5\n"
+                });
+                destination_offset += if is_byte {
+                    1
+                } else if is_pointer {
+                    4
+                } else {
+                    2
+                };
+            }
+        }
+        let mut object_qualifiers = HashMap::new();
+        for global in &globals {
+            object_qualifiers.insert(
+                global.name.clone(),
+                native_object_is_const_qualified(&global.c_type),
+            );
+        }
+        for parameter in &function.declaration.parameters {
+            if let Some(name) = &parameter.name {
+                object_qualifiers.insert(
+                    name.clone(),
+                    native_object_is_const_qualified(&parameter.c_type),
+                );
+            }
+        }
+        collect_native_object_qualifiers(&function.body, &mut object_qualifiers);
+        let const_objects = object_qualifiers
+            .into_iter()
+            .filter_map(|(name, is_const)| is_const.then_some(name))
+            .collect::<HashSet<_>>();
+        if let Some(line) =
+            native_const_write_line_statement(&function.body, &locals, &const_objects)
+        {
+            eprintln!("write to const-qualified object at line {line}");
+            return Ok(None);
+        }
+        if let Some(line) = native_pointer_qualifier_loss_line_statement(
+            &function.body,
+            &locals,
+            &const_objects,
+            &function.declaration.name,
+        ) {
+            eprintln!("pointer conversion discards const qualification at line {line}");
+            return Ok(None);
+        }
+        let returns_void = function.declaration.return_type.trim() == "void";
+        let mut loop_labels = Vec::new();
+        let mut returned = false;
+        for statement in statements {
+            let Some(statement_returns) = emit_native_statement(
+                statement,
+                &locals,
+                &function.declaration.name,
+                returns_void,
+                &mut label_counter,
+                &mut loop_labels,
+                &mut assembly,
+            ) else {
+                eprintln!(
+                    "unsupported {} in {} at line {}",
+                    native_statement_kind(&statement.kind),
+                    function.declaration.name,
+                    statement.line
+                );
+                return Ok(None);
+            };
+            if !returned {
+                returned = statement_returns;
+            }
+        }
+        if !returned {
+            if returns_void {
+                assembly.push_str(&format!(
+                    "    JMPX __c_return_{}\n",
+                    function.declaration.name
+                ));
+            } else if function.declaration.name == "main" {
+                assembly.push_str("    LDI R0, 0\n");
+                assembly.push_str("    JMPX __c_return_main\n");
+            } else {
+                eprintln!(
+                    "non-void function {} does not return on every path",
+                    function.declaration.name
+                );
+                return Ok(None);
+            }
+        }
+        assembly.push_str(&format!("__c_return_{}:\n", function.declaration.name));
+        emit_native_stack_adjustment(frame_size, false, &mut assembly);
+        assembly.push_str("    RET\n");
+    }
+    assembly.push_str(".address 0x80000\n");
+    for global in &globals {
+        assembly.push_str(&format!("__c_global_{}:\n", global.name));
+        for chunk in global.data.chunks(16) {
+            assembly.push_str(".data hex ");
+            for (index, byte) in chunk.iter().enumerate() {
+                if index > 0 {
+                    assembly.push(' ');
+                }
+                assembly.push_str(&format!("0x{byte:02X}"));
+            }
+            assembly.push('\n');
+        }
+    }
+    let mut string_literals = string_literals.into_iter().collect::<Vec<_>>();
+    string_literals.sort();
+    for literal in string_literals {
+        let Some(label) = native_string_label(&literal) else {
+            continue;
+        };
+        let Some(mut bytes) = decode_string_token(&literal) else {
+            continue;
+        };
+        bytes.push(0);
+        assembly.push_str(&format!("{label}:\n"));
+        for chunk in bytes.chunks(16) {
+            assembly.push_str(".data hex ");
+            for (index, byte) in chunk.iter().enumerate() {
+                if index > 0 {
+                    assembly.push(' ');
+                }
+                assembly.push_str(&format!("0x{byte:02X}"));
+            }
+            assembly.push('\n');
+        }
+    }
+    Ok(Some(assembly))
+}
+
+fn expression_calls_are_defined(
+    expression: &Expression,
+    defined_functions: &HashMap<String, (usize, bool, bool, bool)>,
+    allow_void_call: bool,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            let valid_target = match &function.kind {
+                ExpressionKind::Atom(name) => {
+                    defined_functions.get(name).is_some_and(
+                        |(arity, is_void, variadic, has_prototype)| {
+                            ((!has_prototype || *variadic) && arguments.len() >= *arity
+                                || *has_prototype && !variadic && *arity == arguments.len())
+                                && (allow_void_call || !is_void)
+                        },
+                    ) && (name != "printf" || native_printf_call_is_supported(arguments))
+                }
+                _ => false,
+            };
+            if !valid_target {
+                if matches!(&function.kind, ExpressionKind::Atom(name) if name == "printf") {
+                    eprintln!(
+                        "unsupported native printf format or argument list at line {}",
+                        expression.line
+                    );
+                } else {
+                    let target = match &function.kind {
+                        ExpressionKind::Atom(name) => name.as_str(),
+                        _ => "<indirect call>",
+                    };
+                    eprintln!(
+                        "unsupported native call {target} with {} arguments at line {}",
+                        arguments.len(),
+                        expression.line
+                    );
+                }
+            }
+            valid_target
+                && arguments.iter().all(|argument| {
+                    expression_calls_are_defined(argument, defined_functions, false)
+                })
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            expression_calls_are_defined(operand, defined_functions, false)
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Assignment {
+            target: left,
+            value: right,
+            ..
+        }
+        | ExpressionKind::Index {
+            expression: left,
+            index: right,
+        } => {
+            expression_calls_are_defined(left, defined_functions, false)
+                && expression_calls_are_defined(right, defined_functions, false)
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            expression_calls_are_defined(condition, defined_functions, false)
+                && expression_calls_are_defined(when_true, defined_functions, false)
+                && expression_calls_are_defined(when_false, defined_functions, false)
+        }
+        ExpressionKind::Member { expression, .. } => {
+            expression_calls_are_defined(expression, defined_functions, false)
+        }
+        ExpressionKind::InitializerList(values) => values
+            .iter()
+            .all(|value| expression_calls_are_defined(value, defined_functions, false)),
+        ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => true,
+    }
+}
+
+fn statement_calls_are_defined(
+    statement: &Statement,
+    defined_functions: &HashMap<String, (usize, bool, bool, bool)>,
+) -> bool {
+    let expression_is_defined = |expression: &Expression| {
+        expression_calls_are_defined(expression, defined_functions, false)
+    };
+    match &statement.kind {
+        StatementKind::Compound(statements) => statements
+            .iter()
+            .all(|statement| statement_calls_are_defined(statement, defined_functions)),
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .filter_map(|declaration| declaration.initializer.as_ref())
+            .all(expression_is_defined),
+        StatementKind::Expression(Some(expression)) => expression_calls_are_defined(
+            expression,
+            defined_functions,
+            matches!(&expression.kind, ExpressionKind::Call { .. }),
+        ),
+        StatementKind::Expression(None) | StatementKind::Return(None) => true,
+        StatementKind::Return(Some(expression)) => expression_is_defined(expression),
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expression_is_defined(condition)
+                && statement_calls_are_defined(then_branch, defined_functions)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(|branch| statement_calls_are_defined(branch, defined_functions))
+        }
+        StatementKind::While { condition, body } | StatementKind::DoWhile { condition, body } => {
+            expression_is_defined(condition) && statement_calls_are_defined(body, defined_functions)
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => {
+            initializer
+                .as_ref()
+                .is_none_or(|statement| statement_calls_are_defined(statement, defined_functions))
+                && condition.as_ref().is_none_or(expression_is_defined)
+                && update.as_ref().is_none_or(expression_is_defined)
+                && statement_calls_are_defined(body, defined_functions)
+        }
+        StatementKind::Switch { expression, cases } => {
+            expression_is_defined(expression)
+                && cases.iter().all(|(value, statements)| {
+                    value.as_ref().is_none_or(expression_is_defined)
+                        && statements.iter().all(|statement| {
+                            statement_calls_are_defined(statement, defined_functions)
+                        })
+                })
+        }
+        StatementKind::Label { statement, .. } => {
+            statement_calls_are_defined(statement, defined_functions)
+        }
+        StatementKind::Break | StatementKind::Continue | StatementKind::Goto(_) => true,
+    }
+}
+
+fn native_local_name(index: usize) -> String {
+    format!("\0sc16_local_{index}")
+}
+
+fn rewrite_native_local_expression(
+    expression: &mut Expression,
+    scopes: &[HashMap<String, String>],
+) {
+    match &mut expression.kind {
+        ExpressionKind::Atom(name) => {
+            if let Some(local) = scopes.iter().rev().find_map(|scope| scope.get(name)) {
+                *name = local.clone();
+            }
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            rewrite_native_local_expression(operand, scopes);
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Assignment {
+            target: left,
+            value: right,
+            ..
+        }
+        | ExpressionKind::Index {
+            expression: left,
+            index: right,
+        } => {
+            rewrite_native_local_expression(left, scopes);
+            rewrite_native_local_expression(right, scopes);
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            rewrite_native_local_expression(condition, scopes);
+            rewrite_native_local_expression(when_true, scopes);
+            rewrite_native_local_expression(when_false, scopes);
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            rewrite_native_local_expression(function, scopes);
+            for argument in arguments {
+                rewrite_native_local_expression(argument, scopes);
+            }
+        }
+        ExpressionKind::Member { expression, .. } => {
+            rewrite_native_local_expression(expression, scopes);
+        }
+        ExpressionKind::InitializerList(values) => {
+            for value in values {
+                rewrite_native_local_expression(value, scopes);
+            }
+        }
+        ExpressionKind::SizeofType(_) => {}
+    }
+}
+
+fn rewrite_native_local_scopes(
+    statements: &mut [Statement],
+    scopes: &mut Vec<HashMap<String, String>>,
+    next_name: &mut usize,
+    create_scope: bool,
+) -> bool {
+    if create_scope {
+        scopes.push(HashMap::new());
+    }
+    let mut valid = true;
+    for statement in statements {
+        match &mut statement.kind {
+            StatementKind::Compound(nested) => {
+                valid &= rewrite_native_local_scopes(nested, scopes, next_name, true);
+            }
+            StatementKind::Declaration(declarations) => {
+                for declaration in declarations {
+                    let scope = scopes.last_mut().expect("function scope exists");
+                    if scope.contains_key(&declaration.name) {
+                        valid = false;
+                        break;
+                    }
+                    let unique_name = native_local_name(*next_name);
+                    *next_name += 1;
+                    scope.insert(declaration.name.clone(), unique_name.clone());
+                    declaration.name = unique_name;
+                    if let Some(initializer) = &mut declaration.initializer {
+                        rewrite_native_local_expression(initializer, scopes);
+                    }
+                }
+            }
+            StatementKind::Expression(expression) => {
+                if let Some(expression) = expression {
+                    rewrite_native_local_expression(expression, scopes);
+                }
+            }
+            StatementKind::Return(expression) => {
+                if let Some(expression) = expression {
+                    rewrite_native_local_expression(expression, scopes);
+                }
+            }
+            StatementKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                rewrite_native_local_expression(condition, scopes);
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(then_branch),
+                    scopes,
+                    next_name,
+                    false,
+                );
+                if let Some(branch) = else_branch {
+                    valid &= rewrite_native_local_scopes(
+                        std::slice::from_mut(branch),
+                        scopes,
+                        next_name,
+                        false,
+                    );
+                }
+            }
+            StatementKind::While { condition, body } => {
+                rewrite_native_local_expression(condition, scopes);
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(body),
+                    scopes,
+                    next_name,
+                    false,
+                );
+            }
+            StatementKind::DoWhile { body, condition } => {
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(body),
+                    scopes,
+                    next_name,
+                    false,
+                );
+                rewrite_native_local_expression(condition, scopes);
+            }
+            StatementKind::For {
+                initializer,
+                condition,
+                update,
+                body,
+            } => {
+                scopes.push(HashMap::new());
+                if let Some(initializer) = initializer {
+                    valid &= rewrite_native_local_scopes(
+                        std::slice::from_mut(initializer),
+                        scopes,
+                        next_name,
+                        false,
+                    );
+                }
+                if let Some(condition) = condition {
+                    rewrite_native_local_expression(condition, scopes);
+                }
+                if let Some(update) = update {
+                    rewrite_native_local_expression(update, scopes);
+                }
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(body),
+                    scopes,
+                    next_name,
+                    false,
+                );
+                scopes.pop();
+            }
+            StatementKind::Switch { expression, cases } => {
+                rewrite_native_local_expression(expression, scopes);
+                for (value, case_statements) in cases {
+                    if let Some(value) = value {
+                        rewrite_native_local_expression(value, scopes);
+                    }
+                    valid &= rewrite_native_local_scopes(case_statements, scopes, next_name, false);
+                }
+            }
+            StatementKind::Label { statement, .. } => {
+                valid &= rewrite_native_local_scopes(
+                    std::slice::from_mut(statement),
+                    scopes,
+                    next_name,
+                    false,
+                );
+            }
+            StatementKind::Break | StatementKind::Continue | StatementKind::Goto(_) => {}
+        }
+        if !valid {
+            break;
+        }
+    }
+    if create_scope {
+        scopes.pop();
+    }
+    valid
+}
+
+fn native_stack_required_locals(statement: &Statement) -> HashSet<String> {
+    fn collect_discarded_expression(expression: &Expression, names: &mut HashSet<String>) {
+        match &expression.kind {
+            ExpressionKind::Assignment { target, value, .. } => {
+                collect_expression(target, names);
+                collect_expression(value, names);
+            }
+            ExpressionKind::Unary { operator, operand }
+            | ExpressionKind::Postfix {
+                operator,
+                expression: operand,
+            } if matches!(operator.as_str(), "++" | "--") => {
+                collect_expression(operand, names);
+            }
+            ExpressionKind::Binary {
+                operator,
+                left,
+                right,
+            } if operator == "," => {
+                collect_discarded_expression(left, names);
+                collect_discarded_expression(right, names);
+            }
+            ExpressionKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                collect_expression(condition, names);
+                collect_discarded_expression(when_true, names);
+                collect_discarded_expression(when_false, names);
+            }
+            _ => collect_expression(expression, names),
+        }
+    }
+
+    fn collect_expression(expression: &Expression, names: &mut HashSet<String>) {
+        match &expression.kind {
+            ExpressionKind::Unary { operator, operand }
+            | ExpressionKind::Postfix {
+                operator,
+                expression: operand,
+            } => {
+                if matches!(operator.as_str(), "&" | "++" | "--")
+                    && let ExpressionKind::Atom(name) = &operand.kind
+                {
+                    names.insert(name.clone());
+                }
+                collect_expression(operand, names);
+            }
+            ExpressionKind::Assignment {
+                target: left,
+                value: right,
+                ..
+            } => {
+                if let ExpressionKind::Atom(name) = &left.kind {
+                    names.insert(name.clone());
+                }
+                collect_expression(left, names);
+                collect_expression(right, names);
+            }
+            ExpressionKind::Binary { left, right, .. } => {
+                collect_expression(left, names);
+                collect_expression(right, names);
+            }
+            ExpressionKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                collect_expression(condition, names);
+                collect_expression(when_true, names);
+                collect_expression(when_false, names);
+            }
+            ExpressionKind::Call {
+                function,
+                arguments,
+            } => {
+                collect_expression(function, names);
+                for argument in arguments {
+                    collect_expression(argument, names);
+                }
+            }
+            ExpressionKind::Index { expression, index } => {
+                collect_expression(expression, names);
+                collect_expression(index, names);
+            }
+            ExpressionKind::Member { expression, .. }
+            | ExpressionKind::Cast { expression, .. }
+            | ExpressionKind::SizeofExpression(expression) => collect_expression(expression, names),
+            ExpressionKind::InitializerList(expressions) => {
+                for expression in expressions {
+                    collect_expression(expression, names);
+                }
+            }
+            ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => {}
+        }
+    }
+
+    fn collect_statement(statement: &Statement, names: &mut HashSet<String>) {
+        match &statement.kind {
+            StatementKind::Compound(statements) => {
+                for statement in statements {
+                    collect_statement(statement, names);
+                }
+            }
+            StatementKind::Declaration(declarations) => {
+                for declaration in declarations {
+                    if let Some(initializer) = &declaration.initializer {
+                        collect_expression(initializer, names);
+                    }
+                }
+            }
+            StatementKind::Expression(expression) => {
+                if let Some(expression) = expression {
+                    collect_discarded_expression(expression, names);
+                }
+            }
+            StatementKind::Return(expression) => {
+                if let Some(expression) = expression {
+                    collect_expression(expression, names);
+                }
+            }
+            StatementKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                collect_expression(condition, names);
+                collect_statement(then_branch, names);
+                if let Some(else_branch) = else_branch {
+                    collect_statement(else_branch, names);
+                }
+            }
+            StatementKind::While { condition, body }
+            | StatementKind::DoWhile { body, condition } => {
+                collect_expression(condition, names);
+                collect_statement(body, names);
+            }
+            StatementKind::For {
+                initializer,
+                condition,
+                update,
+                body,
+            } => {
+                if let Some(initializer) = initializer {
+                    collect_statement(initializer, names);
+                }
+                if let Some(condition) = condition {
+                    collect_expression(condition, names);
+                }
+                if let Some(update) = update {
+                    collect_discarded_expression(update, names);
+                }
+                collect_statement(body, names);
+            }
+            StatementKind::Switch { expression, cases } => {
+                collect_expression(expression, names);
+                for (value, statements) in cases {
+                    if let Some(value) = value {
+                        collect_expression(value, names);
+                    }
+                    for statement in statements {
+                        collect_statement(statement, names);
+                    }
+                }
+            }
+            StatementKind::Label { statement, .. } => collect_statement(statement, names),
+            StatementKind::Break | StatementKind::Continue | StatementKind::Goto(_) => {}
+        }
+    }
+
+    let mut names = HashSet::new();
+    collect_statement(statement, &mut names);
+    names
+}
+
+fn collect_native_locals(
+    statements: &[Statement],
+    locals: &mut HashMap<String, NativeLocation>,
+    next_register: &mut u8,
+    frame_size: &mut usize,
+    reserve_frame_register: bool,
+    stack_required: &HashSet<String>,
+    records: &HashMap<String, NativeRecordLayout>,
+) -> bool {
+    for statement in statements {
+        match &statement.kind {
+            StatementKind::Declaration(declarations) => {
+                for declaration in declarations {
+                    if locals.contains_key(&declaration.name) {
+                        eprintln!("duplicate local {}", declaration.name);
+                        return false;
+                    }
+                    if let Some(layout) = records.get(native_unqualified_type(&declaration.c_type))
+                    {
+                        let count = declaration.array_length.unwrap_or(1);
+                        let Some(new_frame_size) = count
+                            .checked_mul(layout.size)
+                            .and_then(|size| frame_size.checked_add(size))
+                            .filter(|size| *size <= 65_535)
+                        else {
+                            eprintln!("record local {} exceeds the stack frame", declaration.name);
+                            return false;
+                        };
+                        locals.insert(
+                            declaration.name.clone(),
+                            NativeLocation::StackRecord {
+                                offset: *frame_size,
+                                dimensions: declaration.array_dimensions.clone(),
+                                layout: layout.clone(),
+                            },
+                        );
+                        *frame_size = new_frame_size;
+                        continue;
+                    }
+                    if let Some(length) = declaration.array_length {
+                        let (element_size, element_signed) =
+                            match native_unqualified_type(&declaration.c_type) {
+                                "int" => (2, true),
+                                "unsigned int" => (2, false),
+                                "unsigned char" => (1, false),
+                                "char" | "signed char" => (1, true),
+                                "float" => (4, false),
+                                "double" | "long double" => (8, false),
+                                _ => {
+                                    eprintln!(
+                                        "unsupported local array type {} for {}",
+                                        declaration.c_type, declaration.name
+                                    );
+                                    return false;
+                                }
+                            };
+                        let Some(byte_count) = length.checked_mul(element_size) else {
+                            eprintln!("local array {} is too large", declaration.name);
+                            return false;
+                        };
+                        let Some(new_frame_size) = frame_size.checked_add(byte_count) else {
+                            eprintln!("local array {} exceeds the stack frame", declaration.name);
+                            return false;
+                        };
+                        if length == 0 || new_frame_size > 65_535 {
+                            eprintln!("local array {} exceeds the stack frame", declaration.name);
+                            return false;
+                        }
+                        locals.insert(
+                            declaration.name.clone(),
+                            NativeLocation::StackArray {
+                                offset: *frame_size,
+                                length,
+                                dimensions: declaration.array_dimensions.clone(),
+                                element_size,
+                                element_signed,
+                                element_floating_size: native_floating_type_size(
+                                    &declaration.c_type,
+                                )
+                                .unwrap_or(0),
+                            },
+                        );
+                        *frame_size = new_frame_size;
+                    } else {
+                        if let Some(size) = native_floating_type_size(&declaration.c_type) {
+                            let offset = *frame_size;
+                            let Some(new_frame_size) = frame_size.checked_add(size) else {
+                                return false;
+                            };
+                            if new_frame_size > 65_535 {
+                                eprintln!(
+                                    "floating local {} exceeds the stack frame",
+                                    declaration.name
+                                );
+                                return false;
+                            }
+                            *frame_size = new_frame_size;
+                            locals.insert(
+                                declaration.name.clone(),
+                                NativeLocation::StackFloatingPointScalar { offset, size },
+                            );
+                            continue;
+                        }
+                        if is_native_wide_integer_type(&declaration.c_type) {
+                            let offset = *frame_size;
+                            let Some(new_frame_size) = frame_size.checked_add(4) else {
+                                return false;
+                            };
+                            if new_frame_size > 65_535 {
+                                eprintln!(
+                                    "wide integer local {} exceeds the stack frame",
+                                    declaration.name
+                                );
+                                return false;
+                            }
+                            *frame_size = new_frame_size;
+                            locals.insert(
+                                declaration.name.clone(),
+                                NativeLocation::StackWideScalar {
+                                    offset,
+                                    unsigned: is_native_unsigned_word_type(&declaration.c_type),
+                                },
+                            );
+                            continue;
+                        }
+                        if reserve_frame_register && *next_register == 3 {
+                            *next_register += 1;
+                        }
+                        let byte_signed = match native_unqualified_type(&declaration.c_type) {
+                            "char" | "signed char" => Some(true),
+                            "unsigned char" => Some(false),
+                            _ => None,
+                        };
+                        let record_layout = native_record_pointer(&declaration.c_type, records);
+                        let pointer_element =
+                            native_pointer_element_or_record(&declaration.c_type, records).or_else(
+                                || record_layout.as_ref().map(|layout| (layout.size, false)),
+                            );
+                        if !is_native_word_type(&declaration.c_type)
+                            && byte_signed.is_none()
+                            && pointer_element.is_none()
+                        {
+                            eprintln!(
+                                "unsupported local type {} for {}",
+                                declaration.c_type, declaration.name
+                            );
+                            return false;
+                        }
+                        let location = if *next_register <= 3
+                            && !stack_required.contains(&declaration.name)
+                            && (native_pointer_element_floating_size(&declaration.c_type) == 0
+                                || !reserve_frame_register)
+                        {
+                            let location =
+                                if let Some((element_size, element_signed)) = pointer_element {
+                                    NativeLocation::PointerRegister {
+                                        register: *next_register,
+                                        element_size,
+                                        element_signed,
+                                        element_is_const: native_pointer_target_is_const(
+                                            &declaration.c_type,
+                                        ),
+                                        element_floating_size: native_pointer_element_floating_size(
+                                            &declaration.c_type,
+                                        ),
+                                        record_layout: record_layout.clone(),
+                                    }
+                                } else if let Some(signed) = byte_signed {
+                                    NativeLocation::ByteRegister {
+                                        register: *next_register,
+                                        signed,
+                                    }
+                                } else {
+                                    NativeLocation::Register {
+                                        register: *next_register,
+                                        unsigned: is_native_unsigned_word_type(&declaration.c_type),
+                                    }
+                                };
+                            *next_register += 1;
+                            location
+                        } else if reserve_frame_register {
+                            let offset = *frame_size;
+                            let size = if byte_signed.is_some() {
+                                1
+                            } else if pointer_element.is_some() {
+                                4
+                            } else {
+                                2
+                            };
+                            let Some(new_frame_size) = frame_size.checked_add(size) else {
+                                return false;
+                            };
+                            *frame_size = new_frame_size;
+                            if let Some(signed) = byte_signed {
+                                NativeLocation::ByteStackScalar { offset, signed }
+                            } else if let Some((element_size, element_signed)) = pointer_element {
+                                NativeLocation::PointerStack {
+                                    offset,
+                                    element_size,
+                                    element_signed,
+                                    element_is_const: native_pointer_target_is_const(
+                                        &declaration.c_type,
+                                    ),
+                                    element_floating_size: native_pointer_element_floating_size(
+                                        &declaration.c_type,
+                                    ),
+                                    record_layout: record_layout.clone(),
+                                }
+                            } else {
+                                NativeLocation::StackScalar {
+                                    offset,
+                                    unsigned: is_native_unsigned_word_type(&declaration.c_type),
+                                }
+                            }
+                        } else {
+                            eprintln!("not enough native registers for local {}", declaration.name);
+                            return false;
+                        };
+                        locals.insert(declaration.name.clone(), location);
+                    }
+                }
+            }
+            StatementKind::Compound(statements) => {
+                if !collect_native_locals(
+                    statements,
+                    locals,
+                    next_register,
+                    frame_size,
+                    reserve_frame_register,
+                    stack_required,
+                    records,
+                ) {
+                    return false;
+                }
+            }
+            StatementKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                if !collect_native_locals(
+                    std::slice::from_ref(then_branch),
+                    locals,
+                    next_register,
+                    frame_size,
+                    reserve_frame_register,
+                    stack_required,
+                    records,
+                ) || else_branch.as_ref().is_some_and(|branch| {
+                    !collect_native_locals(
+                        std::slice::from_ref(branch),
+                        locals,
+                        next_register,
+                        frame_size,
+                        reserve_frame_register,
+                        stack_required,
+                        records,
+                    )
+                }) {
+                    return false;
+                }
+            }
+            StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::For { body, .. } => {
+                if !collect_native_locals(
+                    std::slice::from_ref(body),
+                    locals,
+                    next_register,
+                    frame_size,
+                    reserve_frame_register,
+                    stack_required,
+                    records,
+                ) {
+                    return false;
+                }
+                if let StatementKind::For {
+                    initializer: Some(initializer),
+                    ..
+                } = &statement.kind
+                    && !collect_native_locals(
+                        std::slice::from_ref(initializer),
+                        locals,
+                        next_register,
+                        frame_size,
+                        reserve_frame_register,
+                        stack_required,
+                        records,
+                    )
+                {
+                    return false;
+                }
+            }
+            StatementKind::Switch { cases, .. } => {
+                for (_, statements) in cases {
+                    if !collect_native_locals(
+                        statements,
+                        locals,
+                        next_register,
+                        frame_size,
+                        reserve_frame_register,
+                        stack_required,
+                        records,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            StatementKind::Label { statement, .. }
+                if !collect_native_locals(
+                    std::slice::from_ref(statement),
+                    locals,
+                    next_register,
+                    frame_size,
+                    reserve_frame_register,
+                    stack_required,
+                    records,
+                ) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn statement_has_local_array(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations.iter().any(|declaration| {
+            declaration.array_length.is_some()
+                || (!declaration.c_type.contains('*')
+                    && matches!(
+                        native_unqualified_type(&declaration.c_type)
+                            .split_whitespace()
+                            .next(),
+                        Some("struct" | "union")
+                    ))
+        }),
+        StatementKind::Compound(statements) => statements.iter().any(statement_has_local_array),
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_has_local_array(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| statement_has_local_array(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_has_local_array(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .is_some_and(|initializer| statement_has_local_array(initializer))
+                || statement_has_local_array(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|(_, statements)| statements.iter().any(statement_has_local_array)),
+        StatementKind::Label { statement, .. } => statement_has_local_array(statement),
+        _ => false,
+    }
+}
+
+fn statement_has_local_floating_scalar(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations.iter().any(|declaration| {
+            declaration.array_length.is_none()
+                && matches!(
+                    native_unqualified_type(&declaration.c_type),
+                    "float" | "double" | "long double"
+                )
+        }),
+        StatementKind::Compound(statements) => {
+            statements.iter().any(statement_has_local_floating_scalar)
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_has_local_floating_scalar(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| statement_has_local_floating_scalar(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_has_local_floating_scalar(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .is_some_and(|initializer| statement_has_local_floating_scalar(initializer))
+                || statement_has_local_floating_scalar(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|(_, statements)| statements.iter().any(statement_has_local_floating_scalar)),
+        StatementKind::Label { statement, .. } => statement_has_local_floating_scalar(statement),
+        _ => false,
+    }
+}
+
+fn statement_has_local_wide_integer(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations.iter().any(|declaration| {
+            declaration.array_length.is_none() && is_native_wide_integer_type(&declaration.c_type)
+        }),
+        StatementKind::Compound(statements) => {
+            statements.iter().any(statement_has_local_wide_integer)
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_has_local_wide_integer(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| statement_has_local_wide_integer(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_has_local_wide_integer(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .is_some_and(|initializer| statement_has_local_wide_integer(initializer))
+                || statement_has_local_wide_integer(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|(_, statements)| statements.iter().any(statement_has_local_wide_integer)),
+        StatementKind::Label { statement, .. } => statement_has_local_wide_integer(statement),
+        _ => false,
+    }
+}
+
+fn statement_scalar_local_count(statement: &Statement) -> usize {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .filter(|declaration| declaration.array_length.is_none())
+            .count(),
+        StatementKind::Compound(statements) => {
+            statements.iter().map(statement_scalar_local_count).sum()
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            statement_scalar_local_count(then_branch)
+                + else_branch
+                    .as_ref()
+                    .map_or(0, |branch| statement_scalar_local_count(branch))
+        }
+        StatementKind::While { body, .. } | StatementKind::DoWhile { body, .. } => {
+            statement_scalar_local_count(body)
+        }
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            initializer
+                .as_ref()
+                .map_or(0, |initializer| statement_scalar_local_count(initializer))
+                + statement_scalar_local_count(body)
+        }
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .map(|(_, statements)| {
+                statements
+                    .iter()
+                    .map(statement_scalar_local_count)
+                    .sum::<usize>()
+            })
+            .sum(),
+        StatementKind::Label { statement, .. } => statement_scalar_local_count(statement),
+        _ => 0,
+    }
+}
+
+fn collect_native_labels(
+    statement: &Statement,
+    labels: &mut HashSet<String>,
+    references: &mut HashSet<String>,
+) -> bool {
+    match &statement.kind {
+        StatementKind::Compound(statements) => statements
+            .iter()
+            .all(|statement| collect_native_labels(statement, labels, references)),
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_native_labels(then_branch, labels, references)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(|statement| collect_native_labels(statement, labels, references))
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::For { body, .. } => collect_native_labels(body, labels, references),
+        StatementKind::Switch { cases, .. } => cases.iter().all(|(_, statements)| {
+            statements
+                .iter()
+                .all(|statement| collect_native_labels(statement, labels, references))
+        }),
+        StatementKind::Goto(name) => {
+            references.insert(name.clone());
+            true
+        }
+        StatementKind::Label { name, statement } => {
+            labels.insert(name.clone()) && collect_native_labels(statement, labels, references)
+        }
+        _ => true,
+    }
+}
+
+fn native_sizeof_type(c_type: &str) -> Option<u16> {
+    let c_type = native_unqualified_type(c_type);
+    if c_type.ends_with('*')
+        || native_type_is_function_pointer(c_type)
+        || native_type_is_pointer_to_array(c_type)
+    {
+        Some(4)
+    } else if let Some(size) = native_floating_type_size(c_type) {
+        u16::try_from(size).ok()
+    } else if matches!(c_type, "char" | "signed char" | "unsigned char") {
+        Some(1)
+    } else if matches!(
+        c_type,
+        "int" | "signed" | "signed int" | "unsigned" | "unsigned int"
+    ) {
+        Some(2)
+    } else if matches!(c_type, "long" | "signed long" | "unsigned long") {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn native_floating_type_size(c_type: &str) -> Option<usize> {
+    match native_unqualified_type(c_type) {
+        "float" => Some(4),
+        "double" | "long double" => Some(8),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeFloatingConstant {
+    Integer(i64),
+    Binary32(f32),
+    Binary64(f64),
+}
+
+fn evaluate_native_floating_constant(expression: &Expression) -> Option<NativeFloatingConstant> {
+    match &expression.kind {
+        ExpressionKind::Atom(value) => {
+            if let Some(integer) =
+                parse_integer_constant(value).or_else(|| value.parse::<i64>().ok())
+            {
+                return Some(NativeFloatingConstant::Integer(integer));
+            }
+            let (literal, precision) = match value.chars().last() {
+                Some('f' | 'F') => (&value[..value.len() - 1], 32),
+                Some('l' | 'L') => (&value[..value.len() - 1], 64),
+                _ => (value.as_str(), 64),
+            };
+            if precision == 32 {
+                let value = literal.parse::<f32>().ok()?;
+                value
+                    .is_finite()
+                    .then_some(NativeFloatingConstant::Binary32(value))
+            } else {
+                let value = literal.parse::<f64>().ok()?;
+                value
+                    .is_finite()
+                    .then_some(NativeFloatingConstant::Binary64(value))
+            }
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "+" || operator == "-" => {
+            let value = evaluate_native_floating_constant(operand)?;
+            Some(match (operator.as_str(), value) {
+                ("+", value) => value,
+                ("-", NativeFloatingConstant::Integer(value)) => {
+                    NativeFloatingConstant::Integer(value.checked_neg()?)
+                }
+                ("-", NativeFloatingConstant::Binary32(value)) => {
+                    NativeFloatingConstant::Binary32(-value)
+                }
+                ("-", NativeFloatingConstant::Binary64(value)) => {
+                    NativeFloatingConstant::Binary64(-value)
+                }
+                _ => return None,
+            })
+        }
+        ExpressionKind::Cast { c_type, expression } => {
+            let target_type = native_unqualified_type(c_type);
+            let value = evaluate_native_floating_constant(expression)?;
+            match target_type {
+                "float" => {
+                    let value = match value {
+                        NativeFloatingConstant::Integer(value) => value as f32,
+                        NativeFloatingConstant::Binary32(value) => value,
+                        NativeFloatingConstant::Binary64(value) => value as f32,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary32(value))
+                }
+                "double" | "long double" => {
+                    let value = match value {
+                        NativeFloatingConstant::Integer(value) => value as f64,
+                        NativeFloatingConstant::Binary32(value) => value as f64,
+                        NativeFloatingConstant::Binary64(value) => value,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary64(value))
+                }
+                _ => None,
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/" | "%") => {
+            let left = evaluate_native_floating_constant(left)?;
+            let right = evaluate_native_floating_constant(right)?;
+            match (left, right) {
+                (NativeFloatingConstant::Integer(left), NativeFloatingConstant::Integer(right)) => {
+                    let value = match operator.as_str() {
+                        "+" => left.checked_add(right)?,
+                        "-" => left.checked_sub(right)?,
+                        "*" => left.checked_mul(right)?,
+                        "/" if right != 0 => left.checked_div(right)?,
+                        "%" if right != 0 => left.checked_rem(right)?,
+                        _ => return None,
+                    };
+                    Some(NativeFloatingConstant::Integer(value))
+                }
+                (left, right)
+                    if matches!(left, NativeFloatingConstant::Binary64(_))
+                        || matches!(right, NativeFloatingConstant::Binary64(_)) =>
+                {
+                    let to_f64 = |value| match value {
+                        NativeFloatingConstant::Integer(value) => value as f64,
+                        NativeFloatingConstant::Binary32(value) => value as f64,
+                        NativeFloatingConstant::Binary64(value) => value,
+                    };
+                    let left = to_f64(left);
+                    let right = to_f64(right);
+                    if matches!(operator.as_str(), "/" | "%") && right == 0.0 {
+                        return None;
+                    }
+                    let value = match operator.as_str() {
+                        "+" => left + right,
+                        "-" => left - right,
+                        "*" => left * right,
+                        "/" => left / right,
+                        _ => return None,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary64(value))
+                }
+                (left, right) => {
+                    let to_f32 = |value| match value {
+                        NativeFloatingConstant::Integer(value) => Some(value as f32),
+                        NativeFloatingConstant::Binary32(value) => Some(value),
+                        NativeFloatingConstant::Binary64(_) => None,
+                    };
+                    let left = to_f32(left)?;
+                    let right = to_f32(right)?;
+                    if matches!(operator.as_str(), "/" | "%") && right == 0.0 {
+                        return None;
+                    }
+                    let value = match operator.as_str() {
+                        "+" => left + right,
+                        "-" => left - right,
+                        "*" => left * right,
+                        "/" => left / right,
+                        _ => return None,
+                    };
+                    value
+                        .is_finite()
+                        .then_some(NativeFloatingConstant::Binary32(value))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+fn native_floating_initializer(expression: &Expression, c_type: &str) -> Option<Vec<u8>> {
+    let c_type = native_unqualified_type(c_type);
+    let width = match c_type {
+        "float" => 4,
+        "double" | "long double" => 8,
+        _ => return None,
+    };
+    match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if operator == "+" || operator == "-" => {
+            let mut bytes = native_floating_initializer(operand, c_type)?;
+            if operator == "-" {
+                bytes[0] ^= 0x80;
+            }
+            Some(bytes)
+        }
+        _ => match evaluate_native_floating_constant(expression)? {
+            NativeFloatingConstant::Integer(value) if width == 4 => {
+                Some((value as f32).to_be_bytes().to_vec())
+            }
+            NativeFloatingConstant::Integer(value) => Some((value as f64).to_be_bytes().to_vec()),
+            NativeFloatingConstant::Binary32(value) if width == 4 => {
+                Some(value.to_be_bytes().to_vec())
+            }
+            NativeFloatingConstant::Binary32(value) => Some((value as f64).to_be_bytes().to_vec()),
+            NativeFloatingConstant::Binary64(value) if width == 4 => {
+                let value = value as f32;
+                value.is_finite().then(|| value.to_be_bytes().to_vec())
+            }
+            NativeFloatingConstant::Binary64(value) => Some(value.to_be_bytes().to_vec()),
+        },
+    }
+}
+
+fn native_sizeof_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<u16> {
+    if native_expression_is_wide_integer(expression, locals) {
+        return Some(4);
+    }
+    match &expression.kind {
+        ExpressionKind::Atom(value) if parse_integer_constant(value).is_some() => Some(2),
+        ExpressionKind::Atom(name) => match locals.get(name) {
+            Some(NativeLocation::GlobalArray {
+                length,
+                element_size,
+                ..
+            }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
+            Some(NativeLocation::StackArray {
+                length,
+                element_size,
+                ..
+            }) => u16::try_from(length.checked_mul(*element_size)?).ok(),
+            Some(NativeLocation::StackWideScalar { .. }) => Some(4),
+            Some(NativeLocation::GlobalRecord { dimensions, layout })
+            | Some(NativeLocation::StackRecord {
+                dimensions, layout, ..
+            }) => {
+                let count = dimensions
+                    .iter()
+                    .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))?;
+                u16::try_from(count.checked_mul(layout.size)?).ok()
+            }
+            Some(NativeLocation::FloatingPointScalar { size }) => u16::try_from(*size).ok(),
+            Some(NativeLocation::StackFloatingPointScalar { size, .. }) => {
+                u16::try_from(*size).ok()
+            }
+            Some(_) => Some(2),
+            None => None,
+        },
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            if !native_array_index_is_partial(base, index, locals)
+                && let Some(layout) = native_expression_record_layout(expression, locals)
+            {
+                return u16::try_from(layout.size).ok();
+            }
+            let ExpressionKind::Atom(name) = &base.kind else {
+                return None;
+            };
+            match locals.get(name) {
+                Some(NativeLocation::GlobalArray { element_size, .. }) => {
+                    u16::try_from(*element_size).ok()
+                }
+                Some(NativeLocation::StackArray { element_size, .. }) => {
+                    u16::try_from(*element_size).ok()
+                }
+                _ => None,
+            }
+        }
+        ExpressionKind::Unary { operator, operand }
+            if matches!(operator.as_str(), "+" | "-" | "~" | "!") =>
+        {
+            native_sizeof_expression(operand, locals)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_sizeof_expression(left, locals)?;
+            native_sizeof_expression(right, locals)?;
+            Some(2)
+        }
+        ExpressionKind::Assignment { target, value, .. } => {
+            native_sizeof_expression(target, locals)?;
+            native_sizeof_expression(value, locals)?;
+            Some(2)
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            native_sizeof_expression(condition, locals)?;
+            native_sizeof_expression(when_true, locals)?;
+            native_sizeof_expression(when_false, locals)?;
+            Some(2)
+        }
+        ExpressionKind::Call { .. } | ExpressionKind::Postfix { .. } => Some(2),
+        ExpressionKind::Cast { c_type, .. } => native_sizeof_type(c_type),
+        ExpressionKind::SizeofType(c_type) => native_sizeof_type(c_type),
+        ExpressionKind::SizeofExpression(expression) => {
+            native_sizeof_expression(expression, locals)?;
+            Some(2)
+        }
+        _ => None,
+    }
+}
+
+fn native_statement_termination(statement: &Statement) -> Option<bool> {
+    match &statement.kind {
+        StatementKind::Return(_) => Some(true),
+        StatementKind::Break => Some(false),
+        StatementKind::Compound(statements) => {
+            statements.iter().find_map(native_statement_termination)
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } => match (
+            native_statement_termination(then_branch),
+            native_statement_termination(else_branch),
+        ) {
+            (Some(true), Some(true)) => Some(true),
+            (Some(_), Some(_)) => Some(false),
+            _ => None,
+        },
+        StatementKind::If {
+            then_branch,
+            else_branch: None,
+            ..
+        } if native_statement_termination(then_branch) == Some(false) => Some(false),
+        StatementKind::Label { statement, .. } => native_statement_termination(statement),
+        _ => None,
+    }
+}
+
+fn emit_native_index_scale(index_register: u8, element_size: usize, assembly: &mut String) {
+    if element_size == 2 {
+        assembly.push_str(&format!("    SHL R{index_register}, 1\n"));
+    } else if element_size > 2 {
+        assembly.push_str(&format!(
+            "    LDI R6, {element_size}\n    MUL R{index_register}, R6\n"
+        ));
+    }
+}
+
+fn native_location_has_signed_byte_elements(location: &NativeLocation) -> bool {
+    match location {
+        NativeLocation::GlobalArray {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::StackArray {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::PointerRegister {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::PointerStack {
+            element_size,
+            element_signed,
+            ..
+        }
+        | NativeLocation::GlobalPointer {
+            element_size,
+            element_signed,
+            ..
+        } => *element_size == 1 && *element_signed,
+        _ => false,
+    }
+}
+
+fn native_location_is_signed_byte_scalar(location: &NativeLocation) -> bool {
+    matches!(
+        location,
+        NativeLocation::ByteRegister { signed: true, .. }
+            | NativeLocation::ByteStackScalar { signed: true, .. }
+            | NativeLocation::GlobalByteScalar { signed: true }
+    )
+}
+
+fn native_expression_uses_signed_byte(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => locals
+            .get(name)
+            .is_some_and(native_location_is_signed_byte_scalar),
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let indexed_signed_byte = match &base.kind {
+                ExpressionKind::Atom(name) => locals
+                    .get(name)
+                    .is_some_and(native_location_has_signed_byte_elements),
+                _ => false,
+            };
+            indexed_signed_byte
+                || native_expression_uses_signed_byte(base, locals)
+                || native_expression_uses_signed_byte(index, locals)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_expression_uses_signed_byte(left, locals)
+                || native_expression_uses_signed_byte(right, locals)
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        } => native_expression_uses_signed_byte(operand, locals),
+        _ => false,
+    }
+}
+
+fn emit_native_array_address(
+    name: &str,
+    index_register: u8,
+    locals: &HashMap<String, NativeLocation>,
+    assembly: &mut String,
+) -> Option<(usize, bool)> {
+    let (element_size, element_signed) = match locals.get(name)? {
+        NativeLocation::GlobalArray {
+            element_size,
+            element_signed,
+            ..
+        } => {
+            assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+            (*element_size, *element_signed)
+        }
+        NativeLocation::GlobalRecord { layout, .. } => {
+            assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+            (layout.size, false)
+        }
+        NativeLocation::StackRecord { offset, layout, .. } => {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            (layout.size, false)
+        }
+        NativeLocation::GlobalPointer {
+            element_size,
+            element_signed,
+            ..
+        } => {
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    LDP R7, R7\n"
+            ));
+            (*element_size, *element_signed)
+        }
+        NativeLocation::StackArray {
+            offset,
+            element_size,
+            element_signed,
+            ..
+        } => {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            (*element_size, *element_signed)
+        }
+        NativeLocation::PointerStack {
+            offset,
+            element_size,
+            element_signed,
+            ..
+        } => {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    LDP R7, R7\n");
+            (*element_size, *element_signed)
+        }
+        NativeLocation::PointerRegister {
+            register,
+            element_size,
+            element_signed,
+            ..
+        } => {
+            assembly.push_str(&format!("    MOV R7, R{register}\n"));
+            (*element_size, *element_signed)
+        }
+        _ => return None,
+    };
+    emit_native_index_scale(index_register, element_size, assembly);
+    assembly.push_str(&format!("    ADD R7, R{index_register}\n"));
+    Some((element_size, element_signed))
+}
+
+fn emit_native_stack_offset(register: u8, offset: usize, assembly: &mut String) {
+    if offset > 0 {
+        let instruction = if offset > u16::MAX as usize {
+            "LDI30"
+        } else {
+            "LDI"
+        };
+        assembly.push_str(&format!(
+            "    {instruction} R6, {offset}\n    ADD R{register}, R6\n"
+        ));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeIntegerType {
+    wide: bool,
+    unsigned: bool,
+}
+
+fn native_expression_integer_type(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<NativeIntegerType> {
+    let word = |unsigned| NativeIntegerType {
+        wide: false,
+        unsigned,
+    };
+    let wide = |unsigned| NativeIntegerType {
+        wide: true,
+        unsigned,
+    };
+    let combine = |left: NativeIntegerType, right: NativeIntegerType| NativeIntegerType {
+        wide: left.wide || right.wide,
+        unsigned: if left.wide != right.wide {
+            if left.wide {
+                left.unsigned
+            } else {
+                right.unsigned
+            }
+        } else {
+            left.unsigned || right.unsigned
+        },
+    };
+    match &expression.kind {
+        ExpressionKind::Atom(name) => match locals.get(name) {
+            Some(NativeLocation::StackWideScalar { unsigned, .. })
+            | Some(NativeLocation::GlobalWideScalar { unsigned }) => Some(wide(*unsigned)),
+            Some(NativeLocation::Register { unsigned, .. })
+            | Some(NativeLocation::StackScalar { unsigned, .. })
+            | Some(NativeLocation::GlobalScalar { unsigned }) => Some(word(*unsigned)),
+            Some(NativeLocation::ByteRegister { .. })
+            | Some(NativeLocation::ByteStackScalar { .. })
+            | Some(NativeLocation::GlobalByteScalar { .. })
+            | Some(NativeLocation::Constant(_)) => Some(word(false)),
+            _ => {
+                let value = parse_integer_constant(name)?;
+                let unsigned = name.ends_with(['u', 'U'])
+                    || name.to_ascii_lowercase().ends_with("ul")
+                    || value > i64::from(i32::MAX);
+                let explicitly_long = name.contains(['l', 'L']);
+                let nondecimal = name.starts_with('0') && name.len() > 1;
+                let is_wide = explicitly_long
+                    || value > i64::from(u16::MAX)
+                    || (!unsigned && !nondecimal && value > i64::from(i16::MAX));
+                Some(if is_wide {
+                    wide(unsigned)
+                } else {
+                    word(unsigned || value > i64::from(i16::MAX))
+                })
+            }
+        },
+        ExpressionKind::Cast { c_type, .. } if is_native_wide_integer_type(c_type) => {
+            Some(wide(is_native_unsigned_word_type(c_type)))
+        }
+        ExpressionKind::Cast { c_type, .. }
+            if native_floating_type_size(c_type).is_none() && !c_type.contains('*') =>
+        {
+            Some(word(
+                native_byte_type(c_type).is_none() && is_native_unsigned_word_type(c_type),
+            ))
+        }
+        ExpressionKind::Unary { operator, operand } => {
+            if operator == "!" {
+                Some(word(false))
+            } else if operator == "*" {
+                native_expression_pointer_integer_type(operand, locals)
+            } else if matches!(operator.as_str(), "+" | "-" | "~" | "++" | "--") {
+                native_expression_integer_type(operand, locals)
+            } else {
+                None
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            if operator == "," {
+                native_expression_integer_type(right, locals)
+            } else if operator == "-"
+                && native_expression_pointer_element_size(left, locals)
+                    .zip(native_expression_pointer_element_size(right, locals))
+                    .is_some_and(|(left_size, right_size)| left_size == right_size)
+            {
+                Some(wide(false))
+            } else if matches!(
+                operator.as_str(),
+                "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
+            ) {
+                Some(word(false))
+            } else {
+                let left = native_expression_integer_type(left, locals)?;
+                if matches!(operator.as_str(), "<<" | ">>") {
+                    Some(left)
+                } else {
+                    Some(combine(
+                        left,
+                        native_expression_integer_type(right, locals)?,
+                    ))
+                }
+            }
+        }
+        ExpressionKind::Assignment { target, .. }
+        | ExpressionKind::Postfix {
+            expression: target, ..
+        } => native_expression_integer_type(target, locals),
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => Some(combine(
+            native_expression_integer_type(when_true, locals)?,
+            native_expression_integer_type(when_false, locals)?,
+        )),
+        ExpressionKind::Member { .. } => {
+            let field = native_expression_record_field(expression, locals)?;
+            if field.floating_size != 0 {
+                None
+            } else if let Some((_, width)) = field.bit_field {
+                Some(word(!field.signed && width == 16))
+            } else if field.size == 4
+                && field.dimensions.is_empty()
+                && field.record_layout.is_none()
+            {
+                Some(wide(!field.signed))
+            } else if field.size <= 2
+                && field.dimensions.is_empty()
+                && field.record_layout.is_none()
+            {
+                Some(word(field.size == 2 && !field.signed))
+            } else {
+                None
+            }
+        }
+        ExpressionKind::Index {
+            expression: base, ..
+        } => {
+            if let Some(element_type) = native_expression_pointer_integer_type(base, locals) {
+                return Some(element_type);
+            }
+            let mut base = base.as_ref();
+            let mut index_count = 1;
+            while let ExpressionKind::Index {
+                expression: parent, ..
+            } = &base.kind
+            {
+                base = parent;
+                index_count += 1;
+            }
+            let field = native_expression_record_field(base, locals)?;
+            (field.floating_size == 0
+                && field.dimensions.len() == index_count
+                && field.element_size == 4
+                && field.record_layout.is_none())
+            .then(|| wide(!field.signed))
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return None;
+            };
+            match locals.get(name)? {
+                NativeLocation::FunctionParameters {
+                    wide_return_unsigned: Some(unsigned),
+                    ..
+                } => Some(wide(*unsigned)),
+                NativeLocation::FunctionParameters {
+                    float_return_size: 0,
+                    word_return_unsigned,
+                    ..
+                } => Some(word(*word_return_unsigned)),
+                _ => None,
+            }
+        }
+        ExpressionKind::SizeofType(_) | ExpressionKind::SizeofExpression(_) => Some(word(true)),
+        _ => None,
+    }
+}
+
+fn native_expression_is_wide_integer(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    native_expression_integer_type(expression, locals).is_some_and(|c_type| c_type.wide)
+}
+
+fn emit_native_i32_source(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let saved_r1 = emit_native_save_r1(locals, assembly);
+    let emitted = emit_native_i32_source_inner(expression, locals, label_counter, assembly);
+    if emitted {
+        emit_native_restore_r1(saved_r1, assembly);
+    }
+    emitted
+}
+
+fn emit_native_i32_source_inner(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(name) if native_expression_is_wide_integer(expression, locals) => {
+            if let Some(NativeLocation::StackWideScalar { offset, .. }) = locals.get(name) {
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, *offset, assembly);
+                assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+                true
+            } else if matches!(
+                locals.get(name),
+                Some(NativeLocation::GlobalWideScalar { .. })
+            ) {
+                assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+                assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+                true
+            } else {
+                parse_integer_constant(name).is_some_and(|value| {
+                    let Ok(bits) = u32::try_from(value) else {
+                        return false;
+                    };
+                    assembly.push_str(&format!(
+                        "    LDI R4, 0x{:04X}\n    LDI R5, 0x{:04X}\n",
+                        bits >> 16,
+                        bits & 0xffff
+                    ));
+                    true
+                })
+            }
+        }
+        ExpressionKind::Cast {
+            c_type,
+            expression: operand,
+        } if is_native_wide_integer_type(c_type) => {
+            if let Some(size) = native_expression_floating_size(operand, locals) {
+                if !emit_native_floating_conversion(operand, size, locals, label_counter, assembly)
+                {
+                    return false;
+                }
+                assembly.push_str(&format!(
+                    "    F{bits}TO{signed}32 R4, R4\n",
+                    bits = size * 8,
+                    signed = if is_native_unsigned_word_type(c_type) {
+                        "U"
+                    } else {
+                        "I"
+                    }
+                ));
+                true
+            } else if native_expression_pointer_element_size(operand, locals).is_some() {
+                if !emit_native_expression(operand, 0, &[4, 5, 6], locals, label_counter, assembly)
+                {
+                    return false;
+                }
+                assembly.push_str("    MOV R4, R0\n    SPLIT30 R4, R5\n");
+                true
+            } else {
+                emit_native_i32_source(operand, locals, label_counter, assembly)
+            }
+        }
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } if native_expression_is_wide_integer(expression, locals) => {
+            if native_array_index_is_partial(base, index, locals) {
+                return false;
+            }
+            let Some((element_size, _)) = emit_native_indexed_element_address(
+                expression,
+                base,
+                index,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if element_size != 4 {
+                return false;
+            }
+            assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+            true
+        }
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } => {
+            let Some(field) = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if field.bit_field.is_some() {
+                if !emit_native_expression(
+                    expression,
+                    0,
+                    &[4, 5, 6],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                assembly.push_str("    MOV R5, R0\n    AND R5, 0xFFFF\n    LDI R4, 0\n");
+                if !native_expression_is_unsigned(expression, locals) {
+                    assembly.push_str("    MOV R4, R5\n    ASR R4, 15\n");
+                }
+                return true;
+            }
+            if field.size != 4 || field.record_layout.is_some() || !field.dimensions.is_empty() {
+                return false;
+            }
+            assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+            true
+        }
+        ExpressionKind::Unary { operator, operand }
+            if operator == "*" && native_expression_is_wide_integer(expression, locals) =>
+        {
+            if !native_expression_pointer_integer_type(operand, locals)
+                .is_some_and(|element_type| element_type.wide)
+                || !emit_native_expression(operand, 0, &[4, 5, 6], locals, label_counter, assembly)
+            {
+                return false;
+            }
+            assembly.push_str(
+                "    MOV R7, R0\n    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n",
+            );
+            true
+        }
+        ExpressionKind::Unary { operator, operand }
+            if matches!(operator.as_str(), "+" | "-" | "~")
+                && native_expression_is_wide_integer(expression, locals) =>
+        {
+            if !emit_native_i32_source(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            if operator == "-" {
+                assembly.push_str("    NEG32 R4\n");
+            } else if operator == "~" {
+                assembly.push_str("    NOT R4\n    NOT R5\n");
+            }
+            true
+        }
+        ExpressionKind::Unary {
+            operator,
+            operand: target,
+        }
+        | ExpressionKind::Postfix {
+            operator,
+            expression: target,
+        } if matches!(operator.as_str(), "++" | "--")
+            && native_expression_is_wide_integer(expression, locals) =>
+        {
+            let assignment = Expression {
+                kind: ExpressionKind::Assignment {
+                    operator: if operator == "++" { "+=" } else { "-=" }.to_owned(),
+                    target: target.clone(),
+                    value: Box::new(Expression {
+                        kind: ExpressionKind::Atom("1".to_owned()),
+                        line: expression.line,
+                        filename: expression.filename.clone(),
+                    }),
+                },
+                line: expression.line,
+                filename: expression.filename.clone(),
+            };
+            if !emit_native_assignment_store(
+                &assignment,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+                false,
+            ) {
+                return false;
+            }
+            if matches!(expression.kind, ExpressionKind::Postfix { .. }) {
+                assembly.push_str("    LDI R0, 0\n    LDI R1, 1\n");
+                assembly.push_str(if operator == "++" {
+                    "    SUB32 R4, R0\n"
+                } else {
+                    "    ADD32 R4, R0\n"
+                });
+            }
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "-"
+            && native_expression_pointer_element_size(left, locals)
+                .zip(native_expression_pointer_element_size(right, locals))
+                .is_some_and(|(left_size, right_size)| left_size == right_size) =>
+        {
+            let element_size = native_expression_pointer_element_size(left, locals).unwrap();
+            if !emit_native_expression(left, 0, &[4, 5, 6], locals, label_counter, assembly) {
+                eprintln!(
+                    "unsupported left pointer-subtraction operand at line {}",
+                    left.line
+                );
+                return false;
+            }
+            assembly.push_str("    ADJSP -4\n    MOVSP R7\n    STP R0, R7\n");
+            if !emit_native_expression(right, 1, &[4, 5, 6], locals, label_counter, assembly) {
+                eprintln!(
+                    "unsupported right pointer-subtraction operand at line {}",
+                    right.line
+                );
+                return false;
+            }
+            assembly.push_str("    MOVSP R7\n    LDP R0, R7\n    ADJSP 4\n    SUB R0, R1\n");
+            if element_size > 1 {
+                assembly.push_str(&format!("    LDI R1, {element_size}\n    DIVS R0, R1\n"));
+            }
+            assembly.push_str(
+                "    MOV R4, R0\n    ASR R4, 15\n    ASR R4, 1\n\
+                 MOV R5, R0\n    AND R5, 0xFFFF\n",
+            );
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if native_expression_is_wide_integer(expression, locals) && operator != "," => {
+            if !emit_native_i32_source(left, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n");
+            if matches!(operator.as_str(), "<<" | ">>") {
+                if !emit_native_expression(right, 0, &[4, 5, 6], locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    POP R5\n    POP R4\n");
+                let instruction = if operator == "<<" {
+                    "SHL32"
+                } else if native_expression_integer_type(left, locals)
+                    .is_some_and(|c_type| c_type.unsigned)
+                {
+                    "LSR32"
+                } else {
+                    "ASR32"
+                };
+                assembly.push_str(&format!("    {instruction} R4, R0\n"));
+            } else {
+                if !emit_native_i32_source(right, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    MOV32 R0, R4\n    POP R5\n    POP R4\n");
+                let unsigned = native_expression_integer_type(expression, locals)
+                    .unwrap()
+                    .unsigned;
+                let instruction = match operator.as_str() {
+                    "+" => "ADD32",
+                    "-" => "SUB32",
+                    "*" => "MUL32",
+                    "/" if unsigned => "DIV32",
+                    "/" => "DIV32S",
+                    "%" if unsigned => "MOD32",
+                    "%" => "MOD32S",
+                    "&" => "AND32",
+                    "|" => "OR32",
+                    "^" => "XOR32",
+                    _ => return false,
+                };
+                assembly.push_str(&format!("    {instruction} R4, R0\n"));
+            }
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "," => {
+            emit_native_discarded_expression(left, 0, &[4, 5, 6], locals, label_counter, assembly)
+                && emit_native_i32_source(right, locals, label_counter, assembly)
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } if native_expression_is_wide_integer(expression, locals) => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_condition(condition, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("    CMP R0, 0\n    BZX __c_i32_{label}_false\n"));
+            if !emit_native_i32_source(when_true, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_i32_{label}_end\n__c_i32_{label}_false:\n"
+            ));
+            if !emit_native_i32_source(when_false, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("__c_i32_{label}_end:\n"));
+            true
+        }
+        ExpressionKind::Call { .. } if native_expression_is_wide_integer(expression, locals) => {
+            emit_native_expression(expression, 0, &[4, 5, 6], locals, label_counter, assembly)
+        }
+        ExpressionKind::Assignment { .. }
+            if native_expression_is_wide_integer(expression, locals) =>
+        {
+            emit_native_assignment_store(
+                expression,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+                false,
+            )
+        }
+        _ if !native_expression_is_wide_integer(expression, locals) => {
+            if !emit_native_expression(expression, 0, &[4, 5, 6], locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOV R5, R0\n    AND R5, 0xFFFF\n    LDI R4, 0\n");
+            if !native_expression_is_unsigned(expression, locals) {
+                assembly.push_str("    MOV R4, R5\n    ASR R4, 15\n");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn emit_native_wide_conversion(
+    expression: &Expression,
+    unsigned: bool,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let converted = Expression {
+        kind: ExpressionKind::Cast {
+            c_type: if unsigned { "unsigned long" } else { "long" }.to_owned(),
+            expression: Box::new(expression.clone()),
+        },
+        line: expression.line,
+        filename: expression.filename.clone(),
+    };
+    emit_native_i32_source(&converted, locals, label_counter, assembly)
+}
+
+fn emit_native_byte_normalization(register: u8, signed: bool, assembly: &mut String) {
+    if signed {
+        assembly.push_str(&format!("    SHL R{register}, 8\n    ASR R{register}, 8\n"));
+    } else {
+        assembly.push_str(&format!("    LDI R7, 0x00FF\n    AND R{register}, R7\n"));
+    }
+}
+
+fn emit_native_word_normalization(
+    register: u8,
+    unsigned: bool,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) {
+    if !unsigned {
+        let label = *label_counter;
+        *label_counter += 1;
+        assembly.push_str(&format!(
+            "    LDI R7, 0x8000\n    AND R7, R{register}\n\
+             LDI R6, 0\n    CMP R7, R6\n\
+             BZX __c_parameter_sign_{label}_done\n\
+             LDI30 R7, 0x10000\n    SUB R{register}, R7\n\
+             __c_parameter_sign_{label}_done:\n"
+        ));
+    }
+}
+
+fn collect_native_array_indices<'a>(
+    expression: &'a Expression,
+    indices: &mut Vec<&'a Expression>,
+) -> Option<&'a str> {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => Some(name),
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let name = collect_native_array_indices(base, indices)?;
+            indices.push(index);
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+fn collect_native_member_array_indices<'a>(
+    expression: &'a Expression,
+    indices: &mut Vec<&'a Expression>,
+) -> Option<(&'a Expression, &'a str, &'a str)> {
+    match &expression.kind {
+        ExpressionKind::Member {
+            expression,
+            operator,
+            name,
+        } => Some((expression, operator, name)),
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let member = collect_native_member_array_indices(base, indices)?;
+            indices.push(index);
+            Some(member)
+        }
+        _ => None,
+    }
+}
+
+fn emit_native_array_element_address(
+    base: &Expression,
+    index: &Expression,
+    index_destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<(usize, bool)> {
+    let mut indices = Vec::new();
+    let name = collect_native_array_indices(base, &mut indices)?;
+    indices.push(index);
+    let dimensions = match locals.get(name)? {
+        NativeLocation::GlobalArray { dimensions, .. }
+        | NativeLocation::GlobalRecord { dimensions, .. }
+        | NativeLocation::StackRecord { dimensions, .. }
+        | NativeLocation::StackArray { dimensions, .. } => dimensions,
+        NativeLocation::PointerRegister {
+            register,
+            element_size,
+            element_signed,
+            ..
+        } if indices.len() == 1 => {
+            if !emit_native_expression(
+                indices[0],
+                index_destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str(&format!("    MOV R7, R{register}\n"));
+            emit_native_index_scale(index_destination, *element_size, assembly);
+            assembly.push_str(&format!("    ADD R7, R{index_destination}\n"));
+            return Some((*element_size, *element_signed));
+        }
+        NativeLocation::PointerStack {
+            offset,
+            element_size,
+            element_signed,
+            ..
+        } if indices.len() == 1 => {
+            if !emit_native_expression(
+                indices[0],
+                index_destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    LDP R7, R7\n");
+            emit_native_index_scale(index_destination, *element_size, assembly);
+            assembly.push_str(&format!("    ADD R7, R{index_destination}\n"));
+            return Some((*element_size, *element_signed));
+        }
+        NativeLocation::GlobalPointer {
+            element_size,
+            element_signed,
+            ..
+        } if indices.len() == 1 => {
+            if !emit_native_expression(
+                indices[0],
+                index_destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    LDP R7, R7\n"
+            ));
+            emit_native_index_scale(index_destination, *element_size, assembly);
+            assembly.push_str(&format!("    ADD R7, R{index_destination}\n"));
+            return Some((*element_size, *element_signed));
+        }
+        _ => return None,
+    };
+    if indices.len() > dimensions.len() || indices.is_empty() {
+        return None;
+    }
+    if !emit_native_expression(
+        indices[0],
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    ) {
+        return None;
+    }
+    for (index, dimension) in indices.iter().enumerate().skip(1) {
+        let (&index_register, remaining_registers) = temporary_registers.split_first()?;
+        assembly.push_str(&format!("    PUSH R{index_destination}\n"));
+        if !emit_native_expression(
+            dimension,
+            index_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return None;
+        }
+        assembly.push_str(&format!(
+            "    POP R{index_destination}\n    LDI R7, {}\n\
+             MUL R{index_destination}, R7\n    ADD R{index_destination}, R{index_register}\n",
+            dimensions[index]
+        ));
+    }
+    let remaining_stride = dimensions
+        .iter()
+        .skip(indices.len())
+        .try_fold(1usize, |stride, dimension| stride.checked_mul(*dimension))?;
+    if remaining_stride > 1 {
+        assembly.push_str(&format!(
+            "    LDI R6, {remaining_stride}\n    MUL R{index_destination}, R6\n"
+        ));
+    }
+    emit_native_array_address(name, index_destination, locals, assembly)
+}
+
+fn native_array_index_is_partial(
+    base: &Expression,
+    index: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    let mut indices = Vec::new();
+    let Some(name) = collect_native_array_indices(base, &mut indices) else {
+        return false;
+    };
+    indices.push(index);
+    let Some(location) = locals.get(name) else {
+        return false;
+    };
+    let dimensions = match location {
+        NativeLocation::GlobalArray { dimensions, .. }
+        | NativeLocation::GlobalRecord { dimensions, .. }
+        | NativeLocation::StackRecord { dimensions, .. }
+        | NativeLocation::StackArray { dimensions, .. } => dimensions,
+        _ => return false,
+    };
+    indices.len() < dimensions.len()
+}
+
+fn native_expression_record_layout<'a>(
+    expression: &Expression,
+    locals: &'a HashMap<String, NativeLocation>,
+) -> Option<&'a NativeRecordLayout> {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => match locals.get(name)? {
+            NativeLocation::GlobalRecord { layout, .. }
+            | NativeLocation::StackRecord { layout, .. }
+            | NativeLocation::PointerRegister {
+                record_layout: Some(layout),
+                ..
+            }
+            | NativeLocation::PointerStack {
+                record_layout: Some(layout),
+                ..
+            }
+            | NativeLocation::GlobalPointer {
+                record_layout: Some(layout),
+                ..
+            } => Some(layout),
+            _ => None,
+        },
+        ExpressionKind::Member { .. } => native_expression_record_field(expression, locals)?
+            .record_layout
+            .as_deref(),
+        ExpressionKind::Index { expression, .. } => {
+            native_expression_record_layout(expression, locals)
+        }
+        _ => None,
+    }
+}
+
+fn native_expression_record_field<'a>(
+    expression: &Expression,
+    locals: &'a HashMap<String, NativeLocation>,
+) -> Option<&'a NativeRecordField> {
+    let ExpressionKind::Member {
+        expression, name, ..
+    } = &expression.kind
+    else {
+        return None;
+    };
+    native_expression_record_layout(expression, locals)?
+        .fields
+        .get(name)
+}
+
+fn native_location_pointer_target_is_const(location: &NativeLocation) -> bool {
+    native_location_pointer_qualifier(location).unwrap_or(false)
+}
+
+fn native_location_pointer_qualifier(location: &NativeLocation) -> Option<bool> {
+    match location {
+        NativeLocation::PointerRegister {
+            element_is_const, ..
+        }
+        | NativeLocation::PointerStack {
+            element_is_const, ..
+        }
+        | NativeLocation::GlobalPointer {
+            element_is_const, ..
+        } => Some(*element_is_const),
+        _ => None,
+    }
+}
+
+fn native_expression_pointer_target_is_const(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    native_expression_pointer_target_is_const_with_objects(expression, locals, None)
+}
+
+fn native_expression_pointer_target_is_const_with_objects(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: Option<&HashSet<String>>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => locals
+            .get(name)
+            .is_some_and(native_location_pointer_target_is_const),
+        ExpressionKind::Cast { c_type, expression } if c_type.trim().ends_with('*') => {
+            native_pointer_target_is_const(c_type)
+                || native_expression_pointer_target_is_const_with_objects(
+                    expression,
+                    locals,
+                    const_objects,
+                )
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "&" => const_objects
+            .map_or_else(
+                || native_expression_is_const_lvalue(operand, locals),
+                |objects| native_expression_is_const_lvalue_with_objects(operand, locals, objects),
+            ),
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            native_expression_pointer_target_is_const_with_objects(when_true, locals, const_objects)
+                || native_expression_pointer_target_is_const_with_objects(
+                    when_false,
+                    locals,
+                    const_objects,
+                )
+        }
+        ExpressionKind::Binary {
+            operator, right, ..
+        } if operator == "," => {
+            native_expression_pointer_target_is_const_with_objects(right, locals, const_objects)
+        }
+        ExpressionKind::Assignment { target, .. } => {
+            native_expression_pointer_target_is_const_with_objects(target, locals, const_objects)
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return false;
+            };
+            matches!(
+                locals.get(name),
+                Some(NativeLocation::FunctionParameters {
+                    returns_pointer: true,
+                    pointer_return_target_is_const: true,
+                    ..
+                })
+            )
+        }
+        ExpressionKind::Postfix { expression, .. } => {
+            native_expression_pointer_target_is_const_with_objects(
+                expression,
+                locals,
+                const_objects,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn native_assignment_discards_pointer_const_with_objects(
+    target: &Expression,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> bool {
+    let ExpressionKind::Atom(name) = &target.kind else {
+        return false;
+    };
+    let Some(target_is_const) = locals.get(name).and_then(native_location_pointer_qualifier) else {
+        return false;
+    };
+    !target_is_const
+        && native_expression_pointer_target_is_const_with_objects(
+            value,
+            locals,
+            Some(const_objects),
+        )
+}
+
+fn native_assignment_discards_pointer_const(
+    target: &Expression,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    let ExpressionKind::Atom(name) = &target.kind else {
+        return false;
+    };
+    let Some(target_is_const) = locals.get(name).and_then(native_location_pointer_qualifier) else {
+        return false;
+    };
+    !target_is_const && native_expression_pointer_target_is_const(value, locals)
+}
+
+fn native_expression_is_const_lvalue(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            ..
+        } => {
+            native_expression_record_field(expression, locals).is_some_and(|field| field.is_const)
+                || if operator == "->" {
+                    native_expression_pointer_target_is_const(base, locals)
+                } else {
+                    native_expression_is_const_lvalue(base, locals)
+                }
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            native_expression_pointer_target_is_const(operand, locals)
+        }
+        ExpressionKind::Index {
+            expression: base, ..
+        } => {
+            native_expression_pointer_target_is_const(base, locals)
+                || native_expression_is_const_lvalue(base, locals)
+        }
+        _ => false,
+    }
+}
+
+fn collect_native_object_qualifiers(statement: &Statement, qualifiers: &mut HashMap<String, bool>) {
+    match &statement.kind {
+        StatementKind::Compound(statements) => {
+            for statement in statements {
+                collect_native_object_qualifiers(statement, qualifiers);
+            }
+        }
+        StatementKind::Declaration(declarations) => {
+            for declaration in declarations {
+                qualifiers.insert(
+                    declaration.name.clone(),
+                    native_object_is_const_qualified(&declaration.c_type),
+                );
+            }
+        }
+        StatementKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_native_object_qualifiers(then_branch, qualifiers);
+            if let Some(else_branch) = else_branch {
+                collect_native_object_qualifiers(else_branch, qualifiers);
+            }
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Label {
+            statement: body, ..
+        } => collect_native_object_qualifiers(body, qualifiers),
+        StatementKind::For {
+            initializer, body, ..
+        } => {
+            if let Some(initializer) = initializer {
+                collect_native_object_qualifiers(initializer, qualifiers);
+            }
+            collect_native_object_qualifiers(body, qualifiers);
+        }
+        StatementKind::Switch { cases, .. } => {
+            for (_, statements) in cases {
+                for statement in statements {
+                    collect_native_object_qualifiers(statement, qualifiers);
+                }
+            }
+        }
+        StatementKind::Expression(_)
+        | StatementKind::Return(_)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => {}
+    }
+}
+
+fn native_expression_is_const_lvalue_with_objects(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> bool {
+    if native_expression_is_const_lvalue(expression, locals) {
+        return true;
+    }
+    match &expression.kind {
+        ExpressionKind::Atom(name) => const_objects.contains(name),
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            ..
+        } => {
+            operator != "->"
+                && native_expression_is_const_lvalue_with_objects(base, locals, const_objects)
+        }
+        ExpressionKind::Index {
+            expression: base, ..
+        } => native_expression_is_const_lvalue_with_objects(base, locals, const_objects),
+        _ => false,
+    }
+}
+
+fn native_const_write_line_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Assignment { target, value, .. } => {
+            if native_expression_is_const_lvalue_with_objects(target, locals, const_objects) {
+                return Some(target.line);
+            }
+            native_const_write_line_expression(target, locals, const_objects)
+                .or_else(|| native_const_write_line_expression(value, locals, const_objects))
+        }
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "++" | "--") => {
+            if native_expression_is_const_lvalue_with_objects(operand, locals, const_objects) {
+                Some(operand.line)
+            } else {
+                native_const_write_line_expression(operand, locals, const_objects)
+            }
+        }
+        ExpressionKind::Postfix {
+            operator,
+            expression,
+        } if matches!(operator.as_str(), "++" | "--") => {
+            if native_expression_is_const_lvalue_with_objects(expression, locals, const_objects) {
+                Some(expression.line)
+            } else {
+                native_const_write_line_expression(expression, locals, const_objects)
+            }
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            native_const_write_line_expression(operand, locals, const_objects)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_const_write_line_expression(left, locals, const_objects)
+                .or_else(|| native_const_write_line_expression(right, locals, const_objects))
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => native_const_write_line_expression(condition, locals, const_objects)
+            .or_else(|| native_const_write_line_expression(when_true, locals, const_objects))
+            .or_else(|| native_const_write_line_expression(when_false, locals, const_objects)),
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => native_const_write_line_expression(function, locals, const_objects).or_else(|| {
+            arguments.iter().find_map(|argument| {
+                native_const_write_line_expression(argument, locals, const_objects)
+            })
+        }),
+        ExpressionKind::Index { expression, index } => {
+            native_const_write_line_expression(expression, locals, const_objects)
+                .or_else(|| native_const_write_line_expression(index, locals, const_objects))
+        }
+        ExpressionKind::Member { expression, .. } => {
+            native_const_write_line_expression(expression, locals, const_objects)
+        }
+        ExpressionKind::InitializerList(values) => values
+            .iter()
+            .find_map(|value| native_const_write_line_expression(value, locals, const_objects)),
+        ExpressionKind::Atom(_)
+        | ExpressionKind::SizeofType(_)
+        | ExpressionKind::Postfix { .. } => None,
+    }
+}
+
+fn native_pointer_qualifier_loss_line_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Assignment { target, value, .. } => {
+            native_assignment_discards_pointer_const_with_objects(
+                target,
+                value,
+                locals,
+                const_objects,
+            )
+            .then_some(target.line)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(target, locals, const_objects)
+            })
+            .or_else(|| native_pointer_qualifier_loss_line_expression(value, locals, const_objects))
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            let argument_loss =
+                match &function.kind {
+                    ExpressionKind::Atom(name) => match locals.get(name) {
+                        Some(NativeLocation::FunctionParameters {
+                            layout: Some(layout),
+                            ..
+                        }) => arguments.iter().zip(&layout.arguments).find_map(
+                            |(argument, parameter)| {
+                                (matches!(parameter.kind, NativeArgumentKind::Pointer)
+                                    && !parameter.pointer_target_is_const
+                                    && native_expression_pointer_target_is_const_with_objects(
+                                        argument,
+                                        locals,
+                                        Some(const_objects),
+                                    ))
+                                .then_some(argument.line)
+                            },
+                        ),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            argument_loss
+                .or_else(|| {
+                    native_pointer_qualifier_loss_line_expression(function, locals, const_objects)
+                })
+                .or_else(|| {
+                    arguments.iter().find_map(|argument| {
+                        native_pointer_qualifier_loss_line_expression(
+                            argument,
+                            locals,
+                            const_objects,
+                        )
+                    })
+                })
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand) => {
+            native_pointer_qualifier_loss_line_expression(operand, locals, const_objects)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_pointer_qualifier_loss_line_expression(left, locals, const_objects).or_else(
+                || native_pointer_qualifier_loss_line_expression(right, locals, const_objects),
+            )
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => native_pointer_qualifier_loss_line_expression(condition, locals, const_objects)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(when_true, locals, const_objects)
+            })
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(when_false, locals, const_objects)
+            }),
+        ExpressionKind::Index { expression, index } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                .or_else(|| {
+                    native_pointer_qualifier_loss_line_expression(index, locals, const_objects)
+                })
+        }
+        ExpressionKind::Member { expression, .. } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+        }
+        ExpressionKind::InitializerList(values) => values.iter().find_map(|value| {
+            native_pointer_qualifier_loss_line_expression(value, locals, const_objects)
+        }),
+        ExpressionKind::Postfix { expression, .. } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+        }
+        ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => None,
+    }
+}
+
+fn native_pointer_qualifier_loss_line_statement(
+    statement: &Statement,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+    function_name: &str,
+) -> Option<usize> {
+    match &statement.kind {
+        StatementKind::Return(Some(expression)) => {
+            let drops_const = matches!(
+                locals.get(function_name),
+                Some(NativeLocation::FunctionParameters {
+                    returns_pointer: true,
+                    pointer_return_target_is_const: false,
+                    ..
+                })
+            ) && native_expression_pointer_target_is_const_with_objects(
+                expression,
+                locals,
+                Some(const_objects),
+            );
+            drops_const.then_some(expression.line).or_else(|| {
+                native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+            })
+        }
+        StatementKind::Compound(statements) => statements.iter().find_map(|statement| {
+            native_pointer_qualifier_loss_line_statement(
+                statement,
+                locals,
+                const_objects,
+                function_name,
+            )
+        }),
+        StatementKind::Declaration(declarations) => declarations.iter().find_map(|declaration| {
+            let initializer = declaration.initializer.as_ref()?;
+            let target = Expression {
+                kind: ExpressionKind::Atom(declaration.name.clone()),
+                line: initializer.line,
+                filename: initializer.filename.clone(),
+            };
+            native_assignment_discards_pointer_const_with_objects(
+                &target,
+                initializer,
+                locals,
+                const_objects,
+            )
+            .then_some(initializer.line)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_expression(initializer, locals, const_objects)
+            })
+        }),
+        StatementKind::Expression(Some(expression)) => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => native_pointer_qualifier_loss_line_expression(condition, locals, const_objects)
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_statement(
+                    then_branch,
+                    locals,
+                    const_objects,
+                    function_name,
+                )
+            })
+            .or_else(|| {
+                else_branch.as_ref().and_then(|branch| {
+                    native_pointer_qualifier_loss_line_statement(
+                        branch,
+                        locals,
+                        const_objects,
+                        function_name,
+                    )
+                })
+            }),
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            native_pointer_qualifier_loss_line_expression(condition, locals, const_objects).or_else(
+                || {
+                    native_pointer_qualifier_loss_line_statement(
+                        body,
+                        locals,
+                        const_objects,
+                        function_name,
+                    )
+                },
+            )
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => initializer
+            .as_ref()
+            .and_then(|statement| {
+                native_pointer_qualifier_loss_line_statement(
+                    statement,
+                    locals,
+                    const_objects,
+                    function_name,
+                )
+            })
+            .or_else(|| {
+                condition.as_ref().and_then(|expression| {
+                    native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                })
+            })
+            .or_else(|| {
+                update.as_ref().and_then(|expression| {
+                    native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                })
+            })
+            .or_else(|| {
+                native_pointer_qualifier_loss_line_statement(
+                    body,
+                    locals,
+                    const_objects,
+                    function_name,
+                )
+            }),
+        StatementKind::Switch { expression, cases } => {
+            native_pointer_qualifier_loss_line_expression(expression, locals, const_objects)
+                .or_else(|| {
+                    cases.iter().find_map(|(_, statements)| {
+                        statements.iter().find_map(|statement| {
+                            native_pointer_qualifier_loss_line_statement(
+                                statement,
+                                locals,
+                                const_objects,
+                                function_name,
+                            )
+                        })
+                    })
+                })
+        }
+        StatementKind::Label { statement, .. } => native_pointer_qualifier_loss_line_statement(
+            statement,
+            locals,
+            const_objects,
+            function_name,
+        ),
+        StatementKind::Expression(None)
+        | StatementKind::Return(None)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => None,
+    }
+}
+
+fn native_const_write_line_statement(
+    statement: &Statement,
+    locals: &HashMap<String, NativeLocation>,
+    const_objects: &HashSet<String>,
+) -> Option<usize> {
+    match &statement.kind {
+        StatementKind::Compound(statements) => statements.iter().find_map(|statement| {
+            native_const_write_line_statement(statement, locals, const_objects)
+        }),
+        StatementKind::Declaration(declarations) => declarations
+            .iter()
+            .filter_map(|declaration| declaration.initializer.as_ref())
+            .find_map(|initializer| {
+                native_const_write_line_expression(initializer, locals, const_objects)
+            }),
+        StatementKind::Expression(Some(expression)) | StatementKind::Return(Some(expression)) => {
+            native_const_write_line_expression(expression, locals, const_objects)
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => native_const_write_line_expression(condition, locals, const_objects)
+            .or_else(|| native_const_write_line_statement(then_branch, locals, const_objects))
+            .or_else(|| {
+                else_branch.as_ref().and_then(|branch| {
+                    native_const_write_line_statement(branch, locals, const_objects)
+                })
+            }),
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            native_const_write_line_expression(condition, locals, const_objects)
+                .or_else(|| native_const_write_line_statement(body, locals, const_objects))
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => initializer
+            .as_ref()
+            .and_then(|initializer| {
+                native_const_write_line_statement(initializer, locals, const_objects)
+            })
+            .or_else(|| {
+                condition.as_ref().and_then(|condition| {
+                    native_const_write_line_expression(condition, locals, const_objects)
+                })
+            })
+            .or_else(|| {
+                update.as_ref().and_then(|update| {
+                    native_const_write_line_expression(update, locals, const_objects)
+                })
+            })
+            .or_else(|| native_const_write_line_statement(body, locals, const_objects)),
+        StatementKind::Switch { expression, cases } => {
+            native_const_write_line_expression(expression, locals, const_objects).or_else(|| {
+                cases.iter().find_map(|(value, statements)| {
+                    value
+                        .as_ref()
+                        .and_then(|value| {
+                            native_const_write_line_expression(value, locals, const_objects)
+                        })
+                        .or_else(|| {
+                            statements.iter().find_map(|statement| {
+                                native_const_write_line_statement(statement, locals, const_objects)
+                            })
+                        })
+                })
+            })
+        }
+        StatementKind::Label { statement, .. } => {
+            native_const_write_line_statement(statement, locals, const_objects)
+        }
+        StatementKind::Expression(None)
+        | StatementKind::Return(None)
+        | StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Goto(_) => None,
+    }
+}
+
+fn validate_native_bitfield_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Result<(), CCompilerError> {
+    if let ExpressionKind::Cast { c_type, .. } = &expression.kind
+        && native_type_is_function_pointer(c_type)
+    {
+        return Err(error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "function-pointer conversions are not supported",
+        ));
+    }
+    if let ExpressionKind::Cast { c_type, .. } = &expression.kind
+        && native_type_is_pointer_to_array(c_type)
+    {
+        return Err(error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "pointer-to-array conversions are not supported",
+        ));
+    }
+    if let ExpressionKind::Cast {
+        c_type,
+        expression: operand,
+    } = &expression.kind
+        && ((c_type.trim().ends_with('*')
+            && native_expression_floating_size(operand, locals).is_some())
+            || (native_floating_type_size(c_type).is_some()
+                && native_expression_pointer_element_size(operand, locals).is_some()))
+    {
+        return Err(error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "conversion between floating-point and pointer types is not supported",
+        ));
+    }
+    let invalid_floating_pointer_operands = match &expression.kind {
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(
+            operator.as_str(),
+            "+" | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "<<"
+                | ">>"
+                | "&"
+                | "^"
+                | "|"
+                | "=="
+                | "!="
+                | "<"
+                | "<="
+                | ">"
+                | ">="
+        ) =>
+        {
+            (native_expression_floating_size(left, locals).is_some()
+                && native_expression_pointer_element_size(right, locals).is_some())
+                || (native_expression_pointer_element_size(left, locals).is_some()
+                    && native_expression_floating_size(right, locals).is_some())
+        }
+        ExpressionKind::Assignment { target, value, .. } => {
+            (native_expression_floating_size(target, locals).is_some()
+                && native_expression_pointer_element_size(value, locals).is_some())
+                || (native_expression_pointer_element_size(target, locals).is_some()
+                    && native_expression_floating_size(value, locals).is_some())
+        }
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            (native_expression_floating_size(when_true, locals).is_some()
+                && native_expression_pointer_element_size(when_false, locals).is_some())
+                || (native_expression_pointer_element_size(when_true, locals).is_some()
+                    && native_expression_floating_size(when_false, locals).is_some())
+        }
+        _ => false,
+    };
+    if invalid_floating_pointer_operands {
+        return Err(error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "operation or conversion between floating-point and pointer types is not supported",
+        ));
+    }
+    let floating_integer_only_operator = match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if operator == "~" => {
+            native_expression_floating_size(operand, locals).is_some()
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "%" | "<<" | ">>" | "&" | "^" | "|") => {
+            native_expression_floating_size(left, locals).is_some()
+                || native_expression_floating_size(right, locals).is_some()
+        }
+        ExpressionKind::Assignment {
+            operator,
+            target,
+            value,
+        } if matches!(operator.as_str(), "%=" | "<<=" | ">>=" | "&=" | "^=" | "|=") => {
+            native_expression_floating_size(target, locals).is_some()
+                || native_expression_floating_size(value, locals).is_some()
+        }
+        _ => false,
+    };
+    if floating_integer_only_operator {
+        return Err(error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "operator requires integer operands",
+        ));
+    }
+    let prohibited_operand = match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if operator == "&" => Some(operand),
+        ExpressionKind::SizeofExpression(operand) => Some(operand),
+        _ => None,
+    };
+    if let Some(operand) = prohibited_operand
+        && native_expression_record_field(operand, locals)
+            .is_some_and(|field| field.bit_field.is_some())
+    {
+        return Err(error(
+            expression.filename.as_deref().unwrap_or("<source>"),
+            expression.line,
+            "bit-field has no address or sizeof",
+        ));
+    }
+    match &expression.kind {
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::Postfix {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::Cast {
+            expression: operand,
+            ..
+        }
+        | ExpressionKind::SizeofExpression(operand)
+        | ExpressionKind::Member {
+            expression: operand,
+            ..
+        } => {
+            validate_native_bitfield_expression(operand, locals)?;
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Assignment {
+            target: left,
+            value: right,
+            ..
+        }
+        | ExpressionKind::Index {
+            expression: left,
+            index: right,
+        } => {
+            validate_native_bitfield_expression(left, locals)?;
+            validate_native_bitfield_expression(right, locals)?;
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            validate_native_bitfield_expression(condition, locals)?;
+            validate_native_bitfield_expression(when_true, locals)?;
+            validate_native_bitfield_expression(when_false, locals)?;
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            validate_native_bitfield_expression(function, locals)?;
+            for argument in arguments {
+                validate_native_bitfield_expression(argument, locals)?;
+            }
+        }
+        ExpressionKind::InitializerList(values) => {
+            for value in values {
+                validate_native_bitfield_expression(value, locals)?;
+            }
+        }
+        ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_native_bitfield_statement(
+    statement: &Statement,
+    locals: &HashMap<String, NativeLocation>,
+) -> Result<(), CCompilerError> {
+    match &statement.kind {
+        StatementKind::Compound(statements) => {
+            for statement in statements {
+                validate_native_bitfield_statement(statement, locals)?;
+            }
+        }
+        StatementKind::Declaration(declarations) => {
+            for declaration in declarations {
+                if let Some(initializer) = &declaration.initializer {
+                    validate_native_bitfield_expression(initializer, locals)?;
+                }
+            }
+        }
+        StatementKind::Expression(value) | StatementKind::Return(value) => {
+            if let Some(value) = value {
+                validate_native_bitfield_expression(value, locals)?;
+            }
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            validate_native_bitfield_expression(condition, locals)?;
+            validate_native_bitfield_statement(then_branch, locals)?;
+            if let Some(branch) = else_branch {
+                validate_native_bitfield_statement(branch, locals)?;
+            }
+        }
+        StatementKind::While { condition, body } | StatementKind::DoWhile { condition, body } => {
+            validate_native_bitfield_expression(condition, locals)?;
+            validate_native_bitfield_statement(body, locals)?;
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(initializer) = initializer {
+                validate_native_bitfield_statement(initializer, locals)?;
+            }
+            for expression in [condition, update].into_iter().flatten() {
+                validate_native_bitfield_expression(expression, locals)?;
+            }
+            validate_native_bitfield_statement(body, locals)?;
+        }
+        StatementKind::Switch { expression, cases } => {
+            validate_native_bitfield_expression(expression, locals)?;
+            for (value, statements) in cases {
+                if let Some(value) = value {
+                    validate_native_bitfield_expression(value, locals)?;
+                }
+                for statement in statements {
+                    validate_native_bitfield_statement(statement, locals)?;
+                }
+            }
+        }
+        StatementKind::Label { statement, .. } => {
+            validate_native_bitfield_statement(statement, locals)?;
+        }
+        StatementKind::Break | StatementKind::Continue | StatementKind::Goto(_) => {}
+    }
+    Ok(())
+}
+
+fn emit_native_bitfield_extract(register: u8, field: &NativeRecordField, assembly: &mut String) {
+    let (shift, width) = field.bit_field.unwrap();
+    if shift != 0 {
+        assembly.push_str(&format!("    LSR R{register}, {shift}\n"));
+    }
+    assembly.push_str(&format!(
+        "    AND R{register}, 0x{:04X}\n",
+        u16::MAX >> (16 - width)
+    ));
+    if field.signed {
+        let scratch = if register == 6 { 5 } else { 6 };
+        let sign_bit = 1u16 << (width - 1);
+        assembly.push_str(&format!(
+            "    XOR R{register}, 0x{sign_bit:04X}\n\
+             LDI R{scratch}, 0x{sign_bit:04X}\n    SUB R{register}, R{scratch}\n"
+        ));
+    }
+}
+
+fn emit_native_bitfield_store(field: &NativeRecordField, assembly: &mut String) {
+    let (shift, width) = field.bit_field.unwrap();
+    let mask = u16::MAX >> (16 - width);
+    assembly.push_str(&format!("    AND R0, 0x{mask:04X}\n    MOV R4, R0\n"));
+    if shift != 0 {
+        assembly.push_str(&format!("    SHL R4, {shift}\n"));
+    }
+    assembly.push_str(&format!(
+        "    AND R5, 0x{:04X}\n    OR R5, R4\n    STW R7, R5\n",
+        !(mask << shift)
+    ));
+    let mut result_field = field.clone();
+    result_field.bit_field = Some((0, width));
+    emit_native_bitfield_extract(0, &result_field, assembly);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_native_member_address(
+    base: &Expression,
+    operator: &str,
+    member: &str,
+    index_destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<NativeRecordField> {
+    let indexed_member = if matches!(base.kind, ExpressionKind::Index { .. }) {
+        let mut indices = Vec::new();
+        collect_native_member_array_indices(base, &mut indices).map(|member| (member, indices))
+    } else {
+        None
+    };
+    let indexed_base =
+        if let Some(((record, record_operator, array_name), indices)) = indexed_member {
+            let array = emit_native_member_address(
+                record,
+                record_operator,
+                array_name,
+                index_destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            )?;
+            if array.dimensions.is_empty() || indices.len() != array.dimensions.len() {
+                return None;
+            }
+            assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+            let (&first_index, remaining_indices) = indices.split_first()?;
+            if !emit_native_expression(
+                first_index,
+                index_destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            for (dimension_index, index) in remaining_indices.iter().enumerate() {
+                let (&index_register, remaining_registers) = temporary_registers.split_first()?;
+                assembly.push_str(&format!("    PUSH R{index_destination}\n"));
+                if !emit_native_expression(
+                    index,
+                    index_register,
+                    remaining_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return None;
+                }
+                assembly.push_str(&format!(
+                    "    POP R{index_destination}\n    LDI R7, {}\n\
+                 MUL R{index_destination}, R7\n    ADD R{index_destination}, R{index_register}\n",
+                    array.dimensions[dimension_index + 1]
+                ));
+            }
+            emit_native_index_scale(index_destination, array.element_size, assembly);
+            assembly.push_str(&format!(
+                "    MOVSP R6\n    LDP R7, R6\n    ADJSP 4\n    ADD R7, R{index_destination}\n"
+            ));
+            Some(array)
+        } else {
+            None
+        };
+    let nested_base = if let ExpressionKind::Member {
+        expression,
+        operator,
+        name,
+    } = &base.kind
+    {
+        Some(emit_native_member_address(
+            expression,
+            operator,
+            name,
+            index_destination,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )?)
+    } else {
+        None
+    };
+    let layout = if let Some(field) = &indexed_base {
+        field.record_layout.as_deref()?
+    } else if let Some(field) = &nested_base {
+        field.record_layout.as_deref()?
+    } else {
+        let mut indices = Vec::new();
+        let name = collect_native_array_indices(base, &mut indices)?;
+        let location = locals.get(name)?;
+        match (operator, location) {
+            (".", NativeLocation::GlobalRecord { layout, .. })
+            | (".", NativeLocation::StackRecord { layout, .. }) => layout,
+            (
+                "->",
+                NativeLocation::PointerRegister {
+                    record_layout: Some(layout),
+                    ..
+                },
+            )
+            | (
+                "->",
+                NativeLocation::PointerStack {
+                    record_layout: Some(layout),
+                    ..
+                },
+            )
+            | (
+                "->",
+                NativeLocation::GlobalPointer {
+                    record_layout: Some(layout),
+                    ..
+                },
+            ) => layout,
+            _ => return None,
+        }
+    };
+    let field = layout.fields.get(member)?.clone();
+    if nested_base.is_none() && indexed_base.is_none() {
+        let mut indices = Vec::new();
+        let name = collect_native_array_indices(base, &mut indices)?;
+        let location = locals.get(name)?;
+        match (operator, &base.kind, location) {
+            (".", ExpressionKind::Atom(_), NativeLocation::GlobalRecord { .. }) => {
+                assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+            }
+            (".", ExpressionKind::Atom(_), NativeLocation::StackRecord { offset, .. }) => {
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, *offset, assembly);
+            }
+            (".", ExpressionKind::Index { expression, index }, _) => {
+                emit_native_array_element_address(
+                    expression,
+                    index,
+                    index_destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                )?;
+            }
+            ("->", ExpressionKind::Atom(_), NativeLocation::PointerRegister { register, .. }) => {
+                assembly.push_str(&format!("    MOV R7, R{register}\n"));
+            }
+            ("->", ExpressionKind::Atom(_), NativeLocation::PointerStack { offset, .. }) => {
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, *offset, assembly);
+                assembly.push_str("    LDP R7, R7\n");
+            }
+            ("->", ExpressionKind::Atom(_), NativeLocation::GlobalPointer { .. }) => {
+                assembly.push_str(&format!(
+                    "    LDI30 R7, __c_global_{name}\n    LDP R7, R7\n"
+                ));
+            }
+            _ => return None,
+        }
+    }
+    if field.offset > 0 {
+        assembly.push_str(&format!("    LDI R6, {}\n    ADD R7, R6\n", field.offset));
+    }
+    Some(field)
+}
+
+fn emit_native_member_array_element_address(
+    expression: &Expression,
+    index_destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<NativeRecordField> {
+    let mut indices = Vec::new();
+    let (record, record_operator, array_name) =
+        collect_native_member_array_indices(expression, &mut indices)?;
+    let array = emit_native_member_address(
+        record,
+        record_operator,
+        array_name,
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    )?;
+    if array.dimensions.is_empty() || indices.len() != array.dimensions.len() {
+        return None;
+    }
+    assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+    let (&first_index, remaining_indices) = indices.split_first()?;
+    if !emit_native_expression(
+        first_index,
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    ) {
+        return None;
+    }
+    for (dimension_index, index) in remaining_indices.iter().enumerate() {
+        let (&index_register, remaining_registers) = temporary_registers.split_first()?;
+        assembly.push_str(&format!("    PUSH R{index_destination}\n"));
+        if !emit_native_expression(
+            index,
+            index_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return None;
+        }
+        assembly.push_str(&format!(
+            "    POP R{index_destination}\n    LDI R7, {}\n\
+             MUL R{index_destination}, R7\n    ADD R{index_destination}, R{index_register}\n",
+            array.dimensions[dimension_index + 1]
+        ));
+    }
+    emit_native_index_scale(index_destination, array.element_size, assembly);
+    assembly.push_str(&format!(
+        "    MOVSP R6\n    LDP R7, R6\n    ADJSP 4\n    ADD R7, R{index_destination}\n"
+    ));
+    Some(array)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_native_indexed_element_address(
+    expression: &Expression,
+    base: &Expression,
+    index: &Expression,
+    index_destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<(usize, bool)> {
+    let mut indices = Vec::new();
+    if collect_native_member_array_indices(expression, &mut indices).is_some() {
+        let field = emit_native_member_array_element_address(
+            expression,
+            index_destination,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )?;
+        return Some((field.element_size, field.signed));
+    }
+    emit_native_array_element_address(
+        base,
+        index,
+        index_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    )
+}
+
+fn append_native_record_copy_fields(
+    layout: &NativeRecordLayout,
+    base_offset: usize,
+    fields: &mut Vec<(usize, usize)>,
+) -> Option<()> {
+    if layout.is_union {
+        fields.push((base_offset, layout.size));
+        return Some(());
+    }
+    for field in layout
+        .fields
+        .values()
+        .filter(|field| field.bit_field.is_none())
+    {
+        let field_offset = base_offset.checked_add(field.offset)?;
+        if !field.dimensions.is_empty() {
+            let element_count = field
+                .dimensions
+                .iter()
+                .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))?;
+            for element in 0..element_count {
+                let element_offset =
+                    field_offset.checked_add(element.checked_mul(field.element_size)?)?;
+                if let Some(nested_layout) = &field.record_layout {
+                    append_native_record_copy_fields(nested_layout, element_offset, fields)?;
+                } else {
+                    fields.push((element_offset, field.element_size));
+                }
+            }
+        } else if let Some(nested_layout) = &field.record_layout {
+            append_native_record_copy_fields(nested_layout, field_offset, fields)?;
+        } else {
+            fields.push((field_offset, field.size));
+        }
+    }
+    for offset in &layout.bit_field_units {
+        fields.push((base_offset.checked_add(*offset)?, 2));
+    }
+    Some(())
+}
+
+fn emit_native_record_array_assignment(
+    target: &Expression,
+    value: &Expression,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<()> {
+    if !matches!(target.kind, ExpressionKind::Index { .. })
+        || !matches!(value.kind, ExpressionKind::Index { .. })
+    {
+        return None;
+    }
+    let mut indices = Vec::new();
+    collect_native_member_array_indices(target, &mut indices)?;
+
+    let original_length = assembly.len();
+    let original_label_counter = *label_counter;
+    let target_field = emit_native_member_array_element_address(
+        target,
+        0,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    );
+    let Some(target_layout) = target_field.and_then(|field| field.record_layout) else {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    };
+    assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+    let value_field = emit_native_member_array_element_address(
+        value,
+        0,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    );
+    let Some(value_layout) = value_field.and_then(|field| field.record_layout) else {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    };
+    if target_layout != value_layout {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    }
+
+    let mut fields = Vec::new();
+    if append_native_record_copy_fields(&target_layout, 0, &mut fields).is_none()
+        || fields.iter().any(|(_, size)| !matches!(size, 1 | 2))
+    {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    }
+    assembly.push_str("    MOV R6, R7\n    MOVSP R7\n    LDP R7, R7\n    ADJSP 4\n");
+    for (offset, size) in fields {
+        let instruction = match size {
+            1 => "LD",
+            _ => "LDW",
+        };
+        if offset == 0 {
+            assembly.push_str(&format!("    {instruction} R0, R6\n"));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI R5, {offset}\n    ADD R5, R6\n    {instruction} R0, R5\n"
+            ));
+        }
+        if offset == 0 {
+            assembly.push_str(&format!(
+                "    {} R7, R0\n",
+                if size == 1 { "ST" } else { "STW" }
+            ));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI R5, {offset}\n    ADD R5, R7\n    {} R5, R0\n",
+                if size == 1 { "ST" } else { "STW" }
+            ));
+        }
+    }
+    Some(())
+}
+
+fn emit_native_record_lvalue_address(
+    expression: &Expression,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<NativeRecordLayout> {
+    match &expression.kind {
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } => {
+            let field = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            )?;
+            Some((*field.record_layout?).clone())
+        }
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let layout = native_expression_record_layout(expression, locals)?.clone();
+            let (element_size, _) = emit_native_indexed_element_address(
+                expression,
+                base,
+                index,
+                0,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            )?;
+            (element_size == layout.size).then_some(layout)
+        }
+        ExpressionKind::Atom(name) => match locals.get(name)? {
+            NativeLocation::GlobalRecord {
+                dimensions, layout, ..
+            }
+            | NativeLocation::StackRecord {
+                dimensions, layout, ..
+            } if dimensions.is_empty() => {
+                let layout = layout.clone();
+                match locals.get(name)? {
+                    NativeLocation::GlobalRecord { .. } => {
+                        assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+                    }
+                    NativeLocation::StackRecord { offset, .. } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                    }
+                    _ => unreachable!(),
+                }
+                Some(layout)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn emit_native_record_assignment(
+    target: &Expression,
+    value: &Expression,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<()> {
+    let original_length = assembly.len();
+    let original_label_counter = *label_counter;
+    let target_layout = emit_native_record_lvalue_address(
+        target,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    );
+    let Some(target_layout) = target_layout else {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    };
+    assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+    let value_layout = emit_native_record_lvalue_address(
+        value,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+    );
+    let Some(value_layout) = value_layout else {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    };
+    if target_layout != value_layout {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    }
+
+    if target_layout.size == 0 {
+        assembly.truncate(original_length);
+        *label_counter = original_label_counter;
+        return None;
+    }
+    assembly.push_str("    MOV R6, R7\n    MOVSP R7\n    LDP R7, R7\n    ADJSP 4\n");
+    for chunk_offset in (0..target_layout.size).step_by(2) {
+        let chunk_size = (target_layout.size - chunk_offset).min(2);
+        let (load, store) = if chunk_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        if chunk_offset == 0 {
+            assembly.push_str(&format!("    {load} R0, R6\n"));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI R5, {chunk_offset}\n    ADD R5, R6\n    {load} R0, R5\n"
+            ));
+        }
+        if chunk_offset == 0 {
+            assembly.push_str(&format!("    {store} R7, R0\n"));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI R5, {chunk_offset}\n    ADD R5, R7\n    {store} R5, R0\n"
+            ));
+        }
+    }
+    Some(())
+}
+
+fn decode_string_token(value: &str) -> Option<Vec<u8>> {
+    let hex = value.strip_prefix("<string:")?.strip_suffix('>')?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            if pair.len() != 2 {
+                return None;
+            }
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect()
+}
+
+fn native_string_label(value: &str) -> Option<String> {
+    decode_string_token(value)?;
+    Some(format!(
+        "__c_string_{}",
+        value.strip_prefix("<string:")?.strip_suffix('>')?
+    ))
+}
+
+fn emit_native_stack_adjustment(frame_size: usize, allocate: bool, assembly: &mut String) {
+    let mut remaining = frame_size;
+    while remaining > 0 {
+        let adjustment = remaining.min(127) as i32;
+        let adjustment = if allocate { -adjustment } else { adjustment };
+        assembly.push_str(&format!("    ADJSP {adjustment}\n"));
+        remaining -= adjustment.unsigned_abs() as usize;
+    }
+}
+
+fn emit_native_floating_stack_store(
+    bytes: &[u8],
+    offset: usize,
+    assembly: &mut String,
+) -> Option<()> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    for (word_index, word) in bytes.chunks_exact(2).enumerate() {
+        let word_offset = offset.checked_add(word_index.checked_mul(2)?)?;
+        assembly.push_str("    MOV R7, R3\n");
+        emit_native_stack_offset(7, word_offset, assembly);
+        assembly.push_str(&format!(
+            "    LDI R4, 0x{:02X}{:02X}\n    STW R7, R4\n",
+            word[0], word[1]
+        ));
+    }
+    Some(())
+}
+
+fn emit_native_f32_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let wide_pointer = emit_native_save_r1(locals, assembly);
+    let emitted = emit_native_f32_expression_inner(expression, locals, label_counter, assembly);
+    if emitted {
+        emit_native_restore_r1(wide_pointer, assembly);
+    }
+    emitted
+}
+
+fn emit_native_save_r1(locals: &HashMap<String, NativeLocation>, assembly: &mut String) -> bool {
+    let wide_pointer = locals.values().any(|location| {
+        matches!(
+            location,
+            NativeLocation::PointerRegister { register: 1, .. }
+        )
+    });
+    if wide_pointer {
+        assembly.push_str("    ADJSP -4\n    MOVSP R7\n    STP R1, R7\n");
+    } else {
+        assembly.push_str("    PUSH R1\n");
+    }
+    wide_pointer
+}
+
+fn emit_native_restore_r1(wide_pointer: bool, assembly: &mut String) {
+    if wide_pointer {
+        assembly.push_str("    MOVSP R7\n    LDP R1, R7\n    ADJSP 4\n");
+    } else {
+        assembly.push_str("    POP R1\n");
+    }
+}
+
+fn emit_native_f32_expression_inner(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if native_expression_floating_size(expression, locals) == Some(8) {
+        if !emit_native_f64_expression(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str("    F64TOF32 R4, R4\n");
+        return true;
+    }
+    if native_expression_integer_type(expression, locals).is_some() {
+        return emit_native_floating_conversion(expression, 4, locals, label_counter, assembly);
+    }
+    match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "++" | "--") => {
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                4,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            emit_native_f32_expression(operand, locals, label_counter, assembly)
+        }
+        ExpressionKind::Postfix {
+            operator,
+            expression: operand,
+        } => {
+            if !emit_native_f32_expression(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n");
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                4,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    POP R5\n    POP R4\n");
+            true
+        }
+        ExpressionKind::Atom(value) => {
+            if let Some(location) = locals.get(value) {
+                let (offset, global) = match location {
+                    NativeLocation::StackFloatingPointScalar { offset, size: 4 } => {
+                        (Some(*offset), false)
+                    }
+                    NativeLocation::StackWideScalar { offset, unsigned } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                        assembly
+                            .push_str("    LDW R0, R7\n    INC R7\n    INC R7\n    LDW R1, R7\n");
+                        assembly.push_str(&format!(
+                            "    {} R4, R0\n",
+                            if *unsigned { "U32TOF32" } else { "I32TOF32" }
+                        ));
+                        return true;
+                    }
+                    NativeLocation::FloatingPointScalar { size: 4 } => (None, true),
+                    NativeLocation::FloatingPointScalar { .. }
+                    | NativeLocation::StackFloatingPointScalar { .. } => return false,
+                    NativeLocation::Register { .. }
+                    | NativeLocation::StackScalar { .. }
+                    | NativeLocation::ByteRegister { .. }
+                    | NativeLocation::ByteStackScalar { .. }
+                    | NativeLocation::GlobalScalar { .. }
+                    | NativeLocation::GlobalByteScalar { .. } => {
+                        if !emit_native_expression(
+                            expression,
+                            0,
+                            &[1, 2, 3, 4, 5, 6],
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        let conversion = if native_expression_is_unsigned(expression, locals) {
+                            "U16TOF32"
+                        } else {
+                            "I16TOF32"
+                        };
+                        assembly.push_str(&format!("    {conversion} R4, R0\n"));
+                        return true;
+                    }
+                    _ => return false,
+                };
+                if global {
+                    assembly.push_str(&format!("    LDI30 R7, __c_global_{value}\n"));
+                } else {
+                    assembly.push_str("    MOV R7, R3\n");
+                    let Some(offset) = offset else {
+                        return false;
+                    };
+                    emit_native_stack_offset(7, offset, assembly);
+                }
+                assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+                true
+            } else if let Some(bytes) = native_floating_initializer(expression, "float") {
+                assembly.push_str(&format!(
+                    "    LDI R4, 0x{:02X}{:02X}\n    LDI R5, 0x{:02X}{:02X}\n",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                ));
+                true
+            } else if let Some(value) = parse_integer_constant(value)
+                && (-0x8000..=0xffff).contains(&value)
+            {
+                let conversion = if value > i64::from(i16::MAX) {
+                    "U16TOF32"
+                } else {
+                    "I16TOF32"
+                };
+                assembly.push_str(&format!(
+                    "    LDI R0, 0x{:04X}\n    {conversion} R4, R0\n",
+                    value as u16,
+                ));
+                true
+            } else {
+                false
+            }
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "+" || operator == "-" => {
+            if !emit_native_f32_expression(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            if operator == "-" {
+                assembly.push_str("    F32NEG R4\n");
+            }
+            true
+        }
+        ExpressionKind::Cast { c_type, expression }
+            if native_unqualified_type(c_type) == "float" =>
+        {
+            if native_expression_is_f64(expression, locals) {
+                emit_native_f64_expression(expression, locals, label_counter, assembly) && {
+                    assembly.push_str("    F64TOF32 R4, R4\n");
+                    true
+                }
+            } else {
+                emit_native_f32_expression(expression, locals, label_counter, assembly)
+            }
+        }
+        ExpressionKind::Assignment { .. } => emit_native_assignment_store(
+            expression,
+            &[4, 5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+            false,
+        ),
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/") => {
+            if native_expression_is_f64(left, locals) || native_expression_is_f64(right, locals) {
+                return false;
+            }
+            if !native_expression_is_f32(left, locals) && !native_expression_is_f32(right, locals) {
+                if !emit_native_expression(
+                    expression,
+                    0,
+                    &[1, 2, 3, 4, 5, 6],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                let conversion = if native_expression_is_unsigned(expression, locals) {
+                    "U16TOF32"
+                } else {
+                    "I16TOF32"
+                };
+                assembly.push_str(&format!("    {conversion} R4, R0\n"));
+                return true;
+            }
+            if !emit_native_f32_expression(left, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n");
+            if !emit_native_f32_expression(right, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n    POP R5\n    POP R4\n");
+            let instruction = match operator.as_str() {
+                "+" => "F32ADD",
+                "-" => "F32SUB",
+                "*" => "F32MUL",
+                "/" => "F32DIV",
+                _ => return false,
+            };
+            assembly.push_str(&format!("    {instruction} R4, R0\n"));
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
+            && (native_expression_is_f64(left, locals)
+                || native_expression_is_f64(right, locals)) =>
+        {
+            emit_native_f64_comparison(operator, left, right, 0, locals, label_counter, assembly)
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
+            && (native_expression_is_f32(left, locals)
+                || native_expression_is_f32(right, locals)) =>
+        {
+            if native_expression_is_f64(left, locals) || native_expression_is_f64(right, locals) {
+                return false;
+            }
+            if !emit_native_f32_comparison(
+                operator,
+                left,
+                right,
+                0,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    I16TOF32 R4, R0\n");
+            true
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_condition(condition, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_fconditional_{label}_false\n"
+            ));
+            if !emit_native_f32_expression(when_true, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_fconditional_{label}_end\n__c_fconditional_{label}_false:\n"
+            ));
+            if !emit_native_f32_expression(when_false, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("__c_fconditional_{label}_end:\n"));
+            true
+        }
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            if native_array_index_is_partial(base, index, locals) {
+                return false;
+            }
+            let Some((element_size, _)) = emit_native_indexed_element_address(
+                expression,
+                base,
+                index,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if element_size != 4 {
+                return false;
+            }
+            assembly.push_str("    LDW R4, R7\n    LDI R6, 2\n    ADD R7, R6\n    LDW R5, R7\n");
+            true
+        }
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } => {
+            let Some(field) = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if field.floating_size != 4
+                || field.bit_field.is_some()
+                || field.record_layout.is_some()
+                || !field.dimensions.is_empty()
+            {
+                return false;
+            }
+            assembly.push_str("    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n");
+            true
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            if native_expression_pointer_element_size(operand, locals) != Some(4)
+                || !emit_native_expression(
+                    operand,
+                    0,
+                    &[4, 5, 6, 7],
+                    locals,
+                    label_counter,
+                    assembly,
+                )
+            {
+                return false;
+            }
+            assembly.push_str(
+                "    MOV R7, R0\n    LDW R4, R7\n\
+                 LDI R6, 2\n    ADD R7, R6\n    LDW R5, R7\n",
+            );
+            true
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return false;
+            };
+            if !matches!(
+                locals.get(name),
+                Some(NativeLocation::FunctionParameters {
+                    float_return_size: 4,
+                    ..
+                })
+            ) {
+                return false;
+            }
+            emit_native_expression(
+                expression,
+                0,
+                &[4, 5, 6, 7],
+                locals,
+                label_counter,
+                assembly,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn native_uses_stack_frame(locals: &HashMap<String, NativeLocation>) -> bool {
+    locals.values().any(|location| {
+        matches!(
+            location,
+            NativeLocation::StackScalar { .. }
+                | NativeLocation::StackWideScalar { .. }
+                | NativeLocation::ByteStackScalar { .. }
+                | NativeLocation::PointerStack { .. }
+                | NativeLocation::StackFloatingPointScalar { .. }
+                | NativeLocation::StackArray { .. }
+                | NativeLocation::StackRecord { .. }
+        )
+    })
+}
+
+fn emit_native_save_frame_pointer(assembly: &mut String) {
+    assembly.push_str("    ADJSP -4\n    MOVSP R0\n    STP R3, R0\n");
+}
+
+fn emit_native_restore_frame_pointer(scratch: u8, assembly: &mut String) {
+    assembly.push_str(&format!(
+        "    MOVSP R{scratch}\n    LDP R3, R{scratch}\n    ADJSP 4\n"
+    ));
+}
+
+fn emit_native_f64_expression(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if !native_expression_is_f64(expression, locals) {
+        return false;
+    }
+    let frame_pointer = native_uses_stack_frame(locals);
+    if frame_pointer {
+        emit_native_save_frame_pointer(assembly);
+    }
+    let wide_pointer = emit_native_save_r1(locals, assembly);
+    assembly.push_str("    PUSH R2\n    PUSH R3\n");
+    let emitted = emit_native_f64_expression_inner(expression, locals, label_counter, assembly);
+    if emitted {
+        assembly.push_str("    POP R3\n    POP R2\n");
+        if wide_pointer {
+            assembly.push_str("    MOV R0, R7\n");
+        }
+        emit_native_restore_r1(wide_pointer, assembly);
+        if wide_pointer {
+            assembly.push_str("    MOV R7, R0\n");
+        }
+        if frame_pointer {
+            emit_native_restore_frame_pointer(0, assembly);
+        }
+    }
+    emitted
+}
+
+fn emit_native_f64_expression_inner(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if !native_expression_is_f64(expression, locals) {
+        return false;
+    }
+    match &expression.kind {
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "++" | "--") => {
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                8,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            emit_native_f64_expression(operand, locals, label_counter, assembly)
+        }
+        ExpressionKind::Postfix {
+            operator,
+            expression: operand,
+        } => {
+            if !emit_native_f64_expression(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n    PUSH R6\n    PUSH R7\n");
+            if !emit_native_floating_scalar_update(
+                operand,
+                operator,
+                8,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    POP R7\n    POP R6\n    POP R5\n    POP R4\n");
+            true
+        }
+        ExpressionKind::Atom(value) => {
+            if let Some(location) = locals.get(value) {
+                let (offset, global) = match location {
+                    NativeLocation::StackFloatingPointScalar { offset, size: 8 } => {
+                        (Some(*offset), false)
+                    }
+                    NativeLocation::FloatingPointScalar { size: 8 } => (None, true),
+                    NativeLocation::Register { .. }
+                    | NativeLocation::StackScalar { .. }
+                    | NativeLocation::ByteRegister { .. }
+                    | NativeLocation::ByteStackScalar { .. }
+                    | NativeLocation::GlobalScalar { .. }
+                    | NativeLocation::GlobalByteScalar { .. } => {
+                        if !emit_native_expression(
+                            expression,
+                            0,
+                            &[1, 2, 3, 4, 5, 6],
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        let conversion = if native_expression_is_unsigned(expression, locals) {
+                            "U16TOF64"
+                        } else {
+                            "I16TOF64"
+                        };
+                        assembly.push_str(&format!("    {conversion} R4, R0\n"));
+                        return true;
+                    }
+                    _ => return false,
+                };
+                if global {
+                    assembly.push_str(&format!("    LDI30 R7, __c_global_{value}\n"));
+                } else {
+                    assembly.push_str("    MOV R7, R3\n");
+                    let Some(offset) = offset else {
+                        return false;
+                    };
+                    emit_native_stack_offset(7, offset, assembly);
+                }
+                assembly.push_str(
+                    "    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n\
+                     INC R7\n    INC R7\n    LDW R6, R7\n    INC R7\n    INC R7\n    LDW R7, R7\n",
+                );
+                true
+            } else if let Some(bytes) = native_floating_initializer(expression, "double") {
+                if bytes.len() != 8 {
+                    return false;
+                }
+                for (index, word) in bytes.chunks_exact(2).enumerate() {
+                    assembly.push_str(&format!(
+                        "    LDI R{}, 0x{:02X}{:02X}\n",
+                        4 + index,
+                        word[0],
+                        word[1]
+                    ));
+                }
+                true
+            } else {
+                false
+            }
+        }
+        ExpressionKind::Unary { operator, operand } if matches!(operator.as_str(), "+" | "-") => {
+            if !emit_native_f64_expression(operand, locals, label_counter, assembly) {
+                return false;
+            }
+            if operator == "-" {
+                assembly.push_str("    F64NEG R4\n");
+            }
+            true
+        }
+        ExpressionKind::Cast { c_type, expression } => match native_floating_type_size(c_type) {
+            Some(8) => emit_native_f64_operand(expression, locals, label_counter, assembly),
+            _ => false,
+        },
+        ExpressionKind::Assignment { .. } => emit_native_assignment_store(
+            expression,
+            &[4, 5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+            false,
+        ),
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/") => {
+            if !emit_native_f64_operand(left, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n    PUSH R6\n    PUSH R7\n");
+            if !emit_native_f64_operand(right, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(
+                "    MOV R0, R4\n    MOV R1, R5\n    MOV R2, R6\n    MOV R3, R7\n\
+                 POP R7\n    POP R6\n    POP R5\n    POP R4\n",
+            );
+            let instruction = match operator.as_str() {
+                "+" => "F64ADD",
+                "-" => "F64SUB",
+                "*" => "F64MUL",
+                "/" => "F64DIV",
+                _ => return false,
+            };
+            assembly.push_str(&format!("    {instruction} R4, R0\n"));
+            true
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_condition(condition, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_f64_conditional_{label}_false\n"
+            ));
+            if !emit_native_f64_operand(when_true, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_f64_conditional_{label}_end\n\
+                 __c_f64_conditional_{label}_false:\n"
+            ));
+            if !emit_native_f64_operand(when_false, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("__c_f64_conditional_{label}_end:\n"));
+            true
+        }
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            if native_array_index_is_partial(base, index, locals) {
+                return false;
+            }
+            let Some((element_size, _)) = emit_native_indexed_element_address(
+                expression,
+                base,
+                index,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if element_size != 8 {
+                return false;
+            }
+            assembly.push_str(
+                "    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n\
+                 INC R7\n    INC R7\n    LDW R6, R7\n    INC R7\n    INC R7\n    LDW R7, R7\n",
+            );
+            true
+        }
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } => {
+            let Some(field) = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if field.floating_size != 8
+                || field.bit_field.is_some()
+                || field.record_layout.is_some()
+                || !field.dimensions.is_empty()
+            {
+                return false;
+            }
+            assembly.push_str(
+                "    LDW R4, R7\n    INC R7\n    INC R7\n    LDW R5, R7\n\
+                 INC R7\n    INC R7\n    LDW R6, R7\n\
+                 INC R7\n    INC R7\n    LDW R7, R7\n",
+            );
+            true
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            if native_expression_pointer_element_size(operand, locals) != Some(8)
+                || !emit_native_expression(
+                    operand,
+                    0,
+                    &[4, 5, 6, 7],
+                    locals,
+                    label_counter,
+                    assembly,
+                )
+            {
+                return false;
+            }
+            assembly.push_str(
+                "    MOV R7, R0\n    LDW R4, R7\n    INC R7\n    INC R7\n\
+                 LDW R5, R7\n    INC R7\n    INC R7\n    LDW R6, R7\n\
+                 INC R7\n    INC R7\n    LDW R7, R7\n",
+            );
+            true
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return false;
+            };
+            if !matches!(
+                locals.get(name),
+                Some(NativeLocation::FunctionParameters {
+                    float_return_size: 8,
+                    ..
+                })
+            ) {
+                return false;
+            }
+            emit_native_expression(
+                expression,
+                0,
+                &[4, 5, 6, 7],
+                locals,
+                label_counter,
+                assembly,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn emit_native_f64_operand(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if native_expression_is_f32(expression, locals) {
+        if !emit_native_f32_expression(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str("    F32TOF64 R4, R4\n");
+        true
+    } else if native_expression_is_f64(expression, locals) {
+        emit_native_f64_expression(expression, locals, label_counter, assembly)
+    } else if native_expression_is_wide_integer(expression, locals) {
+        if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        let conversion = if native_expression_is_unsigned(expression, locals) {
+            "U32TOF64"
+        } else {
+            "I32TOF64"
+        };
+        assembly.push_str(&format!("    {conversion} R4, R4\n"));
+        true
+    } else {
+        if !emit_native_expression(
+            expression,
+            0,
+            &[1, 2, 3, 4, 5, 6],
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return false;
+        }
+        let conversion = if native_expression_is_unsigned(expression, locals) {
+            "U16TOF64"
+        } else {
+            "I16TOF64"
+        };
+        assembly.push_str(&format!("    {conversion} R4, R0\n"));
+        true
+    }
+}
+
+fn emit_native_f32_compound_value(
+    operator: &str,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let instruction = match operator {
+        "+=" => ("F32ADD", "F64ADD"),
+        "-=" => ("F32SUB", "F64SUB"),
+        "*=" => ("F32MUL", "F64MUL"),
+        "/=" => ("F32DIV", "F64DIV"),
+        _ => return false,
+    };
+    if native_expression_floating_size(value, locals) == Some(8) {
+        assembly.push_str(
+            "    ADJSP -4\n    MOVSP R7\n    STP R3, R7\n\
+             F32TOF64 R4, R4\n    PUSH R4\n    PUSH R5\n    PUSH R6\n    PUSH R7\n",
+        );
+        if !emit_native_f64_operand(value, locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str(
+            "    MOV R0, R4\n    MOV R1, R5\n    MOV R2, R6\n    MOV R3, R7\n\
+             POP R7\n    POP R6\n    POP R5\n    POP R4\n",
+        );
+        assembly.push_str(&format!(
+            "    {} R4, R0\n    F64TOF32 R4, R4\n\
+             MOVSP R7\n    LDP R3, R7\n    ADJSP 4\n",
+            instruction.1
+        ));
+    } else {
+        assembly.push_str("    PUSH R4\n    PUSH R5\n");
+        if !emit_native_f32_expression(value, locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n    POP R5\n    POP R4\n");
+        assembly.push_str(&format!("    {} R4, R0\n", instruction.0));
+    }
+    true
+}
+
+fn emit_native_floating_conversion(
+    expression: &Expression,
+    size: usize,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if size == 8 {
+        return emit_native_f64_operand(expression, locals, label_counter, assembly);
+    }
+    if size != 4 {
+        return false;
+    }
+    match native_expression_floating_size(expression, locals) {
+        Some(8) => {
+            if !emit_native_f64_expression(expression, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    F64TOF32 R4, R4\n");
+        }
+        Some(4) => {
+            return emit_native_f32_expression(expression, locals, label_counter, assembly);
+        }
+        None => {
+            if native_expression_is_wide_integer(expression, locals) {
+                if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str(if native_expression_is_unsigned(expression, locals) {
+                    "    U32TOF32 R4, R4\n"
+                } else {
+                    "    I32TOF32 R4, R4\n"
+                });
+                return true;
+            }
+            if !emit_native_expression(
+                expression,
+                0,
+                &[1, 2, 3, 4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(if native_expression_is_unsigned(expression, locals) {
+                "    U16TOF32 R4, R0\n"
+            } else {
+                "    I16TOF32 R4, R0\n"
+            });
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn emit_native_f64_comparison(
+    operator: &str,
+    left: &Expression,
+    right: &Expression,
+    destination: u8,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let frame_pointer = native_uses_stack_frame(locals);
+    if frame_pointer {
+        emit_native_save_frame_pointer(assembly);
+    }
+    let saved_register = emit_native_save_r1(locals, assembly);
+    assembly.push_str("    PUSH R2\n    PUSH R3\n");
+    let reverse_operands = matches!(operator, ">" | ">=");
+    let (first, second) = if reverse_operands {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    if !emit_native_f64_operand(first, locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str("    PUSH R4\n    PUSH R5\n    PUSH R6\n    PUSH R7\n");
+    if !emit_native_f64_operand(second, locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str(
+        "    MOV R0, R4\n    MOV R1, R5\n    MOV R2, R6\n    MOV R3, R7\n\
+         POP R7\n    POP R6\n    POP R5\n    POP R4\n    F64CMP R4, R0\n",
+    );
+    let branch = match operator {
+        "==" => "BZX",
+        "!=" => "BNZX",
+        "<" | ">" => "BCX",
+        "<=" | ">=" => "BLSX",
+        _ => return false,
+    };
+    let label = *label_counter;
+    *label_counter += 1;
+    assembly.push_str(&format!(
+        "    {branch} __c_f64cmp_{label}_true\n\
+         LDI R4, 0\n\
+         JMPX __c_f64cmp_{label}_end\n\
+         __c_f64cmp_{label}_true:\n\
+         LDI R4, 1\n\
+         __c_f64cmp_{label}_end:\n"
+    ));
+    assembly.push_str("    POP R3\n    POP R2\n");
+    emit_native_restore_r1(saved_register, assembly);
+    if frame_pointer {
+        emit_native_restore_frame_pointer(6, assembly);
+    }
+    if destination != 4 {
+        assembly.push_str(&format!("    MOV R{destination}, R4\n"));
+    }
+    true
+}
+
+fn emit_native_f32_comparison(
+    operator: &str,
+    left: &Expression,
+    right: &Expression,
+    destination: u8,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let saved_register = (destination != 1).then(|| emit_native_save_r1(locals, assembly));
+    let reverse_operands = matches!(operator, ">" | ">=");
+    let (first, second) = if reverse_operands {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    if !emit_native_f32_expression(first, locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str("    PUSH R4\n    PUSH R5\n");
+    if !emit_native_f32_expression(second, locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n    POP R5\n    POP R4\n");
+    assembly.push_str("    F32CMP R4, R0\n");
+    let branch = match operator {
+        "==" => "BZX",
+        "!=" => "BNZX",
+        "<" | ">" => "BCX",
+        "<=" | ">=" => "BLSX",
+        _ => return false,
+    };
+    let label = *label_counter;
+    *label_counter += 1;
+    assembly.push_str(&format!(
+        "    {branch} __c_fcmp_{label}_true\n\
+         LDI R{destination}, 0\n\
+         JMPX __c_fcmp_{label}_end\n\
+         __c_fcmp_{label}_true:\n\
+         LDI R{destination}, 1\n\
+         __c_fcmp_{label}_end:\n"
+    ));
+    if let Some(wide_pointer) = saved_register {
+        emit_native_restore_r1(wide_pointer, assembly);
+    }
+    true
+}
+
+fn emit_native_condition(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    emit_native_truth_value(
+        expression,
+        0,
+        &[4, 5, 6, 7],
+        locals,
+        label_counter,
+        assembly,
+    )
+}
+
+fn emit_native_truth_value(
+    expression: &Expression,
+    destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    if native_expression_is_wide_integer(expression, locals) {
+        if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        let label = *label_counter;
+        *label_counter += 1;
+        assembly.push_str(&format!(
+            "    OR R4, R5\n    CMP R4, 0\n    BZX __c_wide_truth_{label}_false\n\
+             LDI R{destination}, 1\n    JMPX __c_wide_truth_{label}_end\n\
+             __c_wide_truth_{label}_false:\n    LDI R{destination}, 0\n\
+             __c_wide_truth_{label}_end:\n"
+        ));
+        true
+    } else if native_expression_is_f64(expression, locals) {
+        let zero = Expression {
+            kind: ExpressionKind::Atom("0.0".to_owned()),
+            line: expression.line,
+            filename: expression.filename.clone(),
+        };
+        emit_native_f64_comparison(
+            "!=",
+            expression,
+            &zero,
+            destination,
+            locals,
+            label_counter,
+            assembly,
+        )
+    } else if native_expression_is_f32(expression, locals) {
+        if !emit_native_f32_expression(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        let label = *label_counter;
+        *label_counter += 1;
+        assembly.push_str(&format!(
+            "    LDI R0, 0\n    LDI R1, 0\n    F32CMP R4, R0\n\
+             BZX __c_ftruth_{label}_false\n\
+             LDI R0, 1\n    JMPX __c_ftruth_{label}_end\n\
+             __c_ftruth_{label}_false:\n\
+             LDI R0, 0\n__c_ftruth_{label}_end:\n"
+        ));
+        if destination != 0 {
+            assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+        }
+        true
+    } else {
+        emit_native_expression(
+            expression,
+            destination,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )
+    }
+}
+
+fn native_expression_is_f32(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    native_expression_floating_size(expression, locals) == Some(4)
+}
+
+fn native_expression_is_f64(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    native_expression_floating_size(expression, locals) == Some(8)
+}
+
+fn native_expression_floating_size(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Atom(value) => match locals.get(value) {
+            Some(NativeLocation::FloatingPointScalar { size })
+            | Some(NativeLocation::StackFloatingPointScalar { size, .. }) => Some(*size),
+            _ if parse_integer_constant(value).is_none() => {
+                let parsed = value.strip_suffix(['f', 'F', 'l', 'L']).unwrap_or(value);
+                parsed
+                    .parse::<f64>()
+                    .ok()
+                    .map(|_| if value.ends_with(['f', 'F']) { 4 } else { 8 })
+            }
+            _ => None,
+        },
+        ExpressionKind::Unary { operator, operand }
+            if matches!(operator.as_str(), "+" | "-" | "++" | "--") =>
+        {
+            native_expression_floating_size(operand, locals)
+        }
+        ExpressionKind::Cast { c_type, .. } => native_floating_type_size(c_type),
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-" | "*" | "/") => {
+            match (
+                native_expression_floating_size(left, locals),
+                native_expression_floating_size(right, locals),
+            ) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left @ Some(_), None) | (None, left @ Some(_)) => left,
+                (None, None) => None,
+            }
+        }
+        ExpressionKind::Assignment { target, .. } => {
+            native_expression_floating_size(target, locals)
+        }
+        ExpressionKind::Member { .. } => native_expression_record_field(expression, locals)
+            .filter(|field| field.dimensions.is_empty() && field.record_layout.is_none())
+            .map(|field| field.floating_size)
+            .filter(|size| *size != 0),
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            native_expression_pointer_floating_size(operand, locals)
+        }
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            match (
+                native_expression_floating_size(when_true, locals),
+                native_expression_floating_size(when_false, locals),
+            ) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left @ Some(_), None) | (None, left @ Some(_)) => left,
+                (None, None) => None,
+            }
+        }
+        ExpressionKind::Index { expression, .. } => {
+            let mut base = expression;
+            let mut index_count = 1;
+            while let ExpressionKind::Index {
+                expression: parent, ..
+            } = &base.kind
+            {
+                base = parent;
+                index_count += 1;
+            }
+            if let Some(field) = native_expression_record_field(base, locals) {
+                return (field.dimensions.len() == index_count && field.floating_size != 0)
+                    .then_some(field.floating_size);
+            }
+            let ExpressionKind::Atom(name) = &base.kind else {
+                return None;
+            };
+            native_location_floating_element_size(locals.get(name)?)
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return None;
+            };
+            match locals.get(name)? {
+                NativeLocation::FunctionParameters {
+                    float_return_size, ..
+                } if *float_return_size != 0 => Some(*float_return_size),
+                _ => None,
+            }
+        }
+        ExpressionKind::Binary {
+            operator, right, ..
+        } if operator == "," => native_expression_floating_size(right, locals),
+        ExpressionKind::Postfix { expression, .. } => {
+            native_expression_floating_size(expression, locals)
+        }
+        _ => None,
+    }
+}
+
+fn native_location_floating_element_size(location: &NativeLocation) -> Option<usize> {
+    let size = match location {
+        NativeLocation::PointerRegister {
+            element_floating_size,
+            ..
+        }
+        | NativeLocation::PointerStack {
+            element_floating_size,
+            ..
+        }
+        | NativeLocation::GlobalPointer {
+            element_floating_size,
+            ..
+        }
+        | NativeLocation::GlobalArray {
+            element_floating_size,
+            ..
+        }
+        | NativeLocation::StackArray {
+            element_floating_size,
+            ..
+        } => *element_floating_size,
+        _ => 0,
+    };
+    (size != 0).then_some(size)
+}
+
+fn native_expression_pointer_floating_size(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => native_location_floating_element_size(locals.get(name)?),
+        ExpressionKind::Cast { c_type, .. } => {
+            let size = native_pointer_element_floating_size(c_type);
+            (size != 0).then_some(size)
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return None;
+            };
+            match locals.get(name)? {
+                NativeLocation::FunctionParameters {
+                    pointer_return_floating_size,
+                    ..
+                } if *pointer_return_floating_size != 0 => Some(*pointer_return_floating_size),
+                _ => None,
+            }
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "+" | "-") => {
+            native_expression_pointer_floating_size(left, locals)
+                .or_else(|| native_expression_pointer_floating_size(right, locals))
+        }
+        _ => None,
+    }
+}
+
+fn emit_native_f32_stack_store(offset: usize, assembly: &mut String) {
+    assembly.push_str("    MOV R7, R3\n");
+    emit_native_stack_offset(7, offset, assembly);
+    assembly.push_str("    STW R7, R4\n    MOV R7, R3\n");
+    emit_native_stack_offset(7, offset + 2, assembly);
+    assembly.push_str("    STW R7, R5\n");
+}
+
+fn emit_native_f64_stack_store(offset: usize, assembly: &mut String) {
+    assembly.push_str("    PUSH R6\n");
+    assembly.push_str("    MOV R0, R3\n");
+    emit_native_stack_offset(0, offset, assembly);
+    assembly.push_str(
+        "    POP R6\n    STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+         INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n",
+    );
+}
+
+fn emit_native_f32_scalar_store(
+    name: &str,
+    locals: &HashMap<String, NativeLocation>,
+    assembly: &mut String,
+) -> bool {
+    match locals.get(name) {
+        Some(NativeLocation::StackFloatingPointScalar { offset, size: 4 }) => {
+            emit_native_f32_stack_store(*offset, assembly);
+            true
+        }
+        Some(NativeLocation::FloatingPointScalar { size: 4 }) => {
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    STW R7, R4\n\
+                 LDI R7, 2\n    LDI30 R6, __c_global_{name}\n    ADD R6, R7\n    STW R6, R5\n"
+            ));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn emit_native_floating_scalar_update(
+    target: &Expression,
+    operator: &str,
+    size: usize,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let supported_lvalue = match &target.kind {
+        ExpressionKind::Atom(name) => matches!(
+            locals.get(name),
+            Some(NativeLocation::StackFloatingPointScalar { size: target_size, .. })
+                | Some(NativeLocation::FloatingPointScalar { size: target_size })
+                if *target_size == size
+        ),
+        ExpressionKind::Index { expression, index } => {
+            !native_expression_has_side_effects(expression)
+                && !native_expression_has_side_effects(index)
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            !native_expression_has_side_effects(operand)
+        }
+        ExpressionKind::Member {
+            expression,
+            operator: _,
+            ..
+        } => !native_expression_has_side_effects(expression),
+        _ => false,
+    };
+    let compound_operator = match operator {
+        "++" => "+=",
+        "--" => "-=",
+        _ => return false,
+    };
+    if !supported_lvalue || native_expression_floating_size(target, locals) != Some(size) {
+        return false;
+    }
+    let value = Expression {
+        kind: ExpressionKind::Atom(if size == 4 {
+            "1.0f".to_owned()
+        } else {
+            "1.0".to_owned()
+        }),
+        line: target.line,
+        filename: target.filename.clone(),
+    };
+    let assignment = Expression {
+        kind: ExpressionKind::Assignment {
+            operator: compound_operator.to_owned(),
+            target: Box::new(target.clone()),
+            value: Box::new(value),
+        },
+        line: target.line,
+        filename: target.filename.clone(),
+    };
+    emit_native_assignment_store(
+        &assignment,
+        &[4, 5, 6, 7],
+        locals,
+        label_counter,
+        assembly,
+        false,
+    )
+}
+
+fn native_expression_has_side_effects(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Call { .. }
+        | ExpressionKind::Assignment { .. }
+        | ExpressionKind::Postfix { .. } => true,
+        ExpressionKind::Unary { operator, operand } => {
+            matches!(operator.as_str(), "++" | "--") || native_expression_has_side_effects(operand)
+        }
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::Index {
+            expression: left,
+            index: right,
+        } => native_expression_has_side_effects(left) || native_expression_has_side_effects(right),
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            native_expression_has_side_effects(condition)
+                || native_expression_has_side_effects(when_true)
+                || native_expression_has_side_effects(when_false)
+        }
+        ExpressionKind::Member { expression, .. }
+        | ExpressionKind::Cast { expression, .. }
+        | ExpressionKind::SizeofExpression(expression) => {
+            native_expression_has_side_effects(expression)
+        }
+        ExpressionKind::InitializerList(values) => {
+            values.iter().any(native_expression_has_side_effects)
+        }
+        ExpressionKind::Atom(_) | ExpressionKind::SizeofType(_) => false,
+    }
+}
+
+fn emit_native_f64_scalar_store(
+    name: &str,
+    locals: &HashMap<String, NativeLocation>,
+    assembly: &mut String,
+) -> bool {
+    match locals.get(name) {
+        Some(NativeLocation::StackFloatingPointScalar { offset, size: 8 }) => {
+            emit_native_f64_stack_store(*offset, assembly);
+            true
+        }
+        Some(NativeLocation::FloatingPointScalar { size: 8 }) => {
+            assembly.push_str(&format!(
+                "    LDI30 R0, __c_global_{name}\n\
+                 STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+                 INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n"
+            ));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn native_expression_pointer_element_size(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<usize> {
+    match &expression.kind {
+        ExpressionKind::Atom(name) => {
+            if native_string_label(name).is_some() {
+                return Some(1);
+            }
+            match locals.get(name)? {
+                NativeLocation::PointerRegister { element_size, .. }
+                | NativeLocation::PointerStack { element_size, .. }
+                | NativeLocation::GlobalPointer { element_size, .. }
+                | NativeLocation::GlobalArray { element_size, .. }
+                | NativeLocation::StackArray { element_size, .. } => Some(*element_size),
+                NativeLocation::GlobalRecord { layout, .. }
+                | NativeLocation::StackRecord { layout, .. } => Some(layout.size),
+                _ => None,
+            }
+        }
+        ExpressionKind::Cast { c_type, .. } => {
+            native_pointer_element(c_type).map(|(element_size, _)| element_size)
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "&" => {
+            native_sizeof_expression(operand, locals).map(usize::from)
+        }
+        ExpressionKind::Assignment { target, .. } => {
+            native_expression_pointer_element_size(target, locals)
+        }
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => native_expression_pointer_element_size(when_true, locals)
+            .or_else(|| native_expression_pointer_element_size(when_false, locals)),
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "+" => native_expression_pointer_element_size(left, locals)
+            .or_else(|| native_expression_pointer_element_size(right, locals)),
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return None;
+            };
+            match locals.get(name)? {
+                NativeLocation::FunctionParameters {
+                    pointer_return_element_size,
+                    ..
+                } => *pointer_return_element_size,
+                _ => None,
+            }
+        }
+        ExpressionKind::Member { .. } => native_expression_record_field(expression, locals)
+            .and_then(|field| (!field.dimensions.is_empty()).then_some(field.element_size)),
+        _ => None,
+    }
+}
+
+fn native_expression_pointer_integer_type(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> Option<NativeIntegerType> {
+    let from_element = |element_size: usize, signed: bool| match element_size {
+        1 => Some(NativeIntegerType {
+            wide: false,
+            unsigned: false,
+        }),
+        2 => Some(NativeIntegerType {
+            wide: false,
+            unsigned: !signed,
+        }),
+        4 => Some(NativeIntegerType {
+            wide: true,
+            unsigned: !signed,
+        }),
+        _ => None,
+    };
+    match &expression.kind {
+        ExpressionKind::Atom(name) => match locals.get(name)? {
+            NativeLocation::PointerRegister {
+                element_size,
+                element_signed,
+                element_floating_size: 0,
+                record_layout: None,
+                ..
+            }
+            | NativeLocation::PointerStack {
+                element_size,
+                element_signed,
+                element_floating_size: 0,
+                record_layout: None,
+                ..
+            }
+            | NativeLocation::GlobalPointer {
+                element_size,
+                element_signed,
+                element_floating_size: 0,
+                record_layout: None,
+                ..
+            }
+            | NativeLocation::GlobalArray {
+                element_size,
+                element_signed,
+                element_floating_size: 0,
+                ..
+            }
+            | NativeLocation::StackArray {
+                element_size,
+                element_signed,
+                element_floating_size: 0,
+                ..
+            } => from_element(*element_size, *element_signed),
+            _ => None,
+        },
+        ExpressionKind::Cast { c_type, .. } => {
+            let base_type = c_type.trim().strip_suffix('*')?.trim();
+            if native_floating_type_size(base_type).is_some() {
+                None
+            } else {
+                let (element_size, signed) = native_pointer_element(c_type)?;
+                from_element(element_size, signed)
+            }
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "&" => {
+            native_expression_integer_type(operand, locals)
+        }
+        ExpressionKind::Assignment { target, .. } => {
+            native_expression_pointer_integer_type(target, locals)
+        }
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            let when_true = native_expression_pointer_integer_type(when_true, locals)?;
+            let when_false = native_expression_pointer_integer_type(when_false, locals)?;
+            (when_true.wide == when_false.wide && when_true.unsigned == when_false.unsigned)
+                .then_some(when_true)
+        }
+        ExpressionKind::Call { function, .. } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return None;
+            };
+            let NativeLocation::FunctionParameters {
+                pointer_return_element_size: Some(element_size),
+                pointer_return_element_signed,
+                pointer_return_floating_size: 0,
+                pointer_return_is_record: false,
+                ..
+            } = locals.get(name)?
+            else {
+                return None;
+            };
+            from_element(*element_size, *pointer_return_element_signed)
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "+" => native_expression_pointer_integer_type(left, locals)
+            .or_else(|| native_expression_pointer_integer_type(right, locals)),
+        _ => None,
+    }
+}
+
+fn native_expression_is_unsigned(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+) -> bool {
+    if let Some(c_type) = native_expression_integer_type(expression, locals) {
+        return c_type.unsigned;
+    }
+    match &expression.kind {
+        ExpressionKind::Member { .. } => native_expression_record_field(expression, locals)
+            .is_some_and(|field| {
+                !field.signed && field.bit_field.is_none_or(|(_, width)| width == 16)
+            }),
+        ExpressionKind::Atom(name) => match locals.get(name) {
+            Some(NativeLocation::Register { unsigned, .. })
+            | Some(NativeLocation::StackScalar { unsigned, .. })
+            | Some(NativeLocation::StackWideScalar { unsigned, .. })
+            | Some(NativeLocation::GlobalScalar { unsigned }) => *unsigned,
+            Some(NativeLocation::ByteRegister { .. })
+            | Some(NativeLocation::ByteStackScalar { .. })
+            | Some(NativeLocation::GlobalByteScalar { .. }) => false,
+            Some(NativeLocation::PointerRegister { .. })
+            | Some(NativeLocation::PointerStack { .. })
+            | Some(NativeLocation::GlobalPointer { .. })
+            | Some(NativeLocation::GlobalArray { .. })
+            | Some(NativeLocation::GlobalRecord { .. })
+            | Some(NativeLocation::StackRecord { .. })
+            | Some(NativeLocation::StackArray { .. }) => true,
+            _ => false,
+        },
+        ExpressionKind::Cast { c_type, .. } => is_native_unsigned_word_type(c_type),
+        ExpressionKind::Unary { operator, .. } if operator == "!" => false,
+        ExpressionKind::Unary { operand, .. } => native_expression_is_unsigned(operand, locals),
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(
+            operator.as_str(),
+            "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
+        ) =>
+        {
+            false
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            native_expression_is_unsigned(left, locals)
+                || native_expression_is_unsigned(right, locals)
+        }
+        ExpressionKind::Assignment { target, .. } => native_expression_is_unsigned(target, locals),
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            native_expression_is_unsigned(when_true, locals)
+                || native_expression_is_unsigned(when_false, locals)
+        }
+        ExpressionKind::Index {
+            expression: base, ..
+        } => match &base.kind {
+            ExpressionKind::Atom(name) => match locals.get(name) {
+                Some(NativeLocation::PointerRegister {
+                    element_size,
+                    element_signed,
+                    ..
+                })
+                | Some(NativeLocation::PointerStack {
+                    element_size,
+                    element_signed,
+                    ..
+                })
+                | Some(NativeLocation::GlobalPointer {
+                    element_size,
+                    element_signed,
+                    ..
+                })
+                | Some(NativeLocation::GlobalArray {
+                    element_size,
+                    element_signed,
+                    ..
+                })
+                | Some(NativeLocation::StackArray {
+                    element_size,
+                    element_signed,
+                    ..
+                }) => *element_size == 2 && !element_signed,
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn native_compound_operator(operator: &str, unsigned: bool) -> Option<&'static str> {
+    match operator {
+        "+=" => Some("ADD"),
+        "-=" => Some("SUB"),
+        "*=" => Some("MUL"),
+        "/=" if unsigned => Some("DIV"),
+        "/=" => Some("DIVS"),
+        "%=" if unsigned => Some("MOD"),
+        "%=" => Some("MODS"),
+        "<<=" => Some("SHL"),
+        ">>=" if unsigned => Some("LSR"),
+        ">>=" => Some("ASR"),
+        "&=" => Some("AND"),
+        "|=" => Some("OR"),
+        "^=" => Some("XOR"),
+        _ => None,
+    }
+}
+
+fn emit_native_expression(
+    expression: &Expression,
+    destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let is_call = matches!(&expression.kind, ExpressionKind::Call { .. });
+    let is_comma = matches!(
+        &expression.kind,
+        ExpressionKind::Binary { operator, .. } if operator == ","
+    );
+    if native_expression_is_f64(expression, locals) && !is_call && !is_comma {
+        return emit_native_f64_expression(expression, locals, label_counter, assembly);
+    }
+    if native_expression_is_wide_integer(expression, locals) && !is_call && !is_comma {
+        if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str(&format!("    MOV R{destination}, R5\n"));
+        return true;
+    }
+    match &expression.kind {
+        ExpressionKind::Atom(value) => {
+            if let Some(value) = parse_integer_constant(value) {
+                if !(0..=0xffff).contains(&value) {
+                    return false;
+                }
+                assembly.push_str(&format!("    LDI R{destination}, 0x{value:04X}\n"));
+            } else if let Some(label) = native_string_label(value) {
+                assembly.push_str(&format!("    LDI30 R{destination}, {label}\n"));
+            } else if let Some(location) = locals.get(value) {
+                match location {
+                    NativeLocation::Constant(value) => {
+                        assembly.push_str(&format!(
+                            "    LDI R{destination}, 0x{:04X}\n",
+                            *value as u16
+                        ));
+                    }
+                    NativeLocation::GlobalScalar { .. } => assembly.push_str(&format!(
+                        "    LDI30 R7, __c_global_{value}\n    LDW R{destination}, R7\n"
+                    )),
+                    NativeLocation::GlobalWideScalar { .. } => return false,
+                    NativeLocation::FloatingPointScalar { .. } => return false,
+                    NativeLocation::StackFloatingPointScalar { .. } => return false,
+                    NativeLocation::GlobalByteScalar { signed } => {
+                        assembly.push_str(&format!(
+                            "    LDI30 R7, __c_global_{value}\n    LD R{destination}, R7\n"
+                        ));
+                        emit_native_byte_normalization(destination, *signed, assembly);
+                    }
+                    NativeLocation::GlobalPointer { .. } => assembly.push_str(&format!(
+                        "    LDI30 R7, __c_global_{value}\n    LDP R{destination}, R7\n"
+                    )),
+                    NativeLocation::GlobalArray { .. }
+                    | NativeLocation::GlobalRecord { .. }
+                    | NativeLocation::StackRecord { .. }
+                    | NativeLocation::StackArray { .. } => {
+                        assembly.push_str("    LDI R0, 0\n");
+                        if emit_native_array_address(value, 0, locals, assembly).is_none() {
+                            return false;
+                        }
+                        if destination != 7 {
+                            assembly.push_str(&format!("    MOV R{destination}, R7\n"));
+                        }
+                    }
+                    NativeLocation::PointerRegister { register, .. } => {
+                        if *register != destination {
+                            assembly.push_str(&format!("    MOV R{destination}, R{register}\n"));
+                        }
+                    }
+                    NativeLocation::PointerStack { offset, .. } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                        assembly.push_str(&format!("    LDP R{destination}, R7\n"));
+                    }
+                    NativeLocation::ByteRegister { register, signed } => {
+                        if *register != destination {
+                            assembly.push_str(&format!("    MOV R{destination}, R{register}\n"));
+                        }
+                        emit_native_byte_normalization(destination, *signed, assembly);
+                    }
+                    NativeLocation::StackScalar { offset, unsigned } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                        assembly.push_str(&format!("    LDW R{destination}, R7\n"));
+                        emit_native_word_normalization(
+                            destination,
+                            *unsigned,
+                            label_counter,
+                            assembly,
+                        );
+                    }
+                    NativeLocation::StackWideScalar { offset, unsigned } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset + 2, assembly);
+                        assembly.push_str(&format!("    LDW R{destination}, R7\n"));
+                        emit_native_word_normalization(
+                            destination,
+                            *unsigned,
+                            label_counter,
+                            assembly,
+                        );
+                    }
+                    NativeLocation::ByteStackScalar { offset, signed } => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                        assembly.push_str(&format!("    LD R{destination}, R7\n"));
+                        emit_native_byte_normalization(destination, *signed, assembly);
+                    }
+                    NativeLocation::Register {
+                        register: source, ..
+                    } if *source != destination => {
+                        assembly.push_str(&format!("    MOV R{destination}, R{source}\n"));
+                    }
+                    NativeLocation::Register { .. } => {}
+                    NativeLocation::FunctionParameters { .. } => return false,
+                }
+            } else {
+                eprintln!(
+                    "unsupported native atom {value:?} at line {}",
+                    expression.line
+                );
+                return false;
+            }
+            true
+        }
+        ExpressionKind::Member {
+            expression: base,
+            operator,
+            name,
+        } if operator == "." || operator == "->" => {
+            let Some(field) = emit_native_member_address(
+                base,
+                operator,
+                name,
+                0,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                eprintln!(
+                    "unsupported native record member {name} at line {}",
+                    expression.line
+                );
+                return false;
+            };
+            if !field.dimensions.is_empty() {
+                if destination != 7 {
+                    assembly.push_str(&format!("    MOV R{destination}, R7\n"));
+                }
+                return true;
+            }
+            if field.size > 2 || field.record_layout.is_some() {
+                return false;
+            }
+            let load_destination = if destination == 7 { 0 } else { destination };
+            assembly.push_str(&format!(
+                "    {} R{load_destination}, R7\n",
+                if field.size == 1 { "LD" } else { "LDW" }
+            ));
+            if field.bit_field.is_some() {
+                emit_native_bitfield_extract(load_destination, &field, assembly);
+            } else if field.size == 1 {
+                emit_native_byte_normalization(load_destination, field.signed, assembly);
+            }
+            if destination == 7 {
+                assembly.push_str("    MOV R7, R0\n");
+            }
+            true
+        }
+        ExpressionKind::Index {
+            expression: base,
+            index,
+        } => {
+            let is_partial_array = native_array_index_is_partial(base, index, locals);
+            let Some((element_size, element_signed)) = emit_native_indexed_element_address(
+                expression,
+                base,
+                index,
+                0,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                eprintln!("unsupported native array read at line {}", expression.line);
+                return false;
+            };
+            if element_size > 2 {
+                return false;
+            }
+            if is_partial_array {
+                if destination != 7 {
+                    assembly.push_str(&format!("    MOV R{destination}, R7\n"));
+                }
+                return true;
+            }
+            let load_destination = if destination == 7 { 0 } else { destination };
+            assembly.push_str(&format!(
+                "    {} R{load_destination}, R7\n",
+                if element_size == 1 { "LD" } else { "LDW" }
+            ));
+            if element_size == 1 {
+                emit_native_byte_normalization(load_destination, element_signed, assembly);
+            }
+            if destination == 7 {
+                assembly.push_str("    MOV R7, R0\n");
+            }
+            true
+        }
+        ExpressionKind::SizeofType(c_type) => {
+            let Some(size) = native_sizeof_type(c_type) else {
+                return false;
+            };
+            assembly.push_str(&format!("    LDI R{destination}, {size}\n"));
+            true
+        }
+        ExpressionKind::SizeofExpression(operand) => {
+            let Some(size) = native_sizeof_expression(operand, locals) else {
+                return false;
+            };
+            assembly.push_str(&format!("    LDI R{destination}, {size}\n"));
+            true
+        }
+        ExpressionKind::Unary { operator, .. } if matches!(operator.as_str(), "++" | "--") => {
+            let Some(operand) = native_incdec_operand(expression) else {
+                return false;
+            };
+            if native_expression_record_field(operand, locals)
+                .is_some_and(|field| field.bit_field.is_some())
+            {
+                return emit_native_bitfield_update(
+                    operand,
+                    operator,
+                    false,
+                    Some(destination),
+                    locals,
+                    label_counter,
+                    assembly,
+                );
+            }
+            if !emit_native_update(expression, locals, label_counter, assembly) {
+                return false;
+            }
+            emit_native_expression(
+                operand,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            )
+        }
+        ExpressionKind::Postfix { operator, .. } => {
+            let Some(operand) = native_incdec_operand(expression) else {
+                return false;
+            };
+            if native_expression_record_field(operand, locals)
+                .is_some_and(|field| field.bit_field.is_some())
+            {
+                return emit_native_bitfield_update(
+                    operand,
+                    operator,
+                    true,
+                    Some(destination),
+                    locals,
+                    label_counter,
+                    assembly,
+                );
+            }
+            if matches!(
+                &operand.kind,
+                ExpressionKind::Atom(name)
+                    if matches!(locals.get(name), Some(NativeLocation::Register { register, .. }) if *register == destination)
+            ) {
+                return false;
+            }
+            if !emit_native_expression(
+                operand,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!("    PUSH R{destination}\n"));
+            if !emit_native_update(expression, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("    POP R{destination}\n"));
+            true
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "&" => {
+            if destination == 7 {
+                return false;
+            }
+            match &operand.kind {
+                ExpressionKind::Atom(name) => match locals.get(name) {
+                    Some(NativeLocation::StackScalar { offset, .. })
+                    | Some(NativeLocation::ByteStackScalar { offset, .. })
+                    | Some(NativeLocation::StackFloatingPointScalar { offset, .. })
+                    | Some(NativeLocation::PointerStack { offset, .. }) => {
+                        assembly.push_str("    MOV R7, R3\n");
+                        emit_native_stack_offset(7, *offset, assembly);
+                    }
+                    Some(NativeLocation::GlobalScalar { .. })
+                    | Some(NativeLocation::GlobalWideScalar { .. })
+                    | Some(NativeLocation::FloatingPointScalar { .. })
+                    | Some(NativeLocation::GlobalPointer { .. }) => {
+                        assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+                    }
+                    Some(NativeLocation::GlobalArray { .. })
+                    | Some(NativeLocation::GlobalRecord { .. })
+                    | Some(NativeLocation::StackRecord { .. })
+                    | Some(NativeLocation::StackArray { .. }) => {
+                        assembly.push_str("    LDI R0, 0\n");
+                        if emit_native_array_address(name, 0, locals, assembly).is_none() {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                },
+                ExpressionKind::Member {
+                    expression: base,
+                    operator,
+                    name,
+                } => {
+                    let Some(field) = emit_native_member_address(
+                        base,
+                        operator,
+                        name,
+                        0,
+                        temporary_registers,
+                        locals,
+                        label_counter,
+                        assembly,
+                    ) else {
+                        return false;
+                    };
+                    if !field.dimensions.is_empty() || field.bit_field.is_some() {
+                        return false;
+                    }
+                }
+                ExpressionKind::Index { expression, index } => {
+                    let mut indices = Vec::new();
+                    if collect_native_member_array_indices(operand, &mut indices).is_some() {
+                        if emit_native_member_array_element_address(
+                            operand,
+                            0,
+                            temporary_registers,
+                            locals,
+                            label_counter,
+                            assembly,
+                        )
+                        .is_none()
+                        {
+                            return false;
+                        }
+                    } else if emit_native_array_element_address(
+                        expression,
+                        index,
+                        0,
+                        temporary_registers,
+                        locals,
+                        label_counter,
+                        assembly,
+                    )
+                    .is_none()
+                    {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            if destination != 7 {
+                assembly.push_str(&format!("    MOV R{destination}, R7\n"));
+            }
+            true
+        }
+        ExpressionKind::Unary { operator, operand } if operator == "*" => {
+            let (element_size, element_signed) = match &operand.kind {
+                ExpressionKind::Atom(name) => {
+                    assembly.push_str("    LDI R0, 0\n");
+                    let Some(pointer_element) =
+                        emit_native_array_address(name, 0, locals, assembly)
+                    else {
+                        return false;
+                    };
+                    pointer_element
+                }
+                ExpressionKind::Cast { c_type, .. } => {
+                    let Some(pointer_element) = native_pointer_element(c_type) else {
+                        return false;
+                    };
+                    if !emit_native_expression(
+                        operand,
+                        0,
+                        temporary_registers,
+                        locals,
+                        label_counter,
+                        assembly,
+                    ) {
+                        return false;
+                    }
+                    assembly.push_str("    MOV R7, R0\n");
+                    pointer_element
+                }
+                _ => return false,
+            };
+            if element_size > 2 {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    {} R0, R7\n",
+                if element_size == 1 { "LD" } else { "LDW" }
+            ));
+            if element_size == 1 {
+                emit_native_byte_normalization(0, element_signed, assembly);
+            }
+            if destination == 7 {
+                assembly.push_str("    MOV R7, R0\n");
+            } else if destination != 0 {
+                assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+            }
+            true
+        }
+        ExpressionKind::Unary { operator, operand } => {
+            if operator == "!"
+                && (native_expression_is_f32(operand, locals)
+                    || native_expression_is_f64(operand, locals)
+                    || native_expression_is_wide_integer(operand, locals))
+            {
+                if !emit_native_condition(operand, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    LDI R7, 1\n    XOR R0, R7\n");
+                if destination != 0 {
+                    assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+                }
+                return true;
+            }
+            if !matches!(operator.as_str(), "+" | "-" | "~" | "!")
+                || !emit_native_expression(
+                    operand,
+                    destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                )
+            {
+                return false;
+            }
+            match operator.as_str() {
+                "+" => {}
+                "-" => {
+                    assembly.push_str(&format!("    NOT R{destination}\n    INC R{destination}\n"))
+                }
+                "~" => assembly.push_str(&format!("    NOT R{destination}\n")),
+                "!" => {
+                    let label = *label_counter;
+                    *label_counter += 1;
+                    assembly.push_str(&format!(
+                        "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                         BZX __c_not_{label}_true\n\
+                         LDI R{destination}, 0\n\
+                         JMPX __c_not_{label}_end\n\
+                         __c_not_{label}_true:\n\
+                         LDI R{destination}, 1\n\
+                         __c_not_{label}_end:\n"
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            true
+        }
+        ExpressionKind::Assignment { .. } => emit_native_assignment(
+            expression,
+            Some(destination),
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        ),
+        ExpressionKind::Cast { c_type, expression }
+            if c_type.trim().ends_with('*')
+                && native_expression_is_wide_integer(expression, locals) =>
+        {
+            if !emit_native_i32_source(expression, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str(&format!("    JOIN30 R4, R5\n    MOV R{destination}, R4\n"));
+            true
+        }
+        ExpressionKind::Cast { c_type, expression }
+            if matches!(c_type.trim(), "signed" | "unsigned")
+                || is_native_word_type(c_type)
+                || native_pointer_element(c_type).is_some()
+                || c_type.trim().ends_with('*') =>
+        {
+            if is_native_word_type(c_type)
+                && (native_expression_is_f32(expression, locals)
+                    || native_expression_is_f64(expression, locals))
+            {
+                let floating_size =
+                    native_expression_floating_size(expression, locals).unwrap_or(0);
+                let emitted = match floating_size {
+                    4 => emit_native_f32_expression(expression, locals, label_counter, assembly),
+                    8 => emit_native_f64_expression(expression, locals, label_counter, assembly),
+                    _ => false,
+                };
+                if !emitted {
+                    return false;
+                }
+                let is_32_bit = matches!(
+                    native_unqualified_type(c_type),
+                    "long" | "signed long" | "unsigned long"
+                );
+                let conversion = match (
+                    floating_size,
+                    is_32_bit,
+                    is_native_unsigned_word_type(c_type),
+                ) {
+                    (4, false, false) => "F32TOI16",
+                    (4, false, true) => "F32TOU16",
+                    (8, false, false) => "F64TOI16",
+                    (8, false, true) => "F64TOU16",
+                    (4, true, false) => "F32TOI32",
+                    (4, true, true) => "F32TOU32",
+                    (8, true, false) => "F64TOI32",
+                    (8, true, true) => "F64TOU32",
+                    _ => return false,
+                };
+                if is_32_bit && destination > 6 {
+                    return false;
+                }
+                assembly.push_str(&format!("    {conversion} R{destination}, R4\n"));
+                true
+            } else {
+                emit_native_expression(
+                    expression,
+                    destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                )
+            }
+        }
+        ExpressionKind::Cast { c_type, expression }
+            if let Some(signed) = native_byte_type(c_type) =>
+        {
+            if let Some(size) = native_expression_floating_size(expression, locals) {
+                if !emit_native_floating_conversion(
+                    expression,
+                    size,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                assembly.push_str(&format!(
+                    "    {} R{destination}, R4\n",
+                    match (size, signed) {
+                        (4, true) => "F32TOI16",
+                        (4, false) => "F32TOU16",
+                        (8, true) => "F64TOI16",
+                        (8, false) => "F64TOU16",
+                        _ => return false,
+                    }
+                ));
+                emit_native_byte_normalization(destination, signed, assembly);
+                return true;
+            }
+            if !emit_native_expression(
+                expression,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            emit_native_byte_normalization(destination, signed, assembly);
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(
+            operator.as_str(),
+            "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>"
+        ) =>
+        {
+            if operator == "-"
+                && let (Some(left_size), Some(right_size)) = (
+                    native_expression_pointer_element_size(left, locals),
+                    native_expression_pointer_element_size(right, locals),
+                )
+                && left_size != right_size
+            {
+                eprintln!(
+                    "incompatible pointer subtraction operands at line {}",
+                    expression.line
+                );
+                return false;
+            }
+            let pointer_arithmetic = match operator.as_str() {
+                "+" => {
+                    let left_pointer = native_expression_pointer_element_size(left, locals);
+                    let right_pointer = native_expression_pointer_element_size(right, locals);
+                    match (left_pointer, right_pointer) {
+                        (Some(element_size), None) => Some((left, right, element_size)),
+                        (None, Some(element_size)) => Some((right, left, element_size)),
+                        _ => None,
+                    }
+                }
+                "-" if native_expression_pointer_element_size(right, locals).is_none() => {
+                    native_expression_pointer_element_size(left, locals)
+                        .map(|element_size| (left, right, element_size))
+                }
+                _ => None,
+            };
+            if let Some((pointer, offset, element_size)) = pointer_arithmetic {
+                if !emit_native_expression(
+                    pointer,
+                    destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                let pointer_register = if destination == 7 { 0 } else { destination };
+                if destination == 7 {
+                    assembly.push_str("    MOV R0, R7\n");
+                }
+                assembly.push_str(&format!(
+                    "    ADJSP -4\n    MOVSP R7\n    STP R{pointer_register}, R7\n"
+                ));
+                let (right_register, remaining_registers) =
+                    temporary_registers.split_first().map_or_else(
+                        || (if matches!(destination, 0 | 7) { 4 } else { 0 }, &[][..]),
+                        |(register, remaining)| (*register, remaining),
+                    );
+                if !emit_native_expression(
+                    offset,
+                    right_register,
+                    remaining_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                if element_size > 1 {
+                    assembly.push_str(&format!(
+                        "    LDI R7, {element_size}\n    MUL R{right_register}, R7\n"
+                    ));
+                }
+                assembly.push_str(&format!(
+                    "    MOVSP R7\n    LDP R{pointer_register}, R7\n    ADJSP 4\n    {} R{pointer_register}, R{right_register}\n",
+                    if operator == "-" { "SUB" } else { "ADD" }
+                ));
+                if destination == 7 {
+                    assembly.push_str("    MOV R7, R0\n");
+                }
+                return true;
+            }
+            if matches!(operator.as_str(), "/" | "%")
+                && let ExpressionKind::Atom(value) = &right.kind
+                && parse_integer_constant(value).is_some_and(|value| value > u16::MAX as i64)
+            {
+                if !emit_native_expression(
+                    left,
+                    destination,
+                    temporary_registers,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+                if operator == "/" {
+                    assembly.push_str(&format!("    LDI R{destination}, 0\n"));
+                }
+                return true;
+            }
+            let (right_register, remaining_registers) =
+                temporary_registers.split_first().map_or_else(
+                    || (if destination == 0 { 4 } else { 0 }, &[][..]),
+                    |(register, remaining)| (*register, remaining),
+                );
+            if !emit_native_truth_value(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                eprintln!(
+                    "unsupported left operand for {} at line {}",
+                    operator, expression.line
+                );
+                return false;
+            }
+            assembly.push_str(&format!("    PUSH R{destination}\n"));
+            if !emit_native_expression(
+                right,
+                right_register,
+                remaining_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                eprintln!(
+                    "unsupported right operand for {} at line {}",
+                    operator, expression.line
+                );
+                return false;
+            }
+            assembly.push_str(&format!("    POP R{destination}\n"));
+            let unsigned = native_expression_is_unsigned(left, locals)
+                || native_expression_is_unsigned(right, locals);
+            let instruction = match operator.as_str() {
+                "+" => "ADD",
+                "-" => "SUB",
+                "*" => "MUL",
+                "/" if unsigned => "DIV",
+                "/" => "DIVS",
+                "%" if unsigned => "MOD",
+                "%" => "MODS",
+                "&" => "AND",
+                "|" => "OR",
+                "^" => "XOR",
+                "<<" => "SHL",
+                ">>" if unsigned => "LSR",
+                ">>" => "ASR",
+                _ => unreachable!(),
+            };
+            assembly.push_str(&format!(
+                "    {instruction} R{destination}, R{right_register}\n"
+            ));
+            if native_expression_uses_signed_byte(left, locals)
+                || native_expression_uses_signed_byte(right, locals)
+            {
+                assembly.push_str(&format!(
+                    "    LDI R{right_register}, 0xFFFF\n\
+                     AND R{destination}, R{right_register}\n"
+                ));
+            }
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
+            && (native_expression_is_f64(left, locals)
+                || native_expression_is_f64(right, locals)) =>
+        {
+            emit_native_f64_comparison(
+                operator,
+                left,
+                right,
+                destination,
+                locals,
+                label_counter,
+                assembly,
+            )
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=")
+            && (native_expression_is_f32(left, locals)
+                || native_expression_is_f32(right, locals)) =>
+        {
+            emit_native_f32_comparison(
+                operator,
+                left,
+                right,
+                destination,
+                locals,
+                label_counter,
+                assembly,
+            )
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") => {
+            if native_expression_is_wide_integer(left, locals)
+                || native_expression_is_wide_integer(right, locals)
+            {
+                let (Some(left_type), Some(right_type)) = (
+                    native_expression_integer_type(left, locals),
+                    native_expression_integer_type(right, locals),
+                ) else {
+                    return false;
+                };
+                let saved_r1 = (destination != 1).then(|| emit_native_save_r1(locals, assembly));
+                if !emit_native_i32_source(left, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    PUSH R4\n    PUSH R5\n");
+                if !emit_native_i32_source(right, locals, label_counter, assembly) {
+                    return false;
+                }
+                assembly.push_str("    MOV32 R0, R4\n    POP R5\n    POP R4\n    CMP32 R4, R0\n");
+                let unsigned = if left_type.wide == right_type.wide {
+                    left_type.unsigned || right_type.unsigned
+                } else if left_type.wide {
+                    left_type.unsigned
+                } else {
+                    right_type.unsigned
+                };
+                let branch = match operator.as_str() {
+                    "==" => "BZX",
+                    "!=" => "BNZX",
+                    "<" if unsigned => "BCX",
+                    "<" => "BLTX",
+                    "<=" if unsigned => "BLSX",
+                    "<=" => "BLEX",
+                    ">" if unsigned => "BHIX",
+                    ">" => "BGTX",
+                    ">=" if unsigned => "BNCX",
+                    ">=" => "BGEX",
+                    _ => unreachable!(),
+                };
+                let label = *label_counter;
+                *label_counter += 1;
+                assembly.push_str(&format!(
+                    "    {branch} __c_wide_cmp_{label}_true\n    LDI R{destination}, 0\n\
+                     JMPX __c_wide_cmp_{label}_end\n__c_wide_cmp_{label}_true:\n\
+                     LDI R{destination}, 1\n__c_wide_cmp_{label}_end:\n"
+                ));
+                if let Some(wide_pointer) = saved_r1 {
+                    emit_native_restore_r1(wide_pointer, assembly);
+                }
+                return true;
+            }
+            let pointer_comparison = native_expression_pointer_element_size(left, locals).is_some()
+                || native_expression_pointer_element_size(right, locals).is_some();
+            let (right_register, remaining_registers) =
+                temporary_registers.split_first().map_or_else(
+                    || (if destination == 0 { 4 } else { 0 }, &[][..]),
+                    |(register, remaining)| (*register, remaining),
+                );
+            if !emit_native_expression(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            if pointer_comparison {
+                let scratch = if destination == 7 { 6 } else { 7 };
+                assembly.push_str(&format!(
+                    "    ADJSP -4\n    MOVSP R{scratch}\n    STP R{destination}, R{scratch}\n"
+                ));
+            } else {
+                assembly.push_str(&format!("    PUSH R{destination}\n"));
+            }
+            if !emit_native_expression(
+                right,
+                right_register,
+                remaining_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            if pointer_comparison {
+                let scratch = if right_register == 7 { 6 } else { 7 };
+                assembly.push_str(&format!(
+                    "    MOVSP R{scratch}\n    LDP R{destination}, R{scratch}\n    ADJSP 4\n"
+                ));
+            } else {
+                assembly.push_str(&format!(
+                    "    POP R{destination}\n    AND R{destination}, 0xFFFF\n\
+                     AND R{right_register}, 0xFFFF\n"
+                ));
+            }
+            let label = *label_counter;
+            *label_counter += 1;
+            let unsigned = pointer_comparison
+                || native_expression_is_unsigned(left, locals)
+                || native_expression_is_unsigned(right, locals);
+            let (branch, truth_label, end_label) = match operator.as_str() {
+                "==" => ("BZX", "true", "end"),
+                "!=" => ("BNZX", "true", "end"),
+                "<" if unsigned => ("BCX", "true", "end"),
+                "<" => ("BLTX", "true", "end"),
+                "<=" if unsigned => ("BLSX", "true", "end"),
+                "<=" => ("BLEX", "true", "end"),
+                ">" if unsigned => ("BHIX", "true", "end"),
+                ">" => ("BGTX", "true", "end"),
+                ">=" if unsigned => ("BNCX", "true", "end"),
+                ">=" => ("BGEX", "true", "end"),
+                _ => unreachable!(),
+            };
+            assembly.push_str(&format!(
+                "    CMP R{destination}, R{right_register}\n\
+                 {branch} __c_cmp_{label}_{truth_label}\n\
+                 LDI R{destination}, 0\n\
+                 JMPX __c_cmp_{label}_{end_label}\n\
+                 __c_cmp_{label}_{truth_label}:\n\
+                 LDI R{destination}, 1\n\
+                 __c_cmp_{label}_{end_label}:\n"
+            ));
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if matches!(operator.as_str(), "&&" | "||") => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_truth_value(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            let (short_branch, short_target) = if operator == "&&" {
+                ("BZX", "false")
+            } else {
+                ("BNZX", "true")
+            };
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                 {short_branch} __c_logic_{label}_{short_target}\n"
+            ));
+            if !emit_native_truth_value(
+                right,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                 BNZX __c_logic_{label}_true\n\
+                 __c_logic_{label}_false:\n\
+                 LDI R{destination}, 0\n\
+                 JMPX __c_logic_{label}_end\n\
+                 __c_logic_{label}_true:\n\
+                 LDI R{destination}, 1\n\
+                 __c_logic_{label}_end:\n",
+            ));
+            true
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_truth_value(
+                condition,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                 BZX __c_cond_{label}_false\n"
+            ));
+            if !emit_native_expression(
+                when_true,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_cond_{label}_end\n__c_cond_{label}_false:\n"
+            ));
+            if !emit_native_expression(
+                when_false,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(&format!("__c_cond_{label}_end:\n"));
+            true
+        }
+        ExpressionKind::Call {
+            function,
+            arguments,
+        } => {
+            let ExpressionKind::Atom(name) = &function.kind else {
+                return false;
+            };
+            let (float_return_size, wide_return, layout) = match locals.get(name) {
+                Some(NativeLocation::FunctionParameters {
+                    layout,
+                    float_return_size,
+                    wide_return_unsigned,
+                    ..
+                }) => (
+                    *float_return_size,
+                    wide_return_unsigned.is_some(),
+                    layout.as_ref(),
+                ),
+                _ => (0, false, None),
+            };
+            if name == "abs" {
+                if arguments.len() != 1
+                    || !emit_native_expression(
+                        &arguments[0],
+                        destination,
+                        temporary_registers,
+                        locals,
+                        label_counter,
+                        assembly,
+                    )
+                {
+                    return false;
+                }
+                let label = *label_counter;
+                *label_counter += 1;
+                assembly.push_str(&format!(
+                    "    LDI R7, 0\n    CMP R{destination}, R7\n\
+                     BLTX __c_abs_{label}_negative\n\
+                     JMPX __c_abs_{label}_end\n\
+                     __c_abs_{label}_negative:\n\
+                     NOT R{destination}\n    INC R{destination}\n\
+                     __c_abs_{label}_end:\n"
+                ));
+                return true;
+            }
+            let library_function = native_library_for_symbol(name).is_some();
+            let maximum_arguments = if name == "printf" {
+                32
+            } else if library_function {
+                8
+            } else {
+                32_767
+            };
+            if arguments.len() > maximum_arguments {
+                return false;
+            }
+            let preserve_frame_pointer = locals.values().any(|location| {
+                matches!(
+                    location,
+                    NativeLocation::StackScalar { .. }
+                        | NativeLocation::StackWideScalar { .. }
+                        | NativeLocation::ByteStackScalar { .. }
+                        | NativeLocation::StackFloatingPointScalar { .. }
+                        | NativeLocation::PointerStack { .. }
+                        | NativeLocation::StackRecord { .. }
+                        | NativeLocation::StackArray { .. }
+                )
+            });
+            let pointer_registers = (1..=6)
+                .filter(|register| {
+                    locals.values().any(|location| {
+                        matches!(
+                            location,
+                            NativeLocation::PointerRegister {
+                                register: pointer_register,
+                                ..
+                            } if pointer_register == register
+                        )
+                    })
+                })
+                .collect::<HashSet<_>>();
+            if preserve_frame_pointer {
+                assembly.push_str("    MOVSPH R7\n    PUSH R7\n");
+            }
+            let floating_return_registers = if wide_return {
+                2
+            } else {
+                (float_return_size / 2).min(4)
+            };
+            for register in 1..=6 {
+                if (4..4 + floating_return_registers).contains(&register) {
+                    continue;
+                }
+                if pointer_registers.contains(&(register as u8)) {
+                    assembly.push_str(&format!(
+                        "    ADJSP -4\n    MOVSP R7\n    STP R{register}, R7\n"
+                    ));
+                } else {
+                    assembly.push_str(&format!("    PUSH R{register}\n"));
+                }
+            }
+            let mut argument_bytes = 0;
+            if library_function {
+                for (index, argument) in arguments.iter().enumerate().rev() {
+                    if native_argument_is_pointer(name, index, arguments) {
+                        if !emit_native_library_pointer_argument(
+                            name,
+                            index,
+                            argument,
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        emit_native_pointer_push(assembly);
+                        argument_bytes += 4;
+                    } else if native_argument_is_wide_integer(name, index) {
+                        if !emit_native_wide_conversion(
+                            argument,
+                            true,
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        assembly.push_str("    PUSH R5\n    PUSH R4\n");
+                        argument_bytes += 4;
+                    } else {
+                        if !emit_native_expression(
+                            argument,
+                            4,
+                            &[5, 6, 7],
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) {
+                            return false;
+                        }
+                        assembly.push_str("    PUSH R4\n");
+                        argument_bytes += 2;
+                    }
+                }
+            } else {
+                let Some(layout) = layout else {
+                    return false;
+                };
+                if arguments.len() < layout.arguments.len()
+                    || (layout.has_prototype
+                        && !layout.variadic
+                        && arguments.len() != layout.arguments.len())
+                {
+                    return false;
+                }
+                for (index, expression) in arguments.iter().enumerate().rev() {
+                    if !layout.has_prototype || index >= layout.arguments.len() {
+                        let Some(size) = emit_native_variadic_argument(
+                            expression,
+                            locals,
+                            label_counter,
+                            assembly,
+                        ) else {
+                            return false;
+                        };
+                        argument_bytes += size;
+                        if argument_bytes > u16::MAX as usize {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let argument = &layout.arguments[index];
+                    if matches!(&argument.kind, NativeArgumentKind::Pointer)
+                        && !argument.pointer_target_is_const
+                        && native_expression_pointer_target_is_const(expression, locals)
+                    {
+                        eprintln!(
+                            "argument discards pointer target const qualification at line {}",
+                            expression.line
+                        );
+                        return false;
+                    }
+                    match argument.kind {
+                        NativeArgumentKind::Record(ref record_layout) => {
+                            if record_layout.size % 2 != 0 {
+                                return false;
+                            }
+                            let address = Expression {
+                                kind: ExpressionKind::Unary {
+                                    operator: "&".to_owned(),
+                                    operand: Box::new(expression.clone()),
+                                },
+                                line: expression.line,
+                                filename: expression.filename.clone(),
+                            };
+                            if !emit_native_expression(
+                                &address,
+                                0,
+                                &[4, 5, 6],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            assembly.push_str("    MOV R7, R0\n");
+                            for offset in (0..record_layout.size).step_by(2).rev() {
+                                if offset == 0 {
+                                    assembly.push_str("    LDW R5, R7\n");
+                                } else {
+                                    assembly.push_str(&format!(
+                                        "    MOV R0, R7\n    LDI R6, {offset}\n\
+                                         ADD R0, R6\n    LDW R5, R0\n"
+                                    ));
+                                }
+                                assembly.push_str("    PUSH R5\n");
+                            }
+                        }
+                        NativeArgumentKind::Binary32 => {
+                            if !emit_native_floating_conversion(
+                                expression,
+                                4,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            assembly.push_str("    PUSH R5\n    PUSH R4\n");
+                        }
+                        NativeArgumentKind::Binary64 => {
+                            if !emit_native_floating_conversion(
+                                expression,
+                                8,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            assembly
+                                .push_str("    PUSH R7\n    PUSH R6\n    PUSH R5\n    PUSH R4\n");
+                        }
+                        NativeArgumentKind::WideInteger => {
+                            if !emit_native_wide_conversion(
+                                expression,
+                                argument.unsigned,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            assembly.push_str("    PUSH R5\n    PUSH R4\n");
+                        }
+                        _ => {
+                            if !emit_native_expression(
+                                expression,
+                                4,
+                                &[5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return false;
+                            }
+                            match argument.kind {
+                                NativeArgumentKind::Pointer => assembly
+                                    .push_str("    ADJSP -4\n    MOVSP R7\n    STP R4, R7\n"),
+                                NativeArgumentKind::Byte => {
+                                    assembly.push_str("    ADJSP -1\n    MOVSP R7\n    ST R7, R4\n")
+                                }
+                                NativeArgumentKind::Word => assembly.push_str("    PUSH R4\n"),
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                }
+                argument_bytes += layout.size;
+                if argument_bytes > u16::MAX as usize {
+                    return false;
+                }
+            }
+            assembly.push_str(&format!(
+                "    CALLX {}\n",
+                if library_function {
+                    name.clone()
+                } else {
+                    format!("__c_function_{name}")
+                }
+            ));
+            if float_return_size == 4 || wide_return {
+                assembly.push_str("    MOV R4, R0\n    MOV R5, R1\n");
+            } else if float_return_size == 8 {
+                assembly
+                    .push_str("    MOV R4, R0\n    MOV R5, R1\n    MOV R6, R2\n    MOV R7, R3\n");
+            }
+            if argument_bytes != 0 {
+                emit_native_stack_adjustment(argument_bytes, false, assembly);
+            }
+            for register in (1..=6).rev() {
+                if (4..4 + floating_return_registers).contains(&register) {
+                    continue;
+                }
+                if pointer_registers.contains(&(register as u8)) {
+                    let scratch = if float_return_size == 8 { 0 } else { 7 };
+                    assembly.push_str(&format!(
+                        "    MOVSP R{scratch}\n    LDP R{register}, R{scratch}\n    ADJSP 4\n"
+                    ));
+                } else {
+                    assembly.push_str(&format!("    POP R{register}\n"));
+                }
+            }
+            if preserve_frame_pointer {
+                if float_return_size == 8 {
+                    assembly.push_str("    MOV R0, R7\n");
+                }
+                assembly.push_str("    POP R7\n");
+                for _ in 0..16 {
+                    assembly.push_str("    ADD R7, R7\n");
+                }
+                assembly.push_str("    ADD R3, R7\n");
+                if float_return_size == 8 {
+                    assembly.push_str("    MOV R7, R0\n");
+                }
+            }
+            if wide_return {
+                assembly.push_str(&format!("    MOV R{destination}, R5\n"));
+            } else if destination != 0 && float_return_size == 0 {
+                assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+            }
+            true
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "," => {
+            emit_native_discarded_expression(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) && emit_native_expression(
+                right,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn emit_native_discarded_expression(
+    expression: &Expression,
+    destination: u8,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    match &expression.kind {
+        ExpressionKind::Assignment { .. } => emit_native_assignment(
+            expression,
+            None,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        ),
+        _ if native_expression_is_f64(expression, locals) => {
+            emit_native_f64_expression(expression, locals, label_counter, assembly)
+        }
+        _ if native_expression_is_f32(expression, locals) => {
+            emit_native_f32_expression(expression, locals, label_counter, assembly)
+        }
+        ExpressionKind::Postfix { operator, .. } | ExpressionKind::Unary { operator, .. }
+            if matches!(operator.as_str(), "++" | "--") =>
+        {
+            emit_native_update(expression, locals, label_counter, assembly)
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } if operator == "," => {
+            emit_native_discarded_expression(
+                left,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            ) && emit_native_discarded_expression(
+                right,
+                destination,
+                temporary_registers,
+                locals,
+                label_counter,
+                assembly,
+            )
+        }
+        _ => emit_native_expression(
+            expression,
+            destination,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        ),
+    }
+}
+
+fn native_incdec_operand(expression: &Expression) -> Option<&Expression> {
+    match &expression.kind {
+        ExpressionKind::Unary { operator, operand }
+        | ExpressionKind::Postfix {
+            operator,
+            expression: operand,
+        } if matches!(operator.as_str(), "++" | "--")
+            && (matches!(
+                &operand.kind,
+                ExpressionKind::Atom(_)
+                    | ExpressionKind::Index { .. }
+                    | ExpressionKind::Member { .. }
+            ) || matches!(&operand.kind, ExpressionKind::Unary { operator, .. } if operator == "*")) =>
+        {
+            Some(operand)
+        }
+        _ => None,
+    }
+}
+
+fn emit_native_assignment(
+    expression: &Expression,
+    result_destination: Option<u8>,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    emit_native_assignment_with_const(
+        expression,
+        result_destination,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_native_assignment_with_const(
+    expression: &Expression,
+    result_destination: Option<u8>,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+    allow_const_target: bool,
+) -> bool {
+    let ExpressionKind::Assignment {
+        operator,
+        target,
+        value,
+    } = &expression.kind
+    else {
+        return false;
+    };
+    if !allow_const_target && native_assignment_discards_pointer_const(target, value, locals) {
+        eprintln!(
+            "assignment discards pointer target const qualification at line {}",
+            target.line
+        );
+        return false;
+    }
+    let field = native_expression_record_field(target, locals);
+    if !allow_const_target && native_expression_is_const_lvalue(target, locals) {
+        eprintln!(
+            "assignment to const-qualified lvalue at line {}",
+            target.line
+        );
+        return false;
+    }
+    if field.is_some_and(|field| field.bit_field.is_some()) {
+        return emit_native_bitfield_assignment(
+            target,
+            operator,
+            value,
+            result_destination,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    if !emit_native_assignment_store(
+        expression,
+        temporary_registers,
+        locals,
+        label_counter,
+        assembly,
+        allow_const_target,
+    ) {
+        return false;
+    }
+    result_destination.is_none_or(|destination| {
+        emit_native_expression(
+            target,
+            destination,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_native_bitfield_assignment(
+    target: &Expression,
+    operator: &str,
+    value: &Expression,
+    destination: Option<u8>,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let ExpressionKind::Member {
+        expression,
+        operator: member_operator,
+        name,
+    } = &target.kind
+    else {
+        return false;
+    };
+    let Some(field) = emit_native_member_address(
+        expression,
+        member_operator,
+        name,
+        0,
+        &[4, 5, 6],
+        locals,
+        label_counter,
+        assembly,
+    ) else {
+        return false;
+    };
+    assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+    if operator != "="
+        && (native_expression_floating_size(value, locals).is_some()
+            || native_expression_is_wide_integer(value, locals))
+    {
+        let compound_operator = operator.trim_end_matches('=');
+        if native_expression_floating_size(value, locals).is_some()
+            && !matches!(compound_operator, "+" | "-" | "*" | "/")
+        {
+            return false;
+        }
+        assembly.push_str("    LDW R5, R7\n    PUSH R5\n");
+        emit_native_bitfield_extract(5, &field, assembly);
+        assembly.push_str("    MOV R2, R5\n");
+        let temporary_name = "__sc16_bitfield_compound_value";
+        let mut typed_locals = locals.clone();
+        typed_locals.insert(
+            temporary_name.to_owned(),
+            NativeLocation::Register {
+                register: 2,
+                unsigned: !field.signed && field.bit_field.unwrap().1 == 16,
+            },
+        );
+        let temporary_value = Expression {
+            kind: ExpressionKind::Atom(temporary_name.to_owned()),
+            line: target.line,
+            filename: target.filename.clone(),
+        };
+        let compound = Expression {
+            kind: ExpressionKind::Binary {
+                operator: compound_operator.to_owned(),
+                left: Box::new(temporary_value),
+                right: Box::new(value.clone()),
+            },
+            line: target.line,
+            filename: target.filename.clone(),
+        };
+        if native_expression_floating_size(value, locals).is_some() {
+            let converted = Expression {
+                kind: ExpressionKind::Cast {
+                    c_type: if field.signed { "int" } else { "unsigned int" }.to_owned(),
+                    expression: Box::new(compound),
+                },
+                line: target.line,
+                filename: target.filename.clone(),
+            };
+            if !emit_native_expression(
+                &converted,
+                4,
+                &[5, 6],
+                &typed_locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str("    MOV R0, R4\n");
+        } else {
+            if !emit_native_i32_source(&compound, &typed_locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOV R0, R5\n");
+        }
+        assembly.push_str(
+            "    PUSH R0\n    POP R0\n    POP R5\n    MOVSP R6\n    LDP R7, R6\n    ADJSP 4\n",
+        );
+        emit_native_bitfield_store(&field, assembly);
+        if let Some(destination) = destination
+            && destination != 0
+        {
+            assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+        }
+        return true;
+    }
+    let converted_value;
+    let value = if native_expression_floating_size(value, locals).is_some() {
+        converted_value = Expression {
+            kind: ExpressionKind::Cast {
+                c_type: if field.signed { "int" } else { "unsigned int" }.to_owned(),
+                expression: Box::new(value.clone()),
+            },
+            line: value.line,
+            filename: value.filename.clone(),
+        };
+        &converted_value
+    } else {
+        value
+    };
+    if !emit_native_expression(value, 4, &[5, 6], locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str("    MOVSP R0\n    LDP R7, R0\n    ADJSP 4\n    LDW R5, R7\n");
+    if operator == "=" {
+        assembly.push_str("    MOV R0, R4\n");
+    } else {
+        let unsigned = (!field.signed && field.bit_field.unwrap().1 == 16)
+            || native_expression_is_unsigned(value, locals);
+        let Some(instruction) = native_compound_operator(operator, unsigned) else {
+            return false;
+        };
+        assembly.push_str("    MOV R0, R5\n");
+        emit_native_bitfield_extract(0, &field, assembly);
+        assembly.push_str(&format!("    {instruction} R0, R4\n"));
+    }
+    emit_native_bitfield_store(&field, assembly);
+    if let Some(destination) = destination
+        && destination != 0
+    {
+        assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+    }
+    true
+}
+
+fn emit_native_bitfield_update(
+    target: &Expression,
+    operator: &str,
+    postfix: bool,
+    destination: Option<u8>,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let ExpressionKind::Member {
+        expression,
+        operator: member_operator,
+        name,
+    } = &target.kind
+    else {
+        return false;
+    };
+    let Some(field) = emit_native_member_address(
+        expression,
+        member_operator,
+        name,
+        0,
+        &[4, 5, 6],
+        locals,
+        label_counter,
+        assembly,
+    ) else {
+        return false;
+    };
+    assembly.push_str("    LDW R5, R7\n    MOV R0, R5\n");
+    emit_native_bitfield_extract(0, &field, assembly);
+    if postfix && destination.is_some() {
+        assembly.push_str("    PUSH R0\n");
+    }
+    assembly.push_str(&format!(
+        "    {} R0\n",
+        if operator == "++" { "INC" } else { "DEC" }
+    ));
+    emit_native_bitfield_store(&field, assembly);
+    if postfix && destination.is_some() {
+        assembly.push_str("    POP R0\n");
+    }
+    if let Some(destination) = destination
+        && destination != 0
+    {
+        assembly.push_str(&format!("    MOV R{destination}, R0\n"));
+    }
+    true
+}
+
+fn emit_native_f32_member_assignment_store(
+    operator: &str,
+    target: &Expression,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let ExpressionKind::Member {
+        expression: base,
+        operator: member_operator,
+        name,
+    } = &target.kind
+    else {
+        return false;
+    };
+    let wide_pointer = emit_native_save_r1(locals, assembly);
+    let Some(field) = emit_native_member_address(
+        base,
+        member_operator,
+        name,
+        0,
+        &[4, 5, 6],
+        locals,
+        label_counter,
+        assembly,
+    ) else {
+        return false;
+    };
+    if field.floating_size != 4
+        || field.bit_field.is_some()
+        || field.record_layout.is_some()
+        || !field.dimensions.is_empty()
+    {
+        return false;
+    }
+    assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+    let instruction = if operator == "=" {
+        None
+    } else {
+        Some(match operator {
+            "+=" => "F32ADD",
+            "-=" => "F32SUB",
+            "*=" => "F32MUL",
+            "/=" => "F32DIV",
+            _ => return false,
+        })
+    };
+    if instruction.is_some() {
+        assembly.push_str(
+            "    MOVSP R7\n    LDP R6, R7\n    LDW R4, R6\n\
+             LDI R7, 2\n    ADD R6, R7\n    LDW R5, R6\n",
+        );
+    }
+    if let Some(instruction) = instruction {
+        let compound_operator = match instruction {
+            "F32ADD" => "+=",
+            "F32SUB" => "-=",
+            "F32MUL" => "*=",
+            "F32DIV" => "/=",
+            _ => return false,
+        };
+        if !emit_native_f32_compound_value(
+            compound_operator,
+            value,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return false;
+        }
+    } else if !emit_native_f32_expression(value, locals, label_counter, assembly) {
+        return false;
+    }
+    assembly.push_str(
+        "    MOVSP R7\n    LDP R6, R7\n    ADJSP 4\n\
+         STW R6, R4\n    LDI R7, 2\n    ADD R6, R7\n    STW R6, R5\n",
+    );
+    emit_native_restore_r1(wide_pointer, assembly);
+    true
+}
+
+fn emit_native_assignment_store(
+    expression: &Expression,
+    temporary_registers: &[u8],
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+    allow_const_target: bool,
+) -> bool {
+    let ExpressionKind::Assignment {
+        operator,
+        target,
+        value,
+    } = &expression.kind
+    else {
+        return false;
+    };
+    if !allow_const_target && native_expression_is_const_lvalue(target, locals) {
+        eprintln!(
+            "assignment to const-qualified lvalue at line {}",
+            target.line
+        );
+        return false;
+    }
+    if native_expression_is_wide_integer(target, locals) {
+        let wide_field_size = match &target.kind {
+            ExpressionKind::Member {
+                expression: base,
+                operator: member_operator,
+                name,
+            } => emit_native_member_address(
+                base,
+                member_operator,
+                name,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            )
+            .filter(|field| {
+                field.bit_field.is_none()
+                    && field.record_layout.is_none()
+                    && field.dimensions.is_empty()
+            })
+            .map(|field| field.size),
+            ExpressionKind::Index {
+                expression: base,
+                index,
+            } => emit_native_indexed_element_address(
+                target,
+                base,
+                index,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            )
+            .map(|(size, _)| size),
+            ExpressionKind::Unary { operator, operand } if operator == "*" => {
+                if let Some(element_size) = native_expression_pointer_element_size(operand, locals)
+                    && emit_native_expression(
+                        operand,
+                        0,
+                        &[4, 5, 6],
+                        locals,
+                        label_counter,
+                        assembly,
+                    )
+                {
+                    assembly.push_str("    MOV R7, R0\n");
+                    Some(element_size)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(field_size) = wide_field_size {
+            if field_size != 4 || (operator != "=" && native_expression_has_side_effects(target)) {
+                return false;
+            }
+            assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+            let unsigned = native_expression_integer_type(target, locals)
+                .is_some_and(|integer_type| integer_type.unsigned);
+            let compound;
+            let converted_value = if operator == "=" {
+                value.as_ref()
+            } else {
+                let Some(binary_operator) = operator.strip_suffix('=') else {
+                    return false;
+                };
+                compound = Expression {
+                    kind: ExpressionKind::Binary {
+                        operator: binary_operator.to_owned(),
+                        left: target.clone(),
+                        right: value.clone(),
+                    },
+                    line: expression.line,
+                    filename: expression.filename.clone(),
+                };
+                &compound
+            };
+            if !emit_native_wide_conversion(
+                converted_value,
+                unsigned,
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return false;
+            }
+            assembly.push_str(
+                "    MOVSP R7\n    LDP R7, R7\n    ADJSP 4\n\
+                 STW R7, R4\n    INC R7\n    INC R7\n    STW R7, R5\n",
+            );
+            return true;
+        }
+        let ExpressionKind::Atom(name) = &target.kind else {
+            return false;
+        };
+        let Some(location) = locals.get(name) else {
+            return false;
+        };
+        let unsigned = native_expression_integer_type(target, locals)
+            .unwrap()
+            .unsigned;
+        let compound;
+        let value = if operator == "=" {
+            value.as_ref()
+        } else {
+            let Some(binary_operator) = operator.strip_suffix('=') else {
+                return false;
+            };
+            compound = Expression {
+                kind: ExpressionKind::Binary {
+                    operator: binary_operator.to_owned(),
+                    left: target.clone(),
+                    right: value.clone(),
+                },
+                line: expression.line,
+                filename: expression.filename.clone(),
+            };
+            &compound
+        };
+        if !emit_native_wide_conversion(value, unsigned, locals, label_counter, assembly) {
+            return false;
+        }
+        match location {
+            NativeLocation::StackWideScalar { offset, .. } => {
+                assembly.push_str("    MOV R7, R3\n");
+                emit_native_stack_offset(7, *offset, assembly);
+            }
+            NativeLocation::GlobalWideScalar { .. } => {
+                assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n"));
+            }
+            _ => return false,
+        }
+        assembly.push_str("    STW R7, R4\n    INC R7\n    INC R7\n    STW R7, R5\n");
+        return true;
+    }
+    if native_expression_record_field(target, locals).is_some_and(|field| field.bit_field.is_some())
+    {
+        return emit_native_bitfield_assignment(
+            target,
+            operator,
+            value,
+            None,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    if matches!(target.kind, ExpressionKind::Member { .. })
+        && native_expression_is_f32(target, locals)
+    {
+        return emit_native_f32_member_assignment_store(
+            operator,
+            target,
+            value,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    if native_expression_is_f64(target, locals) {
+        return emit_native_f64_assignment_store(
+            operator,
+            target,
+            value,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    if operator == "="
+        && emit_native_record_assignment(
+            target,
+            value,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )
+        .is_some()
+    {
+        return true;
+    }
+    if let ExpressionKind::Unary {
+        operator: pointer_operator,
+        operand: pointer,
+    } = &target.kind
+        && pointer_operator == "*"
+        && native_expression_is_f32(target, locals)
+    {
+        if !emit_native_expression(pointer, 0, &[4, 5, 6, 7], locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str("    MOV R7, R0\n    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+        let wide_pointer = emit_native_save_r1(locals, assembly);
+        if operator != "=" {
+            if !matches!(operator.as_str(), "+=" | "-=" | "*=" | "/=") {
+                return false;
+            }
+            if wide_pointer {
+                assembly.push_str(
+                    "    MOVSP R7\n    LDP R6, R7\n    LDW R4, R6\n\
+                     LDI R7, 2\n    ADD R6, R7\n    LDW R5, R6\n",
+                );
+            } else {
+                assembly
+                    .push_str("    LDW R4, R7\n    LDI R6, 2\n    ADD R7, R6\n    LDW R5, R7\n");
+            }
+            if !emit_native_f32_compound_value(operator, value, locals, label_counter, assembly) {
+                return false;
+            }
+        } else if !emit_native_f32_expression(value, locals, label_counter, assembly) {
+            return false;
+        }
+        emit_native_restore_r1(wide_pointer, assembly);
+        assembly.push_str(
+            "    MOVSP R7\n    LDP R6, R7\n    ADJSP 4\n\
+             STW R6, R4\n    LDI R7, 2\n    ADD R6, R7\n    STW R6, R5\n",
+        );
+        return true;
+    }
+    if operator == "="
+        && emit_native_record_array_assignment(
+            target,
+            value,
+            temporary_registers,
+            locals,
+            label_counter,
+            assembly,
+        )
+        .is_some()
+    {
+        return true;
+    }
+    if let ExpressionKind::Unary {
+        operator: dereference_operator,
+        operand,
+    } = &target.kind
+        && dereference_operator == "*"
+    {
+        let ExpressionKind::Atom(name) = &operand.kind else {
+            return false;
+        };
+        let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
+            return false;
+        };
+        if !emit_native_expression(
+            value,
+            value_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return false;
+        }
+        assembly.push_str("    LDI R0, 0\n");
+        let Some((element_size, element_signed)) =
+            emit_native_array_address(name, 0, locals, assembly)
+        else {
+            return false;
+        };
+        if element_size > 2 {
+            return false;
+        }
+        let (load, store) = if element_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        if operator != "=" {
+            let Some(binary_operator) = native_compound_operator(operator, !element_signed) else {
+                return false;
+            };
+            assembly.push_str(&format!("    {load} R0, R7\n"));
+            if element_signed {
+                emit_native_byte_normalization(0, true, assembly);
+            }
+            assembly.push_str(&format!("    {binary_operator} R0, R{value_register}\n"));
+            if element_size == 1 {
+                emit_native_byte_normalization(0, element_signed, assembly);
+            }
+            assembly.push_str(&format!("    {store} R7, R0\n"));
+        } else {
+            assembly.push_str(&format!("    {store} R7, R{value_register}\n"));
+        }
+        return true;
+    }
+    if let ExpressionKind::Member {
+        expression: base,
+        operator: member_operator,
+        name,
+    } = &target.kind
+    {
+        if member_operator != "." && member_operator != "->" {
+            return false;
+        }
+        let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
+            return false;
+        };
+        if !emit_native_expression(
+            value,
+            value_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return false;
+        }
+        let Some(field) = emit_native_member_address(
+            base,
+            member_operator,
+            name,
+            0,
+            &[5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+        ) else {
+            return false;
+        };
+        if field.size > 2 || field.record_layout.is_some() || !field.dimensions.is_empty() {
+            return false;
+        }
+        let (load, store) = if field.size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        if operator != "=" {
+            let Some(binary_operator) = native_compound_operator(operator, !field.signed) else {
+                return false;
+            };
+            assembly.push_str(&format!("    {load} R0, R7\n"));
+            if field.size == 1 {
+                emit_native_byte_normalization(0, field.signed, assembly);
+            }
+            assembly.push_str(&format!("    {binary_operator} R0, R{value_register}\n"));
+            assembly.push_str(&format!("    {store} R7, R0\n"));
+        } else {
+            assembly.push_str(&format!("    {store} R7, R{value_register}\n"));
+        }
+        return true;
+    }
+    if let ExpressionKind::Index {
+        expression: base,
+        index,
+    } = &target.kind
+    {
+        if native_expression_is_f32(target, locals) {
+            let wide_pointer = emit_native_save_r1(locals, assembly);
+            let Some((element_size, _)) = emit_native_indexed_element_address(
+                target,
+                base,
+                index,
+                0,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+            ) else {
+                return false;
+            };
+            if element_size != 4 {
+                return false;
+            }
+            assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+            if operator != "=" {
+                let instruction = match operator.as_str() {
+                    "+=" => "F32ADD",
+                    "-=" => "F32SUB",
+                    "*=" => "F32MUL",
+                    "/=" => "F32DIV",
+                    _ => return false,
+                };
+                assembly.push_str("    MOVSP R7\n    LDP R6, R7\n");
+                assembly
+                    .push_str("    LDW R4, R6\n    LDI R7, 2\n    ADD R6, R7\n    LDW R5, R6\n");
+                let compound_operator = match instruction {
+                    "F32ADD" => "+=",
+                    "F32SUB" => "-=",
+                    "F32MUL" => "*=",
+                    "F32DIV" => "/=",
+                    _ => return false,
+                };
+                if !emit_native_f32_compound_value(
+                    compound_operator,
+                    value,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return false;
+                }
+            } else if !emit_native_f32_expression(value, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOVSP R7\n    LDP R6, R7\n    ADJSP 4\n");
+            emit_native_restore_r1(wide_pointer, assembly);
+            assembly.push_str("    STW R6, R4\n    LDI R7, 2\n    ADD R6, R7\n    STW R6, R5\n");
+            return true;
+        }
+        let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
+            return false;
+        };
+        if !emit_native_expression(
+            value,
+            value_register,
+            remaining_registers,
+            locals,
+            label_counter,
+            assembly,
+        ) {
+            return false;
+        }
+        let Some((element_size, element_signed)) = emit_native_indexed_element_address(
+            target,
+            base,
+            index,
+            0,
+            &[5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+        ) else {
+            return false;
+        };
+        if element_size > 2 {
+            return false;
+        }
+        let (load, store) = if element_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        if operator != "=" {
+            let Some(binary_operator) = native_compound_operator(operator, !element_signed) else {
+                return false;
+            };
+            assembly.push_str(&format!("    {load} R0, R7\n"));
+            if element_signed {
+                assembly.push_str("    SHL R0, 8\n    ASR R0, 8\n");
+            }
+            assembly.push_str(&format!("    {binary_operator} R0, R{value_register}\n"));
+            assembly.push_str(&format!("    {store} R7, R0\n"));
+        } else {
+            assembly.push_str(&format!("    {store} R7, R{value_register}\n"));
+        }
+        return true;
+    }
+    if let ExpressionKind::Atom(name) = &target.kind
+        && matches!(
+            locals.get(name),
+            Some(NativeLocation::FloatingPointScalar { size: 4 })
+                | Some(NativeLocation::StackFloatingPointScalar { size: 4, .. })
+        )
+    {
+        let wide_pointer = emit_native_save_r1(locals, assembly);
+        if operator == "=" {
+            if !emit_native_f32_expression(value, locals, label_counter, assembly) {
+                return false;
+            }
+        } else {
+            let Some(binary_operator) = operator.strip_suffix('=') else {
+                return false;
+            };
+            let compound = Expression {
+                kind: ExpressionKind::Binary {
+                    operator: binary_operator.to_owned(),
+                    left: target.clone(),
+                    right: value.clone(),
+                },
+                line: expression.line,
+                filename: expression.filename.clone(),
+            };
+            if native_expression_floating_size(&compound, locals) == Some(8) {
+                if !emit_native_f32_expression(&compound, locals, label_counter, assembly) {
+                    return false;
+                }
+                let stored = emit_native_f32_scalar_store(name, locals, assembly);
+                if stored {
+                    emit_native_restore_r1(wide_pointer, assembly);
+                }
+                return stored;
+            }
+            let instruction = match operator.as_str() {
+                "+=" => "F32ADD",
+                "-=" => "F32SUB",
+                "*=" => "F32MUL",
+                "/=" => "F32DIV",
+                _ => return false,
+            };
+            if !emit_native_f32_expression(target, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    PUSH R4\n    PUSH R5\n");
+            if !emit_native_f32_expression(value, locals, label_counter, assembly) {
+                return false;
+            }
+            assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n    POP R5\n    POP R4\n");
+            assembly.push_str(&format!("    {instruction} R4, R0\n"));
+        }
+        let stored = emit_native_f32_scalar_store(name, locals, assembly);
+        if stored {
+            emit_native_restore_r1(wide_pointer, assembly);
+        }
+        return stored;
+    }
+    let ExpressionKind::Atom(name) = &target.kind else {
+        return false;
+    };
+    let Some(location) = locals.get(name) else {
+        return false;
+    };
+    let (destination, is_global, byte_signed) = match location {
+        NativeLocation::Register { register, .. } => (*register, false, None),
+        NativeLocation::ByteRegister { register, signed } => (*register, false, Some(*signed)),
+        NativeLocation::Constant(_) => return false,
+        NativeLocation::FloatingPointScalar { .. } => return false,
+        NativeLocation::StackFloatingPointScalar { .. } => return false,
+        NativeLocation::StackWideScalar { .. } | NativeLocation::GlobalWideScalar { .. } => {
+            return false;
+        }
+        NativeLocation::GlobalScalar { .. } => (0, true, None),
+        NativeLocation::GlobalByteScalar { signed } => (0, false, Some(*signed)),
+        NativeLocation::GlobalPointer { .. } => (0, true, None),
+        NativeLocation::StackScalar { .. } => (0, false, None),
+        NativeLocation::ByteStackScalar { signed, .. } => (0, false, Some(*signed)),
+        NativeLocation::PointerRegister { register, .. } => (*register, false, None),
+        NativeLocation::PointerStack { .. } => (0, false, None),
+        NativeLocation::GlobalArray { .. }
+        | NativeLocation::GlobalRecord { .. }
+        | NativeLocation::StackRecord { .. }
+        | NativeLocation::FunctionParameters { .. }
+        | NativeLocation::StackArray { .. } => return false,
+    };
+    let binary_operator = if operator == "=" {
+        None
+    } else {
+        let Some(instruction) =
+            native_compound_operator(operator, native_expression_is_unsigned(target, locals))
+        else {
+            return false;
+        };
+        Some(instruction)
+    };
+    let Some((&value_register, remaining_registers)) = temporary_registers.split_first() else {
+        return false;
+    };
+    if !emit_native_expression(
+        value,
+        value_register,
+        remaining_registers,
+        locals,
+        label_counter,
+        assembly,
+    ) {
+        return false;
+    }
+    if let NativeLocation::GlobalByteScalar { signed } = location {
+        if let Some(binary_operator) = binary_operator {
+            assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n    LD R0, R7\n"));
+            emit_native_byte_normalization(0, *signed, assembly);
+            assembly.push_str(&format!("    {binary_operator} R0, R{value_register}\n"));
+        } else {
+            assembly.push_str(&format!("    MOV R0, R{value_register}\n"));
+        }
+        emit_native_byte_normalization(0, *signed, assembly);
+        assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n    ST R7, R0\n"));
+        return true;
+    }
+    if is_global {
+        if matches!(location, NativeLocation::GlobalPointer { .. }) {
+            if binary_operator.is_some() {
+                return false;
+            }
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    STP R{value_register}, R7\n"
+            ));
+            return true;
+        }
+        if let Some(binary_operator) = binary_operator {
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    LDW R0, R7\n\
+                 {binary_operator} R0, R{value_register}\n\
+                 LDI30 R7, __c_global_{name}\n    STW R7, R0\n"
+            ));
+        } else {
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    STW R7, R{value_register}\n"
+            ));
+        }
+        return true;
+    }
+    if let NativeLocation::ByteRegister { .. } = location {
+        if let Some(binary_operator) = binary_operator {
+            emit_native_byte_normalization(destination, byte_signed.unwrap_or(false), assembly);
+            assembly.push_str(&format!(
+                "    {binary_operator} R{destination}, R{value_register}\n"
+            ));
+        } else if destination != value_register {
+            assembly.push_str(&format!("    MOV R{destination}, R{value_register}\n"));
+        }
+        emit_native_byte_normalization(destination, byte_signed.unwrap_or(false), assembly);
+        return true;
+    }
+    if let NativeLocation::ByteStackScalar { offset, signed } = location {
+        if let Some(binary_operator) = binary_operator {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    LD R0, R7\n");
+            emit_native_byte_normalization(0, *signed, assembly);
+            assembly.push_str(&format!("    {binary_operator} R0, R{value_register}\n"));
+            emit_native_byte_normalization(0, *signed, assembly);
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    ST R7, R0\n");
+        } else {
+            emit_native_byte_normalization(value_register, *signed, assembly);
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str(&format!("    ST R7, R{value_register}\n"));
+        }
+        return true;
+    }
+    if let NativeLocation::PointerStack { offset, .. } = location {
+        if binary_operator.is_some() {
+            return false;
+        }
+        assembly.push_str("    MOV R7, R3\n");
+        emit_native_stack_offset(7, *offset, assembly);
+        assembly.push_str(&format!("    STP R{value_register}, R7\n"));
+        return true;
+    }
+    match binary_operator {
+        Some(binary_operator) => assembly.push_str(&format!(
+            "    {binary_operator} R{destination}, R{value_register}\n"
+        )),
+        None if destination != value_register => {
+            assembly.push_str(&format!("    MOV R{destination}, R{value_register}\n"))
+        }
+        None => {}
+    }
+    if let NativeLocation::StackScalar { offset, .. } = location {
+        if let Some(binary_operator) = binary_operator {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str(&format!(
+                "    LDW R0, R7\n    {binary_operator} R0, R{value_register}\n"
+            ));
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    STW R7, R0\n");
+        } else {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str(&format!("    STW R7, R{value_register}\n"));
+        }
+        return true;
+    }
+    true
+}
+
+fn emit_native_f64_assignment_store(
+    operator: &str,
+    target: &Expression,
+    value: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let wide_pointer = emit_native_save_r1(locals, assembly);
+    let scalar_name = match &target.kind {
+        ExpressionKind::Atom(name)
+            if matches!(
+                locals.get(name),
+                Some(NativeLocation::FloatingPointScalar { size: 8 })
+                    | Some(NativeLocation::StackFloatingPointScalar { size: 8, .. })
+            ) =>
+        {
+            Some(name.as_str())
+        }
+        _ => None,
+    };
+    let memory_target = scalar_name.is_none();
+    if memory_target {
+        match &target.kind {
+            ExpressionKind::Unary { operator, operand } if operator == "*" => {
+                if native_expression_pointer_element_size(operand, locals) != Some(8)
+                    || !emit_native_expression(
+                        operand,
+                        0,
+                        &[4, 5, 6, 7],
+                        locals,
+                        label_counter,
+                        assembly,
+                    )
+                {
+                    return false;
+                }
+            }
+            ExpressionKind::Index {
+                expression: base,
+                index,
+            } => {
+                if emit_native_indexed_element_address(
+                    target,
+                    base,
+                    index,
+                    0,
+                    &[4, 5, 6],
+                    locals,
+                    label_counter,
+                    assembly,
+                )
+                .is_none_or(|(size, _)| size != 8)
+                {
+                    return false;
+                }
+                assembly.push_str("    MOV R0, R7\n");
+            }
+            ExpressionKind::Member {
+                expression: base,
+                operator: member_operator,
+                name,
+            } => {
+                let Some(field) = emit_native_member_address(
+                    base,
+                    member_operator,
+                    name,
+                    0,
+                    &[4, 5, 6],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) else {
+                    return false;
+                };
+                if field.floating_size != 8
+                    || field.bit_field.is_some()
+                    || field.record_layout.is_some()
+                    || !field.dimensions.is_empty()
+                {
+                    return false;
+                }
+                assembly.push_str("    MOV R0, R7\n");
+            }
+            _ => return false,
+        }
+        assembly.push_str("    ADJSP -4\n    MOVSP R6\n    STP R0, R6\n");
+    }
+    if operator != "=" {
+        let frame_pointer = native_uses_stack_frame(locals);
+        if frame_pointer {
+            emit_native_save_frame_pointer(assembly);
+        }
+        let instruction = match operator {
+            "+=" => "F64ADD",
+            "-=" => "F64SUB",
+            "*=" => "F64MUL",
+            "/=" => "F64DIV",
+            _ => return false,
+        };
+        if scalar_name.is_some() {
+            if !emit_native_f64_expression(target, locals, label_counter, assembly) {
+                return false;
+            }
+        } else {
+            assembly.push_str("    MOVSP R6\n");
+            if frame_pointer {
+                assembly.push_str("    LDI R7, 4\n    ADD R6, R7\n");
+            }
+            assembly.push_str(
+                "    LDP R0, R6\n    LDW R4, R0\n    INC R0\n    INC R0\n\
+                 LDW R5, R0\n    INC R0\n    INC R0\n    LDW R6, R0\n\
+                 INC R0\n    INC R0\n    LDW R7, R0\n",
+            );
+        }
+        assembly.push_str("    PUSH R4\n    PUSH R5\n    PUSH R6\n    PUSH R7\n");
+        if !emit_native_f64_operand(value, locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str(
+            "    MOV R0, R4\n    MOV R1, R5\n    MOV R2, R6\n    MOV R3, R7\n\
+             POP R7\n    POP R6\n    POP R5\n    POP R4\n",
+        );
+        assembly.push_str(&format!("    {instruction} R4, R0\n"));
+        if frame_pointer {
+            emit_native_restore_frame_pointer(0, assembly);
+        }
+    } else if !emit_native_f64_operand(value, locals, label_counter, assembly) {
+        return false;
+    }
+    let stored = if let Some(name) = scalar_name {
+        emit_native_f64_scalar_store(name, locals, assembly)
+    } else {
+        assembly.push_str(
+            "    MOVSP R0\n    LDP R0, R0\n    ADJSP 4\n\
+             STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+             INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n",
+        );
+        true
+    };
+    if stored {
+        emit_native_restore_r1(wide_pointer, assembly);
+    }
+    stored
+}
+
+fn emit_native_record_initializer(
+    target: &Expression,
+    layout: &NativeRecordLayout,
+    initializer: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<()> {
+    let ExpressionKind::InitializerList(values) = &initializer.kind else {
+        return None;
+    };
+    if values.len() > layout.field_order.len() || (layout.is_union && values.len() > 1) {
+        return None;
+    }
+    for (name, value) in layout.field_order.iter().zip(values) {
+        let field = layout.fields.get(name)?;
+        let member = Expression {
+            kind: ExpressionKind::Member {
+                expression: Box::new(target.clone()),
+                operator: ".".to_owned(),
+                name: name.clone(),
+            },
+            line: value.line,
+            filename: value.filename.clone(),
+        };
+        if !field.dimensions.is_empty() {
+            return None;
+        }
+        if let Some(nested) = &field.record_layout {
+            emit_native_record_initializer(
+                &member,
+                nested,
+                value,
+                locals,
+                label_counter,
+                assembly,
+            )?;
+        } else {
+            let assignment = Expression {
+                kind: ExpressionKind::Assignment {
+                    operator: "=".to_owned(),
+                    target: Box::new(member),
+                    value: Box::new(scalar_initializer(value)?.clone()),
+                },
+                line: value.line,
+                filename: value.filename.clone(),
+            };
+            if !emit_native_assignment_with_const(
+                &assignment,
+                None,
+                &[4, 5, 6],
+                locals,
+                label_counter,
+                assembly,
+                true,
+            ) {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+fn emit_native_record_array_initializer(
+    target: &Expression,
+    layout: &NativeRecordLayout,
+    dimensions: &[usize],
+    initializer: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> Option<()> {
+    if dimensions.is_empty() {
+        return emit_native_record_initializer(
+            target,
+            layout,
+            initializer,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    let ExpressionKind::InitializerList(values) = &initializer.kind else {
+        return None;
+    };
+    if values.len() > dimensions[0] {
+        return None;
+    }
+    for (index, value) in values.iter().enumerate() {
+        let element = Expression {
+            kind: ExpressionKind::Index {
+                expression: Box::new(target.clone()),
+                index: Box::new(Expression {
+                    kind: ExpressionKind::Atom(index.to_string()),
+                    line: value.line,
+                    filename: value.filename.clone(),
+                }),
+            },
+            line: value.line,
+            filename: value.filename.clone(),
+        };
+        emit_native_record_array_initializer(
+            &element,
+            layout,
+            &dimensions[1..],
+            value,
+            locals,
+            label_counter,
+            assembly,
+        )?;
+    }
+    Some(())
+}
+
+fn emit_native_statement(
+    statement: &Statement,
+    locals: &HashMap<String, NativeLocation>,
+    function_name: &str,
+    returns_void: bool,
+    label_counter: &mut usize,
+    loop_labels: &mut Vec<(String, String)>,
+    assembly: &mut String,
+) -> Option<bool> {
+    match &statement.kind {
+        StatementKind::Declaration(declarations) => {
+            for declaration in declarations {
+                if let Some(NativeLocation::StackRecord {
+                    offset,
+                    layout,
+                    dimensions,
+                }) = locals.get(&declaration.name)
+                {
+                    if let Some(initializer) = &declaration.initializer {
+                        let count = declaration.array_length.unwrap_or(1);
+                        emit_native_floating_stack_store(
+                            &vec![0; layout.size.checked_mul(count)?],
+                            *offset,
+                            assembly,
+                        )?;
+                        let target = Expression {
+                            kind: ExpressionKind::Atom(declaration.name.clone()),
+                            line: statement.line,
+                            filename: statement.filename.clone(),
+                        };
+                        if dimensions.is_empty() {
+                            emit_native_record_initializer(
+                                &target,
+                                layout,
+                                initializer,
+                                locals,
+                                label_counter,
+                                assembly,
+                            )?;
+                        } else {
+                            emit_native_record_array_initializer(
+                                &target,
+                                layout,
+                                dimensions,
+                                initializer,
+                                locals,
+                                label_counter,
+                                assembly,
+                            )?;
+                        }
+                    }
+                    continue;
+                }
+                if let Some(NativeLocation::StackArray {
+                    offset,
+                    length,
+                    element_size,
+                    ..
+                }) = locals.get(&declaration.name)
+                {
+                    if let Some(initializer) = &declaration.initializer {
+                        if *element_size > 2 {
+                            if *length > 512
+                                || !matches!(initializer.kind, ExpressionKind::InitializerList(_))
+                            {
+                                return None;
+                            }
+                            let values = flatten_initializer_values(initializer)?;
+                            if values.len() > *length {
+                                return None;
+                            }
+                            let element_type = native_unqualified_type(&declaration.c_type);
+                            for index in 0..*length {
+                                let element_offset =
+                                    offset.checked_add(index.checked_mul(*element_size)?)?;
+                                let Some(value) = values.get(index) else {
+                                    emit_native_floating_stack_store(
+                                        &vec![0; *element_size],
+                                        element_offset,
+                                        assembly,
+                                    )?;
+                                    continue;
+                                };
+                                if let Some(bytes) =
+                                    native_floating_initializer(value, element_type)
+                                {
+                                    if bytes.len() != *element_size {
+                                        return None;
+                                    }
+                                    emit_native_floating_stack_store(
+                                        &bytes,
+                                        element_offset,
+                                        assembly,
+                                    )?;
+                                } else if *element_size == 4
+                                    && emit_native_f32_expression(
+                                        value,
+                                        locals,
+                                        label_counter,
+                                        assembly,
+                                    )
+                                {
+                                    emit_native_f32_stack_store(element_offset, assembly);
+                                } else if *element_size == 8 {
+                                    assembly.push_str(&format!("    LDI R0, {index}\n"));
+                                    emit_native_array_address(
+                                        &declaration.name,
+                                        0,
+                                        locals,
+                                        assembly,
+                                    )?;
+                                    assembly
+                                        .push_str("    ADJSP -4\n    MOVSP R6\n    STP R7, R6\n");
+                                    if !emit_native_f64_expression(
+                                        value,
+                                        locals,
+                                        label_counter,
+                                        assembly,
+                                    ) {
+                                        return None;
+                                    }
+                                    assembly.push_str(
+                                        "    MOVSP R0\n    LDP R0, R0\n    ADJSP 4\n\
+                                         STW R0, R4\n    INC R0\n    INC R0\n    STW R0, R5\n\
+                                         INC R0\n    INC R0\n    STW R0, R6\n    INC R0\n    INC R0\n    STW R0, R7\n",
+                                    );
+                                } else {
+                                    return None;
+                                }
+                            }
+                            continue;
+                        }
+                        if let ExpressionKind::Atom(string_token) = &initializer.kind
+                            && let Some(bytes) = decode_string_token(string_token)
+                        {
+                            if declaration.array_dimensions.len() != 1
+                                || *element_size != 1
+                                || bytes.len() > *length
+                                || *length > 512
+                            {
+                                return None;
+                            }
+                            for index in 0..*length {
+                                assembly.push_str(&format!(
+                                    "    LDI R4, {}\n",
+                                    bytes.get(index).copied().unwrap_or(0)
+                                ));
+                                assembly.push_str(&format!("    LDI R0, {index}\n"));
+                                emit_native_array_address(&declaration.name, 0, locals, assembly)?;
+                                assembly.push_str("    ST R7, R4\n");
+                            }
+                        } else {
+                            if !matches!(&initializer.kind, ExpressionKind::InitializerList(_)) {
+                                return None;
+                            }
+                            let values = flatten_initializer_values(initializer)?;
+                            if values.len() > *length || *length > 512 {
+                                return None;
+                            }
+                            for index in 0..*length {
+                                if let Some(value) = values.get(index) {
+                                    if !emit_native_expression(
+                                        value,
+                                        4,
+                                        &[5, 6, 7],
+                                        locals,
+                                        label_counter,
+                                        assembly,
+                                    ) {
+                                        return None;
+                                    }
+                                } else {
+                                    assembly.push_str("    LDI R4, 0\n");
+                                }
+                                assembly.push_str(&format!("    LDI R0, {index}\n"));
+                                emit_native_array_address(&declaration.name, 0, locals, assembly)?;
+                                assembly.push_str(&format!(
+                                    "    {} R7, R4\n",
+                                    if *element_size == 1 { "ST" } else { "STW" }
+                                ));
+                            }
+                        }
+                    }
+                } else if let Some(initializer) = &declaration.initializer {
+                    let initializer = scalar_initializer(initializer)?;
+                    match locals.get(&declaration.name)? {
+                        NativeLocation::Register {
+                            register: destination,
+                            ..
+                        } => {
+                            if !emit_native_expression(
+                                initializer,
+                                *destination,
+                                &[4, 5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                        }
+                        NativeLocation::PointerRegister { register, .. } => {
+                            if !emit_native_expression(
+                                initializer,
+                                *register,
+                                &[4, 5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                        }
+                        NativeLocation::ByteRegister { register, signed } => {
+                            if !emit_native_expression(
+                                initializer,
+                                *register,
+                                &[4, 5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                            emit_native_byte_normalization(*register, *signed, assembly);
+                        }
+                        NativeLocation::StackScalar { offset, .. } => {
+                            if !emit_native_expression(
+                                initializer,
+                                4,
+                                &[5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                            assembly.push_str("    MOV R7, R3\n");
+                            emit_native_stack_offset(7, *offset, assembly);
+                            assembly.push_str("    STW R7, R4\n");
+                        }
+                        NativeLocation::StackWideScalar { offset, unsigned } => {
+                            if !emit_native_wide_conversion(
+                                initializer,
+                                *unsigned,
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                            assembly.push_str("    MOV R7, R3\n");
+                            emit_native_stack_offset(7, *offset, assembly);
+                            assembly.push_str(
+                                "    STW R7, R4\n    INC R7\n    INC R7\n    STW R7, R5\n",
+                            );
+                        }
+                        NativeLocation::StackFloatingPointScalar { offset, size } => {
+                            let c_type = native_unqualified_type(&declaration.c_type);
+                            if let Some(bytes) = native_floating_initializer(initializer, c_type) {
+                                if bytes.len() != *size {
+                                    return None;
+                                }
+                                emit_native_floating_stack_store(&bytes, *offset, assembly)?;
+                            } else if *size == 4
+                                && emit_native_f32_expression(
+                                    initializer,
+                                    locals,
+                                    label_counter,
+                                    assembly,
+                                )
+                            {
+                                emit_native_f32_stack_store(*offset, assembly);
+                            } else if *size == 8
+                                && emit_native_f64_operand(
+                                    initializer,
+                                    locals,
+                                    label_counter,
+                                    assembly,
+                                )
+                            {
+                                emit_native_f64_stack_store(*offset, assembly);
+                            } else {
+                                return None;
+                            }
+                        }
+                        NativeLocation::FloatingPointScalar { .. } => return None,
+                        NativeLocation::ByteStackScalar { offset, signed } => {
+                            if !emit_native_expression(
+                                initializer,
+                                4,
+                                &[5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                            emit_native_byte_normalization(4, *signed, assembly);
+                            assembly.push_str("    MOV R7, R3\n");
+                            emit_native_stack_offset(7, *offset, assembly);
+                            assembly.push_str("    ST R7, R4\n");
+                        }
+                        NativeLocation::PointerStack { offset, .. } => {
+                            if !emit_native_expression(
+                                initializer,
+                                4,
+                                &[5, 6, 7],
+                                locals,
+                                label_counter,
+                                assembly,
+                            ) {
+                                return None;
+                            }
+                            assembly.push_str("    MOV R7, R3\n");
+                            emit_native_stack_offset(7, *offset, assembly);
+                            assembly.push_str("    STP R4, R7\n");
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            Some(false)
+        }
+        StatementKind::Expression(None) => Some(false),
+        StatementKind::Expression(Some(expression)) => {
+            if emit_native_discarded_expression(
+                expression,
+                0,
+                &[4, 5, 6, 7],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        StatementKind::Return(Some(expression)) => {
+            if returns_void {
+                return None;
+            }
+            let (return_size, wide_return, returns_pointer, pointer_return_target_is_const) =
+                match locals.get(function_name) {
+                    Some(NativeLocation::FunctionParameters {
+                        float_return_size,
+                        wide_return_unsigned,
+                        returns_pointer,
+                        pointer_return_target_is_const,
+                        ..
+                    }) => (
+                        *float_return_size,
+                        *wide_return_unsigned,
+                        *returns_pointer,
+                        *pointer_return_target_is_const,
+                    ),
+                    _ => (0, None, false, false),
+                };
+            if returns_pointer
+                && !pointer_return_target_is_const
+                && native_expression_pointer_target_is_const(expression, locals)
+            {
+                eprintln!(
+                    "return discards pointer target const qualification at line {}",
+                    expression.line
+                );
+                return None;
+            }
+            if let Some(unsigned) = wide_return {
+                if !emit_native_wide_conversion(
+                    expression,
+                    unsigned,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return None;
+                }
+                assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n");
+            } else if return_size != 0 {
+                if !emit_native_floating_conversion(
+                    expression,
+                    return_size,
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    return None;
+                }
+                assembly.push_str("    MOV R0, R4\n    MOV R1, R5\n");
+                if return_size == 8 {
+                    assembly.push_str("    MOV R2, R6\n    MOV R3, R7\n");
+                }
+            } else if !emit_native_expression(
+                expression,
+                0,
+                &[4, 5, 6, 7],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            assembly.push_str(&format!("    JMPX __c_return_{function_name}\n"));
+            Some(true)
+        }
+        StatementKind::Return(None) if returns_void => {
+            assembly.push_str(&format!("    JMPX __c_return_{function_name}\n"));
+            Some(true)
+        }
+        StatementKind::Break => {
+            let (break_label, _) = loop_labels.last()?;
+            assembly.push_str(&format!("    JMPX {break_label}\n"));
+            Some(false)
+        }
+        StatementKind::Continue => {
+            let (_, continue_label) = loop_labels.last()?;
+            if continue_label.is_empty() {
+                return None;
+            }
+            assembly.push_str(&format!("    JMPX {continue_label}\n"));
+            Some(false)
+        }
+        StatementKind::Compound(statements) => {
+            let mut branch_returns = false;
+            for statement in statements {
+                let Some(statement_returns) = emit_native_statement(
+                    statement,
+                    locals,
+                    function_name,
+                    returns_void,
+                    label_counter,
+                    loop_labels,
+                    assembly,
+                ) else {
+                    eprintln!(
+                        "unsupported {} at line {} inside {}",
+                        native_statement_kind(&statement.kind),
+                        statement.line,
+                        function_name
+                    );
+                    return None;
+                };
+                if !branch_returns {
+                    branch_returns = statement_returns;
+                }
+            }
+            Some(branch_returns)
+        }
+        StatementKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            if !emit_native_condition(condition, locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str("    LDI R7, 0\n    CMP R0, R7\n");
+            let else_returns = if let Some(else_branch) = else_branch {
+                assembly.push_str(&format!("    BNZX __c_if_{label}_then\n"));
+                let returns = emit_native_statement(
+                    else_branch,
+                    locals,
+                    function_name,
+                    returns_void,
+                    label_counter,
+                    loop_labels,
+                    assembly,
+                )?;
+                assembly.push_str(&format!("    JMPX __c_if_{label}_end\n"));
+                returns
+            } else {
+                assembly.push_str(&format!("    BZX __c_if_{label}_end\n"));
+                false
+            };
+            assembly.push_str(&format!("__c_if_{label}_then:\n"));
+            let then_returns = emit_native_statement(
+                then_branch,
+                locals,
+                function_name,
+                returns_void,
+                label_counter,
+                loop_labels,
+                assembly,
+            )?;
+            assembly.push_str(&format!("__c_if_{label}_end:\n"));
+            Some(else_branch.is_some() && else_returns && then_returns)
+        }
+        StatementKind::While { condition, body } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            assembly.push_str(&format!("__c_while_{label}_begin:\n"));
+            if !emit_native_condition(condition, locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_while_{label}_end\n"
+            ));
+            loop_labels.push((
+                format!("__c_while_{label}_end"),
+                format!("__c_while_{label}_begin"),
+            ));
+            emit_native_statement(
+                body,
+                locals,
+                function_name,
+                returns_void,
+                label_counter,
+                loop_labels,
+                assembly,
+            )?;
+            loop_labels.pop();
+            assembly.push_str(&format!(
+                "    JMPX __c_while_{label}_begin\n__c_while_{label}_end:\n"
+            ));
+            Some(false)
+        }
+        StatementKind::DoWhile { body, condition } => {
+            let label = *label_counter;
+            *label_counter += 1;
+            assembly.push_str(&format!("__c_do_{label}_begin:\n"));
+            loop_labels.push((
+                format!("__c_do_{label}_end"),
+                format!("__c_do_{label}_condition"),
+            ));
+            emit_native_statement(
+                body,
+                locals,
+                function_name,
+                returns_void,
+                label_counter,
+                loop_labels,
+                assembly,
+            )?;
+            loop_labels.pop();
+            assembly.push_str(&format!("__c_do_{label}_condition:\n"));
+            if !emit_native_condition(condition, locals, label_counter, assembly) {
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    LDI R7, 0\n    CMP R0, R7\n    BNZX __c_do_{label}_begin\n"
+            ));
+            assembly.push_str(&format!("__c_do_{label}_end:\n"));
+            Some(false)
+        }
+        StatementKind::For {
+            initializer,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(initializer) = initializer
+                && emit_native_statement(
+                    initializer,
+                    locals,
+                    function_name,
+                    returns_void,
+                    label_counter,
+                    loop_labels,
+                    assembly,
+                )
+                .is_none()
+            {
+                eprintln!(
+                    "unsupported for-loop initializer at line {}",
+                    statement.line
+                );
+                return None;
+            }
+            let label = *label_counter;
+            *label_counter += 1;
+            assembly.push_str(&format!("__c_for_{label}_begin:\n"));
+            if let Some(condition) = condition {
+                if !emit_native_expression(
+                    condition,
+                    0,
+                    &[4, 5, 6, 7],
+                    locals,
+                    label_counter,
+                    assembly,
+                ) {
+                    eprintln!("unsupported for-loop condition at line {}", statement.line);
+                    return None;
+                }
+                assembly.push_str(&format!(
+                    "    LDI R7, 0\n    CMP R0, R7\n    BZX __c_for_{label}_end\n"
+                ));
+            }
+            loop_labels.push((
+                format!("__c_for_{label}_end"),
+                format!("__c_for_{label}_update"),
+            ));
+            if emit_native_statement(
+                body,
+                locals,
+                function_name,
+                returns_void,
+                label_counter,
+                loop_labels,
+                assembly,
+            )
+            .is_none()
+            {
+                eprintln!("unsupported for-loop body at line {}", statement.line);
+                return None;
+            }
+            loop_labels.pop();
+            assembly.push_str(&format!("__c_for_{label}_update:\n"));
+            if let Some(update) = update
+                && !emit_native_assignment(
+                    update,
+                    None,
+                    &[4, 5, 6, 7],
+                    locals,
+                    label_counter,
+                    assembly,
+                )
+                && !emit_native_update(update, locals, label_counter, assembly)
+            {
+                eprintln!("unsupported for-loop update at line {}", statement.line);
+                return None;
+            }
+            assembly.push_str(&format!(
+                "    JMPX __c_for_{label}_begin\n__c_for_{label}_end:\n"
+            ));
+            Some(false)
+        }
+        StatementKind::Switch { expression, cases } => {
+            if !emit_native_expression(
+                expression,
+                0,
+                &[4, 5, 6, 7],
+                locals,
+                label_counter,
+                assembly,
+            ) {
+                return None;
+            }
+            let mut case_labels = Vec::with_capacity(cases.len());
+            let mut default_label = None;
+            let mut case_values = HashSet::new();
+            let constant_names: HashMap<String, i64> = locals
+                .iter()
+                .filter_map(|(name, location)| match location {
+                    NativeLocation::Constant(value) => Some((name.clone(), *value)),
+                    _ => None,
+                })
+                .collect();
+            for (value, _) in cases {
+                let dispatch_label = format!("__c_switch_{}", *label_counter);
+                *label_counter += 1;
+                let body_label = format!("__c_switch_body_{}", *label_counter);
+                *label_counter += 1;
+                if let Some(value) = value {
+                    let Ok(value) = evaluate_integer_constant_with_names(value, &constant_names)
+                    else {
+                        return None;
+                    };
+                    let value = value as u16;
+                    if !case_values.insert(value) {
+                        return None;
+                    }
+                    case_labels.push((Some(value), dispatch_label, body_label));
+                } else {
+                    if default_label.replace(dispatch_label.clone()).is_some() {
+                        return None;
+                    }
+                    case_labels.push((None, dispatch_label, body_label));
+                }
+            }
+            let end_label = format!("__c_switch_{}_end", *label_counter);
+            *label_counter += 1;
+            assembly.push_str("    PUSH R0\n");
+            for (value, dispatch_label, _) in &case_labels {
+                if let Some(value) = value {
+                    assembly.push_str(&format!(
+                        "    LDWS R6, 0\n    LDI R7, 0x{value:04X}\n\
+                         CMP R6, R7\n    BZX {dispatch_label}\n"
+                    ));
+                }
+            }
+            let fallback = default_label.as_deref().unwrap_or(&end_label);
+            if default_label.is_none() {
+                assembly.push_str("    POP R0\n");
+            }
+            assembly.push_str(&format!("    JMPX {fallback}\n"));
+            for (_, dispatch_label, body_label) in &case_labels {
+                assembly.push_str(&format!(
+                    "{dispatch_label}:\n    POP R0\n    JMPX {body_label}\n"
+                ));
+            }
+            let continue_label = loop_labels
+                .iter()
+                .rev()
+                .find(|(_, label)| !label.is_empty())
+                .map_or("", |(_, label)| label.as_str())
+                .to_owned();
+            loop_labels.push((end_label.clone(), continue_label));
+            for ((_, statements), (_, _, body_label)) in cases.iter().zip(&case_labels) {
+                assembly.push_str(&format!("{body_label}:\n"));
+                for statement in statements {
+                    emit_native_statement(
+                        statement,
+                        locals,
+                        function_name,
+                        returns_void,
+                        label_counter,
+                        loop_labels,
+                        assembly,
+                    )?;
+                }
+            }
+            loop_labels.pop();
+            assembly.push_str(&format!("{end_label}:\n"));
+            if default_label.is_none() {
+                return Some(false);
+            }
+            let mut next_case_returns = false;
+            for (_, statements) in cases.iter().rev() {
+                if let Some(returns) = statements.iter().find_map(native_statement_termination) {
+                    next_case_returns = returns;
+                }
+                if !next_case_returns {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+        StatementKind::Goto(name) => {
+            assembly.push_str(&format!("    JMPX __c_label_{function_name}_{name}\n"));
+            Some(false)
+        }
+        StatementKind::Label { name, statement } => {
+            assembly.push_str(&format!("__c_label_{function_name}_{name}:\n"));
+            emit_native_statement(
+                statement,
+                locals,
+                function_name,
+                returns_void,
+                label_counter,
+                loop_labels,
+                assembly,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn emit_native_update(
+    expression: &Expression,
+    locals: &HashMap<String, NativeLocation>,
+    label_counter: &mut usize,
+    assembly: &mut String,
+) -> bool {
+    let (operator, target) = match &expression.kind {
+        ExpressionKind::Postfix {
+            operator,
+            expression,
+        }
+        | ExpressionKind::Unary {
+            operator,
+            operand: expression,
+        } if matches!(operator.as_str(), "++" | "--") => (operator, expression.as_ref()),
+        _ => return false,
+    };
+    if native_expression_is_const_lvalue(target, locals) {
+        eprintln!("update of const-qualified lvalue at line {}", target.line);
+        return false;
+    }
+    if native_expression_is_wide_integer(target, locals) {
+        return emit_native_i32_source(expression, locals, label_counter, assembly);
+    }
+    let instruction = match operator.as_str() {
+        "++" => "INC",
+        "--" => "DEC",
+        _ => return false,
+    };
+    if native_expression_record_field(target, locals).is_some_and(|field| field.bit_field.is_some())
+    {
+        return emit_native_bitfield_update(
+            target,
+            operator,
+            false,
+            None,
+            locals,
+            label_counter,
+            assembly,
+        );
+    }
+    if let ExpressionKind::Member {
+        expression: base,
+        operator,
+        name,
+    } = &target.kind
+    {
+        let Some(field) = emit_native_member_address(
+            base,
+            operator,
+            name,
+            0,
+            &[5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+        ) else {
+            return false;
+        };
+        if field.size > 2 || field.record_layout.is_some() || !field.dimensions.is_empty() {
+            return false;
+        }
+        let (load, store) = if field.size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        assembly.push_str(&format!("    {load} R0, R7\n"));
+        if field.size == 1 {
+            emit_native_byte_normalization(0, field.signed, assembly);
+        }
+        assembly.push_str(&format!("    {instruction} R0\n"));
+        if field.size == 1 {
+            emit_native_byte_normalization(0, field.signed, assembly);
+        }
+        assembly.push_str(&format!("    {store} R7, R0\n"));
+        return true;
+    }
+    if let ExpressionKind::Unary {
+        operator: dereference,
+        operand,
+    } = &target.kind
+        && dereference == "*"
+    {
+        let ExpressionKind::Atom(name) = &operand.kind else {
+            return false;
+        };
+        let Some(location) = locals.get(name) else {
+            return false;
+        };
+        let (element_size, element_signed) = match location {
+            NativeLocation::PointerRegister {
+                element_size,
+                element_signed,
+                ..
+            }
+            | NativeLocation::PointerStack {
+                element_size,
+                element_signed,
+                ..
+            }
+            | NativeLocation::GlobalPointer {
+                element_size,
+                element_signed,
+                ..
+            } => (*element_size, *element_signed),
+            _ => return false,
+        };
+        if !emit_native_expression(operand, 0, &[5, 6, 7], locals, label_counter, assembly) {
+            return false;
+        }
+        assembly.push_str("    MOV R7, R0\n");
+        let (load, store) = if element_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        assembly.push_str(&format!("    {load} R0, R7\n"));
+        if element_size == 1 {
+            emit_native_byte_normalization(0, element_signed, assembly);
+        }
+        assembly.push_str(&format!("    {instruction} R0\n"));
+        if element_size == 1 {
+            emit_native_byte_normalization(0, element_signed, assembly);
+        }
+        assembly.push_str(&format!("    {store} R7, R0\n"));
+        return true;
+    }
+    if let ExpressionKind::Index {
+        expression: base,
+        index,
+    } = &target.kind
+    {
+        let Some((element_size, element_signed)) = emit_native_indexed_element_address(
+            target,
+            base,
+            index,
+            0,
+            &[5, 6, 7],
+            locals,
+            label_counter,
+            assembly,
+        ) else {
+            return false;
+        };
+        if element_size > 2 {
+            return false;
+        }
+        let (load, store) = if element_size == 1 {
+            ("LD", "ST")
+        } else {
+            ("LDW", "STW")
+        };
+        assembly.push_str(&format!("    {load} R0, R7\n"));
+        if element_signed {
+            assembly.push_str("    SHL R0, 8\n    ASR R0, 8\n");
+        }
+        assembly.push_str(&format!("    {instruction} R0\n"));
+        assembly.push_str(&format!("    {store} R7, R0\n"));
+        return true;
+    }
+    let ExpressionKind::Atom(name) = &target.kind else {
+        return false;
+    };
+    let Some(location) = locals.get(name) else {
+        return false;
+    };
+    match location {
+        NativeLocation::GlobalScalar { .. } => assembly.push_str(&format!(
+            "    LDI30 R7, __c_global_{name}\n    LDW R0, R7\n\
+             {instruction} R0\n    LDI30 R7, __c_global_{name}\n    STW R7, R0\n"
+        )),
+        NativeLocation::GlobalByteScalar { signed } => {
+            assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n    LD R0, R7\n"));
+            emit_native_byte_normalization(0, *signed, assembly);
+            assembly.push_str(&format!("    {instruction} R0\n"));
+            emit_native_byte_normalization(0, *signed, assembly);
+            assembly.push_str(&format!("    LDI30 R7, __c_global_{name}\n    ST R7, R0\n"));
+        }
+        NativeLocation::Register { register, .. } => {
+            assembly.push_str(&format!("    {instruction} R{register}\n"));
+        }
+        NativeLocation::ByteRegister { register, signed } => {
+            emit_native_byte_normalization(*register, *signed, assembly);
+            assembly.push_str(&format!("    {instruction} R{register}\n"));
+            emit_native_byte_normalization(*register, *signed, assembly);
+        }
+        NativeLocation::StackScalar { offset, .. } => {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str(&format!("    LDW R0, R7\n    {instruction} R0\n"));
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    STW R7, R0\n");
+        }
+        NativeLocation::ByteStackScalar { offset, signed } => {
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    LD R0, R7\n");
+            emit_native_byte_normalization(0, *signed, assembly);
+            assembly.push_str(&format!("    {instruction} R0\n"));
+            emit_native_byte_normalization(0, *signed, assembly);
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    ST R7, R0\n");
+        }
+        NativeLocation::PointerRegister {
+            register,
+            element_size,
+            ..
+        } => {
+            if *element_size == 1 {
+                assembly.push_str(&format!("    {instruction} R{register}\n"));
+            } else {
+                let arithmetic = if operator == "++" { "ADD" } else { "SUB" };
+                assembly.push_str(&format!(
+                    "    LDI R7, {element_size}\n    {arithmetic} R{register}, R7\n"
+                ));
+            }
+        }
+        NativeLocation::PointerStack {
+            offset,
+            element_size,
+            ..
+        } => {
+            let arithmetic = if operator == "++" { "ADD" } else { "SUB" };
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    LDP R0, R7\n");
+            if *element_size == 1 {
+                assembly.push_str(&format!("    {instruction} R0\n"));
+            } else {
+                assembly.push_str(&format!(
+                    "    LDI R6, {element_size}\n    {arithmetic} R0, R6\n"
+                ));
+            }
+            assembly.push_str("    MOV R7, R3\n");
+            emit_native_stack_offset(7, *offset, assembly);
+            assembly.push_str("    STP R0, R7\n");
+        }
+        NativeLocation::GlobalPointer { element_size, .. } => {
+            let arithmetic = if operator == "++" { "ADD" } else { "SUB" };
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    LDP R0, R7\n"
+            ));
+            if *element_size == 1 {
+                assembly.push_str(&format!("    {instruction} R0\n"));
+            } else {
+                assembly.push_str(&format!(
+                    "    LDI R6, {element_size}\n    {arithmetic} R0, R6\n"
+                ));
+            }
+            assembly.push_str(&format!(
+                "    LDI30 R7, __c_global_{name}\n    STP R0, R7\n"
+            ));
+        }
+        NativeLocation::Constant(_)
+        | NativeLocation::StackWideScalar { .. }
+        | NativeLocation::GlobalWideScalar { .. }
+        | NativeLocation::FloatingPointScalar { .. }
+        | NativeLocation::StackFloatingPointScalar { .. }
+        | NativeLocation::GlobalArray { .. }
+        | NativeLocation::GlobalRecord { .. }
+        | NativeLocation::StackRecord { .. }
+        | NativeLocation::FunctionParameters { .. }
+        | NativeLocation::StackArray { .. } => return false,
+    }
+    true
+}
+
+pub struct StatementParser {
+    expressions: ExpressionParser,
+    enum_values: HashMap<String, i64>,
+}
+
+pub struct TranslationUnitParser {
+    statements: StatementParser,
+    enumerators: HashMap<String, i64>,
+    anonymous_record_counter: usize,
+    records: HashMap<String, NativeRecordLayout>,
+}
+
+const ASSIGNMENTS: [&str; 11] = [
+    "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+];
+const TYPE_WORDS: [&str; 13] = [
+    "void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "const",
+    "volatile", "_Bool", "enum",
+];
+const STORAGE_WORDS: [&str; 6] = [
+    "auto", "extern", "register", "static", "typedef", "restrict",
+];
+
+fn precedence(operator: &str) -> Option<u8> {
+    Some(match operator {
+        "," => 0,
+        "||" => 1,
+        "&&" => 2,
+        "|" => 3,
+        "^" => 4,
+        "&" => 5,
+        "==" | "!=" => 6,
+        "<" | "<=" | ">" | ">=" => 7,
+        "<<" | ">>" => 8,
+        "+" | "-" => 9,
+        "*" | "/" | "%" => 10,
+        _ => return None,
+    })
+}
+
+impl ExpressionParser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        let tokens = if tokens.is_empty() {
+            vec![Token {
+                value: "<eof>".to_owned(),
+                line: 1,
+                filename: None,
+                leading_space: false,
+            }]
+        } else {
+            tokens
+        };
+        Self {
+            tokens,
+            position: 0,
+            typedefs: HashMap::new(),
+        }
+    }
+
+    pub fn from_source(source: &str, filename: &str) -> Result<Self, CCompilerError> {
+        Ok(Self::new(lex_raw(source, filename)?))
+    }
+
+    pub fn parse(&mut self) -> Result<Expression, CCompilerError> {
+        self.parse_expression(0)
+    }
+
+    pub fn is_at_end(&self) -> bool {
+        self.token().value == "<eof>"
+    }
+
+    fn token(&self) -> &Token {
+        &self.tokens[self.position.min(self.tokens.len() - 1)]
+    }
+
+    fn advance(&mut self) -> Token {
+        let token = self.token().clone();
+        if token.value != "<eof>" {
+            self.position += 1;
+        }
+        token
+    }
+
+    fn accept(&mut self, value: &str) -> Option<Token> {
+        if self.token().value == value {
+            Some(self.advance())
+        } else {
+            None
+        }
+    }
+
+    fn expect(&mut self, value: &str) -> Result<Token, CCompilerError> {
+        self.accept(value)
+            .ok_or_else(|| self.fail(&format!("expected {value:?}, got {:?}", self.token().value)))
+    }
+
+    fn fail(&self, message: &str) -> CCompilerError {
+        let token = self.token();
+        error(
+            token.filename.as_deref().unwrap_or("<source>"),
+            token.line,
+            message,
+        )
+    }
+
+    fn make(&self, token: &Token, kind: ExpressionKind) -> Expression {
+        Expression {
+            kind,
+            line: token.line,
+            filename: token.filename.clone(),
+        }
+    }
+
+    fn parse_expression(&mut self, minimum: u8) -> Result<Expression, CCompilerError> {
+        let mut left = self.parse_unary()?;
+        loop {
+            let operator = self.token().value.as_str();
+            if ASSIGNMENTS.contains(&operator) && minimum <= 1 {
+                let token = self.advance();
+                if !Self::is_lvalue(&left) {
+                    return Err(error(
+                        token.filename.as_deref().unwrap_or("<source>"),
+                        token.line,
+                        "assignment requires a scalar variable",
+                    ));
+                }
+                let value = self.parse_expression(1)?;
+                left = self.make(
+                    &token,
+                    ExpressionKind::Assignment {
+                        operator: token.value.clone(),
+                        target: Box::new(left),
+                        value: Box::new(value),
+                    },
+                );
+                continue;
+            }
+            if operator == "?" && minimum <= 1 {
+                let token = self.advance();
+                let when_true = self.parse_expression(0)?;
+                self.expect(":")?;
+                let when_false = self.parse_expression(1)?;
+                left = self.make(
+                    &token,
+                    ExpressionKind::Conditional {
+                        condition: Box::new(left),
+                        when_true: Box::new(when_true),
+                        when_false: Box::new(when_false),
+                    },
+                );
+                continue;
+            }
+            let Some(operator_precedence) = precedence(operator) else {
+                break;
+            };
+            if operator_precedence < minimum {
+                break;
+            }
+            let token = self.advance();
+            let right = self.parse_expression(operator_precedence + 1)?;
+            left = self.make(
+                &token,
+                ExpressionKind::Binary {
+                    operator: token.value.clone(),
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            );
+        }
+        Ok(left)
+    }
+
+    fn is_lvalue(expression: &Expression) -> bool {
+        match expression.kind {
+            ExpressionKind::Atom(ref name) => {
+                !name.starts_with("<string:")
+                    && name != "<eof>"
+                    && name != "sizeof"
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_alphabetic() || character == '_')
+            }
+            ExpressionKind::Index { .. } | ExpressionKind::Member { .. } => true,
+            ExpressionKind::Unary { ref operator, .. } => operator == "*",
+            _ => false,
+        }
+    }
+
+    fn parse_type_name(&mut self) -> Result<String, CCompilerError> {
+        if self.accept("enum").is_some() {
+            if self.token().value != "<eof>"
+                && self
+                    .token()
+                    .value
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_alphabetic() || character == '_')
+            {
+                self.advance();
+            } else {
+                return Err(self.fail("expected an enum tag"));
+            }
+            return Ok("int".to_owned());
+        }
+        if matches!(self.token().value.as_str(), "struct" | "union") {
+            return Err(self.fail("record types are not supported here yet"));
+        }
+        let mut c_type = if let Some(alias) = self.typedefs.get(&self.token().value).cloned() {
+            self.advance();
+            alias
+        } else {
+            let mut words = Vec::new();
+            while TYPE_WORDS.contains(&self.token().value.as_str()) {
+                words.push(self.advance().value);
+            }
+            if !words.iter().any(|word| {
+                matches!(
+                    word.as_str(),
+                    "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+                )
+            }) {
+                return Err(self.fail("expected a type name"));
+            }
+            words.join(" ")
+        };
+        let mut pointer_count = 0;
+        while self.accept("*").is_some() {
+            pointer_count += 1;
+            while matches!(
+                self.token().value.as_str(),
+                "const" | "volatile" | "restrict"
+            ) {
+                self.advance();
+            }
+        }
+        for _ in 0..pointer_count {
+            c_type.push('*');
+        }
+        if self.token().value == "("
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|token| token.value == "*")
+        {
+            self.advance();
+            let mut function_pointer_depth = 0;
+            while self.accept("*").is_some() {
+                function_pointer_depth += 1;
+            }
+            self.expect(")")?;
+            if self.accept("(").is_none() {
+                let mut dimensions = Vec::new();
+                while self.accept("[").is_some() {
+                    if self.accept("]").is_some() {
+                        dimensions.push(INCOMPLETE_ARRAY_LENGTH);
+                        continue;
+                    }
+                    let expression = self.parse_expression(0)?;
+                    self.expect("]")?;
+                    let value = evaluate_integer_constant_with_names(&expression, &HashMap::new())?;
+                    dimensions.push(usize::try_from(value).map_err(|_| {
+                        error(
+                            expression.filename.as_deref().unwrap_or("<source>"),
+                            expression.line,
+                            "array length must be a non-negative integer constant",
+                        )
+                    })?);
+                }
+                if dimensions.is_empty() {
+                    return Err(self.fail("expected a function or array type after a pointer"));
+                }
+                let dimensions = dimensions
+                    .iter()
+                    .map(|dimension| {
+                        if *dimension == INCOMPLETE_ARRAY_LENGTH {
+                            String::new()
+                        } else {
+                            dimension.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("][");
+                return Ok(format!(
+                    "{c_type} ({})[{dimensions}]",
+                    "*".repeat(function_pointer_depth.max(1))
+                ));
+            }
+            let mut parameters = Vec::new();
+            let mut variadic = false;
+            if self.accept(")").is_none() {
+                if self.token().value == "void"
+                    && self
+                        .tokens
+                        .get(self.position + 1)
+                        .is_some_and(|token| token.value == ")")
+                {
+                    self.advance();
+                    self.expect(")")?;
+                    parameters.push("void".to_owned());
+                } else {
+                    loop {
+                        if self.token().value == "."
+                            && self
+                                .tokens
+                                .get(self.position + 1)
+                                .is_some_and(|token| token.value == ".")
+                            && self
+                                .tokens
+                                .get(self.position + 2)
+                                .is_some_and(|token| token.value == ".")
+                        {
+                            self.advance();
+                            self.advance();
+                            self.advance();
+                            variadic = true;
+                            break;
+                        }
+                        parameters.push(self.parse_type_name()?);
+                        if self.accept(",").is_none() {
+                            break;
+                        }
+                    }
+                    if variadic && !parameters.is_empty() {
+                        parameters.push("...".to_owned());
+                    }
+                    self.expect(")")?;
+                }
+            }
+            let parameter_types = parameters.join(", ");
+            return Ok(format!(
+                "{c_type} ({})({parameter_types})",
+                "*".repeat(function_pointer_depth.max(1))
+            ));
+        }
+        Ok(c_type)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expression, CCompilerError> {
+        let token = self.token().clone();
+        if self.accept("sizeof").is_some() {
+            if self.token().value == "(" && self.starts_type_name_within_parens() {
+                self.advance();
+                let c_type = self.parse_type_name()?;
+                self.expect(")")?;
+                return Ok(self.make(&token, ExpressionKind::SizeofType(c_type)));
+            }
+            let expression = self.parse_unary()?;
+            return Ok(self.make(
+                &token,
+                ExpressionKind::SizeofExpression(Box::new(expression)),
+            ));
+        }
+        if self.token().value == "(" && self.starts_type_name_within_parens() {
+            self.advance();
+            let c_type = self.parse_type_name()?;
+            self.expect(")")?;
+            let expression = self.parse_unary()?;
+            return Ok(self.make(
+                &token,
+                ExpressionKind::Cast {
+                    c_type,
+                    expression: Box::new(expression),
+                },
+            ));
+        }
+        if matches!(
+            token.value.as_str(),
+            "+" | "-" | "!" | "~" | "&" | "*" | "++" | "--"
+        ) {
+            self.advance();
+            let operand = self.parse_unary()?;
+            if matches!(token.value.as_str(), "++" | "--") && !Self::is_lvalue(&operand) {
+                return Err(error(
+                    token.filename.as_deref().unwrap_or("<source>"),
+                    token.line,
+                    "increment requires a modifiable lvalue",
+                ));
+            }
+            return Ok(self.make(
+                &token,
+                ExpressionKind::Unary {
+                    operator: token.value.clone(),
+                    operand: Box::new(operand),
+                },
+            ));
+        }
+
+        let mut expression = self.parse_primary()?;
+        loop {
+            if let Some(open) = self.accept("[") {
+                let index = self.parse_expression(0)?;
+                self.expect("]")?;
+                expression = self.make(
+                    &open,
+                    ExpressionKind::Index {
+                        expression: Box::new(expression),
+                        index: Box::new(index),
+                    },
+                );
+            } else if let Some(open) = self.accept("(") {
+                if !Self::is_callable(&expression)
+                    && !matches!(
+                        expression.kind,
+                        ExpressionKind::Unary { ref operator, .. } if operator == "*"
+                    )
+                {
+                    return Err(error(
+                        open.filename.as_deref().unwrap_or("<source>"),
+                        open.line,
+                        "only direct function calls are supported",
+                    ));
+                }
+                let mut arguments = Vec::new();
+                if self.token().value != ")" {
+                    loop {
+                        arguments.push(self.parse_expression(1)?);
+                        if self.accept(",").is_none() {
+                            break;
+                        }
+                    }
+                }
+                self.expect(")")?;
+                expression = self.make(
+                    &open,
+                    ExpressionKind::Call {
+                        function: Box::new(expression),
+                        arguments,
+                    },
+                );
+            } else if matches!(self.token().value.as_str(), "++" | "--") {
+                let operator = self.advance();
+                if !Self::is_lvalue(&expression) {
+                    return Err(error(
+                        operator.filename.as_deref().unwrap_or("<source>"),
+                        operator.line,
+                        "increment requires a modifiable lvalue",
+                    ));
+                }
+                expression = self.make(
+                    &operator,
+                    ExpressionKind::Postfix {
+                        operator: operator.value.clone(),
+                        expression: Box::new(expression),
+                    },
+                );
+            } else if matches!(self.token().value.as_str(), "." | "->") {
+                let operator = self.advance();
+                let name = self.advance();
+                if !name
+                    .value
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_alphabetic() || character == '_')
+                {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "expected a member name",
+                    ));
+                }
+                expression = self.make(
+                    &operator,
+                    ExpressionKind::Member {
+                        expression: Box::new(expression),
+                        operator: operator.value.clone(),
+                        name: name.value,
+                    },
+                );
+            } else {
+                break;
+            }
+        }
+        Ok(expression)
+    }
+
+    fn starts_type_name_within_parens(&self) -> bool {
+        self.token().value == "("
+            && self.tokens.get(self.position + 1).is_some_and(|token| {
+                TYPE_WORDS.contains(&token.value.as_str())
+                    || self.typedefs.contains_key(&token.value)
+            })
+    }
+
+    fn is_callable(expression: &Expression) -> bool {
+        match &expression.kind {
+            ExpressionKind::Atom(name) => name
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_alphabetic() || character == '_'),
+            ExpressionKind::Index { .. } | ExpressionKind::Member { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<Expression, CCompilerError> {
+        let token = self.advance();
+        if token.value == "(" {
+            let expression = self.parse_expression(0)?;
+            self.expect(")")?;
+            return Ok(expression);
+        }
+        let first = token.value.chars().next();
+        let is_identifier =
+            first.is_some_and(|character| character.is_alphabetic() || character == '_');
+        if is_identifier
+            && (TYPE_WORDS.contains(&token.value.as_str())
+                || self.typedefs.contains_key(&token.value)
+                || STORAGE_WORDS.contains(&token.value.as_str()))
+        {
+            return Err(error(
+                token.filename.as_deref().unwrap_or("<source>"),
+                token.line,
+                &format!("{} is not supported", token.value),
+            ));
+        }
+        if token.value == "<eof>" || matches!(token.value.as_str(), ")" | "]" | "}" | ";" | ",") {
+            return Err(error(
+                token.filename.as_deref().unwrap_or("<source>"),
+                token.line,
+                "expected an expression",
+            ));
+        }
+        Ok(self.make(&token, ExpressionKind::Atom(token.value.clone())))
+    }
+}
+
+impl StatementParser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            expressions: ExpressionParser::new(tokens),
+            enum_values: HashMap::new(),
+        }
+    }
+
+    pub fn from_source(source: &str, filename: &str) -> Result<Self, CCompilerError> {
+        Ok(Self::new(lex_raw(source, filename)?))
+    }
+
+    pub fn parse(&mut self) -> Result<Statement, CCompilerError> {
+        let statement = self.parse_statement()?;
+        if !self.expressions.is_at_end() {
+            return Err(self.expressions.fail("unexpected token after statement"));
+        }
+        Ok(statement)
+    }
+
+    fn at(&self, value: &str) -> bool {
+        self.expressions.token().value == value
+    }
+
+    fn expect(&mut self, value: &str) -> Result<Token, CCompilerError> {
+        self.expressions.expect(value)
+    }
+
+    fn accept(&mut self, value: &str) -> Option<Token> {
+        self.expressions.accept(value)
+    }
+
+    fn statement(&self, token: &Token, kind: StatementKind) -> Statement {
+        Statement {
+            kind,
+            line: token.line,
+            filename: token.filename.clone(),
+        }
+    }
+
+    fn parse_statement(&mut self) -> Result<Statement, CCompilerError> {
+        let start = self.expressions.token().clone();
+        if let Some(open) = self.accept("{") {
+            let mut statements = Vec::new();
+            while !self.at("}") && !self.expressions.is_at_end() {
+                statements.push(self.parse_statement()?);
+            }
+            if self.expressions.is_at_end() {
+                return Err(error(
+                    open.filename.as_deref().unwrap_or("<source>"),
+                    open.line,
+                    "unterminated compound statement",
+                ));
+            }
+            self.expect("}")?;
+            return Ok(self.statement(&open, StatementKind::Compound(statements)));
+        }
+        if self.starts_declaration() {
+            return self.parse_declaration();
+        }
+        if self.accept(";").is_some() {
+            return Ok(self.statement(&start, StatementKind::Expression(None)));
+        }
+        if self.accept("return").is_some() {
+            let value = if self.at(";") {
+                None
+            } else {
+                Some(self.expressions.parse_expression(0)?)
+            };
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Return(value)));
+        }
+        if self.accept("if").is_some() {
+            self.expect("(")?;
+            let condition = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            let then_branch = Box::new(self.parse_statement()?);
+            let else_branch = if self.accept("else").is_some() {
+                Some(Box::new(self.parse_statement()?))
+            } else {
+                None
+            };
+            return Ok(self.statement(
+                &start,
+                StatementKind::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                },
+            ));
+        }
+        if self.accept("while").is_some() {
+            self.expect("(")?;
+            let condition = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            let body = Box::new(self.parse_statement()?);
+            return Ok(self.statement(&start, StatementKind::While { condition, body }));
+        }
+        if self.accept("do").is_some() {
+            let body = Box::new(self.parse_statement()?);
+            self.expect("while")?;
+            self.expect("(")?;
+            let condition = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::DoWhile { body, condition }));
+        }
+        if self.accept("for").is_some() {
+            self.expect("(")?;
+            let initializer = if self.at(";") {
+                self.expect(";")?;
+                None
+            } else if self.starts_declaration() {
+                Some(Box::new(self.parse_declaration()?))
+            } else {
+                let expression = self.expressions.parse_expression(0)?;
+                self.expect(";")?;
+                Some(Box::new(self.statement(
+                    &start,
+                    StatementKind::Expression(Some(expression)),
+                )))
+            };
+            let condition = if self.at(";") {
+                None
+            } else {
+                Some(self.expressions.parse_expression(0)?)
+            };
+            self.expect(";")?;
+            let update = if self.at(")") {
+                None
+            } else {
+                Some(self.expressions.parse_expression(0)?)
+            };
+            self.expect(")")?;
+            let body = Box::new(self.parse_statement()?);
+            return Ok(self.statement(
+                &start,
+                StatementKind::For {
+                    initializer,
+                    condition,
+                    update,
+                    body,
+                },
+            ));
+        }
+        if self.accept("break").is_some() {
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Break));
+        }
+        if self.accept("continue").is_some() {
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Continue));
+        }
+        if self.accept("goto").is_some() {
+            let name = self.expect_identifier("expected a label name")?;
+            self.expect(";")?;
+            return Ok(self.statement(&start, StatementKind::Goto(name.value)));
+        }
+        if self.is_identifier() && self.peek_value(1) == ":" {
+            let name = self.expressions.advance();
+            self.expressions.advance();
+            let statement = Box::new(self.parse_statement()?);
+            return Ok(self.statement(
+                &name,
+                StatementKind::Label {
+                    name: name.value.clone(),
+                    statement,
+                },
+            ));
+        }
+        if self.accept("switch").is_some() {
+            self.expect("(")?;
+            let expression = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            self.expect("{")?;
+            let mut cases = Vec::new();
+            let mut has_default = false;
+            while !self.at("}") && !self.expressions.is_at_end() {
+                let value = if self.accept("case").is_some() {
+                    let value = self.expressions.parse_expression(1)?;
+                    self.expect(":")?;
+                    Some(value)
+                } else if self.accept("default").is_some() {
+                    if has_default {
+                        return Err(self.expressions.fail("duplicate default label"));
+                    }
+                    has_default = true;
+                    self.expect(":")?;
+                    None
+                } else {
+                    return Err(self
+                        .expressions
+                        .fail("expected case or default label in switch"));
+                };
+                let mut statements = Vec::new();
+                while !matches!(
+                    self.expressions.token().value.as_str(),
+                    "case" | "default" | "}"
+                ) && !self.expressions.is_at_end()
+                {
+                    statements.push(self.parse_statement()?);
+                }
+                cases.push((value, statements));
+            }
+            self.expect("}")?;
+            return Ok(self.statement(&start, StatementKind::Switch { expression, cases }));
+        }
+        if matches!(self.expressions.token().value.as_str(), "case" | "default") {
+            return Err(self
+                .expressions
+                .fail("case and default labels must be inside a switch"));
+        }
+        let expression = self.expressions.parse_expression(0)?;
+        self.expect(";")?;
+        Ok(self.statement(&start, StatementKind::Expression(Some(expression))))
+    }
+
+    fn starts_declaration(&self) -> bool {
+        TYPE_WORDS.contains(&self.expressions.token().value.as_str())
+            || matches!(self.expressions.token().value.as_str(), "struct" | "union")
+            || self
+                .expressions
+                .typedefs
+                .contains_key(&self.expressions.token().value)
+            || STORAGE_WORDS.contains(&self.expressions.token().value.as_str())
+    }
+
+    fn is_identifier(&self) -> bool {
+        self.expressions
+            .token()
+            .value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_alphabetic() || character == '_')
+            && !TYPE_WORDS.contains(&self.expressions.token().value.as_str())
+            && !self
+                .expressions
+                .typedefs
+                .contains_key(&self.expressions.token().value)
+            && !STORAGE_WORDS.contains(&self.expressions.token().value.as_str())
+    }
+
+    fn peek_value(&self, distance: usize) -> &str {
+        self.expressions
+            .tokens
+            .get(self.expressions.position + distance)
+            .map_or("<eof>", |token| token.value.as_str())
+    }
+
+    fn expect_identifier(&mut self, message: &str) -> Result<Token, CCompilerError> {
+        if self.is_identifier() {
+            Ok(self.expressions.advance())
+        } else {
+            Err(self.expressions.fail(message))
+        }
+    }
+
+    fn parse_initializer(&mut self) -> Result<Expression, CCompilerError> {
+        if let Some(open) = self.accept("{") {
+            let mut values = Vec::new();
+            if !self.at("}") {
+                loop {
+                    values.push(self.parse_initializer()?);
+                    if self.accept(",").is_none() || self.at("}") {
+                        break;
+                    }
+                }
+            }
+            self.expect("}")?;
+            return Ok(self
+                .expressions
+                .make(&open, ExpressionKind::InitializerList(values)));
+        }
+        self.expressions.parse_expression(1)
+    }
+
+    fn parse_declaration(&mut self) -> Result<Statement, CCompilerError> {
+        let start = self.expressions.token().clone();
+        let mut unsupported_storage_class = None;
+        let mut type_qualifiers = Vec::new();
+        while matches!(
+            self.expressions.token().value.as_str(),
+            "static" | "extern" | "register" | "auto" | "const" | "volatile" | "restrict"
+        ) {
+            let specifier = self.expressions.advance().value;
+            if matches!(specifier.as_str(), "static" | "extern") {
+                unsupported_storage_class = Some(specifier);
+            } else if matches!(specifier.as_str(), "const" | "volatile" | "restrict") {
+                type_qualifiers.push(specifier);
+            }
+        }
+        if let Some(storage_class) = unsupported_storage_class {
+            return Err(error(
+                start.filename.as_deref().unwrap_or("<source>"),
+                start.line,
+                &format!("block-scope {storage_class} declarations are not supported"),
+            ));
+        }
+        let mut base_type = if matches!(self.expressions.token().value.as_str(), "struct" | "union")
+        {
+            let kind = self.expressions.advance().value;
+            let tag = self.expect_identifier("expected a record tag")?;
+            format!("{kind} {}", tag.value)
+        } else if self.accept("enum").is_some() {
+            self.expect_identifier("expected an enum tag")?;
+            "int".to_owned()
+        } else if let Some(alias) = self
+            .expressions
+            .typedefs
+            .get(&self.expressions.token().value)
+            .cloned()
+        {
+            self.expressions.advance();
+            alias
+        } else {
+            let mut type_words = Vec::new();
+            while TYPE_WORDS.contains(&self.expressions.token().value.as_str()) {
+                type_words.push(self.expressions.advance().value);
+            }
+            if !type_words.iter().any(|word| {
+                matches!(
+                    word.as_str(),
+                    "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+                )
+            }) {
+                return Err(self.expressions.fail("expected a declaration type"));
+            }
+            type_words.join(" ")
+        };
+        let mut unqualified_words = Vec::new();
+        for word in base_type.split_whitespace() {
+            if matches!(word, "const" | "volatile" | "restrict") {
+                type_qualifiers.push(word.to_owned());
+            } else {
+                unqualified_words.push(word);
+            }
+        }
+        if !type_qualifiers.is_empty() {
+            base_type = format!(
+                "{} {}",
+                type_qualifiers.join(" "),
+                unqualified_words.join(" ")
+            );
+        }
+        let mut declarations = Vec::new();
+        loop {
+            let mut c_type = base_type.clone();
+            while self.accept("*").is_some() {
+                c_type.push('*');
+                if matches!(
+                    self.expressions.token().value.as_str(),
+                    "const" | "volatile" | "restrict"
+                ) {
+                    return Err(self
+                        .expressions
+                        .fail("qualifiers on pointer objects are not supported"));
+                }
+            }
+            let name = self.expect_identifier("expected a variable name")?;
+            let mut array_dimensions = self.parse_array_dimensions()?;
+            let initializer = if self.accept("=").is_some() {
+                Some(self.parse_initializer()?)
+            } else {
+                None
+            };
+            if array_dimensions.first() == Some(&INCOMPLETE_ARRAY_LENGTH) {
+                if array_dimensions.len() != 1 {
+                    return Err(self.expressions.fail(
+                        "incomplete outer arrays with additional dimensions are not supported",
+                    ));
+                }
+                let Some(length) = initializer
+                    .as_ref()
+                    .and_then(|initializer| infer_incomplete_array_length(&c_type, initializer))
+                else {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "incomplete array requires an initializer that determines its size",
+                    ));
+                };
+                if length == 0 {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "array size must be greater than zero",
+                    ));
+                }
+                array_dimensions[0] = length;
+            }
+            let array_length = if array_dimensions.is_empty() {
+                None
+            } else {
+                Some(
+                    array_dimensions
+                        .iter()
+                        .try_fold(1usize, |size, dimension| size.checked_mul(*dimension))
+                        .ok_or_else(|| self.expressions.fail("array size is too large"))?,
+                )
+            };
+            declarations.push(Declaration {
+                c_type,
+                name: name.value,
+                array_length,
+                array_dimensions,
+                initializer,
+            });
+            if self.accept(",").is_none() {
+                break;
+            }
+        }
+        self.expect(";")?;
+        Ok(self.statement(&start, StatementKind::Declaration(declarations)))
+    }
+
+    fn parse_array_dimensions(&mut self) -> Result<Vec<usize>, CCompilerError> {
+        let mut dimensions = Vec::new();
+        while self.accept("[").is_some() {
+            if self.accept("]").is_some() {
+                dimensions.push(INCOMPLETE_ARRAY_LENGTH);
+                continue;
+            }
+            let expression = self.expressions.parse_expression(0)?;
+            self.expect("]")?;
+            let value = evaluate_integer_constant_with_names(&expression, &self.enum_values)?;
+            dimensions.push(usize::try_from(value).map_err(|_| {
+                error(
+                    expression.filename.as_deref().unwrap_or("<source>"),
+                    expression.line,
+                    "array length must be a non-negative integer constant",
+                )
+            })?);
+        }
+        Ok(dimensions)
+    }
+}
+
+impl TranslationUnitParser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            statements: StatementParser::new(tokens),
+            enumerators: HashMap::new(),
+            anonymous_record_counter: 0,
+            records: HashMap::new(),
+        }
+    }
+
+    pub fn from_source(source: &str, filename: &str) -> Result<Self, CCompilerError> {
+        Ok(Self::new(lex_raw(source, filename)?))
+    }
+
+    pub fn parse(&mut self) -> Result<TranslationUnit, CCompilerError> {
+        let mut declarations = Vec::new();
+        while !self.statements.expressions.is_at_end() {
+            declarations.extend(self.parse_external_declaration()?);
+        }
+        Ok(TranslationUnit {
+            declarations,
+            enumerators: self.enumerators.clone(),
+            records: self.records.clone(),
+        })
+    }
+
+    fn parse_external_declaration(&mut self) -> Result<Vec<ExternalDeclaration>, CCompilerError> {
+        let token = self.statements.expressions.token().clone();
+        let (base_type, storage_class) = self.parse_base_type()?;
+        if self.statements.accept(";").is_some() {
+            return Ok(Vec::new());
+        }
+        let (declarator_type, name, declarator_dimensions) = self.parse_declarator(&base_type)?;
+        if self.statements.accept("(").is_some() {
+            if storage_class.as_deref() == Some("typedef") {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("function typedefs are not supported"));
+            }
+            let (parameters, variadic, has_prototype) = self.parse_parameters()?;
+            let declaration = FunctionDeclaration {
+                return_type: declarator_type,
+                name: name.value,
+                parameters,
+                variadic,
+                has_prototype,
+            };
+            if self.statements.accept(";").is_some() {
+                return Ok(vec![ExternalDeclaration::FunctionPrototype(declaration)]);
+            }
+            self.statements.enum_values = self.enumerators.clone();
+            let body = self.statements.parse_statement()?;
+            if !matches!(body.kind, StatementKind::Compound(_)) {
+                return Err(error(
+                    token.filename.as_deref().unwrap_or("<source>"),
+                    token.line,
+                    "expected a function body",
+                ));
+            }
+            return Ok(vec![ExternalDeclaration::FunctionDefinition(
+                FunctionDefinition { declaration, body },
+            )]);
+        }
+
+        let is_typedef = storage_class.as_deref() == Some("typedef");
+        let mut globals = Vec::new();
+        let mut next = Some((declarator_type, name, declarator_dimensions));
+        while let Some((declarator_type, name, mut array_dimensions)) = next.take() {
+            array_dimensions.extend(self.parse_array_dimensions()?);
+            let initializer = if self.statements.accept("=").is_some() {
+                Some(self.statements.parse_initializer()?)
+            } else {
+                None
+            };
+            if storage_class.as_deref() == Some("extern") && initializer.is_none() {
+                next = if self.statements.accept(",").is_some() {
+                    Some(self.parse_declarator(&base_type)?)
+                } else {
+                    None
+                };
+                continue;
+            }
+            if array_dimensions.first() == Some(&INCOMPLETE_ARRAY_LENGTH) {
+                if array_dimensions.len() != 1 {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "incomplete outer arrays with additional dimensions are not supported",
+                    ));
+                }
+                let Some(length) = initializer.as_ref().and_then(|initializer| {
+                    infer_incomplete_array_length(&declarator_type, initializer)
+                }) else {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "incomplete array requires an initializer that determines its size",
+                    ));
+                };
+                if length == 0 {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "array size must be greater than zero",
+                    ));
+                }
+                array_dimensions[0] = length;
+            }
+            let array_length = if array_dimensions.is_empty() {
+                None
+            } else {
+                Some(
+                    array_dimensions
+                        .iter()
+                        .try_fold(1usize, |size, dimension| size.checked_mul(*dimension))
+                        .ok_or_else(|| {
+                            error(
+                                name.filename.as_deref().unwrap_or("<source>"),
+                                name.line,
+                                "array size is too large",
+                            )
+                        })?,
+                )
+            };
+            if is_typedef {
+                if array_length.is_some() || initializer.is_some() {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "array and initialized typedefs are not supported",
+                    ));
+                }
+                if self.enumerators.contains_key(&name.value)
+                    || self
+                        .statements
+                        .expressions
+                        .typedefs
+                        .insert(name.value.clone(), declarator_type.clone())
+                        .is_some()
+                {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        &format!("duplicate typedef name {:?}", name.value),
+                    ));
+                }
+            } else {
+                if self
+                    .statements
+                    .expressions
+                    .typedefs
+                    .contains_key(&name.value)
+                {
+                    return Err(error(
+                        name.filename.as_deref().unwrap_or("<source>"),
+                        name.line,
+                        "declaration conflicts with a typedef name",
+                    ));
+                }
+                globals.push(ExternalDeclaration::Global(Declaration {
+                    c_type: declarator_type.clone(),
+                    name: name.value.clone(),
+                    array_length,
+                    array_dimensions,
+                    initializer,
+                }));
+            }
+            next = if self.statements.accept(",").is_some() {
+                Some(self.parse_declarator(&base_type)?)
+            } else {
+                None
+            };
+        }
+        self.statements.expect(";")?;
+        Ok(if is_typedef { Vec::new() } else { globals })
+    }
+
+    fn parse_base_type(&mut self) -> Result<(String, Option<String>), CCompilerError> {
+        let mut storage_class = None;
+        let mut qualifiers = Vec::new();
+        while matches!(
+            self.statements.expressions.token().value.as_str(),
+            "static" | "extern" | "register" | "auto" | "typedef" | "const" | "volatile"
+        ) {
+            let value = self.statements.expressions.advance().value;
+            if matches!(value.as_str(), "const" | "volatile") {
+                qualifiers.push(value);
+            } else if storage_class.replace(value).is_some() {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("multiple storage-class specifiers in declaration"));
+            }
+        }
+        if self.statements.accept("enum").is_some() {
+            self.parse_enum_specifier()?;
+            let c_type = if qualifiers.is_empty() {
+                "int".to_owned()
+            } else {
+                format!("{} int", qualifiers.join(" "))
+            };
+            return Ok((c_type, storage_class));
+        }
+        if matches!(
+            self.statements.expressions.token().value.as_str(),
+            "struct" | "union"
+        ) {
+            let kind = self.statements.expressions.advance().value;
+            let tag = if self.statements.at("{") {
+                None
+            } else {
+                Some(
+                    self.statements
+                        .expect_identifier("expected a record tag or body")?
+                        .value,
+                )
+            };
+            let record_name = if let Some(tag) = tag {
+                tag
+            } else {
+                self.anonymous_record_counter += 1;
+                format!("__anonymous_{}", self.anonymous_record_counter)
+            };
+            if self.statements.accept("{").is_some() {
+                self.parse_record_members(&format!("{kind} {record_name}"))?;
+            } else if record_name.starts_with("__anonymous_") {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("expected a record tag or body"));
+            }
+            let c_type = format!("{kind} {record_name}");
+            return Ok((
+                if qualifiers.is_empty() {
+                    c_type
+                } else {
+                    format!("{} {c_type}", qualifiers.join(" "))
+                },
+                storage_class,
+            ));
+        }
+        if let Some(alias) = self
+            .statements
+            .expressions
+            .typedefs
+            .get(&self.statements.expressions.token().value)
+            .cloned()
+        {
+            self.statements.expressions.advance();
+            let c_type = if qualifiers.is_empty() {
+                alias
+            } else {
+                format!("{} {alias}", qualifiers.join(" "))
+            };
+            return Ok((c_type, storage_class));
+        }
+        let mut words = Vec::new();
+        while TYPE_WORDS.contains(&self.statements.expressions.token().value.as_str()) {
+            words.push(self.statements.expressions.advance().value);
+        }
+        if !words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+            )
+        }) {
+            return Err(self
+                .statements
+                .expressions
+                .fail("expected a supported declaration type"));
+        }
+        let mut c_type = words.join(" ");
+        if !qualifiers.is_empty() {
+            c_type = format!("{} {c_type}", qualifiers.join(" "));
+        }
+        Ok((c_type, storage_class))
+    }
+
+    fn parse_record_members(&mut self, record_name: &str) -> Result<(), CCompilerError> {
+        let mut fields = HashMap::new();
+        let mut field_order = Vec::new();
+        let mut bit_field_units = Vec::new();
+        let mut current_bit_field_unit: Option<(bool, usize, usize)> = None;
+        let mut size = 0usize;
+        let is_union = record_name.starts_with("union ");
+        let mut layout_supported = true;
+        while !self.statements.at("}") {
+            if self.statements.expressions.is_at_end() {
+                return Err(self.statements.expressions.fail("unterminated record body"));
+            }
+            let member_type = if self.statements.accept("enum").is_some() {
+                self.parse_enum_specifier()?;
+                "int".to_owned()
+            } else if matches!(
+                self.statements.expressions.token().value.as_str(),
+                "struct" | "union"
+            ) {
+                let kind = self.statements.expressions.advance().value;
+                let tag = self.statements.expect_identifier("expected a record tag")?;
+                format!("{kind} {}", tag.value)
+            } else if let Some(alias) = self
+                .statements
+                .expressions
+                .typedefs
+                .get(&self.statements.expressions.token().value)
+                .cloned()
+            {
+                self.statements.expressions.advance();
+                alias
+            } else {
+                let mut words = Vec::new();
+                while TYPE_WORDS.contains(&self.statements.expressions.token().value.as_str()) {
+                    words.push(self.statements.expressions.advance().value);
+                }
+                if !words.iter().any(|word| {
+                    matches!(
+                        word.as_str(),
+                        "void" | "char" | "short" | "int" | "long" | "float" | "double" | "_Bool"
+                    )
+                }) {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("expected a supported record member type"));
+                }
+                words.join(" ")
+            };
+            loop {
+                let mut c_type = member_type.clone();
+                let mut pointer = false;
+                while self.statements.accept("*").is_some() {
+                    pointer = true;
+                    c_type.push('*');
+                }
+                let name = if self.statements.at(":") {
+                    None
+                } else {
+                    Some(
+                        self.statements
+                            .expect_identifier("expected a record member name")?,
+                    )
+                };
+                let dimensions = if name.is_some() {
+                    self.statements.parse_array_dimensions()?
+                } else {
+                    Vec::new()
+                };
+                let bit_width = if self.statements.accept(":").is_some() {
+                    let expression = self.statements.expressions.parse_expression(1)?;
+                    let width =
+                        evaluate_integer_constant_with_names(&expression, &self.enumerators)?;
+                    let width = usize::try_from(width).map_err(|_| {
+                        error(
+                            expression.filename.as_deref().unwrap_or("<source>"),
+                            expression.line,
+                            "bit-field width must be between zero and 16",
+                        )
+                    })?;
+                    if width > 16 {
+                        return Err(error(
+                            expression.filename.as_deref().unwrap_or("<source>"),
+                            expression.line,
+                            "bit-field width must be between zero and 16",
+                        ));
+                    }
+                    if width == 0 && name.is_some() {
+                        return Err(error(
+                            expression.filename.as_deref().unwrap_or("<source>"),
+                            expression.line,
+                            "zero-width bit-field must be unnamed",
+                        ));
+                    }
+                    Some(width)
+                } else {
+                    None
+                };
+                let field_type = c_type.trim();
+                if let Some(width) = bit_width {
+                    let signed = match native_unqualified_type(field_type) {
+                        "int" | "signed" | "signed int" => true,
+                        "unsigned" | "unsigned int" => false,
+                        _ => {
+                            return Err(self
+                                .statements
+                                .expressions
+                                .fail("bit-field base type must be int or unsigned int"));
+                        }
+                    };
+                    if pointer || !dimensions.is_empty() {
+                        return Err(self
+                            .statements
+                            .expressions
+                            .fail("bit-fields cannot be pointers or arrays"));
+                    }
+                    if width == 0 {
+                        if size & 1 != 0 {
+                            size += 1;
+                        }
+                        current_bit_field_unit = None;
+                    } else {
+                        let (unit_offset, bit_offset) = if is_union {
+                            if bit_field_units.is_empty() {
+                                bit_field_units.push(0);
+                            }
+                            size = size.max(2);
+                            (0, 0)
+                        } else {
+                            match current_bit_field_unit {
+                                Some((unit_signed, offset, used))
+                                    if unit_signed == signed && used + width <= 16 =>
+                                {
+                                    current_bit_field_unit = Some((signed, offset, used + width));
+                                    (offset, used)
+                                }
+                                _ => {
+                                    if size & 1 != 0 {
+                                        size += 1;
+                                    }
+                                    let offset = size;
+                                    size = size.checked_add(2).ok_or_else(|| {
+                                        self.statements
+                                            .expressions
+                                            .fail("record layout exceeds the supported size")
+                                    })?;
+                                    bit_field_units.push(offset);
+                                    current_bit_field_unit = Some((signed, offset, width));
+                                    (offset, 0)
+                                }
+                            }
+                        };
+                        if let Some(name) = &name {
+                            if fields
+                                .insert(
+                                    name.value.clone(),
+                                    NativeRecordField {
+                                        offset: unit_offset,
+                                        size: 2,
+                                        signed,
+                                        is_const: native_type_is_const_qualified(field_type),
+                                        floating_size: 0,
+                                        bit_field: Some((bit_offset, width)),
+                                        record_layout: None,
+                                        dimensions: Vec::new(),
+                                        element_size: 2,
+                                    },
+                                )
+                                .is_some()
+                            {
+                                return Err(error(
+                                    name.filename.as_deref().unwrap_or("<source>"),
+                                    name.line,
+                                    "duplicate record member name",
+                                ));
+                            }
+                            field_order.push(name.value.clone());
+                        }
+                    }
+                    if self.statements.accept(",").is_some() {
+                        continue;
+                    }
+                    break;
+                } else {
+                    let Some(name) = name else {
+                        return Err(self
+                            .statements
+                            .expressions
+                            .fail("expected a record member name or bit-field width"));
+                    };
+                    current_bit_field_unit = None;
+                    let field_size = native_sizeof_type(field_type).map(usize::from);
+                    let nested_size = self
+                        .records
+                        .get(field_type)
+                        .map(|layout| layout.size)
+                        .or_else(|| {
+                            field_type
+                                .strip_prefix("struct ")
+                                .and_then(|tag| self.records.get(&format!("struct {tag}")))
+                                .map(|layout| layout.size)
+                        });
+                    let Some(element_size) = field_size.or(nested_size) else {
+                        layout_supported = false;
+                        if self.statements.accept(",").is_some() {
+                            continue;
+                        }
+                        break;
+                    };
+                    if pointer {
+                        layout_supported = false;
+                    } else if let Some(member_size) = dimensions
+                        .iter()
+                        .try_fold(element_size, |member_size, dimension| {
+                            member_size.checked_mul(*dimension)
+                        })
+                    {
+                        let offset = if is_union {
+                            0
+                        } else {
+                            let alignment = element_size.min(2);
+                            if alignment == 2 && size & 1 != 0 {
+                                size += 1;
+                            }
+                            size
+                        };
+                        let signed = native_byte_type(field_type)
+                            .unwrap_or_else(|| !is_native_unsigned_word_type(field_type));
+                        if fields
+                            .insert(
+                                name.value.clone(),
+                                NativeRecordField {
+                                    offset,
+                                    size: if dimensions.is_empty() {
+                                        element_size
+                                    } else {
+                                        member_size
+                                    },
+                                    signed,
+                                    is_const: native_type_is_const_qualified(field_type),
+                                    floating_size: native_floating_type_size(field_type)
+                                        .unwrap_or(0),
+                                    bit_field: None,
+                                    record_layout: self
+                                        .records
+                                        .get(field_type)
+                                        .cloned()
+                                        .map(Box::new),
+                                    dimensions: dimensions.clone(),
+                                    element_size,
+                                },
+                            )
+                            .is_some()
+                        {
+                            return Err(error(
+                                name.filename.as_deref().unwrap_or("<source>"),
+                                name.line,
+                                "duplicate record member name",
+                            ));
+                        }
+                        field_order.push(name.value.clone());
+                        if is_union {
+                            size = size.max(member_size);
+                        } else {
+                            size = size.checked_add(member_size).ok_or_else(|| {
+                                error(
+                                    name.filename.as_deref().unwrap_or("<source>"),
+                                    name.line,
+                                    "record layout exceeds the supported size",
+                                )
+                            })?;
+                        }
+                    } else {
+                        layout_supported = false;
+                    }
+                }
+                if self.statements.accept(",").is_none() {
+                    break;
+                }
+            }
+            self.statements.expect(";")?;
+        }
+        self.statements.expect("}")?;
+        if size & 1 != 0 {
+            size += 1;
+        }
+        if layout_supported && size > 0 {
+            self.records.insert(
+                record_name.to_owned(),
+                NativeRecordLayout {
+                    size,
+                    is_union,
+                    fields,
+                    field_order,
+                    bit_field_units,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn parse_enum_specifier(&mut self) -> Result<(), CCompilerError> {
+        let mut has_tag = false;
+        if !self.statements.at("{")
+            && self
+                .statements
+                .expressions
+                .token()
+                .value
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_alphabetic() || character == '_')
+        {
+            self.statements.expressions.advance();
+            has_tag = true;
+        }
+        if self.statements.accept("{").is_none() {
+            return if has_tag {
+                Ok(())
+            } else {
+                Err(self
+                    .statements
+                    .expressions
+                    .fail("expected an enum tag or body"))
+            };
+        }
+        if self.statements.at("}") {
+            return Err(self
+                .statements
+                .expressions
+                .fail("enum body cannot be empty"));
+        }
+        let mut next_value = 0i64;
+        loop {
+            let name = self
+                .statements
+                .expect_identifier("expected an enumerator name")?;
+            let value = if self.statements.accept("=").is_some() {
+                let expression = self.statements.expressions.parse_expression(1)?;
+                evaluate_integer_constant_with_names(&expression, &self.enumerators)?
+            } else {
+                next_value
+            };
+            if !(i16::MIN as i64..=u16::MAX as i64).contains(&value) {
+                return Err(error(
+                    name.filename.as_deref().unwrap_or("<source>"),
+                    name.line,
+                    "enumerator value is outside the supported int range",
+                ));
+            }
+            if self.enumerators.insert(name.value.clone(), value).is_some() {
+                return Err(error(
+                    name.filename.as_deref().unwrap_or("<source>"),
+                    name.line,
+                    &format!("duplicate enumerator {:?}", name.value),
+                ));
+            }
+            next_value = value.checked_add(1).ok_or_else(|| {
+                error(
+                    name.filename.as_deref().unwrap_or("<source>"),
+                    name.line,
+                    "enumerator value is outside the supported int range",
+                )
+            })?;
+            if self.statements.accept(",").is_none() || self.statements.at("}") {
+                break;
+            }
+        }
+        self.statements.expect("}")?;
+        Ok(())
+    }
+
+    fn parse_declarator(
+        &mut self,
+        base_type: &str,
+    ) -> Result<(String, Token, Vec<usize>), CCompilerError> {
+        let mut c_type = base_type.to_owned();
+        while self.statements.accept("*").is_some() {
+            c_type.push('*');
+            if matches!(
+                self.statements.expressions.token().value.as_str(),
+                "const" | "volatile"
+            ) {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("qualifiers on pointer objects are not supported"));
+            }
+        }
+        if self.statements.at("(") && self.statements.peek_value(1) == "*" {
+            let mut offset = 1;
+            let mut pointer_depth = 0;
+            while self.statements.peek_value(offset) == "*" {
+                pointer_depth += 1;
+                offset += 1;
+            }
+            let mut close_offset = offset + 1;
+            while self.statements.peek_value(close_offset) == "[" {
+                let mut bracket_depth = 0usize;
+                loop {
+                    let token = self.statements.peek_value(close_offset);
+                    if token == "<eof>" {
+                        break;
+                    }
+                    match token {
+                        "[" => bracket_depth += 1,
+                        "]" => bracket_depth -= 1,
+                        _ => {}
+                    }
+                    close_offset += 1;
+                    if bracket_depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if pointer_depth > 0
+                && self.statements.peek_value(close_offset) == ")"
+                && matches!(self.statements.peek_value(close_offset + 1), "(" | "[")
+            {
+                self.statements.expect("(")?;
+                for _ in 0..pointer_depth {
+                    self.statements.expect("*")?;
+                }
+                let name = self
+                    .statements
+                    .expect_identifier("expected a function-pointer identifier")?;
+                let dimensions = self.parse_array_dimensions()?;
+                self.statements.expect(")")?;
+                if self.statements.accept("(").is_some() {
+                    let (parameters, variadic, has_prototype) = self.parse_parameters()?;
+                    let parameter_types = if !has_prototype {
+                        String::new()
+                    } else if parameters.is_empty() {
+                        "void".to_owned()
+                    } else {
+                        let mut types = parameters
+                            .iter()
+                            .map(|parameter| parameter.c_type.clone())
+                            .collect::<Vec<_>>();
+                        if variadic {
+                            types.push("...".to_owned());
+                        }
+                        types.join(", ")
+                    };
+                    return Ok((
+                        format!(
+                            "{c_type} ({})({parameter_types})",
+                            "*".repeat(pointer_depth)
+                        ),
+                        name,
+                        dimensions,
+                    ));
+                }
+                let array_dimensions = self.parse_array_dimensions()?;
+                if array_dimensions.is_empty() {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("expected a function or array type after a pointer declarator"));
+                }
+                let dimensions_text = array_dimensions
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("][");
+                return Ok((
+                    format!(
+                        "{c_type} ({})[{dimensions_text}]",
+                        "*".repeat(pointer_depth)
+                    ),
+                    name,
+                    dimensions,
+                ));
+            }
+        }
+        let name = self
+            .statements
+            .expect_identifier("expected an external identifier")?;
+        Ok((c_type, name, Vec::new()))
+    }
+
+    fn parse_array_dimensions(&mut self) -> Result<Vec<usize>, CCompilerError> {
+        let mut dimensions = Vec::new();
+        while self.statements.accept("[").is_some() {
+            if self.statements.accept("]").is_some() {
+                dimensions.push(INCOMPLETE_ARRAY_LENGTH);
+                continue;
+            }
+            let expression = self.statements.expressions.parse_expression(0)?;
+            self.statements.expect("]")?;
+            let length = evaluate_integer_constant_with_names(&expression, &self.enumerators)?;
+            dimensions.push(usize::try_from(length).map_err(|_| {
+                error(
+                    expression.filename.as_deref().unwrap_or("<source>"),
+                    expression.line,
+                    "array length must be a non-negative integer constant",
+                )
+            })?);
+        }
+        Ok(dimensions)
+    }
+
+    fn parse_parameters(&mut self) -> Result<(Vec<FunctionParameter>, bool, bool), CCompilerError> {
+        let mut parameters = Vec::new();
+        let mut variadic = false;
+        if self.statements.accept(")").is_some() {
+            return Ok((parameters, variadic, false));
+        }
+        if self.statements.at("void") && self.statements.peek_value(1) == ")" {
+            self.statements.expressions.advance();
+            self.statements.expect(")")?;
+            return Ok((parameters, variadic, true));
+        }
+        loop {
+            if self.statements.at(".") && self.statements.peek_value(1) == "." {
+                self.statements.expressions.advance();
+                self.statements.expressions.advance();
+                self.statements.expect(".")?;
+                variadic = true;
+                break;
+            }
+            let (base_type, storage) = self.parse_base_type()?;
+            if storage.is_some() {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("storage class is not valid for a function parameter"));
+            }
+            let (mut c_type, name, mut dimensions) =
+                if self.statements.at(",") || self.statements.at(")") {
+                    (base_type, None, Vec::new())
+                } else {
+                    let (c_type, name, dimensions) = self.parse_declarator(&base_type)?;
+                    (c_type, Some(name.value), dimensions)
+                };
+            if name.is_some() && self.statements.accept("(").is_some() {
+                let (function_parameters, variadic, has_prototype) = self.parse_parameters()?;
+                let mut parameter_types = if !has_prototype {
+                    String::new()
+                } else if function_parameters.is_empty() {
+                    "void".to_owned()
+                } else {
+                    function_parameters
+                        .iter()
+                        .map(|parameter| parameter.c_type.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if variadic {
+                    if !parameter_types.is_empty() {
+                        parameter_types.push_str(", ");
+                    }
+                    parameter_types.push_str("...");
+                }
+                c_type = format!("{c_type} (*)({parameter_types})");
+            }
+            dimensions.extend(self.parse_array_dimensions()?);
+            if dimensions.len() > 1 {
+                if dimensions[1..].contains(&INCOMPLETE_ARRAY_LENGTH) {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("inner array parameter bounds must be complete"));
+                }
+                let array_dimensions = dimensions[1..]
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("][");
+                if native_type_is_function_pointer(&c_type) {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("multidimensional function-pointer arrays are not supported"));
+                }
+                c_type = format!("{c_type} (*)[{array_dimensions}]");
+            } else if !dimensions.is_empty() {
+                c_type = native_adjust_array_parameter_type(&c_type);
+            }
+            parameters.push(FunctionParameter { c_type, name });
+            if self.statements.accept(",").is_none() {
+                break;
+            }
+        }
+        self.statements.expect(")")?;
+        Ok((parameters, variadic, true))
+    }
+}
+
+const MULTI_OPERATORS: [&str; 22] = [
+    "<<=", ">>=", "++", "--", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=",
+    "&=", "|=", "^=", "<<", ">>", "##", "->",
+];
+
+fn error(filename: &str, line: usize, message: &str) -> CCompilerError {
+    CCompilerError(format!("{filename}:{line}: {message}"))
+}
+
+fn float_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut position = start;
+    let mut digits_before = 0;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+        digits_before += 1;
+    }
+
+    let mut is_float = false;
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let fractional_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        is_float = digits_before > 0 || position > fractional_start;
+        if !is_float {
+            return None;
+        }
+    } else if digits_before == 0 {
+        return None;
+    }
+
+    if bytes
+        .get(position)
+        .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+    {
+        let mut exponent_end = position + 1;
+        if bytes
+            .get(exponent_end)
+            .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+        {
+            exponent_end += 1;
+        }
+        let digits_start = exponent_end;
+        while bytes.get(exponent_end).is_some_and(u8::is_ascii_digit) {
+            exponent_end += 1;
+        }
+        if exponent_end > digits_start {
+            is_float = true;
+            position = exponent_end;
+        }
+    }
+
+    if !is_float {
+        return None;
+    }
+    if bytes
+        .get(position)
+        .is_some_and(|byte| matches!(byte, b'f' | b'F' | b'l' | b'L'))
+    {
+        position += 1;
+    }
+    Some(position)
+}
+
+enum QuotedCharacter {
+    Character(char),
+    Byte(u8),
+}
+
+fn decode_quoted(value: &str) -> Result<Vec<QuotedCharacter>, &'static str> {
+    let characters: Vec<char> = value.chars().collect();
+    let mut decoded = Vec::with_capacity(characters.len());
+    let mut position = 0;
+    while position < characters.len() {
+        if characters[position] != '\\' {
+            decoded.push(QuotedCharacter::Character(characters[position]));
+            position += 1;
+            continue;
+        }
+        position += 1;
+        let Some(&escape) = characters.get(position) else {
+            return Err("invalid string literal");
+        };
+        position += 1;
+        let simple = match escape {
+            '\\' => Some('\\'),
+            '\'' => Some('\''),
+            '"' => Some('"'),
+            'a' => Some('\u{7}'),
+            'b' => Some('\u{8}'),
+            'f' => Some('\u{c}'),
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            'v' => Some('\u{b}'),
+            '\n' => None,
+            _ => None,
+        };
+        if matches!(escape, '\n') {
+            continue;
+        }
+        if let Some(character) = simple {
+            decoded.push(QuotedCharacter::Character(character));
+            continue;
+        }
+
+        let radix = match escape {
+            'x' => Some(16),
+            'u' => Some(16),
+            'U' => Some(16),
+            _ => None,
+        };
+        if let Some(radix) = radix {
+            let width = match escape {
+                'x' => characters[position..]
+                    .iter()
+                    .take_while(|character| character.is_ascii_hexdigit())
+                    .count(),
+                'u' => 4,
+                'U' => 8,
+                _ => unreachable!(),
+            };
+            let end = position + width;
+            let Some(digits) = characters.get(position..end) else {
+                return Err("invalid string literal");
+            };
+            if width == 0 {
+                return Err("invalid string literal");
+            }
+            let digits: String = digits.iter().collect();
+            let value =
+                u32::from_str_radix(&digits, radix).map_err(|_| "invalid string literal")?;
+            if escape == 'x' {
+                decoded.push(QuotedCharacter::Byte(
+                    u8::try_from(value).map_err(|_| "invalid string literal")?,
+                ));
+            } else {
+                decoded.push(QuotedCharacter::Character(
+                    char::from_u32(value).ok_or("invalid string literal")?,
+                ));
+            }
+            position = end;
+            continue;
+        }
+
+        if ('0'..='7').contains(&escape) {
+            let mut value = escape.to_digit(8).expect("octal digit");
+            for _ in 0..2 {
+                if let Some(digit) = characters
+                    .get(position)
+                    .and_then(|character| character.to_digit(8))
+                {
+                    value = value * 8 + digit;
+                    position += 1;
+                } else {
+                    break;
+                }
+            }
+            decoded.push(QuotedCharacter::Byte(
+                u8::try_from(value).map_err(|_| "invalid string literal")?,
+            ));
+            continue;
+        }
+
+        decoded.push(QuotedCharacter::Character('\\'));
+        decoded.push(QuotedCharacter::Character(escape));
+    }
+    Ok(decoded)
+}
+
+fn parse_line_marker(
+    marker: &str,
+    filename: &str,
+    line: usize,
+) -> Result<(usize, Option<String>), CCompilerError> {
+    let mut fields = marker.splitn(2, ':');
+    let line_value = fields.next().unwrap_or_default();
+    let parsed_line = line_value
+        .parse::<usize>()
+        .ok()
+        .filter(|line| *line > 0)
+        .ok_or_else(|| error(filename, line, "invalid internal line marker"))?;
+    let marked_filename = match fields.next() {
+        Some(hex) if !hex.is_empty() => {
+            if hex.len() % 2 != 0 {
+                return Err(error(filename, line, "invalid internal filename marker"));
+            }
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            for pair in hex.as_bytes().chunks(2) {
+                let pair = std::str::from_utf8(pair)
+                    .map_err(|_| error(filename, line, "invalid internal filename marker"))?;
+                bytes.push(
+                    u8::from_str_radix(pair, 16)
+                        .map_err(|_| error(filename, line, "invalid internal filename marker"))?,
+                );
+            }
+            Some(
+                String::from_utf8(bytes)
+                    .map_err(|_| error(filename, line, "invalid internal filename marker"))?,
+            )
+        }
+        _ => None,
+    };
+    Ok((parsed_line, marked_filename))
+}
+
+fn parse_line_directive(
+    argument: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    filename: &str,
+    line: usize,
+) -> Result<(usize, Option<String>), CCompilerError> {
+    let mut tokens = lex_unexpanded(argument, filename)?;
+    tokens.pop();
+    set_preprocessor_token_location(&mut tokens, filename, line);
+    let tokens = expand_object_macros(&tokens, macros, &mut Vec::new())?;
+    let Some(line_token) = tokens.first() else {
+        return Err(error(filename, line, "expected a line number after #line"));
+    };
+    if line_token.value.is_empty()
+        || !line_token
+            .value
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return Err(error(filename, line, "invalid line number after #line"));
+    }
+    let line_number = line_token
+        .value
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number > 0 && *number <= u32::MAX as usize)
+        .ok_or_else(|| error(filename, line, "line number after #line is out of range"))?;
+    let marked_filename = match tokens.get(1) {
+        None => None,
+        Some(token) => {
+            let bytes = decode_string_token(&token.value)
+                .ok_or_else(|| error(filename, line, "expected a filename after #line"))?;
+            if tokens.len() != 2 {
+                return Err(error(filename, line, "unexpected tokens after #line"));
+            }
+            Some(
+                String::from_utf8(bytes)
+                    .map_err(|_| error(filename, line, "invalid filename after #line"))?,
+            )
+        }
+    };
+    Ok((line_number, marked_filename))
+}
+
+pub fn lex_raw(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerError> {
+    let mut macros = HashMap::new();
+    let mut macro_snapshots: HashMap<(String, usize), HashMap<String, MacroDefinition>> =
+        HashMap::new();
+    let filtered_source =
+        preprocess_source(source, filename, &mut macros, &mut macro_snapshots, 0)?;
+    let tokens = lex_unexpanded(&filtered_source, filename)?;
+    let mut expanded_tokens = Vec::new();
+    let mut position = 0;
+    while position < tokens.len() {
+        let token = &tokens[position];
+        if token.value == "<eof>" {
+            expanded_tokens.push(token.clone());
+            break;
+        }
+        let key = (
+            token
+                .filename
+                .clone()
+                .unwrap_or_else(|| filename.to_owned()),
+            token.line,
+        );
+        let line_macros = macro_snapshots.get(&key);
+        let mut end = position + 1;
+        while end < tokens.len() && tokens[end].value != "<eof>" {
+            let next_key = (
+                tokens[end]
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| filename.to_owned()),
+                tokens[end].line,
+            );
+            let next_macros = macro_snapshots.get(&next_key);
+            let snapshots_match = match (line_macros, next_macros) {
+                (Some(left), Some(right)) => left == right,
+                (None, None) => true,
+                _ => false,
+            };
+            if !snapshots_match {
+                break;
+            }
+            end += 1;
+        }
+        let line_tokens = &tokens[position..end];
+        if let Some(line_macros) = line_macros {
+            expanded_tokens.extend(expand_object_macros(
+                line_tokens,
+                line_macros,
+                &mut Vec::new(),
+            )?);
+        } else {
+            expanded_tokens.extend_from_slice(line_tokens);
+        }
+        position = end;
+    }
+    Ok(expanded_tokens)
+}
+
+fn preprocess_source(
+    source: &str,
+    filename: &str,
+    macros: &mut HashMap<String, MacroDefinition>,
+    macro_snapshots: &mut HashMap<(String, usize), HashMap<String, MacroDefinition>>,
+    depth: usize,
+) -> Result<String, CCompilerError> {
+    if depth > 64 {
+        return Err(error(
+            filename,
+            1,
+            "include nesting exceeds the supported limit",
+        ));
+    }
+    let translated_source = translate_c90_trigraphs(source);
+    let mut filtered_source = String::with_capacity(source.len());
+    let mut conditionals = Vec::new();
+    let mut active = true;
+    let mut in_block_comment = false;
+    let mut logical_filename = filename.to_owned();
+    let mut logical_line_number = 1;
+    let physical_lines: Vec<_> = translated_source.split_inclusive('\n').collect();
+    let mut physical_index = 0;
+    while physical_index < physical_lines.len() {
+        let mut logical_line = String::new();
+        let mut output_newlines = 0;
+        loop {
+            let physical_line = physical_lines[physical_index];
+            physical_index += 1;
+            let has_newline = physical_line.ends_with('\n');
+            let content = physical_line.strip_suffix('\n').unwrap_or(physical_line);
+            let continuation = if has_newline {
+                content
+                    .strip_suffix("\\\r")
+                    .or_else(|| content.strip_suffix('\\'))
+            } else {
+                None
+            };
+            if let Some(content) = continuation {
+                logical_line.push_str(content);
+                output_newlines += 1;
+                if physical_index < physical_lines.len() {
+                    continue;
+                }
+                break;
+            }
+            logical_line.push_str(content);
+            output_newlines += usize::from(has_newline);
+            break;
+        }
+        let directive_line = strip_comments_for_directive(&logical_line, &mut in_block_comment);
+        let trimmed = directive_line.trim_start();
+        if trimmed.starts_with('#') {
+            let directive = trimmed[1..].trim_start();
+            let directive_end = directive
+                .find(char::is_whitespace)
+                .unwrap_or(directive.len());
+            let directive_name = &directive[..directive_end];
+            let argument = directive[directive_end..].trim_start();
+            match directive_name {
+                "" => {}
+                "ifdef" | "ifndef" => {
+                    let Some((name, trailing)) = split_preprocessor_identifier(argument) else {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "expected a macro name",
+                        ));
+                    };
+                    if !trailing.trim().is_empty()
+                        && !trailing.trim_start().starts_with("//")
+                        && !trailing.trim_start().starts_with("/*")
+                    {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "unexpected tokens after conditional macro name",
+                        ));
+                    }
+                    let mut branch_active = macros.contains_key(name);
+                    if directive_name == "ifndef" {
+                        branch_active = !branch_active;
+                    }
+                    conditionals.push((
+                        active,
+                        branch_active,
+                        false,
+                        logical_filename.clone(),
+                        logical_line_number,
+                    ));
+                    active &= branch_active;
+                }
+                "if" => {
+                    let branch_active = if active {
+                        evaluate_preprocessor_condition(
+                            argument,
+                            macros,
+                            &logical_filename,
+                            logical_line_number,
+                        )?
+                    } else {
+                        false
+                    };
+                    conditionals.push((
+                        active,
+                        branch_active,
+                        false,
+                        logical_filename.clone(),
+                        logical_line_number,
+                    ));
+                    active &= branch_active;
+                }
+                "elif" => {
+                    let Some((parent_active, branch_taken, else_seen, _, _)) =
+                        conditionals.last_mut()
+                    else {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#elif without matching #if",
+                        ));
+                    };
+                    if *else_seen {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#elif after #else",
+                        ));
+                    }
+                    let branch_active = if *parent_active && !*branch_taken {
+                        evaluate_preprocessor_condition(
+                            argument,
+                            macros,
+                            &logical_filename,
+                            logical_line_number,
+                        )?
+                    } else {
+                        false
+                    };
+                    active = branch_active;
+                    *branch_taken |= branch_active;
+                }
+                "else" => {
+                    if !argument.trim().is_empty()
+                        && !argument.trim_start().starts_with("//")
+                        && !argument.trim_start().starts_with("/*")
+                    {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "unexpected tokens after #else",
+                        ));
+                    }
+                    let Some((parent_active, branch_taken, else_seen, _, _)) =
+                        conditionals.last_mut()
+                    else {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#else without matching #if",
+                        ));
+                    };
+                    if *else_seen {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "duplicate #else",
+                        ));
+                    }
+                    active = *parent_active && !*branch_taken;
+                    *branch_taken = true;
+                    *else_seen = true;
+                }
+                "endif" => {
+                    if !argument.trim().is_empty()
+                        && !argument.trim_start().starts_with("//")
+                        && !argument.trim_start().starts_with("/*")
+                    {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "unexpected tokens after #endif",
+                        ));
+                    }
+                    let Some((parent_active, _, _, _, _)) = conditionals.pop() else {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#endif without matching #if",
+                        ));
+                    };
+                    active = parent_active;
+                }
+                "define" if active => {
+                    let definition = argument;
+                    let name_end = definition
+                        .find(|character: char| character.is_whitespace() || character == '(')
+                        .unwrap_or(definition.len());
+                    let name = &definition[..name_end];
+                    if !is_preprocessor_identifier(name) {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "expected a macro name",
+                        ));
+                    }
+                    let tail = &definition[name_end..];
+                    let (parameters, replacement) = if let Some(tail) = tail.strip_prefix('(') {
+                        let Some(close) = tail.find(')') else {
+                            return Err(error(
+                                &logical_filename,
+                                logical_line_number,
+                                "unterminated function-like macro parameter list",
+                            ));
+                        };
+                        let parameter_text = &tail[..close];
+                        let mut parameters = Vec::new();
+                        if !parameter_text.trim().is_empty() {
+                            for parameter in parameter_text.split(',') {
+                                let parameter = parameter.trim();
+                                if !is_preprocessor_identifier(parameter)
+                                    || parameters.iter().any(|existing| existing == parameter)
+                                {
+                                    return Err(error(
+                                        &logical_filename,
+                                        logical_line_number,
+                                        "invalid function-like macro parameter list",
+                                    ));
+                                }
+                                parameters.push(parameter.to_owned());
+                            }
+                        }
+                        (Some(parameters), tail[close + 1..].trim_start())
+                    } else {
+                        (None, tail.trim_start())
+                    };
+                    let mut tokens = lex_unexpanded(replacement, &logical_filename)?;
+                    tokens.pop();
+                    set_preprocessor_token_location(
+                        &mut tokens,
+                        &logical_filename,
+                        logical_line_number,
+                    );
+                    let definition = MacroDefinition {
+                        parameters,
+                        replacement: tokens,
+                    };
+                    if macros
+                        .get(name)
+                        .is_some_and(|previous| !macros_equivalent(previous, &definition))
+                    {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            &format!("incompatible redefinition of macro {name}"),
+                        ));
+                    }
+                    macros.entry(name.to_owned()).or_insert(definition);
+                }
+                "undef" if active => {
+                    let Some((name, trailing)) = split_preprocessor_identifier(argument) else {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "expected a macro name",
+                        ));
+                    };
+                    if !trailing.trim().is_empty()
+                        && !trailing.trim_start().starts_with("//")
+                        && !trailing.trim_start().starts_with("/*")
+                    {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "unexpected tokens after macro name",
+                        ));
+                    }
+                    macros.remove(name);
+                }
+                "include" if active => {
+                    let (target, quoted) = parse_include_target(
+                        argument,
+                        macros,
+                        &logical_filename,
+                        logical_line_number,
+                    )?;
+                    let included_path = resolve_include_path(&target, quoted, filename)
+                        .ok_or_else(|| {
+                            error(
+                                &logical_filename,
+                                logical_line_number,
+                                &format!("cannot find include file {target:?}"),
+                            )
+                        })?;
+                    let included = fs::read_to_string(&included_path).map_err(|io_error| {
+                        error(
+                            &logical_filename,
+                            logical_line_number,
+                            &format!("cannot read include file {target:?}: {io_error}"),
+                        )
+                    })?;
+                    let included_filename = included_path.to_string_lossy();
+                    filtered_source.push_str(&format!(
+                        "\0SC16_LINE:1:{}\n",
+                        hex_encode(included_filename.as_bytes())
+                    ));
+                    filtered_source.push_str(&preprocess_source(
+                        included.strip_prefix('\u{feff}').unwrap_or(&included),
+                        &included_filename,
+                        macros,
+                        macro_snapshots,
+                        depth + 1,
+                    )?);
+                    filtered_source.push_str(&format!(
+                        "\n\0SC16_LINE:{}:{}",
+                        logical_line_number + output_newlines,
+                        hex_encode(logical_filename.as_bytes())
+                    ));
+                }
+                "line" if active => {
+                    let (marked_line, marked_filename) = parse_line_directive(
+                        argument,
+                        macros,
+                        &logical_filename,
+                        logical_line_number,
+                    )?;
+                    let mut marker_filename = logical_filename.clone();
+                    if let Some(marked_filename) = marked_filename {
+                        marker_filename = marked_filename;
+                    }
+                    for _ in 0..output_newlines {
+                        filtered_source.push('\n');
+                    }
+                    filtered_source.push_str(&format!(
+                        "\0SC16_LINE:{marked_line}:{}\n",
+                        hex_encode(marker_filename.as_bytes())
+                    ));
+                    logical_line_number = marked_line;
+                    logical_filename = marker_filename;
+                    continue;
+                }
+                "error" if active => {
+                    let mut tokens = lex_unexpanded(argument, &logical_filename)?;
+                    tokens.pop();
+                    set_preprocessor_token_location(
+                        &mut tokens,
+                        &logical_filename,
+                        logical_line_number,
+                    );
+                    let expanded = expand_object_macros(&tokens, macros, &mut Vec::new())?;
+                    let message = expanded
+                        .iter()
+                        .map(|token| token.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let message = if message.is_empty() {
+                        "#error directive triggered".to_owned()
+                    } else {
+                        format!("#error {message}")
+                    };
+                    return Err(error(&logical_filename, logical_line_number, &message));
+                }
+                "pragma" if active => {}
+                "define" | "undef" => {}
+                _ if !active => {}
+                _ => {
+                    let message =
+                        format!("#{directive_name} is not supported by the Rust C preprocessor");
+                    return Err(error(&logical_filename, logical_line_number, &message));
+                }
+            }
+            for _ in 0..output_newlines {
+                filtered_source.push('\n');
+            }
+        } else {
+            if active {
+                macro_snapshots.insert(
+                    (logical_filename.clone(), logical_line_number),
+                    macros.clone(),
+                );
+                filtered_source.push_str(&logical_line);
+            }
+            for _ in 0..output_newlines {
+                filtered_source.push('\n');
+            }
+        }
+        logical_line_number += output_newlines;
+    }
+    if let Some((_, _, _, opening_filename, opening_line)) = conditionals.last() {
+        return Err(error(
+            opening_filename,
+            *opening_line,
+            "unterminated preprocessor conditional",
+        ));
+    }
+    Ok(filtered_source)
+}
+
+fn split_preprocessor_identifier(input: &str) -> Option<(&str, &str)> {
+    let mut characters = input.char_indices();
+    let (_, first) = characters.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    let end = characters
+        .find_map(|(index, character)| {
+            (!(character == '_' || character.is_ascii_alphanumeric())).then_some(index)
+        })
+        .unwrap_or(input.len());
+    Some((&input[..end], &input[end..]))
+}
+
+fn is_preprocessor_identifier(value: &str) -> bool {
+    let Some((name, trailing)) = split_preprocessor_identifier(value) else {
+        return false;
+    };
+    trailing.is_empty() && name == value
+}
+
+fn macros_equivalent(left: &MacroDefinition, right: &MacroDefinition) -> bool {
+    left.parameters == right.parameters
+        && left.replacement.len() == right.replacement.len()
+        && left
+            .replacement
+            .iter()
+            .zip(&right.replacement)
+            .all(|(left, right)| left.value == right.value)
+}
+
+fn set_preprocessor_token_location(tokens: &mut [Token], filename: &str, line: usize) {
+    for token in tokens {
+        token.line = line;
+        token.filename = Some(filename.to_owned());
+    }
+}
+
+fn parse_include_target(
+    argument: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    filename: &str,
+    line: usize,
+) -> Result<(String, bool), CCompilerError> {
+    let mut tokens = lex_unexpanded(argument, filename)?;
+    tokens.pop();
+    set_preprocessor_token_location(&mut tokens, filename, line);
+    let expanded = expand_object_macros(&tokens, macros, &mut Vec::new())?;
+    if expanded.len() == 1
+        && let Some(hex) = expanded[0]
+            .value
+            .strip_prefix("<string:")
+            .and_then(|value| value.strip_suffix('>'))
+    {
+        if hex.len() % 2 != 0 {
+            return Err(error(filename, line, "invalid #include filename"));
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks(2) {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| error(filename, line, "invalid #include filename"))?;
+            bytes.push(
+                u8::from_str_radix(pair, 16)
+                    .map_err(|_| error(filename, line, "invalid #include filename"))?,
+            );
+        }
+        let target = String::from_utf8(bytes)
+            .map_err(|_| error(filename, line, "#include filename must be valid UTF-8"))?;
+        return Ok((target, true));
+    }
+    if expanded.first().is_some_and(|token| token.value == "<")
+        && expanded.last().is_some_and(|token| token.value == ">")
+        && expanded.len() > 2
+    {
+        let target = expanded[1..expanded.len() - 1]
+            .iter()
+            .map(|token| token.value.as_str())
+            .collect::<String>();
+        return Ok((target, false));
+    }
+    Err(error(filename, line, "invalid #include"))
+}
+
+fn resolve_include_path(target: &str, quoted: bool, filename: &str) -> Option<PathBuf> {
+    let target_path = Path::new(target);
+    let mut candidates = Vec::new();
+    if target_path.is_absolute() {
+        candidates.push(target_path.to_path_buf());
+    } else {
+        if quoted {
+            let source_parent = Path::new(filename)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            candidates.push(source_parent.join(target_path));
+        }
+        let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+        candidates.push(
+            manifest_directory
+                .join("toolchain")
+                .join("include")
+                .join(target_path),
+        );
+        if let Some(repository_directory) = manifest_directory.parent() {
+            candidates.push(
+                repository_directory
+                    .join("toolchain")
+                    .join("include")
+                    .join(target_path),
+            );
+        }
+    }
+    candidates.into_iter().find_map(|candidate| {
+        candidate
+            .is_file()
+            .then(|| candidate.canonicalize().ok())
+            .flatten()
+    })
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn evaluate_preprocessor_condition(
+    source: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    filename: &str,
+    line: usize,
+) -> Result<bool, CCompilerError> {
+    let mut tokens = lex_unexpanded(source, filename)?;
+    tokens.pop();
+    set_preprocessor_token_location(&mut tokens, filename, line);
+    let mut defined_tokens = Vec::new();
+    let mut position = 0;
+    while position < tokens.len() {
+        if tokens[position].value != "defined" {
+            defined_tokens.push(tokens[position].clone());
+            position += 1;
+            continue;
+        }
+        let directive_token = &tokens[position];
+        position += 1;
+        let parenthesized = tokens.get(position).is_some_and(|token| token.value == "(");
+        if parenthesized {
+            position += 1;
+        }
+        let Some(name) = tokens.get(position) else {
+            return Err(error(filename, line, "expected a macro name after defined"));
+        };
+        if !is_preprocessor_identifier(&name.value) {
+            return Err(error(filename, line, "expected a macro name after defined"));
+        }
+        let is_defined = macros.contains_key(&name.value);
+        position += 1;
+        if parenthesized {
+            if !tokens.get(position).is_some_and(|token| token.value == ")") {
+                return Err(error(
+                    filename,
+                    line,
+                    "expected closing parenthesis after defined",
+                ));
+            }
+            position += 1;
+        }
+        defined_tokens.push(Token {
+            value: i32::from(is_defined).to_string(),
+            line: directive_token.line,
+            filename: directive_token.filename.clone(),
+            leading_space: directive_token.leading_space,
+        });
+    }
+    let mut expanded = expand_object_macros(&defined_tokens, macros, &mut Vec::new())?;
+    for token in &mut expanded {
+        if is_preprocessor_identifier(&token.value) {
+            token.value = "0".to_owned();
+        }
+        token.line = line;
+        token.filename = Some(filename.to_owned());
+    }
+    expanded.push(Token {
+        value: "<eof>".to_owned(),
+        line,
+        filename: Some(filename.to_owned()),
+        leading_space: false,
+    });
+    let mut parser = ExpressionParser::new(expanded);
+    let expression = parser.parse_expression(0).map_err(|_| {
+        error(
+            filename,
+            line,
+            "invalid integer constant expression in preprocessor condition",
+        )
+    })?;
+    if !parser.is_at_end() {
+        return Err(error(
+            filename,
+            line,
+            "invalid integer constant expression in preprocessor condition",
+        ));
+    }
+    let value =
+        evaluate_integer_constant_with_names(&expression, &HashMap::new()).map_err(|_| {
+            error(
+                filename,
+                line,
+                "invalid integer constant expression in preprocessor condition",
+            )
+        })?;
+    Ok(value != 0)
+}
+
+fn strip_comments_for_directive(line: &str, in_block_comment: &mut bool) -> String {
+    let characters: Vec<_> = line.chars().collect();
+    let mut directive_line = String::with_capacity(line.len());
+    let mut position = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    if *in_block_comment {
+        directive_line.push(' ');
+    }
+    while position < characters.len() {
+        let character = characters[position];
+        if *in_block_comment {
+            if position + 1 < characters.len()
+                && character == '*'
+                && characters[position + 1] == '/'
+            {
+                *in_block_comment = false;
+                position += 2;
+            } else {
+                position += 1;
+            }
+        } else if let Some(quoted) = quote {
+            directive_line.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == quoted {
+                quote = None;
+            }
+            position += 1;
+        } else if position + 1 < characters.len()
+            && character == '/'
+            && characters[position + 1] == '/'
+        {
+            directive_line.push(' ');
+            break;
+        } else if position + 1 < characters.len()
+            && character == '/'
+            && characters[position + 1] == '*'
+        {
+            directive_line.push(' ');
+            *in_block_comment = true;
+            position += 2;
+        } else {
+            if matches!(character, '"' | '\'') {
+                quote = Some(character);
+            }
+            directive_line.push(character);
+            position += 1;
+        }
+    }
+    directive_line
+}
+
+fn translate_c90_trigraphs(source: &str) -> String {
+    let characters: Vec<_> = source.chars().collect();
+    let mut translated = String::with_capacity(source.len());
+    let mut position = 0;
+    while position < characters.len() {
+        if position + 2 < characters.len()
+            && characters[position] == '?'
+            && characters[position + 1] == '?'
+        {
+            let replacement = match characters[position + 2] {
+                '=' => Some('#'),
+                '/' => Some('\\'),
+                '\'' => Some('^'),
+                '(' => Some('['),
+                ')' => Some(']'),
+                '!' => Some('|'),
+                '<' => Some('{'),
+                '>' => Some('}'),
+                '-' => Some('~'),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                translated.push(replacement);
+                position += 3;
+                continue;
+            }
+        }
+        translated.push(characters[position]);
+        position += 1;
+    }
+    translated
+}
+
+fn expand_object_macros(
+    tokens: &[Token],
+    macros: &HashMap<String, MacroDefinition>,
+    expansion_stack: &mut Vec<String>,
+) -> Result<Vec<Token>, CCompilerError> {
+    let mut expanded = Vec::new();
+    let mut position = 0;
+    while position < tokens.len() {
+        let token = &tokens[position];
+        if token.value == "__LINE__" {
+            expanded.push(Token {
+                value: token.line.to_string(),
+                line: token.line,
+                filename: token.filename.clone(),
+                leading_space: token.leading_space,
+            });
+            position += 1;
+            continue;
+        }
+        if token.value == "__FILE__" {
+            let filename = token.filename.as_deref().unwrap_or("<source>");
+            expanded.push(Token {
+                value: format!("<string:{}>", hex_encode(filename.as_bytes())),
+                line: token.line,
+                filename: token.filename.clone(),
+                leading_space: token.leading_space,
+            });
+            position += 1;
+            continue;
+        }
+        let Some(definition) = macros.get(&token.value) else {
+            expanded.push(token.clone());
+            position += 1;
+            continue;
+        };
+        if expansion_stack.contains(&token.value) {
+            expanded.push(token.clone());
+            position += 1;
+            continue;
+        }
+        if expansion_stack.len() >= 128 {
+            return Err(error(
+                token.filename.as_deref().unwrap_or("<source>"),
+                token.line,
+                "macro expansion exceeds the supported nesting limit",
+            ));
+        }
+        let mut raw_arguments = HashMap::new();
+        let mut invocation_end = position;
+        if let Some(parameters) = &definition.parameters {
+            if !tokens
+                .get(position + 1)
+                .is_some_and(|next| next.value == "(")
+            {
+                expanded.push(token.clone());
+                position += 1;
+                continue;
+            }
+            let mut arguments = vec![Vec::new()];
+            let mut nesting = 0usize;
+            let mut cursor = position + 2;
+            while cursor < tokens.len() {
+                match tokens[cursor].value.as_str() {
+                    "(" => {
+                        nesting += 1;
+                        arguments
+                            .last_mut()
+                            .expect("argument exists")
+                            .push(tokens[cursor].clone());
+                    }
+                    ")" if nesting == 0 => break,
+                    ")" => {
+                        nesting -= 1;
+                        arguments
+                            .last_mut()
+                            .expect("argument exists")
+                            .push(tokens[cursor].clone());
+                    }
+                    "," if nesting == 0 => arguments.push(Vec::new()),
+                    _ => arguments
+                        .last_mut()
+                        .expect("argument exists")
+                        .push(tokens[cursor].clone()),
+                }
+                cursor += 1;
+            }
+            if cursor == tokens.len() {
+                return Err(error(
+                    token.filename.as_deref().unwrap_or("<source>"),
+                    token.line,
+                    "unterminated function-like macro invocation",
+                ));
+            }
+            if parameters.is_empty() && arguments.len() == 1 && arguments[0].is_empty() {
+                arguments.clear();
+            }
+            if arguments.len() != parameters.len() {
+                return Err(error(
+                    token.filename.as_deref().unwrap_or("<source>"),
+                    token.line,
+                    &format!(
+                        "macro {} expects {} argument(s), got {}",
+                        token.value,
+                        parameters.len(),
+                        arguments.len()
+                    ),
+                ));
+            }
+            raw_arguments.extend(parameters.iter().cloned().zip(arguments));
+            invocation_end = cursor;
+        }
+        expansion_stack.push(token.value.clone());
+        let mut substituted = Vec::new();
+        let mut replacement_index = 0;
+        while replacement_index < definition.replacement.len() {
+            let replacement_token = &definition.replacement[replacement_index];
+            if replacement_token.value == "#"
+                && let Some(parameter) = definition.replacement.get(replacement_index + 1)
+                && let Some(argument) = raw_arguments.get(&parameter.value)
+            {
+                let spelling = stringify_macro_argument(argument);
+                let escaped = spelling.replace('\\', "\\\\").replace('"', "\\\"");
+                let mut string_tokens = lex_unexpanded(&format!("\"{escaped}\""), "<macro>")?;
+                string_tokens.pop();
+                for string_token in &mut string_tokens {
+                    string_token.line = token.line;
+                    string_token.filename = token.filename.clone();
+                }
+                substituted.extend(string_tokens);
+                replacement_index += 2;
+                continue;
+            }
+            if let Some(argument) = raw_arguments.get(&replacement_token.value) {
+                let paste_adjacent = definition
+                    .replacement
+                    .get(replacement_index.wrapping_sub(1))
+                    .is_some_and(|previous| previous.value == "##")
+                    || definition
+                        .replacement
+                        .get(replacement_index + 1)
+                        .is_some_and(|next| next.value == "##");
+                let mut argument = if paste_adjacent {
+                    argument.clone()
+                } else {
+                    expand_object_macros(argument, macros, expansion_stack)?
+                };
+                for argument_token in &mut argument {
+                    argument_token.line = token.line;
+                    argument_token.filename = token.filename.clone();
+                }
+                substituted.extend(argument);
+            } else {
+                substituted.push(Token {
+                    value: replacement_token.value.clone(),
+                    line: token.line,
+                    filename: token.filename.clone(),
+                    leading_space: replacement_token.leading_space,
+                });
+            }
+            replacement_index += 1;
+        }
+        let mut rescanned = expand_object_macros(
+            &paste_macro_tokens(substituted, token)?,
+            macros,
+            expansion_stack,
+        )?;
+        expansion_stack.pop();
+        let suffix = &tokens[invocation_end + 1..];
+        if let Some(last) = rescanned.last()
+            && last.value != token.value
+            && macros
+                .get(&last.value)
+                .is_some_and(|macro_definition| macro_definition.parameters.is_some())
+            && suffix.first().is_some_and(|next| next.value == "(")
+        {
+            let mut bridge = vec![rescanned.pop().expect("last token exists")];
+            bridge.extend_from_slice(suffix);
+            expanded.extend(expand_object_macros(&bridge, macros, expansion_stack)?);
+            return Ok(expanded);
+        }
+        expanded.extend(rescanned);
+        position = invocation_end + 1;
+    }
+    Ok(expanded)
+}
+
+fn token_spelling(token: &Token) -> String {
+    if let Some(hex) = token
+        .value
+        .strip_prefix("<string:")
+        .and_then(|value| value.strip_suffix('>'))
+        && hex.len() % 2 == 0
+    {
+        let bytes = hex
+            .as_bytes()
+            .chunks(2)
+            .filter_map(|pair| std::str::from_utf8(pair).ok())
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect::<Vec<_>>();
+        if let Ok(string) = String::from_utf8(bytes) {
+            return format!("{string:?}");
+        }
+    }
+    token.value.clone()
+}
+
+fn stringify_macro_argument(argument: &[Token]) -> String {
+    let mut spelling = String::new();
+    for (index, token) in argument.iter().enumerate() {
+        if index > 0 && token.leading_space {
+            spelling.push(' ');
+        }
+        spelling.push_str(&token_spelling(token));
+    }
+    spelling
+}
+
+fn paste_macro_tokens(
+    tokens: Vec<Token>,
+    invocation: &Token,
+) -> Result<Vec<Token>, CCompilerError> {
+    let mut pasted = Vec::new();
+    let mut position = 0;
+    while position < tokens.len() {
+        if tokens[position].value != "##" {
+            pasted.push(tokens[position].clone());
+            position += 1;
+            continue;
+        }
+        if pasted.is_empty() || position + 1 >= tokens.len() {
+            return Err(error(
+                invocation.filename.as_deref().unwrap_or("<source>"),
+                invocation.line,
+                "invalid ## in macro replacement",
+            ));
+        }
+        let left = pasted.pop().expect("checked non-empty");
+        let spelling = format!(
+            "{}{}",
+            token_spelling(&left),
+            token_spelling(&tokens[position + 1])
+        );
+        let mut joined = lex_unexpanded(&spelling, "<macro>")?;
+        joined.pop();
+        if joined.len() != 1 {
+            return Err(error(
+                invocation.filename.as_deref().unwrap_or("<source>"),
+                invocation.line,
+                "## does not form one token",
+            ));
+        }
+        let mut joined = joined.pop().expect("one token");
+        joined.line = invocation.line;
+        joined.filename = invocation.filename.clone();
+        joined.leading_space = left.leading_space;
+        pasted.push(joined);
+        position += 2;
+    }
+    Ok(pasted)
+}
+
+fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerError> {
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    let mut line = 1;
+    let mut token_filename = filename.to_owned();
+    let mut leading_space = false;
+
+    while position < source.len() {
+        let remaining = &source[position..];
+        let character = remaining
+            .chars()
+            .next()
+            .expect("position is a char boundary");
+        if character.is_whitespace() {
+            if character == '\n' {
+                line += 1;
+            }
+            leading_space = true;
+            position += character.len_utf8();
+            continue;
+        }
+
+        if remaining.starts_with("\0SC16_LINE:") {
+            let marker_start = position + "\0SC16_LINE:".len();
+            let marker_end = source[marker_start..]
+                .find('\n')
+                .map(|offset| marker_start + offset)
+                .unwrap_or(source.len());
+            let marker = &source[marker_start..marker_end];
+            let (marked_line, marked_filename) = parse_line_marker(marker, &token_filename, line)?;
+            line = marked_line - 1;
+            if let Some(marked_filename) = marked_filename {
+                token_filename = marked_filename;
+            }
+            position = marker_end;
+            continue;
+        }
+
+        if remaining.starts_with("//") {
+            leading_space = true;
+            position += remaining.find('\n').unwrap_or(remaining.len());
+            continue;
+        }
+        if let Some(comment_body) = remaining.strip_prefix("/*") {
+            let Some(end) = comment_body.find("*/").map(|offset| position + 2 + offset) else {
+                return Err(error(&token_filename, line, "unterminated comment"));
+            };
+            line += source[position..end + 2].matches('\n').count();
+            leading_space = true;
+            position = end + 2;
+            continue;
+        }
+
+        if let Some(end) = float_end(source, position) {
+            tokens.push(Token {
+                value: source[position..end].to_owned(),
+                line,
+                filename: Some(token_filename.clone()),
+                leading_space,
+            });
+            leading_space = false;
+            position = end;
+            continue;
+        }
+
+        if character == '"' || character == '\'' {
+            let quote = character;
+            let start_line = line;
+            position += quote.len_utf8();
+            let content_start = position;
+            let mut escaped = false;
+            let mut closed = false;
+            while position < source.len() {
+                let current = source[position..]
+                    .chars()
+                    .next()
+                    .expect("valid char boundary");
+                if current == '\n' && !escaped {
+                    let message = if quote == '"' {
+                        "newline in string literal"
+                    } else {
+                        "newline in character/string literal"
+                    };
+                    return Err(error(&token_filename, start_line, message));
+                }
+                if escaped {
+                    escaped = false;
+                } else if current == '\\' {
+                    escaped = true;
+                } else if current == quote {
+                    let content_end = position;
+                    position += current.len_utf8();
+                    let decoded = decode_quoted(&source[content_start..content_end])
+                        .map_err(|message| error(&token_filename, start_line, message))?;
+                    let value = if quote == '"' {
+                        let mut bytes = Vec::new();
+                        for character in decoded {
+                            match character {
+                                QuotedCharacter::Character(character) => {
+                                    let mut encoded = [0; 4];
+                                    bytes.extend_from_slice(
+                                        character.encode_utf8(&mut encoded).as_bytes(),
+                                    );
+                                }
+                                QuotedCharacter::Byte(byte) => bytes.push(byte),
+                            }
+                        }
+                        format!(
+                            "<string:{}>",
+                            bytes
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        )
+                    } else if decoded.len() == 1 {
+                        match decoded[0] {
+                            QuotedCharacter::Character(character) => (character as u32).to_string(),
+                            QuotedCharacter::Byte(byte) => byte.to_string(),
+                        }
+                    } else {
+                        return Err(error(
+                            &token_filename,
+                            start_line,
+                            "character constants must contain one character",
+                        ));
+                    };
+                    if quote == '"'
+                        && let Some(previous) = tokens.last_mut()
+                        && previous.value.starts_with("<string:")
+                        && previous.value.ends_with('>')
+                    {
+                        previous.value.pop();
+                        previous
+                            .value
+                            .push_str(value.strip_prefix("<string:").unwrap_or_default());
+                        leading_space = false;
+                        closed = true;
+                        break;
+                    }
+                    tokens.push(Token {
+                        value,
+                        line: start_line,
+                        filename: Some(token_filename.clone()),
+                        leading_space,
+                    });
+                    leading_space = false;
+                    closed = true;
+                    break;
+                }
+                if quote == '\'' && current == '\n' {
+                    line += 1;
+                }
+                position += current.len_utf8();
+            }
+            if !closed {
+                let message = if quote == '"' {
+                    "unterminated string literal"
+                } else {
+                    "unterminated character/string literal"
+                };
+                return Err(error(&token_filename, start_line, message));
+            }
+            continue;
+        }
+
+        if character.is_alphabetic() || character == '_' {
+            let start = position;
+            position += character.len_utf8();
+            while position < source.len() {
+                let next = source[position..]
+                    .chars()
+                    .next()
+                    .expect("valid char boundary");
+                if !next.is_alphanumeric() && next != '_' {
+                    break;
+                }
+                position += next.len_utf8();
+            }
+            tokens.push(Token {
+                value: source[start..position].to_owned(),
+                line,
+                filename: Some(token_filename.clone()),
+                leading_space,
+            });
+            leading_space = false;
+            continue;
+        }
+
+        if character.is_ascii_digit() {
+            let start = position;
+            position += character.len_utf8();
+            while position < source.len() {
+                let next = source[position..]
+                    .chars()
+                    .next()
+                    .expect("valid char boundary");
+                if !next.is_alphanumeric() && next != '_' {
+                    break;
+                }
+                position += next.len_utf8();
+            }
+            tokens.push(Token {
+                value: source[start..position].to_owned(),
+                line,
+                filename: Some(token_filename.clone()),
+                leading_space,
+            });
+            leading_space = false;
+            continue;
+        }
+
+        if let Some(operator) = MULTI_OPERATORS
+            .iter()
+            .find(|operator| remaining.starts_with(**operator))
+        {
+            tokens.push(Token {
+                value: (*operator).to_owned(),
+                line,
+                filename: Some(token_filename.clone()),
+                leading_space,
+            });
+            leading_space = false;
+            position += operator.len();
+            continue;
+        }
+        if "{}();,:.[]=+-*/%<>!~&|^#?".contains(character) {
+            tokens.push(Token {
+                value: character.to_string(),
+                line,
+                filename: Some(token_filename.clone()),
+                leading_space,
+            });
+            leading_space = false;
+            position += character.len_utf8();
+            continue;
+        }
+        return Err(error(
+            &token_filename,
+            line,
+            &format!("unsupported character {character:?}"),
+        ));
+    }
+
+    tokens.push(Token {
+        value: "<eof>".to_owned(),
+        line,
+        filename: Some(token_filename),
+        leading_space: false,
+    });
+    Ok(tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn values(source: &str) -> Vec<String> {
+        lex_raw(source, "fixture.c")
+            .unwrap()
+            .into_iter()
+            .map(|token| token.value)
+            .collect()
+    }
+
+    #[test]
+    fn tokenizes_c90_operators_in_longest_first_order() {
+        assert_eq!(
+            values("a <<= 2; b -> c; ++a; x && y; x ## y;"),
+            [
+                "a", "<<=", "2", ";", "b", "->", "c", ";", "++", "a", ";", "x", "&&", "y", ";",
+                "x", "##", "y", ";", "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn expands_nested_object_like_macros_and_preserves_invocation_locations() {
+        let tokens = lex_raw(
+            "#define BASE 4\n#define TOTAL (BASE + 3)\nint result = TOTAL;\n",
+            "macros.c",
+        )
+        .unwrap();
+        let result = tokens
+            .iter()
+            .find(|token| token.value == "4")
+            .expect("expanded base constant");
+        assert_eq!(result.line, 3);
+        assert_eq!(result.filename.as_deref(), Some("macros.c"));
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.value.as_str())
+                .collect::<Vec<_>>(),
+            ["int", "result", "=", "(", "4", "+", "3", ")", ";", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn undef_removes_object_like_macros_and_strings_are_not_expanded() {
+        assert_eq!(
+            values("#define TEXT token\nconst char *text = \"TEXT\";\n#undef TEXT\nTEXT"),
+            [
+                "const",
+                "char",
+                "*",
+                "text",
+                "=",
+                "<string:54455854>",
+                ";",
+                "TEXT",
+                "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn macro_expansion_uses_the_definitions_active_at_each_source_line() {
+        assert_eq!(
+            values(
+                "#define VALUE 1\nint first = VALUE;\n#undef VALUE\n\
+                 #define VALUE 2\nint second = VALUE;\n"
+            ),
+            [
+                "int", "first", "=", "1", ";", "int", "second", "=", "2", ";", "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn splices_physical_lines_before_preprocessing_and_tokenizing() {
+        assert_eq!(
+            values("#define VALUE 2 + \\\n3\nint main(void) { ret\\\nurn VALUE; }"),
+            [
+                "int", "main", "(", "void", ")", "{", "return", "2", "+", "3", ";", "}", "<eof>"
+            ]
+        );
+        let tokens = lex_raw("first\\\nsecond\nthird", "continued.c").unwrap();
+        assert_eq!(tokens[0].value, "firstsecond");
+        assert_eq!(tokens[0].line, 1);
+        assert_eq!(tokens[1].value, "third");
+        assert_eq!(tokens[1].line, 3);
+    }
+
+    #[test]
+    fn translates_c90_trigraphs_before_directives_and_line_splicing() {
+        assert_eq!(
+            translate_c90_trigraphs(r"??= ??/ ??' ??( ??) ??! ??< ??> ??-"),
+            r"# \ ^ [ ] | { } ~"
+        );
+        assert_eq!(
+            values(
+                r#"??=define VALUE 2 + ??/
+3
+int main(void) { return VALUE; }"#
+            ),
+            [
+                "int", "main", "(", "void", ")", "{", "return", "2", "+", "3", ";", "}", "<eof>"
+            ]
+        );
+        assert_eq!(
+            values(r#"const char *text = "??=";"#),
+            [
+                "const",
+                "char",
+                "*",
+                "text",
+                "=",
+                "<string:23>",
+                ";",
+                "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn expands_function_like_macros_with_nested_and_prescanned_arguments() {
+        assert_eq!(
+            values(
+                "#define VALUE 4\n#define ADD(left, right) ((left) + (right))\n\
+                 ADD(VALUE, (2 + 1))"
+            ),
+            [
+                "(", "(", "4", ")", "+", "(", "(", "2", "+", "1", ")", ")", ")", "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn rescans_function_macro_invocations_across_lines_and_object_aliases() {
+        assert_eq!(
+            values(
+                "#define ID(value) value\n#define ALIAS ID\n\
+                 ALIAS\n(9)"
+            ),
+            ["9", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn expands_macro_stringification_and_token_pasting() {
+        let tokens = values(
+            "#define TEXT(value) #value\n#define JOIN(left, right) left ## right\n\
+             TEXT(hello world) JOIN(item, 7) JOIN(5, U)",
+        );
+        assert_eq!(
+            tokens,
+            ["<string:68656c6c6f20776f726c64>", "item7", "5U", "<eof>"]
+        );
+        assert_eq!(
+            values(
+                "#define TEXT(value) #value\n\
+                 TEXT(a+b) TEXT(a + b) TEXT(a/**/+b) TEXT(  a   +   b  )"
+            ),
+            [
+                "<string:612b62>",
+                "<string:61202b2062>",
+                "<string:61202b62>",
+                "<string:61202b2062>",
+                "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_function_macro_argument_count_errors() {
+        assert_eq!(
+            lex_raw(
+                "#define PAIR(left, right) left + right\nPAIR(1)\n",
+                "macro.c"
+            )
+            .unwrap_err()
+            .to_string(),
+            "macro.c:2: macro PAIR expects 2 argument(s), got 1"
+        );
+    }
+
+    #[test]
+    fn handles_error_and_pragma_preprocessor_directives() {
+        assert_eq!(
+            values("#pragma once\nint value;\n"),
+            ["int", "value", ";", "<eof>"]
+        );
+        assert_eq!(
+            lex_raw("#define FAILURE stop now\n#error FAILURE\n", "directive.c")
+                .unwrap_err()
+                .to_string(),
+            "directive.c:2: #error stop now"
+        );
+        assert_eq!(
+            values("#if 0\n#error inactive\n#endif\nint value;\n"),
+            ["int", "value", ";", "<eof>"]
+        );
+        assert_eq!(
+            lex_raw("#define VALUE 1\n#define VALUE 2\n", "macro.c")
+                .unwrap_err()
+                .to_string(),
+            "macro.c:2: incompatible redefinition of macro VALUE"
+        );
+    }
+
+    #[test]
+    fn line_directive_maps_tokens_and_macro_snapshots() {
+        let tokens = lex_raw(
+            "#define SOURCE_LINE 37\n#define CURRENT_LINE __LINE__\n\
+             #line SOURCE_LINE \"generated.c\"\nint value = CURRENT_LINE;\n\
+             const char *file = __FILE__;\n",
+            "original.c",
+        )
+        .unwrap();
+        let value = tokens.iter().find(|token| token.value == "value").unwrap();
+        assert_eq!(value.line, 37);
+        assert_eq!(value.filename.as_deref(), Some("generated.c"));
+        let line_literal = tokens.iter().find(|token| token.value == "37").unwrap();
+        assert_eq!(line_literal.line, 37);
+        assert_eq!(line_literal.filename.as_deref(), Some("generated.c"));
+        let file_literal = tokens
+            .iter()
+            .find(|token| token.value == "<string:67656e6572617465642e63>")
+            .unwrap();
+        assert_eq!(file_literal.line, 38);
+        assert_eq!(file_literal.filename.as_deref(), Some("generated.c"));
+        assert_eq!(
+            values("#if __LINE__ == 1\nint enabled;\n#endif"),
+            ["int", "enabled", ";", "<eof>"]
+        );
+        assert_eq!(
+            values("#line 30\n#if __LINE__ == 30\nint enabled;\n#endif"),
+            ["int", "enabled", ";", "<eof>"]
+        );
+        assert_eq!(
+            lex_raw("#line 9 \"virtual.c\"\n#error failed\n", "original.c")
+                .unwrap_err()
+                .to_string(),
+            "virtual.c:9: #error failed"
+        );
+        assert_eq!(
+            lex_raw(
+                "#line 20 \"mapped.c\"\n#define BAD(parameter, parameter) value\n",
+                "original.c"
+            )
+            .unwrap_err()
+            .to_string(),
+            "mapped.c:20: invalid function-like macro parameter list"
+        );
+        assert_eq!(
+            lex_raw("#line 30 \"mapped.c\"\n#if 1\n", "original.c")
+                .unwrap_err()
+                .to_string(),
+            "mapped.c:30: unterminated preprocessor conditional"
+        );
+    }
+
+    #[test]
+    fn line_directive_rejects_invalid_numbers_and_trailing_tokens() {
+        for directive in ["#line 0\n", "#line 4 \"file.c\" extra\n", "#line value\n"] {
+            assert!(
+                lex_raw(directive, "line.c").is_err(),
+                "invalid directive accepted: {directive:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_c90_preprocessing_translation_limit_minima() {
+        let mut nested_conditionals = "#if 1\n".repeat(63);
+        nested_conditionals.push_str("enabled\n");
+        nested_conditionals.push_str(&"#endif\n".repeat(63));
+        assert_eq!(values(&nested_conditionals), ["enabled", "<eof>"]);
+
+        let parameters = (0..127)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let arguments = (1..=127)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            values(&format!(
+                "#define LAST({parameters}) p126\nLAST({arguments})"
+            )),
+            ["127", "<eof>"]
+        );
+
+        let logical_line = format!("/*{}*/\nint value;", "x".repeat(4091));
+        assert_eq!(values(&logical_line), ["int", "value", ";", "<eof>"]);
+        let string_literal = format!("\"{}\"", "x".repeat(4095));
+        let tokens = lex_raw(&string_literal, "limits.c").unwrap();
+        assert_eq!(decode_string_token(&tokens[0].value).unwrap().len(), 4095);
+        assert_eq!(
+            values("#\nint after_directive;"),
+            ["int", "after_directive", ";", "<eof>"]
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("sc16-c90-include-limits-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("root.c");
+        for index in 0..15 {
+            let content = if index == 14 {
+                "included_token\n".to_owned()
+            } else {
+                format!("#include \"nested_{}.h\"\n", index + 1)
+            };
+            fs::write(directory.join(format!("nested_{index}.h")), content).unwrap();
+        }
+        let tokens = lex_raw("#include \"nested_0.h\"\n", source_path.to_str().unwrap()).unwrap();
+        assert!(tokens.iter().any(|token| token.value == "included_token"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reports_preprocessor_resource_limit_exhaustion() {
+        let mut recursive_macros = String::new();
+        for index in 0..=128 {
+            recursive_macros.push_str(&format!("#define M{index} M{}\n", index + 1));
+        }
+        recursive_macros.push_str("M0\n");
+        assert!(
+            lex_raw(&recursive_macros, "macro-depth.c")
+                .unwrap_err()
+                .to_string()
+                .contains("macro expansion exceeds the supported nesting limit")
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("sc16-c90-include-depth-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("root.c");
+        for index in 0..65 {
+            let content = if index == 64 {
+                "included_token\n".to_owned()
+            } else {
+                format!("#include \"nested_{}.h\"\n", index + 1)
+            };
+            fs::write(directory.join(format!("nested_{index}.h")), content).unwrap();
+        }
+        let error = lex_raw("#include \"nested_0.h\"\n", source_path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("include nesting exceeds the supported limit"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ignores_directive_text_inside_block_comments() {
+        assert_eq!(
+            values("/*\n#define HIDDEN 4\n*/\nHIDDEN"),
+            ["HIDDEN", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn recognizes_directives_after_comments_and_keeps_comment_markers_in_strings() {
+        assert_eq!(values("/* lead */ #define VALUE 4\nVALUE"), ["4", "<eof>"]);
+        assert_eq!(
+            values("# /* empty directive */\nint value;"),
+            ["int", "value", ";", "<eof>"]
+        );
+        assert_eq!(
+            values("#define TEXT \"/* not a comment */\"\nTEXT"),
+            ["<string:2f2a206e6f74206120636f6d6d656e74202a2f>", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn resolves_nested_includes_with_shared_include_guards_and_locations() {
+        let directory =
+            std::env::temp_dir().join(format!("sc16-c-includes-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let root = directory.join("root.c");
+        let header = directory.join("values.h");
+        let nested = directory.join("nested.h");
+        fs::write(
+            &header,
+            "#ifndef VALUES_H\n#define VALUES_H\n#include \"nested.h\"\n#define ANSWER (BASE + 1)\n#endif\n",
+        )
+        .unwrap();
+        fs::write(&nested, "#define BASE 40\n").unwrap();
+        let source = "#include \"values.h\"\n#include \"values.h\"\nint result = ANSWER;\n";
+        let tokens = lex_raw(source, &root.to_string_lossy()).unwrap();
+        let answer = tokens
+            .iter()
+            .find(|token| token.value == "40")
+            .expect("included nested macro");
+        assert_eq!(
+            answer.filename.as_deref(),
+            Some(root.to_string_lossy().as_ref())
+        );
+        let result = tokens
+            .iter()
+            .find(|token| token.value == "result")
+            .expect("root source token");
+        assert_eq!(
+            result.filename.as_deref(),
+            Some(root.to_string_lossy().as_ref())
+        );
+        assert_eq!(result.line, 3);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compiles_local_header_includes_natively() {
+        let directory =
+            std::env::temp_dir().join(format!("sc16-c-include-build-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let header = directory.join("answer.h");
+        fs::write(&header, "#define ANSWER 42\n").unwrap();
+        let image = compile_minimal_program(
+            "#include \"answer.h\"\nint main(void) { return ANSWER; }\n",
+            &directory.join("main.c").to_string_lossy(),
+        )
+        .unwrap()
+        .expect("supported C source with local header");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert_eq!(cpu.registers[0], 42);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolves_angle_includes_from_the_repository_library() {
+        let image = compile_minimal_program(
+            "#include <limits.h>\nint main(void) { return INT_MAX; }\n",
+            "angle-include.c",
+        )
+        .unwrap()
+        .expect("supported repository library include");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert_eq!(cpu.registers[0], 32767);
+    }
+
+    #[test]
+    fn expands_function_macros_from_the_integer_standard_header() {
+        let image = compile_minimal_program(
+            "#include <stdint.h>\n\
+             int main(void) { return UINT8_C(7) + UINT16_C(9); }\n",
+            "stdint-include.c",
+        )
+        .unwrap()
+        .expect("supported fixed-width integer header macros");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert_eq!(cpu.registers[0], 16);
+    }
+
+    #[test]
+    fn reports_missing_local_header_with_source_location() {
+        let directory =
+            std::env::temp_dir().join(format!("sc16-c-missing-include-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let result = compile_minimal_program(
+            "#include \"missing.h\"\nint main(void) { return 0; }\n",
+            &directory.join("main.c").to_string_lossy(),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "{}:1: cannot find include file \"missing.h\"",
+                directory.join("main.c").display()
+            )
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn processes_nested_defined_conditionals_and_skips_inactive_directives() {
+        let tokens = lex_raw(
+            "#define SELECTED 9\n\
+             #ifdef SELECTED\n\
+             #if defined(SELECTED) && SELECTED * 2 == 18\n\
+             int value = SELECTED;\n\
+             #elif defined(MISSING)\n\
+             #include <inactive.h>\n\
+             #else\n\
+             #include <inactive.h>\n\
+             #endif\n\
+             #else\n\
+             int wrong = 0;\n\
+             #endif\n",
+            "conditional.c",
+        )
+        .unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.value.as_str())
+                .collect::<Vec<_>>(),
+            ["int", "value", "=", "9", ";", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn evaluates_if_elif_integer_constant_expressions() {
+        let tokens = lex_raw(
+            "#define CHOICE (2 + 3)\n\
+             #if CHOICE < 0\nint wrong = 0;\n\
+             #elif CHOICE == 5 && !defined(UNKNOWN)\nint selected = CHOICE;\n\
+             #elif 1\nint wrong_again = 0;\n\
+             #else\nint final_wrong = 0;\n\
+             #endif\n",
+            "condition-expression.c",
+        )
+        .unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.value.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "int", "selected", "=", "(", "2", "+", "3", ")", ";", "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_preprocessor_conditionals() {
+        assert_eq!(
+            lex_raw("#else\n", "conditional.c").unwrap_err().to_string(),
+            "conditional.c:1: #else without matching #if"
+        );
+        assert_eq!(
+            lex_raw("#ifdef FEATURE\n", "conditional.c")
+                .unwrap_err()
+                .to_string(),
+            "conditional.c:1: unterminated preprocessor conditional"
+        );
+        assert_eq!(
+            lex_raw("#if 1\n#else\n#elif 0\n#endif\n", "conditional.c")
+                .unwrap_err()
+                .to_string(),
+            "conditional.c:3: #elif after #else"
+        );
+        assert_eq!(
+            lex_raw("#if 1 / 0\n#endif\n", "conditional.c")
+                .unwrap_err()
+                .to_string(),
+            "conditional.c:1: invalid integer constant expression in preprocessor condition"
+        );
+        assert_eq!(
+            lex_raw("#elif 1\n", "conditional.c")
+                .unwrap_err()
+                .to_string(),
+            "conditional.c:1: #elif without matching #if"
+        );
+    }
+
+    #[test]
+    fn encodes_string_and_character_literals_as_compiler_tokens() {
+        assert_eq!(
+            values(r#""A\n\u03bb" "B" '\x41' '\101' item.field"#),
+            [
+                "<string:410acebb42>",
+                "65",
+                "65",
+                "item",
+                ".",
+                "field",
+                "<eof>"
+            ]
+        );
+        assert_eq!(
+            values(r#""\xff\101\u03bb""#),
+            ["<string:ff41cebb>", "<eof>"]
+        );
+        assert_eq!(values(".5 1. 1e-2"), [".5", "1.", "1e-2", "<eof>"]);
+        assert_eq!(
+            values("city[i].ladder"),
+            ["city", "[", "i", "]", ".", "ladder", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn recognizes_decimal_floating_constant_forms() {
+        assert_eq!(
+            values(".5 1. 1e-2 2.5F 0x1e"),
+            [".5", "1.", "1e-2", "2.5F", "0x1e", "<eof>"]
+        );
+    }
+
+    #[test]
+    fn tracks_comment_lines_and_internal_file_markers() {
+        let tokens = lex_raw(
+            "/* first\nsecond */\n\0SC16_LINE:27:696e636c7564652e68\nname",
+            "root.c",
+        )
+        .unwrap();
+        assert_eq!(tokens[0].value, "name");
+        assert_eq!(tokens[0].line, 27);
+        assert_eq!(tokens[0].filename.as_deref(), Some("include.h"));
+        assert_eq!(tokens[1].value, "<eof>");
+        assert_eq!(tokens[1].line, 27);
+    }
+
+    #[test]
+    fn reports_unterminated_comments_and_invalid_character_constants() {
+        assert_eq!(
+            lex_raw("/* open", "fixture.c").unwrap_err().to_string(),
+            "fixture.c:1: unterminated comment"
+        );
+        assert_eq!(
+            lex_raw("'ab'", "fixture.c").unwrap_err().to_string(),
+            "fixture.c:1: character constants must contain one character"
+        );
+    }
+
+    #[test]
+    fn reports_unknown_source_characters_with_filename_and_line() {
+        assert_eq!(
+            lex_raw("int x;\n@", "sample.c").unwrap_err().to_string(),
+            "sample.c:2: unsupported character '@'"
+        );
+    }
+
+    fn expression(source: &str) -> Expression {
+        let mut parser = ExpressionParser::from_source(source, "expression.c").unwrap();
+        let expression = parser.parse().unwrap();
+        assert!(parser.is_at_end(), "unparsed token: {:?}", parser.token());
+        expression
+    }
+
+    fn atom(name: &str, line: usize) -> Expression {
+        located_atom(name, line, "expression.c")
+    }
+
+    fn located_atom(name: &str, line: usize, filename: &str) -> Expression {
+        Expression {
+            kind: ExpressionKind::Atom(name.to_owned()),
+            line,
+            filename: Some(filename.to_owned()),
+        }
+    }
+
+    #[test]
+    fn parses_binary_precedence_and_left_associativity() {
+        assert_eq!(
+            expression("a + b * c - d"),
+            Expression {
+                kind: ExpressionKind::Binary {
+                    operator: "-".to_owned(),
+                    left: Box::new(Expression {
+                        kind: ExpressionKind::Binary {
+                            operator: "+".to_owned(),
+                            left: Box::new(atom("a", 1)),
+                            right: Box::new(Expression {
+                                kind: ExpressionKind::Binary {
+                                    operator: "*".to_owned(),
+                                    left: Box::new(atom("b", 1)),
+                                    right: Box::new(atom("c", 1)),
+                                },
+                                line: 1,
+                                filename: Some("expression.c".to_owned()),
+                            }),
+                        },
+                        line: 1,
+                        filename: Some("expression.c".to_owned()),
+                    }),
+                    right: Box::new(atom("d", 1)),
+                },
+                line: 1,
+                filename: Some("expression.c".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_right_associative_assignment_and_conditional_expressions() {
+        let assignment = expression("a = b += c");
+        assert!(matches!(
+            assignment.kind,
+            ExpressionKind::Assignment {
+                operator,
+                value,
+                ..
+            } if operator == "=" && matches!(
+                value.kind,
+                ExpressionKind::Assignment { ref operator, .. } if operator == "+="
+            )
+        ));
+        let conditional = expression("a ? b : c ? d : e");
+        assert!(matches!(
+            conditional.kind,
+            ExpressionKind::Conditional { when_false, .. }
+                if matches!(when_false.kind, ExpressionKind::Conditional { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_calls_indexes_members_and_postfix_operators() {
+        let parsed = expression("object->items[index + 1]++");
+        assert!(matches!(
+            parsed.kind,
+            ExpressionKind::Postfix {
+                operator,
+                expression,
+            } if operator == "++" && matches!(
+                expression.kind,
+                ExpressionKind::Index { ref expression, .. }
+                    if matches!(expression.kind, ExpressionKind::Member { ref operator, .. } if operator == "->")
+            )
+        ));
+        let call = expression("f(a, g(b + 1))");
+        assert!(matches!(
+            call.kind,
+            ExpressionKind::Call { arguments, .. } if arguments.len() == 2
+        ));
+    }
+
+    #[test]
+    fn parses_simple_casts_and_sizeof_type_names() {
+        assert!(matches!(
+            expression("(unsigned long *)pointer").kind,
+            ExpressionKind::Cast { c_type, .. } if c_type == "unsigned long*"
+        ));
+        assert!(matches!(
+            expression("sizeof(unsigned char*)").kind,
+            ExpressionKind::SizeofType(c_type) if c_type == "unsigned char*"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_assignment_targets_and_indirect_calls() {
+        assert_eq!(
+            ExpressionParser::from_source("1 = value", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: assignment requires a scalar variable"
+        );
+        assert_eq!(
+            ExpressionParser::from_source("(a + b)(c)", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: only direct function calls are supported"
+        );
+    }
+
+    fn statement(source: &str) -> Statement {
+        StatementParser::from_source(source, "statement.c")
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn parses_compound_block_with_local_declarations_and_returns() {
+        assert_eq!(
+            statement("{ unsigned int count = 3, *pointer; return count; }"),
+            Statement {
+                kind: StatementKind::Compound(vec![
+                    Statement {
+                        kind: StatementKind::Declaration(vec![
+                            Declaration {
+                                c_type: "unsigned int".to_owned(),
+                                name: "count".to_owned(),
+                                array_length: None,
+                                array_dimensions: Vec::new(),
+                                initializer: Some(located_atom("3", 1, "statement.c")),
+                            },
+                            Declaration {
+                                c_type: "unsigned int*".to_owned(),
+                                name: "pointer".to_owned(),
+                                array_length: None,
+                                array_dimensions: Vec::new(),
+                                initializer: None,
+                            },
+                        ]),
+                        line: 1,
+                        filename: Some("statement.c".to_owned()),
+                    },
+                    Statement {
+                        kind: StatementKind::Return(Some(located_atom("count", 1, "statement.c",))),
+                        line: 1,
+                        filename: Some("statement.c".to_owned()),
+                    },
+                ]),
+                line: 1,
+                filename: Some("statement.c".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_if_else_and_nested_loop_control() {
+        let parsed = statement("if (ready) { while (active) { break; } } else { continue; }");
+        assert!(matches!(
+            parsed.kind,
+            StatementKind::If {
+                then_branch,
+                else_branch: Some(_),
+                ..
+            } if matches!(
+                then_branch.kind,
+                StatementKind::Compound(ref statements)
+                    if matches!(
+                        statements[0].kind,
+                        StatementKind::While { ref body, .. }
+                            if matches!(
+                                body.kind,
+                                StatementKind::Compound(ref nested)
+                                    if matches!(nested[0].kind, StatementKind::Break)
+                            )
+                    )
+            )
+        ));
+    }
+
+    #[test]
+    fn parses_switch_cases_and_reports_duplicate_default() {
+        let parsed = statement("switch (value) { case 1: value++; default: break; }");
+        assert!(matches!(parsed.kind, StatementKind::Switch { .. }));
+        let error =
+            StatementParser::from_source("switch (value) { default: ; default: ; }", "switch.c")
+                .unwrap()
+                .parse()
+                .unwrap_err();
+        assert_eq!(error.to_string(), "switch.c:1: duplicate default label");
+    }
+
+    #[test]
+    fn parses_for_declaration_do_while_and_labels() {
+        let parsed = statement("for (int i = 0; i < 4; i++) { work(i); }");
+        assert!(matches!(
+            parsed.kind,
+            StatementKind::For {
+                initializer: Some(initializer),
+                condition: Some(_),
+                update: Some(_),
+                body,
+            } if matches!(initializer.kind, StatementKind::Declaration(_))
+                && matches!(body.kind, StatementKind::Compound(_))
+        ));
+
+        assert!(matches!(
+            statement("again: do { tick(); } while (pending);").kind,
+            StatementKind::Label { name, statement }
+                if name == "again" && matches!(statement.kind, StatementKind::DoWhile { .. })
+        ));
+    }
+
+    #[test]
+    fn reports_malformed_control_statements_and_unterminated_blocks() {
+        assert_eq!(
+            StatementParser::from_source("if ready return 1;", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: expected \"(\", got \"ready\""
+        );
+        assert_eq!(
+            StatementParser::from_source("{ return 0;", "bad.c")
+                .unwrap()
+                .parse()
+                .unwrap_err()
+                .to_string(),
+            "bad.c:1: unterminated compound statement"
+        );
+    }
+
+    fn translation_unit(source: &str) -> TranslationUnit {
+        TranslationUnitParser::from_source(source, "unit.c")
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn parses_global_declarations_and_function_prototypes() {
+        assert_eq!(
+            translation_unit("unsigned int counter = 3; char *message; int sum(int, int);"),
+            TranslationUnit {
+                declarations: vec![
+                    ExternalDeclaration::Global(Declaration {
+                        c_type: "unsigned int".to_owned(),
+                        name: "counter".to_owned(),
+                        array_length: None,
+                        array_dimensions: Vec::new(),
+                        initializer: Some(located_atom("3", 1, "unit.c")),
+                    }),
+                    ExternalDeclaration::Global(Declaration {
+                        c_type: "char*".to_owned(),
+                        name: "message".to_owned(),
+                        array_length: None,
+                        array_dimensions: Vec::new(),
+                        initializer: None,
+                    }),
+                    ExternalDeclaration::FunctionPrototype(FunctionDeclaration {
+                        return_type: "int".to_owned(),
+                        name: "sum".to_owned(),
+                        parameters: vec![
+                            FunctionParameter {
+                                c_type: "int".to_owned(),
+                                name: None,
+                            },
+                            FunctionParameter {
+                                c_type: "int".to_owned(),
+                                name: None,
+                            },
+                        ],
+                        variadic: false,
+                        has_prototype: true,
+                    }),
+                ],
+                enumerators: HashMap::new(),
+                records: HashMap::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_enumerations_and_integer_constant_expressions() {
+        let unit = translation_unit(
+            "enum Mode { MODE_ZERO = 2, MODE_ONE, MODE_THREE = MODE_ONE + 4 }; \
+             enum Mode current;",
+        );
+        assert_eq!(
+            unit.enumerators,
+            HashMap::from([
+                ("MODE_ZERO".to_owned(), 2),
+                ("MODE_ONE".to_owned(), 3),
+                ("MODE_THREE".to_owned(), 7),
+            ])
+        );
+        assert!(matches!(
+            &unit.declarations[..],
+            [ExternalDeclaration::Global(Declaration {
+                c_type,
+                name,
+                ..
+            })] if c_type == "int" && name == "current"
+        ));
+    }
+
+    #[test]
+    fn parses_scalar_typedef_aliases() {
+        let unit = translation_unit(
+            "typedef int word; typedef word count; \
+             count identity(word value) { count result = value; return result; }",
+        );
+        assert!(matches!(
+            &unit.declarations[..],
+            [ExternalDeclaration::FunctionDefinition(function)]
+                if function.declaration.return_type == "int"
+                    && function.declaration.parameters[0].c_type == "int"
+                    && function.declaration.name == "identity"
+        ));
+    }
+
+    #[test]
+    fn parses_function_pointer_typedefs_and_prototype_metadata() {
+        let unit = translation_unit(
+            "typedef int (*Unary)(int); \
+             typedef int (*Variadic)(int, ...); \
+             Unary callbacks[3]; \
+            int (*direct_callbacks[4])(int); \
+            int (**nested_callback)(int); \
+            int (*row_pointer)[3]; \
+            int *map(int *(*callback)(int), int *value); \
+            int pointer_to_array(int (*rows)[3]); \
+            int accept_callbacks(int (*callbacks[2])(int)); \
+            int array_total(int values[4]); \
+            int pointer_array(int *values[3]); \
+            int callback_parameter(int callback(int)); \
+            int pointer_callback_parameter(int *callback(int)); \
+            int invoke(int (*callback)(int), int value); \
+            int invoke_variadic(int (*callback)(int, ...), int value);",
+        );
+        assert!(matches!(
+            &unit.declarations[..],
+            [
+                ExternalDeclaration::Global(Declaration { c_type, name, array_length: Some(3), .. }),
+                ExternalDeclaration::Global(Declaration { c_type: direct_type, name: direct_name, array_length: Some(4), .. }),
+                ExternalDeclaration::Global(Declaration { c_type: nested_type, name: nested_name, .. }),
+                ExternalDeclaration::Global(Declaration { c_type: row_type, name: row_name, array_length: None, .. }),
+                ExternalDeclaration::FunctionPrototype(pointer_return),
+                ExternalDeclaration::FunctionPrototype(pointer_to_array),
+                ExternalDeclaration::FunctionPrototype(array_parameter),
+                ExternalDeclaration::FunctionPrototype(integer_array),
+                ExternalDeclaration::FunctionPrototype(pointer_array),
+                ExternalDeclaration::FunctionPrototype(callback_parameter),
+                ExternalDeclaration::FunctionPrototype(pointer_callback_parameter),
+                ExternalDeclaration::FunctionPrototype(unary),
+                ExternalDeclaration::FunctionPrototype(variadic),
+            ] if c_type == "int (*)(int)"
+                && name == "callbacks"
+                && direct_type == "int (*)(int)"
+                && direct_name == "direct_callbacks"
+                && nested_type == "int (**)(int)"
+                && nested_name == "nested_callback"
+                && row_type == "int (*)[3]"
+                && row_name == "row_pointer"
+                && pointer_return.return_type == "int*"
+                && pointer_return.parameters[0].c_type == "int* (*)(int)"
+                && pointer_return.parameters[1].c_type == "int*"
+                && pointer_to_array.parameters[0].c_type == "int (*)[3]"
+                && array_parameter.parameters[0].c_type == "int (**)(int)"
+                && integer_array.parameters[0].c_type == "int*"
+                && pointer_array.parameters[0].c_type == "int**"
+                && callback_parameter.parameters[0].c_type == "int (*)(int)"
+                && pointer_callback_parameter.parameters[0].c_type == "int* (*)(int)"
+                && unary.parameters[0].c_type == "int (*)(int)"
+                && unary.parameters[1].c_type == "int"
+                && variadic.parameters[0].c_type == "int (*)(int, ...)"
+        ));
+    }
+
+    #[test]
+    fn parses_abstract_function_pointer_type_names() {
+        assert!(matches!(
+            expression("sizeof(int (*)(int))").kind,
+            ExpressionKind::SizeofType(c_type) if c_type == "int (*)(int)"
+        ));
+        assert!(matches!(
+            expression("(int (*)(int, ...))callback").kind,
+            ExpressionKind::Cast { c_type, .. } if c_type == "int (*)(int, ...)"
+        ));
+        assert!(matches!(
+            expression("sizeof(int * (**)(int))").kind,
+            ExpressionKind::SizeofType(c_type) if c_type == "int* (**)(int)"
+        ));
+    }
+
+    #[test]
+    fn adjusts_multidimensional_array_parameters_to_pointer_to_array_types() {
+        let unit = translation_unit("int read(int values[][3]);");
+        assert!(matches!(
+            &unit.declarations[..],
+            [ExternalDeclaration::FunctionPrototype(function)]
+                if function.parameters[0].c_type == "int (*)[3]"
+        ));
+    }
+
+    #[test]
+    fn parses_struct_typedefs_and_record_typed_objects() {
+        let unit = translation_unit(
+            "typedef struct { int x; int y; unsigned char flags[4]; } Vec2; \
+             typedef struct Building { Vec2 position; int inventory; } Building; \
+             Building city[3]; \
+             int main(void) { Building local; return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[..],
+            [ExternalDeclaration::Global(Declaration {
+                c_type,
+                name,
+                array_length: Some(3),
+                ..
+            }), ExternalDeclaration::FunctionDefinition(function)]
+                if c_type == "struct Building"
+                    && name == "city"
+                    && function.declaration.name == "main"
+        ));
+        let ExternalDeclaration::FunctionDefinition(function) = &unit.declarations[1] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &function.body.kind else {
+            panic!("expected function body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].c_type == "struct Building"
+        ));
+    }
+
+    #[test]
+    fn computes_record_layouts_with_nested_records_and_arrays() {
+        let unit = translation_unit(
+            "typedef struct { int x; int y; } Point; \
+             typedef struct { Point origin; unsigned char path[5]; int count; } Route; \
+             Route route;",
+        );
+        let ExternalDeclaration::Global(route) = &unit.declarations[0] else {
+            panic!("expected global route");
+        };
+        let layout = unit.records.get(&route.c_type).expect("Route layout");
+        assert_eq!(layout.size, 12);
+        assert_eq!(layout.fields["count"].offset, 10);
+        assert_eq!(layout.fields["count"].size, 2);
+    }
+
+    #[test]
+    fn lays_out_struct_and_union_bit_fields() {
+        let unit = translation_unit(
+            "struct Flags { unsigned int ready : 1; unsigned int mode : 3; \
+             signed int signed_value : 4; unsigned int : 8; \
+             unsigned int final : 1; unsigned int : 0; \
+             unsigned int after_zero : 2; unsigned char tail; }; \
+             union Overlay { unsigned int low : 4; unsigned int high : 9; \
+             unsigned char byte; };",
+        );
+        let flags = unit.records.get("struct Flags").expect("Flags layout");
+        assert_eq!(flags.size, 10);
+        assert_eq!(flags.bit_field_units, [0, 2, 4, 6]);
+        assert_eq!(flags.fields["ready"].bit_field, Some((0, 1)));
+        assert_eq!(flags.fields["mode"].bit_field, Some((1, 3)));
+        assert_eq!(flags.fields["signed_value"].bit_field, Some((0, 4)));
+        assert_eq!(flags.fields["final"].bit_field, Some((8, 1)));
+        assert_eq!(flags.fields["after_zero"].offset, 6);
+        assert_eq!(flags.fields["tail"].offset, 8);
+
+        let overlay = unit.records.get("union Overlay").expect("Overlay layout");
+        assert_eq!(overlay.size, 2);
+        assert!(overlay.is_union);
+        assert_eq!(overlay.bit_field_units, [0]);
+        assert_eq!(overlay.fields["low"].bit_field, Some((0, 4)));
+        assert_eq!(overlay.fields["high"].bit_field, Some((0, 9)));
+        assert_eq!(overlay.fields["byte"].offset, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_bit_field_declarations() {
+        for source in [
+            "struct Flags { int ready : 17; }; int main(void) { return 0; }",
+            "struct Flags { int ready : 0; }; int main(void) { return 0; }",
+            "struct Flags { char ready : 1; }; int main(void) { return 0; }",
+            "struct Flags { int *ready : 1; }; int main(void) { return 0; }",
+        ] {
+            assert!(compile_minimal_program(source, "invalid-bit-field.c").is_err());
+        }
+    }
+
+    #[test]
+    fn accesses_nested_record_members_through_pointer_and_global() {
+        let image = compile_minimal_program(
+            "typedef struct { int x; int y; } Point; \
+             typedef struct { Point origin; int count; } State; \
+             State state; \
+             void update(State *value) { value->origin.x = 7; value->origin.y = 9; } \
+             int main(void) { update(&state); return state.origin.x + state.origin.y; }",
+            "nested-record-members.c",
+        )
+        .unwrap()
+        .expect("supported nested record members");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 16);
+    }
+
+    #[test]
+    fn indexes_arrays_of_nested_records_inside_records() {
+        let image = compile_minimal_program(
+            "typedef struct { int x; int y; } Point; \
+             typedef struct { Point points[3]; } State; \
+             State state; \
+             int main(void) { state.points[2].x = 17; state.points[2].y = 19; \
+                 return state.points[2].x + state.points[2].y; }",
+            "nested-record-array.c",
+        )
+        .unwrap()
+        .expect("supported arrays of nested records");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 36);
+    }
+
+    #[test]
+    fn takes_address_of_record_array_member_element() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Robot; \
+             typedef struct { Robot robots[2]; } State; \
+             State state; \
+             void update(State *state, int index) { Robot *robot; \
+                 robot = &state->robots[index]; robot->value = 42; } \
+             int main(void) { update(&state, 1); \
+                 return state.robots[1].value; }",
+            "record-array-member-address.c",
+        )
+        .unwrap()
+        .expect("supported address of a record-array member element");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn takes_address_of_nested_record_member() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Inner; \
+             typedef struct { Inner inner; } Outer; \
+             Outer state; \
+             void update(Inner *inner) { inner->value = 27; } \
+             int main(void) { update(&state.inner); return state.inner.value; }",
+            "nested-record-member-address.c",
+        )
+        .unwrap()
+        .expect("supported address of a nested record member");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 27);
+    }
+
+    #[test]
+    fn assigns_conditional_values_to_record_members() {
+        let image = compile_minimal_program(
+            "typedef enum { NONE, MINE } Kind; \
+             typedef struct { Kind kind; } Item; Item item; \
+             void update(Item *value, Kind requested) { \
+                 value->kind = requested == MINE ? requested : NONE; } \
+             int main(void) { update(&item, MINE); return item.kind; }",
+            "conditional-record-member-assignment.c",
+        )
+        .unwrap()
+        .expect("supported conditional assignment to a record member");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 1);
+    }
+
+    #[test]
+    fn preserves_postfix_value_when_incrementing_record_member() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Item; Item item; \
+             int main(void) { int previous; item.value = 8; \
+                 previous = item.value++; return previous + item.value; }",
+            "postfix-record-member.c",
+        )
+        .unwrap()
+        .expect("supported postfix increment of a record member");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 17);
+    }
+
+    #[test]
+    fn reads_and_writes_arrays_inside_records() {
+        let image = compile_minimal_program(
+            "typedef struct { int values[3]; } State; \
+             State state; \
+             int main(void) { state.values[1] = 9; \
+                 state.values[2] = state.values[1]; return state.values[2]; }",
+            "record-member-array.c",
+        )
+        .unwrap()
+        .expect("supported reads and writes of arrays inside records");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 9);
+    }
+
+    #[test]
+    fn copies_records_between_elements_of_member_arrays() {
+        let image = compile_minimal_program(
+            "typedef struct { int x; unsigned char flag; int y; } Item; \
+             typedef struct { Item items[2]; } State; \
+             State state; \
+             int main(void) { state.items[0].x = 11; state.items[0].flag = 1; \
+                 state.items[0].y = 31; state.items[1] = state.items[0]; \
+                 return state.items[1].x + state.items[1].flag + state.items[1].y; }",
+            "member-record-array-copy.c",
+        )
+        .unwrap()
+        .expect("supported copies between member-array record elements");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 43);
+    }
+
+    #[test]
+    fn uses_file_scope_enumerators_in_local_array_bounds() {
+        let unit = translation_unit(
+            "enum Size { BUFFER_SIZE = 5 }; \
+             int main(void) { int buffer[BUFFER_SIZE]; return 0; }",
+        );
+        let ExternalDeclaration::FunctionDefinition(main) = &unit.declarations[0] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &main.body.kind else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].array_length == Some(5)
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_enumerators() {
+        let error = TranslationUnitParser::from_source(
+            "enum First { SAME }; enum Second { SAME };",
+            "duplicate-enum.c",
+        )
+        .unwrap()
+        .parse()
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "duplicate-enum.c:1: duplicate enumerator \"SAME\""
+        );
+    }
+
+    #[test]
+    fn parses_function_definitions_and_variadic_signatures() {
+        let unit = translation_unit(
+            "int old_style(); \
+             int fixed(void); \
+             int log_value(const char *format, ...); \
+             int add(int left, int right) { return left + right; }",
+        );
+        assert!(matches!(
+            &unit.declarations[0],
+            ExternalDeclaration::FunctionPrototype(function)
+                if function.name == "old_style" && !function.has_prototype
+        ));
+        assert!(matches!(
+            &unit.declarations[1],
+            ExternalDeclaration::FunctionPrototype(function)
+                if function.name == "fixed"
+                    && function.has_prototype
+                    && function.parameters.is_empty()
+        ));
+        assert!(matches!(
+            &unit.declarations[2],
+            ExternalDeclaration::FunctionPrototype(function)
+                if function.name == "log_value"
+                    && function.variadic
+                    && function.has_prototype
+                    && function.parameters.len() == 1
+                    && function.parameters[0].c_type == "const char*"
+                    && function.parameters[0].name.as_deref() == Some("format")
+        ));
+        assert!(matches!(
+            &unit.declarations[3],
+            ExternalDeclaration::FunctionDefinition(definition)
+                if definition.declaration.name == "add"
+                    && definition.declaration.has_prototype
+                    && definition.declaration.parameters.len() == 2
+                    && matches!(definition.body.kind, StatementKind::Compound(_))
+        ));
+        assert!(
+            compile_minimal_program(
+                "int no_arguments(void); \
+                 int main(void) { return no_arguments(1); }",
+                "prototype-arity.c"
+            )
+            .unwrap()
+            .is_none(),
+            "a void prototype must retain its fixed zero-argument contract"
+        );
+    }
+
+    #[test]
+    fn parses_multiple_external_declarators_and_arrays() {
+        let unit = translation_unit(
+            "static int first, second[12]; long *pointer, value; int main(void) { return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[..3],
+            [
+                ExternalDeclaration::Global(Declaration { name: first, .. }),
+                ExternalDeclaration::Global(Declaration { name: second, array_length: Some(12), .. }),
+                ExternalDeclaration::Global(Declaration { name: pointer, c_type, .. }),
+            ] if first == "first" && second == "second" && pointer == "pointer" && c_type == "long*"
+        ));
+        assert!(matches!(
+            unit.declarations.last(),
+            Some(ExternalDeclaration::FunctionDefinition(definition))
+                if definition.declaration.name == "main"
+        ));
+    }
+
+    #[test]
+    fn parses_multidimensional_array_declarators() {
+        let unit = translation_unit(
+            "unsigned char map[15][20]; int main(void) { int values[2][3]; return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[0],
+            ExternalDeclaration::Global(Declaration {
+                array_length: Some(300),
+                array_dimensions,
+                ..
+            }) if array_dimensions == &[15, 20]
+        ));
+        let ExternalDeclaration::FunctionDefinition(main) = &unit.declarations[1] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &main.body.kind else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].array_length == Some(6)
+                    && declarations[0].array_dimensions == [2, 3]
+        ));
+    }
+
+    #[test]
+    fn infers_array_bounds_from_initializers() {
+        let unit = translation_unit(
+            r#"unsigned char bytes[] = { 1, 2, 3 }; char title[] = "SC";
+               int main(void) { int local[] = { 4, 5 }; return 0; }"#,
+        );
+        assert!(matches!(
+            &unit.declarations[..2],
+            [
+                ExternalDeclaration::Global(Declaration {
+                    array_length: Some(3),
+                    ..
+                }),
+                ExternalDeclaration::Global(Declaration {
+                    array_length: Some(3),
+                    ..
+                })
+            ]
+        ));
+        let ExternalDeclaration::FunctionDefinition(main) = &unit.declarations[2] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &main.body.kind else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].array_length == Some(2)
+        ));
+    }
+
+    #[test]
+    fn rejects_incomplete_arrays_without_inferable_initializers() {
+        for source in [
+            "int values[]; int main(void) { return 0; }",
+            "int main(void) { int values[]; return 0; }",
+            "int values[] = 1; int main(void) { return 0; }",
+        ] {
+            assert!(
+                TranslationUnitParser::from_source(source, "incomplete-array.c")
+                    .unwrap()
+                    .parse()
+                    .is_err(),
+                "source unexpectedly parsed: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_function_pointer_objects_without_claiming_codegen_support() {
+        let unit = translation_unit("int (*callback)(int);");
+        assert!(matches!(
+            &unit.declarations[..],
+            [ExternalDeclaration::Global(Declaration { c_type, name, .. })]
+                if c_type == "int (*)(int)" && name == "callback"
+        ));
+    }
+
+    #[test]
+    fn rejects_function_pointer_codegen_instead_of_lowering_as_object_pointers() {
+        for source in [
+            "int (*callback)(int); int main(void) { return 0; }",
+            "int invoke(int (*callback)(int)); int main(void) { return 0; }",
+            "typedef int (*Unary)(int); \
+             int main(void) { Unary callback; return 0; }",
+            "int main(void) { return (int (*)(int))0 != 0; }",
+        ] {
+            let error =
+                compile_minimal_program_to_assembly(source, "function-pointer.c").unwrap_err();
+            assert!(error.to_string().contains("function-pointer"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_pointer_to_array_codegen_explicitly() {
+        let error = compile_minimal_program_to_assembly(
+            "int (*rows)[3]; int main(void) { return 0; }",
+            "pointer-to-array.c",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pointer-to-array code generation"),
+            "{error}"
+        );
+        let error = compile_minimal_program_to_assembly(
+            "int read_rows(int rows[][3]); int main(void) { return 0; }",
+            "pointer-to-array.c",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pointer-to-array code generation"),
+            "{error}"
+        );
+        let error = compile_minimal_program_to_assembly(
+            "int main(void) { return (int (*)[3])0 != 0; }",
+            "pointer-to-array.c",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pointer-to-array conversions are not supported"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn evaluates_integer_constant_expressions_for_array_bounds() {
+        let unit = translation_unit(
+            "int table[2 + 3 * 4]; unsigned char bytes[0x10U]; \
+             int main(void) { int local[(1 << 3) - 2]; return 0; }",
+        );
+        assert!(matches!(
+            &unit.declarations[..2],
+            [
+                ExternalDeclaration::Global(Declaration {
+                    name: first,
+                    array_length: Some(14),
+                    ..
+                }),
+                ExternalDeclaration::Global(Declaration {
+                    name: second,
+                    array_length: Some(16),
+                    ..
+                }),
+            ] if first == "table" && second == "bytes"
+        ));
+        let ExternalDeclaration::FunctionDefinition(main) = &unit.declarations[2] else {
+            panic!("expected main definition");
+        };
+        let StatementKind::Compound(statements) = &main.body.kind else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0].kind,
+            StatementKind::Declaration(declarations)
+                if declarations[0].array_length == Some(6)
+        ));
+    }
+
+    #[test]
+    fn rejects_nonconstant_or_invalid_array_bounds() {
+        for (source, expected) in [
+            (
+                "int values[size];",
+                "bounds.c:1: expected an integer constant expression",
+            ),
+            (
+                "int values[4 / 0];",
+                "bounds.c:1: expected an integer constant expression",
+            ),
+            (
+                "int values[-1];",
+                "bounds.c:1: array length must be a non-negative integer constant",
+            ),
+            (
+                "int values[09];",
+                "bounds.c:1: expected an integer constant expression",
+            ),
+        ] {
+            let error = TranslationUnitParser::from_source(source, "bounds.c")
+                .unwrap()
+                .parse()
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_and_executes_minimal_integer_main_in_rust() {
+        let image = compile_minimal_program("int main(void) { return 2 + 3 * 4; }", "minimal.c")
+            .unwrap()
+            .expect("supported minimal program");
+        assert_eq!(image.entry_point, 0);
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 14);
+    }
+
+    #[test]
+    fn leaves_nontrivial_c_programs_for_the_full_compiler() {
+        assert!(
+            compile_minimal_program(
+                "int main(void) { return helper(); }",
+                "needs-full-compiler.c"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            compile_minimal_program(
+                "int helper(int value) { return value; } int main(void) { return helper(); }",
+                "needs-full-compiler.c",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            compile_minimal_program(
+                "int main(void) { int values[2] = 1; return values[0]; }",
+                "needs-full-compiler.c",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            compile_minimal_program(
+                "int main(void) { return 4294967296UL; }",
+                "needs-full-compiler.c",
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn compiles_local_integers_and_runtime_expressions() {
+        let image = compile_minimal_program(
+            "int main(void) { int left = 7; int right = 5; return left + right * 2; }",
+            "locals.c",
+        )
+        .unwrap()
+        .expect("supported local-integer program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 17);
+    }
+
+    #[test]
+    fn compiles_enum_constants_in_expressions_initializers_and_switches() {
+        let image = compile_minimal_program(
+            "enum Mode { MODE_ZERO = 2, MODE_ONE, MODE_THREE = MODE_ONE + 4 }; \
+             int values[MODE_THREE] = { MODE_ZERO, MODE_ONE }; \
+             int selected = MODE_THREE; \
+             int main(void) { enum Mode choice = MODE_ONE; \
+                 switch (choice) { case MODE_ZERO: return 9; \
+                     case MODE_ONE: return values[1] + selected; \
+                     default: return 10; } }",
+            "enum.c",
+        )
+        .unwrap()
+        .expect("supported enum program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+        assert_eq!(cpu.read_u16(0x80000), 2);
+        assert_eq!(cpu.read_u16(0x80002), 3);
+        assert_eq!(cpu.read_u16(0x8000e), 7);
+    }
+
+    #[test]
+    fn compiles_scalar_typedefs_in_globals_functions_and_type_names() {
+        let image = compile_minimal_program(
+            "typedef int word; typedef word count; \
+             word global = 3; \
+             count twice(word value) { count result = (word)value * 2; return result; } \
+             int main(void) { word local = twice(global); return local + sizeof(count); }",
+            "typedef.c",
+        )
+        .unwrap()
+        .expect("supported scalar typedef program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 8);
+        assert_eq!(cpu.read_u16(0x80000), 3);
+    }
+
+    #[test]
+    fn compiles_object_like_macro_constants() {
+        let image = compile_minimal_program(
+            "#define OFFSET 5\n#define ENABLE_RESULT 1\n\
+             #if defined(ENABLE_RESULT) && ENABLE_RESULT == 1\n#define RESULT (OFFSET * 2)\n\
+             #else\n#error inactive branch should not be processed\n#endif\n\
+             int main(void) { return RESULT; }\n",
+            "macro.c",
+        )
+        .unwrap()
+        .expect("supported object-macro program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+    }
+
+    #[test]
+    fn compiles_initialized_and_zero_initialized_global_integers() {
+        let image = compile_minimal_program(
+            "int total = 3 * 2; int cleared; int main(void) { total += 4; cleared = total; return cleared; }",
+            "globals.c",
+        )
+        .unwrap()
+        .expect("supported global-integer program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+        assert_eq!(cpu.read_u16(0x80000), 10);
+        assert_eq!(cpu.read_u16(0x80002), 10);
+    }
+
+    #[test]
+    fn compiles_extern_declarations_and_merges_tentative_global_definitions() {
+        let image = compile_minimal_program(
+            "extern int total; extern int values[]; \
+             int total; int values[2]; int total; \
+             int values[2] = { 3, 4 }; int total = 5; \
+             int main(void) { return total + values[0] + values[1]; }",
+            "global-linkage.c",
+        )
+        .unwrap()
+        .expect("supported external and tentative global declarations");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 12);
+        assert_eq!(cpu.read_u16(0x80000), 5);
+        assert_eq!(cpu.read_u16(0x80002), 3);
+        assert_eq!(cpu.read_u16(0x80004), 4);
+    }
+
+    #[test]
+    fn rejects_incompatible_or_repeated_initialized_global_definitions() {
+        for source in [
+            "int value; unsigned int value; int main(void) { return value; }",
+            "int value = 1; int value = 2; int main(void) { return value; }",
+            "extern int value; int main(void) { return value; }",
+        ] {
+            assert!(
+                compile_minimal_program(source, "global-linkage-error.c")
+                    .unwrap()
+                    .is_none(),
+                "source unexpectedly compiled: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_unsigned_word_globals_locals_and_function_parameters() {
+        let image = compile_minimal_program(
+            "unsigned int score = 23; \
+             unsigned int identity(unsigned int value) { return value; } \
+             int main(void) { unsigned int local; local = identity(score); return local; }",
+            "unsigned-word.c",
+        )
+        .unwrap()
+        .expect("supported unsigned-word program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 23);
+        assert_eq!(cpu.read_u16(0x80000), 23);
+    }
+
+    #[test]
+    fn passes_local_character_arrays_to_pointer_parameters() {
+        let image = compile_minimal_program(
+            "void write_first(char *output) { output[0] = 'A'; } \
+             int main(void) { char buffer[1]; write_first(buffer); return buffer[0]; }",
+            "char-pointer-parameter.c",
+        )
+        .unwrap()
+        .expect("supported pointer-parameter program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], i64::from(b'A'));
+    }
+
+    #[test]
+    fn passes_global_array_addresses_to_pointer_parameters() {
+        let image = compile_minimal_program(
+            "int values[2] = { 13, 29 }; \
+             int read_second(int *items) { return items[1]; } \
+             int main(void) { return read_second(values); }",
+            "global-pointer-parameter.c",
+        )
+        .unwrap()
+        .expect("supported global pointer argument");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 29);
+    }
+
+    #[test]
+    fn compiles_and_runs_text_demo_stdio_subset() {
+        let image = compile_minimal_program(
+            include_str!("../../programs/text-demo/src/text_demo.c"),
+            "text-demo.c",
+        )
+        .unwrap()
+        .expect("supported Text Demo stdio calls");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.receive_console_input(b"Test\n");
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(100_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            cpu.console
+                .output()
+                .windows(b"Kuka olet? Test\nHuomenta! Kohta kouluun, Test!\n".len())
+                .find(|output| *output == b"Kuka olet? Test\nHuomenta! Kohta kouluun, Test!\n"),
+            Some(&b"Kuka olet? Test\nHuomenta! Kohta kouluun, Test!\n"[..])
+        );
+    }
+
+    #[test]
+    fn printf_formats_multiple_strings_and_integer_arguments() {
+        let image = compile_minimal_program(
+            "int printf(const char *format, ...); \
+             int main(void) { printf(\"%s:%d,%u%%\", \"value\", -12, 34); return 0; }",
+            "printf-integers.c",
+        )
+        .unwrap()
+        .expect("supported mixed printf arguments");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert!(
+            cpu.console
+                .output()
+                .windows(b"value:-12,34%".len())
+                .any(|output| output == b"value:-12,34%")
+        );
+    }
+
+    #[test]
+    fn guest_bug_monitor_functions_write_severity_tagged_serial_messages() {
+        let source = format!(
+            "{}\n{}",
+            include_str!("../../toolchain/include/bug_monitor.h"),
+            "int main(void) { \
+                bug_monitor_debug(\"step\"); \
+                bug_monitor_info(\"ready\"); \
+                bug_monitor_warning(\"slow\"); \
+                bug_monitor_error(\"failed\"); \
+                return 0; \
+            }"
+        );
+        let image = compile_minimal_program(&source, "bug-monitor.c")
+            .unwrap()
+            .expect("Bug Monitor functions should link from lib_stdio.asm");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert!(
+            cpu.console
+                .output()
+                .windows(b"[DEBUG] step\n[INFO] ready\n[WARN] slow\n[ERROR] failed\n".len())
+                .any(
+                    |output| output == b"[DEBUG] step\n[INFO] ready\n[WARN] slow\n[ERROR] failed\n"
+                )
+        );
+    }
+
+    #[test]
+    fn rejects_printf_formats_outside_the_supported_stdio_subset() {
+        assert!(
+            compile_minimal_program(
+                "int printf(const char *format, ...); \
+                 int main(void) { printf(\"%f\", 5); return 0; }",
+                "unsupported-printf-format.c",
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn spills_third_parameters_and_excess_locals_to_stack_frames() {
+        let image = compile_minimal_program(
+            "int sum(int first, int second, int third) { int result = 0; result = first + second + third; return result; } \
+             int main(void) { return sum(11, 13, 17); }",
+            "stacked-parameters.c",
+        )
+        .unwrap()
+        .expect("supported three-parameter stack-frame program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 41);
+    }
+
+    #[test]
+    fn passes_additional_function_arguments_on_the_stack() {
+        let image = compile_minimal_program(
+            "int weighted(int first, int second, int third, int fourth, int fifth) { \
+                 return first + second * 2 + third * 3 + fourth * 4 + fifth * 5; \
+             } int main(void) { return weighted(1, 2, 3, 4, 5); }",
+            "stacked-arguments.c",
+        )
+        .unwrap()
+        .expect("supported function with five parameters");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 55);
+    }
+
+    #[test]
+    fn passes_and_normalizes_byte_function_parameters() {
+        let image = compile_minimal_program(
+            "int combine(int first, unsigned char second, signed char third, \
+             unsigned char fourth) { return first + second + third + fourth; } \
+             int main(void) { return combine(10, 255, 255, 2); }",
+            "byte-parameters.c",
+        )
+        .unwrap()
+        .expect("supported byte function parameters");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 266);
+    }
+
+    #[test]
+    fn local_integer_can_shadow_a_global() {
+        let image = compile_minimal_program(
+            "int value = 10; int main(void) { int value = 3; return value; }",
+            "shadow.c",
+        )
+        .unwrap()
+        .expect("supported shadowing program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 3);
+    }
+
+    #[test]
+    fn compiles_indexed_global_integer_arrays() {
+        let image = compile_minimal_program(
+            "int values[4]; int main(void) { values[1] = 5; values[2] = values[1] + 2; values[1]++; values[2] += values[1]; return values[2]; }",
+            "global-array.c",
+        )
+        .unwrap()
+        .expect("supported global-array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 13);
+        assert_eq!(cpu.read_u16(0x80002), 6);
+        assert_eq!(cpu.read_u16(0x80004), 13);
+    }
+
+    #[test]
+    fn compiles_global_record_members_and_record_arrays() {
+        let image = compile_minimal_program(
+            "typedef struct { int x; unsigned char flag; int y; } Item; \
+             Item items[3]; Item one; \
+             int main(void) { items[1].x = 7; items[2].flag = 1; \
+                 one.y = items[1].x + items[2].flag; return one.y; }",
+            "records.c",
+        )
+        .unwrap()
+        .expect("supported global records and record arrays");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 8);
+    }
+
+    #[test]
+    fn initializes_global_records_and_record_arrays() {
+        let image = compile_minimal_program(
+            "typedef struct { unsigned char kind; int value; } Cell; \
+             typedef struct { int id; Cell cells[2]; unsigned char flags[2]; } Board; \
+             Board board = { 7, { { 1, 10 }, { 2, 20 } }, { 3 } }; \
+             Board boards[2] = { \
+                 { 1, { { 2, 30 }, { 3, 40 } }, { 4, 5 } }, \
+                 { 6, { { 7, 80 }, { 9, 100 } } } \
+             }; \
+             int main(void) { return board.id; }",
+            "global-record-initializers.c",
+        )
+        .unwrap()
+        .expect("supported global record initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            &cpu.memory[0x80000..0x80024],
+            &[
+                0, 7, 1, 0, 0, 10, 2, 0, 0, 20, 3, 0, 0, 1, 2, 0, 0, 30, 3, 0, 0, 40, 4, 5, 0, 6,
+                7, 0, 0, 80, 9, 0, 0, 100, 0, 0,
+            ]
+        );
+        assert_eq!(cpu.registers[0], 7);
+    }
+
+    #[test]
+    fn rejects_nonconstant_global_record_initializers() {
+        let result = compile_minimal_program(
+            "int value(void) { return 1; } \
+             typedef struct { int field; } Item; Item item = { value() }; \
+             int main(void) { return item.field; }",
+            "nonconstant-global-record-initializer.c",
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn compiles_record_pointers_and_scales_pointer_updates() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Node; Node nodes[2]; \
+             int main(void) { Node *cursor; cursor = &nodes[0]; \
+                 cursor->value = 4; cursor++; cursor->value = 9; \
+                 return nodes[1].value; }",
+            "record-pointers.c",
+        )
+        .unwrap()
+        .expect("supported record pointers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 9);
+    }
+
+    #[test]
+    fn preserves_full_width_global_and_stack_record_pointers() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Node; Node nodes[3]; Node *cursor; \
+             int main(void) { int first = 1, second = 2, third = 3; \
+                 Node *local_cursor = &nodes[0]; local_cursor->value = 8; \
+                 cursor = &nodes[1]; cursor++; cursor->value = 9; \
+                 return nodes[0].value + nodes[2].value; }",
+            "global-record-pointer-width.c",
+        )
+        .unwrap()
+        .expect("supported global and stack record pointers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 17);
+    }
+
+    #[test]
+    fn spills_third_record_pointer_parameter_without_truncation() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Node; Node nodes[1]; \
+             int set_node(int first, int second, Node *node) { \
+                 node->value = first + second; return node->value; } \
+             int main(void) { return set_node(17, 25, &nodes[0]); }",
+            "stacked-record-pointer-parameter.c",
+        )
+        .unwrap()
+        .expect("supported third record pointer parameter");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn passes_full_width_record_pointer_as_stack_argument() {
+        let image = compile_minimal_program(
+            "typedef struct { int value; } Node; Node nodes[1]; \
+             int set_node(int first, int second, int third, int fourth, Node *node) { \
+                 node->value = first + second + third + fourth; return node->value; } \
+             int main(void) { return set_node(9, 10, 11, 12, &nodes[0]); }",
+            "stack-argument-record-pointer.c",
+        )
+        .unwrap()
+        .expect("supported record pointer stack argument");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn supports_partial_array_indexing_as_a_subarray_pointer() {
+        let image = compile_minimal_program(
+            "int matrix[2][3]; \
+             int main(void) { int *values; matrix[1][2] = 17; \
+                 values = matrix[1]; return values[2]; }",
+            "subarray-pointer.c",
+        )
+        .unwrap()
+        .expect("supported partial array indexing");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 17);
+    }
+
+    #[test]
+    fn supports_byte_casts_and_absolute_memory_pointer_casts() {
+        let image = compile_minimal_program(
+            "int main(void) { return *(unsigned char *)0x43003; }",
+            "absolute-byte-pointer.c",
+        )
+        .unwrap()
+        .expect("supported absolute byte pointer cast");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn compiles_byte_globals_and_abs_intrinsic() {
+        let image = compile_minimal_program(
+            "unsigned char counter = 255; int main(void) { counter++; return abs(-7); }",
+            "byte-global-abs.c",
+        )
+        .unwrap()
+        .expect("supported byte globals and abs");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 7);
+    }
+
+    #[test]
+    fn compiles_volatile_byte_globals_and_locals() {
+        let image = compile_minimal_program(
+            "volatile unsigned char state = 3; \
+             int main(void) { volatile unsigned char local = 4; \
+                 state += local; return sizeof(volatile unsigned char) + state; }",
+            "volatile-byte.c",
+        )
+        .unwrap()
+        .expect("supported volatile byte globals and locals");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 8);
+    }
+
+    #[test]
+    fn compiles_volatile_byte_pointer_accesses() {
+        let image = compile_minimal_program(
+            "unsigned char values[1] = { 0x5a }; \
+             int read_value(volatile unsigned char *pointer) { return *pointer; } \
+             int main(void) { return read_value(values); }",
+            "volatile-byte-pointer.c",
+        )
+        .unwrap()
+        .expect("supported volatile byte pointer accesses");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0x5a);
+    }
+
+    #[test]
+    fn falling_off_main_returns_zero() {
+        let image = compile_minimal_program("int main(void) {}", "main-fallthrough.c")
+            .unwrap()
+            .expect("supported main fallthrough");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(16).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn compiles_indexed_unsigned_char_global_arrays() {
+        let image = compile_minimal_program(
+            "unsigned char values[4] = { 1, 255, 3 }; \
+             int main(void) { values[1] += 2; values[2]++; values[3] = values[1]; \
+                 return sizeof(values) + values[0] + values[1] + values[2] + values[3]; }",
+            "byte-array.c",
+        )
+        .unwrap()
+        .expect("supported unsigned-char array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 11);
+        assert_eq!(&cpu.memory[0x80000..0x80004], &[1, 1, 4, 1]);
+    }
+
+    #[test]
+    fn compiles_signed_char_global_array_loads_and_compound_assignments() {
+        let image = compile_minimal_program(
+            "char values[2] = { 255, 4 }; \
+             int main(void) { values[0] /= 2; return values[0] + values[1]; }",
+            "signed-byte-array.c",
+        )
+        .unwrap()
+        .expect("supported signed-char array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 4);
+        assert_eq!(&cpu.memory[0x80000..0x80002], &[0, 4]);
+    }
+
+    #[test]
+    fn compiles_global_and_local_character_string_initializers() {
+        let image = compile_minimal_program(
+            "char title[4] = \"Cat\"; \
+             int main(void) { char local[4] = \"dog\"; \
+                 return title[1] + local[2] + sizeof(title) + sizeof(local); }",
+            "string-arrays.c",
+        )
+        .unwrap()
+        .expect("supported character array string initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 208);
+        assert_eq!(&cpu.memory[0x80000..0x80004], b"Cat\0");
+    }
+
+    #[test]
+    fn reads_global_arrays_inside_loops_with_spilled_locals() {
+        let image = compile_minimal_program(
+            "int values[2] = { 7, 11 }; \
+             int main(void) { int m, c, s, ph, o, p; p = 0; \
+                 for (m = 0; m < 2; m++) { ph = values[m]; } return ph + p; }",
+            "loop-array-read.c",
+        )
+        .unwrap()
+        .expect("supported array reads in loop with spilled locals");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 11);
+    }
+
+    #[test]
+    fn folds_division_and_remainder_by_unrepresentable_positive_constants() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = 5; \
+             return value / 100000 + value % 100000 - 5; }",
+            "large-integer-constants.c",
+        )
+        .unwrap()
+        .expect("supported wide divisor folded to 16-bit arithmetic");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn supports_assignment_expressions_and_short_circuit_logic() {
+        let image = compile_minimal_program(
+            "int main(void) { int calls = 0; int value; \
+             value = (calls = calls + 1); \
+             if ((value == 1 && (calls = calls + 1)) || (calls = calls + 100)) \
+                 return calls; return 0; }",
+            "assignment-expressions.c",
+        )
+        .unwrap()
+        .expect("supported assignment expressions and short-circuit logic");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 2);
+    }
+
+    #[test]
+    fn compiles_escaped_exact_fit_and_zero_filled_string_arrays() {
+        let image = compile_minimal_program(
+            r#"char exact[2] = "\377A"; char padded[4] = "hi";
+               int main(void) {
+                   unsigned char local[2] = "\x80\0";
+                   return exact[1] + local[0] + local[1] + padded[2]
+                       + padded[3] + sizeof(local);
+               }"#,
+            "escaped-string-arrays.c",
+        )
+        .unwrap()
+        .expect("supported escaped and exact-fit character arrays");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 195);
+        assert_eq!(&cpu.memory[0x80000..0x80002], &[0xff, b'A']);
+        assert_eq!(&cpu.memory[0x80002..0x80006], b"hi\0\0");
+    }
+
+    #[test]
+    fn compiles_local_pointer_variables_for_array_access() {
+        let image = compile_minimal_program(
+            "int main(void) { unsigned char values[2] = { 3, 4 }; \
+             unsigned char *cursor = values; cursor[1] = 9; \
+             return values[0] + cursor[1]; }",
+            "local-pointers.c",
+        )
+        .unwrap()
+        .expect("supported local pointer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 12);
+    }
+
+    #[test]
+    fn compiles_global_and_stack_backed_pointer_variables() {
+        let image = compile_minimal_program(
+            "unsigned char *global_cursor; \
+             int main(void) { int first = 1, second = 2, third = 3; \
+                 unsigned char values[2] = { 5, 6 }; \
+                 unsigned char *local_cursor = values; \
+                 global_cursor = local_cursor; global_cursor[0] = 8; \
+                 return first + second + third + global_cursor[0]; }",
+            "pointer-storage.c",
+        )
+        .unwrap()
+        .expect("supported global and stack-backed pointers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 14);
+    }
+
+    #[test]
+    fn reads_and_writes_through_pointer_dereferences() {
+        let image = compile_minimal_program(
+            "int main(void) { int values[1] = { 3 }; int *cursor = values; \
+             *cursor = 17; return *cursor + values[0]; }",
+            "pointer-dereference.c",
+        )
+        .unwrap()
+        .expect("supported pointer dereference");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 34);
+    }
+
+    #[test]
+    fn passes_addresses_of_local_variables_to_pointer_parameters() {
+        let image = compile_minimal_program(
+            "int set_value(int *output) { *output = 42; return 0; } \
+             int main(void) { int value = 1; set_value(&value); return value; }",
+            "address-of-local.c",
+        )
+        .unwrap()
+        .expect("supported address of local");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn preserves_caller_frame_pointer_across_calls() {
+        let image = compile_minimal_program(
+            "int set_value(int *output) { int first = 1, second = 2, third = 3; \
+                 int values[1]; values[0] = first + second + third; *output = 42; \
+                 return values[0]; } \
+             int main(void) { int value = 0; set_value(&value); return value; }",
+            "preserve-frame-pointer.c",
+        )
+        .unwrap()
+        .expect("supported calls between stack-framed functions");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn rejects_string_initializers_that_do_not_fit_character_arrays() {
+        for source in [
+            "char text[2] = \"cat\"; int main(void) { return 0; }",
+            "int values[4] = \"cat\"; int main(void) { return 0; }",
+        ] {
+            assert!(
+                compile_minimal_program(source, "too-small-string.c")
+                    .unwrap()
+                    .is_none(),
+                "source unexpectedly compiled: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_initialized_local_integer_arrays_with_stack_frames() {
+        let image = compile_minimal_program(
+            "int helper(int value) { int items[3]; items[0] = value; items[1] = 5; \
+                 return items[0] + items[1]; } \
+             int main(void) { int values[4] = { 2, 3 }; values[1]++; \
+                 values[2] = helper(values[0] + values[1]); \
+                 return sizeof(values) + values[2]; }",
+            "local-array.c",
+        )
+        .unwrap()
+        .expect("supported local integer array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 19);
+    }
+
+    #[test]
+    fn compiles_initialized_local_char_arrays_with_byte_indexing() {
+        let image = compile_minimal_program(
+            "int main(void) { unsigned char values[4] = { 1, 255, 3 }; \
+                 values[1] += 2; values[2]++; \
+                 return sizeof(values) + values[0] + values[1] + values[2]; }",
+            "local-byte-array.c",
+        )
+        .unwrap()
+        .expect("supported local byte array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+    }
+
+    #[test]
+    fn compiles_brace_initialized_global_integer_arrays() {
+        let image = compile_minimal_program(
+            "int values[5] = { 4, { 7 }, 3, 9 }; int main(void) { values[1] += values[2]; return values[0] + values[1] + values[2] + values[3] + values[4]; }",
+            "initialized-array.c",
+        )
+        .unwrap()
+        .expect("supported initialized global-array program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 26);
+        assert_eq!(cpu.read_u16(0x80000), 4);
+        assert_eq!(cpu.read_u16(0x80002), 10);
+        assert_eq!(cpu.read_u16(0x80004), 3);
+        assert_eq!(cpu.read_u16(0x80006), 9);
+        assert_eq!(cpu.read_u16(0x80008), 0);
+    }
+
+    #[test]
+    fn compiles_global_and_local_arrays_with_inferred_bounds() {
+        let image = compile_minimal_program(
+            r##"unsigned char values[] = { 1, 255, 3 }; char title[] = "SC";
+                int main(void) {
+                    int local[] = { 4, 5 };
+                    char text[] = "ok";
+                    return sizeof(values) + values[1] + sizeof(title) + title[2]
+                        + sizeof(local) + local[1] + sizeof(text) + text[2];
+                }"##,
+            "inferred-array-bounds.c",
+        )
+        .unwrap()
+        .expect("supported inferred array bounds");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 273);
+        assert_eq!(&cpu.memory[0x80000..0x80003], &[1, 255, 3]);
+        assert_eq!(&cpu.memory[0x80003..0x80006], b"SC\0");
+    }
+
+    #[test]
+    fn compiles_global_and_local_two_dimensional_arrays() {
+        let image = compile_minimal_program(
+            "unsigned char map[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } }; \
+             int main(void) { int values[2][3] = { { 7, 8 }, { 9 } }; \
+                 values[1][2] = map[1][1] + values[0][1]; \
+                 return sizeof(map) + map[1][2] + values[1][2]; }",
+            "two-dimensional-arrays.c",
+        )
+        .unwrap()
+        .expect("supported two-dimensional arrays");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 25);
+        assert_eq!(&cpu.memory[0x80000..0x80006], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn links_and_executes_native_graphics_library_calls() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             int main(void) { gfx_rect(1, 2, 2, 2, 7); return 0; }",
+            "native-gfx-call.c",
+        )
+        .unwrap()
+        .expect("supported native graphics call");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.memory[0x50000 + 2 * 320 + 1], 7);
+        assert_eq!(cpu.memory[0x50000 + 3 * 320 + 2], 7);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn evaluates_native_call_arguments_before_assigning_argument_registers() {
+        let image = compile_minimal_program(
+            "int target(int first, int second) { return first * 10 + second; } \
+             int relay(int value) { return target(7, value); } \
+             int main(void) { return relay(3); }",
+            "call-argument-register-clobber.c",
+        )
+        .unwrap()
+        .expect("supported nested native calls");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 73);
+    }
+
+    #[test]
+    fn passes_pointer_arguments_to_functions_with_many_parameters() {
+        let image = compile_minimal_program(
+            "int target(int first, char *text, int third, int fourth, int fifth, int sixth) { \
+                 return text[0]; \
+             } \
+             int main(void) { return target(1, \"H\", 3, 4, 5, 6); }",
+            "many-parameter-pointer-argument.c",
+        )
+        .unwrap()
+        .expect("supported pointer argument to a many-parameter function");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], i64::from(b'H'));
+    }
+
+    #[test]
+    fn preserves_pointer_parameters_across_nested_calls() {
+        let image = compile_minimal_program(
+            "int helper(void) { return 1; } \
+             int first_character(char *text) { helper(); return text[0]; } \
+             int main(void) { return first_character(\"H\"); }",
+            "pointer-parameter-preservation.c",
+        )
+        .unwrap()
+        .expect("supported pointer parameter across nested calls");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], i64::from(b'H'));
+    }
+
+    #[test]
+    fn stores_nul_terminated_string_literals_for_native_graphics_calls() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             int main(void) { gfx_text(0, 0, \"Hi\", 1); return 0; }",
+            "native-gfx-string.c",
+        )
+        .unwrap()
+        .expect("supported string argument to graphics builtin");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(8192).unwrap();
+        assert!(!cpu.running);
+        assert!(cpu.memory.windows(3).any(|bytes| bytes == b"Hi\0"));
+    }
+
+    #[test]
+    fn renders_lunar_lander_hud_speed_text_from_local_buffers() {
+        let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("programs")
+            .join("lunar-lander")
+            .join("src")
+            .join("lunarlander.c");
+        let mut source = std::fs::read_to_string(module).expect("Lunar Lander source should load");
+        source = source.replacen("int main(void)", "int original_game_main(void)", 1);
+        source.push_str(
+            "\nint main(void) { \
+             gfx_layer_select(LAYER_HUD); gfx_clear(255); \
+             mode = M_CLASSIC; score = 123; fuel = 800; fuel_max = 900; \
+             level = 2; lives = 3; vx = 80; vy = -120; \
+             hlim = 200; vlim = 200; throttle = 5; \
+             draw_hud(); gfx_present(); return 0; \
+         }",
+        );
+        let image = compile_minimal_program(&source, "lunar-lander-hud-test.c")
+            .unwrap()
+            .expect("Lunar Lander HUD test harness should compile");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(20_000).unwrap();
+
+        let hud = &cpu.layers[4];
+        for (label_y, value_y) in [(34, 34), (44, 44)] {
+            let label_pixels = (label_y..label_y + 7)
+                .flat_map(|y| (4..36).map(move |x| hud[y * 320 + x]))
+                .filter(|&color| color == 9)
+                .count();
+            let value_pixels = (value_y..value_y + 7)
+                .flat_map(|y| (46..70).map(move |x| hud[y * 320 + x]))
+                .filter(|&color| color == 3)
+                .count();
+            assert!(
+                label_pixels > 20,
+                "expected the speed label to render, got {label_pixels} pixels"
+            );
+            assert!(
+                value_pixels > 20,
+                "expected direction arrow and digits to render, got {value_pixels} pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn showcase_benchmark_advances_with_emulator_frame_ticks() {
+        let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("programs")
+            .join("sc16-showcase")
+            .join("src")
+            .join("sc16_showcase.c");
+        let mut source =
+            std::fs::read_to_string(module).expect("SC-16 showcase source should load");
+        source = source.replacen("int main(void)", "int original_game_main(void)", 1);
+        source.push_str(
+            "\nint main(void) { \
+                 int i; int completed; \
+                 gfx_speed(SPEED_MAX); gfx_vsync(1); \
+                 page = 7; bench_state = 1; bench_index = 0; \
+                 while (bench_state == 1) { bench_step(); gfx_present(); } \
+                 completed = 0; \
+                 for (i = 0; i < NTEST; i++) { \
+                     if (bench_kops[i] > 0) completed++; \
+                 } \
+                 return bench_state * 100 + completed; \
+             }",
+        );
+        let image = compile_minimal_program(&source, "showcase-benchmark-test.c")
+            .unwrap()
+            .expect("SC-16 showcase benchmark harness should compile");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        for _ in 0..400 {
+            cpu.begin_frame();
+            cpu.run(200_000).unwrap();
+            if !cpu.running {
+                break;
+            }
+        }
+
+        assert!(!cpu.running, "showcase benchmark did not complete");
+        assert_eq!(
+            cpu.registers[0], 207,
+            "all benchmark results should be recorded"
+        );
+    }
+
+    #[test]
+    fn passes_full_asset_pointer_to_native_graphics_calls() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             unsigned char pixels[4] = { 9, 0, 0, 12 }; \
+             int main(void) { gfx_sprite(10, 11, 2, 2, pixels); return 0; }",
+            "native-gfx-asset-pointer.c",
+        )
+        .unwrap()
+        .expect("supported graphics asset pointer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.memory[0x50000 + 11 * 320 + 10], 9);
+        assert_eq!(cpu.memory[0x50000 + 12 * 320 + 11], 12);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn passes_asset_pointers_to_sprite_upload_and_tilemap_calls() {
+        let sprite_image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             unsigned char pixels[4] = { 7, 0, 0, 8 }; \
+             int main(void) { gfx_sprite_upload(0, 2, 2, pixels); \
+                 gfx_sprite_move(0, 10, 11, SPRITE_VISIBLE); return 0; }",
+            "native-gfx-sprite-upload.c",
+        )
+        .unwrap()
+        .expect("supported sprite upload pointer");
+        let mut sprite_cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        sprite_cpu
+            .load_program(&sprite_image.segments, sprite_image.entry_point)
+            .unwrap();
+        sprite_cpu.run(4096).unwrap();
+        assert!(!sprite_cpu.running);
+        let sprite_frame = sprite_cpu.composited_framebuffer();
+        assert_eq!(sprite_frame[11 * 320 + 10], 7);
+        assert_eq!(sprite_frame[12 * 320 + 11], 8);
+
+        let tile_image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             unsigned char pixels[4] = { 2, 3, 4, 5 }; \
+             unsigned char map[1] = { 1 }; \
+             int main(void) { gfx_layer_select(LAYER_TILES); gfx_tile_size(2); \
+                 gfx_tile_upload(1, pixels); gfx_tilemap(map, 1, 1, 0, 0); \
+                 return 0; }",
+            "native-gfx-tile-upload.c",
+        )
+        .unwrap()
+        .expect("supported tile and tilemap pointers");
+        let mut tile_cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        tile_cpu
+            .load_program(&tile_image.segments, tile_image.entry_point)
+            .unwrap();
+        tile_cpu.run(4096).unwrap();
+        assert!(!tile_cpu.running);
+        let tile_frame = tile_cpu.composited_framebuffer();
+        assert_eq!(&tile_frame[..2], &[2, 3]);
+        assert_eq!(&tile_frame[320..322], &[4, 5]);
+    }
+
+    #[test]
+    fn draws_asteroid_style_polygons_at_expected_coordinates() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             char shape[48] = { 0, -6, 3, -3, 6, 0, 4, 4, \
+                 0, 6, -3, 3, -6, 0, -4, -4, \
+                 0, -11, 6, -6, 11, 0, 7, 7, \
+                 0, 11, -6, 6, -11, 0, -7, -7, \
+                 0, -18, 10, -10, 18, 0, 11, 11, \
+                 0, 18, -10, 10, -18, 0, -11, -11 }; \
+             int main(void) { gfx_poly(50, 100, 8, shape, WHITE); \
+                 gfx_poly(150, 100, 8, shape + 16, WHITE); \
+                 gfx_poly(250, 100, 8, shape + 32, WHITE); return 0; }",
+            "native-gfx-asteroid-poly.c",
+        )
+        .unwrap()
+        .expect("supported asteroid-style polygon");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+        assert!(!cpu.running);
+        let drawn = cpu.memory[0x50000..0x50000 + 320 * 240]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, color)| (*color == 1).then_some((index % 320, index / 320)))
+            .collect::<Vec<_>>();
+        for (origin_x, radius) in [(50, 6), (150, 11), (250, 18)] {
+            let points = drawn
+                .iter()
+                .filter(|point| (origin_x - 25..=origin_x + 25).contains(&point.0))
+                .collect::<Vec<_>>();
+            let min_x = points.iter().map(|point| point.0).min().unwrap();
+            let max_x = points.iter().map(|point| point.0).max().unwrap();
+            let min_y = points.iter().map(|point| point.1).min().unwrap();
+            let max_y = points.iter().map(|point| point.1).max().unwrap();
+            assert_eq!(min_x, origin_x - radius);
+            assert_eq!(max_x, origin_x + radius);
+            assert_eq!(min_y, 100 - radius);
+            assert_eq!(max_y, 100 + radius);
+        }
+    }
+
+    #[test]
+    fn passes_local_polygon_points_to_the_graphics_library() {
+        let image = compile_minimal_program(
+            "#include <suomi_gfx.h>\n\
+             int main(void) { char points[16]; \
+                 points[0] = 0; points[1] = -9; points[2] = 7; points[3] = -7; \
+                 points[4] = 11; points[5] = -1; points[6] = 7; points[7] = 7; \
+                 points[8] = 1; points[9] = 10; points[10] = -6; points[11] = 8; \
+                 points[12] = -10; points[13] = 3; points[14] = -8; points[15] = -5; \
+                 gfx_poly(160, 100, 8, points, GRAY); return 0; }",
+            "native-gfx-local-polygon.c",
+        )
+        .unwrap()
+        .expect("supported local polygon data");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(20_000).unwrap();
+        assert!(!cpu.running);
+        let pixels = &cpu.memory[0x50000..0x50000 + 320 * 240];
+        assert!(pixels.iter().filter(|&&color| color == 9).count() > 40);
+    }
+
+    #[test]
+    fn asteroids_first_frame_keeps_polygon_draws_bounded() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("programs")
+            .join("asteroids")
+            .join("src")
+            .join("asteroids.c");
+        let image = crate::image::build_source(&source).expect("built Asteroids module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2_000_000).unwrap();
+        assert!(cpu.frame_yield, "Asteroids did not present its first frame");
+        let white_pixels = cpu.layers[2].iter().filter(|&&color| color == 1).count();
+        assert!(
+            white_pixels < 10_000,
+            "polygon rendering produced {white_pixels} white pixels"
+        );
+    }
+
+    #[test]
+    fn infinite_city_enemy_ai_moves_and_triggers_spring_jumps() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("programs")
+            .join("infinite-city")
+            .join("src")
+            .join("infinite_city.c");
+        let source = fs::read_to_string(path).expect("Infinite City source should load");
+        let source = source.replacen("int main(void)", "int original_game_main(void)", 1);
+        let source = format!(
+            "{source}\n\
+             int main(void) {{ \
+                 reset_game(); level = START_LEVEL; \
+                 player.x = 0; player.y = 0; player.invuln = 1000; \
+                 enemies[0].alive = 1; enemies[0].kind = ENEMY_MRSIREN; \
+                 enemies[0].x = 1000; enemies[0].y = GROUND_Y - ENEMY_H; \
+                 enemies[0].anim = 1; enemies[0].phase = 0; \
+                 enemies[1].alive = 1; enemies[1].kind = ENEMY_MEGABIRD; \
+                 enemies[1].x = 500; enemies[1].y = 100; enemies[1].phase = 0; \
+                 enemies[2].alive = 1; enemies[2].kind = ENEMY_SPRINGU; \
+                 enemies[2].x = 80; enemies[2].y = GROUND_Y - ENEMY_H; \
+                 enemies[2].on_ground = 1; enemies[2].phase = 31; \
+                 update_enemies(); \
+                 return enemies[0].alive * 4000 + enemies[0].anim * 1000 + \
+                     enemies[0].x + enemies[1].x * 10 + enemies[2].vy + 12; \
+             }}"
+        );
+        let image = compile_minimal_program(&source, "infinite-city-enemy-ai.c")
+            .unwrap()
+            .expect("Infinite City enemy AI harness should compile");
+        let mut cpu = crate::cpu::Cpu::new();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1_000_000).unwrap();
+
+        assert!(!cpu.running, "enemy AI harness did not finish");
+        assert_eq!(
+            cpu.registers[0], 11979,
+            "MrSiren, Megabird, and Springu should perform their expected AI updates"
+        );
+    }
+
+    #[test]
+    fn elite_frames_render_scene_and_hud() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("programs")
+            .join("elite")
+            .join("src")
+            .join("elitedemo.c");
+        let image = crate::image::build_source(&source).expect("built Elite module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        let executed = cpu.run(300_000).unwrap();
+        assert!(cpu.frame_presented, "Elite did not present its first frame");
+        assert!(
+            executed < 300_000,
+            "Elite exceeded the per-frame instruction budget"
+        );
+        let scene = &cpu.layers[3][..320 * 240];
+        for (color, minimum) in [(4, 100), (6, 100), (10, 50)] {
+            let pixels = scene.iter().filter(|&&pixel| pixel == color).count();
+            assert!(
+                pixels >= minimum,
+                "Elite scene rendered only {pixels} pixels with color {color}"
+            );
+        }
+        let title_pixels = (6..13)
+            .map(|row| {
+                cpu.layers[4][row * 320 + 8..row * 320 + 110]
+                    .iter()
+                    .filter(|&&color| color == 6)
+                    .count()
+            })
+            .sum::<usize>();
+        assert!(
+            title_pixels > 30,
+            "Elite title rendered only {title_pixels} cyan pixels"
+        );
+        for (x, y) in [(250, 6), (260, 196), (260, 206)] {
+            let number_pixels = (y..y + 7)
+                .flat_map(|row| cpu.layers[4][row * 320 + x..row * 320 + x + 42].iter())
+                .filter(|&&color| color == 1)
+                .count();
+            assert!(
+                number_pixels >= 10,
+                "Elite numeric HUD text at ({x}, {y}) rendered only {number_pixels} white pixels"
+            );
+        }
+        let framebuffer = cpu.composited_framebuffer();
+        assert!(
+            framebuffer[30 * 320..190 * 320]
+                .iter()
+                .any(|&color| color != 0),
+            "Elite scene layer was not included in the presented framebuffer"
+        );
+        let first_scene = scene.to_vec();
+        for frame in 2..=4 {
+            cpu.begin_frame();
+            let executed = cpu.run(300_000).unwrap();
+            assert!(cpu.frame_presented, "Elite did not present frame {frame}");
+            assert!(
+                executed < 300_000,
+                "Elite exceeded the instruction budget for frame {frame}"
+            );
+        }
+        assert_ne!(
+            &cpu.layers[3][..320 * 240],
+            first_scene,
+            "Elite scene did not update within four frames"
+        );
+    }
+
+    #[test]
+    fn passes_computed_arguments_without_clobbering_operands() {
+        for (source, expected) in [
+            (
+                "int identity(int value) { return value; } \
+                 int main(void) { return identity(70 - 72); }",
+                -2,
+            ),
+            (
+                "int abs_i(int value) { if (value < 0) return -value; return value; } \
+                 int main(void) { return abs_i(70 - 72); }",
+                2,
+            ),
+            (
+                "int sum(int a, int b, int c) { return a + b + c; } \
+                 int main(void) { return sum(10 + 1, 20 + 2, 30 + 3); }",
+                66,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "computed-call-argument.c")
+                .unwrap()
+                .expect("supported computed function argument");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(1000).unwrap();
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn pacman_round_starts_without_a_false_collision() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("programs")
+            .join("pacman")
+            .join("src")
+            .join("pacman.c");
+        let source = std::fs::read_to_string(path).unwrap();
+        let source = source.replace("int main(void)", "int pacman_main(void)");
+        let source = format!(
+            "{source}\nint main(void) {{ int i; new_game(); \
+             for (i = 0; i < 72; i++) {{ tick++; update(0); }} \
+             return mode * 10 + lives; }}"
+        );
+        let image = compile_minimal_program(&source, "pacman-opening-round.c")
+            .unwrap()
+            .expect("supported PacMan module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            cpu.registers[0], 13,
+            "PacMan should be playing with 3 lives"
+        );
+    }
+
+    #[test]
+    fn pacman_stops_at_the_wall_in_its_starting_corridor() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("programs")
+            .join("pacman")
+            .join("src")
+            .join("pacman.c");
+        let source = std::fs::read_to_string(path).unwrap();
+        let source = source.replace("int main(void)", "int pacman_main(void)");
+        let source = format!(
+            "{source}\nint main(void) {{ int i; load_maze(); reset_positions(); mode = 1; \
+             for (i = 0; i < 100; i++) move_pac(0); \
+             return px; }}"
+        );
+        let image = compile_minimal_program(&source, "pacman-wall-collision.c")
+            .unwrap()
+            .expect("supported PacMan module");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 32, "PacMan must stop before the wall");
+    }
+
+    #[test]
+    fn compiles_brace_initialized_global_scalar() {
+        let image = compile_minimal_program(
+            "int value = { { 12 } }; int main(void) { return value; }",
+            "initialized-scalar.c",
+        )
+        .unwrap()
+        .expect("supported braced scalar initializer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert_eq!(cpu.registers[0], 12);
+    }
+
+    #[test]
+    fn compiles_shadowed_locals_with_independent_block_scope() {
+        for (source, expected) in [
+            (
+                "int main(void) { int value = 7; { int value = 3; value++; } return value; }",
+                7,
+            ),
+            (
+                "int main(void) { int value = 5; { int copy = value + 2; int value = 9; return copy + value; } }",
+                16,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "shadowed-locals.c")
+                .unwrap()
+                .expect("supported block-scoped local shadowing");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_for_initializer_scope_and_shadowed_parameters() {
+        for (source, expected) in [
+            (
+                "int main(void) { int i = 9; for (int i = 0; i < 2; i++) { int i = 4; i++; } return i; }",
+                9,
+            ),
+            (
+                "int helper(int value) { { int value = 5; value++; } return value; } int main(void) { return helper(12); }",
+                12,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "nested-scope.c")
+                .unwrap()
+                .expect("supported nested declaration scope");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(256).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_integer_array_initializers() {
+        for source in [
+            "int values[0]; int main(void) { return 0; }",
+            "int values[1] = { 1, 2 }; int main(void) { return 0; }",
+            "int values[1] = { { 1, 2 } }; int main(void) { return 0; }",
+            "int values[1] = 1; int main(void) { return 0; }",
+        ] {
+            assert!(
+                compile_minimal_program(source, "bad-initializer.c")
+                    .unwrap()
+                    .is_none(),
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_brace_initialized_local_scalar() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = { { 9 } }; return value; }",
+            "local-initializer.c",
+        )
+        .unwrap()
+        .expect("supported braced local scalar initializer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert_eq!(cpu.registers[0], 9);
+    }
+
+    #[test]
+    fn compiles_integer_sizeof_without_evaluating_operands() {
+        let image = compile_minimal_program(
+            "int values[2]; int main(void) { int value = 5; return sizeof(int) + sizeof(char) + sizeof(int*) + sizeof(unsigned long) + sizeof(value++) + sizeof(values[0]) + sizeof(values) + value; }",
+            "sizeof.c",
+        )
+        .unwrap()
+        .expect("supported sizeof expressions");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 24);
+    }
+
+    #[test]
+    fn lays_out_binary32_and_binary64_static_floating_objects() {
+        let source = "float narrow[2] = { 1.5f, -0.0f }; \
+                      double wide = 1.5; long double extended = -2.0L; \
+                      int main(void) { return sizeof(float) + sizeof(double) + \
+                      sizeof(long double) + sizeof(narrow) + sizeof(wide); }";
+        let assembly = compile_minimal_program_to_assembly(source, "floating-layout.c")
+            .unwrap()
+            .expect("supported floating static data and sizeof");
+        assert!(assembly.contains(".data hex 0x3F 0xC0 0x00 0x00"));
+        assert!(assembly.contains("0x80 0x00 0x00 0x00"));
+        assert!(assembly.contains(".data hex 0x3F 0xF8 0x00 0x00 0x00 0x00 0x00 0x00"));
+        assert!(assembly.contains(".data hex 0xC0 0x00 0x00 0x00 0x00 0x00 0x00 0x00"));
+
+        let image = compile_minimal_program(source, "floating-layout.c")
+            .unwrap()
+            .expect("floating layout program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 36);
+
+        assert!(
+            compile_minimal_program(
+                "float value = 1.5f; int main(void) { return value; }",
+                "unsupported-floating-read.c"
+            )
+            .unwrap()
+            .is_none(),
+            "floating reads must not be emitted as integer loads"
+        );
+    }
+
+    #[test]
+    fn float_header_boundaries_emit_target_ieee_representations() {
+        let source = "#include <float.h>\n\
+                      float fmax = FLT_MAX;\n\
+                      float fmin = FLT_MIN;\n\
+                      float fepsilon = FLT_EPSILON;\n\
+                      double dmax = DBL_MAX;\n\
+                      double dmin = DBL_MIN;\n\
+                      double deps = DBL_EPSILON;\n\
+                      long double ldmax = LDBL_MAX;\n\
+                      float fsub = 1.401298464e-45F;\n\
+                      double dsub = 4.9406564584124654e-324;\n\
+                      float ftie = 1.000000059604644775390625F;\n\
+                      double dtie = 1.00000000000000011102230246251565404236316680908203125;\n\
+                      double promoted = 1.000000059604644775390625F;\n\
+                      float fsum = 0.1f + 0.2f;\n\
+                      float fmul = 2.0f * 3.0f;\n\
+                      double ddiv = 7.0 / 2.0;\n\
+                      double mixed = 1.0f + 2.0;\n\
+                      double reverse_subtraction = 1.0 - 2.0f;\n\
+                      float integer_division = 1 / 2;\n\
+                      float integer_remainder = 5 % 2;\n\
+                      float cast_float = (float)1.000000059604644775390625;\n\
+                      double cast_double = (double)1.5f;\n\
+                      int main(void) { return 0; }";
+        let image = compile_minimal_program(source, "float-header-boundaries.c")
+            .unwrap()
+            .expect("float.h boundary initializers should compile");
+        let data = image
+            .segments
+            .iter()
+            .find(|segment| segment.address == 0x80000)
+            .expect("global data segment");
+        assert_eq!(
+            &data.data[..60],
+            &[
+                0x7f, 0x7f, 0xff, 0xff, 0x00, 0x80, 0x00, 0x00, 0x34, 0x00, 0x00, 0x00, 0x7f, 0xef,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x3c, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xef, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                0x3f, 0x80, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(
+            &data.data[60..68],
+            &[0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "ties at one-half ULP round to even for binary32 and binary64"
+        );
+        assert_eq!(
+            &data.data[68..76],
+            &[0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "a float constant rounds to binary32 before promotion to double"
+        );
+        assert_eq!(&data.data[76..80], &[0x3e, 0x99, 0x99, 0x9a]);
+        assert_eq!(&data.data[80..84], &[0x40, 0xc0, 0x00, 0x00]);
+        assert_eq!(
+            &data.data[84..92],
+            &[0x40, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            &data.data[92..100],
+            &[0x40, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "binary64 arithmetic keeps operands in source order"
+        );
+        assert_eq!(
+            &data.data[100..108],
+            &[0xbf, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(&data.data[108..112], &[0, 0, 0, 0]);
+        assert_eq!(&data.data[112..116], &[0x3f, 0x80, 0, 0]);
+        assert_eq!(&data.data[116..120], &[0x3f, 0x80, 0, 0]);
+        assert_eq!(&data.data[120..128], &[0x3f, 0xf8, 0, 0, 0, 0, 0, 0]);
+
+        assert!(
+            compile_minimal_program(
+                "float invalid = 1.0f / 0.0f; int main(void) { return 0; }",
+                "float-divide-by-zero-initializer.c"
+            )
+            .unwrap()
+            .is_none(),
+            "constant-expression division by zero must not be silently emitted"
+        );
+
+        for (name, expected) in [
+            ("FLT_RADIX", "2"),
+            ("FLT_ROUNDS", "1"),
+            ("FLT_MANT_DIG", "24"),
+            ("DBL_MANT_DIG", "53"),
+            ("LDBL_MANT_DIG", "53"),
+            ("FLT_DIG", "6"),
+            ("DBL_DIG", "15"),
+            ("LDBL_DIG", "15"),
+            ("FLT_MIN_EXP", "-125"),
+            ("DBL_MIN_EXP", "-1021"),
+            ("LDBL_MIN_EXP", "-1021"),
+            ("FLT_MIN_10_EXP", "-37"),
+            ("DBL_MIN_10_EXP", "-307"),
+            ("LDBL_MIN_10_EXP", "-307"),
+            ("FLT_MAX_EXP", "128"),
+            ("DBL_MAX_EXP", "1024"),
+            ("LDBL_MAX_EXP", "1024"),
+            ("FLT_MAX_10_EXP", "38"),
+            ("DBL_MAX_10_EXP", "308"),
+            ("LDBL_MAX_10_EXP", "308"),
+        ] {
+            let tokens = lex_raw(
+                &format!("#include <float.h>\nint value = {name};"),
+                "float-header-limits.c",
+            )
+            .unwrap();
+            let equals = tokens
+                .iter()
+                .position(|token| token.value == "=")
+                .expect("initializer assignment token");
+            let actual = tokens[equals + 1..]
+                .iter()
+                .take_while(|token| token.value != ";")
+                .map(|token| token.value.as_str())
+                .collect::<Vec<_>>();
+            let expected = if let Some(magnitude) = expected.strip_prefix('-') {
+                vec!["(", "-", magnitude, ")"]
+            } else {
+                vec![expected]
+            };
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn reserves_local_floating_objects_without_generating_integer_accesses() {
+        let source = "int main(void) { float single; double real; long double extended; \
+                      float values[2]; return sizeof(single) + sizeof(real) + \
+                      sizeof(extended) + sizeof(values); }";
+        let assembly = compile_minimal_program_to_assembly(source, "local-floating-layout.c")
+            .unwrap()
+            .expect("uninitialized local floating objects and sizeof");
+        assert!(assembly.contains("ADJSP -28"));
+
+        let image = compile_minimal_program(source, "local-floating-layout.c")
+            .unwrap()
+            .expect("local floating layout program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 28);
+
+        for unsupported in [
+            "int main(void) { float value; return value; }",
+            "int main(void) { float values[2]; return values[0]; }",
+        ] {
+            assert!(
+                compile_minimal_program(unsupported, "unsupported-local-float.c")
+                    .unwrap()
+                    .is_none(),
+                "unsupported floating object use must be rejected: {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn initializes_local_floating_scalars_and_arrays_from_literal_values() {
+        let source = "int main(void) { float single = 1.5f; double real = -2.0; \
+                      long double extended = 3.0L; float values[3] = { 1.0f, -0.0f }; \
+                      return sizeof(single) + sizeof(real) + sizeof(extended) + \
+                      sizeof(values); }";
+        let assembly = compile_minimal_program_to_assembly(source, "local-float-init.c")
+            .unwrap()
+            .expect("literal-initialized local floating objects");
+        for encoded in [
+            "LDI R4, 0x3FC0",
+            "LDI R4, 0xC000",
+            "LDI R4, 0x4008",
+            "LDI R4, 0x3F80",
+            "LDI R4, 0x8000",
+            "LDI R4, 0x0000",
+        ] {
+            assert!(assembly.contains(encoded), "missing {encoded}");
+        }
+        let image = compile_minimal_program(source, "local-float-init.c")
+            .unwrap()
+            .expect("local floating initializer program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 32);
+
+        let representation_source = "int main(void) { float value = 1.5f; \
+                                     unsigned char *bytes = (unsigned char *)&value; \
+                                     float values[2] = { -2.0f }; \
+                                     unsigned char *array = (unsigned char *)values; \
+                                     return bytes[0] != 0x3f || bytes[1] != 0xc0 || \
+                                     bytes[2] != 0 || bytes[3] != 0 || array[0] != 0xc0 || \
+                                     array[1] != 0 || array[2] != 0 || array[3] != 0 || \
+                                     array[4] != 0 || array[5] != 0 || array[6] != 0 || \
+                                     array[7] != 0; }";
+        let image = compile_minimal_program(representation_source, "local-float-bytes.c")
+            .unwrap()
+            .expect("character access to floating object representation");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let expression_source = "int main(void) { float value = 0.1f + 0.2f; \
+                                 unsigned char *bytes = (unsigned char *)&value; \
+                                 return bytes[0] != 0x3e || bytes[1] != 0x99 || \
+                                 bytes[2] != 0x99 || bytes[3] != 0x9a; }";
+        let image = compile_minimal_program(expression_source, "local-float-expression.c")
+            .unwrap()
+            .expect("local floating constant arithmetic");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let cast_source = "int main(void) { \
+                           float narrow = (float)1.000000059604644775390625; \
+                           double promoted = (double)1.5f; \
+                           unsigned char *narrow_bytes = (unsigned char *)&narrow; \
+                           unsigned char *wide_bytes = (unsigned char *)&promoted; \
+                           return narrow_bytes[0] != 0x3f || narrow_bytes[1] != 0x80 || \
+                           narrow_bytes[2] != 0 || narrow_bytes[3] != 0 || \
+                           wide_bytes[0] != 0x3f || wide_bytes[1] != 0xf8 || \
+                           wide_bytes[2] != 0 || wide_bytes[3] != 0 || \
+                           wide_bytes[4] != 0 || wide_bytes[5] != 0 || \
+                           wide_bytes[6] != 0 || wide_bytes[7] != 0; }";
+        let image = compile_minimal_program(cast_source, "local-float-casts.c")
+            .unwrap()
+            .expect("automatic floating casts in constant initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let binary64_source = "int main(void) { double value = -2.0; \
+                               unsigned char *bytes = (unsigned char *)&value; \
+                               return bytes[0] != 0xc0 || bytes[1] != 0 || \
+                               bytes[2] != 0 || bytes[3] != 0 || bytes[4] != 0 || \
+                               bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0; }";
+        let image = compile_minimal_program(binary64_source, "local-double-bytes.c")
+            .unwrap()
+            .expect("character access to binary64 object representation");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let multidimensional_source = "int main(void) { \
+                                      float values[2][2] = { { 1.0f, 2.0f }, { 3.0f } }; \
+                                      unsigned char *bytes = (unsigned char *)values; \
+                                      return bytes[0] != 0x3f || bytes[1] != 0x80 || \
+                                      bytes[4] != 0x40 || bytes[5] != 0 || \
+                                      bytes[8] != 0x40 || bytes[9] != 0x40 || \
+                                      bytes[12] != 0 || bytes[13] != 0 || \
+                                      bytes[14] != 0 || bytes[15] != 0; }";
+        let image =
+            compile_minimal_program(multidimensional_source, "local-float-multidimensional.c")
+                .unwrap()
+                .expect("multidimensional floating array initializer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        for unsupported in [
+            "int main(void) { float values[2] = 1.0f; return 0; }",
+            "int main(void) { float values[1] = { 1.0f, 2.0f }; return 0; }",
+        ] {
+            assert!(
+                compile_minimal_program(unsupported, "unsupported-local-float-init.c")
+                    .unwrap()
+                    .is_none(),
+                "unsupported initializer must not be miscompiled: {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluates_binary32_runtime_scalar_arithmetic_in_local_initializers() {
+        let source = "int main(void) { float left = 1.5f; float right = 2.25f; \
+                      float sum = left + right; float difference = sum - 1; \
+                      float product = -difference * 2.0f; float quotient = product / -2; \
+                      unsigned char *bytes = (unsigned char *)&quotient; \
+                      return bytes[0] != 0x40 || bytes[1] != 0x30 || \
+                      bytes[2] != 0 || bytes[3] != 0; }";
+        let image = compile_minimal_program(source, "runtime-f32-arithmetic.c")
+            .unwrap()
+            .expect("binary32 runtime arithmetic in local initializers");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let mixed_source = "int main(void) { int first = 1; int second = 2; \
+                            float mixed = (first + second) + 0.5f; \
+                            unsigned char *bytes = (unsigned char *)&mixed; \
+                            return bytes[0] != 0x40 || bytes[1] != 0x60 || \
+                            bytes[2] != 0 || bytes[3] != 0; }";
+        let image = compile_minimal_program(mixed_source, "runtime-f32-mixed.c")
+            .unwrap()
+            .expect("integer subexpression converted for binary32 arithmetic");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let unsigned_source = "int main(void) { unsigned int value = 50000; \
+                               float converted = value; \
+                               unsigned char *bytes = (unsigned char *)&converted; \
+                               return bytes[0] != 0x47 || bytes[1] != 0x43 || \
+                               bytes[2] != 0x50 || bytes[3] != 0; }";
+        let image = compile_minimal_program(unsigned_source, "runtime-f32-unsigned-conversion.c")
+            .unwrap()
+            .expect("unsigned integer converted to binary32");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn converts_binary32_to_and_from_signed_and_unsigned_words() {
+        let source = "int main(void) { int signed_value; unsigned int unsigned_value; \
+                      int signed_input = -3; unsigned int input = 50000; \
+                      float converted; float signed_converted; \
+                      signed_value = (int)-3.75f; \
+                      unsigned_value = (unsigned int)4.75f; \
+                      converted = input; signed_converted = signed_input; \
+                      unsigned char *bytes = (unsigned char *)&converted; \
+                      unsigned char *signed_bytes = \
+                          (unsigned char *)&signed_converted; \
+                      return signed_value != -3 || unsigned_value != 4 || \
+                      bytes[0] != 0x47 || bytes[1] != 0x43 || \
+                      bytes[2] != 0x50 || bytes[3] != 0 || \
+                      signed_bytes[0] != 0xc0 || signed_bytes[1] != 0x40 || \
+                      signed_bytes[2] != 0 || signed_bytes[3] != 0; }";
+        let image = compile_minimal_program(source, "runtime-f32-word-conversions.c")
+            .unwrap()
+            .expect("signed and unsigned binary32 word conversions");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn supports_binary32_assignments_and_float_return_codegen() {
+        let source = "float calculate(float value) { \
+                      value += 2.25f; value = value * 2.0f; return value; } \
+                      int main(void) { float value = calculate(1.5f); \
+                      int converted = (int)value; \
+                      int whole = 3; float converted_float; \
+                      converted_float = whole; \
+                      float assigned = (converted_float = 4.0f); \
+                      unsigned char *bytes = (unsigned char *)&value; \
+                      unsigned char *converted_bytes = \
+                          (unsigned char *)&converted_float; \
+                      unsigned char *assigned_bytes = (unsigned char *)&assigned; \
+                      return bytes[0] != 0x40 || bytes[1] != 0xf0 || \
+                      bytes[2] != 0 || bytes[3] != 0 || converted != 7 || \
+                      converted_bytes[0] != 0x40 || converted_bytes[1] != 0x80 || \
+                      converted_bytes[2] != 0 || converted_bytes[3] != 0 || \
+                      assigned_bytes[0] != 0x40 || assigned_bytes[1] != 0x80 || \
+                      assigned_bytes[2] != 0 || assigned_bytes[3] != 0; }";
+        let image = compile_minimal_program(source, "runtime-f32-assignment-return.c")
+            .unwrap()
+            .expect("binary32 assignments and return");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let global_source = "float stored;\nint main(void) { \
+                             stored = 7.5f; return stored == 7.5f ? 0 : 1; }";
+        let image = compile_minimal_program(global_source, "runtime-f32-global-store.c")
+            .unwrap()
+            .expect("binary32 global load and store");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let indexed_source = "int main(void) { float values[2] = { 1.5f, 2.5f }; \
+                              values[1] = 4.0f; \
+                              return values[1] == 4.0f ? 0 : 1; }";
+        let image = compile_minimal_program(indexed_source, "runtime-f32-indexed.c")
+            .unwrap()
+            .expect("binary32 indexed loads, stores, and compound assignment");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let pointer_source = "int main(void) { float value = 2.0f; float *pointer = &value; \
+                              *pointer += 1.0f; return *pointer == 3.0f ? 0 : 1; }";
+        let image = compile_minimal_program(pointer_source, "runtime-f32-pointer.c")
+            .unwrap()
+            .expect("binary32 pointer loads and stores");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+
+        let condition_source = "int main(void) { float value = 0.5f; \
+                                if (value < 1.0f) { value *= 2.0f; } \
+                                value = value ? 3.0f : 0.0f; value + 1.0f; \
+                                if (!value || !(value > 2.0f)) return 1; return 0; }";
+        let image = compile_minimal_program(condition_source, "runtime-f32-condition.c")
+            .unwrap()
+            .expect("binary32 comparisons and truth tests in conditions");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(2048).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn evaluates_binary32_runtime_comparisons_in_local_initializers() {
+        for (expression, expected) in [
+            ("low < high", 1),
+            ("low <= high", 1),
+            ("high > low", 1),
+            ("high >= low", 1),
+            ("low == 1.25f", 1),
+            ("low != high", 1),
+            ("low != 1.25f", 0),
+            ("nan < high", 0),
+            ("nan <= high", 0),
+            ("nan == nan", 0),
+            ("nan != high", 1),
+            ("high != nan", 1),
+            ("nan != nan", 1),
+        ] {
+            let source = format!(
+                "int main(void) {{ float low = 1.25f; float high = 2.5f; \
+                 float nan = 0.0f / 0.0f; int result = {expression}; return result; }}"
+            );
+            let image = compile_minimal_program(&source, "runtime-f32-comparisons.c")
+                .unwrap()
+                .expect("binary32 comparison in an automatic integer initializer");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(2048).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "{expression}");
+        }
+
+        let source = "int main(void) { float low = 1.25f; float high = 2.5f; \
+                      float result = low < high; \
+                      unsigned char *bytes = (unsigned char *)&result; \
+                      return bytes[0] != 0x3f || bytes[1] != 0x80 || \
+                      bytes[2] != 0 || bytes[3] != 0; }";
+        let image = compile_minimal_program(source, "runtime-f32-comparison-to-float.c")
+            .unwrap()
+            .expect("binary32 comparison converted for a floating initializer");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn evaluates_binary32_comparisons_in_general_expressions() {
+        for (comparison, expected) in [
+            ("low < high", 1),
+            ("low <= high", 1),
+            ("high > low", 1),
+            ("high >= low", 1),
+            ("low == 1.25f", 1),
+            ("low != high", 1),
+            ("low != 1.25f", 0),
+            ("nan < high", 0),
+            ("nan <= high", 0),
+            ("nan == nan", 0),
+            ("nan != high", 1),
+        ] {
+            let source = format!(
+                "int main(void) {{ float low = 1.25f; float high = 2.5f; \
+                 float nan = 0.0f / 0.0f; \
+                 int result; result = {comparison}; return result != {expected}; }}"
+            );
+            let image = compile_minimal_program(&source, "runtime-f32-general-comparison.c")
+                .unwrap()
+                .expect("general binary32 comparison");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(2048).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], 0, "{comparison}");
+        }
+    }
+
+    #[test]
+    fn compiles_comma_operator_with_discarded_side_effects() {
+        for (source, expected) in [
+            (
+                "int main(void) { int value = 0; return (value = 3, value + 2); }",
+                5,
+            ),
+            (
+                "int main(void) { int value = 0; return (value++, value + 2); }",
+                3,
+            ),
+            (
+                "int main(void) { int value = 0; return (value = 3, value++, value + 2); }",
+                6,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "comma.c")
+                .unwrap()
+                .unwrap_or_else(|| panic!("unsupported comma expression: {source}"));
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_prefix_and_postfix_updates_as_values() {
+        for (source, expected) in [
+            (
+                "int main(void) { int value = 3; return ++value + value++; }",
+                8,
+            ),
+            (
+                "int value = 3; int main(void) { return value++ + ++value; }",
+                8,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "increment-values.c")
+                .unwrap()
+                .expect("supported increment expression");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_switch_dispatch_fallthrough_default_and_break() {
+        for (source, expected) in [
+            (
+                "int main(void) { int value = 2; int result = 0; switch (value) { case 1: result = 10; break; case 2: result = 20; case 3: result += 3; break; default: result = 99; } return result; }",
+                23,
+            ),
+            (
+                "int main(void) { int value = 9; switch (value) { case 1: return 10; default: return 42; } return 0; }",
+                42,
+            ),
+            (
+                "int main(void) { int value = 9; switch (value) { case 1: value = 10; } return value; }",
+                9,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "switch.c")
+                .unwrap()
+                .expect("supported switch program");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(256).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_forward_backward_and_function_scoped_goto_labels() {
+        let source = "int other(void) { int n = 0; again: n++; if (n < 2) goto again; return n; } int main(void) { goto done; return 99; done: return other(); }";
+        let image = compile_minimal_program(source, "goto.c")
+            .unwrap()
+            .expect("supported goto program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 2);
+    }
+
+    #[test]
+    fn compiles_functions_that_return_from_every_switch_case() {
+        let source = "int choose(int value) { switch (value) { case 1: return 11; case 2: return 22; default: return 33; } } int main(void) { return choose(2); }";
+        let image = compile_minimal_program(source, "switch-return.c")
+            .unwrap()
+            .expect("supported switch-return program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 22);
+    }
+
+    #[test]
+    fn rejects_switch_functions_with_a_break_path_without_a_return() {
+        let source = "int choose(int value) { switch (value) { default: if (value) break; return 1; } } int main(void) { return choose(1); }";
+        assert!(
+            compile_minimal_program(source, "switch-break-path.c")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_or_undefined_goto_labels() {
+        for source in [
+            "int main(void) { goto missing; return 0; }",
+            "int main(void) { again: ; again: return 0; }",
+        ] {
+            assert!(
+                compile_minimal_program(source, "goto.c").unwrap().is_none(),
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_initialized_locals_with_unary_and_bitwise_operations() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = 0x0f; return ~(value ^ 0x03) & 0xff; }",
+            "bitwise.c",
+        )
+        .unwrap()
+        .expect("supported bitwise program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0xf3);
+    }
+
+    #[test]
+    fn compiles_local_assignments_and_signed_division() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = 20; value -= 2; value /= 3; return value * 10 + 20 % 3; }",
+            "assignment.c",
+        )
+        .unwrap()
+        .expect("supported assignment program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 62);
+    }
+
+    #[test]
+    fn compiles_signed_integer_comparisons() {
+        for (source, expected) in [
+            ("int main(void) { return 3 == 3; }", 1),
+            ("int main(void) { return 3 != 3; }", 0),
+            ("int main(void) { return -3 < 2; }", 1),
+            ("int main(void) { return 2 <= -3; }", 0),
+            ("int main(void) { return 4 > 3; }", 1),
+            ("int main(void) { return 4 >= 5; }", 0),
+        ] {
+            let image = compile_minimal_program(source, "comparison.c")
+                .unwrap()
+                .expect("supported comparison program");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(64).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_unsigned_word_division_remainder_shifts_and_comparisons() {
+        for (source, expected) in [
+            (
+                "int main(void) { unsigned int value = 65535; return value / 2; }",
+                32767,
+            ),
+            (
+                "int main(void) { unsigned int value = 65535; return value % 10; }",
+                5,
+            ),
+            (
+                "int main(void) { unsigned int value = 32768; return value >> 1; }",
+                16384,
+            ),
+            (
+                "int main(void) { unsigned int value = 65535; return value > 1; }",
+                1,
+            ),
+            (
+                "int main(void) { unsigned int value = 65535; return value >= 65535; }",
+                1,
+            ),
+            (
+                "int main(void) { unsigned int value = 65535; return value <= 1; }",
+                0,
+            ),
+            (
+                "int main(void) { unsigned int value = 65535; return value < 1; }",
+                0,
+            ),
+            (
+                "int main(void) { unsigned int value = 65535; value /= 2; return value; }",
+                32767,
+            ),
+            (
+                "int main(void) { unsigned int value = 65535; value %= 10; return value; }",
+                5,
+            ),
+            (
+                "int main(void) { unsigned int value = 32768; value >>= 1; return value; }",
+                16384,
+            ),
+            (
+                "unsigned int value = 65535; int main(void) { return value / 2; }",
+                32767,
+            ),
+            (
+                "unsigned int half(int a, int b, unsigned int value) { return value >> 1; } \
+                 int main(void) { return half(0, 0, 32768); }",
+                16384,
+            ),
+            (
+                "int main(void) { int a, b, c, d; unsigned int value = 65535; \
+                 return value / 2; }",
+                32767,
+            ),
+            (
+                "unsigned int values[1] = { 65535 }; \
+                 int main(void) { return values[0] / 2; }",
+                32767,
+            ),
+            (
+                "int main(void) { unsigned int value = 1; int negative = -1; \
+                 return value > negative; }",
+                0,
+            ),
+            (
+                "int main(void) { unsigned char value = 255; return value < -1; }",
+                0,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "unsigned-operations.c")
+                .unwrap()
+                .expect("supported unsigned word operation");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running, "source: {source}");
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_if_else_return_paths() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = -2; if (value < 0) return 11; else return 22; }",
+            "if-else.c",
+        )
+        .unwrap()
+        .expect("supported if/else program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 11);
+    }
+
+    #[test]
+    fn compiles_while_loops_with_local_updates() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = 1; while (value < 6) { value += 1; } return value; }",
+            "while.c",
+        )
+        .unwrap()
+        .expect("supported while-loop program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 6);
+    }
+
+    #[test]
+    fn compiles_for_loops_with_scoped_integer_counters() {
+        let image = compile_minimal_program(
+            "int main(void) { int sum = 0; for (int i = 0; i < 5; i++) { sum += i; } return sum; }",
+            "for.c",
+        )
+        .unwrap()
+        .expect("supported for-loop program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+    }
+
+    #[test]
+    fn compiles_shift_logical_and_conditional_expressions() {
+        for (source, expected) in [
+            ("int main(void) { return (3 << 2) | (16 >> 2); }", 12),
+            ("int main(void) { return !0 + !5; }", 1),
+            ("int main(void) { return 0 && (1 / 0); }", 0),
+            ("int main(void) { return 1 || (1 / 0); }", 1),
+            ("int main(void) { return 0 ? 12 : 7; }", 7),
+            ("int main(void) { return 4 ? 12 : 7; }", 12),
+        ] {
+            let image = compile_minimal_program(source, "expressions.c")
+                .unwrap()
+                .expect("supported expression program");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_do_while_and_increment_statements() {
+        let image = compile_minimal_program(
+            "int main(void) { int count = 0; do { ++count; } while (count < 4); return count; }",
+            "do-while.c",
+        )
+        .unwrap()
+        .expect("supported do/while program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 4);
+    }
+
+    #[test]
+    fn compiles_local_declarations_in_nested_blocks() {
+        let image = compile_minimal_program(
+            "int main(void) { int sum = 0; { int value = 6; sum = value + 4; } return sum; }",
+            "block-locals.c",
+        )
+        .unwrap()
+        .expect("supported nested block locals");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 10);
+    }
+
+    #[test]
+    fn compiles_signed_and_unsigned_byte_scalar_locals() {
+        for (source, expected) in [
+            (
+                "int main(void) { signed char value = 127; value++; return value; }",
+                0xff80,
+            ),
+            (
+                "int main(void) { unsigned char value = 255; value++; return value; }",
+                0,
+            ),
+            (
+                "int helper(int a, int b, int c) { unsigned char value = 257; return value + a + b + c; } int main(void) { return helper(1, 2, 3); }",
+                7,
+            ),
+        ] {
+            let image = compile_minimal_program(source, "byte-scalars.c")
+                .unwrap()
+                .expect("supported byte scalar local");
+            let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            cpu.run(128).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], expected, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn compiles_shift_assignment_and_signed_right_shift() {
+        let image = compile_minimal_program(
+            "int main(void) { int value = -16; value >>= 2; return value; }",
+            "shift.c",
+        )
+        .unwrap()
+        .expect("supported shift assignment program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0] as u16, 0xfffc);
+    }
+
+    #[test]
+    fn compiles_break_and_continue_in_for_loops() {
+        let image = compile_minimal_program(
+            "int main(void) { int sum = 0; for (int i = 0; i < 10; i++) { if (i == 3) continue; if (i == 7) break; sum += i; } return sum; }",
+            "loop-control.c",
+        )
+        .unwrap()
+        .expect("supported loop-control program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(512).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 18, "registers: {:?}", cpu.registers);
+    }
+
+    #[test]
+    fn compiles_multiple_integer_functions_and_recursive_calls() {
+        let source = "int factorial(int n) { if (n <= 1) return 1; return n * factorial(n - 1); } \
+                      int add(int left, int right) { return left + right; } \
+                      int main(void) { return add(factorial(5), 2); }";
+        let image = compile_minimal_program(source, "functions.c")
+            .unwrap()
+            .expect("supported recursive multi-function program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(10_000).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 122);
+    }
+
+    #[test]
+    fn compiles_void_helpers_with_and_without_return_statements() {
+        let source = "int result; void set_result(int value); void set_result(int value) { result = value; } void increment(void) { result++; return; } int main(void) { set_result(5); increment(); return result; }";
+        let image = compile_minimal_program(source, "void-functions.c")
+            .unwrap()
+            .expect("supported void-function program");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(256).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 6);
+    }
+
+    #[test]
+    fn rejects_void_function_results_used_as_values() {
+        let source = "void action(void) {} int main(void) { return action(); }";
+        assert!(
+            compile_minimal_program(source, "void-value.c")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn supports_binary64_runtime_objects_arithmetic_comparisons_and_calls() {
+        let source = "double observed; \
+                                            double scale(double value) { value += 0.5; return value * 2.0; } \
+                                            int main(void) { double values[2]; double *pointer = values; \
+                                            double result; pointer[0] = 1.25; \
+                                            pointer[1] = pointer[0] + 1.25; \
+                                            result = pointer[1] * 2.0; \
+                                            observed = result; \
+                                            if (result != 5.0) return 10; \
+                                            if (pointer[0] + 1 != 2.25) return 15; \
+                                            if (!(pointer[0] < pointer[1])) return 20; \
+                                            if ((int)2.75 != 2) return 30; \
+                                            if ((float)(double)1.5 != 1.5f) return 40; \
+                                            if (scale(1.25) != 3.5) return 50; \
+                                            return 0; }";
+        let image = compile_minimal_program(source, "runtime-f64-general.c")
+            .unwrap()
+            .expect("binary64 runtime expressions");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(4096).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(
+            &cpu.memory[0x80000..0x80008],
+            &[0x40, 0x14, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(cpu.registers[0], 0);
+    }
+
+    #[test]
+    fn converts_unsigned_long_locals_to_binary32_and_binary64() {
+        let source = "float observed; double observed_real; \
+                      int main(void) { long signed_value = 65536L; \
+                      unsigned long unsigned_value = 131072UL; \
+                      float signed_single = signed_value; \
+                      double signed_real = signed_value; \
+                      float unsigned_single = unsigned_value; \
+                      double unsigned_real = unsigned_value; \
+                      observed = unsigned_single; \
+                      observed_real = unsigned_real; \
+                      if (unsigned_single != 131072.0f) return 30; \
+                      if (signed_single != 65536.0f) return 10; \
+                      if (signed_real != 65536.0) return 20; \
+                      if (unsigned_real != 131072.0) return 40; return 0; }";
+        let image = compile_minimal_program(source, "unsigned-long-float.c")
+            .unwrap()
+            .expect("unsigned long conversions");
+        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.run(1024).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(&cpu.memory[0x80000..0x80004], &[0x48, 0, 0, 0]);
+        assert_eq!(&cpu.memory[0x80004..0x8000c], &[0x41, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 0);
+    }
+}

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "netgame-demo",
+  "name": "Netgame Demo",
+  "legacy_disk": "APP00010",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/net_game_demo.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

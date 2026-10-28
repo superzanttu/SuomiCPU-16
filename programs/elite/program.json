@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slug": "elite",
+  "name": "Elite",
+  "legacy_disk": "APP00004",
+  "capacity_bytes": 67108864,
+  "boot": {
+    "source": "src/elitedemo.c",
+    "output": "main.bin"
+  },
+  "assets": null,
+  "executables": []
+}

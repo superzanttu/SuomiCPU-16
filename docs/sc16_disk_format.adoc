@@ -33,7 +33,7 @@ requires a new manifest version.
 
 |+id+
 |String
-|Exactly eight ASCII letters, digits, +_+, or +-+. Disk discovery must require
+|One to 32 ASCII letters, digits, +_+, or +-+, excluding reserved Windows device names. Disk discovery rejects case-insensitive collisions and requires
 that it matches the containing disk directory's identity.
 
 |+label+
@@ -77,7 +77,7 @@ A selected +kernel.bin+ is trusted kernel code. This rule is not secure boot and
 does not authenticate the disk or image. Disk metadata and user programs cannot
 override executable selection or mode.
 
-The common +bios.bin+ image is always counted as trusted firmware and runs in
+The common +firmware/bios.bin+ image is always counted as trusted firmware and runs in
 kernel (Supervisor) mode. This is a fixed emulator policy, not a signature check:
 the image is not authenticated, and the trust assumption does not imply secure
 boot.
@@ -104,7 +104,7 @@ SC-16 image container directly, preserving its entry point, segment
 permissions, and alignment, and never compiles or assembles guest source.
 KERNEL maps to the CPU's +Supervisor+ privilege mode; USER maps to +User+.
 
-The common +bios.bin+ image is required, trusted by policy, and executes in
+The common +firmware/bios.bin+ image is required, trusted by policy, and executes in
 kernel (Supervisor) mode before disk selection.
 The guest BIOS renders through the character-cell display and uses the
 supervisor-only firmware service at +0x43400+ for disk discovery and image
@@ -153,12 +153,12 @@ Supervisor mode. All multi-byte values are big-endian.
 |The selected disk index is at +0x43402+, startup behavior at +0x43406+
   (+0+ selector, +1+ boot preferred disk), and the NUL-terminated SC-NET node
   ID at +0x43410+ in a 17-byte NUL-terminated buffer (maximum 16 printable
-  ASCII bytes). Saves the settings to the emulator-root +bios.json+, preserving
+  ASCII bytes). Saves the settings to the +config/bios.json+, preserving
   additional boolean, integer, and string settings.
 
 |+5+
 |Reload BIOS settings
-|Reloads +bios.json+ and returns the selected disk index, disk count, startup
+|Reloads +config/bios.json+ and returns the selected disk index, disk count, startup
   behavior, and SC-NET node ID in the same fields as command +1+.
 
 |+6+
@@ -189,7 +189,7 @@ The root settings file has this versioned shape:
 ----
 {
   "version": 1,
-  "preferred_disk": "APP00001",
+  "preferred_disk": "anaclock",
   "startup_behavior": "selector",
   "network_name": "SC16-0123456789A",
   "settings": {
@@ -208,7 +208,7 @@ edited there; changes are saved only with F10.
 +preferred_disk+ may be +null+ when no disk is selected. Startup behavior is
 +selector+ or +boot_preferred+. +network_name+ is a 1-16 character printable
 ASCII SC-NET node ID. When omitted, the BIOS generates an ID in the
-+SC16-+ plus 11 hexadecimal digit form. Missing +bios.json+ uses these
++SC16-+ plus 11 hexadecimal digit form. Missing +config/bios.json+ uses these
 defaults; invalid JSON or unsupported field types are reported rather than
 silently replaced.
 
@@ -271,7 +271,7 @@ Guest code cannot create, replace, remove, or rename the root boot filenames
 +main.bin+ and +kernel.bin+. This narrow register gateway is not the finalized
 general syscall ABI and does not provide general MMIO or process isolation.
 Command +0x80+ remains as a read-only recursive file-list compatibility shim
-for +lib/disk.h+; legacy block commands are rejected.
+for +toolchain/include/disk.h+; legacy block commands are rejected.
 
 == Implementation status
 
