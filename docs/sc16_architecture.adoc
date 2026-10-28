@@ -358,7 +358,7 @@ which the native wrappers combine before `SVC`.
 |15 |`startup_argument` |Returns the current process's scalar startup argument,
   zero for ordinary +spawn+.
 |16 |`monotonic_ms` |Returns host-monotonic elapsed milliseconds modulo 2^30.
-  Queried on demand, independent of instruction speed; continues during pause.
+  Queried on demand, independent of instruction speed and host scheduling delays.
 |17 |`spawn_arg` |Like +spawn+, with an unsigned 30-bit scalar startup argument
   in R2. The original +spawn+ ignores R2 and supplies zero.
 |18 |`trywait` |Like +wait+, but returns +-EAGAIN+ (-11) without blocking when

@@ -51,23 +51,6 @@ impl ConsoleDevice {
         }
     }
 
-    pub fn reset(&mut self, preserve_history: bool) {
-        self.receive_buffer.clear();
-        self.overrun = false;
-        self.control = 0x03;
-        if !preserve_history {
-            self.output.clear();
-            self.lines = (0..ROWS).map(|_| vec![b' '; COLUMNS]).collect();
-            self.scrollback.clear();
-            self.column = 0;
-            self.row = 0;
-        }
-        self.escape_state = 0;
-        self.escape_private = false;
-        self.escape_parameters.clear();
-        self.cursor_visible = true;
-    }
-
     pub fn status(&self) -> u8 {
         u8::from(!self.receive_buffer.is_empty()) | 0x02 | (u8::from(self.overrun) << 2)
     }
@@ -508,32 +491,6 @@ mod tests {
             console.write_data(*byte);
         }
         assert!(!console.cursor_visible());
-    }
-
-    #[test]
-    fn reset_can_preserve_or_clear_history_and_output() {
-        let mut console = ConsoleDevice::new();
-        console.write_text("previous");
-        console.receive(b"pending");
-        console.reset(true);
-        assert!(console.receive_buffer().is_empty());
-        assert_eq!(console.control(), 3);
-        assert!(
-            console
-                .scrollback_snapshot()
-                .iter()
-                .any(|line| line.contains("previous"))
-        );
-        assert!(!console.output().is_empty());
-
-        console.reset(false);
-        assert!(console.output().is_empty());
-        assert!(
-            !console
-                .scrollback_snapshot()
-                .iter()
-                .any(|line| line.contains("previous"))
-        );
     }
 
     #[test]

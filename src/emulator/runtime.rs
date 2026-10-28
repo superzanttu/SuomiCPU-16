@@ -30,7 +30,6 @@ use minifb::{
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPEED_ADDR: usize = 0x43003;
@@ -44,14 +43,8 @@ const CONSOLE_WINDOW_HEIGHT: usize = 200;
 const CONSOLE_TOOLBAR_HEIGHT: usize = 28;
 const RUNTIME_INSTRUCTION_CHUNK: usize = 5_000;
 const RUNTIME_CPU_SLICE: Duration = Duration::from_millis(30);
-const TOOLBAR_BUTTONS: [(&str, f32, f32); 5] = [
-    ("PAUSE", 8.0, 104.0),
-    ("STOP", 120.0, 80.0),
-    ("RESET", 208.0, 80.0),
-    ("REBOOT", 296.0, 88.0),
-    ("BUG MONITOR", 392.0, 112.0),
-];
-const CONSOLE_TOOLBAR_BUTTONS: [(usize, usize); 4] = [(6, 94), (106, 72), (184, 92), (282, 104)];
+const BUG_MONITOR_BUTTON: (f32, f32) = (8.0, 112.0);
+const CONSOLE_CLOSE_BUTTON: (usize, usize) = (6, 104);
 const BIOS_TEXT_COLUMNS: usize = 53;
 const BIOS_TEXT_ROWS: usize = 25;
 const BIOS_TEXT_CELL_WIDTH: usize = 12;
@@ -145,14 +138,6 @@ impl AudioEngine {
         );
         self.channels[channel] = Some(ActiveSound { command, sound });
         Ok(())
-    }
-
-    fn stop_all(&mut self) {
-        for active in &mut self.channels {
-            if let Some(active) = active.take() {
-                stop_sound(&active.sound);
-            }
-        }
     }
 }
 
@@ -248,7 +233,7 @@ impl Canvas {
         triangles: &[GpuTriangle],
         lines: &[GpuLine],
         palette: &[[u8; 3]; 256],
-        toolbar: Option<ToolbarState>,
+        toolbar_visible: bool,
     ) {
         let (width, height) = logical_size;
         self.rgba.fill(0);
@@ -264,11 +249,7 @@ impl Canvas {
         }
         self.texture.update_from_bytes(640, 480, &self.rgba);
 
-        let toolbar_height = if toolbar.is_some() {
-            TOOLBAR_HEIGHT
-        } else {
-            0.0
-        };
+        let toolbar_height = if toolbar_visible { TOOLBAR_HEIGHT } else { 0.0 };
         let available_height = (screen_height() - toolbar_height).max(1.0);
         let scale = (screen_width() / width as f32).min(available_height / height as f32);
         let destination = vec2(width as f32 * scale, height as f32 * scale);
@@ -312,8 +293,8 @@ impl Canvas {
                 Color::from_rgba(color[0], color[1], color[2], 255),
             );
         }
-        if let Some(toolbar) = toolbar {
-            draw_toolbar(toolbar);
+        if toolbar_visible {
+            draw_toolbar();
         }
         next_frame().await;
     }
@@ -334,18 +315,9 @@ enum BiosMouseAction {
 
 #[derive(Debug, PartialEq, Eq)]
 enum RuntimeControl {
-    PauseToggled(bool),
     FullscreenToggled(bool),
     ConsoleToggled(bool),
     ConsoleClosed,
-    ResetRequested,
-    RebootRequested,
-    StopRequested,
-}
-
-#[derive(Clone, Copy)]
-struct ToolbarState {
-    paused: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -363,7 +335,7 @@ impl ConsoleWindow {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let window = NativeWindow::new(
-                "SC-16 Bug Monitor | F1 pause  F2 close  F3 reset  F4 reboot  F5 stop",
+                "SC-16 Bug Monitor | F2 close",
                 CONSOLE_WINDOW_WIDTH,
                 CONSOLE_WINDOW_HEIGHT,
                 WindowOptions {
@@ -397,11 +369,7 @@ impl ConsoleWindow {
         }
     }
 
-    fn runtime_control_pressed(
-        &mut self,
-        paused: bool,
-        console_visible: bool,
-    ) -> Option<RuntimeControl> {
+    fn runtime_control_pressed(&mut self) -> Option<RuntimeControl> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if !self.window.is_open() {
@@ -411,20 +379,10 @@ impl ConsoleWindow {
             if !self.window.is_open() {
                 return Some(RuntimeControl::ConsoleClosed);
             }
-            let keyboard_control = [
-                NativeKey::F1,
-                NativeKey::F2,
-                NativeKey::F3,
-                NativeKey::F4,
-                NativeKey::F5,
-            ]
-            .into_iter()
-            .find_map(|key| {
-                self.window
-                    .is_key_pressed(key, KeyRepeat::No)
-                    .then_some(key)
-                    .and_then(|key| console_runtime_control(key, paused))
-            });
+            let keyboard_control = self
+                .window
+                .is_key_pressed(NativeKey::F2, KeyRepeat::No)
+                .then_some(RuntimeControl::ConsoleToggled(false));
             let mouse_down = self.window.get_mouse_down(NativeMouseButton::Left);
             let mouse_clicked = mouse_down && !self.left_mouse_down;
             self.left_mouse_down = mouse_down;
@@ -432,9 +390,7 @@ impl ConsoleWindow {
                 if mouse_clicked {
                     self.window
                         .get_mouse_pos(MouseMode::Clamp)
-                        .and_then(|position| {
-                            console_toolbar_control(position, paused, console_visible)
-                        })
+                        .and_then(|position| console_toolbar_control(position))
                 } else {
                     None
                 }
@@ -442,20 +398,14 @@ impl ConsoleWindow {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (paused, console_visible);
             None
         }
     }
 
-    fn present(
-        &mut self,
-        lines: &[String],
-        font: &[[u8; 8]],
-        paused: bool,
-    ) -> Result<(), RuntimeError> {
+    fn present(&mut self, lines: &[String], font: &[[u8; 8]]) -> Result<(), RuntimeError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            draw_console_lines(&mut self.pixels, lines, font, paused);
+            draw_console_lines(&mut self.pixels, lines, font);
             self.window
                 .update_with_buffer(&self.pixels, CONSOLE_WINDOW_WIDTH, CONSOLE_WINDOW_HEIGHT)
                 .map_err(|error| {
@@ -463,20 +413,8 @@ impl ConsoleWindow {
                 })?;
         }
         #[cfg(target_arch = "wasm32")]
-        let _ = (lines, font, paused);
+        let _ = (lines, font);
         Ok(())
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn console_runtime_control(key: NativeKey, paused: bool) -> Option<RuntimeControl> {
-    match key {
-        NativeKey::F1 => Some(RuntimeControl::PauseToggled(!paused)),
-        NativeKey::F2 => Some(RuntimeControl::ConsoleToggled(false)),
-        NativeKey::F3 => Some(RuntimeControl::ResetRequested),
-        NativeKey::F4 => Some(RuntimeControl::RebootRequested),
-        NativeKey::F5 => Some(RuntimeControl::StopRequested),
-        _ => None,
     }
 }
 
@@ -520,7 +458,7 @@ pub async fn run_with_devices(
     let mut framebuffer = Vec::new();
     let mut canvas = Canvas::new();
     let mut audio = AudioEngine::new();
-    let mut cpu = match fresh_runtime_cpu(root, program, disk_id, network_port, None) {
+    let mut cpu = match fresh_runtime_cpu(root, program, disk_id, network_port) {
         Ok(cpu) => cpu,
         Err(error) => {
             show_bios_startup_error(
@@ -535,7 +473,6 @@ pub async fn run_with_devices(
         }
     };
     cpu.debug_console.log_info("emulator", "BIOS started");
-    let mut paused = false;
     let mut console_visible = false;
     let mut console_window: Option<ConsoleWindow> = None;
     let mut fullscreen = fullscreen;
@@ -579,7 +516,6 @@ pub async fn run_with_devices(
         let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
         let controlled =
             keys.contains(&KeyCode::LeftControl) || keys.contains(&KeyCode::RightControl);
-        let mut pending_action = None;
         let mut control_key_count = 0;
         let mut handled_control_keys = HashSet::new();
         for key in pressed_keys.iter().copied() {
@@ -604,7 +540,6 @@ pub async fn run_with_devices(
             }
             if let Some(control) = apply_runtime_control(
                 key,
-                &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
                 shifted,
@@ -614,27 +549,6 @@ pub async fn run_with_devices(
                 handled_control_keys.insert(key);
                 match control {
                     RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
-                    RuntimeControl::ResetRequested => {
-                        pending_action = Some(RuntimeControl::ResetRequested)
-                    }
-                    RuntimeControl::RebootRequested => {
-                        pending_action = Some(RuntimeControl::RebootRequested)
-                    }
-                    RuntimeControl::StopRequested => {
-                        cpu.running = false;
-                        cpu.debug_console
-                            .log_info("emulator", "CPU stopped by user");
-                    }
-                    RuntimeControl::PauseToggled(paused) => {
-                        cpu.debug_console.log_info(
-                            "emulator",
-                            if paused {
-                                "Emulation paused"
-                            } else {
-                                "Emulation continued"
-                            },
-                        );
-                    }
                     RuntimeControl::ConsoleToggled(_) => {}
                     RuntimeControl::ConsoleClosed => {}
                 }
@@ -643,23 +557,9 @@ pub async fn run_with_devices(
         }
         let console_control = console_window
             .as_mut()
-            .and_then(|window| window.runtime_control_pressed(paused, console_visible));
+            .and_then(|window| window.runtime_control_pressed());
         if let Some(control) = console_control {
             match control {
-                RuntimeControl::ResetRequested | RuntimeControl::RebootRequested => {
-                    pending_action = Some(control);
-                }
-                RuntimeControl::PauseToggled(new_paused) => {
-                    paused = new_paused;
-                    cpu.debug_console.log_info(
-                        "emulator",
-                        if paused {
-                            "Emulation paused"
-                        } else {
-                            "Emulation continued"
-                        },
-                    );
-                }
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
                 RuntimeControl::ConsoleClosed => {
                     console_visible = false;
@@ -668,41 +568,17 @@ pub async fn run_with_devices(
                         .log_debug("emulator", "Bug Monitor window closed");
                 }
                 RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
-                RuntimeControl::StopRequested => {
-                    cpu.running = false;
-                    cpu.debug_console
-                        .log_info("emulator", "CPU stopped by user");
-                }
             }
             last_frame = Instant::now();
         }
         if !fullscreen
             && is_mouse_button_pressed(MouseButton::Left)
-            && let Some(control) = toolbar_control(mouse_position(), paused, console_visible)
+            && let Some(control) = toolbar_control(mouse_position(), console_visible)
         {
             match control {
-                RuntimeControl::PauseToggled(new_paused) => {
-                    paused = new_paused;
-                    cpu.debug_console.log_info(
-                        "emulator",
-                        if paused {
-                            "Emulation paused"
-                        } else {
-                            "Emulation continued"
-                        },
-                    );
-                }
-                RuntimeControl::ResetRequested | RuntimeControl::RebootRequested => {
-                    pending_action = Some(control);
-                }
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
                 RuntimeControl::ConsoleClosed => {}
                 RuntimeControl::FullscreenToggled(_) => {}
-                RuntimeControl::StopRequested => {
-                    cpu.running = false;
-                    cpu.debug_console
-                        .log_info("emulator", "CPU stopped by user");
-                }
             }
         }
         if fullscreen {
@@ -712,85 +588,6 @@ pub async fn run_with_devices(
             console_window = Some(ConsoleWindow::new()?);
         } else if !console_visible {
             console_window = None;
-        }
-        if let Some(action @ (RuntimeControl::ResetRequested | RuntimeControl::RebootRequested)) =
-            pending_action
-        {
-            audio.stop_all();
-            cpu.debug_console.log_debug(
-                "emulator",
-                if action == RuntimeControl::ResetRequested {
-                    "Reset requested"
-                } else {
-                    "Firmware reboot requested"
-                },
-            );
-            let previous_console = (cpu.console.clone(), cpu.debug_console.clone());
-            if action == RuntimeControl::ResetRequested {
-                console_window = None;
-                console_visible = false;
-                cpu = match fresh_runtime_cpu(
-                    root,
-                    program,
-                    disk_id,
-                    network_port,
-                    Some((&previous_console.0, &previous_console.1)),
-                ) {
-                    Ok(cpu) => cpu,
-                    Err(error) => {
-                        show_bios_startup_error(
-                            &error.to_string(),
-                            &font,
-                            &mut pixels,
-                            &mut canvas,
-                            fullscreen,
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                };
-            } else {
-                rebuild_bios_if_stale(root)?;
-                cpu = match fresh_runtime_cpu(
-                    root,
-                    program,
-                    disk_id,
-                    network_port,
-                    Some((&previous_console.0, &previous_console.1)),
-                ) {
-                    Ok(cpu) => cpu,
-                    Err(error) => {
-                        show_bios_startup_error(
-                            &error.to_string(),
-                            &font,
-                            &mut pixels,
-                            &mut canvas,
-                            fullscreen,
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                };
-            }
-            cpu.debug_console.log_info(
-                "emulator",
-                if action == RuntimeControl::ResetRequested {
-                    "System reset complete"
-                } else {
-                    "Firmware reboot complete"
-                },
-            );
-            presented_size = screen_size(&cpu);
-            presented_triangles.clear();
-            presented_lines.clear();
-            presented_palette = cpu.palette;
-            paused = false;
-            old_keys.clear();
-            speed_remainder = 0.0;
-            cpu_budget_remaining = 0;
-            cpu_frame_started = false;
-            last_frame = Instant::now();
-            continue;
         }
         let key_control_only = control_key_count == pressed_keys.len();
         if runtime_should_close(
@@ -835,51 +632,42 @@ pub async fn run_with_devices(
             let typed_characters = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
             receive_typed_text(&mut cpu, typed_characters);
             update_rtc(&mut cpu);
-            if !paused {
-                if cpu_budget_remaining == 0 {
-                    if !cpu_frame_started {
-                        cpu.begin_frame();
-                        cpu_frame_started = true;
-                    }
-                    let elapsed = last_frame.elapsed().as_secs_f64();
-                    last_frame = Instant::now();
-                    let mode = cpu.memory[SPEED_ADDR];
-                    cpu_budget_remaining = match mode {
-                        0 => rate_budget(10.0, elapsed, &mut speed_remainder),
-                        1 => rate_budget(100.0, elapsed, &mut speed_remainder),
-                        2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
-                        3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
-                        _ => 300_000,
-                    };
+            if cpu_budget_remaining == 0 {
+                if !cpu_frame_started {
+                    cpu.begin_frame();
+                    cpu_frame_started = true;
                 }
-                if let Err(error) = run_instruction_slice(&mut cpu, &mut cpu_budget_remaining) {
-                    if let Some(path) = cpu.take_booted_disk_path() {
-                        active_boot_disk = Some(path);
-                    }
-                    let details = runtime_cpu_failure_details(
-                        &cpu,
-                        program,
-                        active_boot_disk.as_deref(),
-                        &error,
-                    );
-                    cpu.debug_console.log_error("emulator", &details);
-                    return Err(RuntimeError::Window(details));
-                }
+                let elapsed = last_frame.elapsed().as_secs_f64();
+                last_frame = Instant::now();
+                let mode = cpu.memory[SPEED_ADDR];
+                cpu_budget_remaining = match mode {
+                    0 => rate_budget(10.0, elapsed, &mut speed_remainder),
+                    1 => rate_budget(100.0, elapsed, &mut speed_remainder),
+                    2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
+                    3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
+                    _ => 300_000,
+                };
+            }
+            if let Err(error) = run_instruction_slice(&mut cpu, &mut cpu_budget_remaining) {
                 if let Some(path) = cpu.take_booted_disk_path() {
                     active_boot_disk = Some(path);
                 }
-                if cpu_budget_remaining == 0 || cpu.frame_yield || !cpu.has_pending_work() {
-                    cpu_budget_remaining = 0;
-                    cpu_frame_started = false;
-                }
-                for command in cpu.take_sound_commands() {
-                    audio.apply(command).await?;
-                }
-                cpu.end_mouse_frame();
-            } else {
-                cpu.end_mouse_frame();
-                last_frame = Instant::now();
+                let details =
+                    runtime_cpu_failure_details(&cpu, program, active_boot_disk.as_deref(), &error);
+                cpu.debug_console.log_error("emulator", &details);
+                return Err(RuntimeError::Window(details));
             }
+            if let Some(path) = cpu.take_booted_disk_path() {
+                active_boot_disk = Some(path);
+            }
+            if cpu_budget_remaining == 0 || cpu.frame_yield || !cpu.has_pending_work() {
+                cpu_budget_remaining = 0;
+                cpu_frame_started = false;
+            }
+            for command in cpu.take_sound_commands() {
+                audio.apply(command).await?;
+            }
+            cpu.end_mouse_frame();
         }
         let cursor_phase = terminal_cursor_phase();
         let capture_display = if cpu.terminal_active {
@@ -908,7 +696,7 @@ pub async fn run_with_devices(
             }
         }
         let (width, height) = presented_size;
-        if (!cpu.has_pending_work() || paused) && !cpu.terminal_active {
+        if !cpu.has_pending_work() && !cpu.terminal_active {
             fill_rect(
                 &mut pixels,
                 width,
@@ -918,16 +706,11 @@ pub async fn run_with_devices(
                 18,
                 rgb(10, 14, 24),
             );
-            let status = if paused {
-                "PAUSED - F1 TO RESUME"
-            } else {
-                "PROGRAM HALTED - PRESS ANY KEY TO CLOSE"
-            };
             draw_text_limited(
                 &mut pixels,
                 width,
                 (4, height.saturating_sub(13)),
-                status,
+                "PROGRAM HALTED - PRESS ANY KEY TO CLOSE",
                 width / 6,
                 0xffff_d000,
                 &font,
@@ -935,7 +718,7 @@ pub async fn run_with_devices(
         }
         if let Some(window) = console_window.as_mut() {
             if window.is_open() {
-                window.present(&cpu.debug_console.text_snapshot(), &font, paused)?;
+                window.present(&cpu.debug_console.text_snapshot(), &font)?;
             } else {
                 console_window = None;
                 console_visible = false;
@@ -948,7 +731,7 @@ pub async fn run_with_devices(
                 &presented_triangles,
                 &presented_lines,
                 &presented_palette,
-                (!fullscreen).then_some(ToolbarState { paused }),
+                !fullscreen,
             )
             .await;
     }
@@ -1022,14 +805,7 @@ async fn show_bios_startup_error(
     loop {
         draw_bios_error(pixels, font, error);
         canvas
-            .present(
-                pixels,
-                (640, 480),
-                &[],
-                &[],
-                &[[0; 3]; 256],
-                (!fullscreen).then_some(ToolbarState { paused: false }),
-            )
+            .present(pixels, (640, 480), &[], &[], &[[0; 3]; 256], !fullscreen)
             .await;
         if is_key_pressed(KeyCode::Escape) {
             return;
@@ -1353,10 +1129,6 @@ fn fresh_runtime_cpu(
     source: Option<&Path>,
     disk_id: Option<&str>,
     network_port: u16,
-    previous_consoles: Option<(
-        &crate::console::ConsoleDevice,
-        &crate::console::ConsoleDevice,
-    )>,
 ) -> Result<Cpu, RuntimeError> {
     let mut cpu = Cpu::new();
     cpu.set_network_port(network_port);
@@ -1373,12 +1145,6 @@ fn fresh_runtime_cpu(
         cpu.mount_data_disk(disk_id).map_err(RuntimeError::Window)?;
     } else if source.is_none() {
         cpu.set_bios_preselected_disk(disk_id);
-    }
-    if let Some((previous_console, previous_debug_console)) = previous_consoles {
-        cpu.console = previous_console.clone();
-        cpu.console.reset(true);
-        cpu.debug_console = previous_debug_console.clone();
-        cpu.debug_console.reset(true);
     }
     let bios_path = root.join("firmware").join("bios.bin");
     if !bios_path.try_exists()? {
@@ -1400,59 +1166,6 @@ fn fresh_runtime_cpu(
     cpu.debug_console
         .log_info("emulator", "trusted BIOS started in kernel mode");
     Ok(cpu)
-}
-
-fn rebuild_bios_if_stale(root: &Path) -> Result<(), RuntimeError> {
-    let source = root.join("firmware").join("bios.asm");
-    let image = root.join("firmware").join("bios.bin");
-    if !source.is_file() {
-        return Ok(());
-    }
-    let source_modified = source.metadata()?.modified()?;
-    let image_modified = image
-        .is_file()
-        .then(|| image.metadata()?.modified())
-        .transpose()?;
-    let needs_build = bios_needs_rebuild(Some(source_modified), image_modified);
-    if !needs_build {
-        return Ok(());
-    }
-
-    let executable = std::env::current_exe()?;
-    let tool_name = format!("sc16build{}", std::env::consts::EXE_SUFFIX);
-    let tool = executable
-        .ancestors()
-        .map(|directory| directory.join(&tool_name))
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            RuntimeError::Window(format!(
-                "BIOS source changed, but {tool_name} was not found beside {}",
-                executable.display()
-            ))
-        })?;
-    let status = Command::new(&tool)
-        .arg("build-bios")
-        .arg(&source)
-        .arg(&image)
-        .current_dir(root)
-        .status()?;
-    if !status.success() {
-        return Err(RuntimeError::Window(format!(
-            "BIOS rebuild failed with status {status}"
-        )));
-    }
-    Ok(())
-}
-
-fn bios_needs_rebuild(
-    source_modified: Option<SystemTime>,
-    image_modified: Option<SystemTime>,
-) -> bool {
-    match (source_modified, image_modified) {
-        (Some(source), Some(image)) => source > image,
-        (Some(_), None) => true,
-        (None, _) => false,
-    }
 }
 
 fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
@@ -1949,20 +1662,12 @@ fn receive_terminal_key(cpu: &mut Cpu, key: KeyCode) {
 
 fn apply_runtime_control(
     key: KeyCode,
-    paused: &mut bool,
     fullscreen: &mut bool,
     console_visible: &mut bool,
     shifted: bool,
     controlled: bool,
 ) -> Option<RuntimeControl> {
     match key {
-        KeyCode::F1 => {
-            *paused = !*paused;
-            Some(RuntimeControl::PauseToggled(*paused))
-        }
-        KeyCode::F3 => Some(RuntimeControl::ResetRequested),
-        KeyCode::F4 => Some(RuntimeControl::RebootRequested),
-        KeyCode::F5 => Some(RuntimeControl::StopRequested),
         KeyCode::F11 => {
             *fullscreen = !*fullscreen;
             Some(RuntimeControl::FullscreenToggled(*fullscreen))
@@ -1979,31 +1684,19 @@ fn apply_runtime_control(
     }
 }
 
-fn toolbar_control(
-    position: (f32, f32),
-    paused: bool,
-    console_visible: bool,
-) -> Option<RuntimeControl> {
+fn toolbar_control(position: (f32, f32), console_visible: bool) -> Option<RuntimeControl> {
     let (x, y) = position;
     if !(5.0..31.0).contains(&y) {
         return None;
     }
-    for (index, (_, left, width)) in TOOLBAR_BUTTONS.iter().enumerate() {
-        if (*left..*left + *width).contains(&x) {
-            return match index {
-                0 => Some(RuntimeControl::PauseToggled(!paused)),
-                1 => Some(RuntimeControl::StopRequested),
-                2 => Some(RuntimeControl::ResetRequested),
-                3 => Some(RuntimeControl::RebootRequested),
-                4 => Some(RuntimeControl::ConsoleToggled(!console_visible)),
-                _ => None,
-            };
-        }
+    let (left, width) = BUG_MONITOR_BUTTON;
+    if (left..left + width).contains(&x) {
+        return Some(RuntimeControl::ConsoleToggled(!console_visible));
     }
     None
 }
 
-fn draw_toolbar(state: ToolbarState) {
+fn draw_toolbar() {
     draw_rectangle(
         0.0,
         0.0,
@@ -2011,35 +1704,18 @@ fn draw_toolbar(state: ToolbarState) {
         TOOLBAR_HEIGHT,
         Color::from_rgba(12, 16, 24, 255),
     );
-    for (index, (label, x, width)) in TOOLBAR_BUTTONS.iter().enumerate() {
-        let label = if index == 0 && state.paused {
-            "CONTINUE"
-        } else {
-            label
-        };
-        let active = index == 0 && state.paused;
-        draw_rectangle(
-            *x,
-            5.0,
-            *width,
-            26.0,
-            if active {
-                Color::from_rgba(43, 95, 70, 255)
-            } else {
-                Color::from_rgba(43, 54, 72, 255)
-            },
-        );
-        draw_ui_text(
-            label,
-            *x + 8.0,
-            23.0,
-            14.0,
-            Color::from_rgba(238, 242, 248, 255),
-        );
-    }
+    let (x, width) = BUG_MONITOR_BUTTON;
+    draw_rectangle(x, 5.0, width, 26.0, Color::from_rgba(43, 54, 72, 255));
+    draw_ui_text(
+        "BUG MONITOR",
+        x + 8.0,
+        23.0,
+        14.0,
+        Color::from_rgba(238, 242, 248, 255),
+    );
 }
 
-fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]], paused: bool) {
+fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]]) {
     pixels.fill(rgb(8, 12, 18));
     fill_rect(
         pixels,
@@ -2050,34 +1726,25 @@ fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]], pa
         CONSOLE_TOOLBAR_HEIGHT,
         rgb(16, 22, 34),
     );
-    for (index, (left, width)) in CONSOLE_TOOLBAR_BUTTONS.iter().enumerate() {
-        fill_rect(
-            pixels,
-            CONSOLE_WINDOW_WIDTH,
-            *left,
-            4,
-            *width,
-            20,
-            rgb(43, 54, 72),
-        );
-        let label = match index {
-            0 if paused => "CONTINUE",
-            0 => "PAUSE",
-            1 => "RESET",
-            2 => "REBOOT",
-            3 => "BUG MONITOR",
-            _ => unreachable!(),
-        };
-        draw_text(
-            pixels,
-            CONSOLE_WINDOW_WIDTH,
-            *left + 7,
-            10,
-            label,
-            rgb(238, 242, 248),
-            font,
-        );
-    }
+    let (left, width) = CONSOLE_CLOSE_BUTTON;
+    fill_rect(
+        pixels,
+        CONSOLE_WINDOW_WIDTH,
+        left,
+        4,
+        width,
+        20,
+        rgb(43, 54, 72),
+    );
+    draw_text(
+        pixels,
+        CONSOLE_WINDOW_WIDTH,
+        left + 7,
+        10,
+        "CLOSE MONITOR",
+        rgb(238, 242, 248),
+        font,
+    );
     for (row, line) in lines
         .iter()
         .skip(
@@ -2100,24 +1767,14 @@ fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]], pa
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn console_toolbar_control(
-    (x, y): (f32, f32),
-    paused: bool,
-    console_visible: bool,
-) -> Option<RuntimeControl> {
+fn console_toolbar_control((x, y): (f32, f32)) -> Option<RuntimeControl> {
     if !(4.0..24.0).contains(&y) {
         return None;
     }
-    CONSOLE_TOOLBAR_BUTTONS
-        .iter()
-        .position(|(left, width)| (*left as f32..(*left + *width) as f32).contains(&x))
-        .and_then(|index| match index {
-            0 => Some(RuntimeControl::PauseToggled(!paused)),
-            1 => Some(RuntimeControl::ResetRequested),
-            2 => Some(RuntimeControl::RebootRequested),
-            3 => Some(RuntimeControl::ConsoleToggled(!console_visible)),
-            _ => None,
-        })
+    let (left, width) = CONSOLE_CLOSE_BUTTON;
+    (left as f32..(left + width) as f32)
+        .contains(&x)
+        .then_some(RuntimeControl::ConsoleToggled(false))
 }
 
 fn screen_size(cpu: &Cpu) -> (usize, usize) {
@@ -2466,7 +2123,7 @@ mod tests {
         let lines = (0..30)
             .map(|line| format!("line-{line:02}"))
             .collect::<Vec<_>>();
-        draw_console_lines(&mut pixels, &lines, &font, false);
+        draw_console_lines(&mut pixels, &lines, &font);
         let mut expected_first_row =
             vec![rgb(8, 12, 18); CONSOLE_WINDOW_WIDTH * CONSOLE_WINDOW_HEIGHT];
         draw_text(
@@ -2523,23 +2180,13 @@ mod tests {
     #[test]
     fn console_toolbar_buttons_dispatch_controls_when_the_console_has_focus() {
         assert_eq!(
-            console_toolbar_control((20.0, 12.0), false, true),
-            Some(RuntimeControl::PauseToggled(true))
-        );
-        assert_eq!(
-            console_toolbar_control((120.0, 12.0), false, true),
-            Some(RuntimeControl::ResetRequested)
-        );
-        assert_eq!(
-            console_toolbar_control((220.0, 12.0), false, true),
-            Some(RuntimeControl::RebootRequested)
-        );
-        assert_eq!(
-            console_toolbar_control((320.0, 12.0), false, true),
+            console_toolbar_control((20.0, 12.0)),
             Some(RuntimeControl::ConsoleToggled(false))
         );
-        assert_eq!(console_toolbar_control((20.0, 30.0), false, true), None);
-        assert_eq!(console_toolbar_control((103.0, 12.0), false, true), None);
+        assert_eq!(console_toolbar_control((20.0, 30.0)), None);
+        for x in [120.0, 220.0, 320.0] {
+            assert_eq!(console_toolbar_control((x, 12.0)), None);
+        }
     }
 
     #[test]
@@ -2787,7 +2434,7 @@ mod tests {
         fs::create_dir_all(root.join("firmware")).unwrap();
         crate::image::write_image(&root.join("firmware").join("bios.bin"), &firmware).unwrap();
 
-        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT).unwrap();
         cpu.run(5000).unwrap();
         cpu.signal_keyboard_event(13);
         cpu.run(30000).unwrap();
@@ -2820,43 +2467,12 @@ mod tests {
         assert_eq!(fs::read(boot_disk.join("result.txt")).unwrap(), b"hello");
         assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
 
-        let consoles = (cpu.console.clone(), cpu.debug_console.clone());
-        drop(cpu);
-        let mut reset = fresh_runtime_cpu(
-            &root,
-            None,
-            Some("DISK0001"),
-            DEFAULT_PORT,
-            Some((&consoles.0, &consoles.1)),
-        )
-        .unwrap();
-        reset.run(5000).unwrap();
-        reset.signal_keyboard_event(13);
-        reset.run(30000).unwrap();
-        assert_eq!(
-            reset.last_page_fault(),
-            Some(crate::mmu::PageFault {
-                virtual_address: 0x4000,
-                access: crate::mmu::MemoryAccess::Read,
-                reason: crate::mmu::PageFaultReason::SupervisorOnly
-            })
-        );
-        assert_eq!(reset.current_task(), None);
-        assert_eq!(reset.task_context(0).unwrap().exit_code, Some(42));
-        assert!(
-            reset
-                .console
-                .output()
-                .windows(b"hello".len())
-                .any(|output| output == b"hello")
-        );
-        assert_eq!(fs::read(boot_disk.join("result.txt")).unwrap(), b"hello");
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn bios_cold_reset_preloads_common_firmware_and_clears_the_previous_guest() {
-        let disk = boot_test_disk("cold-reset");
+    fn bios_cold_start_preloads_common_firmware_and_boots_selected_disks() {
+        let disk = boot_test_disk("cold-start");
         let root = disk.parent().unwrap();
         fs::create_dir(root.join("disks")).unwrap();
         let packaged_disk = root.join("disks").join("DISK0001");
@@ -2883,7 +2499,7 @@ mod tests {
                 .len(),
             2
         );
-        let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
         assert!(cpu.running);
         assert_eq!(cpu.pc, 0);
@@ -2973,39 +2589,6 @@ mod tests {
         assert!(!cpu.guest_text.enabled);
         cpu.write(0x43400, 1);
         assert_eq!(cpu.memory[0x4340c], 1);
-        let consoles = (cpu.console.clone(), cpu.debug_console.clone());
-        drop(cpu);
-        let mut reset = fresh_runtime_cpu(
-            root,
-            None,
-            Some("DISK0002"),
-            DEFAULT_PORT,
-            Some((&consoles.0, &consoles.1)),
-        )
-        .unwrap();
-        assert_eq!(reset.pc, 0);
-        assert_eq!(reset.privilege_mode, PrivilegeMode::Supervisor);
-        assert!(reset.running);
-        assert_eq!(reset.registers, [0; 8]);
-        assert_eq!(
-            &reset.memory[..firmware.segments[0].data.len()],
-            firmware.segments[0].data.as_slice()
-        );
-        reset.run(5000).unwrap();
-        reset.signal_keyboard_event(b' ');
-        reset.run(5000).unwrap();
-        let text = reset
-            .guest_text
-            .cells
-            .iter()
-            .map(|cell| char::from(cell.character))
-            .collect::<String>();
-        assert!(text.contains("DISK0002"), "{text:?}");
-        reset.signal_keyboard_event(13);
-        reset.run(5000).unwrap();
-        assert_eq!(reset.privilege_mode, PrivilegeMode::User);
-        assert_eq!(reset.registers[0], 84);
-        drop(reset);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3059,7 +2642,7 @@ mod tests {
             crate::assembler::assemble(include_str!("../../firmware/bios.asm"), 0).unwrap();
         fs::create_dir(root.join("firmware")).unwrap();
         crate::image::write_image(&root.join("firmware/bios.bin"), &firmware).unwrap();
-        let mut cpu = fresh_runtime_cpu(root, None, Some(id), DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(root, None, Some(id), DEFAULT_PORT).unwrap();
         cpu.run(5000).unwrap();
         assert_eq!(&cpu.memory[0x5160..0x5180], id.as_bytes());
         assert_eq!(cpu.memory[0x5180], 0);
@@ -3098,7 +2681,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
         cpu.run(5000).unwrap();
         let node_id = String::from_utf8(
             cpu.memory[0x43410..0x43420]
@@ -3214,7 +2797,7 @@ mod tests {
         assert_eq!(saved["settings"]["region"], "eu");
         drop(cpu);
 
-        let mut setup_entry = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut setup_entry = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
         setup_entry.signal_keyboard_event(b' ');
         setup_entry.run(5000).unwrap();
         assert_eq!(setup_entry.privilege_mode, PrivilegeMode::Supervisor);
@@ -3228,24 +2811,24 @@ mod tests {
         assert!(setup_text.contains("SETTINGS"), "{setup_text}");
         drop(setup_entry);
 
-        let mut rebooted = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut next_boot = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
         assert_eq!(
-            rebooted.bios_settings().startup_behavior,
+            next_boot.bios_settings().startup_behavior,
             crate::bios_settings::StartupBehavior::BootPreferred
         );
         assert_eq!(
-            rebooted.bios_settings().preferred_disk.as_deref(),
+            next_boot.bios_settings().preferred_disk.as_deref(),
             Some("DISK0001")
         );
-        assert_eq!(rebooted.bios_settings().network_name, "NODE-0123456789A");
-        rebooted.run(5000).unwrap();
-        assert_eq!(rebooted.privilege_mode, PrivilegeMode::Supervisor);
-        assert_eq!(rebooted.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize], 1);
-        rebooted.signal_keyboard_event(0x8a);
-        rebooted.run(5000).unwrap();
-        assert_eq!(rebooted.privilege_mode, PrivilegeMode::User);
-        assert_eq!(rebooted.registers[0], 42);
-        drop(rebooted);
+        assert_eq!(next_boot.bios_settings().network_name, "NODE-0123456789A");
+        next_boot.run(5000).unwrap();
+        assert_eq!(next_boot.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(next_boot.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize], 1);
+        next_boot.signal_keyboard_event(0x8a);
+        next_boot.run(5000).unwrap();
+        assert_eq!(next_boot.privilege_mode, PrivilegeMode::User);
+        assert_eq!(next_boot.registers[0], 42);
+        drop(next_boot);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3282,7 +2865,7 @@ mod tests {
         fs::create_dir_all(root.join("firmware")).unwrap();
         crate::image::write_image(&root.join("firmware").join("bios.bin"), &firmware).unwrap();
 
-        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT).unwrap();
         cpu.run(5000).unwrap();
         cpu.signal_keyboard_event(b' ');
         cpu.run(5000).unwrap();
@@ -3329,7 +2912,7 @@ mod tests {
         assert_eq!(saved["startup_behavior"], "boot_preferred");
         drop(cpu);
 
-        let mut automatic = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut automatic = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT).unwrap();
         automatic.run(5000).unwrap();
         assert_eq!(automatic.memory[BIOS_AUTOBOOT_WAIT_MARKER as usize], 1);
         automatic.signal_keyboard_event(0x8a);
@@ -3441,7 +3024,7 @@ mod tests {
             .save(&root.join("config").join("bios.json"))
             .unwrap();
 
-        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT).unwrap();
         cpu.run(5000).unwrap();
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
         let selected_index = u16::from_be_bytes([cpu.memory[0x43402], cpu.memory[0x43403]]);
@@ -3666,14 +3249,14 @@ mod tests {
     fn bios_startup_rejects_missing_or_invalid_common_firmware() {
         let disk = boot_test_disk("missing-bios");
         let root = disk.parent().unwrap();
-        let missing = match fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None) {
+        let missing = match fresh_runtime_cpu(root, None, None, DEFAULT_PORT) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("startup unexpectedly accepted missing firmware"),
         };
         assert!(missing.contains("required common BIOS is missing"));
         fs::create_dir_all(root.join("firmware")).unwrap();
         fs::write(root.join("firmware").join("bios.bin"), b"invalid firmware").unwrap();
-        let invalid = match fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None) {
+        let invalid = match fresh_runtime_cpu(root, None, None, DEFAULT_PORT) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("startup unexpectedly accepted invalid firmware"),
         };
@@ -3695,7 +3278,7 @@ mod tests {
                 source,
                 folder_disk: true,
             };
-            let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT, None).unwrap();
+            let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
             assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
             boot_target(&mut cpu, &target).unwrap();
             assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
@@ -3951,35 +3534,11 @@ mod tests {
     }
 
     #[test]
-    fn bios_rebuild_is_requested_only_when_source_is_newer_or_image_is_missing() {
-        let earlier = UNIX_EPOCH + Duration::from_secs(10);
-        let later = UNIX_EPOCH + Duration::from_secs(20);
-        assert!(bios_needs_rebuild(Some(later), None));
-        assert!(bios_needs_rebuild(Some(later), Some(earlier)));
-        assert!(!bios_needs_rebuild(Some(earlier), Some(later)));
-        assert!(!bios_needs_rebuild(None, Some(later)));
-    }
-
-    #[test]
-    fn runtime_pause_and_fullscreen_controls_toggle_independently() {
-        let (mut paused, mut fullscreen, mut console_visible) = (false, false, false);
-        assert_eq!(
-            apply_runtime_control(
-                KeyCode::F1,
-                &mut paused,
-                &mut fullscreen,
-                &mut console_visible,
-                false,
-                false,
-            ),
-            Some(RuntimeControl::PauseToggled(true))
-        );
-        assert!(paused);
-        assert!(!fullscreen);
+    fn runtime_fullscreen_control_toggles_without_changing_monitor_visibility() {
+        let (mut fullscreen, mut console_visible) = (false, false);
         assert_eq!(
             apply_runtime_control(
                 KeyCode::F11,
-                &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
                 false,
@@ -3989,21 +3548,19 @@ mod tests {
         );
         assert_eq!(
             apply_runtime_control(
-                KeyCode::F1,
-                &mut paused,
+                KeyCode::F11,
                 &mut fullscreen,
                 &mut console_visible,
                 false,
                 false,
             ),
-            Some(RuntimeControl::PauseToggled(false))
+            Some(RuntimeControl::FullscreenToggled(false))
         );
-        assert!(!paused);
-        assert!(fullscreen);
+        assert!(!fullscreen);
+        assert!(!console_visible);
         assert_eq!(
             apply_runtime_control(
                 KeyCode::A,
-                &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
                 false,
@@ -4014,39 +3571,26 @@ mod tests {
     }
 
     #[test]
-    fn runtime_function_keys_one_through_five_match_emulator_controls() {
-        let (mut paused, mut fullscreen, mut console_visible) = (false, false, false);
-        let mut control = |key| {
-            apply_runtime_control(
-                key,
-                &mut paused,
-                &mut fullscreen,
-                &mut console_visible,
-                false,
-                false,
-            )
-        };
+    fn runtime_only_reserves_f2_for_the_bug_monitor() {
+        let (mut fullscreen, mut console_visible) = (false, false);
+        let mut control =
+            |key| apply_runtime_control(key, &mut fullscreen, &mut console_visible, false, false);
 
-        assert_eq!(
-            control(KeyCode::F1),
-            Some(RuntimeControl::PauseToggled(true))
-        );
+        for key in [KeyCode::F1, KeyCode::F3, KeyCode::F4, KeyCode::F5] {
+            assert_eq!(control(key), None);
+        }
         assert_eq!(
             control(KeyCode::F2),
             Some(RuntimeControl::ConsoleToggled(true))
         );
-        assert_eq!(control(KeyCode::F3), Some(RuntimeControl::ResetRequested));
-        assert_eq!(control(KeyCode::F4), Some(RuntimeControl::RebootRequested));
-        assert_eq!(control(KeyCode::F5), Some(RuntimeControl::StopRequested));
     }
 
     #[test]
     fn runtime_shift_control_f_toggles_fullscreen_and_f2_only_opens_windowed_console() {
-        let (mut paused, mut fullscreen, mut console_visible) = (false, false, false);
+        let (mut fullscreen, mut console_visible) = (false, false);
         assert_eq!(
             apply_runtime_control(
                 KeyCode::F,
-                &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
                 true,
@@ -4057,7 +3601,6 @@ mod tests {
         assert_eq!(
             apply_runtime_control(
                 KeyCode::F2,
-                &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
                 false,
@@ -4070,7 +3613,6 @@ mod tests {
         assert_eq!(
             apply_runtime_control(
                 KeyCode::F,
-                &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
                 true,
@@ -4081,7 +3623,6 @@ mod tests {
         assert_eq!(
             apply_runtime_control(
                 KeyCode::F2,
-                &mut paused,
                 &mut fullscreen,
                 &mut console_visible,
                 false,
@@ -4095,28 +3636,18 @@ mod tests {
     #[test]
     fn runtime_toolbar_controls_hit_expected_buttons_and_ignore_gaps() {
         assert_eq!(
-            toolbar_control((50.0, 18.0), false, false),
-            Some(RuntimeControl::PauseToggled(true))
-        );
-        assert_eq!(
-            toolbar_control((150.0, 18.0), false, false),
-            Some(RuntimeControl::StopRequested)
-        );
-        assert_eq!(
-            toolbar_control((240.0, 18.0), false, false),
-            Some(RuntimeControl::ResetRequested)
-        );
-        assert_eq!(
-            toolbar_control((330.0, 18.0), false, false),
-            Some(RuntimeControl::RebootRequested)
-        );
-        assert_eq!(
-            toolbar_control((440.0, 18.0), false, false),
+            toolbar_control((50.0, 18.0), false),
             Some(RuntimeControl::ConsoleToggled(true))
         );
-        assert_eq!(toolbar_control((115.0, 18.0), false, false), None);
-        assert_eq!(toolbar_control((200.0, 18.0), false, false), None);
-        assert_eq!(toolbar_control((50.0, 34.0), false, false), None);
+        assert_eq!(
+            toolbar_control((50.0, 18.0), true),
+            Some(RuntimeControl::ConsoleToggled(false))
+        );
+        for x in [150.0, 240.0, 330.0, 440.0] {
+            assert_eq!(toolbar_control((x, 18.0), false), None);
+        }
+        assert_eq!(toolbar_control((120.0, 18.0), false), None);
+        assert_eq!(toolbar_control((50.0, 34.0), false), None);
     }
 
     #[test]
@@ -4514,35 +4045,6 @@ mod tests {
         assert!(!pixels.contains(&0xff005020));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn console_window_shortcuts_control_emulation_when_console_has_focus() {
-        assert_eq!(
-            console_runtime_control(NativeKey::F2, false),
-            Some(RuntimeControl::ConsoleToggled(false))
-        );
-        assert_eq!(
-            console_runtime_control(NativeKey::F3, false),
-            Some(RuntimeControl::ResetRequested)
-        );
-        assert_eq!(
-            console_runtime_control(NativeKey::F4, false),
-            Some(RuntimeControl::RebootRequested)
-        );
-        assert_eq!(
-            console_runtime_control(NativeKey::F1, false),
-            Some(RuntimeControl::PauseToggled(true))
-        );
-        assert_eq!(
-            console_runtime_control(NativeKey::F1, true),
-            Some(RuntimeControl::PauseToggled(false))
-        );
-        assert_eq!(
-            console_runtime_control(NativeKey::F5, false),
-            Some(RuntimeControl::StopRequested)
-        );
-    }
-
     #[test]
     fn bios_selector_renders_empty_state_and_persistent_error_message() {
         let font = vec![[0xf8; 8]; 128];
@@ -4626,7 +4128,49 @@ mod tests {
     }
 
     #[test]
-    fn elite_can_restart_between_bounded_instruction_slices() {
+    fn instruction_slices_resume_a_sleeping_cpu_without_treating_it_as_halted() {
+        let image = crate::assembler::assemble("SVC\nHALT\n.address 0x300\nRTI", 0x100).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.load_idt(0x800).unwrap();
+        cpu.set_idt_descriptor(
+            crate::isa::SVC_VECTOR,
+            crate::interrupts::IdtDescriptor {
+                handler: 0x300,
+                present: true,
+                privilege: 3,
+                gate_type: crate::interrupts::GateType::Interrupt,
+            },
+        )
+        .unwrap();
+        let task = cpu.create_user_task(0x100, 0x7000, 0xf000, None).unwrap();
+        cpu.start_task(task).unwrap();
+        cpu.test_monotonic_ms = Some(1000);
+        cpu.registers[0] = crate::syscall::SyscallNumber::SleepMillis as i64;
+        cpu.registers[1] = 1000;
+        cpu.registers[7] = crate::syscall::ABI_VERSION;
+        cpu.step().unwrap();
+        assert!(!cpu.running);
+        assert!(!runtime_should_close(false, cpu.has_pending_work(), true));
+
+        cpu.test_monotonic_ms = Some(1999);
+        let mut budget = 100;
+        assert!(run_instruction_slice(&mut cpu, &mut budget).unwrap() > 0);
+        assert_eq!(cpu.current_task(), None);
+        assert!(cpu.has_pending_work());
+
+        cpu.test_monotonic_ms = Some(2000);
+        let mut budget = 100;
+        assert!(run_instruction_slice(&mut cpu, &mut budget).unwrap() >= 2);
+        assert_eq!(cpu.current_task(), Some(task));
+        assert_eq!(cpu.pc, 0x104);
+        assert!(!cpu.has_pending_work());
+        assert!(runtime_should_close(false, cpu.has_pending_work(), true));
+    }
+
+    #[test]
+    fn elite_executes_between_bounded_instruction_slices() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = root
             .join("programs")
@@ -4643,7 +4187,7 @@ mod tests {
             source: image_path.clone(),
             folder_disk: false,
         };
-        let mut cpu = fresh_runtime_cpu(root, Some(&image_path), None, DEFAULT_PORT, None).unwrap();
+        let mut cpu = fresh_runtime_cpu(root, Some(&image_path), None, DEFAULT_PORT).unwrap();
         boot_target(&mut cpu, &target).unwrap();
         cpu.begin_frame();
         let mut budget_remaining = 1_000_000;
@@ -4655,22 +4199,11 @@ mod tests {
             "Elite should still have work remaining"
         );
 
-        let consoles = (cpu.console.clone(), cpu.debug_console.clone());
-        cpu = fresh_runtime_cpu(
-            root,
-            Some(&image_path),
-            None,
-            DEFAULT_PORT,
-            Some((&consoles.0, &consoles.1)),
-        )
-        .unwrap();
-        boot_target(&mut cpu, &target).unwrap();
-
         cpu.begin_frame();
         budget_remaining = 1_000_000;
-        let restarted_slice = run_instruction_slice(&mut cpu, &mut budget_remaining).unwrap();
-        assert!(restarted_slice > 0);
-        assert!(cpu.running, "Elite halted after reset");
+        let next_slice = run_instruction_slice(&mut cpu, &mut budget_remaining).unwrap();
+        assert!(next_slice > 0);
+        assert!(cpu.running, "Elite halted between slices");
         fs::remove_file(image_path).unwrap();
     }
 

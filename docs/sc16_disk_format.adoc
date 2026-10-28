@@ -98,8 +98,8 @@ or boots the selected disk. Escape cancels an edit.
 +--disk ID+ preselects a boot disk without bypassing checks. Metadata is
 validated only when a disk is selected, so an invalid manifest cannot hide
 other boot choices. Invalid metadata, images, and +NOT_BOOT+ cases are logged
-to the Bug Monitor and leave the selector available for another choice. Reset
-restarts firmware and rescans the collection. The BIOS service loads the
+to the Bug Monitor and leave the selector available for another choice.
+Relaunching the emulator starts firmware and rescans the collection. The BIOS service loads the
 SC-16 image container directly, preserving its entry point, segment
 permissions, and alignment, and never compiles or assembles guest source.
 KERNEL maps to the CPU's +Supervisor+ privilege mode; USER maps to +User+.
@@ -178,9 +178,10 @@ Supervisor mode. All multi-byte values are big-endian.
 Status at +0x4340c+ is zero on success and one on failure. Failures are also
 logged to the Bug Monitor; a failed boot leaves the BIOS available to retry.
 The BIOS menu uses F9 to reload settings and F10 to save. During automatic
-startup, press Space within five seconds to enter BIOS setup. The emulator uses
-F1 to pause/resume, F2 for the Bug Monitor, F3 to reset, F4 to reboot, and F5
-to stop. The SC-NET node ID identifies the emulator on SC-NET and is
+startup, press Space within five seconds to enter BIOS setup. F2 toggles the
+Bug Monitor. The emulator has no host pause, stop, reset, or reboot controls;
+start a fresh session by closing and relaunching it. Firmware builds remain
+offline. The SC-NET node ID identifies the emulator on SC-NET and is
 independent of guest application network titles.
 
 The root settings file has this versioned shape:

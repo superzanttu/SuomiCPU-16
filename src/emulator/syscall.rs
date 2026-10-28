@@ -202,7 +202,10 @@ mod tests {
         assert_eq!(SyscallNumber::try_from(-1), Err(()));
         assert_eq!(SyscallNumber::try_from(14), Ok(SyscallNumber::ProcessInfo));
         assert_eq!(SyscallNumber::try_from(19), Ok(SyscallNumber::SleepMillis));
-        assert_eq!(SyscallNumber::try_from(20), Ok(SyscallNumber::ProcessStatus));
+        assert_eq!(
+            SyscallNumber::try_from(20),
+            Ok(SyscallNumber::ProcessStatus)
+        );
         assert_eq!(SyscallNumber::try_from(21), Err(()));
     }
 

@@ -6154,6 +6154,35 @@ mod tests {
     }
 
     #[test]
+    fn process_status_validates_buffers_and_sanitizes_program_names() {
+        let (mut cpu, parent) = cpu_with_syscall_task();
+        cpu.syscall_state.register_process(parent, None);
+        cpu.syscall_state.processes.get_mut(&parent).unwrap().name = "a\nb c".to_owned();
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::ProcessStatus,
+            [0, 0x400, 64, 0, 0, 0],
+        );
+        assert_eq!(
+            &cpu.memory[0x400..0x400 + cpu.registers[0] as usize],
+            b"0 - running a?b?c\n"
+        );
+        for (index, destination, capacity, expected) in [
+            (0, 0x400, 1, crate::syscall::error::OVERFLOW),
+            (0, 0xffff, 64, crate::syscall::error::BAD_ADDRESS),
+            (0, 0x400, 4097, crate::syscall::error::INVALID),
+            (1, 0x400, 64, 0),
+        ] {
+            invoke_syscall(
+                &mut cpu,
+                SyscallNumber::ProcessStatus,
+                [index, destination, capacity, 0, 0, 0],
+            );
+            assert_eq!(cpu.registers[0], expected);
+        }
+    }
+
+    #[test]
     fn background_process_services_preserve_arguments_and_do_not_block_waiters() {
         let (mut cpu, parent) = cpu_with_syscall_task();
         let child = cpu
@@ -7024,6 +7053,15 @@ mod tests {
                 crate::mmu::PagePermissions::USER_DATA,
             )
             .unwrap();
+        parent_mmu
+            .map_borrowed_page(
+                &mut cpu.memory,
+                parent_root,
+                0xff000,
+                0xff,
+                crate::mmu::PagePermissions::KERNEL_DATA,
+            )
+            .unwrap();
         cpu.memory[0x40_000 + 0x100..0x40_000 + 0x10a]
             .copy_from_slice(&parent_assembly.segments[0].data[0..10]);
         cpu.memory[0x41_000..0x41_00a].copy_from_slice(b"child.img\0");
@@ -7268,6 +7306,9 @@ mod tests {
         let stack_table_entry = 0x4000 + (((0xdffff >> 12) & 0x1ff) as usize) * 4;
         cpu.memory[stack_table_entry..stack_table_entry + 4]
             .copy_from_slice(&stack_entry.to_be_bytes());
+        let kernel_stack_entry =
+            crate::mmu::encode_entry(0xef, crate::mmu::PagePermissions::KERNEL_DATA).unwrap();
+        cpu.memory[0x43bc..0x43c0].copy_from_slice(&kernel_stack_entry.to_be_bytes());
         cpu.memory[0x5000..0x5002].copy_from_slice(&((OP_LD << 11) | (1 << 5)).to_be_bytes());
         cpu.memory[0x5300..0x5302].copy_from_slice(&(OP_RTI << 11).to_be_bytes());
         cpu.enable_mmu(0x2000).unwrap();
@@ -9816,6 +9857,15 @@ mod tests {
                 crate::mmu::PagePermissions::KERNEL_CODE,
             )
             .unwrap();
+        manager
+            .map_borrowed_page(
+                &mut cpu.memory,
+                directory,
+                0xff000,
+                0xff,
+                crate::mmu::PagePermissions::KERNEL_DATA,
+            )
+            .unwrap();
         cpu.memory[code_frame as usize * crate::mmu::PAGE_SIZE
             ..code_frame as usize * crate::mmu::PAGE_SIZE + 4]
             .copy_from_slice(
@@ -9943,6 +9993,15 @@ mod tests {
                 0x43000,
                 0x43,
                 crate::mmu::PagePermissions::USER_DATA,
+            )
+            .unwrap();
+        manager
+            .map_borrowed_page(
+                &mut cpu.memory,
+                directory,
+                0xff000,
+                0xff,
+                crate::mmu::PagePermissions::KERNEL_DATA,
             )
             .unwrap();
         cpu.memory[code_frame as usize * crate::mmu::PAGE_SIZE
