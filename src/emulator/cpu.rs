@@ -1435,6 +1435,10 @@ impl Cpu {
     }
 
     pub fn read(&mut self, address: u32) -> u8 {
+        if crate::machine::is_device_aperture(address) {
+            return crate::machine::system_register_byte(address, self.memory.len())
+                .expect("host read from an unimplemented device register");
+        }
         let address = address & self.memory_mask;
         match address {
             CONSOLE_DATA => {
@@ -3317,6 +3321,10 @@ impl Cpu {
     }
 
     pub fn write(&mut self, address: u32, value: u8) {
+        assert!(
+            !crate::machine::is_device_aperture(address),
+            "host write to a read-only or unimplemented device register"
+        );
         let address = address & self.memory_mask;
         let index = address as usize;
         self.memory[index] = value;
@@ -3425,10 +3433,23 @@ impl Cpu {
         access: crate::mmu::MemoryAccess,
     ) -> Result<(), CpuError> {
         if crate::machine::is_device_aperture(address) {
+            let reason = if !crate::machine::is_implemented_device_page(address) {
+                crate::mmu::PageFaultReason::PhysicalOutOfRange
+            } else if self.privilege_mode == PrivilegeMode::User {
+                crate::mmu::PageFaultReason::SupervisorOnly
+            } else if access == crate::mmu::MemoryAccess::Fetch {
+                crate::mmu::PageFaultReason::NotExecutable
+            } else if crate::machine::system_register_byte(address, self.memory.len()).is_none() {
+                crate::mmu::PageFaultReason::PhysicalOutOfRange
+            } else if access == crate::mmu::MemoryAccess::Write {
+                crate::mmu::PageFaultReason::ReadOnly
+            } else {
+                return Ok(());
+            };
             return Err(CpuError::PageFault(crate::mmu::PageFault {
                 virtual_address: address,
                 access,
-                reason: crate::mmu::PageFaultReason::PhysicalOutOfRange,
+                reason,
             }));
         }
         if self.privilege_mode != PrivilegeMode::User
@@ -3485,6 +3506,8 @@ impl Cpu {
                         })
                     })?;
                 virtual_address
+            } else if crate::machine::is_device_aperture(address.wrapping_add(offset)) {
+                address.wrapping_add(offset)
             } else {
                 address.wrapping_add(offset) & self.memory_mask
             };
@@ -3499,9 +3522,17 @@ impl Cpu {
                 )
                 .map_err(CpuError::PageFault)?
             } else {
-                virtual_address & self.memory_mask
+                virtual_address
             };
-            self.check_guest_access(physical_address, access)?;
+            self.check_guest_access(physical_address, access)
+                .map_err(|error| {
+                    if let CpuError::PageFault(mut fault) = error {
+                        fault.virtual_address = virtual_address;
+                        CpuError::PageFault(fault)
+                    } else {
+                        error
+                    }
+                })?;
             physical_addresses.push(physical_address);
         }
         Ok(physical_addresses)
@@ -3726,12 +3757,12 @@ impl Cpu {
             return Ok(());
         }
         if operation == 8 {
-            let address = self.registers[source] as u32 & self.guest_address_mask();
+            let address = self.registers[source] as u32 & ADDRESS_MASK;
             self.registers[destination] = i64::from(self.read_guest_u32(address)? & ADDRESS_MASK);
             return Ok(());
         }
         if operation == 9 {
-            let address = self.registers[source] as u32 & self.guest_address_mask();
+            let address = self.registers[source] as u32 & ADDRESS_MASK;
             let value = self.registers[destination] as u32 & ADDRESS_MASK;
             self.write_guest_u32(address, value)?;
             return Ok(());
@@ -3811,7 +3842,7 @@ impl Cpu {
             return Ok(());
         }
         if operation == 11 || operation == 12 {
-            let address = self.register_pair_u32(source) & self.guest_address_mask();
+            let address = self.register_pair_u32(source) & ADDRESS_MASK;
             if operation == 11 {
                 let value = self.read_guest_u32(address)?;
                 self.set_pair(destination, value);
@@ -3977,10 +4008,10 @@ impl Cpu {
                 self.registers[destination] = i64::from(result);
                 self.set_flags(result, self.flags.carry, false);
             }
-            2 => self.pc = u32::from(value) & self.guest_address_mask(),
+            2 => self.pc = u32::from(value) & ADDRESS_MASK,
             3 => {
                 self.push_u32(self.pc)?;
-                self.pc = u32::from(value) & self.guest_address_mask();
+                self.pc = u32::from(value) & ADDRESS_MASK;
             }
             4 => self.push_u16(self.pack_flags())?,
             5 => {
@@ -3989,7 +4020,7 @@ impl Cpu {
             }
             6 => self.flags.carry = true,
             7 => self.flags.carry = false,
-            8 => self.sp = u32::from(value) & self.guest_address_mask(),
+            8 => self.sp = u32::from(value) & ADDRESS_MASK,
             9 => {
                 self.registers[destination] = i64::from(value.leading_zeros());
                 self.flags.zero = value == 0;
@@ -4002,7 +4033,7 @@ impl Cpu {
                 if selector == 11 {
                     self.push_u32(self.pc)?;
                 }
-                self.pc = target & self.guest_address_mask();
+                self.pc = target & ADDRESS_MASK;
             }
             13 => {
                 self.sp = (self.sp & 0xffff) | (u32::from(value & 0x3fff) << 16);
@@ -4200,11 +4231,11 @@ impl Cpu {
             OP_HALT => return Err(CpuError::UnsupportedInstruction(instruction)),
             OP_LDI => self.registers[rd] = i64::from(immediate),
             OP_LD => {
-                let address = self.registers[rs1] as u32 & self.guest_address_mask();
+                let address = self.registers[rs1] as u32 & ADDRESS_MASK;
                 self.registers[rd] = i64::from(self.read_guest(address)?);
             }
             OP_ST => {
-                let address = self.registers[rs1] as u32 & self.guest_address_mask();
+                let address = self.registers[rs1] as u32 & ADDRESS_MASK;
                 self.write_guest(address, self.registers[rd] as u8)?;
             }
             OP_MOV => self.registers[rd] = self.registers[rs1],
@@ -4280,33 +4311,31 @@ impl Cpu {
                 self.push_u32(self.pc)?;
                 self.pc = (instruction & 0x7ff) as u32;
             }
-            OP_RET => self.pc = self.pop_u32()? & self.guest_address_mask(),
+            OP_RET => self.pc = self.pop_u32()? & ADDRESS_MASK,
             OP_BZ => {
                 if self.flags.zero {
                     self.pc = (instruction & 0x7ff) as u32;
                 }
             }
             OP_LDW => {
-                let address = self.registers[rs1] as u32 & self.guest_address_mask();
+                let address = self.registers[rs1] as u32 & ADDRESS_MASK;
                 self.registers[rd] = i64::from(self.read_guest_u16(address)?);
             }
             OP_STW => {
-                let address = self.registers[rs1] as u32 & self.guest_address_mask();
+                let address = self.registers[rs1] as u32 & ADDRESS_MASK;
                 self.write_guest_u16(address, self.registers[rd] as u16)?;
             }
             OP_LDWS => {
                 self.registers[rd] =
-                    i64::from(self.read_guest_u16(
-                        self.sp.wrapping_add(immediate) & self.guest_address_mask(),
-                    )?)
+                    i64::from(self.read_guest_u16(self.sp.wrapping_add(immediate) & ADDRESS_MASK)?)
             }
             OP_STWS => self.write_guest_u16(
-                self.sp.wrapping_add(immediate) & self.guest_address_mask(),
+                self.sp.wrapping_add(immediate) & ADDRESS_MASK,
                 self.registers[rd] as u16,
             )?,
             OP_ADJSP => {
                 let offset = (immediate as u8 as i8) as i32;
-                self.sp = self.sp.wrapping_add_signed(offset) & self.guest_address_mask();
+                self.sp = self.sp.wrapping_add_signed(offset) & ADDRESS_MASK;
             }
             OP_BC => {
                 if self.flags.carry {
@@ -4333,7 +4362,7 @@ impl Cpu {
                     | self.fetch_guest_u16(self.pc.wrapping_add(2))? as u32;
                 self.pc = self.pc.wrapping_add(4) & self.guest_address_mask();
                 if branch_condition(self.flags, condition) {
-                    self.pc = target & self.guest_address_mask();
+                    self.pc = target & ADDRESS_MASK;
                 }
             }
             OP_SHR if instruction & FAR_CONTROL_MASK == FAR_CONTROL_PREFIX => {
@@ -4342,13 +4371,13 @@ impl Cpu {
                     | self.fetch_guest_u16(self.pc.wrapping_add(2))? as u32;
                 self.pc = self.pc.wrapping_add(4) & self.guest_address_mask();
                 match operation {
-                    0 => self.pc = target & self.guest_address_mask(),
+                    0 => self.pc = target & ADDRESS_MASK,
                     1 => {
                         self.push_u32(self.pc)?;
-                        self.pc = target & self.guest_address_mask();
+                        self.pc = target & ADDRESS_MASK;
                     }
-                    2 if self.flags.zero => self.pc = target & self.guest_address_mask(),
-                    3 if self.flags.carry => self.pc = target & self.guest_address_mask(),
+                    2 if self.flags.zero => self.pc = target & ADDRESS_MASK,
+                    3 if self.flags.carry => self.pc = target & ADDRESS_MASK,
                     _ => {}
                 }
             }
@@ -5691,7 +5720,7 @@ impl Cpu {
     }
 
     fn push_u16(&mut self, value: u16) -> Result<(), CpuError> {
-        let stack_pointer = self.sp.wrapping_sub(2) & self.guest_address_mask();
+        let stack_pointer = self.sp.wrapping_sub(2) & ADDRESS_MASK;
         self.write_guest_u16(stack_pointer, value)?;
         self.sp = stack_pointer;
         Ok(())
@@ -5699,7 +5728,7 @@ impl Cpu {
 
     fn pop_u16(&mut self) -> Result<u16, CpuError> {
         let value = self.read_guest_u16(self.sp)?;
-        self.sp = self.sp.wrapping_add(2) & self.guest_address_mask();
+        self.sp = self.sp.wrapping_add(2) & ADDRESS_MASK;
         Ok(value)
     }
 
@@ -5899,7 +5928,7 @@ impl Cpu {
     }
 
     fn push_u32(&mut self, value: u32) -> Result<(), CpuError> {
-        let stack_pointer = self.sp.wrapping_sub(4) & self.guest_address_mask();
+        let stack_pointer = self.sp.wrapping_sub(4) & ADDRESS_MASK;
         self.write_guest_u32(stack_pointer, value)?;
         self.sp = stack_pointer;
         Ok(())
@@ -5907,7 +5936,7 @@ impl Cpu {
 
     fn pop_u32(&mut self) -> Result<u32, CpuError> {
         let value = self.read_guest_u32(self.sp)?;
-        self.sp = self.sp.wrapping_add(4) & self.guest_address_mask();
+        self.sp = self.sp.wrapping_add(4) & ADDRESS_MASK;
         Ok(value)
     }
 
@@ -6187,7 +6216,7 @@ mod tests {
             let mut cpu = Cpu::with_memory_size(size).unwrap();
             for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
                 cpu.privilege_mode = mode;
-                for address in [crate::machine::DEVICE_APERTURE_START, ADDRESS_MASK] {
+                for address in [crate::machine::INTERRUPT_BASE, ADDRESS_MASK] {
                     let aliased = (address & cpu.memory_mask) as usize;
                     cpu.memory[aliased] = 0xa5;
                     assert!(cpu.read_guest(address).is_err());
@@ -6201,10 +6230,212 @@ mod tests {
                 let address = crate::machine::DEVICE_APERTURE_START - 1;
                 let aliased = (address & cpu.memory_mask) as usize;
                 cpu.memory[aliased] = 0xa5;
-                assert!(cpu.read_guest_u16(address).is_err());
+                if mode == PrivilegeMode::User {
+                    assert!(cpu.read_guest_u16(address).is_err());
+                }
                 assert!(cpu.write_guest_u16(address, 0x5a5a).is_err());
                 assert_eq!(cpu.memory[aliased], 0xa5);
             }
+        }
+    }
+
+    #[test]
+    fn system_bank_is_read_only_supervisor_data_without_ram_backing() {
+        use crate::machine::*;
+        use crate::mmu::{MemoryAccess, PageFaultReason};
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            let aliased = (SYSTEM_BASE & cpu.memory_mask) as usize;
+            cpu.memory[aliased..aliased + 20].fill(0xa5);
+            for (register, value) in [
+                (SYSTEM_MACHINE_REVISION, MACHINE_REVISION),
+                (SYSTEM_DEVICE_ABI, DEVICE_ABI),
+                (SYSTEM_RAM_BYTES, usable_ram_size(size) as u32),
+                (SYSTEM_ADDRESS_BITS, 30),
+                (SYSTEM_BANKS, IMPLEMENTED_BANKS),
+            ] {
+                assert_eq!(cpu.read_guest_u32(register).unwrap(), value);
+                assert_eq!(cpu.read_u32(register), value);
+                assert_eq!(
+                    cpu.read_guest_u16(register + 1).unwrap(),
+                    (value >> 8) as u16
+                );
+                assert!(matches!(
+                    cpu.write_guest_u32(register, 0x5a5a5a5a),
+                    Err(CpuError::PageFault(crate::mmu::PageFault {
+                        reason: PageFaultReason::ReadOnly,
+                        ..
+                    }))
+                ));
+            }
+            assert!(cpu.read_guest_u16(SYSTEM_BANKS + 3).is_err());
+            assert!(cpu.read_guest_u32(SYSTEM_BANKS + 1).is_err());
+            for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
+                cpu.privilege_mode = mode;
+                for address in SYSTEM_BASE..SYSTEM_BASE + 20 {
+                    for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {
+                        let result = cpu.check_guest_access(address, access);
+                        let reason = if mode == PrivilegeMode::User {
+                            Some(PageFaultReason::SupervisorOnly)
+                        } else {
+                            match access {
+                                MemoryAccess::Read => None,
+                                MemoryAccess::Write => Some(PageFaultReason::ReadOnly),
+                                MemoryAccess::Fetch => Some(PageFaultReason::NotExecutable),
+                            }
+                        };
+                        if let Some(reason) = reason {
+                            assert_eq!(
+                                result,
+                                Err(CpuError::PageFault(crate::mmu::PageFault {
+                                    virtual_address: address,
+                                    access,
+                                    reason,
+                                }))
+                            );
+                        } else {
+                            result.unwrap();
+                        }
+                    }
+                }
+                for address in [
+                    SYSTEM_BASE + 20,
+                    SYSTEM_BASE + 4095,
+                    INTERRUPT_BASE,
+                    ADDRESS_MASK,
+                ] {
+                    assert!(cpu.read_guest(address).is_err());
+                }
+            }
+            assert!(
+                cpu.memory[aliased..aliased + 20]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+    }
+
+    #[test]
+    fn translated_system_bank_rejects_aliases_fetches_and_buffer_copies() {
+        use crate::machine::*;
+        use crate::mmu::{MemoryAccess, PageFault, PageFaultReason};
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+        cpu.memory[0x3024..0x3028].copy_from_slice(&(SYSTEM_BASE | 0xf).to_be_bytes());
+        cpu.enable_mmu(0x2000).unwrap();
+        assert_eq!(cpu.read_guest_u32(0x9008).unwrap(), 1 << 20);
+        for (access, reason) in [
+            (MemoryAccess::Write, PageFaultReason::ReadOnly),
+            (MemoryAccess::Fetch, PageFaultReason::NotExecutable),
+        ] {
+            assert_eq!(
+                cpu.resolve_guest_range(0x9000, 4, access),
+                Err(CpuError::PageFault(PageFault {
+                    virtual_address: 0x9000,
+                    access,
+                    reason
+                }))
+            );
+        }
+        assert_eq!(
+            cpu.read_guest(0x9014),
+            Err(CpuError::PageFault(PageFault {
+                virtual_address: 0x9014,
+                access: MemoryAccess::Read,
+                reason: PageFaultReason::PhysicalOutOfRange,
+            }))
+        );
+        for user in [false, true] {
+            assert!(
+                cpu.guest_memory_addresses(0x9000, 4, MemoryAccess::Read, user)
+                    .is_err()
+            );
+        }
+        cpu.privilege_mode = PrivilegeMode::User;
+        assert_eq!(
+            cpu.read_guest(0x9000),
+            Err(CpuError::PageFault(PageFault {
+                virtual_address: 0x9000,
+                access: MemoryAccess::Read,
+                reason: PageFaultReason::SupervisorOnly,
+            }))
+        );
+    }
+
+    #[test]
+    fn instruction_operands_cannot_mask_reserved_devices_into_small_ram() {
+        let address = crate::machine::INTERRUPT_BASE;
+        for source in [
+            "LD R2, R0",
+            "ST R0, R2",
+            "LDW R2, R0",
+            "STW R0, R2",
+            "LDP R2, R0",
+            "STP R2, R0",
+            "LD32 R4, R0",
+            "ST32 R4, R0",
+            "LDWS R2, 0",
+            "STWS R2, 0",
+            "PUSH R2",
+            "POP R2",
+            "RET",
+        ] {
+            let image = crate::assembler::assemble(source, 0x100).unwrap();
+            for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
+                let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+                cpu.load_program(&image.segments, image.entry_point)
+                    .unwrap();
+                cpu.registers[0] = i64::from(address);
+                if source.contains("32") {
+                    cpu.registers[0] = i64::from(address >> 16);
+                    cpu.registers[1] = i64::from(address & 0xffff);
+                }
+                cpu.sp = address + if source == "PUSH R2" { 2 } else { 0 };
+                cpu.privilege_mode = mode;
+                let memory = cpu.memory.to_vec();
+                let registers = cpu.registers;
+                let sp = cpu.sp;
+                assert!(
+                    matches!(cpu.execute_instruction(), Err(CpuError::PageFault(_))),
+                    "{source}: {mode:?}"
+                );
+                assert_eq!(&cpu.memory[..], memory, "{source}");
+                assert_eq!(cpu.registers, registers, "{source}");
+                assert_eq!(cpu.sp, sp, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn far_control_flow_does_not_mask_device_fetch_targets_into_ram() {
+        let target = crate::machine::SYSTEM_BASE;
+        for source in [
+            format!("JMPX {target}"),
+            format!("CALLX {target}"),
+            format!("LDI R0, {}\nLDI R1, 0\nJMPRP R1, R0", target >> 16),
+            format!("LDI R0, {}\nLDI R1, 0\nCALLRP R1, R0", target >> 16),
+        ] {
+            let image = crate::assembler::assemble(&source, 0x100).unwrap();
+            let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            for _ in 0..8 {
+                if cpu.pc == target {
+                    break;
+                }
+                cpu.execute_instruction().unwrap();
+            }
+            assert_eq!(cpu.pc, target, "{source}");
+            assert!(matches!(
+                cpu.execute_instruction(),
+                Err(CpuError::PageFault(crate::mmu::PageFault {
+                    virtual_address,
+                    reason: crate::mmu::PageFaultReason::NotExecutable,
+                    ..
+                })) if virtual_address == target
+            ));
         }
     }
 
@@ -8685,7 +8916,7 @@ mod tests {
         assert_eq!((cpu.registers[0], cpu.registers[1]), (0xffff, 0xfffe));
 
         let cpu = run_assembly(
-            "LDI R0, 0xFFFF\nLDI R1, 0xFFFF\nLDI R2, 0x1234\nLDI R3, 0x5678\n\
+            "LDI R0, 0x123F\nLDI R1, 0xFFFF\nLDI R2, 0x1234\nLDI R3, 0x5678\n\
              ST32 R2, R0\nLD32 R4, R0\nHALT",
         );
         assert_eq!((cpu.registers[4], cpu.registers[5]), (0x1234, 0x5678));
@@ -8693,7 +8924,7 @@ mod tests {
         assert_eq!(cpu.memory[cpu.memory_mask as usize], 0x12);
 
         let cpu = run_assembly(
-            "LDI30 R0, 0x12345678\nLDI30 R1, 0x3FFFFFFD\nSTP R0, R1\n\
+            "LDI30 R0, 0x12345678\nLDI30 R1, 0x123FFFFD\nSTP R0, R1\n\
              LDP R2, R1\nHALT",
         );
         assert_eq!(cpu.registers[2], 0x12345678);

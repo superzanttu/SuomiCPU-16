@@ -33,10 +33,76 @@ accesses are permitted when every byte is valid and permitted. Address
 translation and permission checks apply independently to every byte of an
 access.
 
-The aperture is currently reserved, not an implemented replacement device bus.
-Guest accesses into it fail rather than wrapping onto small configured RAM.
-The low-address legacy device banks remain in use until their coordinated
-firmware/toolchain/program migration is complete.
+The system identification bank is implemented in this aperture without RAM
+backing. All other high banks remain reserved. The low-address legacy device
+banks remain in use until their coordinated firmware/toolchain/program migration
+is complete. Instruction operands retain architectural address bits before
+device checks, including on small-memory machines; device accesses cannot
+be masked into low RAM. Legacy wrapping of nondevice RAM accesses remains
+during migration.
+
+=== High device map and system bank
+
+The canonical bank addresses are defined in `src/emulator/machine.rs`.
+`toolchain/include/sc16_machine.h` exposes the same addresses for privileged C;
+a test checks every definition against the Rust contract. These constants do
+not grant user code access to devices. Privileged assembly can use the numeric
+addresses below; no shared assembly constant syntax is currently supported.
+
+[cols="1,1,2"]
+|===
+|Base |Bank |Implementation
+|`0x3ff00000` |System identification |Implemented, read-only
+|`0x3ff01000` |Interrupt/PIT |Reserved
+|`0x3ff02000` |Fault status |Reserved
+|`0x3ff03000` |Input |Reserved
+|`0x3ff04000` |Clock/random |Reserved
+|`0x3ff05000` |Graphics |Reserved
+|`0x3ff06000` |Audio |Reserved
+|`0x3ff07000` |Game network |Reserved
+|`0x3ff08000` |Filesystem |Reserved
+|`0x3ff09000` |Console |Reserved
+|`0x3ff0a000` |Firmware text |Reserved
+|`0x3ff0b000` |Firmware gateway |Reserved
+|===
+
+Each bank occupies a 4096-byte page. All remaining aperture pages are reserved.
+System registers are unsigned 32-bit big-endian values, readable bytewise and
+unaligned. They have no read side effects, writable bits, commands or overflow
+behavior. They are immutable after CPU creation; image-entry preparation does
+not change them.
+
+[cols="1,1,3"]
+|===
+|System offset |Register |Value
+|`0x00` |Machine revision |`1` during migration; not yet revision 2
+|`0x04` |Device ABI |`1`, identifying this bank contract
+|`0x08` |Usable RAM bytes |Configured backing size capped at `0x3ff00000`
+|`0x0c` |Address bits |`30`
+|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `1`
+|===
+
+The migration-time machine revision does not advertise completion of the
+revision-2 contract. Images still use SC16IMG2; the machine revision changes
+only with the coordinated image, firmware and program migration.
+
+Every high device access is supervisor-only and nonexecutable, regardless
+of user/executable bits in a forged page-table entry. MMU translation permits
+supervisor data access to the implemented system page independently of RAM
+size, but the CPU additionally checks each register byte: offsets `0x14..0xfff`
+and all unimplemented banks fault with `PhysicalOutOfRange`. Reads/writes by
+user code to the system page fault with `SupervisorOnly`; supervisor fetches
+fault with `NotExecutable`, and writes to defined registers fault with
+`ReadOnly`. Multi-byte accesses are fully checked before any read or write;
+aliases report the original virtual fault address.
+
+Page-table helpers permit borrowed device mappings only with supervisor,
+nonexecutable permissions. Device mappings never allocate, reserve, clear,
+free or count device frames as RAM. Page tables themselves must remain in RAM.
+Validated transfer buffers and exception frames remain RAM-only, including
+through supervisor device aliases. The host's infallible physical read/write
+helpers assert on invalid high device accesses; guest access errors are
+validated and delivered as CPU faults rather than host assertions.
 
 The instruction decoder must distinguish an invalid or unavailable encoding
 from a halt. In the target architecture, an invalid encoding raises an illegal

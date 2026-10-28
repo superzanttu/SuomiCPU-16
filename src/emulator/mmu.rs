@@ -484,6 +484,15 @@ pub fn translate(
         return Err(fail(PageFaultReason::NotPresent));
     }
 
+    let physical_address =
+        (((table_entry & PTE_FRAME_MASK) >> 12) * PAGE_SIZE as u32) | (virtual_address & PAGE_MASK);
+    let device = crate::machine::is_implemented_device_page(physical_address);
+    if device && user_mode {
+        return Err(fail(PageFaultReason::SupervisorOnly));
+    }
+    if device && access == MemoryAccess::Fetch {
+        return Err(fail(PageFaultReason::NotExecutable));
+    }
     let writable = directory_entry & PTE_WRITABLE != 0 && table_entry & PTE_WRITABLE != 0;
     let user = directory_entry & PTE_USER != 0 && table_entry & PTE_USER != 0;
     let executable = directory_entry & PTE_EXECUTABLE != 0 && table_entry & PTE_EXECUTABLE != 0;
@@ -497,8 +506,9 @@ pub fn translate(
         return Err(fail(PageFaultReason::NotExecutable));
     }
 
-    let physical_address =
-        (((table_entry & PTE_FRAME_MASK) >> 12) * PAGE_SIZE as u32) | (virtual_address & PAGE_MASK);
+    if device {
+        return Ok(physical_address);
+    }
     if physical_address as usize >= crate::machine::usable_ram_size(memory.len()) {
         return Err(fail(PageFaultReason::PhysicalOutOfRange));
     }
@@ -544,10 +554,17 @@ pub fn address_space_physical_frames(
             .map_err(|_| PageTableError::MalformedEntry)?;
             if table_entry & PTE_PRESENT != 0 {
                 let frame = (table_entry & PTE_FRAME_MASK) >> 12;
-                if frame as usize * PAGE_SIZE >= crate::machine::usable_ram_size(memory.len()) {
+                let permissions = PagePermissions {
+                    writable: table_entry & PTE_WRITABLE != 0,
+                    user: table_entry & PTE_USER != 0,
+                    executable: table_entry & PTE_EXECUTABLE != 0,
+                };
+                if !valid_leaf_frame(memory.len(), frame, permissions) {
                     return Err(PageTableError::InvalidPhysicalFrame);
                 }
-                frames.insert(frame);
+                if !crate::machine::is_implemented_device_page(frame * PAGE_SIZE as u32) {
+                    frames.insert(frame);
+                }
             }
         }
     }
@@ -574,7 +591,7 @@ pub fn map_page(
     if virtual_address >= ADDRESS_SPACE_SIZE || virtual_address & PAGE_MASK != 0 {
         return Err(PageTableError::InvalidVirtualAddress);
     }
-    if physical_frame >= crate::machine::usable_ram_size(memory.len()).div_ceil(PAGE_SIZE) as u32 {
+    if !valid_leaf_frame(memory.len(), physical_frame, permissions) {
         return Err(PageTableError::InvalidPhysicalFrame);
     }
     let directory_index = ((virtual_address >> 21) & 0x1ff) as usize;
@@ -651,11 +668,21 @@ pub fn set_page_permissions(
         return Err(PageTableError::NotMapped);
     }
     let frame = (page_entry & PTE_FRAME_MASK) >> 12;
-    if frame as usize * PAGE_SIZE >= crate::machine::usable_ram_size(memory.len()) {
+    if !valid_leaf_frame(memory.len(), frame, permissions) {
         return Err(PageTableError::InvalidPhysicalFrame);
     }
     let updated = encode_entry(frame, permissions).ok_or(PageTableError::InvalidPhysicalFrame)?;
     write_entry(memory, table_base, table_index, updated)
+}
+
+fn valid_leaf_frame(memory_size: usize, frame: u32, permissions: PagePermissions) -> bool {
+    let Some(address) = frame.checked_mul(PAGE_SIZE as u32) else {
+        return false;
+    };
+    if crate::machine::is_implemented_device_page(address) {
+        return !permissions.user && !permissions.executable;
+    }
+    frame < crate::machine::usable_ram_size(memory_size).div_ceil(PAGE_SIZE) as u32
 }
 
 pub fn unmap_page(
@@ -823,7 +850,11 @@ mod tests {
         write_entry(
             &mut memory,
             0x2000,
-            encode_entry(aperture / PAGE_SIZE as u32, PagePermissions::USER_CODE).unwrap(),
+            encode_entry(
+                crate::machine::INTERRUPT_BASE / PAGE_SIZE as u32,
+                PagePermissions::USER_CODE,
+            )
+            .unwrap(),
         );
         for user in [false, true] {
             for access in [MemoryAccess::Read, MemoryAccess::Fetch] {
@@ -870,6 +901,106 @@ mod tests {
 
     fn write_entry(memory: &mut [u8], address: usize, value: u32) {
         memory[address..address + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[test]
+    fn supervisor_device_mappings_do_not_own_or_reserve_device_frames() {
+        let mut memory = vec![0; 1 << 16];
+        let mut manager = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
+        let root = manager.create_address_space(&mut memory).unwrap();
+        let used = manager.used_frames();
+        let device = crate::machine::SYSTEM_BASE / PAGE_SIZE as u32;
+        for permissions in [PagePermissions::USER_DATA, PagePermissions::KERNEL_CODE] {
+            assert_eq!(
+                manager.map_borrowed_page(&mut memory, root, 0x9000, device, permissions),
+                Err(PageTableError::InvalidPhysicalFrame)
+            );
+            assert_eq!(manager.used_frames(), used);
+        }
+        manager
+            .map_borrowed_page(
+                &mut memory,
+                root,
+                0x9000,
+                device,
+                PagePermissions::KERNEL_DATA,
+            )
+            .unwrap();
+        assert_eq!(manager.used_frames(), used + 1);
+        assert_eq!(
+            translate(&memory, root, 0x9008, MemoryAccess::Read, false).unwrap(),
+            crate::machine::SYSTEM_RAM_BYTES
+        );
+        assert_eq!(
+            translate(&memory, root, 0x9008, MemoryAccess::Read, true)
+                .unwrap_err()
+                .reason,
+            PageFaultReason::SupervisorOnly
+        );
+        assert!(
+            !address_space_physical_frames(&memory, root)
+                .unwrap()
+                .contains(&device)
+        );
+        for permissions in [PagePermissions::USER_DATA, PagePermissions::KERNEL_CODE] {
+            assert_eq!(
+                manager.set_permissions(&mut memory, root, 0x9000, permissions),
+                Err(PageTableError::InvalidPhysicalFrame)
+            );
+        }
+        manager
+            .set_permissions(
+                &mut memory,
+                root,
+                0x9000,
+                PagePermissions {
+                    writable: false,
+                    user: false,
+                    executable: false,
+                },
+            )
+            .unwrap();
+        let mut adopted = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
+        adopted.adopt_address_space(&memory, root).unwrap();
+        assert_eq!(adopted.used_frames(), manager.used_frames());
+        manager.unmap_page(&mut memory, root, 0x9000).unwrap();
+        assert_eq!(manager.used_frames(), used);
+        manager
+            .map_borrowed_page(
+                &mut memory,
+                root,
+                0x9000,
+                device,
+                PagePermissions::KERNEL_DATA,
+            )
+            .unwrap();
+        manager.destroy_address_space(&mut memory, root).unwrap();
+        assert_eq!(manager.used_frames(), 2);
+    }
+
+    #[test]
+    fn forged_user_executable_device_entries_cannot_override_bus_protection() {
+        let mut memory = mapped_memory(PagePermissions::USER_CODE, PagePermissions::USER_CODE);
+        write_entry(&mut memory, 0x2000, crate::machine::SYSTEM_BASE | 0xf);
+        assert_eq!(
+            translate(&memory, 0, 0, MemoryAccess::Read, false).unwrap(),
+            crate::machine::SYSTEM_BASE
+        );
+        for (user, access, reason) in [
+            (true, MemoryAccess::Read, PageFaultReason::SupervisorOnly),
+            (true, MemoryAccess::Write, PageFaultReason::SupervisorOnly),
+            (true, MemoryAccess::Fetch, PageFaultReason::SupervisorOnly),
+            (false, MemoryAccess::Fetch, PageFaultReason::NotExecutable),
+        ] {
+            assert_eq!(
+                translate(&memory, 0, 0, access, user).unwrap_err().reason,
+                reason
+            );
+        }
+        assert_eq!(
+            address_space_physical_frames(&memory, 0),
+            Err(PageTableError::InvalidPhysicalFrame)
+        );
     }
 
     fn mapped_memory(

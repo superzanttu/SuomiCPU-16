@@ -18,6 +18,40 @@ fn data(source: &mut String, address: u32, bytes: &[u8]) {
 }
 
 #[test]
+fn supervisor_executes_reads_from_the_high_system_bus_with_small_ram() {
+    use suomicpu16::machine::*;
+
+    for translated in [false, true] {
+        let base = if translated { 0x9000 } else { SYSTEM_BASE };
+        let source = format!(
+            "LDI30 R2, {base}\nLDW R0, R2\n\
+             LDI30 R2, {}\nLDW R1, R2\n\
+             LDI30 R2, {}\nLDW R3, R2\nHALT",
+            base + 2,
+            base + 8
+        );
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.memory[..20].fill(0xa5);
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+            cpu.memory[0x3004..0x3008].copy_from_slice(&0x100bu32.to_be_bytes());
+            cpu.memory[0x3024..0x3028].copy_from_slice(&(SYSTEM_BASE | 3).to_be_bytes());
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+        cpu.run(16).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[0], 0);
+        assert_eq!(cpu.registers[1], i64::from(MACHINE_REVISION));
+        assert_eq!(cpu.registers[3], 1);
+        assert_eq!(cpu.current_task(), None);
+        assert!(cpu.memory[..20].iter().all(|byte| *byte == 0xa5));
+    }
+}
+
+#[test]
 fn unmanaged_svc_always_enters_the_guest_kernel() {
     for abi_register in [0, 1, 77] {
         let image = assemble("SVC\nHALT\n.address 0x300\nINC R5\nRTI", 0x100).unwrap();

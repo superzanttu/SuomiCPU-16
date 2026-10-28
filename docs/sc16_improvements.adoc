@@ -590,6 +590,8 @@ Checklist status: [x] completed; [ ] planned.
     side-effect-free rejection, display-mode-independent bounds, and frame reuse.
 *** [ ] Move device registers out of RAM and implement the revised physical
     bus, including supervisor-only access, reserved offsets, and fetch rejection.
+**** [x] Implement the RAM-independent high system bank, checked guest
+     constants, and supervisor device-page mappings with execution regressions.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup

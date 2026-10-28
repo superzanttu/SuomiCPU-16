@@ -21,6 +21,27 @@ fn run_c(source: &str) -> i64 {
 }
 
 #[test]
+fn guest_c_machine_header_reads_the_supervisor_system_bank() {
+    assert_eq!(
+        run_c(
+            "#include <sc16_machine.h>\n\
+             int main(void) {\n\
+                 volatile unsigned long *revision = (volatile unsigned long *)SC16_SYSTEM_MACHINE_REVISION;\n\
+                 volatile unsigned long *ram = (volatile unsigned long *)SC16_SYSTEM_RAM_BYTES;\n\
+                 volatile unsigned long *bits = (volatile unsigned long *)SC16_SYSTEM_ADDRESS_BITS;\n\
+                 volatile unsigned long *banks = (volatile unsigned long *)SC16_SYSTEM_BANKS;\n\
+                 if (*revision != 1UL) return 11;\n\
+                 if (*ram != 1048576UL) return 12;\n\
+                 if (*bits != 30UL) return 13;\n\
+                 if (*banks != 1UL) return 14;\n\
+                 return 1;\n\
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
 fn c_compiler_image_matches_independently_assembled_output() {
     let source = "int main(void) { return 40 + 2; }";
     let assembly = compile_minimal_program_to_assembly(source, "c90-conformance.c")
