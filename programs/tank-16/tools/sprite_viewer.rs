@@ -1,3 +1,6 @@
+//! Supplies sprite-atlas geometry for Tank-16's viewer.
+//! Computes padded atlas dimensions, sprite IDs, and cell bounds, with geometry tests.
+
 pub const SPRITE_SIZE: u32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

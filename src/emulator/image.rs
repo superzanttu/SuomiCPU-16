@@ -1,3 +1,7 @@
+//! Defines and loads SC-16 executable images.
+//! Validates segments and container metadata, encodes/decodes images, and connects
+//! offline source construction with prebuilt-image loading.
+
 use crate::CpuError;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};

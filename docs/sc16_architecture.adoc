@@ -158,6 +158,10 @@ pair (high word first); both starting registers must be even. These instructions
 same validation as the corresponding CPU control APIs.
 `STARTU Rn, Rm` creates and activates a scheduled user task with those entry
 and stack addresses, using the active address space and kernel stack.
+It opts that task into the emulator-backed scheduling and syscall extension.
+`ENTERU` does not create a host task: a guest kernel can instead own scheduling,
+save registers on timer entry, change its page-directory root, select a saved
+supervisor stack, and resume with `RTI`.
 Interrupt-control, timer-control, BIOS, and other protected MMIO accesses are
 rejected in user mode. The explicit user-safe console, disk, text, input, and
 basic graphics ranges are filtered by the CPU. The GPU speed selector at
@@ -172,10 +176,18 @@ memory when MMU translation is enabled. Page permissions apply to every byte
 of multi-byte accesses. The supervisor-only `ENTERU` instruction validates the entry point and stack,
 including their page permissions when translation is enabled. `SVC` is
 encoded as `0x0080` and dispatches through
-vector 128. ABI version 1 uses this instruction for the syscall interface
-below. An `SVC` with R7 zero retains ordinary guest-handler delivery; unknown
-nonzero ABI versions are rejected. Do not treat the legacy no-MMU user mode as
-an isolation boundary.
+vector 128. For emulator-managed tasks, ABI version 1 uses this instruction for
+the syscall interface below; R7 zero retains ordinary guest-handler delivery,
+and unknown nonzero ABI versions are rejected. Without a host-managed task,
+`SVC` always enters the guest vector handler, regardless of R7. User register
+contents must not opt a guest-written kernel into host syscall dispatch.
+Do not treat the legacy no-MMU user mode as an isolation boundary.
+
+With translation enabled, user entry validation uses the installed user and
+execute page permissions, not a comparison of the virtual PC with physical
+image segment addresses. This permits kernels to relocate user code or load
+new code into allocated frames. Without translation, the initial entry must
+still belong to an executable loaded-image segment when image metadata exists.
 
 == Exceptions and interrupts
 
@@ -248,6 +260,16 @@ versioned guest syscall interface below exposes the supported process and
 synchronization services. The Phase 9 lifecycle fixture and Phase 10 SisuOS
 demonstration boot through the common BIOS and execute guest workloads; neither
 example establishes general-purpose OS readiness.
+
+The independent hardware regression in `tests/preemptive_hardware.rs` does not
+create host tasks or invoke host scheduling services. Its guest kernel installs
+the IDT and two page directories, then handles PIT interrupts in assembly to
+save registers, switch address spaces and supervisor stacks, and restore the
+next user context with `RTI`. Two user loops share virtual addresses but have
+different physical code, data, and stack pages. The test checks continued
+progress, register and stack preservation, and guest-owned SVC handling.
+Run it with `cargo test --test preemptive_hardware`. This is a hardware
+acceptance fixture, not a replacement SisuOS implementation.
 
 == Memory translation
 

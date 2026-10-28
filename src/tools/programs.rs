@@ -1,3 +1,7 @@
+//! Builds and installs programs from validated repository manifests.
+//! Provides catalog discovery, staged builds, ownership/conflict checks,
+//! recoverable disk installation, and legacy program-disk migration.
+
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;

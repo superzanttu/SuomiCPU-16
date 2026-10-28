@@ -1,3 +1,6 @@
+//! Provides Tank-16's interactive graphical map editor.
+//! Handles map creation/loading, tileset selection, layer editing, and saving.
+
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, WHITE,
     clear_background, draw_rectangle, draw_rectangle_lines, draw_text, draw_texture_ex,

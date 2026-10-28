@@ -1,3 +1,6 @@
+//! Provides the deterministic Tank-16 map-generation command.
+//! Parses the output directory, generates the standard map set, and reports its paths.
+
 use std::path::PathBuf;
 
 fn main() {

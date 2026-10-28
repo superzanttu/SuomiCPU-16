@@ -1,3 +1,7 @@
+//! Implements the Rust-native C compiler for the supported SC-16 C subset.
+//! Contains preprocessing, parsing, type and layout analysis, assembly generation,
+//! guest runtime linkage, diagnostics, and compiler execution regressions.
+
 use crate::image::ProgramImage;
 use std::collections::{HashMap, HashSet};
 use std::fs;

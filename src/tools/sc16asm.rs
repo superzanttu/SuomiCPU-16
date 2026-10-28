@@ -1,3 +1,6 @@
+//! Provides the standalone SC-16 assembler command-line tool.
+//! Parses source/output arguments, assembles files, and writes executable images.
+
 use std::path::PathBuf;
 
 fn main() {

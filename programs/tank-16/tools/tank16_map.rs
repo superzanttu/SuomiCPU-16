@@ -1,3 +1,7 @@
+//! Implements Tank-16 map and runtime-asset processing.
+//! Loads, validates, edits, and saves maps; converts tiles/assets and emits
+//! guest headers, runtime map data, and executable builds.
+
 use image::imageops::FilterType;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};

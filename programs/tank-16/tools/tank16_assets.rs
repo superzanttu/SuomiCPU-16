@@ -1,3 +1,6 @@
+//! Generates Tank-16's procedural object sprite atlas.
+//! Contains raster drawing helpers, object artwork, output-path handling, and PNG generation.
+
 use image::{Rgba, RgbaImage};
 use imageproc::{
     drawing::{

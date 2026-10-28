@@ -1,3 +1,7 @@
+//! Provides Tank-16's asset, map, and runtime build command-line tools.
+//! Dispatches map validation/conversion, header and runtime generation,
+//! geographic map generation, and terrain-atlas extension.
+
 use std::path::PathBuf;
 
 fn main() {

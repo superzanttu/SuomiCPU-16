@@ -1,3 +1,6 @@
+//! Provides the Tank-16 object-tileset generation command.
+//! Selects the output path and invokes the shared procedural atlas generator.
+
 use std::path::PathBuf;
 
 fn main() {

@@ -1,3 +1,7 @@
+//! Defines the emulator-backed guest syscall ABI and kernel bookkeeping.
+//! Contains syscall numbers, register/error conventions, file handles, process records,
+//! sleep/wait state, and semaphores used by CPU syscall dispatch.
+
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 

@@ -1,3 +1,6 @@
+//! Implements the guest terminal console independently of host rendering.
+//! Manages bounded input/output, screen cells, scrollback, cursor state, and escape sequences.
+
 use std::collections::{VecDeque, vec_deque};
 
 pub const RX_CAPACITY: usize = 4096;

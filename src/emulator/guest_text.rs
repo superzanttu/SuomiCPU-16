@@ -1,4 +1,5 @@
-// No imports needed for this current implementation
+//! Maintains the firmware's guest character-cell display.
+//! Defines colored text cells, cursor movement, screen clearing, and text output.
 
 pub const GUEST_TEXT_COLUMNS: usize = 53;
 pub const GUEST_TEXT_ROWS: usize = 25;

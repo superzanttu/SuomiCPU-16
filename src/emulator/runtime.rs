@@ -1,3 +1,7 @@
+//! Runs the host-facing SC-16 emulator environment.
+//! Handles BIOS and program startup, windowed/headless execution, rendering,
+//! input, audio, debug-monitor windows, and runtime integration tests.
+
 use crate::cpu::{
     BIOS_AUTOBOOT_WAIT_MARKER, BIOS_FIRMWARE_MARKER, Cpu, GpuLine, GpuSoundCommand, GpuTriangle,
     PrivilegeMode, VSYNC_ADDR,

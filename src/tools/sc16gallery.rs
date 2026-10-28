@@ -1,3 +1,6 @@
+//! Generates an animated gallery by executing packaged SC-16 programs.
+//! Captures graphics or console frames, writes GIFs, and updates README gallery links.
+
 use gif::{Encoder, Frame, Repeat};
 use std::fs::{self, File};
 use std::io::{self, Write};

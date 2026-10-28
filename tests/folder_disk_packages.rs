@@ -1,3 +1,7 @@
+//! Verifies checked-in firmware and folder-disk packages end to end.
+//! Checks reproducible BIOS assembly, packaged-program execution, disk capacity,
+//! and legacy block-disk import/export preservation.
+
 use std::path::PathBuf;
 
 use suomicpu16::cpu::{Cpu, PrivilegeMode};

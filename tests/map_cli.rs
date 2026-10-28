@@ -1,3 +1,7 @@
+//! Tests Tank-16 map tools through their command-line executables.
+//! Uses temporary files to verify generation, validation, editing-tool arguments,
+//! runtime conversion, and reported command results.
+
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;

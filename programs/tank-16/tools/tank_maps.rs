@@ -1,3 +1,6 @@
+//! Generates Tank-16's seeded natural-terrain map collection.
+//! Defines standard maps and constructs terrain, waterways, roads, and map objects.
+
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;

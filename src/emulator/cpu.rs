@@ -1,3 +1,7 @@
+//! Implements SC-16 CPU execution and its connected device gateways.
+//! Contains machine state, instruction decoding, memory access, privilege transitions,
+//! interrupts, task/syscall integration, graphics operations, and behavioral tests.
+
 use memmap2::MmapMut;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -1052,14 +1056,8 @@ impl Cpu {
         if !self.mmu_enabled && user_sp > self.kernel_sp.saturating_sub(0x1000) {
             return Err(CpuError::InvalidUserStack(user_sp));
         }
-        if !self.loaded_image_segments.is_empty()
-            && !self.loaded_image_segments.iter().any(|segment| {
-                segment.permissions.execute
-                    && user_pc >= segment.address
-                    && ((user_pc - segment.address) as usize) < segment.length
-            })
-        {
-            return Err(CpuError::InvalidEntryPoint(user_pc));
+        if !self.mmu_enabled {
+            self.validate_user_image_entry(user_pc)?;
         }
         if self.mmu_enabled {
             self.validate_user_mapping(user_pc, user_sp)?;
@@ -1086,14 +1084,11 @@ impl Cpu {
         }
         if entry_point
             > page_directory.map_or(self.memory_mask, |_| crate::mmu::ADDRESS_SPACE_SIZE - 1)
-            || (!self.loaded_image_segments.is_empty()
-                && !self.loaded_image_segments.iter().any(|segment| {
-                    segment.permissions.execute
-                        && entry_point >= segment.address
-                        && ((entry_point - segment.address) as usize) < segment.length
-                }))
         {
             return Err(CpuError::InvalidEntryPoint(entry_point));
+        }
+        if page_directory.is_none() {
+            self.validate_user_image_entry(entry_point)?;
         }
         if user_sp == 0
             || user_sp
@@ -1322,6 +1317,19 @@ impl Cpu {
 
     fn validate_user_mapping(&self, entry_point: u32, user_sp: u32) -> Result<(), CpuError> {
         self.validate_user_mapping_in(self.page_directory, entry_point, user_sp)
+    }
+
+    fn validate_user_image_entry(&self, entry_point: u32) -> Result<(), CpuError> {
+        if !self.loaded_image_segments.is_empty()
+            && !self.loaded_image_segments.iter().any(|segment| {
+                segment.permissions.execute
+                    && entry_point >= segment.address
+                    && ((entry_point - segment.address) as usize) < segment.length
+            })
+        {
+            return Err(CpuError::InvalidEntryPoint(entry_point));
+        }
+        Ok(())
     }
 
     fn validate_user_mapping_in(
@@ -3975,6 +3983,7 @@ impl Cpu {
                 let descriptor = self.idt_descriptor(vector)?;
                 let caller_privilege = u8::from(self.privilege_mode == PrivilegeMode::User) * 3;
                 let is_syscall = self.privilege_mode == PrivilegeMode::User
+                    && self.scheduler.current_task().is_some()
                     && self.registers[crate::syscall::REGISTER_ABI_VERSION] != 0;
                 if caller_privilege > descriptor.privilege {
                     self.enter_exception(EXCEPTION_PRIVILEGE_VIOLATION, self.pc)?;

@@ -1,3 +1,7 @@
+//! Implements named-node SC-NET communication over UDP.
+//! Handles discovery, heartbeats, identity collisions, peer expiry, and bounded messages,
+//! independently of the game networking protocol.
+
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

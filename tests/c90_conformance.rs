@@ -1,3 +1,6 @@
+//! Exercises the supported C90 subset through compilation and CPU execution.
+//! Checks language behavior and consistency between compiler images and assembled output.
+
 use suomicpu16::{
     Cpu,
     assembler::assemble,

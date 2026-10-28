@@ -1,3 +1,6 @@
+//! Starts the SC-16 emulator from command-line options.
+//! Selects BIOS, image, or disk boot and launches the windowed or headless runtime.
+
 use std::path::{Path, PathBuf};
 
 use suomicpu16::runtime::window_conf;

@@ -1,3 +1,7 @@
+//! Provides offline SC-16 build and disk-packaging commands.
+//! Dispatches source/image builds, BIOS generation, program installation/migration,
+//! legacy-disk import, and kernel/user disk packaging.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

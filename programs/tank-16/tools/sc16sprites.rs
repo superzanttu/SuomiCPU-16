@@ -1,3 +1,6 @@
+//! Provides Tank-16's interactive sprite-atlas viewer.
+//! Loads object/terrain atlases and supports atlas selection, zoom, and sprite inspection.
+
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, WHITE,
     clear_background, draw_rectangle_lines, draw_text, draw_texture_ex, is_key_pressed,

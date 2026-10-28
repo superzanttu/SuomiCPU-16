@@ -1,3 +1,6 @@
+//! Defines shared SC-16 instruction encodings and mnemonic tables.
+//! Contains opcode/prefix constants, operation selectors, and instruction lookup helpers.
+
 pub const OP_HALT: u16 = 0x00;
 pub const OP_LDI: u16 = 0x01;
 pub const OP_LD: u16 = 0x02;

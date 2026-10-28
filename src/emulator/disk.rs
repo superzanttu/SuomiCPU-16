@@ -1,3 +1,7 @@
+//! Implements folder-backed disks and legacy block-disk import/export.
+//! Handles manifests, disk discovery, boot images, filesystem operations, capacity,
+//! path validation, and read-only/protected-file rules.
+
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, File};

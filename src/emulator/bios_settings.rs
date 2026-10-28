@@ -1,3 +1,6 @@
+//! Stores and validates persistent BIOS configuration.
+//! Defines startup preferences, network identity, additional settings, and file persistence.
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};

@@ -576,10 +576,26 @@ Checklist status: [x] completed; [ ] planned.
   the shell after the demo exits.
 * [x] Document how to build a fresh disk without overwriting existing output,
   select it in BIOS, use the shell, and understand the example's limitations.
-* [ ] Analyze current memory-mapped control registers and suggest a better
-  architecture.
+* [ ] Analyze current memory-mapped controls and implement a revised architecture
+  suitable for a guest-written preemptive operating system.
+** [x] Verify guest-owned PIT scheduling, context/stack preservation,
+   address-space switching, nonidentity user entry, and SVC handling without
+   host tasks. Preserve the existing emulator-backed SisuOS demonstration.
+** [ ] Define the revised physical map, register access/side-effect contracts,
+   machine/image versions, and user device-service ABI.
+** [ ] Separate RAM from high-address, page-separated, supervisor-only MMIO;
+   reject user aliases and device instruction fetches.
+** [ ] Implement validated user device services and shared protected startup
+   for ordinary user programs.
+** [ ] Version executable images and reject stale or unversioned runtime
+   images with actionable diagnostics.
+** [ ] Migrate firmware, toolchain, all programs, and launch paths; rebuild
+   installed images without overwriting writable disk data or settings.
+** [ ] Pass hardware, protection, compiler-execution, BIOS, SisuOS, and
+   program regressions; update the architecture and migration documentation.
 
 === Phase 11 - Final tasks
 * [ ] Perform a final review of all documentation, ensuring accuracy and completeness.
 * [ ] Write documentation how to compile and package the BIOS, kernel, and user programs, as well as how to create and manage bootable disks.
 * [ ] Ensure all helper tools and scripts are documented, including usage examples and expected outputs.
+* [ ] Create a "Getting Started" document to explain that documentation user should read and which order to gain understanding and skills to use SC-16.

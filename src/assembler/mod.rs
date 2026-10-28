@@ -1,3 +1,6 @@
+//! Assembles SC-16 source into executable image segments.
+//! Handles source directives, labels, instruction encoding, file input, and diagnostics.
+
 use crate::image::{ImageSegment, ProgramImage};
 use crate::isa::{
     ALU_IMMEDIATE_FLAG, ALU_MISC_OPERATION, ALU_OPERATIONS, ALU_PREFIX, BASE_OPCODES,

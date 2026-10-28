@@ -1,3 +1,7 @@
+//! Builds Tank-16 maps from geographic data for Finland.
+//! Processes country, lake, road, railway, and city features into terrain,
+//! map objects, and preview output.
+
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;

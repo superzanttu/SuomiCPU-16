@@ -1,3 +1,7 @@
+//! Tests the SC-16 C target ABI through compiled guest execution.
+//! Covers data layout, record copies, pointers, argument/return conventions,
+//! arithmetic, and stack preservation across compiler-generated calls.
+
 use suomicpu16::{Cpu, assembler::assemble, c_compiler::compile_minimal_program_to_assembly};
 
 fn run_c(source: &str) -> Cpu {

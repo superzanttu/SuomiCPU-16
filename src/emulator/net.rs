@@ -1,3 +1,7 @@
+//! Implements the application/game UDP networking protocol.
+//! Tracks player slots, peer discovery and timeouts, packet exchange, and receive queues;
+//! this protocol is separate from SC-NET.
+
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 

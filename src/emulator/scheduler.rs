@@ -1,3 +1,7 @@
+//! Implements the emulator-backed round-robin task scheduler.
+//! Defines saved CPU contexts and task states, with activation, rescheduling,
+//! blocking, wakeup, exit, and task-lifecycle validation.
+
 use crate::cpu::{Flags, PrivilegeMode};
 
 pub type TaskId = u32;

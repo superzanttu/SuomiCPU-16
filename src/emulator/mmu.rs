@@ -1,3 +1,7 @@
+//! Implements SC-16 paged address translation and physical-frame management.
+//! Defines page permissions and faults, validates page tables, and manages
+//! address-space allocation, mapping, permission changes, and teardown.
+
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_MASK: u32 = (PAGE_SIZE as u32) - 1;
 pub const PAGE_DIRECTORY_ENTRIES: usize = 512;

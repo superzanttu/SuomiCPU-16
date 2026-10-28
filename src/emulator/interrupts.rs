@@ -1,3 +1,6 @@
+//! Defines the SC-16 interrupt descriptor table contract.
+//! Provides vector constants, gate descriptors, encoding/validation, and table access.
+
 pub const IDT_ENTRY_COUNT: usize = 256;
 pub const IDT_ENTRY_BYTES: usize = 8;
 pub const IDT_BYTES: usize = IDT_ENTRY_COUNT * IDT_ENTRY_BYTES;
