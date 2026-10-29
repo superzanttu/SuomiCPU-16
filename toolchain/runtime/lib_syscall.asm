@@ -428,3 +428,21 @@ sc16_graphics:
     LDI R7, 1
     SVC
     RET
+
+sc16_input_snapshot:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDI R2, 0
+    LDI R3, 0
+    LDI R4, 0
+    LDI R5, 0
+    LDI R6, 0
+    LDI R0, 25
+    LDI R7, 1
+    SVC
+    RET

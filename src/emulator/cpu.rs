@@ -2325,6 +2325,7 @@ impl Cpu {
                 Ok(SyscallNumber::Seek) => self.syscall_seek(task_id),
                 Ok(SyscallNumber::ScNet) => self.syscall_scnet(task_id),
                 Ok(SyscallNumber::Graphics) => self.syscall_graphics(task_id),
+                Ok(SyscallNumber::InputSnapshot) => self.syscall_input_snapshot(task_id),
                 Ok(SyscallNumber::ProcessInfo | SyscallNumber::ProcessStatus) => {
                     self.syscall_process_info()
                 }
@@ -2961,6 +2962,30 @@ impl Cpu {
         self.execute_graphics_request(request)
             .map(i64::from)
             .unwrap_or(crate::syscall::error::INVALID)
+    }
+
+    fn syscall_input_snapshot(&mut self, task_id: Option<TaskId>) -> i64 {
+        if task_id.is_none() || self.registers[2..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let Ok(destination) = u32::try_from(self.registers[1]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let destinations = match self.guest_memory_addresses(
+            destination,
+            crate::machine::INPUT_SNAPSHOT_SIZE,
+            crate::mmu::MemoryAccess::Write,
+            true,
+        ) {
+            Ok(destinations) => destinations,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let snapshot = self.input.take_snapshot();
+        self.sync_input_mirrors();
+        for (address, byte) in destinations.into_iter().zip(snapshot) {
+            self.memory[address] = byte;
+        }
+        crate::machine::INPUT_SNAPSHOT_SIZE as i64
     }
 
     fn ensure_page_memory_manager(&mut self) -> Result<(), crate::mmu::PageTableError> {
@@ -8827,6 +8852,38 @@ mod tests {
         assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
         let framebuffer_after_rejection = cpu.composited_framebuffer();
         assert_eq!(framebuffer_after_rejection, framebuffer);
+    }
+
+    #[test]
+    fn input_snapshot_validates_output_before_consuming_events() {
+        let (mut cpu, _) = cpu_with_syscall_task_memory(1 << 20);
+        cpu.input.key = 0x41;
+        cpu.input.keys = 0x0000_1234;
+        cpu.input.mouse = [0, 42, 0, 43, 1, 0x08, 0xff, 0xfe];
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::InputSnapshot,
+            [i64::from(crate::machine::INPUT_BASE), 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        assert_eq!(cpu.input.key, 0x41);
+        assert_eq!(cpu.input.mouse[5], 0x08);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::InputSnapshot,
+            [0x400, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 13);
+        assert_eq!(
+            &cpu.memory[0x400..0x40d],
+            &[0x41, 0, 0, 0x12, 0x34, 0, 42, 0, 43, 1, 0x08, 0xff, 0xfe]
+        );
+        assert_eq!(cpu.input.key, 0);
+        assert_eq!(cpu.input.mouse[5], 0);
+        assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], 0);
+        assert_eq!(cpu.memory[MOUSE_ADDR as usize + 5], 0);
     }
 
     #[test]

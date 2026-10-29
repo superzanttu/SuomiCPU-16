@@ -49,6 +49,7 @@ pub enum SyscallNumber {
     ArgumentCount = 22,
     Argument = 23,
     Graphics = 24,
+    InputSnapshot = 25,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -81,6 +82,7 @@ impl TryFrom<i64> for SyscallNumber {
             22 => Ok(Self::ArgumentCount),
             23 => Ok(Self::Argument),
             24 => Ok(Self::Graphics),
+            25 => Ok(Self::InputSnapshot),
             _ => Err(()),
         }
     }
@@ -242,7 +244,11 @@ mod tests {
         );
         assert_eq!(SyscallNumber::try_from(23), Ok(SyscallNumber::Argument));
         assert_eq!(SyscallNumber::try_from(24), Ok(SyscallNumber::Graphics));
-        assert_eq!(SyscallNumber::try_from(25), Err(()));
+        assert_eq!(
+            SyscallNumber::try_from(25),
+            Ok(SyscallNumber::InputSnapshot)
+        );
+        assert_eq!(SyscallNumber::try_from(26), Err(()));
     }
 
     #[test]

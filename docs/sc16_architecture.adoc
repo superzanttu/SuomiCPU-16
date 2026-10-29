@@ -994,6 +994,13 @@ which the native wrappers combine before `SVC`.
   invalid user buffers return `-EFAULT`, and success returns the operation
   result. This service does not modify supervisor graphics staging registers
   or status.
+|25 |`input_snapshot` |R1 writable pointer to a 13-byte output buffer; R2-R6
+  must be zero. Returns 13 on success. Byte 0 is the consumed key event;
+  bytes 1-4 are the held-key mask in big-endian order (currently 24 bits);
+  bytes 5-6 and 7-8 are big-endian mouse X and Y; byte 9 is held mouse
+  buttons; byte 10 is the consumed mouse-event latch; bytes 11-12 are the
+  signed big-endian wheel delta. The entire output buffer is validated before
+  either event latch is consumed. Invalid buffers return `-EFAULT`.
 |===
 
 The original `spawn` and `spawn_arg` supply the executable path as argument

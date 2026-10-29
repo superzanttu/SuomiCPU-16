@@ -3,7 +3,16 @@
 
 #define SC16_SYSCALL_ABI_VERSION 1
 #define SC16_SYSCALL_GRAPHICS 24
+#define SC16_SYSCALL_INPUT_SNAPSHOT 25
 #define SC16_GRAPHICS_PARAMETERS_SIZE 10
+#define SC16_INPUT_SNAPSHOT_SIZE 13
+#define SC16_INPUT_KEY_OFFSET 0
+#define SC16_INPUT_KEYS_OFFSET 1
+#define SC16_INPUT_MOUSE_X_OFFSET 5
+#define SC16_INPUT_MOUSE_Y_OFFSET 7
+#define SC16_INPUT_MOUSE_BUTTONS_OFFSET 9
+#define SC16_INPUT_MOUSE_EVENTS_OFFSET 10
+#define SC16_INPUT_MOUSE_WHEEL_OFFSET 11
 #define SC16_MAX_ARGUMENTS 16
 #define SC16_MAX_ARGUMENT_BYTES 1024
 
@@ -59,5 +68,6 @@ long sc16_semop(unsigned int operation, unsigned long semaphore_id,
 int sc16_graphics(unsigned int operation,
                   const struct sc16_graphics_parameters *parameters,
                   const void *data, unsigned int length);
+int sc16_input_snapshot(unsigned char *buffer);
 
 #endif

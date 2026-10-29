@@ -626,6 +626,9 @@ Checklist status: [x] completed; [ ] planned.
 *** [x] Add syscall 24 for bounded graphics operations; validate and copy
     user request/data buffers before drawing, share the checked renderer with
     supervisor MMIO, and verify C-to-CPU execution without changing staging.
+*** [x] Add syscall 25 for a validated keyboard/mouse snapshot; verify
+    event-latch preservation on invalid output buffers and execute the C ABI
+    from a protected guest task.
 ** [ ] Version executable images and reject stale or unversioned runtime
    images with actionable diagnostics.
 ** [ ] Migrate firmware, toolchain, all programs, and launch paths to the

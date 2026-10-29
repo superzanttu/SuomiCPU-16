@@ -38,6 +38,7 @@ pub const INPUT_MOUSE_Y: u32 = INPUT_BASE + 10;
 pub const INPUT_MOUSE_BUTTONS: u32 = INPUT_BASE + 12;
 pub const INPUT_MOUSE_EVENTS: u32 = INPUT_BASE + 13;
 pub const INPUT_MOUSE_WHEEL: u32 = INPUT_BASE + 14;
+pub const INPUT_SNAPSHOT_SIZE: usize = 13;
 pub const CLOCK_CAPTURE: u32 = CLOCK_BASE;
 pub const CLOCK_MONOTONIC_MILLIS: u32 = CLOCK_BASE + 4;
 pub const CLOCK_FRAMES: u32 = CLOCK_BASE + 8;
@@ -815,6 +816,17 @@ pub struct InputDevice {
 }
 
 impl InputDevice {
+    pub fn take_snapshot(&mut self) -> [u8; INPUT_SNAPSHOT_SIZE] {
+        let mut snapshot = [0; INPUT_SNAPSHOT_SIZE];
+        snapshot[0] = std::mem::take(&mut self.key);
+        snapshot[1..5].copy_from_slice(&(self.keys & 0x00ff_ffff).to_be_bytes());
+        snapshot[5..9].copy_from_slice(&self.mouse[..4]);
+        snapshot[9] = self.mouse[4];
+        snapshot[10] = std::mem::take(&mut self.mouse[5]);
+        snapshot[11..13].copy_from_slice(&self.mouse[6..8]);
+        snapshot
+    }
+
     pub fn read(&mut self, address: u32) -> Option<u8> {
         match address {
             INPUT_KEY => Some(std::mem::take(&mut self.key)),

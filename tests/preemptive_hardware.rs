@@ -141,6 +141,67 @@ fn user_c_draws_through_the_validated_graphics_syscall() {
 }
 
 #[test]
+fn user_c_reads_the_validated_input_snapshot_syscall() {
+    let c_source = "#include <sc16_syscall.h>\n\
+                    int main(void) {\n\
+                        unsigned char snapshot[SC16_INPUT_SNAPSHOT_SIZE];\n\
+                        if (sc16_input_snapshot(snapshot) != SC16_INPUT_SNAPSHOT_SIZE) {\n\
+                            sc16_exit(10);\n\
+                        }\n\
+                        if (snapshot[SC16_INPUT_KEY_OFFSET] != 65 ||\n\
+                            snapshot[SC16_INPUT_KEYS_OFFSET] != 0 ||\n\
+                            snapshot[SC16_INPUT_KEYS_OFFSET + 3] != 4 ||\n\
+                            snapshot[SC16_INPUT_MOUSE_X_OFFSET] != 0 ||\n\
+                            snapshot[SC16_INPUT_MOUSE_X_OFFSET + 1] != 42 ||\n\
+                            snapshot[SC16_INPUT_MOUSE_Y_OFFSET] != 0 ||\n\
+                            snapshot[SC16_INPUT_MOUSE_Y_OFFSET + 1] != 43 ||\n\
+                            snapshot[SC16_INPUT_MOUSE_BUTTONS_OFFSET] != 1 ||\n\
+                            snapshot[SC16_INPUT_MOUSE_EVENTS_OFFSET] == 0 ||\n\
+                            snapshot[SC16_INPUT_MOUSE_WHEEL_OFFSET] != 0xff ||\n\
+                            snapshot[SC16_INPUT_MOUSE_WHEEL_OFFSET + 1] != 0xfe) {\n\
+                            sc16_exit(11);\n\
+                        }\n\
+                        sc16_exit(0);\n\
+                        for (;;) { }\n\
+                    }";
+    let user_assembly = suomicpu16::c_compiler::compile_minimal_program_to_assembly(
+        c_source,
+        "user-input-snapshot.c",
+    )
+    .unwrap()
+    .unwrap();
+    let image = assemble(&user_assembly, 0).unwrap();
+    let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.load_idt(0x800).unwrap();
+    cpu.set_idt_descriptor(
+        suomicpu16::isa::SVC_VECTOR,
+        suomicpu16::interrupts::IdtDescriptor {
+            handler: 0x300,
+            present: true,
+            privilege: 3,
+            gate_type: suomicpu16::interrupts::GateType::Interrupt,
+        },
+    )
+    .unwrap();
+    cpu.write(0x43000, 65);
+    cpu.set_key(4, true);
+    cpu.set_mouse_position(42, 43);
+    cpu.mouse_button(0, true, 42, 43, 0);
+    cpu.set_mouse_wheel(-2);
+    let task = cpu
+        .create_user_task(image.entry_point, 0x7000, 0xf000, None)
+        .unwrap();
+    cpu.start_task(task).unwrap();
+    cpu.run(10_000).unwrap();
+
+    let context = cpu.task_context(task).unwrap();
+    assert_eq!(context.state, suomicpu16::scheduler::TaskState::Exited);
+    assert_eq!(context.exit_code, Some(0));
+}
+
+#[test]
 fn high_pit_mask_latches_and_unmask_delivers_to_an_unmanaged_guest_kernel() {
     use suomicpu16::machine::*;
 
