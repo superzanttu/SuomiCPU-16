@@ -309,6 +309,61 @@ fn supervisor_executes_high_console_and_firmware_text_with_small_ram() {
 }
 
 #[test]
+fn supervisor_executes_high_audio_commands_with_small_ram_and_translated_aliases() {
+    use suomicpu16::machine::*;
+
+    for translated in [false, true] {
+        let base = if translated { 0x9000 } else { AUDIO_BASE };
+        let source = format!(
+            "LDI30 R2, {}\nLDI R0, 3\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 440\nSTW R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 60\nSTW R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 2\nSTW R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 75\nSTW R2, R0\n\
+             LDI30 R2, {base}\nLDI R0, 1\nST R2, R0\n\
+             LDI30 R2, {}\nLD R4, R2\n\
+             LDI30 R2, {}\nLD R5, R2\nHALT",
+            base + 2,
+            base + 4,
+            base + 6,
+            base + 8,
+            base + 10,
+            base + 1,
+            base + 12,
+        );
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.memory[0x6000..0x6010].fill(0xa5);
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+            cpu.memory[0x3004..0x3008].copy_from_slice(&0x100bu32.to_be_bytes());
+            cpu.memory[0x3024..0x3028].copy_from_slice(&(AUDIO_BASE | 3).to_be_bytes());
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.current_task(), None);
+        assert_eq!(cpu.registers[4], 0);
+        assert_eq!(cpu.registers[5], 8);
+        assert_eq!(
+            cpu.take_sound_commands(),
+            [suomicpu16::cpu::GpuSoundCommand {
+                channel: 3,
+                frequency: 440,
+                frames: 60,
+                waveform: 2,
+                volume: 75,
+            }]
+        );
+        assert!(cpu.take_sound_commands().is_empty());
+        assert_eq!(cpu.read(AUDIO_PENDING), 0);
+        assert!(cpu.memory[0x6000..0x6010].iter().all(|byte| *byte == 0xa5));
+    }
+}
+
+#[test]
 fn unmanaged_svc_always_enters_the_guest_kernel() {
     for abi_register in [0, 1, 77] {
         let image = assemble("SVC\nHALT\n.address 0x300\nINC R5\nRTI", 0x100).unwrap();

@@ -913,6 +913,7 @@ mod tests {
             crate::machine::INPUT_BASE,
             crate::machine::CONSOLE_BASE,
             crate::machine::FIRMWARE_TEXT_BASE,
+            crate::machine::AUDIO_BASE,
         ] {
             let mut memory = vec![0; 1 << 16];
             let mut manager = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
@@ -998,6 +999,7 @@ mod tests {
             crate::machine::INPUT_BASE,
             crate::machine::CONSOLE_BASE,
             crate::machine::FIRMWARE_TEXT_BASE,
+            crate::machine::AUDIO_BASE,
         ] {
             let mut memory = mapped_memory(PagePermissions::USER_CODE, PagePermissions::USER_CODE);
             write_entry(&mut memory, 0x2000, base | 0xf);

@@ -264,14 +264,7 @@ pub struct GpuLine {
     pub color: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GpuSoundCommand {
-    pub channel: u8,
-    pub frequency: u16,
-    pub frames: u16,
-    pub waveform: u16,
-    pub volume: u16,
-}
+pub use crate::machine::SoundCommand as GpuSoundCommand;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GpuSprite {
@@ -373,7 +366,7 @@ pub struct Cpu {
     pub palette: [[u8; 3]; 256],
     pub gpu_triangles: Vec<GpuTriangle>,
     pub gpu_lines: Vec<GpuLine>,
-    sound_commands: [Option<GpuSoundCommand>; 4],
+    audio: crate::machine::AudioDevice,
     disk_root: PathBuf,
     bios_preselected_disk: Option<String>,
     bios_settings_path: Option<PathBuf>,
@@ -509,7 +502,7 @@ impl Cpu {
             palette,
             gpu_triangles: Vec::new(),
             gpu_lines: Vec::new(),
-            sound_commands: [None; 4],
+            audio: crate::machine::AudioDevice::default(),
             disk_root: PathBuf::from("disks"),
             bios_preselected_disk: None,
             bios_settings_path: None,
@@ -1451,6 +1444,7 @@ impl Cpu {
             return crate::machine::system_register_byte(address, self.memory.len())
                 .or_else(|| self.interrupts.read(address))
                 .or_else(|| self.clock.read(address))
+                .or_else(|| self.audio.read(address))
                 .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
         }
@@ -3335,6 +3329,11 @@ impl Cpu {
             );
             if self.write_terminal_register(address, value) {
                 return;
+            } else if (crate::machine::AUDIO_BASE
+                ..crate::machine::AUDIO_BASE + crate::machine::DEVICE_BANK_SIZE)
+                .contains(&address)
+            {
+                self.audio.write(address, value);
             } else if address == crate::machine::CLOCK_CAPTURE {
                 if value & 1 != 0 {
                     self.clock
@@ -4742,10 +4741,7 @@ impl Cpu {
     }
 
     pub fn take_sound_commands(&mut self) -> Vec<GpuSoundCommand> {
-        self.sound_commands
-            .iter_mut()
-            .filter_map(Option::take)
-            .collect()
+        self.audio.take_commands()
     }
 
     fn gpu_word(&self, offset: u32) -> i16 {
@@ -5651,7 +5647,7 @@ impl Cpu {
                     waveform: self.gpu_word(6) as u16,
                     volume: self.gpu_word(8) as u16,
                 };
-                self.sound_commands[command.channel as usize] = Some(command);
+                self.audio.submit(command);
             }
             GPU_NET_OPEN..=GPU_NET_INFO => self.gpu_network(command, color, self.gpu_word(2)),
             GPU_PALETTE => {
@@ -6895,6 +6891,195 @@ mod tests {
     }
 
     #[test]
+    fn audio_bank_stages_commands_without_ram_backing_and_drains_once_per_channel() {
+        use crate::machine::*;
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            let alias = (AUDIO_BASE & cpu.memory_mask) as usize;
+            cpu.memory[alias..alias + 16].fill(0xa5);
+            assert_eq!(cpu.read_guest(AUDIO_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 0);
+            cpu.write_guest(AUDIO_CHANNEL, 3).unwrap();
+            cpu.write_guest_u16(AUDIO_FREQUENCY, 60000).unwrap();
+            cpu.write_guest_u16(AUDIO_FRAMES, u16::MAX).unwrap();
+            cpu.write_guest_u16(AUDIO_WAVEFORM, 2).unwrap();
+            cpu.write_guest_u16(AUDIO_VOLUME, 75).unwrap();
+            assert!(cpu.take_sound_commands().is_empty());
+            cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(AUDIO_COMMAND).unwrap(), 0);
+            assert_eq!(cpu.read_guest(AUDIO_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 8);
+            cpu.write_guest_u16(AUDIO_FREQUENCY, 440).unwrap();
+            assert_eq!(cpu.read_guest_u16(AUDIO_FREQUENCY).unwrap(), 440);
+            assert_eq!(cpu.read_guest_u16(AUDIO_FRAMES).unwrap(), u16::MAX);
+            assert_eq!(cpu.read_guest_u16(AUDIO_WAVEFORM).unwrap(), 2);
+            assert_eq!(cpu.read_guest_u16(AUDIO_VOLUME).unwrap(), 75);
+            assert_eq!(
+                cpu.take_sound_commands(),
+                [GpuSoundCommand {
+                    channel: 3,
+                    frequency: 60000,
+                    frames: u16::MAX,
+                    waveform: 2,
+                    volume: 75,
+                }]
+            );
+            assert!(cpu.take_sound_commands().is_empty());
+            assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 0);
+            cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
+            cpu.write_guest_u16(AUDIO_FREQUENCY, 220).unwrap();
+            cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
+            cpu.write_guest(AUDIO_CHANNEL, 0).unwrap();
+            cpu.write_guest(AUDIO_COMMAND, 2).unwrap();
+            assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 9);
+            assert_eq!(
+                cpu.take_sound_commands(),
+                [
+                    GpuSoundCommand {
+                        channel: 0,
+                        frequency: 0,
+                        frames: 0,
+                        waveform: 0,
+                        volume: 0
+                    },
+                    GpuSoundCommand {
+                        channel: 3,
+                        frequency: 220,
+                        frames: u16::MAX,
+                        waveform: 2,
+                        volume: 75
+                    },
+                ]
+            );
+            assert!(
+                cpu.memory[alias..alias + 16]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+    }
+
+    #[test]
+    fn audio_rejects_bad_commands_without_replacing_pending_sound_or_panicking() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_guest_u16(AUDIO_FREQUENCY, 440).unwrap();
+        cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
+        let expected = GpuSoundCommand {
+            channel: 0,
+            frequency: 440,
+            frames: 0,
+            waveform: 0,
+            volume: 0,
+        };
+        for (command, channel, waveform, volume, status) in [
+            (0, 0, 0, 0, 1),
+            (255, 0, 0, 0, 1),
+            (1, 4, 0, 0, 2),
+            (2, 255, 0, 0, 2),
+            (1, 0, 3, 0, 3),
+            (1, 0, u16::MAX, 0, 3),
+            (1, 0, 0, 101, 4),
+            (1, 0, 0, u16::MAX, 4),
+        ] {
+            cpu.write_guest(AUDIO_CHANNEL, channel).unwrap();
+            cpu.write_guest_u16(AUDIO_WAVEFORM, waveform).unwrap();
+            cpu.write_guest_u16(AUDIO_VOLUME, volume).unwrap();
+            cpu.write_guest(AUDIO_COMMAND, command).unwrap();
+            assert_eq!(cpu.read_guest(AUDIO_STATUS).unwrap(), status);
+            assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 1);
+        }
+        assert_eq!(cpu.take_sound_commands(), [expected]);
+        cpu.write_guest(AUDIO_CHANNEL, 2).unwrap();
+        cpu.write_guest(AUDIO_COMMAND, 2).unwrap();
+        assert_eq!(cpu.read_guest(AUDIO_STATUS).unwrap(), 0);
+        assert_eq!(
+            cpu.take_sound_commands(),
+            [GpuSoundCommand {
+                channel: 2,
+                frequency: 0,
+                frames: 0,
+                waveform: 0,
+                volume: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn audio_validation_is_atomic_and_image_entry_preserves_pending_commands() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_guest(AUDIO_CHANNEL, 1).unwrap();
+        cpu.write_guest_u16(AUDIO_FREQUENCY, 440).unwrap();
+        cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
+        assert!(cpu.write_guest_u16(AUDIO_COMMAND, 0x0200).is_err());
+        assert!(cpu.write_guest_u16(AUDIO_VOLUME + 1, 0x4b00).is_err());
+        assert!(cpu.write_guest_u16(AUDIO_CHANNEL, 0x0300).is_err());
+        cpu.privilege_mode = PrivilegeMode::User;
+        assert!(cpu.write_guest(AUDIO_COMMAND, 2).is_err());
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        assert_eq!(cpu.read_guest(AUDIO_CHANNEL).unwrap(), 1);
+        assert_eq!(cpu.read_guest_u16(AUDIO_VOLUME).unwrap(), 0);
+        assert_eq!(cpu.read_guest(AUDIO_STATUS).unwrap(), 0);
+        cpu.prepare_image_entry();
+        assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 2);
+        assert_eq!(cpu.read_guest_u16(AUDIO_FREQUENCY).unwrap(), 440);
+        assert_eq!(
+            cpu.take_sound_commands(),
+            [GpuSoundCommand {
+                channel: 1,
+                frequency: 440,
+                frames: 0,
+                waveform: 0,
+                volume: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_gpu_and_high_audio_share_one_pending_queue_without_shared_staging() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write_guest(AUDIO_CHANNEL, 1).unwrap();
+        cpu.write_guest_u16(AUDIO_FREQUENCY, 440).unwrap();
+        cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
+        cpu.write(GPU_BASE + 1, 5);
+        cpu.write_u16(GPU_BASE + 2, 220);
+        cpu.write_u16(GPU_BASE + 4, 60);
+        cpu.write_u16(GPU_BASE + 6, 8);
+        cpu.write_u16(GPU_BASE + 8, 200);
+        cpu.write(GPU_BASE, GPU_SOUND);
+        assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 2);
+        assert_eq!(cpu.read_guest_u16(AUDIO_FREQUENCY).unwrap(), 440);
+        assert_eq!(
+            cpu.take_sound_commands(),
+            [GpuSoundCommand {
+                channel: 1,
+                frequency: 220,
+                frames: 60,
+                waveform: 8,
+                volume: 200,
+            }]
+        );
+        cpu.write(GPU_BASE, GPU_SOUND);
+        cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
+        assert_eq!(
+            cpu.take_sound_commands(),
+            [GpuSoundCommand {
+                channel: 1,
+                frequency: 440,
+                frames: 0,
+                waveform: 0,
+                volume: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn high_control_banks_validate_permissions_offsets_and_translated_aliases() {
         use crate::machine::*;
         use crate::mmu::{MemoryAccess, PageFaultReason};
@@ -6908,6 +7093,7 @@ mod tests {
         cpu.memory[0x3034..0x3038]
             .copy_from_slice(&(crate::machine::CONSOLE_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3038..0x303c].copy_from_slice(&(FIRMWARE_TEXT_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x303c..0x3040].copy_from_slice(&(AUDIO_BASE | 0xf).to_be_bytes());
         cpu.enable_mmu(0x2000).unwrap();
         for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
             cpu.privilege_mode = mode;
@@ -6918,6 +7104,7 @@ mod tests {
                 (0xc000, INPUT_BASE),
                 (0xd000, crate::machine::CONSOLE_BASE),
                 (0xe000, FIRMWARE_TEXT_BASE),
+                (0xf000, AUDIO_BASE),
             ] {
                 for offset in 0..DEVICE_BANK_SIZE {
                     for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {

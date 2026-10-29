@@ -33,7 +33,7 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 1UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 1567UL) return 14;\n\
+                 if (*banks != 1631UL) return 14;\n\
                  return 1;\n\
              }"
         ),
@@ -134,6 +134,35 @@ fn guest_c_writes_high_console_and_firmware_text_devices() {
                  if (*col != 4) return 13;\n\
                  *cmd = 1;\n\
                  if (*row != 0 || *col != 0) return 14;\n\
+                 return 1;\n\
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
+fn guest_c_submits_and_stops_high_audio_commands() {
+    assert_eq!(
+        run_c(
+            "#include <sc16_machine.h>\n\
+             int main(void) {\n\
+                 volatile unsigned char *command = (volatile unsigned char *)SC16_AUDIO_COMMAND;\n\
+                 volatile unsigned char *status = (volatile unsigned char *)SC16_AUDIO_STATUS;\n\
+                 volatile unsigned char *channel = (volatile unsigned char *)SC16_AUDIO_CHANNEL;\n\
+                 volatile unsigned int *frequency = (volatile unsigned int *)SC16_AUDIO_FREQUENCY;\n\
+                 volatile unsigned int *wave = (volatile unsigned int *)SC16_AUDIO_WAVEFORM;\n\
+                 volatile unsigned char *pending = (volatile unsigned char *)SC16_AUDIO_PENDING;\n\
+                 *channel = 3;\n\
+                 *frequency = 440;\n\
+                 *wave = 2;\n\
+                 *command = 1;\n\
+                 if (*status != 0 || *pending != 8 || *frequency != 440) return 11;\n\
+                 *wave = 3;\n\
+                 *command = 1;\n\
+                 if (*status != 3 || *pending != 8) return 12;\n\
+                 *command = 2;\n\
+                 if (*status != 0 || *command != 0) return 13;\n\
                  return 1;\n\
              }"
         ),

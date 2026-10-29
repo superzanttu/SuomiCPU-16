@@ -43,6 +43,14 @@ pub const CLOCK_MONOTONIC_MILLIS: u32 = CLOCK_BASE + 4;
 pub const CLOCK_FRAMES: u32 = CLOCK_BASE + 8;
 pub const CLOCK_RTC: u32 = CLOCK_BASE + 12;
 pub const CLOCK_RANDOM: u32 = CLOCK_BASE + 16;
+pub const AUDIO_COMMAND: u32 = AUDIO_BASE;
+pub const AUDIO_STATUS: u32 = AUDIO_BASE + 1;
+pub const AUDIO_CHANNEL: u32 = AUDIO_BASE + 2;
+pub const AUDIO_FREQUENCY: u32 = AUDIO_BASE + 4;
+pub const AUDIO_FRAMES: u32 = AUDIO_BASE + 6;
+pub const AUDIO_WAVEFORM: u32 = AUDIO_BASE + 8;
+pub const AUDIO_VOLUME: u32 = AUDIO_BASE + 10;
+pub const AUDIO_PENDING: u32 = AUDIO_BASE + 12;
 pub const CONSOLE_DATA: u32 = CONSOLE_BASE;
 pub const CONSOLE_STATUS: u32 = CONSOLE_BASE + 1;
 pub const CONSOLE_CONTROL: u32 = CONSOLE_BASE + 2;
@@ -55,7 +63,7 @@ pub const FIRMWARE_TEXT_COLUMN: u32 = FIRMWARE_TEXT_BASE + 5;
 pub const FIRMWARE_TEXT_ENABLED: u32 = FIRMWARE_TEXT_BASE + 6;
 pub const MACHINE_REVISION: u32 = 1;
 pub const DEVICE_ABI: u32 = 1;
-pub const IMPLEMENTED_BANKS: u32 = 0x61f;
+pub const IMPLEMENTED_BANKS: u32 = 0x65f;
 
 pub const fn usable_ram_size(backing_size: usize) -> usize {
     if backing_size < DEVICE_APERTURE_START as usize {
@@ -71,6 +79,7 @@ pub const fn is_device_aperture(address: u32) -> bool {
 
 pub const fn is_implemented_device_page(address: u32) -> bool {
     (address >= SYSTEM_BASE && address < CLOCK_BASE + DEVICE_BANK_SIZE)
+        || (address >= AUDIO_BASE && address < AUDIO_BASE + DEVICE_BANK_SIZE)
         || (address >= CONSOLE_BASE && address < FIRMWARE_TEXT_BASE + DEVICE_BANK_SIZE)
 }
 
@@ -89,6 +98,9 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
         INPUT_KEY => Some(false),
         address if (INPUT_KEYS..INPUT_MOUSE_WHEEL + 2).contains(&address) => Some(false),
         CLOCK_CAPTURE => Some(true),
+        AUDIO_COMMAND | AUDIO_CHANNEL => Some(true),
+        AUDIO_STATUS | AUDIO_PENDING => Some(false),
+        address if (AUDIO_FREQUENCY..AUDIO_PENDING).contains(&address) => Some(true),
         CONSOLE_DATA..=CONSOLE_CONTROL => Some(true),
         FIRMWARE_TEXT_DATA..=FIRMWARE_TEXT_COLUMN => Some(true),
         FIRMWARE_TEXT_ENABLED => Some(false),
@@ -101,6 +113,98 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
             Some(false)
         }
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoundCommand {
+    pub channel: u8,
+    pub frequency: u16,
+    pub frames: u16,
+    pub waveform: u16,
+    pub volume: u16,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AudioDevice {
+    channel: u8,
+    parameters: [u8; 8],
+    status: u8,
+    pending: [Option<SoundCommand>; 4],
+}
+
+impl AudioDevice {
+    pub fn read(&self, address: u32) -> Option<u8> {
+        match address {
+            AUDIO_COMMAND => Some(0),
+            AUDIO_STATUS => Some(self.status),
+            AUDIO_CHANNEL => Some(self.channel),
+            AUDIO_PENDING => Some(
+                self.pending
+                    .iter()
+                    .enumerate()
+                    .fold(0, |mask, (channel, command)| {
+                        mask | (u8::from(command.is_some()) << channel)
+                    }),
+            ),
+            address if (AUDIO_FREQUENCY..AUDIO_PENDING).contains(&address) => {
+                Some(self.parameters[(address - AUDIO_FREQUENCY) as usize])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn write(&mut self, address: u32, value: u8) {
+        match address {
+            AUDIO_CHANNEL => self.channel = value,
+            address if (AUDIO_FREQUENCY..AUDIO_PENDING).contains(&address) => {
+                self.parameters[(address - AUDIO_FREQUENCY) as usize] = value;
+            }
+            AUDIO_COMMAND => self.commit(value),
+            _ => panic!("host write to a read-only or unimplemented audio register"),
+        }
+    }
+
+    fn commit(&mut self, operation: u8) {
+        let word =
+            |offset| u16::from_be_bytes([self.parameters[offset], self.parameters[offset + 1]]);
+        let command = SoundCommand {
+            channel: self.channel,
+            frequency: word(0),
+            frames: word(2),
+            waveform: word(4),
+            volume: word(6),
+        };
+        self.status = if !matches!(operation, 1 | 2) {
+            1
+        } else if command.channel >= 4 {
+            2
+        } else if operation == 1 && command.waveform > 2 {
+            3
+        } else if operation == 1 && command.volume > 100 {
+            4
+        } else {
+            if operation == 2 {
+                self.submit(SoundCommand {
+                    frequency: 0,
+                    frames: 0,
+                    waveform: 0,
+                    volume: 0,
+                    ..command
+                });
+            } else {
+                self.submit(command);
+            }
+            0
+        };
+    }
+
+    pub fn submit(&mut self, command: SoundCommand) {
+        self.pending[usize::from(command.channel)] = Some(command);
+    }
+
+    pub fn take_commands(&mut self) -> Vec<SoundCommand> {
+        self.pending.iter_mut().filter_map(Option::take).collect()
     }
 }
 
@@ -417,6 +521,14 @@ mod tests {
             ("CLOCK_FRAMES", CLOCK_FRAMES),
             ("CLOCK_RTC", CLOCK_RTC),
             ("CLOCK_RANDOM", CLOCK_RANDOM),
+            ("AUDIO_COMMAND", AUDIO_COMMAND),
+            ("AUDIO_STATUS", AUDIO_STATUS),
+            ("AUDIO_CHANNEL", AUDIO_CHANNEL),
+            ("AUDIO_FREQUENCY", AUDIO_FREQUENCY),
+            ("AUDIO_FRAMES", AUDIO_FRAMES),
+            ("AUDIO_WAVEFORM", AUDIO_WAVEFORM),
+            ("AUDIO_VOLUME", AUDIO_VOLUME),
+            ("AUDIO_PENDING", AUDIO_PENDING),
             ("CONSOLE_DATA", CONSOLE_DATA),
             ("CONSOLE_STATUS", CONSOLE_STATUS),
             ("CONSOLE_CONTROL", CONSOLE_CONTROL),

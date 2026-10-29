@@ -602,6 +602,9 @@ Checklist status: [x] completed; [ ] planned.
 **** [x] Implement RAM-independent console and firmware-text banks with
      shared terminal/display handlers, protected aliases, live cursor readback,
      atomic side-effect validation, and compiled-C/native execution regressions.
+**** [x] Implement a RAM-independent audio bank with staged parameters,
+     validated submit/stop status, shared legacy pending commands and PCM
+     rendering, and compiled-C/native execution/protection regressions.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup

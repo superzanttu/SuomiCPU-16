@@ -33,8 +33,8 @@ accesses are permitted when every byte is valid and permitted. Address
 translation and permission checks apply independently to every byte of an
 access.
 
-The system identification, interrupt/PIT, fault, input, clock/random, console and
-firmware-text banks are implemented in this aperture without RAM backing. All other high banks remain
+The system identification, interrupt/PIT, fault, input, clock/random, audio,
+console and firmware-text banks are implemented in this aperture without RAM backing. All other high banks remain
 reserved. The low-address legacy device
 banks remain in use until their coordinated firmware/toolchain/program migration
 is complete. Instruction operands retain architectural address bits before
@@ -59,7 +59,7 @@ addresses below; no shared assembly constant syntax is currently supported.
 |`0x3ff03000` |Input |Implemented, read-only
 |`0x3ff04000` |Clock/random |Implemented
 |`0x3ff05000` |Graphics |Reserved
-|`0x3ff06000` |Audio |Reserved
+|`0x3ff06000` |Audio |Implemented
 |`0x3ff07000` |Game network |Reserved
 |`0x3ff08000` |Filesystem |Reserved
 |`0x3ff09000` |Console |Implemented
@@ -80,7 +80,7 @@ not change them.
 |`0x04` |Device ABI |`1`, identifying this bank contract
 |`0x08` |Usable RAM bytes |Configured backing size capped at `0x3ff00000`
 |`0x0c` |Address bits |`30`
-|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0x61f`
+|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0x65f`
 |===
 
 The migration-time machine revision does not advertise completion of the
@@ -212,6 +212,51 @@ zero high byte. Legacy mouse byte layouts and migration-time supervisor byte
 writes are retained. Host input producers and valid destructive reads maintain
 low RAM mirrors only where backing exists; direct host RAM mutation is not an
 input API. High input access works even when no legacy backing exists.
+
+==== Audio bank
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |RW |Command: 1 submit staged sound, 2 stop staged channel; reads return zero
+|`0x01` |1 |R |Last command status: 0 accepted, 1 invalid command, 2 invalid channel, 3 invalid waveform, 4 invalid volume
+|`0x02` |1 |RW |Staged channel, valid values 0..3 at command commit
+|`0x04` |2 |RW |Staged unsigned frequency in Hz
+|`0x06` |2 |RW |Staged unsigned duration in 1/60-second frames; zero loops
+|`0x08` |2 |RW |Staged waveform: 0 square, 1 noise, 2 triangle
+|`0x0a` |2 |RW |Staged unsigned volume 0..100; zero retains legacy full-volume meaning
+|`0x0c` |1 |R |Pending-command mask, bit N for channel N
+|===
+
+All multibyte registers are big-endian and all other offsets are reserved.
+Creation sets staging, status and pending mask to zero. Staging writes retain
+all bits and do not enqueue sound; a command byte commits an immutable copy.
+Submit validates command, channel, waveform and volume in that order. Every
+invalid operation records its explicit status without replacing any pending
+sound. Stop validates the channel but ignores frequency/duration/waveform/volume,
+enqueuing a zero-frequency command with the remaining parameters zero. Successful
+commands clear a previous error status. Commands do not clear or rewrite staging.
+
+The four pending slots are shared with legacy GPU sound commands. The last
+accepted command for each channel replaces any unconsumed command for that
+channel; other channels remain independent. Host consumption takes each slot
+exactly once in channel order. Pending means awaiting host consumption, not
+currently playing or successful host audio output. Reads of command, status,
+staging and pending have no side effects; no register polls yield or block.
+Rejected multi-byte accesses cause CPU faults before changing staging, status
+or pending sound. There are no writable reserved bits or asynchronous device
+commands. Audio staging/status/pending state survives image-entry preparation,
+matching the existing sound-queue lifetime.
+
+Both interfaces deliver the same typed sound commands to the existing host
+renderer. Frequency zero stops that channel; other frequencies are clamped to
+20..11025 Hz at rendering. Duration uses unsigned 16-bit frames, with zero
+looping until replacement/stop; volume zero means 100%, not silence. Runtime
+audio-device failures remain host runtime errors, not an accepted-sound guarantee.
+The high bank rejects unsupported waveforms/volumes explicitly; the migration
+alias retains legacy channel masking, waveform fallback and volume clamping.
+Legacy GPU parameter bytes do not modify high audio staging or status. No audio
+command accepts a RAM pointer, and high audio accesses never index RAM.
 
 ==== Console bank
 

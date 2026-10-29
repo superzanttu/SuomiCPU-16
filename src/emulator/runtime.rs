@@ -3853,6 +3853,32 @@ mod tests {
     }
 
     #[test]
+    fn high_audio_commands_feed_the_existing_pcm_renderer() {
+        use crate::machine::*;
+
+        for waveform in 0..=2 {
+            let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+            cpu.write(AUDIO_CHANNEL, 2);
+            cpu.write_u16(AUDIO_FREQUENCY, 440);
+            cpu.write_u16(AUDIO_FRAMES, 60);
+            cpu.write_u16(AUDIO_WAVEFORM, waveform);
+            cpu.write_u16(AUDIO_VOLUME, 50);
+            cpu.write(AUDIO_COMMAND, 1);
+            let commands = cpu.take_sound_commands();
+            assert_eq!(commands.len(), 1);
+            let command = commands[0];
+            assert_eq!(command.channel, 2);
+            let wav = synthesize_sound(command);
+            assert_eq!(&wav[..4], b"RIFF");
+            assert_eq!(&wav[8..12], b"WAVE");
+            assert_eq!(wav.len(), 44 + 44_100);
+            assert!(wav[44..].iter().any(|byte| *byte != 0));
+            cpu.write(AUDIO_COMMAND, 2);
+            assert_eq!(cpu.take_sound_commands()[0].frequency, 0);
+        }
+    }
+
+    #[test]
     fn sound_synthesis_produces_valid_pcm_wav_with_requested_duration() {
         let wav = synthesize_sound(GpuSoundCommand {
             channel: 0,
