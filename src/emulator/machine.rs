@@ -1,4 +1,4 @@
-//! Defines address boundaries, register contracts, and interrupt/input/clock state.
+//! Defines address boundaries, register contracts, and typed device state.
 //! Separates usable RAM from devices and supplies the checked guest register contract.
 
 pub const ADDRESS_SPACE_SIZE: u32 = 1 << 30;
@@ -51,6 +51,15 @@ pub const AUDIO_FRAMES: u32 = AUDIO_BASE + 6;
 pub const AUDIO_WAVEFORM: u32 = AUDIO_BASE + 8;
 pub const AUDIO_VOLUME: u32 = AUDIO_BASE + 10;
 pub const AUDIO_PENDING: u32 = AUDIO_BASE + 12;
+pub const NETWORK_COMMAND: u32 = NETWORK_BASE;
+pub const NETWORK_STATUS: u32 = NETWORK_BASE + 1;
+pub const NETWORK_LENGTH: u32 = NETWORK_BASE + 2;
+pub const NETWORK_QUERY: u32 = NETWORK_BASE + 3;
+pub const NETWORK_ARGUMENT: u32 = NETWORK_BASE + 4;
+pub const NETWORK_RESULT: u32 = NETWORK_BASE + 6;
+pub const NETWORK_TITLE: u32 = NETWORK_BASE + 0x10;
+pub const NETWORK_TRANSMIT: u32 = NETWORK_BASE + 0x20;
+pub const NETWORK_RECEIVE: u32 = NETWORK_BASE + 0x50;
 pub const CONSOLE_DATA: u32 = CONSOLE_BASE;
 pub const CONSOLE_STATUS: u32 = CONSOLE_BASE + 1;
 pub const CONSOLE_CONTROL: u32 = CONSOLE_BASE + 2;
@@ -63,7 +72,7 @@ pub const FIRMWARE_TEXT_COLUMN: u32 = FIRMWARE_TEXT_BASE + 5;
 pub const FIRMWARE_TEXT_ENABLED: u32 = FIRMWARE_TEXT_BASE + 6;
 pub const MACHINE_REVISION: u32 = 1;
 pub const DEVICE_ABI: u32 = 1;
-pub const IMPLEMENTED_BANKS: u32 = 0x65f;
+pub const IMPLEMENTED_BANKS: u32 = 0x6df;
 
 pub const fn usable_ram_size(backing_size: usize) -> usize {
     if backing_size < DEVICE_APERTURE_START as usize {
@@ -79,7 +88,7 @@ pub const fn is_device_aperture(address: u32) -> bool {
 
 pub const fn is_implemented_device_page(address: u32) -> bool {
     (address >= SYSTEM_BASE && address < CLOCK_BASE + DEVICE_BANK_SIZE)
-        || (address >= AUDIO_BASE && address < AUDIO_BASE + DEVICE_BANK_SIZE)
+        || (address >= AUDIO_BASE && address < NETWORK_BASE + DEVICE_BANK_SIZE)
         || (address >= CONSOLE_BASE && address < FIRMWARE_TEXT_BASE + DEVICE_BANK_SIZE)
 }
 
@@ -101,6 +110,16 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
         AUDIO_COMMAND | AUDIO_CHANNEL => Some(true),
         AUDIO_STATUS | AUDIO_PENDING => Some(false),
         address if (AUDIO_FREQUENCY..AUDIO_PENDING).contains(&address) => Some(true),
+        NETWORK_COMMAND | NETWORK_LENGTH | NETWORK_QUERY => Some(true),
+        NETWORK_STATUS => Some(false),
+        address if (NETWORK_ARGUMENT..NETWORK_RESULT).contains(&address) => Some(true),
+        address
+            if (NETWORK_RESULT..NETWORK_RESULT + 2).contains(&address)
+                || (NETWORK_RECEIVE..NETWORK_RECEIVE + 48).contains(&address) =>
+        {
+            Some(false)
+        }
+        address if (NETWORK_TITLE..NETWORK_TRANSMIT + 48).contains(&address) => Some(true),
         CONSOLE_DATA..=CONSOLE_CONTROL => Some(true),
         FIRMWARE_TEXT_DATA..=FIRMWARE_TEXT_COLUMN => Some(true),
         FIRMWARE_TEXT_ENABLED => Some(false),
@@ -113,6 +132,131 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
             Some(false)
         }
         _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkDevice {
+    length: u8,
+    query: u8,
+    argument: [u8; 2],
+    title: [u8; 16],
+    transmit: [u8; 48],
+    receive: [u8; 48],
+    result: u16,
+    status: u8,
+}
+
+impl Default for NetworkDevice {
+    fn default() -> Self {
+        Self {
+            length: 0,
+            query: 0,
+            argument: [0; 2],
+            title: [0; 16],
+            transmit: [0; 48],
+            receive: [0; 48],
+            result: 0,
+            status: 0,
+        }
+    }
+}
+
+impl NetworkDevice {
+    pub fn read(&self, address: u32) -> Option<u8> {
+        match address {
+            NETWORK_COMMAND => Some(0),
+            NETWORK_STATUS => Some(self.status),
+            NETWORK_LENGTH => Some(self.length),
+            NETWORK_QUERY => Some(self.query),
+            address if (NETWORK_ARGUMENT..NETWORK_RESULT).contains(&address) => {
+                Some(self.argument[(address - NETWORK_ARGUMENT) as usize])
+            }
+            address if (NETWORK_RESULT..NETWORK_RESULT + 2).contains(&address) => {
+                Some(self.result.to_be_bytes()[(address - NETWORK_RESULT) as usize])
+            }
+            address if (NETWORK_TITLE..NETWORK_TRANSMIT).contains(&address) => {
+                Some(self.title[(address - NETWORK_TITLE) as usize])
+            }
+            address if (NETWORK_TRANSMIT..NETWORK_RECEIVE).contains(&address) => {
+                Some(self.transmit[(address - NETWORK_TRANSMIT) as usize])
+            }
+            address if (NETWORK_RECEIVE..NETWORK_RECEIVE + 48).contains(&address) => {
+                Some(self.receive[(address - NETWORK_RECEIVE) as usize])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn write(&mut self, address: u32, value: u8) {
+        match address {
+            NETWORK_LENGTH => self.length = value,
+            NETWORK_QUERY => self.query = value,
+            address if (NETWORK_ARGUMENT..NETWORK_RESULT).contains(&address) => {
+                self.argument[(address - NETWORK_ARGUMENT) as usize] = value;
+            }
+            address if (NETWORK_TITLE..NETWORK_TRANSMIT).contains(&address) => {
+                self.title[(address - NETWORK_TITLE) as usize] = value;
+            }
+            address if (NETWORK_TRANSMIT..NETWORK_RECEIVE).contains(&address) => {
+                self.transmit[(address - NETWORK_TRANSMIT) as usize] = value;
+            }
+            _ => panic!("host write to a read-only or unimplemented network staging register"),
+        }
+    }
+
+    pub fn command(&mut self, operation: u8, node: &mut crate::net::NetNode) -> Result<(), String> {
+        self.result = 0;
+        self.status = match operation {
+            1 if self.title[0] == 0 => 3,
+            3 if usize::from(self.length) > self.transmit.len() => 2,
+            5 if self.query > 6 => 7,
+            1..=5 => 0,
+            _ => 1,
+        };
+        if self.status != 0 {
+            return Ok(());
+        }
+        node.poll();
+        match operation {
+            1 => {
+                let length = self.title.iter().position(|byte| *byte == 0).unwrap_or(16);
+                match node.open(&self.title[..length]) {
+                    Ok(opened) => self.result = u16::from(opened),
+                    Err(error) => {
+                        self.status = 5;
+                        return Err(error);
+                    }
+                }
+            }
+            2 => node.close(),
+            3 => match node.try_send(&self.transmit[..usize::from(self.length)]) {
+                Ok(true) => self.result = 1,
+                Ok(false) => self.status = 4,
+                Err(error) => {
+                    self.status = 5;
+                    return Err(error);
+                }
+            },
+            4 => {
+                if !node.is_open() {
+                    self.status = 4;
+                } else if let Some((_, data)) = node.receive() {
+                    self.receive.fill(0);
+                    self.receive[..data.len()].copy_from_slice(&data);
+                    self.result = data.len() as u16;
+                } else {
+                    self.status = 6;
+                }
+            }
+            5 => {
+                self.result = node
+                    .query(self.query, u16::from_be_bytes(self.argument))
+                    .expect("validated network query");
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
     }
 }
 
@@ -529,6 +673,15 @@ mod tests {
             ("AUDIO_WAVEFORM", AUDIO_WAVEFORM),
             ("AUDIO_VOLUME", AUDIO_VOLUME),
             ("AUDIO_PENDING", AUDIO_PENDING),
+            ("NETWORK_COMMAND", NETWORK_COMMAND),
+            ("NETWORK_STATUS", NETWORK_STATUS),
+            ("NETWORK_LENGTH", NETWORK_LENGTH),
+            ("NETWORK_QUERY", NETWORK_QUERY),
+            ("NETWORK_ARGUMENT", NETWORK_ARGUMENT),
+            ("NETWORK_RESULT", NETWORK_RESULT),
+            ("NETWORK_TITLE", NETWORK_TITLE),
+            ("NETWORK_TRANSMIT", NETWORK_TRANSMIT),
+            ("NETWORK_RECEIVE", NETWORK_RECEIVE),
             ("CONSOLE_DATA", CONSOLE_DATA),
             ("CONSOLE_STATUS", CONSOLE_STATUS),
             ("CONSOLE_CONTROL", CONSOLE_CONTROL),

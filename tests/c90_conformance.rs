@@ -33,7 +33,7 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 1UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 1631UL) return 14;\n\
+                 if (*banks != 1759UL) return 14;\n\
                  return 1;\n\
              }"
         ),
@@ -163,6 +163,49 @@ fn guest_c_submits_and_stops_high_audio_commands() {
                  if (*status != 3 || *pending != 8) return 12;\n\
                  *command = 2;\n\
                  if (*status != 0 || *command != 0) return 13;\n\
+                 return 1;\n\
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
+fn guest_c_uses_bounded_high_network_staging_and_explicit_status() {
+    assert_eq!(
+        run_c(
+            "#include <sc16_machine.h>\n\
+             int main(void) {\n\
+                 volatile unsigned char *command = (volatile unsigned char *)SC16_NETWORK_COMMAND;\n\
+                 volatile unsigned char *status = (volatile unsigned char *)SC16_NETWORK_STATUS;\n\
+                 volatile unsigned char *length = (volatile unsigned char *)SC16_NETWORK_LENGTH;\n\
+                 volatile unsigned char *query = (volatile unsigned char *)SC16_NETWORK_QUERY;\n\
+                 volatile unsigned int *argument = (volatile unsigned int *)SC16_NETWORK_ARGUMENT;\n\
+                 volatile unsigned int *result = (volatile unsigned int *)SC16_NETWORK_RESULT;\n\
+                 volatile unsigned char *title = (volatile unsigned char *)SC16_NETWORK_TITLE;\n\
+                 volatile unsigned char *tx = (volatile unsigned char *)SC16_NETWORK_TRANSMIT;\n\
+                 volatile unsigned char *rx = (volatile unsigned char *)SC16_NETWORK_RECEIVE;\n\
+                 *command = 1;\n\
+                 if (*status != 3 || *result != 0) return 11;\n\
+                 title[15] = 65;\n\
+                 tx[47] = 123;\n\
+                 *length = 49;\n\
+                 *command = 3;\n\
+                 if (*status != 2 || tx[47] != 123 || title[15] != 65) return 12;\n\
+                 *length = 48;\n\
+                 *command = 3;\n\
+                 if (*status != 4) return 13;\n\
+                 *query = 1;\n\
+                 *command = 5;\n\
+                 if (*status != 0 || *result != 65535U || *command != 0) return 14;\n\
+                 *query = 2;\n\
+                 *argument = 65535U;\n\
+                 *command = 5;\n\
+                 if (*status != 0 || *result != 0 || *argument != 65535U) return 15;\n\
+                 *command = 4;\n\
+                 if (*status != 4 || rx[47] != 0) return 16;\n\
+                 *command = 2;\n\
+                 if (*status != 0) return 17;\n\
                  return 1;\n\
              }"
         ),

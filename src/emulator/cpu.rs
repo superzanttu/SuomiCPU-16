@@ -375,6 +375,7 @@ pub struct Cpu {
     program_folder_disk: Option<FolderDisk>,
     folder_disk: Option<FolderDisk>,
     network: Option<NetNode>,
+    network_registers: crate::machine::NetworkDevice,
     network_port: u16,
     scnet: Option<ScNetNode>,
     scnet_enabled: bool,
@@ -511,6 +512,7 @@ impl Cpu {
             program_folder_disk: None,
             folder_disk: None,
             network: None,
+            network_registers: crate::machine::NetworkDevice::default(),
             network_port: DEFAULT_PORT,
             scnet: None,
             scnet_enabled: false,
@@ -1445,6 +1447,7 @@ impl Cpu {
                 .or_else(|| self.interrupts.read(address))
                 .or_else(|| self.clock.read(address))
                 .or_else(|| self.audio.read(address))
+                .or_else(|| self.network_registers.read(address))
                 .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
         }
@@ -3303,16 +3306,7 @@ impl Cpu {
                 }
             }
             GPU_NET_INFO => {
-                let value = match query {
-                    0 => node.players(),
-                    1 => node.slot() as u16,
-                    2 => u16::from(argument >= 0 && node.active(argument as u16)),
-                    3 => u16::from(node.is_full()),
-                    4 => node.last_sender(),
-                    5 => u16::from(node.ready()),
-                    6 => u16::from(node.is_open()),
-                    _ => 0,
-                };
+                let value = node.query(query, argument as u16).unwrap_or(0);
                 self.set_gpu_result(value);
             }
             _ => {}
@@ -3334,6 +3328,21 @@ impl Cpu {
                 .contains(&address)
             {
                 self.audio.write(address, value);
+            } else if (crate::machine::NETWORK_BASE
+                ..crate::machine::NETWORK_BASE + crate::machine::DEVICE_BANK_SIZE)
+                .contains(&address)
+            {
+                if address == crate::machine::NETWORK_COMMAND {
+                    let node = self
+                        .network
+                        .get_or_insert_with(|| NetNode::new(self.network_port));
+                    if let Err(error) = self.network_registers.command(value, node) {
+                        self.debug_console
+                            .log_error("network", &format!("command failed: {error}"));
+                    }
+                } else {
+                    self.network_registers.write(address, value);
+                }
             } else if address == crate::machine::CLOCK_CAPTURE {
                 if value & 1 != 0 {
                     self.clock
@@ -7094,6 +7103,7 @@ mod tests {
             .copy_from_slice(&(crate::machine::CONSOLE_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3038..0x303c].copy_from_slice(&(FIRMWARE_TEXT_BASE | 0xf).to_be_bytes());
         cpu.memory[0x303c..0x3040].copy_from_slice(&(AUDIO_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x3040..0x3044].copy_from_slice(&(NETWORK_BASE | 0xf).to_be_bytes());
         cpu.enable_mmu(0x2000).unwrap();
         for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
             cpu.privilege_mode = mode;
@@ -7105,6 +7115,7 @@ mod tests {
                 (0xd000, crate::machine::CONSOLE_BASE),
                 (0xe000, FIRMWARE_TEXT_BASE),
                 (0xf000, AUDIO_BASE),
+                (0x10000, NETWORK_BASE),
             ] {
                 for offset in 0..DEVICE_BANK_SIZE {
                     for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {
@@ -7161,6 +7172,132 @@ mod tests {
         assert_eq!(cpu.read_u32(FAULT_ADDRESS), 0);
         assert_eq!(cpu.read_u16(FAULT_INFO), 0);
         assert_eq!(cpu.read(INTERRUPT_ENABLE), 0);
+    }
+
+    #[test]
+    fn network_bank_staging_status_and_lifetime_are_independent_of_ram() {
+        use crate::machine::*;
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            let alias = (NETWORK_BASE & cpu.memory_mask) as usize;
+            cpu.memory[alias..alias + 128].fill(0xa5);
+            assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(NETWORK_RESULT).unwrap(), 0);
+            for offset in 0..16 {
+                assert_eq!(cpu.read_guest(NETWORK_TITLE + offset).unwrap(), 0);
+                cpu.write_guest(NETWORK_TITLE + offset, (offset + 1) as u8)
+                    .unwrap();
+            }
+            for offset in 0..48 {
+                assert_eq!(cpu.read_guest(NETWORK_TRANSMIT + offset).unwrap(), 0);
+                assert_eq!(cpu.read_guest(NETWORK_RECEIVE + offset).unwrap(), 0);
+                cpu.write_guest(NETWORK_TRANSMIT + offset, (offset + 2) as u8)
+                    .unwrap();
+            }
+            assert!(cpu.network.is_none());
+            cpu.write_guest(NETWORK_COMMAND, 0).unwrap();
+            assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 1);
+            cpu.write_guest(NETWORK_LENGTH, 49).unwrap();
+            cpu.write_guest(NETWORK_COMMAND, 3).unwrap();
+            assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 2);
+            cpu.write_guest(NETWORK_LENGTH, 48).unwrap();
+            cpu.write_guest(NETWORK_COMMAND, 3).unwrap();
+            assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 4);
+            cpu.write_guest(NETWORK_COMMAND, 4).unwrap();
+            assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 4);
+            cpu.write_guest(NETWORK_QUERY, 7).unwrap();
+            cpu.write_guest(NETWORK_COMMAND, 5).unwrap();
+            assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 7);
+            cpu.write_guest(NETWORK_QUERY, 1).unwrap();
+            cpu.write_guest(NETWORK_COMMAND, 5).unwrap();
+            assert_eq!(cpu.read_guest_u16(NETWORK_RESULT).unwrap(), u16::MAX);
+            assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 0);
+            cpu.prepare_image_entry();
+            assert_eq!(cpu.read_guest_u16(NETWORK_RESULT).unwrap(), u16::MAX);
+            assert_eq!(cpu.read_guest(NETWORK_COMMAND).unwrap(), 0);
+            for offset in 0..16 {
+                assert_eq!(
+                    cpu.read_guest(NETWORK_TITLE + offset).unwrap(),
+                    (offset + 1) as u8
+                );
+            }
+            for offset in 0..48 {
+                assert_eq!(
+                    cpu.read_guest(NETWORK_TRANSMIT + offset).unwrap(),
+                    (offset + 2) as u8
+                );
+            }
+            assert!(
+                cpu.memory[alias..alias + 128]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_network_wide_accesses_do_not_commit_or_change_staging() {
+        use crate::machine::*;
+        use crate::mmu::PageFaultReason;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_guest(NETWORK_TITLE, b'G').unwrap();
+        let error = cpu.write_guest_u16(NETWORK_COMMAND, 0x0100).unwrap_err();
+        assert!(matches!(
+            error,
+            CpuError::PageFault(crate::mmu::PageFault {
+                virtual_address: NETWORK_STATUS,
+                reason: PageFaultReason::ReadOnly,
+                ..
+            })
+        ));
+        assert!(cpu.network.is_none());
+        assert_eq!(cpu.read_guest(NETWORK_STATUS).unwrap(), 0);
+        cpu.write_guest(NETWORK_RECEIVE - 1, 0x33).unwrap();
+        assert!(cpu.write_guest_u16(NETWORK_RECEIVE - 1, 0x4455).is_err());
+        assert_eq!(cpu.read_guest(NETWORK_RECEIVE - 1).unwrap(), 0x33);
+        assert!(cpu.read_guest_u16(NETWORK_RECEIVE + 47).is_err());
+        assert!(cpu.write_guest_u16(NETWORK_RESULT - 1, 0x1234).is_err());
+        assert_eq!(cpu.read_guest_u16(NETWORK_ARGUMENT).unwrap(), 0);
+    }
+
+    #[test]
+    fn high_and_legacy_network_commands_share_a_node_but_not_staging() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.set_network_port(0);
+        cpu.write(NETWORK_TITLE, b'H');
+        cpu.write(NETWORK_COMMAND, 1);
+        assert_eq!(cpu.read(NETWORK_STATUS), 0);
+        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
+        cpu.write(GPU_BASE + 1, 6);
+        cpu.write(GPU_BASE, GPU_NET_INFO);
+        assert_eq!(cpu.read_u16(GPU_BASE + 14), 1);
+        cpu.write(GPU_BASE, GPU_NET_CLOSE);
+        cpu.write(NETWORK_QUERY, 6);
+        cpu.write(NETWORK_COMMAND, 5);
+        assert_eq!(cpu.read_u16(NETWORK_RESULT), 0);
+
+        cpu.memory[0x1000..0x1002].copy_from_slice(b"L\0");
+        cpu.write_u16(GPU_BASE + 10, 0x1000);
+        cpu.write(GPU_BASE, GPU_NET_OPEN);
+        cpu.write(NETWORK_COMMAND, 5);
+        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
+        cpu.write(NETWORK_TITLE, 0);
+        cpu.write(NETWORK_COMMAND, 1);
+        assert_eq!(cpu.read(NETWORK_STATUS), 3);
+        cpu.write(NETWORK_COMMAND, 5);
+        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
+        cpu.write(NETWORK_COMMAND, 4);
+        assert_eq!(cpu.read(NETWORK_STATUS), 6);
+        cpu.prepare_image_entry();
+        cpu.write(NETWORK_COMMAND, 5);
+        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
+        cpu.write(NETWORK_COMMAND, 2);
+        cpu.write(GPU_BASE, GPU_NET_INFO);
+        assert_eq!(cpu.read_u16(GPU_BASE + 14), 0);
     }
 
     #[test]

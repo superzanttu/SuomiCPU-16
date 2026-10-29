@@ -33,7 +33,7 @@ accesses are permitted when every byte is valid and permitted. Address
 translation and permission checks apply independently to every byte of an
 access.
 
-The system identification, interrupt/PIT, fault, input, clock/random, audio,
+The system identification, interrupt/PIT, fault, input, clock/random, audio, game-network,
 console and firmware-text banks are implemented in this aperture without RAM backing. All other high banks remain
 reserved. The low-address legacy device
 banks remain in use until their coordinated firmware/toolchain/program migration
@@ -60,7 +60,7 @@ addresses below; no shared assembly constant syntax is currently supported.
 |`0x3ff04000` |Clock/random |Implemented
 |`0x3ff05000` |Graphics |Reserved
 |`0x3ff06000` |Audio |Implemented
-|`0x3ff07000` |Game network |Reserved
+|`0x3ff07000` |Game network |Implemented
 |`0x3ff08000` |Filesystem |Reserved
 |`0x3ff09000` |Console |Implemented
 |`0x3ff0a000` |Firmware text |Implemented
@@ -80,7 +80,7 @@ not change them.
 |`0x04` |Device ABI |`1`, identifying this bank contract
 |`0x08` |Usable RAM bytes |Configured backing size capped at `0x3ff00000`
 |`0x0c` |Address bits |`30`
-|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0x65f`
+|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0x6df`
 |===
 
 The migration-time machine revision does not advertise completion of the
@@ -257,6 +257,61 @@ The high bank rejects unsupported waveforms/volumes explicitly; the migration
 alias retains legacy channel masking, waveform fallback and volume clamping.
 Legacy GPU parameter bytes do not modify high audio staging or status. No audio
 command accepts a RAM pointer, and high audio accesses never index RAM.
+
+==== Game-network bank
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |RW |Command: 1 open, 2 close, 3 send, 4 receive, 5 query; reads return zero
+|`0x01` |1 |R |Last command status
+|`0x02` |1 |RW |Staged transmit length, 0..48 at send commit
+|`0x03` |1 |RW |Staged query selector, 0..6 at query commit
+|`0x04` |2 |RW |Staged unsigned query argument
+|`0x06` |2 |R |Last command result
+|`0x10` |16 |RW |Staged game title
+|`0x20` |48 |RW |Staged transmit payload
+|`0x50` |48 |R |Last successfully received payload, zero-padded
+|===
+
+Multibyte registers are big-endian; all other offsets are reserved. Creation
+zeros all registers and buffers. Staging retains every written bit and has no
+network effects. Only a command byte commits an operation; commands do not
+change staging. Registers, receive payload and the shared network node survive
+image-entry preparation. No high-bank operation accepts a guest RAM pointer.
+
+Status is 0 for success, 1 for invalid command, 2 for transmit length above 48,
+3 for an empty title, 4 for send/receive without an active local slot/open node,
+5 for a host socket/open/send failure, 6 for no queued receive packet, or 7 for
+an invalid query. Host failures are also logged to the debug console. Every
+command resets result to zero; validation errors do not poll, change the node,
+or consume messages. Only parameters relevant to that command are validated.
+Open uses bytes before the first NUL, or all 16 bytes if no NUL exists; the first
+byte must be nonzero. Empty-title rejection leaves an existing connection intact.
+A valid open retains the existing transport's close-then-open behavior.
+
+Open returns 1 once the local UDP socket/title is established. Send returns 1
+only after the OS accepts the datagram; UDP delivery is not guaranteed. Socket
+errors return status 5 rather than a successful-send result. Zero-length
+datagrams are permitted. Close is idempotent and returns zero. Receive consumes
+at most one packet from the shared bounded inbox, returns its length 0..48,
+and replaces/zero-pads the receive window. Status distinguishes a successful
+empty datagram from an empty inbox. Failed/empty receives retain the prior
+payload but return result zero. Reads never poll, consume packets or yield.
+Rejected multibyte accesses fault before any command or staging side effect.
+
+Query explicitly polls and snapshots one value into result: 0 player count,
+1 local slot (`0xffff` if absent), 2 whether the argument slot is active,
+3 game-full flag, 4 last consumed sender, 5 join-ready flag, or 6 open flag.
+The existing game protocol supports eight players, 48-byte payloads, and a
+64-message inbox that drops incoming packets when full. Node polling,
+discovery, timeouts and close semantics are unchanged. This is the game UDP
+protocol, not SC-NET, and it provides no authentication or reliable delivery.
+
+Legacy GPU network commands and the high bank share exactly one node/inbox;
+consumption through either interface removes the same packet. Their staging,
+results and status are separate. Legacy pointer/length/title handling and
+best-effort send-result semantics remain unchanged during migration.
 
 ==== Console bank
 

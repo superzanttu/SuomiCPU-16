@@ -152,6 +152,25 @@ impl NetNode {
         true
     }
 
+    pub fn try_send(&self, payload: &[u8]) -> Result<bool, String> {
+        if self.slot.is_none() || payload.len() > MAX_PAYLOAD {
+            return Ok(false);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.try_send_packet_to(
+                DATA,
+                payload,
+                (std::net::Ipv4Addr::BROADCAST, self.port).into(),
+            )?;
+            Ok(true)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err("UDP networking is unavailable in the browser runtime".to_owned())
+        }
+    }
+
     pub fn receive(&mut self) -> Option<(u8, Vec<u8>)> {
         self.poll();
         let message = self.inbox.pop_front()?;
@@ -195,6 +214,19 @@ impl NetNode {
         self.title.is_some()
     }
 
+    pub fn query(&self, query: u8, argument: u16) -> Option<u16> {
+        match query {
+            0 => Some(self.players()),
+            1 => Some(self.slot() as u16),
+            2 => Some(u16::from(self.active(argument))),
+            3 => Some(u16::from(self.is_full())),
+            4 => Some(self.last_sender()),
+            5 => Some(u16::from(self.ready())),
+            6 => Some(u16::from(self.is_open())),
+            _ => None,
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn settled(&self, now: Instant) -> bool {
         self.slot.is_some() && now.duration_since(self.joined_at) >= JOIN_TIME
@@ -224,6 +256,16 @@ impl NetNode {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn send_packet_to(&self, kind: u8, payload: &[u8], destination: std::net::SocketAddr) {
+        let _ = self.try_send_packet_to(kind, payload, destination);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_send_packet_to(
+        &self,
+        kind: u8,
+        payload: &[u8],
+        destination: std::net::SocketAddr,
+    ) -> Result<(), String> {
         if let (Some(socket), Some(title)) = (&self.socket, self.title) {
             let mut packet = Vec::with_capacity(HEADER_SIZE + payload.len());
             packet.extend_from_slice(b"SC16");
@@ -232,7 +274,15 @@ impl NetNode {
             packet.extend_from_slice(&title);
             packet.extend_from_slice(&self.instance_id.to_be_bytes());
             packet.extend_from_slice(payload);
-            let _ = socket.send_to(&packet, destination);
+            let sent = socket
+                .send_to(&packet, destination)
+                .map_err(|error| format!("cannot send UDP packet: {error}"))?;
+            if sent != packet.len() {
+                return Err("UDP packet was not sent in full".to_owned());
+            }
+            Ok(())
+        } else {
+            Err("UDP socket is not open".to_owned())
         }
     }
 
@@ -382,6 +432,80 @@ mod tests {
     }
 
     #[test]
+    fn high_network_mailbox_receives_bounded_packets_only_on_explicit_command() {
+        use crate::machine::*;
+
+        let mut node = NetNode::new(0);
+        let title = *b"high-network-001";
+        node.title = Some(title);
+        node.slot = Some(0);
+        node.instance_id = 9;
+        node.handle_packet(&packet(DATA, 3, &title, 10, &[7; 100]), Instant::now());
+        let mut device = NetworkDevice::default();
+        for _ in 0..2 {
+            assert_eq!(device.read(NETWORK_RECEIVE), Some(0));
+            assert_eq!(device.read(NETWORK_RESULT), Some(0));
+        }
+        assert_eq!(node.inbox.len(), 1);
+        device.command(0, &mut node).unwrap();
+        assert_eq!(node.inbox.len(), 1);
+        device.command(4, &mut node).unwrap();
+        assert!(node.inbox.is_empty());
+        assert_eq!(device.read(NETWORK_STATUS), Some(0));
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(48));
+        for offset in 0..48 {
+            assert_eq!(device.read(NETWORK_RECEIVE + offset), Some(7));
+        }
+        device.write(NETWORK_QUERY, 4);
+        device.command(5, &mut node).unwrap();
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(3));
+        node.inbox.push_back((2, b"x".to_vec()));
+        device.command(4, &mut node).unwrap();
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(1));
+        assert_eq!(device.read(NETWORK_RECEIVE), Some(b'x'));
+        for offset in 1..48 {
+            assert_eq!(device.read(NETWORK_RECEIVE + offset), Some(0));
+        }
+        device.command(4, &mut node).unwrap();
+        assert_eq!(device.read(NETWORK_STATUS), Some(6));
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(0));
+        assert_eq!(device.read(NETWORK_RECEIVE), Some(b'x'));
+        node.inbox.push_back((2, Vec::new()));
+        device.command(4, &mut node).unwrap();
+        assert_eq!(device.read(NETWORK_STATUS), Some(0));
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(0));
+        assert_eq!(node.last_sender(), 2);
+        for offset in 0..48 {
+            assert_eq!(device.read(NETWORK_RECEIVE + offset), Some(0));
+        }
+    }
+
+    #[test]
+    fn high_network_send_reports_transport_failure_and_accepts_bounded_payloads() {
+        use crate::machine::*;
+
+        let mut node = NetNode::new(0);
+        let mut device = NetworkDevice::default();
+        node.title = Some(*b"high-network-001");
+        node.slot = Some(0);
+        device.write(NETWORK_LENGTH, 48);
+        assert!(device.command(3, &mut node).is_err());
+        assert_eq!(device.read(NETWORK_STATUS), Some(5));
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(0));
+        node.open(b"high-network-001").unwrap();
+        node.port = node.socket.as_ref().unwrap().local_addr().unwrap().port();
+        device.command(3, &mut node).unwrap();
+        assert_eq!(device.read(NETWORK_STATUS), Some(0));
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(1));
+        device.write(NETWORK_LENGTH, 0);
+        device.command(3, &mut node).unwrap();
+        assert_eq!(device.read(NETWORK_STATUS), Some(0));
+        device.write(NETWORK_LENGTH, 49);
+        device.command(3, &mut node).unwrap();
+        assert_eq!(device.read(NETWORK_STATUS), Some(2));
+    }
+
+    #[test]
     fn peer_slot_is_active_and_messages_are_bounded() {
         let mut node = NetNode::new(DEFAULT_PORT);
         let mut title = [0; 16];
@@ -460,6 +584,20 @@ mod tests {
         second.send_packet_to(DATA, b"udp payload", first_addr);
         first.poll();
         assert_eq!(first.receive(), Some((1, b"udp payload".to_vec())));
+
+        use crate::machine::*;
+        second.send_packet_to(DATA, b"mailbox UDP", first_addr);
+        let mut device = NetworkDevice::default();
+        device.command(4, &mut first).unwrap();
+        assert_eq!(device.read(NETWORK_STATUS), Some(0));
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(11));
+        for (offset, byte) in b"mailbox UDP".iter().enumerate() {
+            assert_eq!(device.read(NETWORK_RECEIVE + offset as u32), Some(*byte));
+        }
+        assert!(first.receive().is_none());
+        device.write(NETWORK_QUERY, 4);
+        device.command(5, &mut first).unwrap();
+        assert_eq!(device.read(NETWORK_RESULT + 1), Some(1));
 
         second.send_packet_to(BYE, &[], first_addr);
         first.poll();
