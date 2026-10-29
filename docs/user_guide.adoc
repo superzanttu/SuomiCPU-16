@@ -59,7 +59,7 @@ On Windows, run the PowerShell launcher with a source or binary path:
 
 +run.ps1+ changes to the repository directory and starts the Rust emulator
 through Cargo. C and assembly source paths are compiled to a temporary
-+SC16IMG2+ image by +sc16build+ before the emulator starts; the temporary image
++SC16IMG3+ image by +sc16build+ before the emulator starts; the temporary image
 is removed when it exits. The runtime itself accepts only prebuilt images or
 validated disk folders and does not compile or assemble source. The launcher
 requires Rust and Cargo to be available on +PATH+. The Rust C
@@ -87,11 +87,12 @@ all program recipes still compile with
 +cargo run --bin sc16build -- build-programs+. Builds write only
 +build/programs/<slug>/+; installation stages and validates updates before
 switching the disk directory.
-Offline images use the version 2 +SC16IMG2+ container, with fixed load
-addresses, an executable entry point, and explicit segment alignment and
-permissions. +sc16asm+ and +sc16build+ emit this format; the loader rejects
-older +SC16IMG1+ files. Generated images currently mark segments readable,
-writable, and executable because code and mutable data may share a segment.
+Offline images use the version 3 +SC16IMG3+ container for machine revision 2,
+with fixed load addresses, an executable entry point, and explicit segment
+alignment and permissions. +sc16asm+ and +sc16build+ emit this format; the
+loader rejects older or unversioned images. Generated images currently mark
+segments readable, writable, and executable because code and mutable data may
+share a segment.
 The MMU enforces mapped permissions when translation is enabled, but the
 normal BIOS USER boot path does not yet enable translation and is not an
 isolation boundary.
@@ -187,15 +188,14 @@ unsupported. Compile C sources to segmented images with the Rust build tool:
 cargo run --bin sc16build -- examples/example.asm build/example.sc16img
 cargo run --bin suomicpu16 -- build/example.sc16img
 cargo run --bin sc16build -- examples/factorial.c examples/factorial.sc16img
-cargo run --bin suomicpu16 -- examples/factorial.bin
+cargo run --bin suomicpu16 -- examples/factorial.sc16img
 ----
 
-The runtime accepts prebuilt flat +.bin+, +SC16IMG2+ images with +.img+ or
+The runtime accepts prebuilt +SC16IMG3+ images with +.bin+, +.img+ or
 +.sc16img+ extensions, and validated folder disks. Source files must be built
 offline with +sc16build+ (or by +run.ps1+ before the emulator starts). A
-+.bin+ file starting with the +SC16IMG2+ signature is read as an image
-container; the replaced +SC16IMG1+ signature is rejected rather than executed
-as flat code.
++.bin+ file must contain the +SC16IMG3+ image signature; legacy containers and
+raw/unversioned binaries are rejected rather than executed.
 
 The input file argument is optional. Without it, the BIOS loads a prebuilt
 image from a selected folder disk. Use +--disk ID+ to preselect a boot disk
@@ -887,19 +887,18 @@ interrupt_handler:
     RTI
 ----
 
-The interrupt control register (+ICR+, +0x43002+) uses bit 0 as the global
-interrupt enable, bit 1 as keyboard-pending, bit 3 as RTC-pending, and bit 4
-as instruction-timer-pending. The CPU services one pending source after each
-instruction, in keyboard, timer, RTC priority order. It clears only the source
-being serviced; other pending sources remain set. A pending bit coalesces
+The high-bank interrupt controller exposes global interrupt enable at
++0x3ff01000+, pending sources at +0x3ff01004+, and write-one-to-clear
+acknowledgements at +0x3ff01005+. The CPU services one pending source after
+each instruction, in keyboard, timer, RTC priority order. Pending bits coalesce
 repeated events of the same source until serviced.
 
-The 16-bit instruction-timer period is stored big-endian at +0x4301e+-+0x4301f+.
-Writing zero disables it; a nonzero period raises the timer interrupt every
-that many executed instructions and writing a new period restarts its countdown.
-The timer is independent of rendering and also runs during headless execution.
-The RTC still raises its interrupt on display-loop updates. Set up vectors and
-handlers before enabling interrupts.
+The 16-bit instruction-timer period is stored big-endian at
++0x3ff01008+-+0x3ff01009+. Writing zero disables it; a nonzero period raises
+the timer interrupt every that many executed instructions and writing a new
+period restarts its countdown. The timer is independent of rendering and also
+runs during headless execution. The RTC still raises its interrupt on
+display-loop updates. Set up vectors and handlers before enabling interrupts.
 
 === Multitasking model
 
@@ -963,44 +962,32 @@ memory ranges:
 |153,600 bytes
 
 |Keyboard
-|+0x43000+
+|+0x3ff03000+
 |1 byte
 
 |Interrupt control (+ICR+)
-|+0x43002+
-|1 byte
-
-|Speed register (0 = fixed, 1 = maximum)
-|+0x43003+
-|1 byte
-
-|Frame-synchronization control
-|+0x43013+
+|+0x3ff01000+
 |1 byte
 
 |GPU mode
-|+0x43014+
+|+0x3ff05210+
 |1 byte
 
 |Held-key bitmask
-|+0x43004+
-|1 byte
+|+0x3ff03004+
+|4 bytes
 
 |Instruction-timer period
-|+0x4301e+-+0x4301f+
+|+0x3ff01008+-+0x3ff01009+
 |2 bytes
 
-|Disk storage device
-|+0x43100+
-|16 bytes
+|Mouse registers
+|+0x3ff03008+-+0x3ff0300f+
+|8 bytes
 
 |RTC seconds/minutes/hours
-|+0x43010+-+0x43012+
+|+0x3ff0400c+-+0x3ff0400e+
 |3 bytes
-
-|Graphics coprocessor and layer registers
-|+0x43020+-+0x4303B+
-|28 bytes
 |===
 
 The display supports 320x240 indexed 8-bit mode and 640x480 packed 4-bit mode.
@@ -1016,17 +1003,16 @@ per display frame (capped at 60 frames per second), so long drawing routines can
 finish without requiring a separate screen update for every CPU instruction.
 When the CPU halts, the window remains open with the final frame displayed;
 press any key to close it, or close the window using its title-bar control.
-Keyboard key presses write the character byte to the keyboard address and mark
-a keyboard interrupt pending. Reading the keyboard address returns and clears
-the pending character. The RTC writes seconds, minutes, and hours to its three
-declared byte addresses.
+Keyboard input is exposed through the high-bank input device. Reading its key
+register returns and clears the pending character; keyboard interrupts are
+acknowledged through the high-bank interrupt controller. The RTC writes
+seconds, minutes, and hours to its three declared byte addresses.
 
-Guest filesystem requests use the byte-register gateway at +0x43100+, with
-commands and C helpers defined in +toolchain/include/folder_fs.h+. It supports directory
-listing, file reads and replacement writes, directory creation, deletion,
-rename, and metadata queries. Paths are normalized relative to the mounted
-folder disk; transfers are bounded and failures set an explicit status. See
-+docs/sc16_disk_format.adoc+ for the request layout and access policies.
+User programs access the selected folder disk through the protected syscall
+ABI. The supervisor-only high filesystem bank provides bounded inline
+directory, file and metadata operations. The former low register window at
++0x43100+-+0x431FF+ is ordinary RAM and has no filesystem handler. See
++docs/sc16_architecture.adoc+ for the high-bank request layout and access rules.
 
 The former guest block interface is removed. Original JSON block-disk files
 remain as import sources and can be converted with
@@ -1345,7 +1331,7 @@ contain the disk-control address, and byte +15+ is the startup status.
 The status is +0+ after successful initialization or disk selection and +1+
 when a disk cannot be mounted.
 
-The serial device is memory-mapped at the legacy UART-like console addresses:
+The supervisor-only console device is in the high console bank:
 
 [cols="1,1,1"]
 |===
@@ -1353,22 +1339,24 @@ The serial device is memory-mapped at the legacy UART-like console addresses:
 |Register
 |Meaning
 
-|+0x43200+
+|+0x3ff09000+
 |Data
 |Write one output byte; read and remove one input byte.
 
-|+0x43201+
+|+0x3ff09001+
 |Status
 |Bit 0: input available; bit 1: output ready; bit 2: input overflow. Write bit 2 as 1 to clear overflow.
 
-|+0x43202+
+|+0x3ff09002+
 |Control
 |Bit 0 enables local echo; bit 1 enables host keyboard input. Both are enabled at reset.
 |===
 
 Guest console input and output use the main emulator display as an 80×25 text
-terminal. Guest writes to standard output/error or +0x43200+ appear there;
-keyboard input is echoed as the guest reads it. Carriage return, line feed,
+terminal. SisuOS standard output/error and privileged firmware console writes
+appear there; user tasks use the kernel's validated console services rather
+than direct MMIO. The retired +0x43200+ address is ordinary RAM. Keyboard input
+is echoed as the guest reads it. Carriage return, line feed,
 backspace, tabs, wrapping, and scrolling are supported. The terminal also
 supports ANSI CSI cursor movement, cursor positioning, line/screen erase, and
 cursor save/restore sequences. A cursor marks the current insertion position.
@@ -1402,14 +1390,11 @@ to the host event loop, so a C +getchar+ wait does not prevent keyboard events
 from being processed.
 
 The guest filesystem is rooted at the folder disk selected by the BIOS or
-+--disk ID+. The register service at +0x43100+ supports bounded listing, file
-reads and replacement writes, directory creation, deletion, rename, and
-metadata queries. Its command IDs and C register helpers are defined in
-+toolchain/include/folder_fs.h+; +toolchain/include/disk.h+ provides file-reading and recursive-list
-helpers for existing programs. Status at +\+16+ is +0+ on success and +1+ on
-error. Paths are normalized, relative ASCII paths confined to the mounted
-folder; transfers are limited to 4096 bytes. Filesystem operations cannot
-access other disks or host paths.
++--disk ID+. User-mode file operations use the protected syscall ABI and are
+confined to the mounted folder. The former low-address filesystem register
+interface and its pointer-based C helpers are retired; +0x43100+-+0x431FF+ is
+ordinary RAM. The supervisor-only high filesystem bank uses bounded inline
+requests and is not directly accessible to user code.
 
 The native C compiler also links an unbuffered hosted file-stream subset when
 one of its supported file APIs is used: +fopen+, +freopen+, +fclose+,
@@ -1436,15 +1421,11 @@ deterministically from tile coordinates. Only graphics atlases are included in
 the Tank-16 executable, not map data. The map editor mirrors saved maps into
 the program's +disks/maps/+ folder.
 
-Programs booted from a folder disk can access that selected disk through the
-bounded USER-mode filesystem service in +#include "folder_fs.h"+. It supports
-directory listing, file reads and replacement writes, directory creation,
-entry deletion/rename, and metadata queries. Transfers are limited to 4096
-bytes, paths are normalized disk-relative ASCII paths, and read-only disks,
-protected paths, and boot executable names are enforced by the service. See
-link:sc16_disk_format.adoc[+sc16_disk_format.adoc+] for the request registers
-and result format. The older +disk.h+ file helpers remain for direct-source
-developer launches and are not a substitute for the folder-disk service.
+Programs booted from a folder disk access their selected disk through the
+protected syscall ABI. The former +folder_fs.h+ and +disk.h+ pointer-based
+register interfaces are not supported by the revised hardware contract.
+Supervisor firmware uses the separate high filesystem bank documented in
+link:sc16_architecture.adoc[+sc16_architecture.adoc+].
 
 +<stdio.h>+ currently provides console +getchar+, +putchar+, +puts+, +gets+,
 +fgetc+, +fgets+, +fputc+, +fputs+, +printf+, +fprintf+, +vprintf+, and +vfprintf+.
@@ -1628,16 +1609,17 @@ space.
 |Store/restore the currently selected layer in private GPU memory.
 |===
 
-Everything is clipped to the screen. Held keys (bitmask at +0x43004+): bit 0
-left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter, 6 Tab. The second byte
-(+0x43005+, +gfx_keys_ext()+, constants +KEYX_*+) holds bit 0 Q, 1 E, 2 X/Shift, 3 Z/Ctrl.
-The third byte (+0x43006+, +gfx_keys_ext2()+) uses +KEYX2_*+ constants; Tank-16
-assigns bit 0 C, 1 J, 2 L, 3 I, 4 K, and 5 period. The mouse register block
-starts at +0x43008+.
+Everything is clipped to the screen. Held keys are exposed as a bitmask at
++0x3ff03004+: bit 0 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter,
+6 Tab. +gfx_keys_ext()+ reports Q, E, X/Shift, and Z/Ctrl; +gfx_keys_ext2()+
+uses +KEYX2_*+ constants. Tank-16 assigns bit 0 C, 1 J, 2 L, 3 I, 4 K, and
+5 period. The mouse register block starts at +0x3ff03008+.
 
-Speed register (+0x43003+): 0 = fixed speed (30 frames/s, 30000 instructions per frame), nonzero = maximum speed: the emulator drops the frame cap, skips most display refreshes and runs up to 300000 instructions per pass. User programs may write this register and the frame-synchronization register at +0x43013+; the adjacent interrupt-control register remains supervisor-only. Use it from C with +gfx_speed(1)+ / +gfx_speed(0)+; time maximum-speed runs with the real-time clock (+gfx_rtc+), since frame ticks no longer match wall time. Page 9 of the showcase uses it to measure the SC-16 for 3 seconds.
+Guest-controlled speed and frame-synchronization registers were removed in
+machine revision 2. CPU scheduling is controlled by the host runtime; writes
+to their former low addresses no longer change execution speed.
 
-Mouse registers (base +0x43008+): +\+0+ X word, +\+2+ Y word, +\+4+ held buttons, +\+5+ events.
+Mouse registers (base +0x3ff03008+): +\+0+ X word, +\+2+ Y word, +\+4+ held buttons, +\+5+ events.
 A double click is a second press of the same button within 400 ms and 4 pixels; it raises
 the press bit and the double-click bit together. Drag and drop = button held while the
 position changes; the release event marks the drop.

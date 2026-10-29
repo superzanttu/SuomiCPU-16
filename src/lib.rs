@@ -46,9 +46,7 @@ pub mod tank16_map;
 #[path = "../programs/tank-16/tools/tank_maps.rs"]
 pub mod tank_maps;
 
-pub use cpu::{
-    ADDRESS_MASK, Cpu, CpuError, Flags, ICR_ADDR, MEMORY_SIZE, MemorySegment, TIMER_PERIOD_ADDR,
-};
+pub use cpu::{ADDRESS_MASK, Cpu, CpuError, Flags, MEMORY_SIZE, MemorySegment};
 
 #[path = "tools/programs.rs"]
 pub mod programs;

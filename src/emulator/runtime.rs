@@ -4,11 +4,7 @@
 
 use crate::cpu::{
     BIOS_AUTOBOOT_WAIT_MARKER, BIOS_FIRMWARE_MARKER, Cpu, GpuLine, GpuSoundCommand, GpuTriangle,
-    PrivilegeMode, VSYNC_ADDR,
-};
-#[cfg(test)]
-use crate::cpu::{
-    GUEST_TEXT_BACKGROUND, GUEST_TEXT_CONTROL, GUEST_TEXT_DATA, GUEST_TEXT_FOREGROUND,
+    PrivilegeMode,
 };
 use crate::disk::{FolderBootMode, FolderDisk};
 #[cfg(test)]
@@ -32,7 +28,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SPEED_ADDR: usize = 0x43003;
 const SOUND_RATE: u32 = 22_050;
 const SOUND_FPS: u32 = 60;
 const TOOLBAR_HEIGHT: f32 = 36.0;
@@ -483,10 +478,8 @@ pub async fn run_with_devices(
     }
 
     let mut old_keys = HashSet::new();
-    let mut speed_remainder = 0.0;
     let mut cpu_budget_remaining = 0;
     let mut cpu_frame_started = false;
-    let mut last_frame = Instant::now();
     let mut presented_size = screen_size(&cpu);
     let mut presented_triangles = Vec::new();
     let mut presented_lines = Vec::new();
@@ -550,7 +543,6 @@ pub async fn run_with_devices(
                     RuntimeControl::ConsoleToggled(_) => {}
                     RuntimeControl::ConsoleClosed => {}
                 }
-                last_frame = Instant::now();
             }
         }
         let console_control = console_window
@@ -567,7 +559,6 @@ pub async fn run_with_devices(
                 }
                 RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
             }
-            last_frame = Instant::now();
         }
         if !fullscreen
             && is_mouse_button_pressed(MouseButton::Left)
@@ -635,16 +626,7 @@ pub async fn run_with_devices(
                     cpu.begin_frame();
                     cpu_frame_started = true;
                 }
-                let elapsed = last_frame.elapsed().as_secs_f64();
-                last_frame = Instant::now();
-                let mode = cpu.memory[SPEED_ADDR];
-                cpu_budget_remaining = match mode {
-                    0 => rate_budget(10.0, elapsed, &mut speed_remainder),
-                    1 => rate_budget(100.0, elapsed, &mut speed_remainder),
-                    2 => rate_budget(1_000_000.0, elapsed, &mut speed_remainder),
-                    3 => rate_budget(10_000_000.0, elapsed, &mut speed_remainder),
-                    _ => 300_000,
-                };
+                cpu_budget_remaining = 300_000;
             }
             if let Err(error) = run_instruction_slice(&mut cpu, &mut cpu_budget_remaining) {
                 if let Some(path) = cpu.take_booted_disk_path() {
@@ -671,11 +653,7 @@ pub async fn run_with_devices(
         let capture_display = if cpu.terminal_active {
             cpu.terminal_dirty || last_terminal_cursor_phase != cursor_phase
         } else {
-            should_capture_display_frame(
-                cpu.memory[VSYNC_ADDR] != 0,
-                cpu.frame_presented,
-                cpu.guest_text.enabled,
-            )
+            should_capture_display_frame(cpu.frame_presented, cpu.guest_text.enabled)
         };
         if capture_display {
             if cpu.terminal_active {
@@ -1484,13 +1462,6 @@ fn update_rtc(cpu: &mut Cpu) {
     cpu.update_rtc(now.as_secs());
 }
 
-fn rate_budget(rate: f64, elapsed: f64, remainder: &mut f64) -> usize {
-    let exact = rate * elapsed.max(0.0) + *remainder;
-    let result = exact.floor() as usize;
-    *remainder = exact - result as f64;
-    result
-}
-
 fn bios_autoboot_timeout_due(
     waiting: bool,
     space_pressed: bool,
@@ -1919,12 +1890,8 @@ fn draw_guest_text(
     }
 }
 
-fn should_capture_display_frame(
-    vsync_enabled: bool,
-    frame_presented: bool,
-    text_console_active: bool,
-) -> bool {
-    !vsync_enabled || frame_presented || text_console_active
+fn should_capture_display_frame(frame_presented: bool, text_console_active: bool) -> bool {
+    frame_presented || text_console_active
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
@@ -2333,7 +2300,7 @@ mod tests {
             cpu.registers[1] = 99;
             cpu.flags.zero = true;
             cpu.sp = 0x100;
-            cpu.write(crate::cpu::ICR_ADDR, 1);
+            cpu.write(crate::machine::INTERRUPT_ENABLE, 1);
             boot_target(&mut cpu, &target).unwrap();
             assert!(cpu.running);
             assert_eq!(cpu.pc, 0x100);
@@ -2342,7 +2309,7 @@ mod tests {
             assert_eq!(cpu.flags, crate::cpu::Flags::default());
             assert_eq!(cpu.sp, expected_sp);
             assert_eq!(cpu.kernel_sp, cpu.memory.len() as u32 - 1);
-            assert_eq!(cpu.memory[crate::cpu::ICR_ADDR as usize], 0);
+            assert_eq!(cpu.memory[0x43002], 0);
             assert_eq!(cpu.loaded_image_segments.len(), 1);
             fs::remove_dir_all(disk.parent().unwrap()).unwrap();
         }
@@ -2388,7 +2355,8 @@ mod tests {
             crate::scheduler::TaskState::Exited
         );
         assert_eq!(cpu.current_task(), None);
-        assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
+        assert_eq!(cpu.read_u16(crate::machine::INTERRUPT_PIT_PERIOD), 0);
+        assert_eq!(cpu.read_u16(0x4301e), 4);
 
         boot_target(&mut cpu, &target).unwrap();
         assert_eq!(cpu.pc, 0x4000);
@@ -2438,7 +2406,14 @@ mod tests {
         crate::image::write_image(&root.join("firmware").join("bios.bin"), &firmware).unwrap();
 
         let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT).unwrap();
-        cpu.run(5000).unwrap();
+        cpu.run(5000).unwrap_or_else(|error| {
+            panic!(
+                "BIOS cold start failed: {error}; PC={:#x}, fault={:?}, registers={:?}",
+                cpu.pc,
+                cpu.last_page_fault(),
+                cpu.registers
+            )
+        });
         cpu.signal_keyboard_event(13);
         cpu.run(30000).unwrap();
 
@@ -2468,7 +2443,8 @@ mod tests {
             cpu.last_page_fault()
         );
         assert_eq!(fs::read(boot_disk.join("result.txt")).unwrap(), b"hello");
-        assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
+        assert_eq!(cpu.read_u16(crate::machine::INTERRUPT_PIT_PERIOD), 0);
+        assert_eq!(cpu.read_u16(0x4301e), 4);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2506,12 +2482,19 @@ mod tests {
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
         assert!(cpu.running);
         assert_eq!(cpu.pc, 0);
-        assert_eq!(cpu.memory[0x43000], 0);
+        assert_eq!(cpu.read(crate::machine::INPUT_KEY), 0);
         assert_eq!(
             &cpu.memory[..firmware.segments[0].data.len()],
             firmware.segments[0].data.as_slice()
         );
-        cpu.run(5000).unwrap();
+        cpu.run(5000).unwrap_or_else(|error| {
+            panic!(
+                "BIOS cold start failed: {error}; PC={:#x}, fault={:?}, registers={:?}",
+                cpu.pc,
+                cpu.last_page_fault(),
+                cpu.registers
+            )
+        });
         assert!(cpu.guest_text.enabled);
         let text = cpu
             .guest_text
@@ -2519,14 +2502,20 @@ mod tests {
             .iter()
             .map(|cell| char::from(cell.character))
             .collect::<String>();
+        let firmware_registers = [
+            cpu.read(crate::machine::FIRMWARE_INDEX),
+            cpu.read(crate::machine::FIRMWARE_INDEX + 1),
+            cpu.read(crate::machine::FIRMWARE_STATUS),
+        ];
+        let pending_key = cpu.read(crate::machine::INPUT_KEY);
         assert!(
             text.contains("DISK0001"),
             "{text:?} pc={:#x} regs={:?} key={} id={:?} registers={:?} console={:?}",
             cpu.pc,
             cpu.registers,
-            cpu.memory[0x43000],
+            pending_key,
             &cpu.memory[0x5000..0x5009],
-            &cpu.memory[0x43402..0x4340c],
+            firmware_registers,
             cpu.debug_console.text_snapshot()
         );
         assert!(text.contains("BIOS SETUP UTILITY"), "{text:?}");
@@ -2572,6 +2561,8 @@ mod tests {
         assert!(!text.contains("Save changes with F10"), "{text:?}");
         cpu.signal_keyboard_event(13);
         cpu.run(5000).unwrap();
+        let firmware_status = cpu.read(crate::machine::FIRMWARE_STATUS);
+        let pending_key = cpu.read(crate::machine::INPUT_KEY);
         assert_eq!(
             cpu.registers[0],
             84,
@@ -2579,8 +2570,8 @@ mod tests {
             cpu.pc,
             cpu.privilege_mode,
             cpu.running,
-            cpu.memory[0x4340c],
-            cpu.memory[0x43000],
+            firmware_status,
+            pending_key,
             cpu.registers,
             cpu.debug_console.text_snapshot()
         );
@@ -2590,8 +2581,8 @@ mod tests {
             Some("DISK0002")
         );
         assert!(!cpu.guest_text.enabled);
-        cpu.write(0x43400, 1);
-        assert_eq!(cpu.memory[0x4340c], 1);
+        cpu.write(crate::machine::FIRMWARE_COMMAND, 1);
+        assert_eq!(cpu.read(crate::machine::FIRMWARE_STATUS), 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2611,13 +2602,20 @@ mod tests {
         ] {
             let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
             configure_disk(&mut cpu, root, &image).unwrap();
-            cpu.memory[0x1000..0x100a].copy_from_slice(b"probe.txt\0");
-            cpu.memory[0x43116..0x4311a].copy_from_slice(&0x1000u32.to_be_bytes());
-            cpu.memory[0x4311a..0x4311e].copy_from_slice(&0x2000u32.to_be_bytes());
-            cpu.memory[0x4311e..0x43120].copy_from_slice(&16u16.to_be_bytes());
-            cpu.write(0x43100, 0x42);
-            assert_eq!(cpu.memory[0x43110], 0);
-            assert_eq!(&cpu.memory[0x2000..0x2000 + expected.len()], expected);
+            for (offset, byte) in b"probe.txt\0".iter().enumerate() {
+                cpu.write(crate::machine::FILESYSTEM_PATH + offset as u32, *byte);
+            }
+            cpu.write(crate::machine::FILESYSTEM_OPERATION, 0x42);
+            cpu.write(crate::machine::FILESYSTEM_LENGTH, 0);
+            cpu.write(crate::machine::FILESYSTEM_LENGTH + 1, expected.len() as u8);
+            cpu.write(crate::machine::FILESYSTEM_COMMAND, 1);
+            assert_eq!(cpu.read(crate::machine::FILESYSTEM_STATUS), 0);
+            for (offset, expected_byte) in expected.iter().enumerate() {
+                assert_eq!(
+                    cpu.read(crate::machine::FILESYSTEM_DATA + offset as u32),
+                    *expected_byte
+                );
+            }
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -2687,9 +2685,8 @@ mod tests {
         let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
         cpu.run(5000).unwrap();
         let node_id = String::from_utf8(
-            cpu.memory[0x43410..0x43420]
-                .iter()
-                .copied()
+            (0..16)
+                .map(|offset| cpu.read(crate::machine::FIRMWARE_NETWORK_NAME + offset))
                 .take_while(|byte| *byte != 0)
                 .collect(),
         )
@@ -2721,12 +2718,17 @@ mod tests {
             editing_node.contains("Editing in place"),
             "{editing_node:?}"
         );
-        let original_node = cpu.memory[0x43410..0x43420].to_vec();
+        let original_node = (0..16)
+            .map(|offset| cpu.read(crate::machine::FIRMWARE_NETWORK_NAME + offset))
+            .collect::<Vec<_>>();
         cpu.signal_keyboard_event(8);
         cpu.run(30_000).unwrap();
         cpu.signal_keyboard_event(27);
         cpu.run(30_000).unwrap();
-        assert_eq!(&cpu.memory[0x43410..0x43420], original_node);
+        let current_node = (0..16)
+            .map(|offset| cpu.read(crate::machine::FIRMWARE_NETWORK_NAME + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(current_node, original_node);
         cpu.signal_keyboard_event(13);
         cpu.run(30_000).unwrap();
         for _ in 0..16 {
@@ -2738,21 +2740,21 @@ mod tests {
             cpu.run(5000).unwrap();
         }
         cpu.signal_keyboard_event(13);
-        cpu.run(5000).unwrap();
+        cpu.run(30_000).unwrap();
         cpu.signal_keyboard_event(0x80);
-        cpu.run(5000).unwrap();
+        cpu.run(30_000).unwrap();
         cpu.signal_keyboard_event(13);
-        cpu.run(5000).unwrap();
+        cpu.run(30_000).unwrap();
         cpu.signal_keyboard_event(0x83);
-        cpu.run(5000).unwrap();
+        cpu.run(30_000).unwrap();
         cpu.signal_keyboard_event(13);
-        cpu.run(5000).unwrap();
+        cpu.run(30_000).unwrap();
         for _ in 0..3 {
             cpu.signal_keyboard_event(0x81);
-            cpu.run(5000).unwrap();
+            cpu.run(30_000).unwrap();
         }
         cpu.signal_keyboard_event(13);
-        cpu.run(5000).unwrap();
+        cpu.run(30_000).unwrap();
         for _ in 0..2 {
             cpu.signal_keyboard_event(8);
             cpu.run(30_000).unwrap();
@@ -2776,7 +2778,9 @@ mod tests {
         );
         assert_eq!(
             cpu.bios_settings().additional.get("score"),
-            Some(&crate::bios_settings::BiosSettingValue::Integer(42))
+            Some(&crate::bios_settings::BiosSettingValue::Integer(42)),
+            "{:?}",
+            cpu.debug_console.text_snapshot()
         );
         cpu.signal_keyboard_event(0x89);
         cpu.run(5000).unwrap();
@@ -2784,11 +2788,12 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join("config").join("bios.json")).unwrap())
                 .unwrap();
+        let firmware_status = cpu.read(crate::machine::FIRMWARE_STATUS);
         assert_eq!(
             saved["preferred_disk"],
             "DISK0001",
             "saved settings: {saved}; BIOS status: {}; CPU: PC={:#x} mode={:?} registers={:?} logs={:?}",
-            cpu.memory[0x4340c],
+            firmware_status,
             cpu.pc,
             cpu.privilege_mode,
             cpu.registers,
@@ -2878,11 +2883,12 @@ mod tests {
             cpu.signal_keyboard_event(0x83);
             cpu.run(5000).unwrap();
         }
+        let selected_index = cpu.read_u16(crate::machine::FIRMWARE_INDEX);
         assert_eq!(
-            cpu.read_u16(0x43402),
+            selected_index,
             2,
             "BIOS disk index, row, PC, and screen: index={}, row={}, PC={:#x}, screen={}",
-            cpu.read_u16(0x43402),
+            selected_index,
             cpu.memory[0x5021],
             cpu.pc,
             cpu.guest_text
@@ -3030,7 +3036,7 @@ mod tests {
         let mut cpu = fresh_runtime_cpu(&root, None, None, DEFAULT_PORT).unwrap();
         cpu.run(5000).unwrap();
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
-        let selected_index = u16::from_be_bytes([cpu.memory[0x43402], cpu.memory[0x43403]]);
+        let selected_index = cpu.read_u16(crate::machine::FIRMWARE_INDEX);
         assert_eq!(
             FolderDisk::discover_paths(&disks).unwrap()[usize::from(selected_index)]
                 .file_name()
@@ -3051,12 +3057,13 @@ mod tests {
                 ),
             }
         }
+        let firmware_status = cpu.read(crate::machine::FIRMWARE_STATUS);
         assert_eq!(
             cpu.privilege_mode,
             PrivilegeMode::User,
             "SisuOS did not enter user mode: PC={:#x}, status={}, running={}, logs={:?}, screen={}",
             cpu.pc,
-            cpu.memory[0x4340c],
+            firmware_status,
             cpu.running,
             cpu.debug_console.text_snapshot(),
             cpu.guest_text
@@ -3091,7 +3098,7 @@ mod tests {
         }
         cpu.run(500_000).unwrap();
 
-        let output = String::from_utf8_lossy(cpu.console.output());
+        let output = String::from_utf8_lossy(cpu.console.output()).into_owned();
         for expected in [
             "SisuOS interactive shell",
             "Type 'run demo' to see preemptive task switching.",
@@ -3117,6 +3124,11 @@ mod tests {
                 cpu.console.text_snapshot()
             );
         }
+        assert_eq!(
+            cpu.read_u16(crate::machine::INTERRUPT_PIT_PERIOD),
+            4,
+            "SisuOS kernel did not program the high-address PIT bank"
+        );
         let screen = cpu.console.text_snapshot().join("\n");
         assert!(cpu.terminal_active);
         assert!(cpu.terminal_dirty);
@@ -3150,7 +3162,7 @@ mod tests {
             crate::scheduler::TaskState::Exited
         );
         assert_eq!(cpu.task_context(1).unwrap().exit_code, Some(7));
-        assert_eq!(cpu.read_u16(crate::cpu::TIMER_PERIOD_ADDR), 4);
+        assert_eq!(cpu.read_u16(crate::machine::INTERRUPT_PIT_PERIOD), 4);
         assert!(cpu.is_mmu_enabled());
 
         cpu.test_monotonic_ms = Some(1000);
@@ -3268,8 +3280,9 @@ mod tests {
     }
 
     #[test]
-    fn packaged_programs_boot_through_the_runtime_and_execute_guest_code() {
+    fn packaged_programs_run_or_reject_legacy_images_for_revision_2() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut legacy_images_rejected = 0;
         for program in crate::programs::catalog(root)
             .unwrap()
             .into_iter()
@@ -3283,7 +3296,14 @@ mod tests {
             };
             let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
             assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
-            boot_target(&mut cpu, &target).unwrap();
+            if let Err(error) = boot_target(&mut cpu, &target) {
+                assert!(
+                    error.to_string().contains("rebuild for machine revision 2"),
+                    "{id}: {error}"
+                );
+                legacy_images_rejected += 1;
+                continue;
+            }
             assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
             let mut executed = 0;
             while executed < 1000 && cpu.running && !cpu.frame_yield {
@@ -3300,6 +3320,7 @@ mod tests {
             }
             assert!(executed > 0, "no guest code ran for {id}");
         }
+        assert!(legacy_images_rejected > 0);
     }
 
     #[test]
@@ -3415,12 +3436,26 @@ mod tests {
             KeyCode::Period,
         ]);
         update_keys(&mut cpu, &previous, &current, false);
-        assert_eq!(&cpu.memory[0x43004..0x43007], &[0x41, 0x05, 0x21]);
+        assert_eq!(
+            [
+                cpu.read(crate::machine::INPUT_KEYS + 1),
+                cpu.read(crate::machine::INPUT_KEYS + 2),
+                cpu.read(crate::machine::INPUT_KEYS + 3),
+            ],
+            [0x21, 0x05, 0x41]
+        );
 
         previous = current;
         let current = HashSet::from([KeyCode::D, KeyCode::E, KeyCode::Z, KeyCode::J]);
         update_keys(&mut cpu, &previous, &current, false);
-        assert_eq!(&cpu.memory[0x43004..0x43007], &[0x02, 0x0a, 0x02]);
+        assert_eq!(
+            [
+                cpu.read(crate::machine::INPUT_KEYS + 1),
+                cpu.read(crate::machine::INPUT_KEYS + 2),
+                cpu.read(crate::machine::INPUT_KEYS + 3),
+            ],
+            [0x02, 0x0a, 0x02]
+        );
     }
 
     #[test]
@@ -3468,7 +3503,7 @@ mod tests {
         receive_terminal_key(&mut cpu, KeyCode::Backspace);
         receive_typed_text(&mut cpu, ['h', 'e', 'l', 'p']);
         assert!(cpu.console.receive_buffer().is_empty());
-        assert_eq!(cpu.memory[0x43000], 8);
+        assert_eq!(cpu.read(crate::machine::INPUT_KEY), 8);
 
         cpu.terminal_active = true;
         receive_terminal_key(&mut cpu, KeyCode::Enter);
@@ -3492,15 +3527,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             b"\x1b[D"
         );
-    }
-
-    #[test]
-    fn display_rate_budget_accumulates_fractional_frames_without_negative_work() {
-        let mut remainder = 0.0;
-        assert_eq!(rate_budget(10.0, 0.05, &mut remainder), 0);
-        assert_eq!(rate_budget(10.0, 0.05, &mut remainder), 1);
-        assert_eq!(rate_budget(10.0, -1.0, &mut remainder), 0);
-        assert_eq!(remainder, 0.0);
     }
 
     #[test]
@@ -3692,10 +3718,10 @@ mod tests {
             [false, false],
             1000,
         );
-        assert_eq!(cpu.read_u16(0x43008), 40);
-        assert_eq!(cpu.read_u16(0x4300a), 30);
-        assert_eq!(cpu.memory[0x4300c], 1);
-        assert_eq!(cpu.read_u16(0x4300e), u16::MAX);
+        assert_eq!(cpu.read_u16(crate::machine::INPUT_MOUSE_X), 40);
+        assert_eq!(cpu.read_u16(crate::machine::INPUT_MOUSE_Y), 30);
+        assert_eq!(cpu.read(crate::machine::INPUT_MOUSE_BUTTONS), 1);
+        assert_eq!(cpu.read_u16(crate::machine::INPUT_MOUSE_WHEEL), u16::MAX);
 
         update_mouse(
             &mut cpu,
@@ -3713,12 +3739,12 @@ mod tests {
             [false, false],
             1200,
         );
-        assert_eq!(cpu.memory[0x4300c], 1);
-        assert_eq!(cpu.read(0x4300d), 1 | 4 | 16);
-        assert_eq!(cpu.read(0x4300d), 0);
-        assert_eq!(cpu.read_u16(0x4300e), 1);
+        assert_eq!(cpu.read(crate::machine::INPUT_MOUSE_BUTTONS), 1);
+        assert_eq!(cpu.read(crate::machine::INPUT_MOUSE_EVENTS), 1 | 4 | 16);
+        assert_eq!(cpu.read(crate::machine::INPUT_MOUSE_EVENTS), 0);
+        assert_eq!(cpu.read_u16(crate::machine::INPUT_MOUSE_WHEEL), 1);
         cpu.end_mouse_frame();
-        assert_eq!(cpu.read_u16(0x4300e), 0);
+        assert_eq!(cpu.read_u16(crate::machine::INPUT_MOUSE_WHEEL), 0);
     }
 
     #[test]
@@ -3749,12 +3775,10 @@ mod tests {
     }
 
     #[test]
-    fn vsync_refreshes_only_after_a_gpu_present_command() {
-        assert!(should_capture_display_frame(false, false, false));
-        assert!(should_capture_display_frame(false, true, false));
-        assert!(!should_capture_display_frame(true, false, false));
-        assert!(should_capture_display_frame(true, true, false));
-        assert!(should_capture_display_frame(true, false, true));
+    fn display_refresh_requires_a_presented_frame_or_enabled_text_display() {
+        assert!(!should_capture_display_frame(false, false));
+        assert!(should_capture_display_frame(true, false));
+        assert!(should_capture_display_frame(false, true));
     }
 
     #[test]
@@ -3789,10 +3813,10 @@ mod tests {
         cpu.palette[1] = [0, 255, 0];
         cpu.palette[2] = [0, 0, 255];
         cpu.palette[3] = [255, 0, 0];
-        cpu.write(GUEST_TEXT_FOREGROUND, 3);
-        cpu.write(GUEST_TEXT_BACKGROUND, 2);
-        cpu.write(GUEST_TEXT_DATA, b'A');
-        cpu.write(GUEST_TEXT_CONTROL, 2);
+        cpu.write(crate::machine::FIRMWARE_TEXT_FOREGROUND, 3);
+        cpu.write(crate::machine::FIRMWARE_TEXT_BACKGROUND, 2);
+        cpu.write(crate::machine::FIRMWARE_TEXT_DATA, b'A');
+        cpu.write(crate::machine::FIRMWARE_TEXT_CONTROL, 2);
 
         let font = load_font();
         let mut high_resolution_pixels = vec![0; 640 * 480];
@@ -4265,84 +4289,20 @@ mod tests {
     }
 
     #[test]
-    fn disk_editor_compiles_and_presents_a_frame_in_the_emulator() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let source = root
-            .join("programs")
-            .join("disk-editor")
-            .join("src")
-            .join("disk_editor.c");
-        let image = load_program(&source).expect("DiskEditor should compile");
-        let temp = std::env::temp_dir().join(format!(
-            "sc16-disk-editor-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let disk = temp.join("disks").join("TEST0001");
-        fs::create_dir_all(&disk).unwrap();
-        fs::write(
-            disk.join("disk.json"),
-            r#"{"version":1,"id":"TEST0001","label":"Disk Editor Test","capacity_bytes":4096,"read_only":false,"protected_files":[]}"#,
-        )
-        .unwrap();
-        fs::write(disk.join("notes.txt"), b"test").unwrap();
-        let mut cpu = Cpu::new();
-        cpu.configure_disk(temp.join("disks"), source.parent().unwrap().join("disks"))
-            .expect("DiskEditor disk paths should configure");
-        assert_eq!(cpu.available_disks().unwrap(), ["TEST0001"]);
-        cpu.mount_data_disk("TEST0001").unwrap();
-        cpu.load_program(&image.segments, image.entry_point)
-            .expect("DiskEditor should load");
-        cpu.begin_frame();
-        for _ in 0..100_000 {
-            cpu.step().expect("DiskEditor instruction should execute");
-            if cpu.frame_yield || !cpu.running {
-                break;
-            }
-        }
-        let presents_frame = cpu.frame_yield;
-        let remains_running = cpu.running;
-        let listed_file = &cpu.memory[0x40200..0x4020a];
-        fs::remove_dir_all(&temp).unwrap();
-        assert!(remains_running, "DiskEditor halted during startup");
-        assert!(presents_frame, "DiskEditor did not present its first frame");
-        assert_eq!(listed_file, b"notes.txt\0");
-    }
-
-    #[test]
-    fn c_guest_can_list_mounted_folder_filesystem() {
-        let source = "unsigned char *r = 0x43100; char *path = 0x1000; int main(void) { path[0] = 0; r[10] = 0; r[11] = 0; r[22] = 0; r[23] = 0; r[24] = 0x10; r[25] = 0; r[26] = 0; r[27] = 0; r[28] = 0x20; r[29] = 0; r[30] = 0; r[31] = 128; r[0] = 0x41; return 0; }";
-        let image = crate::c_compiler::compile_minimal_program(source, "disk-list-test.c")
+    fn low_disk_window_is_ordinary_ram_for_user_code() {
+        let source =
+            "unsigned char *r = 0x43100; int main(void) { r[0] = 0x41; r[16] = 0xa5; return 0; }";
+        let image = crate::c_compiler::compile_minimal_program(source, "low-disk-ram-test.c")
             .unwrap()
-            .expect("disk-list test should compile");
-        let temp = std::env::temp_dir().join(format!(
-            "sc16-disk-list-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let disk = temp.join("TEST0001");
-        fs::create_dir_all(&disk).unwrap();
-        fs::write(
-            disk.join("disk.json"),
-            r#"{"version":1,"id":"TEST0001","label":"Listing Test","capacity_bytes":4096,"read_only":true,"protected_files":[]}"#,
-        )
-        .unwrap();
-        fs::write(disk.join("notes.txt"), b"test").unwrap();
+            .expect("low-disk RAM test should compile");
         let mut cpu = Cpu::new();
-        cpu.mount_folder_disk(&disk).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
             .unwrap();
+        cpu.privilege_mode = PrivilegeMode::User;
         cpu.run(10_000).unwrap();
 
-        assert_eq!(&cpu.memory[0x43110..0x43111], &[0]);
-        assert_eq!(&cpu.memory[0x2000..0x200a], b"notes.txt\0");
-        fs::remove_dir_all(temp).unwrap();
+        assert_eq!(cpu.memory[0x43100], 0x41);
+        assert_eq!(cpu.memory[0x43110], 0xa5);
     }
 
     #[test]

@@ -593,15 +593,15 @@ Checklist status: [x] completed; [ ] planned.
     bus, including supervisor-only access, reserved offsets, and fetch rejection.
 **** [x] Implement the RAM-independent high system bank, checked guest
      constants, and supervisor device-page mappings with execution regressions.
-**** [x] Implement RAM-independent interrupt/PIT and fault banks, shared
-     legacy controller state, staged period commit, pending acknowledgement,
+**** [x] Implement RAM-independent interrupt/PIT and fault banks, typed
+     controller state, staged period commit, pending acknowledgement,
      and guest-owned timer/fault execution through protected device aliases.
 **** [x] Implement RAM-independent clock/random snapshots, shared typed
      RTC/random handlers, rollover checks, and compiled-C/native execution.
 **** [x] Implement the RAM-independent input bank with shared keyboard/mouse
      latches, validated read side effects, held keys, coordinates and wheel.
 **** [x] Implement RAM-independent console and firmware-text banks with
-     shared terminal/display handlers, protected aliases, live cursor readback,
+     typed terminal/display handlers, protected aliases, live cursor readback,
      atomic side-effect validation, and compiled-C/native execution regressions.
 **** [x] Implement a RAM-independent audio bank with staged parameters,
      validated submit/stop status, shared legacy pending commands and PCM
@@ -619,6 +619,11 @@ Checklist status: [x] completed; [ ] planned.
      framebuffer storage, bounded inline pixel operations, mode selection,
      full-region validation, protected aliases, and compiled-C/native execution
      regressions.
+**** [x] Retire low console/text, interrupt/PIT, RTC, fault, BIOS and disk
+     aliases; verify these addresses are ordinary RAM while keeping the active
+     low graphics window reserved and supervisor-only.
+**** [ ] Retire the remaining low graphics register window and verify its
+     former addresses are ordinary RAM with no handler or buffer reservation.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup
@@ -629,14 +634,16 @@ Checklist status: [x] completed; [ ] planned.
 *** [x] Add syscall 25 for a validated keyboard/mouse snapshot; verify
     event-latch preservation on invalid output buffers and execute the C ABI
     from a protected guest task.
-** [ ] Version executable images and reject stale or unversioned runtime
+** [x] Version executable images and reject stale or unversioned runtime
    images with actionable diagnostics.
-** [ ] Migrate firmware, toolchain, all programs, and launch paths to the
-   revised ABI; remove legacy device/ABI implementation paths rather than
-   retaining compatibility shims; rebuild installed images without overwriting
-   writable disk data or settings.
-** [ ] Pass hardware, protection, compiler-execution, BIOS, SisuOS, and
-   program regressions; update the architecture and migration documentation.
+** [ ] Migrate the BIOS, shared components required by SisuOS, and SisuOS
+   launch paths to the revised ABI; remove legacy device/ABI implementation
+   paths rather than retaining compatibility shims; rebuild SisuOS images
+   without overwriting writable disk data or settings. Do not update unrelated
+   programs or images.
+** [ ] Pass hardware, protection and SisuOS acceptance regressions, adding
+   compiler-execution coverage only where required; update the architecture
+   and migration documentation.
 
 === Phase 11 - Final tasks
 * [ ] Perform a final review of all documentation, ensuring accuracy and completeness.

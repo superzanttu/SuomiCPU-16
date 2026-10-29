@@ -82,10 +82,10 @@ kernel (Supervisor) mode. This is a fixed emulator policy, not a signature check
 the image is not authenticated, and the trust assumption does not imply secure
 boot.
 
-Boot executables use the version 2 +SC16IMG2+ container specified in
-link:sc16_architecture.adoc[+sc16_architecture.adoc+]. The loader rejects the
-previous +SC16IMG1+ format; disks containing v1 images must be rebuilt with
-+sc16build+ or otherwise migrated. Segment permissions and alignment are
+Boot executables use the version 3 +SC16IMG3+ container for machine revision 2,
+specified in link:sc16_architecture.adoc[+sc16_architecture.adoc+]. The loader
+rejects +SC16IMG1+, +SC16IMG2+, unknown revisions and raw binaries; executable
+images must be rebuilt for revision 2. Segment permissions and alignment are
 validated as image metadata. The MMU enforces mapped permissions when
 translation is enabled; normal BIOS USER boot does not yet enable translation
 and is not an isolation boundary.
@@ -107,7 +107,7 @@ KERNEL maps to the CPU's +Supervisor+ privilege mode; USER maps to +User+.
 The common +firmware/bios.bin+ image is required, trusted by policy, and executes in
 kernel (Supervisor) mode before disk selection.
 The guest BIOS renders through the character-cell display and uses the
-supervisor-only firmware service at +0x43400+ for disk discovery and image
+supervisor-only firmware gateway at +0x3ff0b000+ for disk discovery and image
 loading. This service is a firmware boundary, not a general syscall or
 authenticated boot mechanism. The guest folder-filesystem service is exposed
 through the separate register gateway below; it does not use the retired
@@ -116,8 +116,11 @@ workflow and can mount a folder disk with +--disk ID+.
 
 == Guest BIOS disk service
 
-The service is invoked by writing a command byte to +0x43400+ while in
-Supervisor mode. All multi-byte values are big-endian.
+The service is invoked by writing a command byte to +0x3ff0b000+ while in
+Supervisor mode. Requests are staged in the same 90-byte high-address bank.
+All multi-byte values are big-endian. Status is at +0x3ff0b001+; command
+results are returned in the gateway's inline output area beginning at
++0x3ff0b100+, with its byte length at +0x3ff0b008+.
 
 [cols="1,2,3"]
 |===
@@ -125,34 +128,33 @@ Supervisor mode. All multi-byte values are big-endian.
 
 |+1+
 |Count disks
-|Writes the default selection index to +0x43402+ and the candidate count to
-  +0x43404+. +--disk ID+ selects the initial index when it matches a
+|Writes the default selection index to +0x3ff0b002+ and the candidate count
+  to +0x3ff0b004+. +--disk ID+ selects the initial index when it matches a
   discovered ID; otherwise index zero is used and the missing ID is logged.
-  +0x43406+ is nonzero when automatic startup is enabled and a preferred disk
-  was found. With that value set, the BIOS waits five seconds for Space before
-  booting; the startup wait marker at +0x4342e+ is nonzero during this window.
-  The SC-NET node ID is written at +0x43410+ in a 17-byte
+  +0x3ff0b006+ is nonzero when automatic startup is enabled and a preferred
+  disk was found. With that value set, the BIOS waits five seconds for Space
+  before booting; the startup wait marker at +0x4ffff+ is nonzero during this
+  window. The SC-NET node ID is written at +0x3ff0b010+ in a 17-byte
   NUL-terminated buffer (maximum 16 printable ASCII bytes). The number of
-  custom settings is at +0x4340e+.
+  custom settings is at +0x3ff0b00e+.
 
 |+2+
 |Read disk ID
-|The 16-bit candidate index is at +0x43402+. Output pointer and capacity are
-  at +0x43406+ and +0x4340a+. The selected ID is written as ASCII followed by
-  NUL.
+|The 16-bit candidate index is at +0x3ff0b002+. The ID is returned as ASCII
+  followed by NUL in the inline output area.
 
 |+3+
 |Boot disk
-|The candidate index is at +0x43402+. The service validates the folder
+|The candidate index is at +0x3ff0b002+. The service validates the folder
   manifest and boot image, loads the fixed +main.bin+ or +kernel.bin+ image,
   mounts the selected folder, and transfers control in the corresponding
   privilege mode.
 
 |+4+
 |Save BIOS settings
-|The selected disk index is at +0x43402+, startup behavior at +0x43406+
+|The selected disk index is at +0x3ff0b002+, startup behavior at +0x3ff0b006+
   (+0+ selector, +1+ boot preferred disk), and the NUL-terminated SC-NET node
-  ID at +0x43410+ in a 17-byte NUL-terminated buffer (maximum 16 printable
+  ID at +0x3ff0b010+ in a 17-byte NUL-terminated buffer (maximum 16 printable
   ASCII bytes). Saves the settings to the +config/bios.json+, preserving
   additional boolean, integer, and string settings.
 
@@ -163,8 +165,8 @@ Supervisor mode. All multi-byte values are big-endian.
 
 |+6+
 |Read custom setting
-|The zero-based index in the sorted settings list is at +0x43402+. The result
-  record starts at +0x43430+: a 17-byte NUL-terminated name, a type byte
+|The zero-based index in the sorted settings list is at +0x3ff0b002+. The result
+  record starts at +0x3ff0b030+: a 17-byte NUL-terminated name, a type byte
   (+0+ boolean, +1+ string, +2+ integer), and a 24-byte NUL-terminated value.
   Boolean values are +Yes+/+No+ and integer values use signed decimal text.
 
@@ -173,9 +175,19 @@ Supervisor mode. All multi-byte values are big-endian.
 |Writes the same record layout returned by command +6+. The name and type
   must match an existing setting. String values are limited to 16 printable
   ASCII bytes; integer values must parse as signed 64-bit decimal values.
+
+|+8+
+|Read disk information
+|The 16-bit candidate index is at +0x3ff0b002+. The display summary is
+  returned as NUL-terminated ASCII in the inline output area.
+
+|+9+
+|Save preferred disk
+|The selected disk index is at +0x3ff0b002+. Updates the preferred disk while
+  preserving the current startup behavior.
 |===
 
-Status at +0x4340c+ is zero on success and one on failure. Failures are also
+Status at +0x3ff0b001+ is zero on success and one on failure. Failures are also
 logged to the Bug Monitor; a failed boot leaves the BIOS available to retry.
 The BIOS menu uses F9 to reload settings and F10 to save. During automatic
 startup, press Space within five seconds to enter BIOS setup. F2 toggles the
@@ -215,64 +227,14 @@ silently replaced.
 
 == Guest folder-filesystem service
 
-Booting a folder disk mounts that disk for the guest. The current compatibility
-service is selected by writing one command to +0x43100+ while in USER mode.
-Path and buffer addresses are big-endian 32-bit values; paths are null
-terminated ASCII, at most 128 bytes, and use the normalized relative-path
-syntax above. Guest buffer ranges must fit in configured memory and must not
-overlap memory-mapped devices. Transfers are limited to 4096 bytes. Service
-failure sets status at +0x43110+ to 1 and writes the diagnostic to the Bug
-Monitor; success sets status to 0.
-
-[cols="1,2,3"]
-|===
-|Command |Operation |Request and result
-
-|+0x41+
-|List directory entry
-|+0x43116+ points to a directory path; an empty string selects the disk root.
-  The 16-bit entry index is at +0x4310a+. The output pointer and capacity are
-  at +0x4311a+ and +0x4311e+. An entry encodes name plus NUL, a type byte
-  (+1+ for directory, +0+ for file), and a 32-bit big-endian size. Result at
-  +0x4310e+ is the total entry count; an index past the end returns an empty
-  name.
-
-|+0x42+
-|Read file
-|Path pointer at +0x43116+, 32-bit file offset at +0x43112+, output pointer
-  at +0x4311a+, and requested length at +0x4311e+. Result is bytes read;
-  32-bit file size is returned at +0x43120+.
-
-|+0x43+
-|Replace file
-|Path and input buffer pointers at +0x43116+ and +0x4311a+; input length at
-  +0x4311e+. The operation replaces the whole file and returns bytes written.
-
-|+0x44+
-|Create directory
-|Path pointer at +0x43116+.
-
-|+0x45+
-|Delete file or empty directory
-|Path pointer at +0x43116+.
-
-|+0x46+
-|Rename file or directory
-|Source path pointer at +0x43116+; destination path pointer at +0x43112+.
-
-|+0x47+
-|Query entry metadata
-|Path pointer at +0x43116+; output pointer at +0x4311a+. Output is a type
-  byte (+1+ for directory, +0+ for file) followed by 32-bit big-endian size.
-|===
-
-The 16-bit result register is at +0x4310e+ and status is at +0x43110+.
-Guest mutations obey disk-wide read-only mode and manifest protected paths.
-Guest code cannot create, replace, remove, or rename the root boot filenames
-+main.bin+ and +kernel.bin+. This narrow register gateway is not the finalized
-general syscall ABI and does not provide general MMIO or process isolation.
-Command +0x80+ remains as a read-only recursive file-list compatibility shim
-for +toolchain/include/disk.h+; legacy block commands are rejected.
+The low register service formerly mapped at +0x43100+-+0x431FF+ has been
+retired; those addresses are ordinary RAM and have no filesystem side effects.
+User programs access their mounted folder disk through the protected syscall
+ABI. The supervisor-only high filesystem bank provides bounded inline
+operations; its register layout and validation rules are documented in
+link:sc16_architecture.adoc[+sc16_architecture.adoc+]. The former pointer-based
+register helpers in +toolchain/include/folder_fs.h+ and +toolchain/include/disk.h+
+do not describe a supported hardware interface.
 
 == Implementation status
 
@@ -282,9 +244,9 @@ reads regular files, lists directories, creates directories, writes, copies,
 renames, and deletes files and empty directories, accounts regular-file bytes,
 enforces disk-wide read-only mode, protected paths, and write/copy capacity,
 rejects over-capacity disks at mount, and selects/validates the fixed-name boot
-image. Image parsing accepts only `SC16IMG2`, checks segment ranges, overlap,
-alignment, permissions, entry-point execution permission, reserved fields, and
-exact file length. `sc16build import-block-disk` exports legacy JSON blocks as
+image. Image parsing accepts only `SC16IMG3` for machine revision 2, checks
+segment ranges, overlap, alignment, permissions, entry-point execution
+permission, reserved fields, and exact file length. `sc16build import-block-disk` exports legacy JSON blocks as
 regular files without modifying the source. `sc16build package-disk` builds
 one program into a new boot-disk folder with `main.bin` or `kernel.bin`.
 Guest integration includes a bounded user-mode register gateway for directory

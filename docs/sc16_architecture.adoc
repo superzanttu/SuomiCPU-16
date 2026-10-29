@@ -33,14 +33,16 @@ accesses are permitted when every byte is valid and permitted. Address
 translation and permission checks apply independently to every byte of an
 access.
 
-The system identification, interrupt/PIT, fault, input, clock/random, audio, game-network,
-console, firmware-text and firmware-gateway banks are implemented in this aperture without RAM backing. All other high banks remain
-reserved. The low-address legacy device
-banks remain in use until their coordinated firmware/toolchain/program migration
-is complete. Instruction operands retain architectural address bits before
-device checks, including on small-memory machines; device accesses cannot
-be masked into low RAM. Legacy wrapping of nondevice RAM accesses remains
-during migration.
+The system identification, interrupt/PIT, fault, input, clock/random, graphics,
+audio, game-network, filesystem, console, firmware-text and firmware-gateway
+banks are implemented in this aperture without RAM backing. All other high
+banks remain reserved. The low console/text, interrupt/PIT, RTC, fault and BIOS
+aliases have been retired and their addresses are ordinary RAM. Legacy low
+graphics and disk register windows remain reserved and supervisor-only until
+those interfaces are removed. Instruction operands retain architectural
+address bits before high-device checks, including on small-memory machines;
+device accesses cannot be masked into low RAM. Legacy wrapping of nondevice RAM
+accesses remains during migration.
 
 === High device map and register contracts
 
@@ -76,16 +78,15 @@ not change them.
 [cols="1,1,3"]
 |===
 |System offset |Register |Value
-|`0x00` |Machine revision |`1` during migration; not yet revision 2
+|`0x00` |Machine revision |`2`
 |`0x04` |Device ABI |`1`, identifying this bank contract
 |`0x08` |Usable RAM bytes |Configured backing size capped at `0x3ff00000`
 |`0x0c` |Address bits |`30`
 |`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0xfff`
 |===
 
-The migration-time machine revision does not advertise completion of the
-revision-2 contract. Images still use SC16IMG2; the machine revision changes
-only with the coordinated image, firmware and program migration.
+Revision 2 identifies the high-address device contract. SC16IMG3 images encode
+this revision; older and unversioned images are rejected by runtime loaders.
 
 Every high device access is supervisor-only and nonexecutable, regardless
 of user/executable bits in a forged page-table entry. MMU translation permits
@@ -141,12 +142,10 @@ IDT/PIT scheduling without emulator-managed tasks. The timer advances after
 executed instructions and during existing host-managed idle scheduling; it is
 not a wall-clock frequency guarantee.
 
-The migration-time low ICR, PIT mask and period addresses use this same controller,
-not RAM as authoritative state. Legacy period byte writes retain their existing
-immediate reload behavior. Legacy writes and host events may maintain low RAM
-mirrors where backing exists, but direct host RAM mutation is not a device API.
-High register writes never index or wrap into RAM. These aliases remain only
-until the coordinated revision-2 migration.
+Interrupt control, PIT configuration and pending state are exposed only through
+the high interrupt bank. The former low ICR, PIT mask and period addresses are
+ordinary RAM and do not update controller state. High register writes never
+index or wrap into RAM.
 
 ==== Fault bank
 
@@ -165,8 +164,8 @@ Fault state starts at zero and is cleared by image-entry preparation. Recording
 a fault replaces all fields before dispatching its handler, independently of RAM
 size. Reads neither acknowledge nor clear it; all writes fault as read-only.
 There is no command or overflow behavior. Translated device aliases retain the
-original virtual address, not the physical bank address. Legacy fault-register
-reads use this same record; low backing mirrors are maintained only when present.
+original virtual address, not the physical bank address. The former low fault
+register addresses are ordinary RAM and do not mirror fault state.
 
 ==== Input bank
 
@@ -199,19 +198,16 @@ Position is clamped to 320x240 or 640x480 according to the active video mode.
 Wheel updates accumulate with signed 16-bit saturation until the existing host
 end-of-mouse-frame hook clears them. Reading wheel does not clear it.
 
-Keyboard and mouse-event reads through high, translated or legacy addresses
+Keyboard and mouse-event reads through high or translated device addresses
 consume the same typed latch exactly once. Every byte of a multibyte access is
 validated before consumption, so an access crossing reserved bytes or failing
 permissions leaves events intact. Other input reads have no device side effects.
 Input state and double-click history survive image-entry preparation; interrupt
 pending state is separately cleared by that path.
 
-Legacy held-key bytes remain in their original low-byte-first order; the high
-bank exposes the same 24 bits as a conventional big-endian 32-bit value with a
-zero high byte. Legacy mouse byte layouts and migration-time supervisor byte
-writes are retained. Host input producers and valid destructive reads maintain
-low RAM mirrors only where backing exists; direct host RAM mutation is not an
-input API. High input access works even when no legacy backing exists.
+The high bank exposes held keys as a conventional big-endian 32-bit value with
+a zero high byte. Host input producers and valid destructive reads update only
+the typed device state; direct host RAM mutation is not an input API. High input access works even when no legacy backing exists.
 
 ==== Graphics bank
 
@@ -378,9 +374,9 @@ scrollback and 65536-byte bounded output log. Output-log overflow discards its
 oldest quarter; it does not block or set input-overrun.
 
 Data writes and echoed input update the same terminal render state and output
-log as legacy console accesses and console syscalls. High and low accesses
-consume the same FIFO exactly once; a rejected multibyte access consumes/echoes
-nothing and changes neither control nor overrun. Input/output, cursor, escape
+log as high console accesses and console syscalls. The retired low console
+addresses are ordinary RAM. A rejected multibyte access consumes/echoes nothing
+and changes neither control nor overrun. Input/output, cursor, escape
 parser, overrun and control survive image-entry preparation; existing BIOS
 handoff may separately clear input. This bank still addresses the single console;
 four per-session terminals are a later OS requirement, not implemented here.
@@ -416,21 +412,18 @@ Writing a coordinate affects only that coordinate, preserving the other live
 coordinate. All reads are side-effect-free. Invalid multibyte accesses do not
 partially print, clear, enable or move the cursor.
 
-High and legacy paths use the same display handlers and cells. For migration
-compatibility, legacy text register reads retain their last written byte rather
-than the new bank's live cursor/command readback. Legacy row/column writes still
-combine the two last-written coordinate latches; high coordinate writes act on
-the current cursor. These legacy latches are now outside RAM. Only legacy writes
-maintain backed low register mirrors; high console/text accesses never index RAM.
+The high console/text banks use typed device state and do not index or mirror
+registers in low RAM. Their cursor readback is live and independent of the
+retired low text addresses.
 
 ==== Filesystem bank
 
 The supervisor-only filesystem bank provides bounded inline access to the
 currently mounted folder disk, or the program disk when no data disk is mounted.
 It calls the same `FolderDisk` containment, symlink rejection, capacity,
-read-only and protected-file checks as the legacy disk service. It is not a
-user authorization boundary; multiuser permissions and the protected user
-filesystem service are not yet implemented.
+read-only and protected-file checks used by the protected filesystem syscalls.
+It is not a user authorization boundary; multiuser permissions and the
+protected user filesystem service are not yet implemented.
 
 [cols="1,1,1,3"]
 |===
@@ -467,19 +460,16 @@ count and encodes the staged index into data as `name NUL`, directory byte
 one zero byte. Read returns up to the staged length from the staged 32-bit offset,
 with byte count in result and 32-bit file size. Write replaces the whole file
 from the first staged `length` bytes; file size/result equal that length. Transfer
-lengths above 512 are rejected; the legacy disk interface retains its separate
-4096-byte limit. `mkdir`, delete and rename use the corresponding protected
-folder-disk operations; delete accepts files or empty directories and rename
-does not replace existing entries. Mutation of `main.bin` and `kernel.bin` is
-forbidden. Stat returns result 5 and a five-byte response: directory flag then
-32-bit size. Root-level `disk.json` remains hidden by listing and protected by
-the existing disk implementation. No host paths or unchecked guest pointers
-are exposed through this bank.
+lengths above 512 are rejected. `mkdir`, delete and rename use the
+corresponding protected folder-disk operations; delete accepts files or empty
+directories and rename does not replace existing entries. Mutation of
+`main.bin` and `kernel.bin` is forbidden. Stat returns result 5 and a five-byte
+response: directory flag then 32-bit size. Root-level `disk.json` remains
+hidden by listing and protected by the existing disk implementation. No host
+paths or unchecked guest pointers are exposed through this bank.
 
-The legacy disk register service remains active during migration and uses its
-RAM-only path and transfer buffers. Both interfaces target the same mounted disk
-and preserve manifest/capacity semantics, but they use independent staging and
-response windows. This bank does not implement ownership, chmod/chown, cwd,
+The retired low disk register window is ordinary RAM and has no device handler.
+This bank does not implement ownership, chmod/chown, cwd,
 atomic replacement, credential metadata or user-mode access; those belong to
 the later protected filesystem service.
 
@@ -605,16 +595,17 @@ constrained by the rules below.
 
 == Executable image format
 
-Offline build tools emit the version 2 `SC16IMG2` container. All multibyte
-container fields are unsigned big-endian values. The 20-byte header contains:
+Offline build tools emit the version 3 `SC16IMG3` container for machine
+revision 2. All multibyte container fields are unsigned big-endian values. The
+20-byte header contains:
 
 [cols="1,1,2"]
 |===
 |Offset |Size |Value
 
-|0 |8 bytes |ASCII magic `SC16IMG2`
-|8 |2 bytes |Format version, exactly 2
-|10 |2 bytes |Reserved header flags, required to be zero
+|0 |8 bytes |ASCII magic `SC16IMG3`
+|8 |2 bytes |Format version, exactly 3
+|10 |2 bytes |Required machine revision, exactly 2
 |12 |4 bytes |30-bit entry-point address
 |16 |4 bytes |Load-segment count, from 1 through 65,536
 |===
@@ -643,7 +634,8 @@ segments are loaded at their encoded addresses, and the offline assembler and
 compiler must resolve every reference before emitting the image. An unresolved
 reference is a build error. Current C builds are single translation units;
 multi-translation-unit linkage remains tracked separately in the C90 roadmap.
-`SC16IMG1` is intentionally rejected; no v1 reader compatibility is provided.
+`SC16IMG1`, `SC16IMG2`, unknown machine revisions and unversioned raw binaries
+are rejected; no compatibility reader is provided.
 
 CPU loading validates every segment and the entry point against configured RAM
 before copying any segment. Direct and folder-disk launch, including BIOS
@@ -689,7 +681,7 @@ source-compilation or host-selector fallback. CPU state is:
 The common firmware image starts at address zero and continues executing until
 it launches a selected image. The guest BIOS renders its selector through the
 character-cell device, polls the keyboard device, and uses the supervisor-only
-firmware service at +0x43400+ to enumerate candidate disk IDs, display the
+firmware service at +0x3ff0b000+ to enumerate candidate disk IDs, display the
 selected manifest's label, capacity, write policy and boot mode, and boot the
 selected folder. The service validates the selected manifest and fixed
 executable rule, loads the prebuilt image, mounts the disk, and transfers
@@ -702,9 +694,9 @@ design does not claim authenticated boot or memory isolation. Firmware may
 enable interrupts only after its handlers and kernel stack are ready.
 
 For the BIOS firmware gateway, write the operation number to byte
-`0x43400`; byte `0x4340c` reports success (0) or failure (nonzero). The
-selected disk index is the big-endian word at `0x43402`. Operation 4 saves the
-settings menu, including startup policy byte `0x43406`; operation 9 saves only
+`0x3ff0b000`; byte `0x3ff0b001` reports success (0) or failure (nonzero). The
+selected disk index is the big-endian word at `0x3ff0b002`. Operation 4 saves the
+settings menu, including startup policy byte `0x3ff0b006`; operation 9 saves only
 the preferred disk and deliberately leaves startup policy and other settings
 unchanged. Enter on the Boot Device row uses operation 9 before booting, so a
 disk index cannot be mistaken for the 0/1 startup policy.
@@ -741,14 +733,12 @@ It opts that task into the emulator-backed scheduling and syscall extension.
 `ENTERU` does not create a host task: a guest kernel can instead own scheduling,
 save registers on timer entry, change its page-directory root, select a saved
 supervisor stack, and resume with `RTI`.
-Interrupt-control, timer-control, BIOS, and other protected MMIO accesses are
-rejected in user mode. The explicit user-safe console, disk, text, input, and
-basic graphics ranges are filtered by the CPU. The GPU speed selector at
-`0x43003`, frame-synchronization control at `0x43013`, and display mode
-selector at `0x43014` are also user-writeable; the interrupt-control register
-at `0x43002` remains supervisor-only. Pointer-bearing GPU commands are
-rejected for MMU-enabled user tasks until a validated guest-buffer ABI is
-available.
+High-aperture MMIO access is rejected in user mode, including translated
+aliases. The remaining low graphics register window is supervisor-only.
+Retired low console/text, interrupt/clock/fault, BIOS and disk addresses are
+ordinary RAM rather than device aliases. User programs use only typed,
+validated syscall services; there is no generic register or physical-memory
+access syscall.
 
 User instruction fetches, loads, and stores may access only user-permitted
 memory when MMU translation is enabled. Page permissions apply to every byte
@@ -830,11 +820,12 @@ there. Events from supervisor mode use the current supervisor stack. The
 frame layout above is implemented. Missing handlers are not replaced by
 legacy fixed-vector words.
 
-The PIT period is a 16-bit value at `0x4301e`; zero disables periodic
-generation. One timer tick is one completed emulator instruction, including
-headless execution, so no host wall clock is involved. The mask/enable bit is
-bit 0 at `0x43016`; timer pending is bit `0x10` in the interrupt-control
-register. Pending state remains latched while masked and is cleared on
+The PIT period is a 16-bit value at `INTERRUPT_PIT_PERIOD`; zero disables
+periodic generation. One timer tick is one completed emulator instruction,
+including headless execution, so no host wall clock is involved. The
+`INTERRUPT_PIT_ENABLE` register masks delivery without stopping counting.
+Pending sources are read from `INTERRUPT_PENDING` and acknowledged through
+`INTERRUPT_ACK`. Pending state remains latched while masked and is cleared on
 delivery. A scheduler-managed task context is preempted at the validated PIT
 boundary; otherwise delivery enters the installed vector handler.
 
@@ -884,33 +875,34 @@ unmap. Unmapped pages can serve as guard pages. These are kernel primitives;
 the BIOS does not yet establish a protected address space as part of normal
 user boot.
 
-The emulator-managed process allocator reserves the remaining low MMIO backing
-`0x43000..0x43fff` before allocating page tables or process pages. Graphics
-pixels live in a device-owned buffer, independent of backing RAM size and
-unaddressable by guest loads, stores, DMA-like operations or process mappings.
+The emulator-managed process allocator reserves the remaining low graphics
+register window before allocating page tables or process pages.
+The high device aperture is excluded from usable RAM, images, and page
+allocations. Graphics pixels live in a device-owned buffer, independent of
+backing RAM size and unaddressable by guest loads, stores, DMA-like operations
+or process mappings.
 Addresses formerly occupied by the framebuffer are ordinary RAM; they do not
 alias the device-owned pixels.
 
 == Device access
 
-The emulator exposes keyboard, mouse, interrupt control, RTC, timer, GPU,
-disk, and console registers through memory-mapped addresses. User instruction
-access is filtered by safe service ranges; privileged controls and BIOS
-registers are rejected. The folder-filesystem gateway validates user pointers
+The emulator exposes the revised device banks through high-address,
+supervisor-only MMIO. The remaining low graphics register window is
+migration-only and supervisor-only; retired low control, terminal, BIOS and
+disk addresses are RAM. The folder-filesystem gateway validates user pointers
 against the active MMU mappings, including noncontiguous buffers, when paging
-is enabled. Legacy block commands are rejected in user mode. This device
+is enabled. The retired low disk window has no command handler. This device
 gateway remains distinct from the general syscall ABI. With translation
 disabled, ordinary RAM is not isolated from user code.
 
 Validated buffer services reject both virtual and translated physical addresses
-in the MMIO backing range above. This applies to paths,
-arguments, console and file transfers, process reports, networking, and folder
-gateway transfers, including requests made by supervisor code through those
+in the high device aperture and the remaining low graphics window. This applies
+to paths, arguments, console and file transfers, process reports, networking,
+and folder gateway transfers, including requests made by supervisor code through those
 buffer helpers. Checks cover every requested byte before consuming input or
 modifying output; crossing from ordinary RAM into a device range is an error,
-not a partial transfer. Direct legacy graphics/MMIO access is unchanged here:
-this buffer and allocator protection does not complete the planned supervisor-only
-device bus or make no-MMU execution isolated.
+not a partial transfer. Direct access to the remaining legacy low graphics
+window is not a supported user interface.
 
 == System-call ABI version 1
 
@@ -1073,7 +1065,7 @@ contract:
   written at the last column wraps. Advancing beyond the last row scrolls all
   rows up by one, clears the final row using the current background, and leaves
   the cursor there.
-* The service is exposed through guest-visible byte registers at `0x43300`:
+* The service is exposed through guest-visible byte registers at `0x3ff0a000`:
   data at offset 0, foreground at 1, background at 2, control at 3, row at 4,
   and column at 5. Control commands 1, 2, and 3 clear, enable, and disable the
   surface. Cursor coordinates are zero-based and clamped to the surface. The
@@ -1095,11 +1087,10 @@ The currently supported encoded formats and interfaces are:
 |Interface |Supported version or status
 
 |Machine/ISA
-|This document defines the target contract; there is no separately encoded
-machine or ISA version.
+|Machine revision 2; device ABI 1.
 
 |Executable image
-|Version 2 (`SC16IMG2`). Version 1 images are rejected.
+|Version 3 (`SC16IMG3`), machine revision 2. Earlier and raw images are rejected.
 
 |Folder-disk manifest
 |Version 1 (`disk.json`).

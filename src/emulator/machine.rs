@@ -118,7 +118,7 @@ pub const FILESYSTEM_PATH: u32 = FILESYSTEM_BASE + 24;
 pub const FILESYSTEM_DESTINATION: u32 = FILESYSTEM_BASE + 152;
 pub const FILESYSTEM_DATA: u32 = FILESYSTEM_BASE + 0x120;
 pub const FILESYSTEM_DATA_SIZE: usize = 512;
-pub const MACHINE_REVISION: u32 = 1;
+pub const MACHINE_REVISION: u32 = 2;
 pub const DEVICE_ABI: u32 = 1;
 pub const IMPLEMENTED_BANKS: u32 = 0xfff;
 
@@ -977,16 +977,6 @@ impl InterruptController {
             }
             _ => panic!("host write to a read-only or unimplemented interrupt register"),
         }
-    }
-
-    pub fn write_legacy_period_byte(&mut self, low: bool, value: u8) {
-        self.period = if low {
-            (self.period & 0xff00) | u16::from(value)
-        } else {
-            (self.period & 0xff) | (u16::from(value) << 8)
-        };
-        self.period_latch = self.period;
-        self.countdown = self.period;
     }
 
     pub fn tick(&mut self) {

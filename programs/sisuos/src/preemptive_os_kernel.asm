@@ -3,7 +3,7 @@ kernel_start:
     LDI R0, 0
     LDI R1, 0x800
     LIDT R0
-    LDI30 R6, 0x4301e
+    LDI30 R6, 0x3ff01008
     LDI R0, 4
     STW R6, R0
     LDI R0, 0

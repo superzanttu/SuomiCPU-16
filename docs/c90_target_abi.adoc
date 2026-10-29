@@ -263,7 +263,7 @@ and recursive returns.
 
 == Freestanding image entry
 
-The `SC16IMG2` entry point is an image/loader contract, not the hosted C
+The `SC16IMG3` entry point is an image/loader contract, not the hosted C
 `main` interface. The loader begins execution at the image entry point with
 R0-R7 zeroed, flags clear, interrupts disabled, and SP pointing to a valid
 writable stack region that grows toward lower addresses. The loader also
@@ -391,12 +391,15 @@ conventions; their binary16 math routines are not binary64 C90 implementations.
 
 The hosted implementation uses the emulator's byte-addressable 1 GiB
 address space. The common guest BIOS exposes a descriptor at +0x43040+, an
-interactive folder-disk selector, and a memory-mapped console at +0x43200+.
+interactive folder-disk selector, and a supervisor-only console at
++0x3ff09000+.
 The BIOS loads the selected prebuilt image into memory; folder disks also
 provide the guest filesystem. The console currently supports a subset of standard
 text streams and formatted output. File-backed streams, floating-point format
 conversions, and several required C90 I/O facilities remain unimplemented.
-Device-mapped addresses retain their documented SC-16 behavior. Compiler
+The shared C stdio assembly still references the retired low console address
++0x43200+ and is not migrated to the revised machine; SisuOS uses protected
+kernel console services. Device-mapped addresses retain their documented SC-16 behavior. Compiler
 global/static data is currently placed in +0x80000..0xFFFFF+; generated
 addresses use +LDI30+ so this region and other addresses are not truncated to
 16 bits. This allocation does

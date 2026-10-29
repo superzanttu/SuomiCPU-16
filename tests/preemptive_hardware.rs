@@ -185,7 +185,8 @@ fn user_c_reads_the_validated_input_snapshot_syscall() {
         },
     )
     .unwrap();
-    cpu.write(0x43000, 65);
+    cpu.signal_keyboard_event(65);
+    cpu.write(suomicpu16::machine::INTERRUPT_ACK, 2);
     cpu.set_key(4, true);
     cpu.set_mouse_position(42, 43);
     cpu.mouse_button(0, true, 42, 43, 0);
@@ -899,7 +900,7 @@ fn event_frame_validation_prevents_partial_writes() {
 
 #[test]
 fn event_frames_reject_device_backing_aliases_before_reading_or_writing() {
-    for physical in [0x43000u32] {
+    for physical in [0x43020u32] {
         let mut cpu = translated_kernel_stack(3);
         cpu.memory[0x3028..0x302c].copy_from_slice(&(physical | 3).to_be_bytes());
         cpu.memory[0x20ff8..0x21000].fill(0xa5);

@@ -19,16 +19,10 @@ use crate::syscall::{KernelState, OpenFile, SyscallNumber};
 pub const MEMORY_SIZE: usize = crate::machine::ADDRESS_SPACE_SIZE as usize;
 pub const ADDRESS_MASK: u32 = (MEMORY_SIZE as u32) - 1;
 
-pub const ICR_ADDR: u32 = 0x43002;
-const GPU_SPEED_ADDR: u32 = 0x43003;
-pub const VSYNC_ADDR: usize = 0x43013;
 const EXCEPTION_ILLEGAL_INSTRUCTION: u16 = 0;
 const EXCEPTION_PRIVILEGE_VIOLATION: u16 = 1;
 const EXCEPTION_PAGE_FAULT: u16 = 2;
 const EXCEPTION_ENTRY_BYTES: u32 = 16;
-const KEYBOARD_ADDR: u32 = 0x43000;
-const KEYS_ADDR: u32 = 0x43004;
-const MOUSE_ADDR: u32 = 0x43008;
 const GPU_BASE: u32 = 0x43020;
 const GPU_MODE_ADDR: u32 = GPU_BASE - 12;
 const GPU_LAYER_SELECT: u32 = GPU_BASE + 16;
@@ -37,35 +31,9 @@ const GPU_LAYER_TRANSPARENCY: u32 = GPU_BASE + 18;
 const GPU_LAYER_ORDER: u32 = GPU_BASE + 23;
 const GPU_LAYER_COUNT: usize = 5;
 const GPU_PALETTE: u8 = 27;
-const RTC_START: u32 = 0x43010;
-pub const TIMER_PERIOD_ADDR: u32 = 0x4301e;
-const PIT_CONTROL_ADDR: u32 = 0x43016;
-const PAGE_FAULT_ADDRESS_ADDR: u32 = 0x43018;
-const PAGE_FAULT_INFO_ADDR: u32 = 0x4301c;
-const DISK_BASE: u32 = 0x43100;
-const DISK_STATUS: u32 = DISK_BASE + 16;
-const BIOS_BASE: u32 = 0x43400;
-const BIOS_STATUS: u32 = BIOS_BASE + 12;
-#[cfg(test)]
-const BIOS_SETTING_RECORD: usize = BIOS_BASE as usize + 0x30;
-pub const BIOS_FIRMWARE_MARKER: u32 = BIOS_BASE + 0x2f;
-pub const BIOS_AUTOBOOT_WAIT_MARKER: u32 = BIOS_BASE + 0x2e;
-const CONSOLE_DATA: u32 = 0x43200;
-const CONSOLE_STATUS: u32 = 0x43201;
-const CONSOLE_CONTROL: u32 = 0x43202;
-pub const GUEST_TEXT_BASE: u32 = 0x43300;
-pub const GUEST_TEXT_DATA: u32 = GUEST_TEXT_BASE;
-pub const GUEST_TEXT_FOREGROUND: u32 = GUEST_TEXT_BASE + 1;
-pub const GUEST_TEXT_BACKGROUND: u32 = GUEST_TEXT_BASE + 2;
-pub const GUEST_TEXT_CONTROL: u32 = GUEST_TEXT_BASE + 3;
-pub const GUEST_TEXT_ROW: u32 = GUEST_TEXT_BASE + 4;
-pub const GUEST_TEXT_COLUMN: u32 = GUEST_TEXT_BASE + 5;
-#[cfg(test)]
-const GUEST_TEXT_CLEAR: u8 = 1;
-#[cfg(test)]
-const GUEST_TEXT_ENABLE: u8 = 2;
-#[cfg(test)]
-const GUEST_TEXT_DISABLE: u8 = 3;
+const LEGACY_GRAPHICS_RANGES: [(u32, u32); 2] = [(GPU_MODE_ADDR, 1), (GPU_BASE, 0xe0)];
+pub const BIOS_FIRMWARE_MARKER: u32 = 0x4fffe;
+pub const BIOS_AUTOBOOT_WAIT_MARKER: u32 = 0x4ffff;
 const GPU_CLEAR: u8 = 1;
 const GPU_PIXEL: u8 = 2;
 const GPU_RECT: u8 = 3;
@@ -115,7 +83,6 @@ const GPU_TILE_COUNT: usize = 256;
 const GPU_TILE_MAX_SIZE: usize = 64;
 const GPU_TILEMAP_MAX_SIZE: usize = 1024;
 const GPU_SPRITE_MAX_SIZE: i32 = 64;
-const DISK_MAX_FILE_READ_SIZE: usize = 4096;
 const FOLDER_FS_LIST: u8 = 0x41;
 const FOLDER_FS_READ: u8 = 0x42;
 const FOLDER_FS_WRITE: u8 = 0x43;
@@ -123,10 +90,7 @@ const FOLDER_FS_CREATE_DIR: u8 = 0x44;
 const FOLDER_FS_DELETE: u8 = 0x45;
 const FOLDER_FS_RENAME: u8 = 0x46;
 const FOLDER_FS_STAT: u8 = 0x47;
-const MMIO_START: u32 = 0x43000;
-const MMIO_END: u32 = 0x44000;
 const VRAM_BYTES: usize = 640 * 480 / 2;
-const DEVICE_RAM_RANGES: [(u32, u32); 1] = [(MMIO_START, MMIO_END - MMIO_START)];
 #[cfg(test)]
 const FORMER_FRAMEBUFFER_START: u32 = 0x50000;
 const GPU3D_FILL: u16 = 1;
@@ -681,7 +645,7 @@ pub struct Cpu {
     pub terminal_active: bool,
     pub terminal_dirty: bool,
     pub guest_text: GuestTextDisplay,
-    legacy_text_registers: [u8; 6],
+
     pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
     pub layers: [Vec<u8>; GPU_LAYER_COUNT],
@@ -757,18 +721,13 @@ impl Cpu {
             let font_size = font.len().min(size - FONT_ADDR);
             memory[FONT_ADDR..FONT_ADDR + font_size].copy_from_slice(&font[..font_size]);
         }
-        if size > CONSOLE_CONTROL as usize {
-            memory[ICR_ADDR as usize] = 0;
-            memory[CONSOLE_CONTROL as usize] = 3;
+        if size > GPU_LAYER_ORDER as usize + GPU_LAYER_COUNT {
             memory[(GPU_BASE - 12) as usize] = 0;
             memory[(GPU_BASE - 13) as usize] = 2;
             memory[GPU_LAYER_MASK as usize] = (1 << GPU_LAYER_COUNT) - 1;
             for layer in 0..GPU_LAYER_COUNT {
                 memory[(GPU_LAYER_ORDER as usize) + layer] = layer as u8;
             }
-        }
-        if let Some(control) = memory.get_mut(PIT_CONTROL_ADDR as usize) {
-            *control = 1;
         }
         let mut palette = [[0; 3]; 256];
         for (index, color) in palette.iter_mut().enumerate() {
@@ -826,7 +785,7 @@ impl Cpu {
             terminal_active: false,
             terminal_dirty: false,
             guest_text: GuestTextDisplay::new(),
-            legacy_text_registers: [0; 6],
+
             saved_video: None,
             random_state: 0x16c0_ffee,
             layers: std::array::from_fn(|_| vec![0; 640 * 480]),
@@ -891,69 +850,6 @@ impl Cpu {
 
     pub fn take_booted_disk_path(&mut self) -> Option<PathBuf> {
         self.booted_disk_path.take()
-    }
-
-    fn bios_register_u16(&self, offset: usize) -> u16 {
-        u16::from_be_bytes([
-            self.memory[BIOS_BASE as usize + offset],
-            self.memory[BIOS_BASE as usize + offset + 1],
-        ])
-    }
-
-    fn bios_register_u32(&self, offset: usize) -> u32 {
-        u32::from_be_bytes([
-            self.memory[BIOS_BASE as usize + offset],
-            self.memory[BIOS_BASE as usize + offset + 1],
-            self.memory[BIOS_BASE as usize + offset + 2],
-            self.memory[BIOS_BASE as usize + offset + 3],
-        ])
-    }
-
-    fn bios_status(&mut self, status: u8) {
-        self.memory[BIOS_STATUS as usize] = status;
-    }
-
-    fn bios_control(&mut self, command: u8) {
-        self.bios_status(0);
-        if self.privilege_mode != PrivilegeMode::Supervisor {
-            self.bios_status(1);
-            self.debug_console
-                .log_error("bios", "user-mode firmware operation was rejected");
-            return;
-        }
-        let mut request = [0; crate::machine::FIRMWARE_REQUEST_BYTES];
-        request.copy_from_slice(
-            &self.memory
-                [BIOS_BASE as usize..BIOS_BASE as usize + crate::machine::FIRMWARE_REQUEST_BYTES],
-        );
-        let result = (|| {
-            let output = if matches!(command, 2 | 8) {
-                Some(self.guest_range(
-                    self.bios_register_u32(6),
-                    usize::from(self.bios_register_u16(10)),
-                )?)
-            } else {
-                None
-            };
-            let response = self.firmware_operation(command, &mut request)?;
-            if command != 3 {
-                self.memory[BIOS_BASE as usize..BIOS_BASE as usize + request.len()]
-                    .copy_from_slice(&request);
-            }
-            if let (Some(output), Some(response)) = (output, response) {
-                if response.len() + 1 > output.len() {
-                    return Err("firmware output buffer capacity is too small".to_owned());
-                }
-                self.memory[output.start..output.start + response.len()]
-                    .copy_from_slice(response.as_bytes());
-                self.memory[output.start + response.len()] = 0;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.bios_status(1);
-            self.debug_console.log_error("bios", &error);
-        }
     }
 
     fn firmware_operation(
@@ -1410,9 +1306,6 @@ impl Cpu {
         self.booted_disk_path = None;
         self.terminal_active = false;
         self.terminal_dirty = false;
-        if let Some(interrupt_control) = self.memory.get_mut(ICR_ADDR as usize) {
-            *interrupt_control = 0;
-        }
     }
 
     pub fn initial_user_stack_pointer(&self) -> u32 {
@@ -1600,8 +1493,8 @@ impl Cpu {
         self.kernel_sp = context.kernel_sp;
         self.flags = context.flags;
         self.privilege_mode = context.privilege_mode;
-        let interrupt_control = (self.read(ICR_ADDR) & !1) | u8::from(context.interrupt_enabled);
-        self.write(ICR_ADDR, interrupt_control);
+        self.interrupts.control =
+            (self.interrupts.control & !1) | u8::from(context.interrupt_enabled);
         self.mmu_enabled = context.mmu_enabled;
         self.page_directory = context.page_directory;
         self.running = true;
@@ -1810,7 +1703,6 @@ impl Cpu {
                 return value;
             }
             if let Some(value) = self.input.read(address) {
-                self.sync_input_mirrors();
                 return value;
             }
             return crate::machine::system_register_byte(address, self.memory.len())
@@ -1824,25 +1716,7 @@ impl Cpu {
                 .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
         }
-        if let Some(value) = self.read_legacy_terminal(address) {
-            return value;
-        }
-        if let Some(value) = self.read_legacy_input(address) {
-            return value;
-        }
-        if let Some(value) = self.legacy_control_byte(address) {
-            return value;
-        }
         let address = address & self.memory_mask;
-        if let Some(value) = self.read_legacy_terminal(address) {
-            return value;
-        }
-        if let Some(value) = self.read_legacy_input(address) {
-            return value;
-        }
-        if let Some(value) = self.legacy_control_byte(address) {
-            return value;
-        }
         self.memory[address as usize]
     }
 
@@ -1884,7 +1758,6 @@ impl Cpu {
         }
         let disk_path = self.disk_root.join(disk_id);
         self.folder_disk = Some(FolderDisk::open(&disk_path)?);
-        self.memory[DISK_STATUS as usize] = 0;
         Ok(())
     }
 
@@ -1936,245 +1809,11 @@ impl Cpu {
         }
     }
 
-    fn disk_register_u16(&self, offset: usize) -> u16 {
-        u16::from_be_bytes([
-            self.memory[DISK_BASE as usize + offset],
-            self.memory[DISK_BASE as usize + offset + 1],
-        ])
-    }
-
-    fn disk_register_u32(&self, offset: usize) -> u32 {
-        u32::from_be_bytes([
-            self.memory[DISK_BASE as usize + offset],
-            self.memory[DISK_BASE as usize + offset + 1],
-            self.memory[DISK_BASE as usize + offset + 2],
-            self.memory[DISK_BASE as usize + offset + 3],
-        ])
-    }
-
-    fn disk_write_result(&mut self, result: u16) {
-        let [high, low] = result.to_be_bytes();
-        self.memory[DISK_BASE as usize + 14] = high;
-        self.memory[DISK_BASE as usize + 15] = low;
-    }
-
-    fn disk_control(&mut self, command: u8) {
-        let caller_mode = self.privilege_mode;
-        if !(command == 0x80 || (FOLDER_FS_LIST..=FOLDER_FS_STAT).contains(&command)) {
-            self.memory[DISK_STATUS as usize] = 1;
-            self.debug_console
-                .log_error("disk", "unsupported disk operation was rejected");
-            return;
-        }
-        self.privilege_mode = PrivilegeMode::Supervisor;
-        self.memory[DISK_STATUS as usize] = 0;
-        if let Err(error) = self.disk_control_inner(command, caller_mode == PrivilegeMode::User) {
-            self.memory[DISK_STATUS as usize] = 1;
-            self.debug_console
-                .log_error("disk", &format!("operation failed: {error}"));
-        }
-        self.privilege_mode = caller_mode;
-    }
-
-    fn disk_control_inner(&mut self, command: u8, user_mode: bool) -> Result<(), String> {
-        match command {
-            0x80 => self.legacy_file_list(user_mode),
-            FOLDER_FS_LIST..=FOLDER_FS_STAT => self.folder_fs_control(command, user_mode),
-            _ => Err("unknown disk service operation".to_owned()),
-        }
-    }
-
-    fn legacy_file_list(&mut self, user_mode: bool) -> Result<(), String> {
-        let index = usize::from(self.disk_register_u16(10));
-        let capacity = usize::from(self.disk_register_u16(30));
-        let disk = self
-            .folder_disk
-            .as_ref()
-            .or(self.program_folder_disk.as_ref())
-            .ok_or_else(|| "no folder filesystem is mounted".to_owned())?;
-        let files = disk.list_files()?;
-        let name = files.get(index).map(String::as_str).unwrap_or("");
-        let encoded = name.as_bytes();
-        let length = encoded.len() + 1;
-        if length > capacity {
-            return Err("virtual file name buffer is too small".to_owned());
-        }
-        let output = self.guest_memory_addresses(
-            self.disk_register_u32(26),
-            length,
-            crate::mmu::MemoryAccess::Write,
-            user_mode,
-        )?;
-        for (address, byte) in output.into_iter().zip(encoded.iter().copied().chain([0])) {
-            self.memory[address] = byte;
-        }
-        self.disk_write_result(u16::try_from(files.len()).unwrap_or(u16::MAX));
-        Ok(())
-    }
-
-    fn folder_fs_control(&mut self, command: u8, user_mode: bool) -> Result<(), String> {
-        let disk = self
-            .folder_disk
-            .as_ref()
-            .or(self.program_folder_disk.as_ref())
-            .ok_or_else(|| "no folder filesystem is mounted".to_owned())?;
-        match command {
-            FOLDER_FS_LIST => {
-                let directory = self.read_guest_path(self.disk_register_u32(22), user_mode)?;
-                let entries = disk.list_dir(directory.as_deref())?;
-                let index = usize::from(self.disk_register_u16(10));
-                let encoded = if let Some(entry) = entries.get(index) {
-                    let size = u32::try_from(entry.size_bytes)
-                        .map_err(|_| "folder filesystem entry exceeds 32-bit size".to_owned())?;
-                    let mut encoded = entry.name.as_bytes().to_vec();
-                    encoded.push(0);
-                    encoded.push(u8::from(entry.is_directory));
-                    encoded.extend_from_slice(&size.to_be_bytes());
-                    encoded
-                } else {
-                    vec![0]
-                };
-                let capacity = usize::from(self.disk_register_u16(30));
-                if encoded.len() > capacity {
-                    return Err("folder filesystem listing buffer is too small".to_owned());
-                }
-                let output = self.guest_memory_addresses(
-                    self.disk_register_u32(26),
-                    encoded.len(),
-                    crate::mmu::MemoryAccess::Write,
-                    user_mode,
-                )?;
-                for (address, byte) in output.into_iter().zip(encoded) {
-                    self.memory[address] = byte;
-                }
-                self.disk_write_result(u16::try_from(entries.len()).unwrap_or(u16::MAX));
-            }
-            FOLDER_FS_READ => {
-                let path = self
-                    .read_guest_path(self.disk_register_u32(22), user_mode)?
-                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
-                let length = usize::from(self.disk_register_u16(30));
-                if length > DISK_MAX_FILE_READ_SIZE {
-                    return Err("folder filesystem transfer exceeds 4096 bytes".to_owned());
-                }
-                let output = self.guest_memory_addresses(
-                    self.disk_register_u32(26),
-                    length,
-                    crate::mmu::MemoryAccess::Write,
-                    user_mode,
-                )?;
-                let offset = u64::from(self.disk_register_u32(18));
-                let (data, file_size) = disk.read_file(&path, offset, length)?;
-                let file_size = u32::try_from(file_size)
-                    .map_err(|_| "folder filesystem file exceeds 32-bit size".to_owned())?;
-                let bytes_read = data.len();
-                for (address, byte) in output.into_iter().zip(data) {
-                    self.memory[address] = byte;
-                }
-                self.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36]
-                    .copy_from_slice(&file_size.to_be_bytes());
-                self.disk_write_result(u16::try_from(bytes_read).unwrap_or(u16::MAX));
-            }
-            FOLDER_FS_WRITE => {
-                let path = self
-                    .read_guest_path(self.disk_register_u32(22), user_mode)?
-                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
-                Self::validate_guest_mutation_path(&path)?;
-                let length = usize::from(self.disk_register_u16(30));
-                if length > DISK_MAX_FILE_READ_SIZE {
-                    return Err("folder filesystem transfer exceeds 4096 bytes".to_owned());
-                }
-                let input = self.guest_memory_addresses(
-                    self.disk_register_u32(26),
-                    length,
-                    crate::mmu::MemoryAccess::Read,
-                    user_mode,
-                )?;
-                let data = input
-                    .into_iter()
-                    .map(|address| self.memory[address])
-                    .collect::<Vec<_>>();
-                disk.write_file(&path, &data)?;
-                self.disk_write_result(u16::try_from(length).unwrap_or(u16::MAX));
-            }
-            FOLDER_FS_CREATE_DIR => {
-                let path = self
-                    .read_guest_path(self.disk_register_u32(22), user_mode)?
-                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
-                Self::validate_guest_mutation_path(&path)?;
-                disk.create_dir(&path)?;
-                self.disk_write_result(0);
-            }
-            FOLDER_FS_DELETE => {
-                let path = self
-                    .read_guest_path(self.disk_register_u32(22), user_mode)?
-                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
-                Self::validate_guest_mutation_path(&path)?;
-                disk.delete_entry(&path)?;
-                self.disk_write_result(0);
-            }
-            FOLDER_FS_RENAME => {
-                let source = self
-                    .read_guest_path(self.disk_register_u32(22), user_mode)?
-                    .ok_or_else(|| "folder filesystem source path is empty".to_owned())?;
-                let destination = self
-                    .read_guest_path(self.disk_register_u32(18), user_mode)?
-                    .ok_or_else(|| "folder filesystem destination path is empty".to_owned())?;
-                Self::validate_guest_mutation_path(&source)?;
-                Self::validate_guest_mutation_path(&destination)?;
-                disk.rename_entry(&source, &destination)?;
-                self.disk_write_result(0);
-            }
-            FOLDER_FS_STAT => {
-                let path = self
-                    .read_guest_path(self.disk_register_u32(22), user_mode)?
-                    .ok_or_else(|| "folder filesystem path is empty".to_owned())?;
-                let entry = disk.metadata(&path)?;
-                let size = u32::try_from(entry.size_bytes)
-                    .map_err(|_| "folder filesystem entry exceeds 32-bit size".to_owned())?;
-                let output = self.guest_memory_addresses(
-                    self.disk_register_u32(26),
-                    5,
-                    crate::mmu::MemoryAccess::Write,
-                    user_mode,
-                )?;
-                for (address, byte) in output.into_iter().zip([
-                    u8::from(entry.is_directory),
-                    size.to_be_bytes()[0],
-                    size.to_be_bytes()[1],
-                    size.to_be_bytes()[2],
-                    size.to_be_bytes()[3],
-                ]) {
-                    self.memory[address] = byte;
-                }
-                self.disk_write_result(5);
-            }
-            _ => return Err("unknown folder filesystem operation".to_owned()),
-        }
-        Ok(())
-    }
-
     fn validate_guest_mutation_path(path: &str) -> Result<(), String> {
         if matches!(path, "main.bin" | "kernel.bin") {
             return Err("boot executable paths cannot be changed by guest code".to_owned());
         }
         Ok(())
-    }
-
-    fn guest_range(&self, address: u32, length: usize) -> Result<std::ops::Range<usize>, String> {
-        let start = usize::try_from(address)
-            .map_err(|_| "guest buffer address is outside memory".to_owned())?;
-        let end = start
-            .checked_add(length)
-            .filter(|end| *end <= crate::machine::usable_ram_size(self.memory.len()))
-            .ok_or_else(|| "guest buffer range is outside memory".to_owned())?;
-        if DEVICE_RAM_RANGES
-            .iter()
-            .any(|&(base, length)| address < base + length && end > base as usize)
-        {
-            return Err("guest buffer overlaps device backing memory".to_owned());
-        }
-        Ok(start..end)
     }
 
     fn guest_memory_addresses(
@@ -2199,7 +1838,7 @@ impl Cpu {
                 })
                 .ok_or_else(|| "guest buffer range is outside address space".to_owned())?;
             if Self::is_device_backing_address(virtual_address) {
-                return Err("guest buffer overlaps device backing memory".to_owned());
+                return Err("guest buffer overlaps device registers".to_owned());
             }
             let physical_address = if self.mmu_enabled {
                 crate::mmu::translate(
@@ -2225,7 +1864,7 @@ impl Cpu {
 
     fn is_device_backing_address(address: u32) -> bool {
         crate::machine::is_device_aperture(address)
-            || DEVICE_RAM_RANGES
+            || LEGACY_GRAPHICS_RANGES
                 .iter()
                 .any(|&(base, length)| address >= base && address - base < length)
     }
@@ -2981,7 +2620,6 @@ impl Cpu {
             Err(_) => return crate::syscall::error::BAD_ADDRESS,
         };
         let snapshot = self.input.take_snapshot();
-        self.sync_input_mirrors();
         for (address, byte) in destinations.into_iter().zip(snapshot) {
             self.memory[address] = byte;
         }
@@ -2993,7 +2631,7 @@ impl Cpu {
             return Ok(());
         }
         let mut manager = crate::mmu::PageMemoryManager::new(self.memory.len(), 0x8000)?;
-        for (base, length) in DEVICE_RAM_RANGES {
+        for (base, length) in LEGACY_GRAPHICS_RANGES {
             let start = base as usize;
             if start < self.memory.len() {
                 let length = (length as usize).min(self.memory.len() - start);
@@ -3273,9 +2911,10 @@ impl Cpu {
         if result.is_ok() {
             for segment in &image.segments {
                 let segment_end = segment.address as usize + segment.data.len();
-                if (segment.address as usize) < MMIO_END as usize
-                    && segment_end > MMIO_START as usize
-                {
+                if LEGACY_GRAPHICS_RANGES.iter().any(|&(base, length)| {
+                    (segment.address as usize) < (base + length) as usize
+                        && segment_end > base as usize
+                }) {
                     result = Err(crate::mmu::PageTableError::InvalidVirtualAddress);
                     break;
                 }
@@ -3861,25 +3500,11 @@ impl Cpu {
             }
             return;
         }
-        if self.write_legacy_terminal(address, value) {
-            return;
-        }
-        if self.write_legacy_control_byte(address, value) {
-            return;
-        }
         let address = address & self.memory_mask;
-        if self.write_legacy_terminal(address, value) {
-            return;
-        }
-        if self.write_legacy_control_byte(address, value) {
-            return;
-        }
         let index = address as usize;
         self.memory[index] = value;
         match address {
             GPU_BASE => self.gpu_command(value),
-            DISK_BASE => self.disk_control(value),
-            BIOS_BASE => self.bios_control(value),
             GPU_LAYER_SELECT => self.gpu_layer_select = value,
             GPU_LAYER_MASK => self.gpu_layer_mask = value,
             address
@@ -3961,50 +3586,6 @@ impl Cpu {
         true
     }
 
-    fn read_legacy_terminal(&mut self, address: u32) -> Option<u8> {
-        match address {
-            CONSOLE_DATA | CONSOLE_STATUS | CONSOLE_CONTROL => {
-                self.read_terminal_register(crate::machine::CONSOLE_BASE + address - CONSOLE_DATA)
-            }
-            GUEST_TEXT_BASE..=GUEST_TEXT_COLUMN => {
-                Some(self.legacy_text_registers[(address - GUEST_TEXT_BASE) as usize])
-            }
-            _ => None,
-        }
-    }
-
-    fn write_legacy_terminal(&mut self, address: u32, value: u8) -> bool {
-        match address {
-            CONSOLE_DATA | CONSOLE_STATUS | CONSOLE_CONTROL => {
-                self.write_terminal_register(
-                    crate::machine::CONSOLE_BASE + address - CONSOLE_DATA,
-                    value,
-                );
-            }
-            GUEST_TEXT_BASE..=GUEST_TEXT_COLUMN => {
-                self.legacy_text_registers[(address - GUEST_TEXT_BASE) as usize] = value;
-                if address == GUEST_TEXT_ROW || address == GUEST_TEXT_COLUMN {
-                    self.guest_text.set_cursor(
-                        usize::from(self.legacy_text_registers[4]),
-                        usize::from(self.legacy_text_registers[5]),
-                    );
-                } else {
-                    self.guest_text
-                        .write_register(address - GUEST_TEXT_BASE, value);
-                }
-            }
-            _ => return false,
-        }
-        if let Some(byte) = self.memory.get_mut(address as usize) {
-            *byte = if address == CONSOLE_CONTROL {
-                self.console.control()
-            } else {
-                value
-            };
-        }
-        true
-    }
-
     fn fault_register_byte(&self, address: u32) -> Option<u8> {
         use crate::machine::*;
         let fault_address = self
@@ -4043,59 +3624,8 @@ impl Cpu {
         (access << 8) | reason
     }
 
-    fn legacy_control_byte(&self, address: u32) -> Option<u8> {
-        match address {
-            address if (RTC_START..RTC_START + 3).contains(&address) => {
-                Some(self.clock.rtc[(address - RTC_START) as usize])
-            }
-            ICR_ADDR => Some(self.interrupts.control),
-            PIT_CONTROL_ADDR => Some(u8::from(self.interrupts.pit_enabled)),
-            address if (TIMER_PERIOD_ADDR..TIMER_PERIOD_ADDR + 2).contains(&address) => {
-                Some(self.interrupts.period.to_be_bytes()[(address - TIMER_PERIOD_ADDR) as usize])
-            }
-            address
-                if (PAGE_FAULT_ADDRESS_ADDR..PAGE_FAULT_ADDRESS_ADDR + 4).contains(&address) =>
-            {
-                self.fault_register_byte(
-                    crate::machine::FAULT_ADDRESS + address - PAGE_FAULT_ADDRESS_ADDR,
-                )
-            }
-            address if (PAGE_FAULT_INFO_ADDR..PAGE_FAULT_INFO_ADDR + 2).contains(&address) => self
-                .fault_register_byte(crate::machine::FAULT_INFO + address - PAGE_FAULT_INFO_ADDR),
-            _ => None,
-        }
-    }
-
-    fn write_legacy_control_byte(&mut self, address: u32, value: u8) -> bool {
-        match address {
-            KEYBOARD_ADDR => self.input.key = value,
-            address if (KEYS_ADDR..KEYS_ADDR + 3).contains(&address) => {
-                let shift = (address - KEYS_ADDR) * 8;
-                self.input.keys =
-                    (self.input.keys & !(0xff << shift)) | (u32::from(value) << shift);
-            }
-            address if (MOUSE_ADDR..MOUSE_ADDR + 8).contains(&address) => {
-                self.input.mouse[(address - MOUSE_ADDR) as usize] = value;
-            }
-            address if (RTC_START..RTC_START + 3).contains(&address) => {
-                self.clock.rtc[(address - RTC_START) as usize] = value;
-            }
-            ICR_ADDR => self.interrupts.control = value,
-            PIT_CONTROL_ADDR => self.interrupts.pit_enabled = value & 1 != 0,
-            address if (TIMER_PERIOD_ADDR..TIMER_PERIOD_ADDR + 2).contains(&address) => {
-                self.interrupts
-                    .write_legacy_period_byte(address != TIMER_PERIOD_ADDR, value);
-            }
-            _ => return false,
-        }
-        if let Some(byte) = self.memory.get_mut(address as usize) {
-            *byte = value;
-        }
-        true
-    }
-
     pub fn raise_rtc_interrupt(&mut self) {
-        self.write(ICR_ADDR, self.interrupts.control | 8);
+        self.interrupts.control |= 8;
     }
 
     pub fn update_rtc(&mut self, timestamp: u64) {
@@ -4104,12 +3634,6 @@ impl Cpu {
             ((timestamp / 60) % 60) as u8,
             ((timestamp / 3600) % 24) as u8,
         ];
-        if let Some(bytes) = self
-            .memory
-            .get_mut(RTC_START as usize..RTC_START as usize + 3)
-        {
-            bytes.copy_from_slice(&self.clock.rtc);
-        }
         self.raise_rtc_interrupt();
     }
 
@@ -4150,25 +3674,6 @@ impl Cpu {
         }
     }
 
-    fn wrapped_range_contains(&self, address: u32, base: u32, length: u32) -> bool {
-        let address = address & self.memory_mask;
-        let start = base & self.memory_mask;
-        let end = base.wrapping_add(length - 1) & self.memory_mask;
-        if start <= end {
-            (start..=end).contains(&address)
-        } else {
-            address >= start || address <= end
-        }
-    }
-
-    fn guest_range_contains(&self, address: u32, base: u32, length: u32) -> bool {
-        if self.mmu_enabled {
-            address >= base && address < base.saturating_add(length)
-        } else {
-            self.wrapped_range_contains(address, base, length)
-        }
-    }
-
     fn check_guest_access(
         &self,
         address: u32,
@@ -4196,37 +3701,21 @@ impl Cpu {
                 reason,
             }));
         }
-        if self.privilege_mode != PrivilegeMode::User
-            || !self.guest_range_contains(address, MMIO_START, MMIO_END - MMIO_START)
+        if self.privilege_mode == PrivilegeMode::User
+            && LEGACY_GRAPHICS_RANGES
+                .iter()
+                .any(|&(base, length)| self.guest_range_contains(address, base, length))
         {
-            return Ok(());
-        }
-        let write = access == crate::mmu::MemoryAccess::Write;
-        let user_service = access != crate::mmu::MemoryAccess::Fetch
-            && (self.guest_range_contains(address, GPU_SPEED_ADDR, 1)
-                || self.guest_range_contains(address, VSYNC_ADDR as u32, 1)
-                || self.guest_range_contains(address, GPU_MODE_ADDR, 1)
-                || self.guest_range_contains(address, DISK_BASE, 0x40)
-                || self.guest_range_contains(address, GPU_BASE, 0x80)
-                || self.guest_range_contains(address, CONSOLE_DATA, 3)
-                || self.guest_range_contains(address, GUEST_TEXT_BASE, 6)
-                || (!write
-                    && (self.guest_range_contains(address, KEYBOARD_ADDR, 1)
-                        || self.guest_range_contains(address, KEYS_ADDR, 3)
-                        || self.guest_range_contains(address, MOUSE_ADDR, 8)
-                        || self.guest_range_contains(address, RTC_START, 4))));
-        if user_service {
-            Ok(())
-        } else {
-            Err(CpuError::PrivilegeViolation {
+            return Err(CpuError::PrivilegeViolation {
                 pc: self.pc,
                 operation: match access {
-                    crate::mmu::MemoryAccess::Fetch => "MMIO instruction fetch",
-                    crate::mmu::MemoryAccess::Read => "MMIO read",
-                    crate::mmu::MemoryAccess::Write => "MMIO write",
+                    crate::mmu::MemoryAccess::Fetch => "legacy MMIO instruction fetch",
+                    crate::mmu::MemoryAccess::Read => "legacy MMIO read",
+                    crate::mmu::MemoryAccess::Write => "legacy MMIO write",
                 },
-            })
+            });
         }
+        Ok(())
     }
 
     fn resolve_guest_range(
@@ -4334,21 +3823,17 @@ impl Cpu {
         Ok(())
     }
 
+    fn guest_range_contains(&self, address: u32, base: u32, length: u32) -> bool {
+        let address = if self.mmu_enabled {
+            address
+        } else {
+            address & self.memory_mask
+        };
+        (base..base + length).contains(&address)
+    }
+
     fn record_page_fault(&mut self, fault: crate::mmu::PageFault) {
         self.last_page_fault = Some(fault);
-        if let Some(bytes) = self
-            .memory
-            .get_mut(PAGE_FAULT_ADDRESS_ADDR as usize..PAGE_FAULT_ADDRESS_ADDR as usize + 4)
-        {
-            bytes.copy_from_slice(&fault.virtual_address.to_be_bytes());
-        }
-        let info = self.page_fault_info().to_be_bytes();
-        if let Some(bytes) = self
-            .memory
-            .get_mut(PAGE_FAULT_INFO_ADDR as usize..PAGE_FAULT_INFO_ADDR as usize + 2)
-        {
-            bytes.copy_from_slice(&info);
-        }
     }
 
     fn read_u64_registers(&self, register: usize) -> u64 {
@@ -5032,8 +4517,7 @@ impl Cpu {
                         operation: "EI",
                     });
                 }
-                let value = self.read(ICR_ADDR) | 1;
-                self.write(ICR_ADDR, value);
+                self.interrupts.control |= 1;
             }
             OP_DI => {
                 if self.privilege_mode != PrivilegeMode::Supervisor {
@@ -5042,8 +4526,7 @@ impl Cpu {
                         operation: "DI",
                     });
                 }
-                let value = self.read(ICR_ADDR) & !1;
-                self.write(ICR_ADDR, value);
+                self.interrupts.control &= !1;
             }
             OP_RTI => self.return_from_exception()?,
             OP_PUSH => self.push_u16(self.registers[rd] as u16)?,
@@ -5159,7 +4642,7 @@ impl Cpu {
         }
 
         self.advance_timer();
-        if self.read(ICR_ADDR) & 1 != 0 {
+        if self.interrupts.control & 1 != 0 {
             self.check_interrupts()?;
         }
         Ok(())
@@ -5194,48 +4677,13 @@ impl Cpu {
         self.console.receive(bytes);
     }
 
-    fn sync_input_mirrors(&mut self) {
-        if let Some(byte) = self.memory.get_mut(KEYBOARD_ADDR as usize) {
-            *byte = self.input.key;
-        }
-        if let Some(bytes) = self
-            .memory
-            .get_mut(KEYS_ADDR as usize..KEYS_ADDR as usize + 3)
-        {
-            bytes.copy_from_slice(&self.input.keys.to_le_bytes()[..3]);
-        }
-        if let Some(bytes) = self
-            .memory
-            .get_mut(MOUSE_ADDR as usize..MOUSE_ADDR as usize + 8)
-        {
-            bytes.copy_from_slice(&self.input.mouse);
-        }
-    }
-
-    fn read_legacy_input(&mut self, address: u32) -> Option<u8> {
-        let value = match address {
-            KEYBOARD_ADDR => self.input.read(crate::machine::INPUT_KEY)?,
-            address if (KEYS_ADDR..KEYS_ADDR + 3).contains(&address) => {
-                self.input.keys.to_le_bytes()[(address - KEYS_ADDR) as usize]
-            }
-            address if (MOUSE_ADDR..MOUSE_ADDR + 8).contains(&address) => self
-                .input
-                .read(crate::machine::INPUT_MOUSE_X + address - MOUSE_ADDR)?,
-            _ => return None,
-        };
-        self.sync_input_mirrors();
-        Some(value)
-    }
-
     pub fn signal_keyboard_event(&mut self, keycode: u8) {
-        self.write(KEYBOARD_ADDR, keycode);
-        let icr = self.read(ICR_ADDR) | 2;
-        self.write(ICR_ADDR, icr);
+        self.input.key = keycode;
+        self.interrupts.control |= 2;
     }
 
     pub fn set_key(&mut self, mask: u32, pressed: bool) {
         self.input.set_key(mask, pressed);
-        self.sync_input_mirrors();
     }
 
     pub fn set_mouse_position(&mut self, x: u16, y: u16) {
@@ -5249,22 +4697,18 @@ impl Cpu {
         let [x_high, x_low] = x.to_be_bytes();
         let [y_high, y_low] = y.to_be_bytes();
         self.input.mouse[..4].copy_from_slice(&[x_high, x_low, y_high, y_low]);
-        self.sync_input_mirrors();
     }
 
     pub fn mouse_button(&mut self, button: usize, down: bool, x: u16, y: u16, now_ms: u64) {
         self.input.mouse_button(button, down, x, y, now_ms);
-        self.sync_input_mirrors();
     }
 
     pub fn set_mouse_wheel(&mut self, delta: i16) {
         self.input.add_wheel(delta);
-        self.sync_input_mirrors();
     }
 
     pub fn end_mouse_frame(&mut self) {
         self.input.mouse[6..8].fill(0);
-        self.sync_input_mirrors();
     }
 
     pub fn take_sound_commands(&mut self) -> Vec<GpuSoundCommand> {
@@ -6552,7 +5996,7 @@ impl Cpu {
         };
 
         let flags = self.pack_flags().to_be_bytes();
-        let interrupt_enabled = self.read(ICR_ADDR) & 1 != 0;
+        let interrupt_enabled = self.interrupts.control & 1 != 0;
         let status = (u16::from(old_mode == PrivilegeMode::User)
             | (u16::from(interrupt_enabled) << 1))
             .to_be_bytes();
@@ -6570,8 +6014,7 @@ impl Cpu {
         }
 
         if gate_type == crate::interrupts::GateType::Interrupt {
-            let interrupt_control = self.read(ICR_ADDR) & !1;
-            self.write(ICR_ADDR, interrupt_control);
+            self.interrupts.control &= !1;
         }
         self.privilege_mode = PrivilegeMode::Supervisor;
         self.sp = frame_start;
@@ -6651,8 +6094,7 @@ impl Cpu {
         self.restore_flags(saved_flags);
         self.pc = saved_pc;
         self.privilege_mode = prior_mode;
-        let interrupt_control = (self.read(ICR_ADDR) & !1) | ((status >> 1) as u8 & 1);
-        self.write(ICR_ADDR, interrupt_control);
+        self.interrupts.control = (self.interrupts.control & !1) | ((status >> 1) as u8 & 1);
         if prior_mode == PrivilegeMode::User {
             self.kernel_sp = frame_end;
             self.sp = saved_sp;
@@ -6677,20 +6119,20 @@ impl Cpu {
     }
 
     fn check_interrupts(&mut self) -> Result<(), CpuError> {
-        let icr = self.read(ICR_ADDR);
+        let icr = self.interrupts.control;
         if icr & 1 == 0 {
             return Ok(());
         }
         let (pending_bit, vector) = if icr & 2 != 0 {
             (2, u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD))
-        } else if icr & 0x10 != 0 && self.read(PIT_CONTROL_ADDR) & 1 != 0 {
+        } else if icr & 0x10 != 0 && self.interrupts.pit_enabled {
             (0x10, u16::from(crate::interrupts::IDT_VECTOR_PIT))
         } else if icr & 8 != 0 {
             (8, u16::from(crate::interrupts::IDT_VECTOR_RTC))
         } else {
             return Ok(());
         };
-        self.write(ICR_ADDR, icr & !pending_bit);
+        self.interrupts.control = icr & !pending_bit;
         let descriptor = match self.idt_descriptor(vector) {
             Ok(descriptor) => descriptor,
             Err(error) => {
@@ -6742,9 +6184,6 @@ impl Cpu {
             }
         }
         self.interrupts.tick();
-        if let Some(byte) = self.memory.get_mut(ICR_ADDR as usize) {
-            *byte = self.interrupts.control;
-        }
     }
 }
 
@@ -6854,6 +6293,14 @@ fn gpu3d_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_interrupt_control(cpu: &Cpu) -> u8 {
+        cpu.interrupts.control
+    }
+
+    fn write_interrupt_control(cpu: &mut Cpu, value: u8) {
+        cpu.interrupts.control = value;
+    }
 
     fn cpu_with_program(program: &[u16]) -> Cpu {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
@@ -6973,7 +6420,7 @@ mod tests {
         for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
             let mut cpu = Cpu::with_memory_size(size).unwrap();
             if size == 1 << 16 {
-                assert_eq!(cpu.memory[(PIT_CONTROL_ADDR & cpu.memory_mask) as usize], 0);
+                assert_eq!(cpu.memory[0x3016], 0);
             }
             let interrupt_alias = (INTERRUPT_BASE & cpu.memory_mask) as usize;
             let fault_alias = (FAULT_BASE & cpu.memory_mask) as usize;
@@ -7130,21 +6577,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_clock_and_gpu_commands_share_typed_time_and_random_handlers() {
+    fn high_clock_bank_captures_rtc_time_and_random_values() {
         use crate::machine::*;
 
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.update_rtc(3661);
-        cpu.memory[RTC_START as usize..RTC_START as usize + 3].fill(0xff);
-        assert_eq!(cpu.read(RTC_START), 1);
-        cpu.write(RTC_START + 1, 23);
-        cpu.write(GPU_BASE + 1, 1);
-        cpu.write(GPU_BASE, GPU_RTC);
-        assert_eq!(cpu.read(GPU_BASE + 14), 23);
         cpu.write(CLOCK_CAPTURE, 1);
-        assert_eq!(cpu.read(CLOCK_RTC + 1), 23);
-        cpu.write(GPU_BASE, GPU_RANDOM);
-        assert_eq!(cpu.read(GPU_BASE + 14), cpu.random_state as u8);
+        assert_eq!(cpu.read(CLOCK_RTC), 1);
+        assert_eq!(cpu.read(CLOCK_RTC + 1), 1);
+        assert_eq!(cpu.read(CLOCK_RTC + 2), 1);
         let mut expected = cpu.random_state;
         expected ^= expected << 13;
         expected ^= expected >> 17;
@@ -7152,8 +6593,6 @@ mod tests {
         cpu.write(CLOCK_CAPTURE, 2);
         assert_eq!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), expected);
         cpu.frame_count = 0x1234;
-        cpu.write(GPU_BASE, GPU_TICKS);
-        assert_eq!(cpu.read_u16(GPU_BASE + 14), 0x1234);
         cpu.write(CLOCK_CAPTURE, 1);
         assert_eq!(cpu.read_u16(CLOCK_FRAMES), 0x1234);
     }
@@ -7166,6 +6605,11 @@ mod tests {
             let mut cpu = Cpu::with_memory_size(size).unwrap();
             let alias = (INPUT_BASE & cpu.memory_mask) as usize;
             cpu.memory[alias..alias + 16].fill(0xa5);
+            if size > 0x43000 {
+                cpu.write(0x43000, b'Z');
+                assert_eq!(cpu.read(0x43000), b'Z');
+                assert_eq!(cpu.read(INPUT_KEY), 0);
+            }
             cpu.signal_keyboard_event(b'A');
             cpu.set_key(0xff12ab34, true);
             cpu.set_mouse_position(600, 400);
@@ -7180,23 +6624,20 @@ mod tests {
             assert!(cpu.read_guest(INPUT_MOUSE_EVENTS).is_err());
             cpu.privilege_mode = PrivilegeMode::Supervisor;
             assert_eq!(cpu.read_guest(INPUT_KEY).unwrap(), b'A');
-            assert_eq!(cpu.read(KEYBOARD_ADDR), 0);
-            assert_eq!(cpu.read(ICR_ADDR) & 2, 2);
+            assert_eq!(cpu.read(INPUT_KEY), 0);
+            assert_eq!(cpu.read(INTERRUPT_PENDING), 2);
             cpu.signal_keyboard_event(b'B');
             cpu.signal_keyboard_event(b'C');
-            assert_eq!(cpu.read(KEYBOARD_ADDR), b'C');
+            assert_eq!(cpu.read(INPUT_KEY), b'C');
             assert_eq!(cpu.read_guest(INPUT_KEY).unwrap(), 0);
             assert_eq!(cpu.read_guest_u32(INPUT_KEYS).unwrap(), 0x12ab34);
-            assert_eq!(cpu.read(KEYS_ADDR), 0x34);
-            assert_eq!(cpu.read(KEYS_ADDR + 1), 0xab);
-            assert_eq!(cpu.read(KEYS_ADDR + 2), 0x12);
             cpu.set_key(0x020004, false);
             assert_eq!(cpu.read_guest_u32(INPUT_KEYS).unwrap(), 0x10ab30);
             assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_X).unwrap(), 319);
             assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_Y).unwrap(), 239);
             assert_eq!(cpu.read_guest(INPUT_MOUSE_BUTTONS).unwrap(), 1);
             assert_eq!(cpu.read_guest(INPUT_MOUSE_EVENTS).unwrap(), 1);
-            assert_eq!(cpu.read(MOUSE_ADDR + 5), 0);
+            assert_eq!(cpu.read(crate::machine::INPUT_MOUSE_EVENTS), 0);
             assert_eq!(
                 cpu.read_guest_u16(INPUT_MOUSE_WHEEL).unwrap(),
                 (-2i16) as u16
@@ -7207,7 +6648,7 @@ mod tests {
             );
             cpu.mouse_button(0, false, 12, 13, 150);
             cpu.mouse_button(0, true, 15, 16, 500);
-            assert_eq!(cpu.read(MOUSE_ADDR + 5), 0x15);
+            assert_eq!(cpu.read(crate::machine::INPUT_MOUSE_EVENTS), 0x15);
             assert_eq!(cpu.read_guest(INPUT_MOUSE_EVENTS).unwrap(), 0);
             cpu.end_mouse_frame();
             assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_WHEEL).unwrap(), 0);
@@ -7244,8 +6685,8 @@ mod tests {
         cpu.signal_keyboard_event(b'Q');
         cpu.prepare_image_entry();
         assert_eq!(cpu.read_guest(INPUT_KEY).unwrap(), b'Q');
-        assert_eq!(cpu.read(ICR_ADDR) & 2, 0);
-        cpu.memory[KEYS_ADDR as usize..KEYS_ADDR as usize + 3].fill(0xff);
+        assert_eq!(cpu.read(crate::machine::INTERRUPT_PENDING), 0);
+        cpu.memory[0x43004..0x43007].fill(0xff);
         assert_eq!(cpu.read_guest_u32(INPUT_KEYS).unwrap(), 0);
     }
 
@@ -7267,12 +6708,12 @@ mod tests {
             assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ENABLED).unwrap(), 0);
             cpu.receive_console_input(b"AB");
             assert_eq!(cpu.read_guest(machine::CONSOLE_DATA).unwrap(), b'A');
-            assert_eq!(cpu.read(CONSOLE_DATA), b'B');
+            assert_eq!(cpu.read(machine::CONSOLE_DATA), b'B');
             assert_eq!(cpu.console.output(), b"AB");
             cpu.write_guest(machine::CONSOLE_CONTROL, 0xfe).unwrap();
-            assert_eq!(cpu.read(CONSOLE_CONTROL), 2);
+            assert_eq!(cpu.read(machine::CONSOLE_CONTROL), 2);
             cpu.write_guest(machine::CONSOLE_DATA, b'C').unwrap();
-            cpu.write(CONSOLE_DATA, b'D');
+            cpu.write(machine::CONSOLE_DATA, b'D');
             assert_eq!(cpu.console.output(), b"ABCD");
             assert!(cpu.terminal_active && cpu.terminal_dirty);
             assert_eq!(cpu.read_guest(machine::CONSOLE_DATA).unwrap(), 0);
@@ -7286,14 +6727,15 @@ mod tests {
             cpu.write_guest(machine::FIRMWARE_TEXT_COLUMN, 2).unwrap();
             cpu.write_guest(machine::FIRMWARE_TEXT_CONTROL, 2).unwrap();
             cpu.write_guest(machine::FIRMWARE_TEXT_DATA, b'A').unwrap();
-            cpu.write(GUEST_TEXT_DATA, b'B');
+            cpu.write(0x43300, b'B');
+            assert_eq!(cpu.read(0x43300), b'B');
             let cell = cpu.guest_text.cells[crate::guest_text::GUEST_TEXT_COLUMNS + 2];
             assert_eq!(
                 (cell.character, cell.foreground, cell.background),
                 (b'A', 3, 4)
             );
             assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ROW).unwrap(), 1);
-            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 4);
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 3);
             assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ENABLED).unwrap(), 1);
             assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_DATA).unwrap(), 0);
             assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_CONTROL).unwrap(), 0);
@@ -7401,27 +6843,30 @@ mod tests {
     }
 
     #[test]
-    fn legacy_text_cursor_latches_are_separate_from_high_live_cursor_reads() {
-        use crate::machine;
-
+    fn removed_low_device_registers_are_plain_ram() {
+        use crate::machine::*;
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GUEST_TEXT_ROW, 1);
-        cpu.write(GUEST_TEXT_COLUMN, 2);
-        cpu.write(GUEST_TEXT_DATA, b'A');
-        assert_eq!(cpu.read(GUEST_TEXT_COLUMN), 2);
-        assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 3);
-        cpu.memory[GUEST_TEXT_ROW as usize] = 15;
-        cpu.memory[GUEST_TEXT_COLUMN as usize] = 40;
-        cpu.write(GUEST_TEXT_COLUMN, 4);
-        assert_eq!(cpu.guest_text.cursor_row, 1);
-        assert_eq!(cpu.guest_text.cursor_column, 4);
-        cpu.write_guest(machine::FIRMWARE_TEXT_ROW, 5).unwrap();
-        cpu.write_guest(machine::FIRMWARE_TEXT_COLUMN, 6).unwrap();
-        assert_eq!(cpu.read(GUEST_TEXT_ROW), 1);
-        assert_eq!(cpu.read(GUEST_TEXT_COLUMN), 4);
-        cpu.prepare_image_entry();
-        assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ROW).unwrap(), 5);
-        assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 6);
+        for (address, value) in [
+            (0x43002, 0xa2),
+            (0x43010, 0xa3),
+            (0x43016, 0xa4),
+            (0x43018, 0xa5),
+            (0x4301c, 0xa6),
+            (0x43100, 0xa7),
+            (0x431ff, 0xa8),
+            (0x43200, 0xa7),
+            (0x43300, 0xa8),
+            (0x43400, 0xa9),
+        ] {
+            cpu.write(address, value);
+            assert_eq!(cpu.read(address), value);
+        }
+        cpu.write(CLOCK_CAPTURE, 1);
+        assert_eq!(cpu.read(CLOCK_RTC), 0);
+        assert_eq!(cpu.read(INTERRUPT_ENABLE), 0);
+        assert_eq!(cpu.read(FAULT_ADDRESS), 0);
+        assert_eq!(cpu.read(crate::machine::CONSOLE_DATA), 0);
+        assert_eq!(cpu.read(FIRMWARE_TEXT_DATA), 0);
     }
 
     #[test]
@@ -7695,7 +7140,7 @@ mod tests {
         assert_eq!(cpu.read_guest_u32(0xa000).unwrap(), 0x9123);
         assert_eq!(cpu.read_guest_u16(0xa004).unwrap(), 0x0203);
         assert_eq!(cpu.read_guest(0xa006).unwrap(), 1);
-        assert_eq!(cpu.read_u16(PAGE_FAULT_INFO_ADDR), 0x0203);
+        assert_eq!(cpu.read_u16(crate::machine::FAULT_INFO), 0x0203);
         cpu.prepare_image_entry();
         assert_eq!(cpu.read(FAULT_VALID), 0);
         assert_eq!(cpu.read_u32(FAULT_ADDRESS), 0);
@@ -7816,7 +7261,7 @@ mod tests {
     }
 
     #[test]
-    fn high_and_legacy_firmware_share_settings_and_validate_persistence() {
+    fn high_firmware_gateway_shares_settings_and_validates_persistence() {
         use crate::machine::*;
 
         let root = std::env::temp_dir().join(format!(
@@ -7850,13 +7295,12 @@ mod tests {
         }
         cpu.write(FIRMWARE_COMMAND, 7);
         assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
-        cpu.bios_control(6);
-        assert_eq!(
-            &cpu.memory[BIOS_SETTING_RECORD + 18..BIOS_SETTING_RECORD + 22],
-            b"Yes\0"
-        );
-        cpu.memory[BIOS_SETTING_RECORD + 18..BIOS_SETTING_RECORD + 22].copy_from_slice(b"No\0\0");
-        cpu.bios_control(7);
+        assert_eq!(cpu.read(FIRMWARE_SETTING + 18), b'Y');
+        for (offset, byte) in b"No\0\0".iter().enumerate() {
+            cpu.write(FIRMWARE_SETTING + 18 + offset as u32, *byte);
+        }
+        cpu.write(FIRMWARE_COMMAND, 7);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
         cpu.write(FIRMWARE_COMMAND, 6);
         assert_eq!(cpu.read(FIRMWARE_SETTING + 18), b'N');
         cpu.write(FIRMWARE_STARTUP, 1);
@@ -8224,26 +7668,40 @@ mod tests {
     }
 
     #[test]
-    fn legacy_control_registers_share_state_with_high_banks_not_ram() {
+    fn high_interrupt_registers_are_independent_of_legacy_ram_addresses() {
         use crate::machine::*;
 
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(ICR_ADDR, 0x1b);
-        assert_eq!(cpu.read(INTERRUPT_ENABLE), 1);
-        assert_eq!(cpu.read(INTERRUPT_PENDING), 0x1a);
-        cpu.write(INTERRUPT_ACK, 0x12);
-        assert_eq!(cpu.read(ICR_ADDR), 9);
+        cpu.write(INTERRUPT_ENABLE, 1);
+        cpu.signal_keyboard_event(b'K');
         cpu.raise_rtc_interrupt();
-        cpu.write(PIT_CONTROL_ADDR, 0);
+        assert_eq!(cpu.read(INTERRUPT_ENABLE), 1);
+        assert_eq!(cpu.read(INTERRUPT_PENDING), 0x0a);
+        cpu.write(INTERRUPT_ACK, 0xff);
+        assert_eq!(cpu.read(INTERRUPT_PENDING), 0);
+        cpu.write_guest(crate::machine::INTERRUPT_PIT_ENABLE, 0)
+            .unwrap();
         assert_eq!(cpu.read(INTERRUPT_PIT_ENABLE), 0);
-        cpu.write_u16(TIMER_PERIOD_ADDR, 0x1234);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 0x1234)
+            .unwrap();
         assert_eq!(cpu.read_u16(INTERRUPT_PIT_PERIOD), 0x1234);
         cpu.write_u16(INTERRUPT_PIT_PERIOD, 0x5678);
-        assert_eq!(cpu.read_u16(TIMER_PERIOD_ADDR), 0x5678);
-        cpu.memory[ICR_ADDR as usize] = 0xff;
-        cpu.memory[TIMER_PERIOD_ADDR as usize..TIMER_PERIOD_ADDR as usize + 2].fill(0xff);
-        assert_eq!(cpu.read(ICR_ADDR), 9);
-        assert_eq!(cpu.read_u16(TIMER_PERIOD_ADDR), 0x5678);
+        assert_eq!(
+            cpu.read_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD)
+                .unwrap(),
+            0x5678
+        );
+        for (address, value) in [(0x43002, 0xff), (0x43016, 0xfe), (0x4301e, 0xfd)] {
+            cpu.write(address, value);
+            assert_eq!(cpu.read(address), value);
+        }
+        assert_eq!(cpu.read(INTERRUPT_ENABLE), 1);
+        assert_eq!(cpu.read(INTERRUPT_PENDING), 0);
+        assert_eq!(
+            cpu.read_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD)
+                .unwrap(),
+            0x5678
+        );
     }
 
     #[test]
@@ -8679,12 +8137,15 @@ mod tests {
     }
 
     #[test]
-    fn device_buffer_bounds_are_independent_of_active_graphics_mode() {
+    fn guest_buffers_allow_retired_aliases_but_exclude_active_device_registers() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         for mode in [0, 1] {
             cpu.set_graphics_mode(mode).unwrap();
-            for (address, length) in [(MMIO_START - 1, 2), (MMIO_START, 1), (MMIO_END - 1, 2)] {
-                assert!(cpu.guest_range(address, length).is_err());
+            for (address, length) in [
+                (crate::machine::DEVICE_APERTURE_START - 1, 2),
+                (crate::machine::DEVICE_APERTURE_START, 1),
+                (crate::machine::ADDRESS_SPACE_SIZE - 1, 2),
+            ] {
                 for user in [false, true] {
                     for access in [
                         crate::mmu::MemoryAccess::Read,
@@ -8697,11 +8158,10 @@ mod tests {
                     }
                 }
             }
-            for address in [MMIO_START - 1, MMIO_END] {
-                assert_eq!(
-                    cpu.guest_range(address, 1).unwrap(),
-                    address as usize..address as usize + 1
-                );
+            for address in [
+                0x43000, 0x43010, 0x43016, 0x43018, 0x4301c, 0x43100, 0x431ff, 0x43200, 0x43300,
+                0x43400, 0x43fff, 0x44000,
+            ] {
                 assert_eq!(
                     cpu.guest_memory_addresses(address, 1, crate::mmu::MemoryAccess::Read, true)
                         .unwrap(),
@@ -8714,10 +8174,6 @@ mod tests {
                 FORMER_FRAMEBUFFER_START + 153600 - 1,
             ] {
                 assert_eq!(
-                    cpu.guest_range(address, 1).unwrap(),
-                    address as usize..address as usize + 1
-                );
-                assert_eq!(
                     cpu.guest_memory_addresses(address, 1, crate::mmu::MemoryAccess::Read, true)
                         .unwrap(),
                     [address as usize]
@@ -8727,12 +8183,9 @@ mod tests {
     }
 
     #[test]
-    fn process_allocations_never_use_device_backing_frames() {
+    fn process_allocations_use_only_usable_ram_frames() {
         for memory_size in [1 << 16, 1 << 19, 1 << 20] {
             let mut cpu = Cpu::with_memory_size(memory_size).unwrap();
-            if memory_size > MMIO_START as usize {
-                cpu.memory[MMIO_START as usize..MMIO_END as usize].fill(0x5a);
-            }
             cpu.ensure_page_memory_manager().unwrap();
             let manager = cpu.page_memory_manager.as_mut().unwrap();
             let free = manager.free_frames();
@@ -8756,7 +8209,7 @@ mod tests {
                     ) {
                         Ok(physical) => {
                             let physical = physical * crate::mmu::PAGE_SIZE as u32;
-                            assert!(!(MMIO_START..MMIO_END).contains(&physical));
+                            assert!(physical < crate::machine::usable_ram_size(memory_size) as u32);
                             allocated_former_framebuffer |= (FORMER_FRAMEBUFFER_START
                                 ..FORMER_FRAMEBUFFER_START + 153600)
                                 .contains(&physical);
@@ -8773,13 +8226,6 @@ mod tests {
                     .destroy_address_space(&mut cpu.memory, root)
                     .unwrap();
                 assert_eq!(manager.free_frames(), free);
-                if memory_size > MMIO_START as usize {
-                    assert!(
-                        cpu.memory[MMIO_START as usize..MMIO_END as usize]
-                            .iter()
-                            .all(|byte| *byte == 0x5a)
-                    );
-                }
             }
         }
     }
@@ -8882,8 +8328,8 @@ mod tests {
         );
         assert_eq!(cpu.input.key, 0);
         assert_eq!(cpu.input.mouse[5], 0);
-        assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], 0);
-        assert_eq!(cpu.memory[MOUSE_ADDR as usize + 5], 0);
+        assert_eq!(cpu.memory[0x43000], 0);
+        assert_eq!(cpu.memory[0x4300d], 0);
     }
 
     #[test]
@@ -9123,7 +8569,7 @@ mod tests {
 
     #[test]
     fn reset_starts_in_supervisor_mode_with_interrupts_disabled() {
-        let mut cpu = Cpu::with_memory_size(1 << 19).unwrap();
+        let cpu = Cpu::with_memory_size(1 << 19).unwrap();
 
         assert_eq!(cpu.pc, 0);
         assert_eq!(cpu.registers, [0; 8]);
@@ -9131,7 +8577,7 @@ mod tests {
         assert_eq!(cpu.kernel_sp, cpu.sp);
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
         assert_eq!(cpu.flags, Flags::default());
-        assert_eq!(cpu.read(ICR_ADDR) & 1, 0);
+        assert_eq!(read_interrupt_control(&cpu) & 1, 0);
     }
 
     #[test]
@@ -9150,7 +8596,7 @@ mod tests {
             negative: true,
             overflow: false,
         };
-        cpu.write(ICR_ADDR, 1);
+        write_interrupt_control(&mut cpu, 1);
 
         cpu.step().unwrap();
 
@@ -9171,7 +8617,7 @@ mod tests {
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
         assert_eq!(cpu.flags.zero, true);
         assert_eq!(cpu.flags.negative, true);
-        assert_eq!(cpu.read(ICR_ADDR) & 1, 1);
+        assert_eq!(read_interrupt_control(&cpu) & 1, 1);
     }
 
     #[test]
@@ -9193,53 +8639,34 @@ mod tests {
     fn user_instruction_cannot_write_or_read_interrupt_control_registers() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         install_test_handler(&mut cpu, EXCEPTION_PRIVILEGE_VIOLATION, 0x300, 0);
+        install_test_handler(&mut cpu, EXCEPTION_PAGE_FAULT, 0x300, 0);
         cpu.write_u16(0, (OP_ST << 11) | (1 << 5));
         cpu.write_u16(2, (OP_LD << 11) | (2 << 8) | (1 << 5));
         cpu.write_u16(0x300, OP_RTI << 11);
         cpu.registers[0] = 0x10;
-        cpu.registers[1] = i64::from(ICR_ADDR);
+        cpu.registers[1] = i64::from(crate::machine::INTERRUPT_ENABLE);
         cpu.sp = 0x7000;
         cpu.kernel_sp = 0xf000;
         cpu.privilege_mode = PrivilegeMode::User;
-        cpu.write(ICR_ADDR, 1);
+        write_interrupt_control(&mut cpu, 1);
 
         cpu.step().unwrap();
 
         assert_eq!(cpu.pc, 0x300);
-        assert_eq!(cpu.memory[ICR_ADDR as usize], 0);
-        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PRIVILEGE_VIOLATION);
+        assert_eq!(cpu.read(crate::machine::INTERRUPT_ENABLE), 0);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PAGE_FAULT);
 
         cpu.write_u32(cpu.sp, 2);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 2);
-        cpu.write(ICR_ADDR, 1);
+        write_interrupt_control(&mut cpu, 1);
 
         cpu.step().unwrap();
 
         assert_eq!(cpu.pc, 0x300);
         assert_eq!(cpu.registers[2], 0);
+        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PAGE_FAULT);
         assert_eq!(cpu.read_u32(cpu.sp), 2);
-    }
-
-    #[test]
-    fn user_instruction_can_set_safe_gpu_controls_without_accessing_interrupt_control() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write_u16(0, (OP_ST << 11) | (1 << 5));
-        cpu.write_u16(2, (OP_ST << 11) | (1 << 5));
-        cpu.write_u16(4, (OP_ST << 11) | (1 << 5));
-        cpu.registers[0] = 1;
-        cpu.registers[1] = i64::from(GPU_SPEED_ADDR);
-        cpu.enter_user_mode(0, 0x7000).unwrap();
-
-        cpu.step().unwrap();
-        cpu.registers[1] = VSYNC_ADDR as i64;
-        cpu.step().unwrap();
-        cpu.registers[1] = i64::from(GPU_MODE_ADDR);
-        cpu.step().unwrap();
-
-        assert_eq!(cpu.read(GPU_SPEED_ADDR), 1);
-        assert_eq!(cpu.memory[VSYNC_ADDR], 1);
-        assert_eq!(cpu.screen_size(), (640, 480));
     }
 
     #[test]
@@ -9531,7 +8958,7 @@ mod tests {
         assert_eq!(cpu.syscall_scnet(Some(task)), 0);
 
         cpu.registers[1] = 0;
-        cpu.registers[2] = i64::from(CONSOLE_DATA);
+        cpu.registers[2] = i64::from(crate::machine::CONSOLE_DATA);
         cpu.registers[3] = 1;
         assert_eq!(
             cpu.syscall_scnet(Some(task)),
@@ -10365,8 +9792,8 @@ mod tests {
                 reason: crate::mmu::PageFaultReason::NotPresent,
             })
         );
-        assert_eq!(cpu.read_u32(PAGE_FAULT_ADDRESS_ADDR), 0x2000);
-        assert_eq!(cpu.read_u16(PAGE_FAULT_INFO_ADDR), 0x0102);
+        assert_eq!(cpu.read_u32(crate::machine::FAULT_ADDRESS), 0x2000);
+        assert_eq!(cpu.read_u16(crate::machine::FAULT_INFO), 0x0102);
         assert_eq!(cpu.read_u32(cpu.sp), 0);
 
         cpu.step().unwrap();
@@ -10377,173 +9804,46 @@ mod tests {
     }
 
     #[test]
-    fn user_filesystem_services_bound_memory_and_preserve_boot_files() {
-        let root = folder_disk_for_test("operations", false);
+    fn high_device_aperture_is_supervisor_only() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.mount_folder_disk(&root).unwrap();
         cpu.privilege_mode = PrivilegeMode::User;
-        cpu.memory[0x1000..0x1009].copy_from_slice(b"note.txt\0");
-        cpu.memory[0x1100..0x1108].copy_from_slice(b"renamed\0");
-        cpu.memory[0x1200] = 0;
-        cpu.memory[0x2000..0x2003].copy_from_slice(b"abc");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u32(DISK_BASE + 26, 0x2000);
-        cpu.write_u16(DISK_BASE + 30, 3);
-        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(cpu.disk_register_u16(14), 3);
-        assert_eq!(std::fs::read(root.join("note.txt")).unwrap(), b"abc");
-        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-
-        cpu.write_u32(DISK_BASE + 26, 0x3000);
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(&cpu.memory[0x3000..0x3003], b"abc");
-        assert_eq!(
-            u32::from_be_bytes(
-                cpu.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36]
-                    .try_into()
-                    .unwrap()
-            ),
-            3
+        for address in [
+            crate::machine::SYSTEM_BASE,
+            crate::machine::INTERRUPT_ENABLE,
+            crate::machine::CONSOLE_DATA,
+            crate::machine::FIRMWARE_TEXT_DATA,
+            crate::machine::FIRMWARE_COMMAND,
+        ] {
+            for access in [
+                crate::mmu::MemoryAccess::Read,
+                crate::mmu::MemoryAccess::Write,
+                crate::mmu::MemoryAccess::Fetch,
+            ] {
+                assert!(matches!(
+                    cpu.check_guest_access(address, access),
+                    Err(CpuError::PageFault(crate::mmu::PageFault {
+                        reason: crate::mmu::PageFaultReason::SupervisorOnly,
+                        ..
+                    }))
+                ));
+            }
+        }
+        for address in [0x43010, 0x43016, 0x43018, 0x43200, 0x43300, 0x43400] {
+            assert!(
+                cpu.check_guest_access(address, crate::mmu::MemoryAccess::Read)
+                    .is_ok()
+            );
+        }
+        for address in [GPU_MODE_ADDR, GPU_BASE] {
+            assert!(matches!(
+                cpu.check_guest_access(address, crate::mmu::MemoryAccess::Write),
+                Err(CpuError::PrivilegeViolation { .. })
+            ));
+        }
+        assert!(
+            cpu.check_guest_access(0x43100, crate::mmu::MemoryAccess::Write)
+                .is_ok()
         );
-
-        cpu.write_u32(DISK_BASE + 26, 0x3000);
-        cpu.write(DISK_BASE, FOLDER_FS_STAT);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(&cpu.memory[0x3000..0x3005], &[0, 0, 0, 0, 3]);
-
-        cpu.write_u32(DISK_BASE + 18, 0x1100);
-        cpu.write(DISK_BASE, FOLDER_FS_RENAME);
-        assert!(root.join("renamed").is_file());
-        assert!(!root.join("note.txt").exists());
-
-        cpu.write_u32(DISK_BASE + 22, 0x1200);
-        cpu.write_u16(DISK_BASE + 10, 2);
-        cpu.write_u32(DISK_BASE + 26, 0x3000);
-        cpu.write_u16(DISK_BASE + 30, 64);
-        cpu.write(DISK_BASE, FOLDER_FS_LIST);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(cpu.disk_register_u16(14), 3);
-        assert_eq!(&cpu.memory[0x3000..0x3009], b"renamed\0\0");
-
-        cpu.write_u32(DISK_BASE + 22, 0x1100);
-        cpu.write(DISK_BASE, FOLDER_FS_DELETE);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert!(!root.join("renamed").exists());
-
-        cpu.memory[0x1100..0x1107].copy_from_slice(b"subdir\0");
-        cpu.write(DISK_BASE, FOLDER_FS_CREATE_DIR);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert!(root.join("subdir").is_dir());
-        cpu.write(DISK_BASE, FOLDER_FS_DELETE);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert!(!root.join("subdir").exists());
-
-        cpu.memory[0x1000..0x100b].copy_from_slice(b"kernel.bin\0");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-
-        cpu.write_u32(DISK_BASE + 22, 0xffff_fffc);
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-
-        cpu.memory[0x1000..0x100b].copy_from_slice(b"../outside\0");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert!(!root.parent().unwrap().join("outside").exists());
-
-        cpu.memory[0x1000..0x1009].copy_from_slice(b"main.bin\0");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u16(DISK_BASE + 30, 4097);
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert_eq!(&cpu.memory[0x2000..0x2003], b"abc");
-
-        cpu.write_u16(DISK_BASE + 30, 1);
-        cpu.write_u32(DISK_BASE + 26, DISK_BASE);
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-
-        cpu.write(DISK_BASE, 0x04);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn user_filesystem_service_enforces_protected_files_and_capacity() {
-        let root = folder_disk_for_test("protected-capacity", false);
-        std::fs::write(root.join("locked.txt"), b"xy").unwrap();
-        std::fs::write(
-            root.join("disk.json"),
-            r#"{"version":1,"id":"DISK0001","label":"Guest FS","capacity_bytes":8,"read_only":false,"protected_files":["locked.txt"]}"#,
-        )
-        .unwrap();
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.mount_folder_disk(&root).unwrap();
-        cpu.privilege_mode = PrivilegeMode::User;
-        cpu.memory[0x1000..0x100b].copy_from_slice(b"locked.txt\0");
-        cpu.memory[0x100b..0x1014].copy_from_slice(b"note.txt\0");
-        cpu.memory[0x2000] = b'z';
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u32(DISK_BASE + 26, 0x2000);
-        cpu.write_u16(DISK_BASE + 30, 1);
-        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert_eq!(std::fs::read(root.join("locked.txt")).unwrap(), b"xy");
-
-        cpu.write_u32(DISK_BASE + 22, 0x100b);
-        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert!(!root.join("note.txt").exists());
-        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn user_filesystem_service_rejects_read_only_disks() {
-        let root = folder_disk_for_test("readonly", true);
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.mount_folder_disk(&root).unwrap();
-        cpu.privilege_mode = PrivilegeMode::User;
-        cpu.memory[0x1000..0x1009].copy_from_slice(b"note.txt\0");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u32(DISK_BASE + 26, 0x2000);
-        cpu.write_u16(DISK_BASE + 30, 0);
-        cpu.write(DISK_BASE, FOLDER_FS_WRITE);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        assert!(!root.join("note.txt").exists());
-        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn guest_program_executes_a_bounded_user_filesystem_read() {
-        let root = folder_disk_for_test("guest-execution", false);
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        let image = crate::assembler::assemble("LDA R1, 0x43100\nLDI R0, 0x42\nST R1, R0\nHALT", 0)
-            .unwrap();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.mount_folder_disk(&root).unwrap();
-        cpu.memory[0x1000..0x1009].copy_from_slice(b"main.bin\0");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u32(DISK_BASE + 26, 0x2000);
-        cpu.write_u16(DISK_BASE + 30, 3);
-        cpu.privilege_mode = PrivilegeMode::User;
-        assert_eq!(cpu.run(10).unwrap(), 4);
-        assert!(!cpu.running);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(cpu.disk_register_u16(14), 3);
-        assert_eq!(
-            &cpu.memory[DISK_BASE as usize + 32..DISK_BASE as usize + 36],
-            &[0, 0, 0, 3]
-        );
-        assert_eq!(&cpu.memory[0x2000..0x2003], &[1, 2, 3]);
-        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -11554,16 +10854,24 @@ mod tests {
     }
 
     #[test]
-    fn key_masks_use_sc16_little_byte_order() {
+    fn key_masks_use_sc16_key_bit_assignments() {
         let mut cpu = Cpu::with_memory_size(1 << 19).unwrap();
         cpu.set_key(0x20_0405, true);
         assert_eq!(
-            &cpu.memory[KEYS_ADDR as usize..KEYS_ADDR as usize + 3],
-            &[0x05, 0x04, 0x20]
+            &[
+                cpu.read(crate::machine::INPUT_KEYS + 1),
+                cpu.read(crate::machine::INPUT_KEYS + 2),
+                cpu.read(crate::machine::INPUT_KEYS + 3),
+            ],
+            &[0x20, 0x04, 0x05]
         );
         cpu.set_key(0x20_0405, false);
         assert_eq!(
-            &cpu.memory[KEYS_ADDR as usize..KEYS_ADDR as usize + 3],
+            &[
+                cpu.read(crate::machine::INPUT_KEYS + 1),
+                cpu.read(crate::machine::INPUT_KEYS + 2),
+                cpu.read(crate::machine::INPUT_KEYS + 3),
+            ],
             &[0, 0, 0]
         );
     }
@@ -11882,106 +11190,6 @@ mod tests {
     }
 
     #[test]
-    fn disk_mmio_reads_virtual_files_and_lists_module_disk_contents() {
-        let root = std::env::temp_dir().join(format!(
-            "sc16-cpu-files-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("program")).unwrap();
-        std::fs::write(root.join("program").join("hello.txt"), b"hello world").unwrap();
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.configure_disk(root.join("disks"), root.join("program"))
-            .unwrap();
-        cpu.memory[0x1000..0x100a].copy_from_slice(b"hello.txt\0");
-        cpu.write_u32(DISK_BASE + 18, 6);
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u32(DISK_BASE + 26, 0x1100);
-        cpu.write_u16(DISK_BASE + 30, 4);
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(cpu.disk_register_u16(14), 4);
-        assert_eq!(&cpu.memory[0x1100..0x1104], b"worl");
-        assert_eq!(cpu.disk_register_u32(32), 11);
-
-        cpu.write_u16(DISK_BASE + 10, 0);
-        cpu.write_u32(DISK_BASE + 26, 0x1200);
-        cpu.write_u16(DISK_BASE + 30, 32);
-        cpu.write(DISK_BASE, 0x80);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(&cpu.memory[0x1200..0x120a], b"hello.txt\0");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn disk_mmio_reads_large_module_files_in_chunks_and_lists_only_module_files() {
-        let root = std::env::temp_dir().join(format!(
-            "sc16-cpu-file-chunks-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let module_files = root.join("programs").join("tank16").join("disks");
-        let other_files = root.join("programs").join("other").join("disks");
-        std::fs::create_dir_all(module_files.join("maps")).unwrap();
-        std::fs::create_dir_all(&other_files).unwrap();
-        let payload = (0u8..=255).cycle().take(76_800).collect::<Vec<u8>>();
-        std::fs::write(module_files.join("maps").join("world.json"), &payload).unwrap();
-        std::fs::write(module_files.join("index.txt"), b"index").unwrap();
-        std::fs::write(other_files.join("secret.json"), b"secret").unwrap();
-
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.configure_disk(root.join("disks"), module_files)
-            .unwrap();
-        cpu.memory[0x1000..0x1010].copy_from_slice(b"maps/world.json\0");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u32(DISK_BASE + 26, 0x2000);
-        cpu.write_u16(DISK_BASE + 30, 4096);
-
-        for offset in [0, 4096, 65_530, 72_704, 76_800] {
-            cpu.write_u32(DISK_BASE + 18, offset);
-            cpu.write(DISK_BASE, FOLDER_FS_READ);
-            let expected = &payload[offset as usize..(offset as usize + 4096).min(payload.len())];
-            assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-            assert_eq!(
-                cpu.disk_register_u16(14) as usize,
-                expected.len(),
-                "file offset {offset}"
-            );
-            assert_eq!(
-                cpu.disk_register_u32(32),
-                payload.len() as u32,
-                "reported file length at offset {offset}"
-            );
-            assert_eq!(
-                &cpu.memory[0x2000..0x2000 + expected.len()],
-                expected,
-                "file bytes at offset {offset}"
-            );
-        }
-
-        cpu.write_u16(DISK_BASE + 10, 0);
-        cpu.write_u32(DISK_BASE + 26, 0x3000);
-        cpu.write_u16(DISK_BASE + 30, 32);
-        cpu.write(DISK_BASE, 0x80);
-        assert_eq!(cpu.disk_register_u16(14), 2);
-        assert_eq!(&cpu.memory[0x3000..0x300a], b"index.txt\0");
-
-        cpu.write_u16(DISK_BASE + 10, 1);
-        cpu.write(DISK_BASE, 0x80);
-        assert_eq!(&cpu.memory[0x3000..0x3010], b"maps/world.json\0");
-
-        cpu.memory[0x1000..0x100a].copy_from_slice(b"../secret\0");
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 1);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn mounting_data_disks_preserves_the_loaded_program_and_rejects_missing_ids() {
         let root = std::env::temp_dir().join(format!(
             "sc16-cpu-data-disk-{}-{}",
@@ -12011,17 +11219,9 @@ mod tests {
         assert!(cpu.mount_data_disk("MISSING1").is_err());
         assert!(cpu.mount_data_disk("../DATA0001").is_err());
         cpu.mount_data_disk("DATA0001").unwrap();
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
         assert_eq!(cpu.pc, 0x1234);
         assert_eq!(cpu.memory[0x1234], 0x5a);
-
-        cpu.memory[0x1000..0x100c].copy_from_slice(b"payload.bin\0");
-        cpu.write_u32(DISK_BASE + 22, 0x1000);
-        cpu.write_u32(DISK_BASE + 26, 0x2000);
-        cpu.write_u16(DISK_BASE + 30, 256);
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_STATUS as usize], 0);
-        assert_eq!(&cpu.memory[0x2000..0x2100], &[0xa5; 256]);
+        assert!(cpu.folder_disk.is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -12068,6 +11268,8 @@ mod tests {
 
     #[test]
     fn bios_additional_settings_can_be_read_and_updated_with_typed_values() {
+        use crate::machine::*;
+
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.bios_settings
             .additional
@@ -12085,44 +11287,51 @@ mod tests {
             (1, "label", 1, "demo"),
             (2, "retries", 2, "5"),
         ] {
-            cpu.memory[BIOS_BASE as usize + 2] = 0;
-            cpu.memory[BIOS_BASE as usize + 3] = index;
-            cpu.bios_control(6);
-            assert_eq!(cpu.read(BIOS_STATUS), 0);
-            let record = BIOS_SETTING_RECORD;
-            let name_end = cpu.memory[record..record + 17]
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap();
-            assert_eq!(&cpu.memory[record..record + name_end], name.as_bytes());
-            assert_eq!(cpu.memory[record + 17], kind);
-            let value_bytes = &cpu.memory[record + 18..record + 42];
-            let value_end = value_bytes.iter().position(|byte| *byte == 0).unwrap();
-            assert_eq!(&value_bytes[..value_end], value.as_bytes());
+            cpu.write_u16(FIRMWARE_INDEX, index);
+            cpu.write(FIRMWARE_COMMAND, 6);
+            assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+            let name_bytes: Vec<_> = (0..17)
+                .map(|offset| cpu.read(FIRMWARE_SETTING + offset))
+                .take_while(|byte| *byte != 0)
+                .collect();
+            assert_eq!(name_bytes, name.as_bytes());
+            assert_eq!(cpu.read(FIRMWARE_SETTING + 17), kind);
+            let value_bytes: Vec<_> = (0..24)
+                .map(|offset| cpu.read(FIRMWARE_SETTING + 18 + offset))
+                .take_while(|byte| *byte != 0)
+                .collect();
+            assert_eq!(value_bytes, value.as_bytes());
         }
 
-        let record = BIOS_SETTING_RECORD;
-        cpu.memory[BIOS_BASE as usize + 3] = 0;
-        cpu.bios_control(6);
-        assert_eq!(cpu.read(BIOS_STATUS), 0);
-        cpu.memory[record + 17] = 0;
-        cpu.memory[record + 18..record + 42].fill(0);
-        cpu.memory[record + 18..record + 21].copy_from_slice(b"Yes");
-        cpu.bios_control(7);
-        assert_eq!(cpu.read(BIOS_STATUS), 0);
+        cpu.write_u16(FIRMWARE_INDEX, 0);
+        cpu.write(FIRMWARE_COMMAND, 6);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        cpu.write(FIRMWARE_SETTING + 17, 0);
+        for offset in 0..24 {
+            cpu.write(FIRMWARE_SETTING + 18 + offset, 0);
+        }
+        for (offset, byte) in b"Yes".iter().enumerate() {
+            cpu.write(FIRMWARE_SETTING + 18 + offset as u32, *byte);
+        }
+        cpu.write(FIRMWARE_COMMAND, 7);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
         assert_eq!(
             cpu.bios_settings.additional.get("enabled"),
             Some(&BiosSettingValue::Boolean(true))
         );
 
-        cpu.memory[BIOS_BASE as usize + 3] = 2;
-        cpu.bios_control(6);
-        assert_eq!(cpu.read(BIOS_STATUS), 0);
-        cpu.memory[record + 17] = 2;
-        cpu.memory[record + 18..record + 42].fill(0);
-        cpu.memory[record + 18..record + 20].copy_from_slice(b"-9");
-        cpu.bios_control(7);
-        assert_eq!(cpu.read(BIOS_STATUS), 0);
+        cpu.write_u16(FIRMWARE_INDEX, 2);
+        cpu.write(FIRMWARE_COMMAND, 6);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        cpu.write(FIRMWARE_SETTING + 17, 2);
+        for offset in 0..24 {
+            cpu.write(FIRMWARE_SETTING + 18 + offset, 0);
+        }
+        for (offset, byte) in b"-9".iter().enumerate() {
+            cpu.write(FIRMWARE_SETTING + 18 + offset as u32, *byte);
+        }
+        cpu.write(FIRMWARE_COMMAND, 7);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
         assert_eq!(
             cpu.bios_settings.additional.get("retries"),
             Some(&BiosSettingValue::Integer(-9))
@@ -12131,6 +11340,8 @@ mod tests {
 
     #[test]
     fn bios_preferred_disk_save_does_not_change_startup_policy() {
+        use crate::machine::*;
+
         let root = std::env::temp_dir().join(format!(
             "sc16-bios-preferred-{}-{}",
             std::process::id(),
@@ -12151,12 +11362,10 @@ mod tests {
         cpu.bios_settings.startup_behavior = StartupBehavior::BootPreferred;
         cpu.bios_settings.network_name = "NODE".to_owned();
         cpu.bios_settings.save(&root.join("bios.json")).unwrap();
-        cpu.memory[BIOS_BASE as usize + 2..BIOS_BASE as usize + 4]
-            .copy_from_slice(&2u16.to_be_bytes());
-        cpu.memory[BIOS_BASE as usize + 6] = 1;
-
-        cpu.bios_control(9);
-        assert_eq!(cpu.read(BIOS_STATUS), 0);
+        cpu.write_u16(FIRMWARE_INDEX, 2);
+        cpu.write(FIRMWARE_STARTUP, 1);
+        cpu.write(FIRMWARE_COMMAND, 9);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
 
         assert_eq!(
             cpu.bios_settings.preferred_disk.as_deref(),
@@ -12166,15 +11375,14 @@ mod tests {
             cpu.bios_settings.startup_behavior,
             StartupBehavior::BootPreferred
         );
-        assert_eq!(cpu.memory[BIOS_BASE as usize + 6], 1);
+        assert_eq!(cpu.read(FIRMWARE_STARTUP), 1);
         let saved = BiosSettings::load(&root.join("bios.json")).unwrap();
         assert_eq!(saved.preferred_disk.as_deref(), Some("DISK0003"));
         assert_eq!(saved.startup_behavior, StartupBehavior::BootPreferred);
 
-        cpu.memory[BIOS_BASE as usize + 2..BIOS_BASE as usize + 4]
-            .copy_from_slice(&3u16.to_be_bytes());
-        cpu.bios_control(9);
-        assert_eq!(cpu.read(BIOS_STATUS), 1);
+        cpu.write_u16(FIRMWARE_INDEX, 3);
+        cpu.write(FIRMWARE_COMMAND, 9);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 1);
         assert_eq!(
             cpu.bios_settings.preferred_disk.as_deref(),
             Some("DISK0003")
@@ -12184,6 +11392,8 @@ mod tests {
 
     #[test]
     fn bios_firmware_shows_selected_disk_manifest_and_boot_metadata() {
+        use crate::machine::*;
+
         let root = std::env::temp_dir().join(format!(
             "sc16-bios-disk-info-{}-{}",
             std::process::id(),
@@ -12204,12 +11414,12 @@ mod tests {
 
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.disk_root = root.clone();
-        cpu.memory[BIOS_BASE as usize + 6..BIOS_BASE as usize + 10]
-            .copy_from_slice(&0x5080u32.to_be_bytes());
-        cpu.memory[BIOS_BASE as usize + 10..BIOS_BASE as usize + 12]
-            .copy_from_slice(&128u16.to_be_bytes());
-        cpu.bios_control(8);
-        assert_eq!(cpu.read(BIOS_STATUS), 0);
+        cpu.write(FIRMWARE_COMMAND, 8);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        assert_eq!(
+            cpu.read_u16(FIRMWARE_OUTPUT_LENGTH),
+            b"Friendly App | 123456 B | READ-WRITE | USER".len() as u16
+        );
         let firmware =
             crate::assembler::assemble(include_str!("../../firmware/bios.asm"), 0).unwrap();
         cpu.load_program(&firmware.segments, firmware.entry_point)
@@ -12223,7 +11433,7 @@ mod tests {
             .take_while(|byte| **byte != 0)
             .copied()
             .collect::<Vec<_>>();
-        assert_eq!(cpu.memory[BIOS_STATUS as usize], 0);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
         assert_eq!(disk_info, b"Friendly App | 123456 B | READ-WRITE | USER");
         let text = cpu
             .guest_text
@@ -12289,7 +11499,7 @@ mod tests {
             cpu.signal_keyboard_event(key);
             for _ in 0..5_000 {
                 cpu.step().unwrap();
-                if cpu.memory[KEYBOARD_ADDR as usize] == 0 {
+                if cpu.input.key == 0 {
                     break;
                 }
             }
@@ -12303,7 +11513,7 @@ mod tests {
         }
         assert_eq!(cpu.memory[0x5021], 5);
         send_key(&mut cpu, 13);
-        assert_eq!(cpu.memory[BIOS_SETTING_RECORD + 17], 2);
+        assert_eq!(cpu.read(crate::machine::FIRMWARE_SETTING + 17), 2);
         send_key(&mut cpu, 8);
         send_key(&mut cpu, 8);
         send_key(&mut cpu, b'9');
@@ -12338,10 +11548,10 @@ mod tests {
         send_key(&mut cpu, 13);
         assert_eq!(cpu.memory[BIOS_FIRMWARE_MARKER as usize], 1);
         assert!(cpu.booted_disk_path.is_none());
-        assert_eq!(cpu.bios_register_u16(2), 0);
+        assert_eq!(cpu.read_u16(crate::machine::FIRMWARE_INDEX), 0);
         send_key(&mut cpu, 0x89);
         assert_eq!(
-            cpu.memory[BIOS_STATUS as usize],
+            cpu.read(crate::machine::FIRMWARE_STATUS),
             0,
             "{:?}",
             cpu.debug_console.text_snapshot()
@@ -12452,29 +11662,29 @@ mod tests {
     fn console_mmio_reads_and_keyboard_events_are_stateful() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.receive_console_input(b"A");
-        assert_eq!(cpu.read(CONSOLE_STATUS), 3);
-        assert_eq!(cpu.read(CONSOLE_DATA), b'A');
-        assert_eq!(cpu.read(CONSOLE_STATUS), 2);
+        assert_eq!(cpu.read(crate::machine::CONSOLE_STATUS), 3);
+        assert_eq!(cpu.read(crate::machine::CONSOLE_DATA), b'A');
+        assert_eq!(cpu.read(crate::machine::CONSOLE_STATUS), 2);
         assert_eq!(cpu.console.output(), b"A");
         assert!(cpu.frame_yield);
         assert!(!cpu.frame_presented);
         cpu.frame_yield = false;
         cpu.signal_keyboard_event(b'B');
-        assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], b'B');
-        assert_eq!(cpu.read(KEYBOARD_ADDR), b'B');
-        assert_eq!(cpu.memory[KEYBOARD_ADDR as usize], 0);
-        assert_eq!(cpu.read(ICR_ADDR) & 2, 2);
+        assert_eq!(cpu.input.key, b'B');
+        assert_eq!(cpu.read(crate::machine::INPUT_KEY), b'B');
+        assert_eq!(cpu.input.key, 0);
+        assert_eq!(read_interrupt_control(&cpu) & 2, 2);
     }
 
     #[test]
     fn guest_text_mmio_controls_display_and_writes_to_selected_cursor() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GUEST_TEXT_FOREGROUND, 3);
-        cpu.write(GUEST_TEXT_BACKGROUND, 4);
-        cpu.write(GUEST_TEXT_ROW, 1);
-        cpu.write(GUEST_TEXT_COLUMN, 2);
-        cpu.write(GUEST_TEXT_CONTROL, GUEST_TEXT_ENABLE);
-        cpu.write(GUEST_TEXT_DATA, b'A');
+        cpu.write(crate::machine::FIRMWARE_TEXT_FOREGROUND, 3);
+        cpu.write(crate::machine::FIRMWARE_TEXT_BACKGROUND, 4);
+        cpu.write(crate::machine::FIRMWARE_TEXT_ROW, 1);
+        cpu.write(crate::machine::FIRMWARE_TEXT_COLUMN, 2);
+        cpu.write(crate::machine::FIRMWARE_TEXT_CONTROL, 2);
+        cpu.write(crate::machine::FIRMWARE_TEXT_DATA, b'A');
 
         let cell = cpu.guest_text.cells[crate::guest_text::GUEST_TEXT_COLUMNS + 2];
         assert_eq!(cell.character, b'A');
@@ -12484,7 +11694,7 @@ mod tests {
         assert_eq!(cpu.guest_text.cursor_column, 3);
         assert!(cpu.guest_text.enabled);
 
-        cpu.write(GUEST_TEXT_CONTROL, GUEST_TEXT_CLEAR);
+        cpu.write(crate::machine::FIRMWARE_TEXT_CONTROL, 1);
         assert_eq!(cpu.guest_text.cursor_row, 0);
         assert_eq!(cpu.guest_text.cursor_column, 0);
         assert!(
@@ -12495,7 +11705,7 @@ mod tests {
         );
         assert!(cpu.guest_text.cells.iter().all(|cell| cell.background == 4));
 
-        cpu.write(GUEST_TEXT_CONTROL, GUEST_TEXT_DISABLE);
+        cpu.write(crate::machine::FIRMWARE_TEXT_CONTROL, 3);
         assert!(!cpu.guest_text.enabled);
     }
 
@@ -12503,16 +11713,16 @@ mod tests {
     fn console_mmio_bounds_input_and_clears_overrun_status() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         cpu.receive_console_input(&vec![b'x'; crate::console::RX_CAPACITY + 1]);
-        assert_eq!(cpu.read(CONSOLE_STATUS), 7);
-        cpu.write(CONSOLE_STATUS, 0x04);
-        assert_eq!(cpu.read(CONSOLE_STATUS), 3);
+        assert_eq!(cpu.read(crate::machine::CONSOLE_STATUS), 7);
+        cpu.write(crate::machine::CONSOLE_STATUS, 0x04);
+        assert_eq!(cpu.read(crate::machine::CONSOLE_STATUS), 3);
 
-        cpu.write(CONSOLE_CONTROL, 0x02);
+        cpu.write(crate::machine::CONSOLE_CONTROL, 0x02);
         for _ in 0..crate::console::RX_CAPACITY {
-            cpu.read(CONSOLE_DATA);
+            cpu.read(crate::machine::CONSOLE_DATA);
         }
         cpu.receive_console_input(b"B");
-        assert_eq!(cpu.read(CONSOLE_DATA), b'B');
+        assert_eq!(cpu.read(crate::machine::CONSOLE_DATA), b'B');
         assert_eq!(cpu.console.output(), b"");
     }
 
@@ -12526,7 +11736,7 @@ mod tests {
             0x20,
             0,
         );
-        cpu.write(ICR_ADDR, 2);
+        write_interrupt_control(&mut cpu, 2);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x20);
         assert_eq!(cpu.read_u32(cpu.sp), 2);
@@ -12536,7 +11746,7 @@ mod tests {
             u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD)
         );
         assert_eq!(cpu.read_u16(cpu.sp + 14), 1);
-        assert_eq!(cpu.read(ICR_ADDR), 0);
+        assert_eq!(read_interrupt_control(&cpu), 0);
     }
 
     #[test]
@@ -12564,7 +11774,7 @@ mod tests {
                 negative: true,
                 overflow: true,
             };
-            cpu.write(ICR_ADDR, pending);
+            write_interrupt_control(&mut cpu, pending);
 
             cpu.step().unwrap();
             let handler = if pending & 2 != 0 { 0x300 } else { 0x400 };
@@ -12573,7 +11783,7 @@ mod tests {
             assert_eq!(cpu.read_u16(cpu.sp + 4), 0b1101);
             assert_eq!(cpu.read_u16(cpu.sp + 6), 2);
             assert_eq!(
-                cpu.read(ICR_ADDR),
+                read_interrupt_control(&cpu),
                 pending & !(if pending & 2 != 0 { 2 } else { 8 })
             );
 
@@ -12613,11 +11823,11 @@ mod tests {
         );
         cpu.write_u16(0x300, OP_EI << 11);
         cpu.write_u16(0x400, OP_RTI << 11);
-        cpu.write(ICR_ADDR, 0x0a);
+        write_interrupt_control(&mut cpu, 0x0a);
 
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x300);
-        assert_eq!(cpu.read(ICR_ADDR), 8);
+        assert_eq!(read_interrupt_control(&cpu), 8);
 
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x400);
@@ -12644,17 +11854,19 @@ mod tests {
             0,
         );
         cpu.write_u16(0x200, OP_RTI << 11);
-        cpu.write_u16(TIMER_PERIOD_ADDR, 2);
-        cpu.write(ICR_ADDR, 1);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 2)
+            .unwrap();
+        write_interrupt_control(&mut cpu, 1);
 
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 2);
-        cpu.write(ICR_ADDR, 1 | 8);
+        write_interrupt_control(&mut cpu, 1 | 8);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x100);
         assert_eq!(cpu.read_u32(cpu.sp), 4);
-        assert_eq!(cpu.read(ICR_ADDR), 8);
-        cpu.write_u16(TIMER_PERIOD_ADDR, 0);
+        assert_eq!(read_interrupt_control(&cpu), 8);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 0)
+            .unwrap();
 
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x200);
@@ -12665,11 +11877,16 @@ mod tests {
     #[test]
     fn pit_period_register_does_not_overlap_gpu_mode_register() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write_u16(TIMER_PERIOD_ADDR, 2);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 2)
+            .unwrap();
 
         cpu.write(GPU_MODE_ADDR, 1);
 
-        assert_eq!(cpu.read_u16(TIMER_PERIOD_ADDR), 2);
+        assert_eq!(
+            cpu.read_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD)
+                .unwrap(),
+            2
+        );
         assert_eq!(cpu.screen_size(), (640, 480));
     }
 
@@ -12683,29 +11900,33 @@ mod tests {
             0,
         );
         cpu.write_u16(0x100, OP_RTI << 11);
-        cpu.write_u16(TIMER_PERIOD_ADDR, 1);
-        cpu.write(PIT_CONTROL_ADDR, 0);
-        cpu.write(ICR_ADDR, 1);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 1)
+            .unwrap();
+        cpu.write_guest(crate::machine::INTERRUPT_PIT_ENABLE, 0)
+            .unwrap();
+        write_interrupt_control(&mut cpu, 1);
 
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 2);
-        assert_eq!(cpu.read(ICR_ADDR), 0x11);
+        assert_eq!(read_interrupt_control(&cpu), 0x11);
 
-        cpu.write(PIT_CONTROL_ADDR, 1);
+        cpu.write_guest(crate::machine::INTERRUPT_PIT_ENABLE, 1)
+            .unwrap();
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 0x100);
-        assert_eq!(cpu.read(ICR_ADDR) & 0x10, 0);
+        assert_eq!(read_interrupt_control(&cpu) & 0x10, 0);
         assert_eq!(cpu.read_u32(cpu.sp), 4);
         assert_eq!(
             cpu.read_u16(cpu.sp + 12),
             u16::from(crate::interrupts::IDT_VECTOR_PIT)
         );
-        cpu.write_u16(TIMER_PERIOD_ADDR, 0);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 0)
+            .unwrap();
 
         cpu.step().unwrap();
 
         assert_eq!(cpu.pc, 4);
-        assert_eq!(cpu.read(ICR_ADDR) & 1, 1);
+        assert_eq!(read_interrupt_control(&cpu) & 1, 1);
     }
 
     #[test]
@@ -12721,8 +11942,9 @@ mod tests {
         );
         let first = cpu.create_user_task(0x100, 0x7000, 0xf000, None).unwrap();
         let second = cpu.create_user_task(0x200, 0x5000, 0xd000, None).unwrap();
-        cpu.write_u16(TIMER_PERIOD_ADDR, 1);
-        cpu.write(ICR_ADDR, 1);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 1)
+            .unwrap();
+        write_interrupt_control(&mut cpu, 1);
         cpu.start_task(first).unwrap();
         cpu.registers[3] = 0x1234;
         cpu.flags = Flags {
@@ -12816,8 +12038,9 @@ mod tests {
         let second = cpu
             .create_user_task(virtual_entry, 0x5000, 0x9000, Some(second_directory))
             .unwrap();
-        cpu.write_u16(TIMER_PERIOD_ADDR, 1);
-        cpu.write(ICR_ADDR, 1);
+        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 1)
+            .unwrap();
+        write_interrupt_control(&mut cpu, 1);
         cpu.start_task(first).unwrap();
 
         cpu.step().unwrap();
@@ -13003,7 +12226,7 @@ mod tests {
     }
 
     #[test]
-    fn mmu_user_instruction_cannot_reach_mapped_protected_interrupt_registers() {
+    fn mmu_user_instruction_treats_removed_low_interrupt_alias_as_ram() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
         let directory = manager.create_address_space(&mut cpu.memory).unwrap();
@@ -13023,14 +12246,6 @@ mod tests {
                 crate::mmu::PagePermissions::USER_DATA,
             )
             .unwrap();
-        let handler_frame = manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x4000,
-                crate::mmu::PagePermissions::KERNEL_CODE,
-            )
-            .unwrap();
         manager
             .map_borrowed_page(
                 &mut cpu.memory,
@@ -13038,150 +12253,34 @@ mod tests {
                 0x43000,
                 0x43,
                 crate::mmu::PagePermissions::USER_DATA,
-            )
-            .unwrap();
-        manager
-            .map_borrowed_page(
-                &mut cpu.memory,
-                directory,
-                0xff000,
-                0xff,
-                crate::mmu::PagePermissions::KERNEL_DATA,
             )
             .unwrap();
         cpu.memory[code_frame as usize * crate::mmu::PAGE_SIZE
             ..code_frame as usize * crate::mmu::PAGE_SIZE + 2]
             .copy_from_slice(&((OP_ST << 11) | (1 << 5)).to_be_bytes());
-        cpu.memory[handler_frame as usize * crate::mmu::PAGE_SIZE
-            ..handler_frame as usize * crate::mmu::PAGE_SIZE + 2]
-            .copy_from_slice(&(OP_RTI << 11).to_be_bytes());
         cpu.enable_mmu(directory).unwrap();
-        cpu.load_idt(0x800).unwrap();
-        cpu.set_idt_descriptor(
-            EXCEPTION_PRIVILEGE_VIOLATION,
-            crate::interrupts::IdtDescriptor {
-                handler: 0x4000,
-                present: true,
-                privilege: 0,
-                gate_type: crate::interrupts::GateType::Interrupt,
-            },
-        )
-        .unwrap();
-        cpu.registers[0] = 0;
-        cpu.registers[1] = i64::from(ICR_ADDR);
-        cpu.write(ICR_ADDR, 9);
+        cpu.registers[0] = 0x5a5a;
+        cpu.registers[1] = 0x43002;
         cpu.enter_user_mode(0x1000, 0x3000).unwrap();
 
         cpu.step().unwrap();
 
-        assert_eq!(cpu.memory[ICR_ADDR as usize], 8);
-        assert_eq!(cpu.pc, 0x4000);
-        assert_eq!(cpu.read_u16(cpu.sp + 12), EXCEPTION_PRIVILEGE_VIOLATION);
-    }
-
-    #[test]
-    fn mmu_user_filesystem_service_validates_noncontiguous_guest_buffers() {
-        let disk_path = folder_disk_for_test("mmu-guest-buffer", false);
-        let root = disk_path.parent().unwrap().to_path_buf();
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.mount_folder_disk(&disk_path).unwrap();
-        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
-        let directory = manager.create_address_space(&mut cpu.memory).unwrap();
-        let path_frame = manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x1000,
-                crate::mmu::PagePermissions::USER_DATA,
-            )
-            .unwrap();
-        let first_output_frame = manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x3000,
-                crate::mmu::PagePermissions::USER_DATA,
-            )
-            .unwrap();
-        let second_output_frame = manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x4000,
-                crate::mmu::PagePermissions::USER_DATA,
-            )
-            .unwrap();
-        let code_frame = manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x5000,
-                crate::mmu::PagePermissions::USER_CODE,
-            )
-            .unwrap();
-        manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x7000,
-                crate::mmu::PagePermissions::USER_DATA,
-            )
-            .unwrap();
-        manager
-            .map_borrowed_page(
-                &mut cpu.memory,
-                directory,
-                0x43000,
-                0x43,
-                crate::mmu::PagePermissions::USER_DATA,
-            )
-            .unwrap();
-        let path_start = path_frame as usize * crate::mmu::PAGE_SIZE;
-        cpu.memory[path_start..path_start + 9].copy_from_slice(b"main.bin\0");
-        let instruction = (OP_ST << 11) | (1 << 5);
-        let code_start = code_frame as usize * crate::mmu::PAGE_SIZE;
-        cpu.memory[code_start..code_start + 2].copy_from_slice(&instruction.to_be_bytes());
-        cpu.memory[DISK_BASE as usize + 22..DISK_BASE as usize + 26]
-            .copy_from_slice(&0x1000u32.to_be_bytes());
-        cpu.memory[DISK_BASE as usize + 26..DISK_BASE as usize + 30]
-            .copy_from_slice(&0x3fffu32.to_be_bytes());
-        cpu.memory[DISK_BASE as usize + 30..DISK_BASE as usize + 32]
-            .copy_from_slice(&3u16.to_be_bytes());
-        cpu.enable_mmu(directory).unwrap();
-        cpu.registers[0] = i64::from(FOLDER_FS_READ);
-        cpu.registers[1] = i64::from(DISK_BASE);
-        cpu.enter_user_mode(0x5000, 0x8000).unwrap();
-
-        cpu.step().unwrap();
-
-        let first_output_start = first_output_frame as usize * crate::mmu::PAGE_SIZE;
-        let second_output_start = second_output_frame as usize * crate::mmu::PAGE_SIZE;
-        assert_eq!(
-            cpu.memory[first_output_start + crate::mmu::PAGE_SIZE - 1],
-            1
-        );
-        assert_eq!(cpu.memory[second_output_start], 2);
-        assert_eq!(cpu.memory[second_output_start + 1], 3);
-        assert_eq!(cpu.memory[DISK_BASE as usize + 16], 0);
-
-        cpu.memory[DISK_BASE as usize + 26..DISK_BASE as usize + 30]
-            .copy_from_slice(&0x6000u32.to_be_bytes());
-        cpu.write(DISK_BASE, FOLDER_FS_READ);
-        assert_eq!(cpu.memory[DISK_BASE as usize + 16], 1);
-        assert_eq!(cpu.memory[0x6000], 0);
-        drop(cpu);
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
+        assert_eq!(cpu.pc, 0x1002);
+        assert_eq!(cpu.read(0x43002), 0x5a);
+        assert_eq!(cpu.read(crate::machine::INTERRUPT_ENABLE), 0);
+        assert_eq!(cpu.read(crate::machine::INTERRUPT_PENDING), 0);
     }
 
     #[test]
     fn disabled_interrupts_leave_pending_sources_untouched() {
         let mut cpu = cpu_with_program(&[(OP_INC << 11) | (3 << 8)]);
         cpu.registers[3] = 7;
-        cpu.write(ICR_ADDR, 0x0a);
+        write_interrupt_control(&mut cpu, 0x0a);
         cpu.step().unwrap();
         assert_eq!(cpu.registers[3], 8);
         assert_eq!(cpu.pc, 2);
-        assert_eq!(cpu.read(ICR_ADDR), 0x0a);
+        assert_eq!(read_interrupt_control(&cpu), 0x0a);
     }
 
     #[test]

@@ -4,12 +4,12 @@
 
 use crate::CpuError;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"SC16IMG2";
-const PREVIOUS_MAGIC: &[u8; 8] = b"SC16IMG1";
-const FORMAT_VERSION: u16 = 2;
+const MAGIC: &[u8; 8] = b"SC16IMG3";
+const PREVIOUS_MAGICS: [&[u8; 8]; 2] = [b"SC16IMG1", b"SC16IMG2"];
+const FORMAT_VERSION: u16 = 3;
 const HEADER_SIZE: u64 = 20;
 const SEGMENT_HEADER_SIZE: u64 = 20;
 const MAX_SEGMENTS: usize = 65_536;
@@ -201,29 +201,15 @@ pub fn load_binary(path: &Path) -> Result<ProgramImage, ImageError> {
         if &magic == MAGIC {
             return read_image(path);
         }
-        if &magic == PREVIOUS_MAGIC {
-            return Err(ImageError::InvalidFormat("unsupported image version"));
+        if PREVIOUS_MAGICS.iter().any(|previous| &magic == *previous) {
+            return Err(ImageError::InvalidFormat(
+                "legacy SC-16 image; rebuild for machine revision 2",
+            ));
         }
     }
-    if file_length > MEMORY_SIZE {
-        return Err(ImageError::InvalidFormat("binary exceeds SC-16 memory"));
-    }
-    let capacity = usize::try_from(file_length)
-        .map_err(|_| ImageError::InvalidFormat("binary exceeds SC-16 memory"))?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(capacity)
-        .map_err(|_| ImageError::InvalidFormat("binary allocation failed"))?;
-    file.take(MEMORY_SIZE + 1).read_to_end(&mut data)?;
-    if data.len() as u64 > MEMORY_SIZE {
-        return Err(ImageError::InvalidFormat("binary exceeds SC-16 memory"));
-    }
-    let image = ProgramImage {
-        entry_point: 0,
-        segments: vec![ImageSegment::new(0, data)],
-    };
-    validate_image(&image)?;
-    Ok(image)
+    Err(ImageError::InvalidFormat(
+        "unversioned raw binary; runtime requires an SC16IMG3 image for machine revision 2",
+    ))
 }
 
 pub fn load_program(path: &Path) -> Result<ProgramImage, ImageError> {
@@ -280,7 +266,7 @@ pub fn encode_image(image: &ProgramImage) -> Result<Vec<u8>, ImageError> {
     let mut file = Vec::new();
     file.write_all(MAGIC)?;
     file.write_all(&FORMAT_VERSION.to_be_bytes())?;
-    file.write_all(&0u16.to_be_bytes())?;
+    file.write_all(&(crate::machine::MACHINE_REVISION as u16).to_be_bytes())?;
     file.write_all(&image.entry_point.to_be_bytes())?;
     file.write_all(&segment_count.to_be_bytes())?;
     for segment in &image.segments {
@@ -382,18 +368,28 @@ pub fn read_image(path: &Path) -> Result<ProgramImage, ImageError> {
     }
     let mut header = [0u8; HEADER_SIZE as usize];
     file.read_exact(&mut header)?;
-    if &header[..8] == PREVIOUS_MAGIC {
-        return Err(ImageError::InvalidFormat("unsupported image version"));
+    if PREVIOUS_MAGICS
+        .iter()
+        .any(|previous| &header[..8] == *previous)
+    {
+        return Err(ImageError::InvalidFormat(
+            "legacy SC-16 image; rebuild for machine revision 2",
+        ));
     }
     if &header[..8] != MAGIC {
         return Err(ImageError::InvalidFormat("bad magic"));
     }
     let version = u16::from_be_bytes(header[8..10].try_into().unwrap());
     if version != FORMAT_VERSION {
-        return Err(ImageError::InvalidFormat("unsupported image version"));
+        return Err(ImageError::InvalidFormat(
+            "unsupported image container version; rebuild for SC16IMG3 machine revision 2",
+        ));
     }
-    if u16::from_be_bytes(header[10..12].try_into().unwrap()) != 0 {
-        return Err(ImageError::InvalidFormat("nonzero reserved header flags"));
+    let machine_revision = u16::from_be_bytes(header[10..12].try_into().unwrap());
+    if machine_revision != crate::machine::MACHINE_REVISION as u16 {
+        return Err(ImageError::InvalidFormat(
+            "image targets an unsupported machine revision; rebuild for revision 2",
+        ));
     }
     let entry_point = u32::from_be_bytes(header[12..16].try_into().unwrap());
     let segment_count = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
@@ -483,7 +479,7 @@ mod tests {
     fn raw_image(entry_point: u32, segments: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&(crate::machine::MACHINE_REVISION as u16).to_be_bytes());
         bytes.extend_from_slice(&entry_point.to_be_bytes());
         bytes.extend_from_slice(&(segments.len() as u32).to_be_bytes());
         for segment in segments {
@@ -655,23 +651,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_replaced_v1_images_and_unknown_versions() {
+    fn rejects_legacy_images_and_unknown_revisions() {
         let path =
             std::env::temp_dir().join(format!("sc16-old-image-version-{}.img", std::process::id()));
         let mut bytes = raw_image(0, &[raw_segment(0, 1, PERMISSION_MASK, &[0, 0])]);
-        bytes[..8].copy_from_slice(PREVIOUS_MAGIC);
+        bytes[..8].copy_from_slice(&PREVIOUS_MAGICS[1][..]);
         fs::write(&path, bytes).unwrap();
         assert!(matches!(
             read_image(&path),
-            Err(ImageError::InvalidFormat("unsupported image version"))
+            Err(ImageError::InvalidFormat(
+                "legacy SC-16 image; rebuild for machine revision 2"
+            ))
         ));
 
         let mut bytes = raw_image(0, &[raw_segment(0, 1, PERMISSION_MASK, &[0, 0])]);
-        bytes[9] = 3;
+        bytes[9] = 4;
         fs::write(&path, bytes).unwrap();
         assert!(matches!(
             read_image(&path),
-            Err(ImageError::InvalidFormat("unsupported image version"))
+            Err(ImageError::InvalidFormat(
+                "unsupported image container version; rebuild for SC16IMG3 machine revision 2"
+            ))
+        ));
+
+        let mut bytes = raw_image(0, &[raw_segment(0, 1, PERMISSION_MASK, &[0, 0])]);
+        bytes[11] = 1;
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            read_image(&path),
+            Err(ImageError::InvalidFormat(
+                "image targets an unsupported machine revision; rebuild for revision 2"
+            ))
         ));
         fs::remove_file(path).unwrap();
     }
@@ -683,11 +693,13 @@ mod tests {
         let valid_segment = raw_segment(0, 1, PERMISSION_MASK, &[0, 0]);
 
         let mut bytes = raw_image(0, &[valid_segment.clone()]);
-        bytes[11] = 1;
+        bytes[10] = 1;
         fs::write(&path, bytes).unwrap();
         assert!(matches!(
             read_image(&path),
-            Err(ImageError::InvalidFormat("nonzero reserved header flags"))
+            Err(ImageError::InvalidFormat(
+                "image targets an unsupported machine revision; rebuild for revision 2"
+            ))
         ));
 
         let mut reserved = raw_segment(0, 1, PERMISSION_MASK, &[0, 0]);
@@ -764,7 +776,7 @@ mod tests {
 
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
-        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&(crate::machine::MACHINE_REVISION as u16).to_be_bytes());
         bytes.extend_from_slice(&0u32.to_be_bytes());
         bytes.extend_from_slice(&((MAX_SEGMENTS as u32) + 1).to_be_bytes());
         fs::write(&path, bytes).unwrap();
@@ -843,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_version_two_image_and_executes_loaded_entry() {
+    fn writes_version_three_image_and_executes_loaded_entry() {
         let source_path =
             std::env::temp_dir().join(format!("sc16-image-entry-{}.asm", std::process::id()));
         let image_path =
@@ -852,6 +864,14 @@ mod tests {
         let image = build_source(&source_path).unwrap();
         write_image(&image_path, &image).unwrap();
         assert_eq!(&fs::read(&image_path).unwrap()[..8], MAGIC);
+        assert_eq!(
+            u16::from_be_bytes(fs::read(&image_path).unwrap()[8..10].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u16::from_be_bytes(fs::read(&image_path).unwrap()[10..12].try_into().unwrap()),
+            crate::machine::MACHINE_REVISION as u16
+        );
         let loaded = read_image(&image_path).unwrap();
         fs::remove_file(source_path).unwrap();
         fs::remove_file(image_path).unwrap();
@@ -882,13 +902,13 @@ mod tests {
         let binary_path =
             std::env::temp_dir().join(format!("sc16-binary-{}.bin", std::process::id()));
         fs::write(&binary_path, [0x12, 0x34, 0x56]).unwrap();
-        let image = load_program(&binary_path).unwrap();
+        assert!(matches!(
+            load_program(&binary_path),
+            Err(ImageError::InvalidFormat(
+                "unversioned raw binary; runtime requires an SC16IMG3 image for machine revision 2"
+            ))
+        ));
         fs::remove_file(binary_path).unwrap();
-        assert_eq!(image.entry_point, 0);
-        assert_eq!(
-            image.segments,
-            [ImageSegment::new(0, vec![0x12, 0x34, 0x56])]
-        );
 
         let container_path =
             std::env::temp_dir().join(format!("sc16-container-{}.bin", std::process::id()));
@@ -908,10 +928,16 @@ mod tests {
 
         let legacy_path =
             std::env::temp_dir().join(format!("sc16-legacy-container-{}.bin", std::process::id()));
-        fs::write(&legacy_path, [PREVIOUS_MAGIC.as_slice(), &[0; 16]].concat()).unwrap();
+        fs::write(
+            &legacy_path,
+            [PREVIOUS_MAGICS[1].as_slice(), &[0; 16]].concat(),
+        )
+        .unwrap();
         assert!(matches!(
             load_program(&legacy_path),
-            Err(ImageError::InvalidFormat("unsupported image version"))
+            Err(ImageError::InvalidFormat(
+                "legacy SC-16 image; rebuild for machine revision 2"
+            ))
         ));
         fs::remove_file(&legacy_path).unwrap();
 
