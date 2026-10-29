@@ -1,4 +1,4 @@
-//! Defines address boundaries, device banks, system identification, and interrupt state.
+//! Defines address boundaries, register contracts, and interrupt/input/clock state.
 //! Separates usable RAM from devices and supplies the checked guest register contract.
 
 pub const ADDRESS_SPACE_SIZE: u32 = 1 << 30;
@@ -31,9 +31,31 @@ pub const INTERRUPT_PIT_COUNTDOWN: u32 = INTERRUPT_BASE + 12;
 pub const FAULT_ADDRESS: u32 = FAULT_BASE;
 pub const FAULT_INFO: u32 = FAULT_BASE + 4;
 pub const FAULT_VALID: u32 = FAULT_BASE + 6;
+pub const INPUT_KEY: u32 = INPUT_BASE;
+pub const INPUT_KEYS: u32 = INPUT_BASE + 4;
+pub const INPUT_MOUSE_X: u32 = INPUT_BASE + 8;
+pub const INPUT_MOUSE_Y: u32 = INPUT_BASE + 10;
+pub const INPUT_MOUSE_BUTTONS: u32 = INPUT_BASE + 12;
+pub const INPUT_MOUSE_EVENTS: u32 = INPUT_BASE + 13;
+pub const INPUT_MOUSE_WHEEL: u32 = INPUT_BASE + 14;
+pub const CLOCK_CAPTURE: u32 = CLOCK_BASE;
+pub const CLOCK_MONOTONIC_MILLIS: u32 = CLOCK_BASE + 4;
+pub const CLOCK_FRAMES: u32 = CLOCK_BASE + 8;
+pub const CLOCK_RTC: u32 = CLOCK_BASE + 12;
+pub const CLOCK_RANDOM: u32 = CLOCK_BASE + 16;
+pub const CONSOLE_DATA: u32 = CONSOLE_BASE;
+pub const CONSOLE_STATUS: u32 = CONSOLE_BASE + 1;
+pub const CONSOLE_CONTROL: u32 = CONSOLE_BASE + 2;
+pub const FIRMWARE_TEXT_DATA: u32 = FIRMWARE_TEXT_BASE;
+pub const FIRMWARE_TEXT_FOREGROUND: u32 = FIRMWARE_TEXT_BASE + 1;
+pub const FIRMWARE_TEXT_BACKGROUND: u32 = FIRMWARE_TEXT_BASE + 2;
+pub const FIRMWARE_TEXT_CONTROL: u32 = FIRMWARE_TEXT_BASE + 3;
+pub const FIRMWARE_TEXT_ROW: u32 = FIRMWARE_TEXT_BASE + 4;
+pub const FIRMWARE_TEXT_COLUMN: u32 = FIRMWARE_TEXT_BASE + 5;
+pub const FIRMWARE_TEXT_ENABLED: u32 = FIRMWARE_TEXT_BASE + 6;
 pub const MACHINE_REVISION: u32 = 1;
 pub const DEVICE_ABI: u32 = 1;
-pub const IMPLEMENTED_BANKS: u32 = 7;
+pub const IMPLEMENTED_BANKS: u32 = 0x61f;
 
 pub const fn usable_ram_size(backing_size: usize) -> usize {
     if backing_size < DEVICE_APERTURE_START as usize {
@@ -48,7 +70,8 @@ pub const fn is_device_aperture(address: u32) -> bool {
 }
 
 pub const fn is_implemented_device_page(address: u32) -> bool {
-    address >= SYSTEM_BASE && address < FAULT_BASE + DEVICE_BANK_SIZE
+    (address >= SYSTEM_BASE && address < CLOCK_BASE + DEVICE_BANK_SIZE)
+        || (address >= CONSOLE_BASE && address < FIRMWARE_TEXT_BASE + DEVICE_BANK_SIZE)
 }
 
 pub fn device_register_writable(address: u32) -> Option<bool> {
@@ -63,7 +86,125 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
             Some(false)
         }
         FAULT_ADDRESS..=FAULT_VALID => Some(false),
+        INPUT_KEY => Some(false),
+        address if (INPUT_KEYS..INPUT_MOUSE_WHEEL + 2).contains(&address) => Some(false),
+        CLOCK_CAPTURE => Some(true),
+        CONSOLE_DATA..=CONSOLE_CONTROL => Some(true),
+        FIRMWARE_TEXT_DATA..=FIRMWARE_TEXT_COLUMN => Some(true),
+        FIRMWARE_TEXT_ENABLED => Some(false),
+        address
+            if (CLOCK_MONOTONIC_MILLIS..CLOCK_MONOTONIC_MILLIS + 4).contains(&address)
+                || (CLOCK_FRAMES..CLOCK_FRAMES + 2).contains(&address)
+                || (CLOCK_RTC..CLOCK_RTC + 3).contains(&address)
+                || (CLOCK_RANDOM..CLOCK_RANDOM + 4).contains(&address) =>
+        {
+            Some(false)
+        }
         _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InputDevice {
+    pub key: u8,
+    pub keys: u32,
+    pub mouse: [u8; 8],
+    last_mouse_click: [Option<(u64, u16, u16)>; 2],
+}
+
+impl InputDevice {
+    pub fn read(&mut self, address: u32) -> Option<u8> {
+        match address {
+            INPUT_KEY => Some(std::mem::take(&mut self.key)),
+            address if (INPUT_KEYS..INPUT_KEYS + 4).contains(&address) => {
+                Some((self.keys & 0x00ff_ffff).to_be_bytes()[(address - INPUT_KEYS) as usize])
+            }
+            INPUT_MOUSE_EVENTS => Some(std::mem::take(&mut self.mouse[5])),
+            address if (INPUT_MOUSE_X..INPUT_MOUSE_X + 8).contains(&address) => {
+                Some(self.mouse[(address - INPUT_MOUSE_X) as usize])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn set_key(&mut self, mask: u32, pressed: bool) {
+        let mask = mask & 0x00ff_ffff;
+        if pressed {
+            self.keys |= mask;
+        } else {
+            self.keys &= !mask;
+        }
+    }
+
+    pub fn mouse_button(&mut self, button: usize, down: bool, x: u16, y: u16, now_ms: u64) {
+        if button > 1 {
+            return;
+        }
+        let bit = 1 << button;
+        if !down {
+            self.mouse[4] &= !bit;
+            self.mouse[5] |= bit << 4;
+            return;
+        }
+        self.mouse[4] |= bit;
+        self.mouse[5] |= bit;
+        let double =
+            self.last_mouse_click[button].is_some_and(|(previous_ms, previous_x, previous_y)| {
+                now_ms.saturating_sub(previous_ms) <= 400
+                    && x.abs_diff(previous_x) <= 4
+                    && y.abs_diff(previous_y) <= 4
+            });
+        if double {
+            self.mouse[5] |= bit << 2;
+            self.last_mouse_click[button] = None;
+        } else {
+            self.last_mouse_click[button] = Some((now_ms, x, y));
+        }
+    }
+
+    pub fn add_wheel(&mut self, delta: i16) {
+        let wheel = i16::from_be_bytes([self.mouse[6], self.mouse[7]]);
+        self.mouse[6..8].copy_from_slice(&wheel.saturating_add(delta).to_be_bytes());
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClockDevice {
+    pub rtc: [u8; 3],
+    milliseconds: u32,
+    frames: u16,
+    captured_rtc: [u8; 3],
+    random: u32,
+}
+
+impl ClockDevice {
+    pub fn capture_time(&mut self, milliseconds: u32, frames: u16) {
+        self.milliseconds = milliseconds & (ADDRESS_SPACE_SIZE - 1);
+        self.frames = frames;
+        self.captured_rtc = self.rtc;
+    }
+
+    pub fn capture_random(&mut self, random: u32) {
+        self.random = random;
+    }
+
+    pub fn read(&self, address: u32) -> Option<u8> {
+        match address {
+            CLOCK_CAPTURE => Some(0),
+            address if (CLOCK_MONOTONIC_MILLIS..CLOCK_MONOTONIC_MILLIS + 4).contains(&address) => {
+                Some(self.milliseconds.to_be_bytes()[(address - CLOCK_MONOTONIC_MILLIS) as usize])
+            }
+            address if (CLOCK_FRAMES..CLOCK_FRAMES + 2).contains(&address) => {
+                Some(self.frames.to_be_bytes()[(address - CLOCK_FRAMES) as usize])
+            }
+            address if (CLOCK_RTC..CLOCK_RTC + 3).contains(&address) => {
+                Some(self.captured_rtc[(address - CLOCK_RTC) as usize])
+            }
+            address if (CLOCK_RANDOM..CLOCK_RANDOM + 4).contains(&address) => {
+                Some(self.random.to_be_bytes()[(address - CLOCK_RANDOM) as usize])
+            }
+            _ => None,
+        }
     }
 }
 
@@ -214,7 +355,22 @@ mod tests {
         ));
         assert!(is_implemented_device_page(INTERRUPT_BASE));
         assert!(is_implemented_device_page(FAULT_BASE));
-        assert!(!is_implemented_device_page(INPUT_BASE));
+        assert!(is_implemented_device_page(INPUT_BASE));
+        assert!(is_implemented_device_page(CLOCK_BASE));
+        assert!(!is_implemented_device_page(GRAPHICS_BASE));
+    }
+
+    #[test]
+    fn implemented_bank_mask_matches_every_aperture_page_boundary() {
+        for page in 0..(ADDRESS_SPACE_SIZE - DEVICE_APERTURE_START) / DEVICE_BANK_SIZE {
+            let base = DEVICE_APERTURE_START + page * DEVICE_BANK_SIZE;
+            let implemented = page < 32 && IMPLEMENTED_BANKS & (1 << page) != 0;
+            assert_eq!(is_implemented_device_page(base), implemented);
+            assert_eq!(
+                is_implemented_device_page(base + DEVICE_BANK_SIZE - 1),
+                implemented
+            );
+        }
     }
 
     #[test]
@@ -249,6 +405,28 @@ mod tests {
             ("FAULT_ADDRESS", FAULT_ADDRESS),
             ("FAULT_INFO", FAULT_INFO),
             ("FAULT_VALID", FAULT_VALID),
+            ("INPUT_KEY", INPUT_KEY),
+            ("INPUT_KEYS", INPUT_KEYS),
+            ("INPUT_MOUSE_X", INPUT_MOUSE_X),
+            ("INPUT_MOUSE_Y", INPUT_MOUSE_Y),
+            ("INPUT_MOUSE_BUTTONS", INPUT_MOUSE_BUTTONS),
+            ("INPUT_MOUSE_EVENTS", INPUT_MOUSE_EVENTS),
+            ("INPUT_MOUSE_WHEEL", INPUT_MOUSE_WHEEL),
+            ("CLOCK_CAPTURE", CLOCK_CAPTURE),
+            ("CLOCK_MONOTONIC_MILLIS", CLOCK_MONOTONIC_MILLIS),
+            ("CLOCK_FRAMES", CLOCK_FRAMES),
+            ("CLOCK_RTC", CLOCK_RTC),
+            ("CLOCK_RANDOM", CLOCK_RANDOM),
+            ("CONSOLE_DATA", CONSOLE_DATA),
+            ("CONSOLE_STATUS", CONSOLE_STATUS),
+            ("CONSOLE_CONTROL", CONSOLE_CONTROL),
+            ("FIRMWARE_TEXT_DATA", FIRMWARE_TEXT_DATA),
+            ("FIRMWARE_TEXT_FOREGROUND", FIRMWARE_TEXT_FOREGROUND),
+            ("FIRMWARE_TEXT_BACKGROUND", FIRMWARE_TEXT_BACKGROUND),
+            ("FIRMWARE_TEXT_CONTROL", FIRMWARE_TEXT_CONTROL),
+            ("FIRMWARE_TEXT_ROW", FIRMWARE_TEXT_ROW),
+            ("FIRMWARE_TEXT_COLUMN", FIRMWARE_TEXT_COLUMN),
+            ("FIRMWARE_TEXT_ENABLED", FIRMWARE_TEXT_ENABLED),
         ];
         let definitions: Vec<_> = header
             .lines()

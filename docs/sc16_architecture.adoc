@@ -33,8 +33,9 @@ accesses are permitted when every byte is valid and permitted. Address
 translation and permission checks apply independently to every byte of an
 access.
 
-The system identification, interrupt/PIT and fault banks are implemented in
-this aperture without RAM backing. All other high banks remain reserved. The low-address legacy device
+The system identification, interrupt/PIT, fault, input, clock/random, console and
+firmware-text banks are implemented in this aperture without RAM backing. All other high banks remain
+reserved. The low-address legacy device
 banks remain in use until their coordinated firmware/toolchain/program migration
 is complete. Instruction operands retain architectural address bits before
 device checks, including on small-memory machines; device accesses cannot
@@ -55,14 +56,14 @@ addresses below; no shared assembly constant syntax is currently supported.
 |`0x3ff00000` |System identification |Implemented, read-only
 |`0x3ff01000` |Interrupt/PIT |Implemented
 |`0x3ff02000` |Fault status |Implemented, read-only
-|`0x3ff03000` |Input |Reserved
-|`0x3ff04000` |Clock/random |Reserved
+|`0x3ff03000` |Input |Implemented, read-only
+|`0x3ff04000` |Clock/random |Implemented
 |`0x3ff05000` |Graphics |Reserved
 |`0x3ff06000` |Audio |Reserved
 |`0x3ff07000` |Game network |Reserved
 |`0x3ff08000` |Filesystem |Reserved
-|`0x3ff09000` |Console |Reserved
-|`0x3ff0a000` |Firmware text |Reserved
+|`0x3ff09000` |Console |Implemented
+|`0x3ff0a000` |Firmware text |Implemented
 |`0x3ff0b000` |Firmware gateway |Reserved
 |===
 
@@ -79,7 +80,7 @@ not change them.
 |`0x04` |Device ABI |`1`, identifying this bank contract
 |`0x08` |Usable RAM bytes |Configured backing size capped at `0x3ff00000`
 |`0x0c` |Address bits |`30`
-|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `7`
+|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0x61f`
 |===
 
 The migration-time machine revision does not advertise completion of the
@@ -166,6 +167,165 @@ size. Reads neither acknowledge nor clear it; all writes fault as read-only.
 There is no command or overflow behavior. Translated device aliases retain the
 original virtual address, not the physical bank address. Legacy fault-register
 reads use this same record; low backing mirrors are maintained only when present.
+
+==== Input bank
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |R |Last keyboard event byte; reading consumes it
+|`0x04` |4 |R |Big-endian held-key mask; only bits 0..23 are defined
+|`0x08` |2 |R |Big-endian unsigned mouse X
+|`0x0a` |2 |R |Big-endian unsigned mouse Y
+|`0x0c` |1 |R |Held mouse buttons: left bit 0, right bit 1
+|`0x0d` |1 |R |Latched mouse events; reading clears all event bits
+|`0x0e` |2 |R |Big-endian signed 16-bit per-frame wheel delta
+|===
+
+All other offsets are reserved. All writes fault as read-only. Devices start
+with zero key, held mask, coordinates, buttons, events and wheel; there are no
+commands or writable value bits. The keyboard event retains the latest byte
+until read; a later event replaces an unread byte. Zero means no event. This
+preserves the existing single-event hardware latch, not a keyboard FIFO.
+Signalling a keyboard event also latches the keyboard interrupt. Reading its
+byte does not clear the interrupt pending bit, and interrupt delivery does not
+consume the byte.
+
+Mouse event bits 0/1 mean left/right press, 2/3 double-click, and 4/5 release.
+Events coalesce until read. A second press within 400 milliseconds and four
+pixels on each axis counts as a double-click; that pair is then consumed by
+double-click detection. Held state is independent of event consumption.
+Position is clamped to 320x240 or 640x480 according to the active video mode.
+Wheel updates accumulate with signed 16-bit saturation until the existing host
+end-of-mouse-frame hook clears them. Reading wheel does not clear it.
+
+Keyboard and mouse-event reads through high, translated or legacy addresses
+consume the same typed latch exactly once. Every byte of a multibyte access is
+validated before consumption, so an access crossing reserved bytes or failing
+permissions leaves events intact. Other input reads have no device side effects.
+Input state and double-click history survive image-entry preparation; interrupt
+pending state is separately cleared by that path.
+
+Legacy held-key bytes remain in their original low-byte-first order; the high
+bank exposes the same 24 bits as a conventional big-endian 32-bit value with a
+zero high byte. Legacy mouse byte layouts and migration-time supervisor byte
+writes are retained. Host input producers and valid destructive reads maintain
+low RAM mirrors only where backing exists; direct host RAM mutation is not an
+input API. High input access works even when no legacy backing exists.
+
+==== Console bank
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |RW |Read the next input byte; write an output byte
+|`0x01` |1 |RW |Status: input-ready bit 0, output-ready bit 1, input-overrun bit 2
+|`0x02` |1 |RW |Control: read-echo bit 0, input-receive enable bit 1
+|===
+
+All other offsets are reserved. Control starts at 3; reserved control bits are
+ignored and read as zero. Status writes clear input-overrun only when bit 2 is
+one, ignoring other bits. Reading status does not clear overrun or consume input.
+An empty status poll while the CPU is running retains the existing host-frame
+yield hint; it is not a process sleep or a guest interrupt.
+
+The shared console has a 4096-byte receive FIFO. Host input is discarded while
+receive is disabled; disabling receive does not flush queued bytes. Over-capacity
+input is dropped and latches overrun until explicitly cleared. Data reads pop
+one byte, return zero when empty, and echo nonzero bytes when echo is enabled.
+Zero input bytes are still consumed; use status to distinguish input-ready.
+Output is always ready and uses the existing 80x25 ANSI terminal, 1000-row
+scrollback and 65536-byte bounded output log. Output-log overflow discards its
+oldest quarter; it does not block or set input-overrun.
+
+Data writes and echoed input update the same terminal render state and output
+log as legacy console accesses and console syscalls. High and low accesses
+consume the same FIFO exactly once; a rejected multibyte access consumes/echoes
+nothing and changes neither control nor overrun. Input/output, cursor, escape
+parser, overrun and control survive image-entry preparation; existing BIOS
+handoff may separately clear input. This bank still addresses the single console;
+four per-session terminals are a later OS requirement, not implemented here.
+
+==== Firmware-text bank
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |RW |Write a character/control byte; reads return zero
+|`0x01` |1 |RW |Foreground palette index
+|`0x02` |1 |RW |Background palette index
+|`0x03` |1 |RW |Command: 1 clear, 2 enable display, 3 disable display; reads return zero
+|`0x04` |1 |RW |Live cursor row, clamped to 0..24 on write
+|`0x05` |1 |RW |Live cursor column, clamped to 0..52 on write
+|`0x06` |1 |R |Display enabled, bit 0
+|===
+
+All other offsets are reserved. Unknown command values are no-ops; commands
+commit synchronously at their byte store with no busy/status/error state.
+Foreground/background accept all eight palette-index bits. Creation sets
+foreground 1, background 0, cursor (0,0), disabled display and blank cells.
+Image-entry preparation retains the display; the existing BIOS handoff may
+separately clear and disable it. Enable/disable does not clear cells or cursor.
+Clear fills all 53x25 cells using the current colors and resets the cursor.
+
+Character output uses the existing firmware display: printable ASCII renders
+directly, other bytes use `?`, with LF advancing a row while retaining column,
+CR returning to column zero, backspace blanking the previous column and Tab
+writing spaces to the next eight-column tab stop. A tab crossing the right edge
+wraps and terminates; scrolling keeps the cursor within the fixed surface.
+Writing a coordinate affects only that coordinate, preserving the other live
+coordinate. All reads are side-effect-free. Invalid multibyte accesses do not
+partially print, clear, enable or move the cursor.
+
+High and legacy paths use the same display handlers and cells. For migration
+compatibility, legacy text register reads retain their last written byte rather
+than the new bank's live cursor/command readback. Legacy row/column writes still
+combine the two last-written coordinate latches; high coordinate writes act on
+the current cursor. These legacy latches are now outside RAM. Only legacy writes
+maintain backed low register mirrors; high console/text accesses never index RAM.
+
+==== Clock/random bank
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |RW |Capture command: bit 0 snapshots time, bit 1 advances and snapshots random
+|`0x04` |4 |R |Captured unsigned monotonic milliseconds, modulo `2^30`
+|`0x08` |2 |R |Captured unsigned host frame counter, modulo `2^16`
+|`0x0c` |3 |R |Captured UTC seconds, minutes, hours, one byte each
+|`0x10` |4 |R |Captured unsigned 32-bit deterministic random value
+|===
+
+All multibyte values are big-endian. All other offsets are reserved. The capture
+register reads as zero; reserved command bits are ignored. Writing bit 0 samples
+all time fields together without advancing random. Writing bit 1 advances the
+shared xorshift32 generator once and replaces only the random snapshot. Setting
+both bits performs both operations synchronously at the command-byte commit.
+Every byte of a multibyte store is validated first: a store spanning the command
+and a reserved offset faults without sampling time or advancing random.
+
+All snapshot fields start at zero and remain unchanged until the corresponding
+capture command. Reads have no side effects; bytewise, unaligned and repeated
+reads cannot tear a snapshot as time advances. All snapshot writes fault as
+read-only. There is no busy state, asynchronous completion or error/status
+register; undefined offsets and access violations use the common device faults.
+
+Monotonic time uses the same CPU-lifetime epoch and 30-bit rollover as the
+monotonic-milliseconds syscall. Frame count uses the existing host frame updates,
+not executed instructions or wall-clock seconds. UTC comes from the last host RTC
+update (zero before the first update), retaining the existing runtime/gallery
+clock update cadence. Midnight wraps to 00:00:00. Clock snapshots, live RTC,
+epoch, frame count and random state survive image-entry preparation.
+
+Random uses the existing deterministic xorshift32 sequence (shifts 13, 17, 5),
+initially seeded with `0x16c0ffee`. It is intended for guest games, not passwords,
+salts, security tokens or entropy. Legacy GPU random commands and high random
+captures advance the same sequence; legacy GPU commands do not overwrite a high
+snapshot. Legacy GPU ticks/RTC commands use the same frame counter/live RTC,
+without changing captured time. Runtime and gallery RTC producers update typed
+clock state and latch the existing RTC interrupt; low RTC reads use that state
+instead of RAM. Migration-time supervisor low RTC writes retain their prior
+byte-write behavior; direct host RAM mutation is no longer a clock device API.
 
 The instruction decoder must distinguish an invalid or unavailable encoding
 from a halt. In the target architecture, an invalid encoding raises an illegal

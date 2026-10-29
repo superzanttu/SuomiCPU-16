@@ -33,7 +33,7 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 1UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 7UL) return 14;\n\
+                 if (*banks != 1567UL) return 14;\n\
                  return 1;\n\
              }"
         ),
@@ -58,6 +58,82 @@ fn guest_c_controls_the_high_pit_and_reads_fault_status() {
                  if (*valid != 0 || *address != 0UL) return 13;\n\
                  *period = 0;\n\
                  *enable = 1;\n\
+                 return 1;\n\
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
+fn guest_c_captures_stable_clock_and_random_registers() {
+    assert_eq!(
+        run_c(
+            "#include <sc16_machine.h>\n\
+             int main(void) {\n\
+                 volatile unsigned char *capture = (volatile unsigned char *)SC16_CLOCK_CAPTURE;\n\
+                 volatile unsigned long *random = (volatile unsigned long *)SC16_CLOCK_RANDOM;\n\
+                 volatile unsigned long *time = (volatile unsigned long *)SC16_CLOCK_MONOTONIC_MILLIS;\n\
+                 unsigned long first;\n\
+                 unsigned long stamp;\n\
+                 *capture = 3;\n\
+                 first = *random;\n\
+                 stamp = *time;\n\
+                 if (first == 0UL || *random != first) return 11;\n\
+                 *capture = 2;\n\
+                 if (*random == first || *time != stamp) return 12;\n\
+                 if (*capture != 0) return 13;\n\
+                 return 1;\n\
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
+fn guest_c_reads_the_high_input_bank() {
+    assert_eq!(
+        run_c(
+            "#include <sc16_machine.h>\n\
+             int main(void) {\n\
+                 volatile unsigned char *key = (volatile unsigned char *)SC16_INPUT_KEY;\n\
+                 volatile unsigned long *keys = (volatile unsigned long *)SC16_INPUT_KEYS;\n\
+                 volatile unsigned int *x = (volatile unsigned int *)SC16_INPUT_MOUSE_X;\n\
+                 volatile unsigned char *events = (volatile unsigned char *)SC16_INPUT_MOUSE_EVENTS;\n\
+                 if (*key != 0 || *key != 0) return 11;\n\
+                 if (*keys != 0UL || *x != 0 || *events != 0) return 12;\n\
+                 return 1;\n\
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
+fn guest_c_writes_high_console_and_firmware_text_devices() {
+    assert_eq!(
+        run_c(
+            "#include <sc16_machine.h>\n\
+             int main(void) {\n\
+                 volatile unsigned char *data = (volatile unsigned char *)SC16_CONSOLE_DATA;\n\
+                 volatile unsigned char *control = (volatile unsigned char *)SC16_CONSOLE_CONTROL;\n\
+                 volatile unsigned char *text = (volatile unsigned char *)SC16_FIRMWARE_TEXT_DATA;\n\
+                 volatile unsigned char *row = (volatile unsigned char *)SC16_FIRMWARE_TEXT_ROW;\n\
+                 volatile unsigned char *col = (volatile unsigned char *)SC16_FIRMWARE_TEXT_COLUMN;\n\
+                 volatile unsigned char *cmd = (volatile unsigned char *)SC16_FIRMWARE_TEXT_CONTROL;\n\
+                 volatile unsigned char *enabled = (volatile unsigned char *)SC16_FIRMWARE_TEXT_ENABLED;\n\
+                 *control = 254;\n\
+                 *data = 65;\n\
+                 if (*control != 2) return 11;\n\
+                 *cmd = 2;\n\
+                 *row = 24;\n\
+                 *col = 52;\n\
+                 *text = 9;\n\
+                 if (*row != 24 || *col != 3 || *enabled != 1) return 12;\n\
+                 *text = 66;\n\
+                 if (*col != 4) return 13;\n\
+                 *cmd = 1;\n\
+                 if (*row != 0 || *col != 0) return 14;\n\
                  return 1;\n\
              }"
         ),

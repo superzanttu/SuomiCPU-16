@@ -851,7 +851,7 @@ mod tests {
             &mut memory,
             0x2000,
             encode_entry(
-                crate::machine::INPUT_BASE / PAGE_SIZE as u32,
+                crate::machine::GRAPHICS_BASE / PAGE_SIZE as u32,
                 PagePermissions::USER_CODE,
             )
             .unwrap(),
@@ -909,6 +909,10 @@ mod tests {
             crate::machine::SYSTEM_BASE,
             crate::machine::INTERRUPT_BASE,
             crate::machine::FAULT_BASE,
+            crate::machine::CLOCK_BASE,
+            crate::machine::INPUT_BASE,
+            crate::machine::CONSOLE_BASE,
+            crate::machine::FIRMWARE_TEXT_BASE,
         ] {
             let mut memory = vec![0; 1 << 16];
             let mut manager = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
@@ -990,6 +994,10 @@ mod tests {
             crate::machine::SYSTEM_BASE,
             crate::machine::INTERRUPT_BASE,
             crate::machine::FAULT_BASE,
+            crate::machine::CLOCK_BASE,
+            crate::machine::INPUT_BASE,
+            crate::machine::CONSOLE_BASE,
+            crate::machine::FIRMWARE_TEXT_BASE,
         ] {
             let mut memory = mapped_memory(PagePermissions::USER_CODE, PagePermissions::USER_CODE);
             write_entry(&mut memory, 0x2000, base | 0xf);

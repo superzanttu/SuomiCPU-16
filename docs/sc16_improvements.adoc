@@ -595,6 +595,13 @@ Checklist status: [x] completed; [ ] planned.
 **** [x] Implement RAM-independent interrupt/PIT and fault banks, shared
      legacy controller state, staged period commit, pending acknowledgement,
      and guest-owned timer/fault execution through protected device aliases.
+**** [x] Implement RAM-independent clock/random snapshots, shared typed
+     RTC/random handlers, rollover checks, and compiled-C/native execution.
+**** [x] Implement the RAM-independent input bank with shared keyboard/mouse
+     latches, validated read side effects, held keys, coordinates and wheel.
+**** [x] Implement RAM-independent console and firmware-text banks with
+     shared terminal/display handlers, protected aliases, live cursor readback,
+     atomic side-effect validation, and compiled-C/native execution regressions.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup

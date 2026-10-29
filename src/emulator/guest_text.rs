@@ -75,8 +75,8 @@ impl GuestTextDisplay {
                 }
             }
             b'\t' => {
-                let next_tab = (self.cursor_column / 8 + 1) * 8;
-                while self.cursor_column < next_tab {
+                let spaces = 8 - self.cursor_column % 8;
+                for _ in 0..spaces {
                     self.write_char(b' ', foreground, background);
                 }
             }
@@ -99,6 +99,35 @@ impl GuestTextDisplay {
         self.background = background;
         self.cursor_column = 0;
         self.cursor_row = 0;
+    }
+
+    pub fn read_register(&self, offset: u32) -> Option<u8> {
+        match offset {
+            0 | 3 => Some(0),
+            1 => Some(self.foreground),
+            2 => Some(self.background),
+            4 => Some(self.cursor_row as u8),
+            5 => Some(self.cursor_column as u8),
+            6 => Some(u8::from(self.enabled)),
+            _ => None,
+        }
+    }
+
+    pub fn write_register(&mut self, offset: u32, value: u8) {
+        match offset {
+            0 => self.write_byte(value, self.foreground, self.background),
+            1 => self.foreground = value,
+            2 => self.background = value,
+            3 => match value {
+                1 => self.clear(self.background),
+                2 => self.enabled = true,
+                3 => self.enabled = false,
+                _ => {}
+            },
+            4 => self.set_cursor(usize::from(value), self.cursor_column),
+            5 => self.set_cursor(self.cursor_row, usize::from(value)),
+            _ => panic!("host write to a read-only or unimplemented firmware text register"),
+        }
     }
 
     fn write_cell(&mut self, character: u8) {
@@ -147,6 +176,23 @@ mod tests {
         assert_eq!(display.cells[8].character, b'c');
         assert_eq!(display.cursor_column, 1);
         assert_eq!(display.cursor_row, 0);
+    }
+
+    #[test]
+    fn tab_near_the_right_edge_wraps_and_terminates_even_on_the_bottom_row() {
+        for column in 48..GUEST_TEXT_COLUMNS {
+            let mut display = GuestTextDisplay::new();
+            display.set_cursor(GUEST_TEXT_ROWS - 1, column);
+            display.write_byte(b'\t', 2, 5);
+            assert_eq!(display.cursor_row, GUEST_TEXT_ROWS - 1);
+            assert_eq!(display.cursor_column, 3);
+            assert!(display.cells.iter().all(|cell| cell.character == b' '));
+            display.write_byte(b'x', 2, 5);
+            assert_eq!(
+                display.cells[(GUEST_TEXT_ROWS - 1) * GUEST_TEXT_COLUMNS + 3].character,
+                b'x'
+            );
+        }
     }
 
     #[test]

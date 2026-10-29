@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPEED_ADDR: usize = 0x43003;
-const RTC_START: usize = 0x43010;
 const GFX_MODE_ADDR: usize = 0x43014;
 const SOUND_RATE: u32 = 22_050;
 const SOUND_FPS: u32 = 60;
@@ -1483,13 +1482,7 @@ fn update_rtc(cpu: &mut Cpu) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let seconds = now.as_secs() % 60;
-    let minutes = (now.as_secs() / 60) % 60;
-    let hours = (now.as_secs() / 3600) % 24;
-    cpu.memory[RTC_START] = seconds as u8;
-    cpu.memory[RTC_START + 1] = minutes as u8;
-    cpu.memory[RTC_START + 2] = hours as u8;
-    cpu.raise_rtc_interrupt();
+    cpu.update_rtc(now.as_secs());
 }
 
 fn rate_budget(rate: f64, elapsed: f64, remainder: &mut f64) -> usize {

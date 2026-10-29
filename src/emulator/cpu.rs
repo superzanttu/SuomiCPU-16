@@ -29,7 +29,6 @@ const EXCEPTION_ENTRY_BYTES: u32 = 16;
 const KEYBOARD_ADDR: u32 = 0x43000;
 const KEYS_ADDR: u32 = 0x43004;
 const MOUSE_ADDR: u32 = 0x43008;
-const MOUSE_EVENTS_ADDR: u32 = MOUSE_ADDR + 5;
 const GPU_BASE: u32 = 0x43020;
 const GPU_MODE_ADDR: u32 = GPU_BASE - 12;
 const GPU_LAYER_SELECT: u32 = GPU_BASE + 16;
@@ -60,8 +59,11 @@ pub const GUEST_TEXT_BACKGROUND: u32 = GUEST_TEXT_BASE + 2;
 pub const GUEST_TEXT_CONTROL: u32 = GUEST_TEXT_BASE + 3;
 pub const GUEST_TEXT_ROW: u32 = GUEST_TEXT_BASE + 4;
 pub const GUEST_TEXT_COLUMN: u32 = GUEST_TEXT_BASE + 5;
+#[cfg(test)]
 const GUEST_TEXT_CLEAR: u8 = 1;
+#[cfg(test)]
 const GUEST_TEXT_ENABLE: u8 = 2;
+#[cfg(test)]
 const GUEST_TEXT_DISABLE: u8 = 3;
 const VRAM_START: u32 = 0x50000;
 const GPU_CLEAR: u8 = 1;
@@ -364,6 +366,7 @@ pub struct Cpu {
     pub terminal_active: bool,
     pub terminal_dirty: bool,
     pub guest_text: GuestTextDisplay,
+    legacy_text_registers: [u8; 6],
     pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
     pub layers: [Vec<u8>; GPU_LAYER_COUNT],
@@ -384,8 +387,7 @@ pub struct Cpu {
     scnet_enabled: bool,
     scnet_port: u16,
     scnet_name: Option<String>,
-    last_mouse_click: [Option<(u64, u16, u16)>; 2],
-    mouse_wheel_delta: i16,
+    input: crate::machine::InputDevice,
     sprites: [Option<GpuSprite>; GPU_SPRITE_SLOTS],
     sprite_descriptors: [(i32, i32, u8); GPU_SPRITE_SLOTS],
     tile_memory: Vec<u8>,
@@ -398,6 +400,7 @@ pub struct Cpu {
     memory_mask: u32,
     layer_mode: u8,
     interrupts: crate::machine::InterruptController,
+    clock: crate::machine::ClockDevice,
     idt_base: Option<u32>,
     mmu_enabled: bool,
     page_directory: u32,
@@ -499,6 +502,7 @@ impl Cpu {
             terminal_active: false,
             terminal_dirty: false,
             guest_text: GuestTextDisplay::new(),
+            legacy_text_registers: [0; 6],
             saved_video: None,
             random_state: 0x16c0_ffee,
             layers: std::array::from_fn(|_| vec![0; 640 * 480]),
@@ -519,8 +523,7 @@ impl Cpu {
             scnet_enabled: false,
             scnet_port: crate::sc_net::DEFAULT_PORT,
             scnet_name: None,
-            last_mouse_click: [None; 2],
-            mouse_wheel_delta: 0,
+            input: crate::machine::InputDevice::default(),
             sprites: std::array::from_fn(|_| None),
             sprite_descriptors: [(0, 0, 0); GPU_SPRITE_SLOTS],
             tile_memory,
@@ -533,6 +536,7 @@ impl Cpu {
             memory_mask,
             layer_mode: 0,
             interrupts: crate::machine::InterruptController::default(),
+            clock: crate::machine::ClockDevice::default(),
             idt_base: None,
             mmu_enabled: false,
             page_directory: 0,
@@ -1437,46 +1441,39 @@ impl Cpu {
 
     pub fn read(&mut self, address: u32) -> u8 {
         if crate::machine::is_device_aperture(address) {
+            if let Some(value) = self.read_terminal_register(address) {
+                return value;
+            }
+            if let Some(value) = self.input.read(address) {
+                self.sync_input_mirrors();
+                return value;
+            }
             return crate::machine::system_register_byte(address, self.memory.len())
                 .or_else(|| self.interrupts.read(address))
+                .or_else(|| self.clock.read(address))
                 .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
+        }
+        if let Some(value) = self.read_legacy_terminal(address) {
+            return value;
+        }
+        if let Some(value) = self.read_legacy_input(address) {
+            return value;
         }
         if let Some(value) = self.legacy_control_byte(address) {
             return value;
         }
         let address = address & self.memory_mask;
+        if let Some(value) = self.read_legacy_terminal(address) {
+            return value;
+        }
+        if let Some(value) = self.read_legacy_input(address) {
+            return value;
+        }
         if let Some(value) = self.legacy_control_byte(address) {
             return value;
         }
-        match address {
-            CONSOLE_DATA => {
-                let value = self.console.read_data();
-                if self.console.control() & 1 != 0 && value != 0 {
-                    self.terminal_active = true;
-                    self.terminal_dirty = true;
-                }
-                value
-            }
-            CONSOLE_STATUS => {
-                if self.console.receive_buffer().is_empty() && self.running {
-                    self.frame_yield = true;
-                }
-                self.console.status()
-            }
-            CONSOLE_CONTROL => self.console.control(),
-            KEYBOARD_ADDR => {
-                let key = self.memory[address as usize];
-                self.memory[address as usize] = 0;
-                key
-            }
-            MOUSE_EVENTS_ADDR => {
-                let events = self.memory[address as usize];
-                self.memory[address as usize] = 0;
-                events
-            }
-            _ => self.memory[address as usize],
-        }
+        self.memory[address as usize]
     }
 
     pub fn configure_disk(
@@ -3336,13 +3333,32 @@ impl Cpu {
                 Some(true),
                 "host write to a read-only or unimplemented device register"
             );
-            self.interrupts.write(address, value);
+            if self.write_terminal_register(address, value) {
+                return;
+            } else if address == crate::machine::CLOCK_CAPTURE {
+                if value & 1 != 0 {
+                    self.clock
+                        .capture_time(self.monotonic_milliseconds() as u32, self.frame_count);
+                }
+                if value & 2 != 0 {
+                    let random = self.next_random();
+                    self.clock.capture_random(random);
+                }
+            } else {
+                self.interrupts.write(address, value);
+            }
+            return;
+        }
+        if self.write_legacy_terminal(address, value) {
             return;
         }
         if self.write_legacy_control_byte(address, value) {
             return;
         }
         let address = address & self.memory_mask;
+        if self.write_legacy_terminal(address, value) {
+            return;
+        }
         if self.write_legacy_control_byte(address, value) {
             return;
         }
@@ -3360,38 +3376,107 @@ impl Cpu {
                     }
                 }
             }
-            CONSOLE_DATA => {
+            _ => {}
+        }
+    }
+
+    fn read_terminal_register(&mut self, address: u32) -> Option<u8> {
+        match address {
+            crate::machine::CONSOLE_DATA => {
+                let value = self.console.read_data();
+                if self.console.control() & 1 != 0 && value != 0 {
+                    self.terminal_active = true;
+                    self.terminal_dirty = true;
+                }
+                Some(value)
+            }
+            crate::machine::CONSOLE_STATUS => {
+                if self.console.receive_buffer().is_empty() && self.running {
+                    self.frame_yield = true;
+                }
+                Some(self.console.status())
+            }
+            crate::machine::CONSOLE_CONTROL => Some(self.console.control()),
+            address
+                if (crate::machine::FIRMWARE_TEXT_BASE..=crate::machine::FIRMWARE_TEXT_ENABLED)
+                    .contains(&address) =>
+            {
+                self.guest_text
+                    .read_register(address - crate::machine::FIRMWARE_TEXT_BASE)
+            }
+            _ => None,
+        }
+    }
+
+    fn write_terminal_register(&mut self, address: u32, value: u8) -> bool {
+        match address {
+            crate::machine::CONSOLE_DATA => {
                 self.console.write_data(value);
                 if value != 0 {
                     self.terminal_active = true;
                     self.terminal_dirty = true;
                 }
             }
-            CONSOLE_STATUS if value & 0x04 != 0 => self.console.clear_overrun(),
-            CONSOLE_CONTROL => {
-                self.console.set_control(value);
-                self.memory[index] = self.console.control();
+            crate::machine::CONSOLE_STATUS => {
+                if value & 4 != 0 {
+                    self.console.clear_overrun();
+                }
             }
-            GUEST_TEXT_DATA => self.guest_text.write_byte(
-                value,
-                self.guest_text.foreground,
-                self.guest_text.background,
-            ),
-            GUEST_TEXT_FOREGROUND => self.guest_text.foreground = value,
-            GUEST_TEXT_BACKGROUND => self.guest_text.background = value,
-            GUEST_TEXT_CONTROL => match value {
-                GUEST_TEXT_CLEAR => self.guest_text.clear(self.guest_text.background),
-                GUEST_TEXT_ENABLE => self.guest_text.enabled = true,
-                GUEST_TEXT_DISABLE => self.guest_text.enabled = false,
-                _ => {}
-            },
-            GUEST_TEXT_ROW | GUEST_TEXT_COLUMN => {
-                let row = usize::from(self.memory[GUEST_TEXT_ROW as usize]);
-                let column = usize::from(self.memory[GUEST_TEXT_COLUMN as usize]);
-                self.guest_text.set_cursor(row, column);
+            crate::machine::CONSOLE_CONTROL => self.console.set_control(value),
+            address
+                if (crate::machine::FIRMWARE_TEXT_BASE..=crate::machine::FIRMWARE_TEXT_COLUMN)
+                    .contains(&address) =>
+            {
+                self.guest_text
+                    .write_register(address - crate::machine::FIRMWARE_TEXT_BASE, value);
             }
-            _ => {}
+            _ => return false,
         }
+        true
+    }
+
+    fn read_legacy_terminal(&mut self, address: u32) -> Option<u8> {
+        match address {
+            CONSOLE_DATA | CONSOLE_STATUS | CONSOLE_CONTROL => {
+                self.read_terminal_register(crate::machine::CONSOLE_BASE + address - CONSOLE_DATA)
+            }
+            GUEST_TEXT_BASE..=GUEST_TEXT_COLUMN => {
+                Some(self.legacy_text_registers[(address - GUEST_TEXT_BASE) as usize])
+            }
+            _ => None,
+        }
+    }
+
+    fn write_legacy_terminal(&mut self, address: u32, value: u8) -> bool {
+        match address {
+            CONSOLE_DATA | CONSOLE_STATUS | CONSOLE_CONTROL => {
+                self.write_terminal_register(
+                    crate::machine::CONSOLE_BASE + address - CONSOLE_DATA,
+                    value,
+                );
+            }
+            GUEST_TEXT_BASE..=GUEST_TEXT_COLUMN => {
+                self.legacy_text_registers[(address - GUEST_TEXT_BASE) as usize] = value;
+                if address == GUEST_TEXT_ROW || address == GUEST_TEXT_COLUMN {
+                    self.guest_text.set_cursor(
+                        usize::from(self.legacy_text_registers[4]),
+                        usize::from(self.legacy_text_registers[5]),
+                    );
+                } else {
+                    self.guest_text
+                        .write_register(address - GUEST_TEXT_BASE, value);
+                }
+            }
+            _ => return false,
+        }
+        if let Some(byte) = self.memory.get_mut(address as usize) {
+            *byte = if address == CONSOLE_CONTROL {
+                self.console.control()
+            } else {
+                value
+            };
+        }
+        true
     }
 
     fn fault_register_byte(&self, address: u32) -> Option<u8> {
@@ -3434,6 +3519,9 @@ impl Cpu {
 
     fn legacy_control_byte(&self, address: u32) -> Option<u8> {
         match address {
+            address if (RTC_START..RTC_START + 3).contains(&address) => {
+                Some(self.clock.rtc[(address - RTC_START) as usize])
+            }
             ICR_ADDR => Some(self.interrupts.control),
             PIT_CONTROL_ADDR => Some(u8::from(self.interrupts.pit_enabled)),
             address if (TIMER_PERIOD_ADDR..TIMER_PERIOD_ADDR + 2).contains(&address) => {
@@ -3454,6 +3542,18 @@ impl Cpu {
 
     fn write_legacy_control_byte(&mut self, address: u32, value: u8) -> bool {
         match address {
+            KEYBOARD_ADDR => self.input.key = value,
+            address if (KEYS_ADDR..KEYS_ADDR + 3).contains(&address) => {
+                let shift = (address - KEYS_ADDR) * 8;
+                self.input.keys =
+                    (self.input.keys & !(0xff << shift)) | (u32::from(value) << shift);
+            }
+            address if (MOUSE_ADDR..MOUSE_ADDR + 8).contains(&address) => {
+                self.input.mouse[(address - MOUSE_ADDR) as usize] = value;
+            }
+            address if (RTC_START..RTC_START + 3).contains(&address) => {
+                self.clock.rtc[(address - RTC_START) as usize] = value;
+            }
             ICR_ADDR => self.interrupts.control = value,
             PIT_CONTROL_ADDR => self.interrupts.pit_enabled = value & 1 != 0,
             address if (TIMER_PERIOD_ADDR..TIMER_PERIOD_ADDR + 2).contains(&address) => {
@@ -3470,6 +3570,30 @@ impl Cpu {
 
     pub fn raise_rtc_interrupt(&mut self) {
         self.write(ICR_ADDR, self.interrupts.control | 8);
+    }
+
+    pub fn update_rtc(&mut self, timestamp: u64) {
+        self.clock.rtc = [
+            (timestamp % 60) as u8,
+            ((timestamp / 60) % 60) as u8,
+            ((timestamp / 3600) % 24) as u8,
+        ];
+        if let Some(bytes) = self
+            .memory
+            .get_mut(RTC_START as usize..RTC_START as usize + 3)
+        {
+            bytes.copy_from_slice(&self.clock.rtc);
+        }
+        self.raise_rtc_interrupt();
+    }
+
+    fn next_random(&mut self) -> u32 {
+        let mut value = self.random_state;
+        value ^= value << 13;
+        value ^= value >> 17;
+        value ^= value << 5;
+        self.random_state = value;
+        value
     }
 
     pub fn read_u16(&mut self, address: u32) -> u16 {
@@ -4544,6 +4668,39 @@ impl Cpu {
         self.console.receive(bytes);
     }
 
+    fn sync_input_mirrors(&mut self) {
+        if let Some(byte) = self.memory.get_mut(KEYBOARD_ADDR as usize) {
+            *byte = self.input.key;
+        }
+        if let Some(bytes) = self
+            .memory
+            .get_mut(KEYS_ADDR as usize..KEYS_ADDR as usize + 3)
+        {
+            bytes.copy_from_slice(&self.input.keys.to_le_bytes()[..3]);
+        }
+        if let Some(bytes) = self
+            .memory
+            .get_mut(MOUSE_ADDR as usize..MOUSE_ADDR as usize + 8)
+        {
+            bytes.copy_from_slice(&self.input.mouse);
+        }
+    }
+
+    fn read_legacy_input(&mut self, address: u32) -> Option<u8> {
+        let value = match address {
+            KEYBOARD_ADDR => self.input.read(crate::machine::INPUT_KEY)?,
+            address if (KEYS_ADDR..KEYS_ADDR + 3).contains(&address) => {
+                self.input.keys.to_le_bytes()[(address - KEYS_ADDR) as usize]
+            }
+            address if (MOUSE_ADDR..MOUSE_ADDR + 8).contains(&address) => self
+                .input
+                .read(crate::machine::INPUT_MOUSE_X + address - MOUSE_ADDR)?,
+            _ => return None,
+        };
+        self.sync_input_mirrors();
+        Some(value)
+    }
+
     pub fn signal_keyboard_event(&mut self, keycode: u8) {
         self.write(KEYBOARD_ADDR, keycode);
         let icr = self.read(ICR_ADDR) | 2;
@@ -4551,20 +4708,12 @@ impl Cpu {
     }
 
     pub fn set_key(&mut self, mask: u32, pressed: bool) {
-        for offset in 0..3 {
-            let address = KEYS_ADDR + offset;
-            let shift = offset * 8;
-            let bit = ((mask >> shift) & 0xff) as u8;
-            if pressed {
-                self.memory[address as usize] |= bit;
-            } else {
-                self.memory[address as usize] &= !bit;
-            }
-        }
+        self.input.set_key(mask, pressed);
+        self.sync_input_mirrors();
     }
 
     pub fn set_mouse_position(&mut self, x: u16, y: u16) {
-        let (width, height) = if self.memory[GPU_MODE_ADDR as usize] == 1 {
+        let (width, height) = if self.layer_mode == 1 {
             (640, 480)
         } else {
             (320, 240)
@@ -4573,47 +4722,23 @@ impl Cpu {
         let y = y.min(height - 1);
         let [x_high, x_low] = x.to_be_bytes();
         let [y_high, y_low] = y.to_be_bytes();
-        self.memory[MOUSE_ADDR as usize..MOUSE_ADDR as usize + 4]
-            .copy_from_slice(&[x_high, x_low, y_high, y_low]);
+        self.input.mouse[..4].copy_from_slice(&[x_high, x_low, y_high, y_low]);
+        self.sync_input_mirrors();
     }
 
     pub fn mouse_button(&mut self, button: usize, down: bool, x: u16, y: u16, now_ms: u64) {
-        if button > 1 {
-            return;
-        }
-        let held_index = MOUSE_ADDR as usize + 4;
-        let event_index = held_index + 1;
-        let bit = 1 << button;
-        if !down {
-            self.memory[held_index] &= !bit;
-            self.memory[event_index] |= bit << 4;
-            return;
-        }
-        self.memory[held_index] |= bit;
-        self.memory[event_index] |= bit;
-        let is_double_click =
-            self.last_mouse_click[button].is_some_and(|(previous_ms, previous_x, previous_y)| {
-                now_ms.saturating_sub(previous_ms) <= 400
-                    && x.abs_diff(previous_x) <= 4
-                    && y.abs_diff(previous_y) <= 4
-            });
-        if is_double_click {
-            self.memory[event_index] |= bit << 2;
-            self.last_mouse_click[button] = None;
-        } else {
-            self.last_mouse_click[button] = Some((now_ms, x, y));
-        }
+        self.input.mouse_button(button, down, x, y, now_ms);
+        self.sync_input_mirrors();
     }
 
     pub fn set_mouse_wheel(&mut self, delta: i16) {
-        self.mouse_wheel_delta = self.mouse_wheel_delta.saturating_add(delta);
-        self.memory[MOUSE_ADDR as usize + 6..MOUSE_ADDR as usize + 8]
-            .copy_from_slice(&self.mouse_wheel_delta.to_be_bytes());
+        self.input.add_wheel(delta);
+        self.sync_input_mirrors();
     }
 
     pub fn end_mouse_frame(&mut self) {
-        self.mouse_wheel_delta = 0;
-        self.memory[MOUSE_ADDR as usize + 6..MOUSE_ADDR as usize + 8].fill(0);
+        self.input.mouse[6..8].fill(0);
+        self.sync_input_mirrors();
     }
 
     pub fn take_sound_commands(&mut self) -> Vec<GpuSoundCommand> {
@@ -5504,11 +5629,7 @@ impl Cpu {
                 self.frame_presented = true;
             }
             GPU_RANDOM => {
-                let mut value = self.random_state;
-                value ^= value << 13;
-                value ^= value >> 17;
-                value ^= value << 5;
-                self.random_state = value;
+                let value = self.next_random();
                 self.memory[(GPU_BASE + 14) as usize] = value as u8;
             }
             GPU_POLY => self.gpu_polygon(x, y, w, color),
@@ -5519,11 +5640,8 @@ impl Cpu {
             }
             GPU_RTC => {
                 let index = color as usize;
-                self.memory[(GPU_BASE + 14) as usize] = if index < 3 {
-                    self.memory[(RTC_START as usize) + index]
-                } else {
-                    0
-                };
+                self.memory[(GPU_BASE + 14) as usize] =
+                    if index < 3 { self.clock.rtc[index] } else { 0 };
             }
             GPU_SOUND => {
                 let command = GpuSoundCommand {
@@ -6295,7 +6413,7 @@ mod tests {
             let mut cpu = Cpu::with_memory_size(size).unwrap();
             for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
                 cpu.privilege_mode = mode;
-                for address in [crate::machine::INPUT_BASE, ADDRESS_MASK] {
+                for address in [crate::machine::GRAPHICS_BASE, ADDRESS_MASK] {
                     let aliased = (address & cpu.memory_mask) as usize;
                     cpu.memory[aliased] = 0xa5;
                     assert!(cpu.read_guest(address).is_err());
@@ -6396,6 +6514,387 @@ mod tests {
     }
 
     #[test]
+    fn clock_snapshots_are_coherent_side_effect_free_and_independent_of_ram() {
+        use crate::machine::*;
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            let alias = (CLOCK_BASE & cpu.memory_mask) as usize;
+            cpu.memory[alias..alias + 20].fill(0xa5);
+            assert_eq!(cpu.read_guest_u32(CLOCK_MONOTONIC_MILLIS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), 0);
+            cpu.test_monotonic_ms = Some(0x12345678);
+            cpu.frame_count = 0xfffe;
+            cpu.update_rtc(23 * 3600 + 59 * 60 + 58);
+            let seed = cpu.random_state;
+            cpu.write_guest(CLOCK_CAPTURE, 1).unwrap();
+            assert_eq!(cpu.random_state, seed);
+            cpu.test_monotonic_ms = Some(0x23456789);
+            cpu.frame_count = 1;
+            cpu.update_rtc(0);
+            for _ in 0..2 {
+                assert_eq!(
+                    cpu.read_guest_u32(CLOCK_MONOTONIC_MILLIS).unwrap(),
+                    0x12345678
+                );
+                assert_eq!(cpu.read_guest_u16(CLOCK_FRAMES).unwrap(), 0xfffe);
+                assert_eq!(cpu.read_guest_u16(CLOCK_RTC).unwrap(), 0x3a3b);
+                assert_eq!(cpu.read_guest(CLOCK_RTC + 2).unwrap(), 23);
+                assert_eq!(cpu.read_guest(CLOCK_CAPTURE).unwrap(), 0);
+            }
+            cpu.write_guest(CLOCK_CAPTURE, 2).unwrap();
+            let random = cpu.random_state;
+            assert_ne!(random, seed);
+            assert_eq!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), random);
+            assert_eq!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), random);
+            assert_eq!(
+                cpu.read_guest_u32(CLOCK_MONOTONIC_MILLIS).unwrap(),
+                0x12345678
+            );
+            cpu.write_guest(CLOCK_CAPTURE, 0xfc).unwrap();
+            assert_eq!(cpu.random_state, random);
+            assert!(cpu.write_guest_u16(CLOCK_CAPTURE, 0x0300).is_err());
+            assert_eq!(cpu.random_state, random);
+            assert_eq!(
+                cpu.read_guest_u32(CLOCK_MONOTONIC_MILLIS).unwrap(),
+                0x12345678
+            );
+            cpu.write_guest(CLOCK_CAPTURE, 3).unwrap();
+            assert_eq!(
+                cpu.read_guest_u32(CLOCK_MONOTONIC_MILLIS).unwrap(),
+                0x23456789
+            );
+            assert_eq!(cpu.read_guest_u16(CLOCK_FRAMES).unwrap(), 1);
+            assert_eq!(cpu.read_guest_u16(CLOCK_RTC).unwrap(), 0);
+            assert_ne!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), random);
+            assert!(
+                cpu.memory[alias..alias + 20]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+    }
+
+    #[test]
+    fn clock_rollover_and_image_entry_preserve_the_documented_clock_lifetime() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.test_monotonic_ms = Some(ADDRESS_MASK);
+        cpu.frame_count = u16::MAX;
+        cpu.write_guest(CLOCK_CAPTURE, 3).unwrap();
+        let random = cpu.read_guest_u32(CLOCK_RANDOM).unwrap();
+        assert_eq!(
+            cpu.read_guest_u32(CLOCK_MONOTONIC_MILLIS).unwrap(),
+            ADDRESS_MASK
+        );
+        cpu.test_monotonic_ms = Some(ADDRESS_MASK + 1);
+        cpu.begin_frame();
+        cpu.write_guest(CLOCK_CAPTURE, 1).unwrap();
+        assert_eq!(cpu.read_guest_u32(CLOCK_MONOTONIC_MILLIS).unwrap(), 0);
+        assert_eq!(cpu.read_guest_u16(CLOCK_FRAMES).unwrap(), 0);
+        assert_eq!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), random);
+        cpu.prepare_image_entry();
+        assert_eq!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), random);
+        assert_eq!(cpu.random_state, random);
+    }
+
+    #[test]
+    fn legacy_clock_and_gpu_commands_share_typed_time_and_random_handlers() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.update_rtc(3661);
+        cpu.memory[RTC_START as usize..RTC_START as usize + 3].fill(0xff);
+        assert_eq!(cpu.read(RTC_START), 1);
+        cpu.write(RTC_START + 1, 23);
+        cpu.write(GPU_BASE + 1, 1);
+        cpu.write(GPU_BASE, GPU_RTC);
+        assert_eq!(cpu.read(GPU_BASE + 14), 23);
+        cpu.write(CLOCK_CAPTURE, 1);
+        assert_eq!(cpu.read(CLOCK_RTC + 1), 23);
+        cpu.write(GPU_BASE, GPU_RANDOM);
+        assert_eq!(cpu.read(GPU_BASE + 14), cpu.random_state as u8);
+        let mut expected = cpu.random_state;
+        expected ^= expected << 13;
+        expected ^= expected >> 17;
+        expected ^= expected << 5;
+        cpu.write(CLOCK_CAPTURE, 2);
+        assert_eq!(cpu.read_guest_u32(CLOCK_RANDOM).unwrap(), expected);
+        cpu.frame_count = 0x1234;
+        cpu.write(GPU_BASE, GPU_TICKS);
+        assert_eq!(cpu.read_u16(GPU_BASE + 14), 0x1234);
+        cpu.write(CLOCK_CAPTURE, 1);
+        assert_eq!(cpu.read_u16(CLOCK_FRAMES), 0x1234);
+    }
+
+    #[test]
+    fn input_bank_consumes_shared_events_only_after_full_access_validation() {
+        use crate::machine::*;
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            let alias = (INPUT_BASE & cpu.memory_mask) as usize;
+            cpu.memory[alias..alias + 16].fill(0xa5);
+            cpu.signal_keyboard_event(b'A');
+            cpu.set_key(0xff12ab34, true);
+            cpu.set_mouse_position(600, 400);
+            cpu.mouse_button(0, true, 12, 13, 100);
+            cpu.set_mouse_wheel(-2);
+            assert!(cpu.read_guest_u16(INPUT_KEY).is_err());
+            assert!(cpu.read_guest_u32(INPUT_MOUSE_EVENTS).is_err());
+            assert!(cpu.write_guest(INPUT_KEY, 0).is_err());
+            assert!(cpu.write_guest(INPUT_MOUSE_EVENTS, 0).is_err());
+            cpu.privilege_mode = PrivilegeMode::User;
+            assert!(cpu.read_guest(INPUT_KEY).is_err());
+            assert!(cpu.read_guest(INPUT_MOUSE_EVENTS).is_err());
+            cpu.privilege_mode = PrivilegeMode::Supervisor;
+            assert_eq!(cpu.read_guest(INPUT_KEY).unwrap(), b'A');
+            assert_eq!(cpu.read(KEYBOARD_ADDR), 0);
+            assert_eq!(cpu.read(ICR_ADDR) & 2, 2);
+            cpu.signal_keyboard_event(b'B');
+            cpu.signal_keyboard_event(b'C');
+            assert_eq!(cpu.read(KEYBOARD_ADDR), b'C');
+            assert_eq!(cpu.read_guest(INPUT_KEY).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u32(INPUT_KEYS).unwrap(), 0x12ab34);
+            assert_eq!(cpu.read(KEYS_ADDR), 0x34);
+            assert_eq!(cpu.read(KEYS_ADDR + 1), 0xab);
+            assert_eq!(cpu.read(KEYS_ADDR + 2), 0x12);
+            cpu.set_key(0x020004, false);
+            assert_eq!(cpu.read_guest_u32(INPUT_KEYS).unwrap(), 0x10ab30);
+            assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_X).unwrap(), 319);
+            assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_Y).unwrap(), 239);
+            assert_eq!(cpu.read_guest(INPUT_MOUSE_BUTTONS).unwrap(), 1);
+            assert_eq!(cpu.read_guest(INPUT_MOUSE_EVENTS).unwrap(), 1);
+            assert_eq!(cpu.read(MOUSE_ADDR + 5), 0);
+            assert_eq!(
+                cpu.read_guest_u16(INPUT_MOUSE_WHEEL).unwrap(),
+                (-2i16) as u16
+            );
+            assert_eq!(
+                cpu.read_guest_u16(INPUT_MOUSE_WHEEL).unwrap(),
+                (-2i16) as u16
+            );
+            cpu.mouse_button(0, false, 12, 13, 150);
+            cpu.mouse_button(0, true, 15, 16, 500);
+            assert_eq!(cpu.read(MOUSE_ADDR + 5), 0x15);
+            assert_eq!(cpu.read_guest(INPUT_MOUSE_EVENTS).unwrap(), 0);
+            cpu.end_mouse_frame();
+            assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_WHEEL).unwrap(), 0);
+            assert!(
+                cpu.memory[alias..alias + 16]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+    }
+
+    #[test]
+    fn input_wheel_saturates_and_mouse_position_obeys_video_mode() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GPU_MODE_ADDR, 1);
+        cpu.set_mouse_position(u16::MAX, u16::MAX);
+        assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_X).unwrap(), 639);
+        assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_Y).unwrap(), 479);
+        cpu.set_mouse_wheel(i16::MAX);
+        cpu.set_mouse_wheel(10);
+        assert_eq!(
+            cpu.read_guest_u16(INPUT_MOUSE_WHEEL).unwrap(),
+            i16::MAX as u16
+        );
+        cpu.end_mouse_frame();
+        cpu.set_mouse_wheel(i16::MIN);
+        cpu.set_mouse_wheel(-10);
+        assert_eq!(
+            cpu.read_guest_u16(INPUT_MOUSE_WHEEL).unwrap(),
+            i16::MIN as u16
+        );
+        cpu.signal_keyboard_event(b'Q');
+        cpu.prepare_image_entry();
+        assert_eq!(cpu.read_guest(INPUT_KEY).unwrap(), b'Q');
+        assert_eq!(cpu.read(ICR_ADDR) & 2, 0);
+        cpu.memory[KEYS_ADDR as usize..KEYS_ADDR as usize + 3].fill(0xff);
+        assert_eq!(cpu.read_guest_u32(INPUT_KEYS).unwrap(), 0);
+    }
+
+    #[test]
+    fn terminal_banks_share_devices_without_ram_backing() {
+        use crate::machine;
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            let console_alias = (machine::CONSOLE_BASE & cpu.memory_mask) as usize;
+            let text_alias = (machine::FIRMWARE_TEXT_BASE & cpu.memory_mask) as usize;
+            cpu.memory[console_alias..console_alias + 8].fill(0xa5);
+            cpu.memory[text_alias..text_alias + 8].fill(0xa5);
+            assert_eq!(cpu.read_guest(machine::CONSOLE_CONTROL).unwrap(), 3);
+            assert_eq!(
+                cpu.read_guest(machine::FIRMWARE_TEXT_FOREGROUND).unwrap(),
+                1
+            );
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ENABLED).unwrap(), 0);
+            cpu.receive_console_input(b"AB");
+            assert_eq!(cpu.read_guest(machine::CONSOLE_DATA).unwrap(), b'A');
+            assert_eq!(cpu.read(CONSOLE_DATA), b'B');
+            assert_eq!(cpu.console.output(), b"AB");
+            cpu.write_guest(machine::CONSOLE_CONTROL, 0xfe).unwrap();
+            assert_eq!(cpu.read(CONSOLE_CONTROL), 2);
+            cpu.write_guest(machine::CONSOLE_DATA, b'C').unwrap();
+            cpu.write(CONSOLE_DATA, b'D');
+            assert_eq!(cpu.console.output(), b"ABCD");
+            assert!(cpu.terminal_active && cpu.terminal_dirty);
+            assert_eq!(cpu.read_guest(machine::CONSOLE_DATA).unwrap(), 0);
+            assert_eq!(cpu.read_guest(machine::CONSOLE_STATUS).unwrap(), 2);
+            assert!(cpu.frame_yield);
+            cpu.write_guest(machine::FIRMWARE_TEXT_FOREGROUND, 3)
+                .unwrap();
+            cpu.write_guest(machine::FIRMWARE_TEXT_BACKGROUND, 4)
+                .unwrap();
+            cpu.write_guest(machine::FIRMWARE_TEXT_ROW, 1).unwrap();
+            cpu.write_guest(machine::FIRMWARE_TEXT_COLUMN, 2).unwrap();
+            cpu.write_guest(machine::FIRMWARE_TEXT_CONTROL, 2).unwrap();
+            cpu.write_guest(machine::FIRMWARE_TEXT_DATA, b'A').unwrap();
+            cpu.write(GUEST_TEXT_DATA, b'B');
+            let cell = cpu.guest_text.cells[crate::guest_text::GUEST_TEXT_COLUMNS + 2];
+            assert_eq!(
+                (cell.character, cell.foreground, cell.background),
+                (b'A', 3, 4)
+            );
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ROW).unwrap(), 1);
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 4);
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ENABLED).unwrap(), 1);
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_DATA).unwrap(), 0);
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_CONTROL).unwrap(), 0);
+            cpu.write_guest(machine::FIRMWARE_TEXT_ROW, 255).unwrap();
+            cpu.write_guest(machine::FIRMWARE_TEXT_COLUMN, 255).unwrap();
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ROW).unwrap(), 24);
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 52);
+            cpu.write_guest(machine::FIRMWARE_TEXT_CONTROL, 1).unwrap();
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 0);
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ROW).unwrap(), 0);
+            assert!(
+                cpu.guest_text
+                    .cells
+                    .iter()
+                    .all(|cell| cell.character == b' ' && cell.background == 4)
+            );
+            cpu.write_guest(machine::FIRMWARE_TEXT_CONTROL, 0xff)
+                .unwrap();
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ENABLED).unwrap(), 1);
+            cpu.write_guest(machine::FIRMWARE_TEXT_CONTROL, 3).unwrap();
+            assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ENABLED).unwrap(), 0);
+            assert!(
+                cpu.memory[console_alias..console_alias + 8]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+            assert!(
+                cpu.memory[text_alias..text_alias + 8]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_bank_invalid_accesses_preserve_input_output_and_cursor() {
+        use crate::machine;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.receive_console_input(&vec![b'X'; crate::console::RX_CAPACITY + 1]);
+        assert_eq!(cpu.console.status(), 7);
+        assert!(cpu.read_guest_u32(machine::CONSOLE_DATA).is_err());
+        assert!(
+            cpu.write_guest_u32(machine::CONSOLE_DATA, 0x41040300)
+                .is_err()
+        );
+        assert!(
+            cpu.write_guest_u32(machine::FIRMWARE_TEXT_ROW, 0x01020100)
+                .is_err()
+        );
+        cpu.guest_text.write_text("unchanged", 3, 4);
+        assert!(
+            cpu.write_guest_u32(machine::FIRMWARE_TEXT_CONTROL, 0x01000000)
+                .is_err()
+        );
+        for mode in [PrivilegeMode::User, PrivilegeMode::Supervisor] {
+            cpu.privilege_mode = mode;
+            if mode == PrivilegeMode::User {
+                assert!(cpu.read_guest(machine::CONSOLE_DATA).is_err());
+                assert!(cpu.write_guest(machine::CONSOLE_DATA, b'Q').is_err());
+                assert!(cpu.write_guest(machine::FIRMWARE_TEXT_DATA, b'Q').is_err());
+            }
+            assert!(
+                cpu.resolve_guest_range(machine::CONSOLE_DATA, 1, crate::mmu::MemoryAccess::Fetch)
+                    .is_err()
+            );
+            assert!(
+                cpu.resolve_guest_range(
+                    machine::FIRMWARE_TEXT_DATA,
+                    1,
+                    crate::mmu::MemoryAccess::Fetch
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            cpu.console.receive_buffer().len(),
+            crate::console::RX_CAPACITY
+        );
+        assert!(cpu.console.output().is_empty());
+        assert_eq!(cpu.console.control(), 3);
+        assert_eq!(cpu.console.status(), 7);
+        assert_eq!(
+            (cpu.guest_text.cursor_row, cpu.guest_text.cursor_column),
+            (0, 9)
+        );
+        assert_eq!(cpu.guest_text.cells[0].character, b'u');
+        assert!(!cpu.frame_yield);
+        cpu.write_guest(machine::CONSOLE_STATUS, 0xfb).unwrap();
+        assert_eq!(cpu.console.status(), 7);
+        cpu.write_guest(machine::CONSOLE_STATUS, 4).unwrap();
+        assert_eq!(cpu.console.status(), 3);
+        cpu.write_guest(machine::CONSOLE_CONTROL, 0).unwrap();
+        cpu.receive_console_input(b"Z");
+        assert_eq!(
+            cpu.console.receive_buffer().len(),
+            crate::console::RX_CAPACITY
+        );
+        cpu.prepare_image_entry();
+        assert_eq!(cpu.console.control(), 0);
+        assert_eq!(
+            cpu.console.receive_buffer().len(),
+            crate::console::RX_CAPACITY
+        );
+    }
+
+    #[test]
+    fn legacy_text_cursor_latches_are_separate_from_high_live_cursor_reads() {
+        use crate::machine;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(GUEST_TEXT_ROW, 1);
+        cpu.write(GUEST_TEXT_COLUMN, 2);
+        cpu.write(GUEST_TEXT_DATA, b'A');
+        assert_eq!(cpu.read(GUEST_TEXT_COLUMN), 2);
+        assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 3);
+        cpu.memory[GUEST_TEXT_ROW as usize] = 15;
+        cpu.memory[GUEST_TEXT_COLUMN as usize] = 40;
+        cpu.write(GUEST_TEXT_COLUMN, 4);
+        assert_eq!(cpu.guest_text.cursor_row, 1);
+        assert_eq!(cpu.guest_text.cursor_column, 4);
+        cpu.write_guest(machine::FIRMWARE_TEXT_ROW, 5).unwrap();
+        cpu.write_guest(machine::FIRMWARE_TEXT_COLUMN, 6).unwrap();
+        assert_eq!(cpu.read(GUEST_TEXT_ROW), 1);
+        assert_eq!(cpu.read(GUEST_TEXT_COLUMN), 4);
+        cpu.prepare_image_entry();
+        assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_ROW).unwrap(), 5);
+        assert_eq!(cpu.read_guest(machine::FIRMWARE_TEXT_COLUMN).unwrap(), 6);
+    }
+
+    #[test]
     fn high_control_banks_validate_permissions_offsets_and_translated_aliases() {
         use crate::machine::*;
         use crate::mmu::{MemoryAccess, PageFaultReason};
@@ -6404,10 +6903,22 @@ mod tests {
         cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
         cpu.memory[0x3024..0x3028].copy_from_slice(&(INTERRUPT_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3028..0x302c].copy_from_slice(&(FAULT_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x302c..0x3030].copy_from_slice(&(CLOCK_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x3030..0x3034].copy_from_slice(&(INPUT_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x3034..0x3038]
+            .copy_from_slice(&(crate::machine::CONSOLE_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x3038..0x303c].copy_from_slice(&(FIRMWARE_TEXT_BASE | 0xf).to_be_bytes());
         cpu.enable_mmu(0x2000).unwrap();
         for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
             cpu.privilege_mode = mode;
-            for (base, page) in [(0x9000, INTERRUPT_BASE), (0xa000, FAULT_BASE)] {
+            for (base, page) in [
+                (0x9000, INTERRUPT_BASE),
+                (0xa000, FAULT_BASE),
+                (0xb000, CLOCK_BASE),
+                (0xc000, INPUT_BASE),
+                (0xd000, crate::machine::CONSOLE_BASE),
+                (0xe000, FIRMWARE_TEXT_BASE),
+            ] {
                 for offset in 0..DEVICE_BANK_SIZE {
                     for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {
                         let expected = if mode == PrivilegeMode::User {
@@ -6551,7 +7062,7 @@ mod tests {
                 for address in [
                     SYSTEM_BASE + 20,
                     SYSTEM_BASE + 4095,
-                    INPUT_BASE,
+                    GRAPHICS_BASE,
                     ADDRESS_MASK,
                 ] {
                     assert!(cpu.read_guest(address).is_err());
@@ -6615,7 +7126,7 @@ mod tests {
 
     #[test]
     fn instruction_operands_cannot_mask_reserved_devices_into_small_ram() {
-        let address = crate::machine::INPUT_BASE;
+        let address = crate::machine::GRAPHICS_BASE;
         for source in [
             "LD R2, R0",
             "ST R0, R2",

@@ -154,6 +154,161 @@ fn guest_fault_handler_reads_the_high_fault_bank_after_a_denied_device_alias() {
 }
 
 #[test]
+fn supervisor_executes_clock_snapshots_without_ram_backing_or_host_tasks() {
+    use suomicpu16::machine::*;
+
+    for translated in [false, true] {
+        let base = if translated { 0x9000 } else { CLOCK_BASE };
+        let source = format!(
+            "LDI30 R2, {base}\nLDI R0, 3\nST R2, R0\n\
+             LDI R2, {}\nLDI R3, {}\nLD32 R4, R2\n\
+             LD32 R6, R2\n\
+             LDI30 R2, {}\nLDW R0, R2\n\
+             LDI30 R2, {}\nLDW R1, R2\nHALT",
+            (base + 16) >> 16,
+            (base + 16) & 0xffff,
+            base + 8,
+            base + 12,
+        );
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.update_rtc(23 * 3600 + 59 * 60 + 58);
+        cpu.frame_count = 0x1234;
+        cpu.memory[0x4000..0x4014].fill(0xa5);
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+            cpu.memory[0x3004..0x3008].copy_from_slice(&0x100bu32.to_be_bytes());
+            cpu.memory[0x3024..0x3028].copy_from_slice(&(CLOCK_BASE | 3).to_be_bytes());
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.current_task(), None);
+        assert_eq!(cpu.registers[0], 0x1234);
+        assert_eq!(cpu.registers[1], 0x3a3b);
+        assert_eq!(cpu.registers[4..6], cpu.registers[6..8]);
+        assert_ne!(cpu.registers[4] | cpu.registers[5], 0);
+        assert!(cpu.memory[0x4000..0x4014].iter().all(|byte| *byte == 0xa5));
+    }
+}
+
+#[test]
+fn supervisor_consumes_high_input_events_with_small_ram_and_translated_aliases() {
+    use suomicpu16::machine::*;
+
+    for translated in [false, true] {
+        let base = if translated { 0x9000 } else { INPUT_BASE };
+        let source = format!(
+            "LDI30 R2, {base}\nLD R0, R2\nLD R1, R2\n\
+             LDI R2, {}\nLDI R3, {}\nLD32 R4, R2\n\
+             LDI30 R2, {}\nLDW R6, R2\n\
+             LDI30 R2, {}\nLDW R7, R2\n\
+             LDI30 R2, {}\nLD R3, R2\nHALT",
+            (base + 4) >> 16,
+            (base + 4) & 0xffff,
+            base + 8,
+            base + 10,
+            base + 13,
+        );
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.signal_keyboard_event(b'Z');
+        cpu.set_key(0x12ab34, true);
+        cpu.set_mouse_position(600, 400);
+        cpu.mouse_button(1, true, 600, 400, 100);
+        cpu.memory[0x3000..0x3010].fill(0xa5);
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x500fu32.to_be_bytes());
+            cpu.memory[0x5004..0x5008].copy_from_slice(&0x100bu32.to_be_bytes());
+            cpu.memory[0x5024..0x5028].copy_from_slice(&(INPUT_BASE | 3).to_be_bytes());
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+        cpu.run(32).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.current_task(), None);
+        assert_eq!(cpu.registers[0], i64::from(b'Z'));
+        assert_eq!(cpu.registers[1], 0);
+        assert_eq!(cpu.registers[3], 2);
+        assert_eq!(cpu.registers[4], 0x12);
+        assert_eq!(cpu.registers[5], 0xab34);
+        assert_eq!(cpu.registers[6], 319);
+        assert_eq!(cpu.registers[7], 239);
+        assert_eq!(cpu.read(INPUT_KEY), 0);
+        assert_eq!(cpu.read(INPUT_MOUSE_EVENTS), 0);
+        assert!(cpu.memory[0x3000..0x3010].iter().all(|byte| *byte == 0xa5));
+    }
+}
+
+#[test]
+fn supervisor_executes_high_console_and_firmware_text_with_small_ram() {
+    use suomicpu16::machine::*;
+
+    for translated in [false, true] {
+        let console = if translated { 0x9000 } else { CONSOLE_BASE };
+        let text = if translated {
+            0xa000
+        } else {
+            FIRMWARE_TEXT_BASE
+        };
+        let source = format!(
+            "LDI30 R2, {}\nLD R1, R2\n\
+             LDI30 R2, {console}\nLD R0, R2\n\
+             LDI R3, 33\nST R2, R3\n\
+             LDI30 R2, {}\nLDI R3, 2\nST R2, R3\n\
+             LDI30 R2, {}\nLDI R3, 24\nST R2, R3\n\
+             LDI30 R2, {}\nLDI R3, 52\nST R2, R3\n\
+             LDI30 R2, {text}\nLDI R3, 9\nST R2, R3\n\
+             LDI R3, 65\nST R2, R3\n\
+             LDI30 R2, {}\nLD R4, R2\n\
+             LDI30 R2, {}\nLD R5, R2\nHALT",
+            console + 1,
+            text + 3,
+            text + 4,
+            text + 5,
+            text + 4,
+            text + 5,
+        );
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.receive_console_input(b"K");
+        cpu.memory[0x9000..0x9008].fill(0xa5);
+        cpu.memory[0xa000..0xa008].fill(0xa5);
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+            for (page, entry) in [
+                (1, 0x100bu32),
+                (9, CONSOLE_BASE | 3),
+                (10, FIRMWARE_TEXT_BASE | 3),
+            ] {
+                let offset = 0x3000 + page * 4;
+                cpu.memory[offset..offset + 4].copy_from_slice(&entry.to_be_bytes());
+            }
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+        cpu.run(64).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.current_task(), None);
+        assert_eq!(cpu.registers[0], i64::from(b'K'));
+        assert_eq!(cpu.registers[1], 3);
+        assert_eq!(cpu.registers[4], 24);
+        assert_eq!(cpu.registers[5], 4);
+        assert_eq!(cpu.console.output(), b"K!");
+        assert!(cpu.console.receive_buffer().is_empty());
+        assert!(cpu.guest_text.enabled);
+        let index = 24 * suomicpu16::guest_text::GUEST_TEXT_COLUMNS + 3;
+        assert_eq!(cpu.guest_text.cells[index].character, b'A');
+        assert!(cpu.memory[0x9000..0x9008].iter().all(|byte| *byte == 0xa5));
+        assert!(cpu.memory[0xa000..0xa008].iter().all(|byte| *byte == 0xa5));
+    }
+}
+
+#[test]
 fn unmanaged_svc_always_enters_the_guest_kernel() {
     for abi_register in [0, 1, 77] {
         let image = assemble("SVC\nHALT\n.address 0x300\nINC R5\nRTI", 0x100).unwrap();
