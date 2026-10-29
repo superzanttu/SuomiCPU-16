@@ -608,6 +608,9 @@ Checklist status: [x] completed; [ ] planned.
 **** [x] Implement a RAM-independent game-network bank with bounded inline
      title/packet buffers, explicit command/transport errors, shared legacy node
      and inbox, and compiled-C/native execution/protection regressions.
+**** [x] Implement a RAM-independent firmware gateway with request-local
+     shared BIOS handlers, bounded inline responses, protected aliases,
+     validated persistence, and compiled-C/native query and boot regressions.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup

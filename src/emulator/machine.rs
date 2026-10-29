@@ -70,9 +70,20 @@ pub const FIRMWARE_TEXT_CONTROL: u32 = FIRMWARE_TEXT_BASE + 3;
 pub const FIRMWARE_TEXT_ROW: u32 = FIRMWARE_TEXT_BASE + 4;
 pub const FIRMWARE_TEXT_COLUMN: u32 = FIRMWARE_TEXT_BASE + 5;
 pub const FIRMWARE_TEXT_ENABLED: u32 = FIRMWARE_TEXT_BASE + 6;
+pub const FIRMWARE_COMMAND: u32 = FIRMWARE_GATEWAY_BASE;
+pub const FIRMWARE_STATUS: u32 = FIRMWARE_GATEWAY_BASE + 1;
+pub const FIRMWARE_INDEX: u32 = FIRMWARE_GATEWAY_BASE + 2;
+pub const FIRMWARE_DISK_COUNT: u32 = FIRMWARE_GATEWAY_BASE + 4;
+pub const FIRMWARE_STARTUP: u32 = FIRMWARE_GATEWAY_BASE + 6;
+pub const FIRMWARE_OUTPUT_LENGTH: u32 = FIRMWARE_GATEWAY_BASE + 8;
+pub const FIRMWARE_SETTING_COUNT: u32 = FIRMWARE_GATEWAY_BASE + 14;
+pub const FIRMWARE_NETWORK_NAME: u32 = FIRMWARE_GATEWAY_BASE + 16;
+pub const FIRMWARE_SETTING: u32 = FIRMWARE_GATEWAY_BASE + 48;
+pub const FIRMWARE_OUTPUT: u32 = FIRMWARE_GATEWAY_BASE + 0x100;
+pub const FIRMWARE_REQUEST_BYTES: usize = 90;
 pub const MACHINE_REVISION: u32 = 1;
 pub const DEVICE_ABI: u32 = 1;
-pub const IMPLEMENTED_BANKS: u32 = 0x6df;
+pub const IMPLEMENTED_BANKS: u32 = 0xedf;
 
 pub const fn usable_ram_size(backing_size: usize) -> usize {
     if backing_size < DEVICE_APERTURE_START as usize {
@@ -89,7 +100,7 @@ pub const fn is_device_aperture(address: u32) -> bool {
 pub const fn is_implemented_device_page(address: u32) -> bool {
     (address >= SYSTEM_BASE && address < CLOCK_BASE + DEVICE_BANK_SIZE)
         || (address >= AUDIO_BASE && address < NETWORK_BASE + DEVICE_BANK_SIZE)
-        || (address >= CONSOLE_BASE && address < FIRMWARE_TEXT_BASE + DEVICE_BANK_SIZE)
+        || (address >= CONSOLE_BASE && address < FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE)
 }
 
 pub fn device_register_writable(address: u32) -> Option<bool> {
@@ -123,6 +134,22 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
         CONSOLE_DATA..=CONSOLE_CONTROL => Some(true),
         FIRMWARE_TEXT_DATA..=FIRMWARE_TEXT_COLUMN => Some(true),
         FIRMWARE_TEXT_ENABLED => Some(false),
+        FIRMWARE_COMMAND | FIRMWARE_STARTUP => Some(true),
+        FIRMWARE_STATUS | FIRMWARE_SETTING_COUNT => Some(false),
+        address
+            if (FIRMWARE_INDEX..FIRMWARE_INDEX + 2).contains(&address)
+                || (FIRMWARE_NETWORK_NAME..FIRMWARE_NETWORK_NAME + 17).contains(&address)
+                || (FIRMWARE_SETTING..FIRMWARE_SETTING + 42).contains(&address) =>
+        {
+            Some(true)
+        }
+        address
+            if (FIRMWARE_DISK_COUNT..FIRMWARE_DISK_COUNT + 2).contains(&address)
+                || (FIRMWARE_OUTPUT_LENGTH..FIRMWARE_OUTPUT_LENGTH + 2).contains(&address)
+                || (FIRMWARE_OUTPUT..FIRMWARE_OUTPUT + 512).contains(&address) =>
+        {
+            Some(false)
+        }
         address
             if (CLOCK_MONOTONIC_MILLIS..CLOCK_MONOTONIC_MILLIS + 4).contains(&address)
                 || (CLOCK_FRAMES..CLOCK_FRAMES + 2).contains(&address)
@@ -132,6 +159,80 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
             Some(false)
         }
         _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FirmwareGateway {
+    registers: [u8; FIRMWARE_REQUEST_BYTES],
+    output: [u8; 512],
+}
+
+impl Default for FirmwareGateway {
+    fn default() -> Self {
+        Self {
+            registers: [0; FIRMWARE_REQUEST_BYTES],
+            output: [0; 512],
+        }
+    }
+}
+
+impl FirmwareGateway {
+    pub fn read(&self, address: u32) -> Option<u8> {
+        device_register_writable(address)?;
+        if (FIRMWARE_GATEWAY_BASE..FIRMWARE_GATEWAY_BASE + FIRMWARE_REQUEST_BYTES as u32)
+            .contains(&address)
+        {
+            if address == FIRMWARE_COMMAND {
+                Some(0)
+            } else {
+                Some(self.registers[(address - FIRMWARE_GATEWAY_BASE) as usize])
+            }
+        } else if (FIRMWARE_OUTPUT..FIRMWARE_OUTPUT + 512).contains(&address) {
+            Some(self.output[(address - FIRMWARE_OUTPUT) as usize])
+        } else {
+            None
+        }
+    }
+
+    pub fn write(&mut self, address: u32, value: u8) {
+        assert!(
+            address != FIRMWARE_COMMAND
+                && (FIRMWARE_GATEWAY_BASE..FIRMWARE_GATEWAY_BASE + FIRMWARE_REQUEST_BYTES as u32)
+                    .contains(&address)
+                && device_register_writable(address) == Some(true),
+            "host write to an invalid firmware staging register"
+        );
+        self.registers[(address - FIRMWARE_GATEWAY_BASE) as usize] = value;
+    }
+
+    pub fn request(&self) -> [u8; FIRMWARE_REQUEST_BYTES] {
+        self.registers
+    }
+
+    pub fn complete(
+        &mut self,
+        mut request: [u8; FIRMWARE_REQUEST_BYTES],
+        output: Option<&str>,
+    ) -> Result<(), String> {
+        let length = output.map_or(0, |text| text.len());
+        if length >= self.output.len() {
+            self.fail();
+            return Err("firmware response exceeds 511 bytes".to_owned());
+        }
+        self.output.fill(0);
+        if let Some(output) = output {
+            self.output[..length].copy_from_slice(output.as_bytes());
+        }
+        request[1] = 0;
+        request[8..10].copy_from_slice(&(length as u16).to_be_bytes());
+        self.registers = request;
+        Ok(())
+    }
+
+    pub fn fail(&mut self) {
+        self.registers[1] = 1;
+        self.registers[8..10].fill(0);
     }
 }
 
@@ -692,6 +793,16 @@ mod tests {
             ("FIRMWARE_TEXT_ROW", FIRMWARE_TEXT_ROW),
             ("FIRMWARE_TEXT_COLUMN", FIRMWARE_TEXT_COLUMN),
             ("FIRMWARE_TEXT_ENABLED", FIRMWARE_TEXT_ENABLED),
+            ("FIRMWARE_COMMAND", FIRMWARE_COMMAND),
+            ("FIRMWARE_STATUS", FIRMWARE_STATUS),
+            ("FIRMWARE_INDEX", FIRMWARE_INDEX),
+            ("FIRMWARE_DISK_COUNT", FIRMWARE_DISK_COUNT),
+            ("FIRMWARE_STARTUP", FIRMWARE_STARTUP),
+            ("FIRMWARE_OUTPUT_LENGTH", FIRMWARE_OUTPUT_LENGTH),
+            ("FIRMWARE_SETTING_COUNT", FIRMWARE_SETTING_COUNT),
+            ("FIRMWARE_NETWORK_NAME", FIRMWARE_NETWORK_NAME),
+            ("FIRMWARE_SETTING", FIRMWARE_SETTING),
+            ("FIRMWARE_OUTPUT", FIRMWARE_OUTPUT),
         ];
         let definitions: Vec<_> = header
             .lines()

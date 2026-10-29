@@ -33,7 +33,7 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 1UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 1759UL) return 14;\n\
+                 if (*banks != 3807UL) return 14;\n\
                  return 1;\n\
              }"
         ),
@@ -211,6 +211,54 @@ fn guest_c_uses_bounded_high_network_staging_and_explicit_status() {
         ),
         1
     );
+}
+
+#[test]
+fn guest_c_reads_firmware_disks_through_bounded_inline_responses() {
+    let root = std::env::temp_dir().join(format!(
+        "sc16-c90-firmware-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    let assembly = compile_minimal_program_to_assembly(
+        "#include <sc16_machine.h>\n\
+         int main(void) {\n\
+             volatile unsigned char *command = (volatile unsigned char *)SC16_FIRMWARE_COMMAND;\n\
+             volatile unsigned char *status = (volatile unsigned char *)SC16_FIRMWARE_STATUS;\n\
+             volatile unsigned int *index = (volatile unsigned int *)SC16_FIRMWARE_INDEX;\n\
+             volatile unsigned int *count = (volatile unsigned int *)SC16_FIRMWARE_DISK_COUNT;\n\
+             volatile unsigned int *length = (volatile unsigned int *)SC16_FIRMWARE_OUTPUT_LENGTH;\n\
+             volatile unsigned char *output = (volatile unsigned char *)SC16_FIRMWARE_OUTPUT;\n\
+             *command = 1;\n\
+             if (*status != 0 || *count != 1 || *index != 0) return 11;\n\
+             *command = 2;\n\
+             if (*status != 0 || *length != 3 || output[0] != 97 || output[3] != 0) return 12;\n\
+             *index = 65535U;\n\
+             *command = 2;\n\
+             if (*status != 1 || *length != 0 || output[0] != 97) return 13;\n\
+             *index = 0;\n\
+             *command = 2;\n\
+             if (*status != 0 || *length != 3 || *command != 0) return 14;\n\
+             return 1;\n\
+         }",
+        "high-firmware.c",
+    )
+    .unwrap()
+    .unwrap();
+    let image = assemble(&assembly, 0).unwrap();
+    let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+    cpu.configure_disk(root.clone(), root.join("missing"))
+        .unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.run(1_000_000).unwrap();
+    assert!(!cpu.running);
+    assert_eq!(cpu.registers[0], 1);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

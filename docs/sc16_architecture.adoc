@@ -34,7 +34,7 @@ translation and permission checks apply independently to every byte of an
 access.
 
 The system identification, interrupt/PIT, fault, input, clock/random, audio, game-network,
-console and firmware-text banks are implemented in this aperture without RAM backing. All other high banks remain
+console, firmware-text and firmware-gateway banks are implemented in this aperture without RAM backing. All other high banks remain
 reserved. The low-address legacy device
 banks remain in use until their coordinated firmware/toolchain/program migration
 is complete. Instruction operands retain architectural address bits before
@@ -64,7 +64,7 @@ addresses below; no shared assembly constant syntax is currently supported.
 |`0x3ff08000` |Filesystem |Reserved
 |`0x3ff09000` |Console |Implemented
 |`0x3ff0a000` |Firmware text |Implemented
-|`0x3ff0b000` |Firmware gateway |Reserved
+|`0x3ff0b000` |Firmware gateway |Implemented
 |===
 
 Each bank occupies a 4096-byte page. All remaining aperture pages are reserved.
@@ -80,7 +80,7 @@ not change them.
 |`0x04` |Device ABI |`1`, identifying this bank contract
 |`0x08` |Usable RAM bytes |Configured backing size capped at `0x3ff00000`
 |`0x0c` |Address bits |`30`
-|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0x6df`
+|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0xedf`
 |===
 
 The migration-time machine revision does not advertise completion of the
@@ -383,6 +383,77 @@ than the new bank's live cursor/command readback. Legacy row/column writes still
 combine the two last-written coordinate latches; high coordinate writes act on
 the current cursor. These legacy latches are now outside RAM. Only legacy writes
 maintain backed low register mirrors; high console/text accesses never index RAM.
+
+==== Firmware gateway
+
+The supervisor-only gateway uses request-local firmware handlers shared with
+legacy BIOS operations. It does not forward high registers through legacy RAM
+or accept guest pointers. Firmware management is not a user device service.
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |RW |Command byte, reads zero
+|`0x01` |1 |R |Last command status: 0 success, 1 failure (details in debug console)
+|`0x02` |2 |RW |Staged disk/setting index
+|`0x04` |2 |R |Disk count from enumeration/reload
+|`0x06` |1 |RW |Startup selector: 0 selector, 1 preferred-disk boot
+|`0x08` |2 |R |Response byte length excluding NUL, zero on failure/no response
+|`0x0e` |1 |R |Additional-setting count from enumeration/reload
+|`0x10` |17 |RW |Staged network name (up to 16 printable ASCII bytes plus NUL)
+|`0x30` |42 |RW |Staged additional-setting record
+|`0x100` |512 |R |Inline NUL-terminated response window
+|===
+
+All multibyte registers are unsigned big-endian. All remaining offsets are
+reserved, including old BIOS pointer/capacity and host UI marker offsets.
+Creation zeros every register/window. Staging writes retain raw bytes and
+have no persistence or boot effects; the command byte is the sole commit point.
+Rejected wide accesses fault before changing any register or invoking firmware.
+Reads never enumerate disks, reload/save settings or transfer execution.
+Gateway state survives image-entry preparation, including successful boot.
+
+Commands preserve the existing BIOS operation numbers:
+
+* 1 enumerates disks, selects the CLI/preferred disk, and snapshots count,
+  startup/autoboot choice, network name and additional-setting count.
+* 2 returns the selected disk ID in the inline response.
+* 3 validates and boots the selected disk through the existing image loader;
+  KERNEL remains supervisor, USER enters user mode. Program/entry preflight
+  happens before clearing CPU state or copying image segments.
+* 4 validates and atomically saves the selected preference, startup choice,
+  network name and current additional settings.
+* 5 reloads the configured settings file and performs enumeration.
+* 6 reads the indexed additional setting into the record.
+* 7 validates and updates the named additional setting in memory; command 4
+  persists it. The existing type cannot be changed.
+* 8 returns the selected disk's label, capacity, read-only and boot-mode summary.
+* 9 atomically saves only the selected preferred disk, retaining startup policy.
+
+An additional-setting record has 17 name bytes at offset 0, type at 17
+(0 boolean, 1 string, 2 signed integer), and 24 value bytes at 18.
+Name/value must be NUL-terminated; boolean values are `Yes`/`No`, integers are
+signed decimal i64, and names/string values retain the existing bounded
+printable-ASCII settings validation. There are at most eight additional settings.
+The startup selector and name are checked only by operations that use them;
+network-name processing uses the first 16 bytes, stopping at NUL.
+
+Every command reports success/failure synchronously. Invalid commands, indices,
+configuration, settings types, I/O and oversized responses fail explicitly.
+Responses are at most 511 bytes plus NUL; success zero-fills the window and
+reports the length. Success without text clears the window/length. Failure sets
+status 1 and length zero but retains prior staging, snapshots and response bytes.
+Do not treat retained response bytes as a successful result after failure.
+No error text is truncated into a success response. Persistent settings use the
+existing atomic save; failed validation/save does not replace active settings.
+Boot retains existing SC-NET name-conflict checks, text/console handoff and
+diagnostics. This gateway does not claim that protected normal USER startup or
+revision-2 image migration is complete.
+
+Legacy BIOS pointer outputs remain RAM-only and validated by their frontend.
+The two frontends share configuration, disk discovery and boot/persistence
+handlers, but not staged bytes or response/status registers. Legacy firmware
+and host UI marker aliases remain until the coordinated migration.
 
 ==== Clock/random bank
 

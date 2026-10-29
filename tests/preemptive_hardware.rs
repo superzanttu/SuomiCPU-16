@@ -405,6 +405,91 @@ fn supervisor_executes_high_network_commands_with_small_ram_and_translated_alias
 }
 
 #[test]
+fn supervisor_executes_high_firmware_queries_and_boot_with_small_ram() {
+    use suomicpu16::machine::*;
+
+    let root = std::env::temp_dir().join(format!(
+        "sc16-native-firmware-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = root.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("disk.json"),
+        r#"{"version":1,"id":"app","label":"Application","capacity_bytes":65536,"read_only":false,"protected_files":[]}"#,
+    )
+    .unwrap();
+    for translated in [false, true] {
+        for kernel in [false, true] {
+            let base = if translated {
+                0x9000
+            } else {
+                FIRMWARE_GATEWAY_BASE
+            };
+            let boot_name = if kernel { "kernel.bin" } else { "main.bin" };
+            let boot = assemble("LDI R0, 123\nHALT", 0x4000).unwrap();
+            suomicpu16::image::write_image(&app.join(boot_name), &boot).unwrap();
+            let source = format!(
+                "LDI30 R2, {base}\nLDI R0, 1\nST R2, R0\n\
+                 LDI30 R2, {}\nLDW R4, R2\n\
+                 LDI30 R2, {base}\nLDI R0, 2\nST R2, R0\n\
+                 LDI30 R2, {}\nLD R5, R2\n\
+                 LDI30 R2, {}\nLDW R6, R2\n\
+                 LDI30 R2, {base}\nLDI R0, 3\nST R2, R0\nHALT",
+                base + 4,
+                base + 0x100,
+                base + 8,
+            );
+            let image = assemble(&source, 0x1000).unwrap();
+            let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+            cpu.configure_disk(root.clone(), root.join("missing"))
+                .unwrap();
+            cpu.load_program(&image.segments, image.entry_point)
+                .unwrap();
+            if translated {
+                cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+                cpu.memory[0x3004..0x3008].copy_from_slice(&0x100bu32.to_be_bytes());
+                cpu.memory[0x3024..0x3028]
+                    .copy_from_slice(&(FIRMWARE_GATEWAY_BASE | 3).to_be_bytes());
+            }
+            cpu.memory[0xb000..0xb300].fill(0xa5);
+            if translated {
+                cpu.enable_mmu(0x2000).unwrap();
+            }
+            for _ in 0..14 {
+                cpu.step().unwrap();
+            }
+            assert_eq!(cpu.registers[4], 1);
+            assert_eq!(cpu.registers[5], i64::from(b'a'));
+            assert_eq!(cpu.registers[6], 3);
+            cpu.step().unwrap();
+            assert_eq!(cpu.pc, 0x4000);
+            assert_eq!(cpu.current_task(), None);
+            assert_eq!(
+                cpu.privilege_mode,
+                if kernel {
+                    PrivilegeMode::Supervisor
+                } else {
+                    PrivilegeMode::User
+                }
+            );
+            cpu.run(8).unwrap();
+            assert!(!cpu.running);
+            assert_eq!(cpu.registers[0], 123);
+            assert_eq!(cpu.take_booted_disk_path(), Some(app.clone()));
+            assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+            assert!(cpu.memory[0xb000..0xb300].iter().all(|byte| *byte == 0xa5));
+            std::fs::remove_file(app.join(boot_name)).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unmanaged_svc_always_enters_the_guest_kernel() {
     for abi_register in [0, 1, 77] {
         let image = assemble("SVC\nHALT\n.address 0x300\nINC R5\nRTI", 0x100).unwrap();

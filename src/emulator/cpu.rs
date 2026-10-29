@@ -46,6 +46,7 @@ const DISK_BASE: u32 = 0x43100;
 const DISK_STATUS: u32 = DISK_BASE + 16;
 const BIOS_BASE: u32 = 0x43400;
 const BIOS_STATUS: u32 = BIOS_BASE + 12;
+#[cfg(test)]
 const BIOS_SETTING_RECORD: usize = BIOS_BASE as usize + 0x30;
 pub const BIOS_FIRMWARE_MARKER: u32 = BIOS_BASE + 0x2f;
 pub const BIOS_AUTOBOOT_WAIT_MARKER: u32 = BIOS_BASE + 0x2e;
@@ -376,6 +377,7 @@ pub struct Cpu {
     folder_disk: Option<FolderDisk>,
     network: Option<NetNode>,
     network_registers: crate::machine::NetworkDevice,
+    firmware_gateway: crate::machine::FirmwareGateway,
     network_port: u16,
     scnet: Option<ScNetNode>,
     scnet_enabled: bool,
@@ -513,6 +515,7 @@ impl Cpu {
             folder_disk: None,
             network: None,
             network_registers: crate::machine::NetworkDevice::default(),
+            firmware_gateway: crate::machine::FirmwareGateway::default(),
             network_port: DEFAULT_PORT,
             scnet: None,
             scnet_enabled: false,
@@ -588,20 +591,69 @@ impl Cpu {
                 .log_error("bios", "user-mode firmware operation was rejected");
             return;
         }
-        let result = match command {
-            1 => self.bios_list_count(),
-            2 => self.bios_list_id(),
-            3 => self.bios_boot_disk(),
-            4 => self.bios_save_settings(),
-            5 => self.bios_reload_settings(),
-            6 => self.bios_read_setting(),
-            7 => self.bios_write_setting(),
-            8 => self.bios_disk_info(),
-            9 => self.bios_save_preferred_disk(),
-            _ => Err("unsupported firmware operation".to_owned()),
-        };
+        let mut request = [0; crate::machine::FIRMWARE_REQUEST_BYTES];
+        request.copy_from_slice(
+            &self.memory
+                [BIOS_BASE as usize..BIOS_BASE as usize + crate::machine::FIRMWARE_REQUEST_BYTES],
+        );
+        let result = (|| {
+            let output = if matches!(command, 2 | 8) {
+                Some(self.guest_range(
+                    self.bios_register_u32(6),
+                    usize::from(self.bios_register_u16(10)),
+                )?)
+            } else {
+                None
+            };
+            let response = self.firmware_operation(command, &mut request)?;
+            if command != 3 {
+                self.memory[BIOS_BASE as usize..BIOS_BASE as usize + request.len()]
+                    .copy_from_slice(&request);
+            }
+            if let (Some(output), Some(response)) = (output, response) {
+                if response.len() + 1 > output.len() {
+                    return Err("firmware output buffer capacity is too small".to_owned());
+                }
+                self.memory[output.start..output.start + response.len()]
+                    .copy_from_slice(response.as_bytes());
+                self.memory[output.start + response.len()] = 0;
+            }
+            Ok(())
+        })();
         if let Err(error) = result {
             self.bios_status(1);
+            self.debug_console.log_error("bios", &error);
+        }
+    }
+
+    fn firmware_operation(
+        &mut self,
+        command: u8,
+        request: &mut [u8; crate::machine::FIRMWARE_REQUEST_BYTES],
+    ) -> Result<Option<String>, String> {
+        let index = usize::from(u16::from_be_bytes([request[2], request[3]]));
+        match command {
+            1 => self.bios_list_count(request)?,
+            2 => return self.bios_list_id(index).map(Some),
+            3 => self.bios_boot_disk(index)?,
+            4 => self.bios_save_settings(request)?,
+            5 => self.bios_reload_settings(request)?,
+            6 => self.bios_read_setting(request)?,
+            7 => self.bios_write_setting(request)?,
+            8 => return self.bios_disk_info(index).map(Some),
+            9 => self.bios_save_preferred_disk(index)?,
+            _ => return Err("unsupported firmware operation".to_owned()),
+        }
+        Ok(None)
+    }
+
+    fn high_firmware_command(&mut self, command: u8) {
+        let mut request = self.firmware_gateway.request();
+        let result = self
+            .firmware_operation(command, &mut request)
+            .and_then(|output| self.firmware_gateway.complete(request, output.as_deref()));
+        if let Err(error) = result {
+            self.firmware_gateway.fail();
             self.debug_console.log_error("bios", &error);
         }
     }
@@ -610,7 +662,10 @@ impl Cpu {
         FolderDisk::discover_paths(&self.disk_root)
     }
 
-    fn bios_list_count(&mut self) -> Result<(), String> {
+    fn bios_list_count(
+        &mut self,
+        request: &mut [u8; crate::machine::FIRMWARE_REQUEST_BYTES],
+    ) -> Result<(), String> {
         if self.scnet_enabled {
             self.ensure_scnet_node(std::time::Duration::from_millis(650))?;
         }
@@ -668,24 +723,20 @@ impl Cpu {
             .map_err(|_| "selected firmware disk index exceeds 65535".to_owned())?
             .to_be_bytes();
         let [count_high, count_low] = count.to_be_bytes();
-        self.memory[BIOS_BASE as usize + 2] = index_high;
-        self.memory[BIOS_BASE as usize + 3] = index_low;
-        self.memory[BIOS_BASE as usize + 4] = count_high;
-        self.memory[BIOS_BASE as usize + 5] = count_low;
-        self.memory[BIOS_BASE as usize + 6] = u8::from(auto_boot);
-        self.memory[BIOS_BASE as usize + 0x0e] = u8::try_from(self.bios_settings.additional.len())
+        request[2] = index_high;
+        request[3] = index_low;
+        request[4] = count_high;
+        request[5] = count_low;
+        request[6] = u8::from(auto_boot);
+        request[0x0e] = u8::try_from(self.bios_settings.additional.len())
             .map_err(|_| "too many additional BIOS settings".to_owned())?;
-        self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x21].fill(0);
+        request[0x10..0x21].fill(0);
         let network_name = self.bios_settings.network_name.as_bytes();
-        self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x10 + network_name.len()]
-            .copy_from_slice(network_name);
+        request[0x10..0x10 + network_name.len()].copy_from_slice(network_name);
         Ok(())
     }
 
-    fn bios_list_id(&mut self) -> Result<(), String> {
-        let index = usize::from(self.bios_register_u16(2));
-        let capacity = usize::from(self.bios_register_u16(10));
-        let output = self.guest_range(self.bios_register_u32(6), capacity)?;
+    fn bios_list_id(&self, index: usize) -> Result<String, String> {
         let paths = self.bios_disk_paths()?;
         let path = paths
             .get(index)
@@ -694,24 +745,10 @@ impl Cpu {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| "firmware disk ID is not valid text".to_owned())?;
-        let encoded = id.as_bytes();
-        let required = encoded.len() + 1;
-        if required > capacity {
-            return Err(format!(
-                "firmware disk ID output buffer at {:#x} has capacity {capacity}; {required} required",
-                output.start
-            ));
-        }
-        let start = output.start;
-        self.memory[start..start + encoded.len()].copy_from_slice(encoded);
-        self.memory[start + encoded.len()] = 0;
-        Ok(())
+        Ok(id.to_owned())
     }
 
-    fn bios_disk_info(&mut self) -> Result<(), String> {
-        let index = usize::from(self.bios_register_u16(2));
-        let capacity = usize::from(self.bios_register_u16(10));
-        let output = self.guest_range(self.bios_register_u32(6), capacity)?;
+    fn bios_disk_info(&self, index: usize) -> Result<String, String> {
         let paths = self.bios_disk_paths()?;
         let path = paths
             .get(index)
@@ -746,23 +783,13 @@ impl Cpu {
                 "READ-WRITE"
             }
         );
-        if summary.len() + 1 > capacity {
-            return Err(format!(
-                "firmware disk information buffer has capacity {capacity}; {} required",
-                summary.len() + 1
-            ));
-        }
-        let start = output.start;
-        self.memory[start..start + summary.len()].copy_from_slice(summary.as_bytes());
-        self.memory[start + summary.len()] = 0;
-        Ok(())
+        Ok(summary)
     }
 
-    fn bios_boot_disk(&mut self) -> Result<(), String> {
+    fn bios_boot_disk(&mut self, index: usize) -> Result<(), String> {
         if self.scnet_enabled {
             self.ensure_scnet_node(std::time::Duration::from_millis(650))?;
         }
-        let index = usize::from(self.bios_register_u16(2));
         let paths = self.bios_disk_paths()?;
         let path = paths
             .get(index)
@@ -776,7 +803,9 @@ impl Cpu {
         self.prepare_image_entry();
         self.load_program(&boot.image.segments, boot.image.entry_point)
             .map_err(|error| format!("cannot load selected firmware disk: {error}"))?;
-        self.memory[BIOS_FIRMWARE_MARKER as usize] = 0;
+        if let Some(marker) = self.memory.get_mut(BIOS_FIRMWARE_MARKER as usize) {
+            *marker = 0;
+        }
         self.booted_disk_path = Some(path.clone());
         self.folder_disk = Some(disk);
         match boot.mode {
@@ -811,13 +840,16 @@ impl Cpu {
         Ok(())
     }
 
-    fn bios_save_settings(&mut self) -> Result<(), String> {
+    fn bios_save_settings(
+        &mut self,
+        request: &[u8; crate::machine::FIRMWARE_REQUEST_BYTES],
+    ) -> Result<(), String> {
         let path = self
             .bios_settings_path
             .as_ref()
             .ok_or_else(|| "BIOS settings file path is not configured".to_owned())?;
         let paths = self.bios_disk_paths()?;
-        let selected = usize::from(self.bios_register_u16(2));
+        let selected = usize::from(u16::from_be_bytes([request[2], request[3]]));
         if selected >= paths.len() && !paths.is_empty() {
             return Err(format!("firmware disk index {selected} is out of range"));
         }
@@ -830,13 +862,13 @@ impl Cpu {
                     .ok_or_else(|| "selected disk ID is not valid text".to_owned())
             })
             .transpose()?;
-        let startup_behavior = match self.memory[BIOS_BASE as usize + 6] {
+        let startup_behavior = match request[6] {
             0 => StartupBehavior::Selector,
             1 => StartupBehavior::BootPreferred,
             _ => return Err("BIOS startup behavior value is invalid".to_owned()),
         };
         let mut network_name = Vec::with_capacity(16);
-        for byte in &self.memory[BIOS_BASE as usize + 0x10..BIOS_BASE as usize + 0x20] {
+        for byte in &request[0x10..0x20] {
             if *byte == 0 {
                 break;
             }
@@ -856,13 +888,12 @@ impl Cpu {
         Ok(())
     }
 
-    fn bios_save_preferred_disk(&mut self) -> Result<(), String> {
+    fn bios_save_preferred_disk(&mut self, selected: usize) -> Result<(), String> {
         let path = self
             .bios_settings_path
             .as_ref()
             .ok_or_else(|| "BIOS settings file path is not configured".to_owned())?;
         let paths = self.bios_disk_paths()?;
-        let selected = usize::from(self.bios_register_u16(2));
         let disk_path = paths
             .get(selected)
             .ok_or_else(|| format!("firmware disk index {selected} is out of range"))?;
@@ -878,27 +909,33 @@ impl Cpu {
         Ok(())
     }
 
-    fn bios_reload_settings(&mut self) -> Result<(), String> {
+    fn bios_reload_settings(
+        &mut self,
+        request: &mut [u8; crate::machine::FIRMWARE_REQUEST_BYTES],
+    ) -> Result<(), String> {
         let path = self
             .bios_settings_path
             .as_ref()
             .ok_or_else(|| "BIOS settings file path is not configured".to_owned())?;
         self.bios_settings = BiosSettings::load(path)?;
-        self.bios_list_count()
+        self.bios_list_count(request)
     }
 
-    fn bios_read_setting(&mut self) -> Result<(), String> {
-        let index = usize::from(self.bios_register_u16(2));
+    fn bios_read_setting(
+        &self,
+        request: &mut [u8; crate::machine::FIRMWARE_REQUEST_BYTES],
+    ) -> Result<(), String> {
+        let index = usize::from(u16::from_be_bytes([request[2], request[3]]));
         let (name, value) = self
             .bios_settings
             .additional
             .iter()
             .nth(index)
             .ok_or_else(|| format!("additional BIOS setting index {index} is out of range"))?;
-        let record = BIOS_SETTING_RECORD;
-        self.memory[record..record + 0x2a].fill(0);
-        self.memory[record..record + name.len()].copy_from_slice(name.as_bytes());
-        self.memory[record + 17] = match value {
+        let record = 0x30;
+        request[record..record + 0x2a].fill(0);
+        request[record..record + name.len()].copy_from_slice(name.as_bytes());
+        request[record + 17] = match value {
             BiosSettingValue::Boolean(_) => 0,
             BiosSettingValue::String(_) => 1,
             BiosSettingValue::Integer(_) => 2,
@@ -914,21 +951,24 @@ impl Cpu {
             BiosSettingValue::String(value) => value.clone(),
             BiosSettingValue::Integer(value) => value.to_string(),
         };
-        self.memory[record + 18..record + 18 + encoded_value.len()]
+        request[record + 18..record + 18 + encoded_value.len()]
             .copy_from_slice(encoded_value.as_bytes());
         Ok(())
     }
 
-    fn bios_write_setting(&mut self) -> Result<(), String> {
-        let record = BIOS_SETTING_RECORD;
-        let name_bytes = &self.memory[record..record + 17];
+    fn bios_write_setting(
+        &mut self,
+        request: &[u8; crate::machine::FIRMWARE_REQUEST_BYTES],
+    ) -> Result<(), String> {
+        let record = 0x30;
+        let name_bytes = &request[record..record + 17];
         let name_end = name_bytes
             .iter()
             .position(|byte| *byte == 0)
             .ok_or_else(|| "additional BIOS setting name is not terminated".to_owned())?;
         let name = std::str::from_utf8(&name_bytes[..name_end])
             .map_err(|_| "additional BIOS setting name is not valid UTF-8".to_owned())?;
-        let value_bytes = &self.memory[record + 18..record + 0x2a];
+        let value_bytes = &request[record + 18..record + 0x2a];
         let value_end = value_bytes
             .iter()
             .position(|byte| *byte == 0)
@@ -940,7 +980,7 @@ impl Cpu {
             .additional
             .get(name)
             .ok_or_else(|| format!("additional BIOS setting {name:?} was not found"))?;
-        let new_value = match (self.memory[record + 17], existing) {
+        let new_value = match (request[record + 17], existing) {
             (0, BiosSettingValue::Boolean(_)) => match value {
                 "Yes" => BiosSettingValue::Boolean(true),
                 "No" => BiosSettingValue::Boolean(false),
@@ -1448,6 +1488,7 @@ impl Cpu {
                 .or_else(|| self.clock.read(address))
                 .or_else(|| self.audio.read(address))
                 .or_else(|| self.network_registers.read(address))
+                .or_else(|| self.firmware_gateway.read(address))
                 .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
         }
@@ -3323,6 +3364,15 @@ impl Cpu {
             );
             if self.write_terminal_register(address, value) {
                 return;
+            } else if (crate::machine::FIRMWARE_GATEWAY_BASE
+                ..crate::machine::FIRMWARE_GATEWAY_BASE + crate::machine::DEVICE_BANK_SIZE)
+                .contains(&address)
+            {
+                if address == crate::machine::FIRMWARE_COMMAND {
+                    self.high_firmware_command(value);
+                } else {
+                    self.firmware_gateway.write(address, value);
+                }
             } else if (crate::machine::AUDIO_BASE
                 ..crate::machine::AUDIO_BASE + crate::machine::DEVICE_BANK_SIZE)
                 .contains(&address)
@@ -7104,6 +7154,7 @@ mod tests {
         cpu.memory[0x3038..0x303c].copy_from_slice(&(FIRMWARE_TEXT_BASE | 0xf).to_be_bytes());
         cpu.memory[0x303c..0x3040].copy_from_slice(&(AUDIO_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3040..0x3044].copy_from_slice(&(NETWORK_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x3044..0x3048].copy_from_slice(&(FIRMWARE_GATEWAY_BASE | 0xf).to_be_bytes());
         cpu.enable_mmu(0x2000).unwrap();
         for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
             cpu.privilege_mode = mode;
@@ -7116,6 +7167,7 @@ mod tests {
                 (0xe000, FIRMWARE_TEXT_BASE),
                 (0xf000, AUDIO_BASE),
                 (0x10000, NETWORK_BASE),
+                (0x11000, FIRMWARE_GATEWAY_BASE),
             ] {
                 for offset in 0..DEVICE_BANK_SIZE {
                     for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {
@@ -7172,6 +7224,236 @@ mod tests {
         assert_eq!(cpu.read_u32(FAULT_ADDRESS), 0);
         assert_eq!(cpu.read_u16(FAULT_INFO), 0);
         assert_eq!(cpu.read(INTERRUPT_ENABLE), 0);
+    }
+
+    #[test]
+    fn firmware_gateway_uses_inline_responses_without_ram_backing() {
+        use crate::machine::*;
+
+        let root = std::env::temp_dir().join(format!(
+            "sc16-high-firmware-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            cpu.disk_root = root.clone();
+            cpu.bios_settings.network_name = "NODE".to_owned();
+            cpu.bios_settings.preferred_disk = Some("other".to_owned());
+            cpu.bios_settings.startup_behavior = StartupBehavior::BootPreferred;
+            cpu.bios_settings
+                .additional
+                .insert("count".to_owned(), BiosSettingValue::Integer(i64::MIN));
+            let alias = (FIRMWARE_GATEWAY_BASE & cpu.memory_mask) as usize;
+            cpu.memory[alias..alias + 0x300].fill(0xa5);
+            assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(FIRMWARE_OUTPUT_LENGTH).unwrap(), 0);
+            cpu.write_guest(FIRMWARE_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(FIRMWARE_INDEX).unwrap(), 1);
+            assert_eq!(cpu.read_guest_u16(FIRMWARE_DISK_COUNT).unwrap(), 2);
+            assert_eq!(cpu.read_guest(FIRMWARE_STARTUP).unwrap(), 1);
+            assert_eq!(cpu.read_guest(FIRMWARE_SETTING_COUNT).unwrap(), 1);
+            assert_eq!(cpu.read_guest(FIRMWARE_NETWORK_NAME).unwrap(), b'N');
+            cpu.write_guest(FIRMWARE_COMMAND, 2).unwrap();
+            assert_eq!(cpu.read_guest_u16(FIRMWARE_OUTPUT_LENGTH).unwrap(), 5);
+            for (offset, byte) in b"other\0".iter().enumerate() {
+                assert_eq!(
+                    cpu.read_guest(FIRMWARE_OUTPUT + offset as u32).unwrap(),
+                    *byte
+                );
+            }
+            cpu.write_guest_u16(FIRMWARE_INDEX, u16::MAX).unwrap();
+            cpu.write_guest(FIRMWARE_COMMAND, 2).unwrap();
+            assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 1);
+            assert_eq!(cpu.read_guest_u16(FIRMWARE_OUTPUT_LENGTH).unwrap(), 0);
+            assert_eq!(cpu.read_guest(FIRMWARE_OUTPUT).unwrap(), b'o');
+            cpu.write_guest_u16(FIRMWARE_INDEX, 0).unwrap();
+            cpu.write_guest(FIRMWARE_COMMAND, 2).unwrap();
+            assert_eq!(cpu.read_guest_u16(FIRMWARE_OUTPUT_LENGTH).unwrap(), 3);
+            assert_eq!(cpu.read_guest(FIRMWARE_OUTPUT + 4).unwrap(), 0);
+            cpu.write_guest(FIRMWARE_COMMAND, 6).unwrap();
+            assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest(FIRMWARE_SETTING + 17).unwrap(), 2);
+            let value = i64::MIN.to_string();
+            for (offset, byte) in value.bytes().enumerate() {
+                assert_eq!(
+                    cpu.read_guest(FIRMWARE_SETTING + 18 + offset as u32)
+                        .unwrap(),
+                    byte
+                );
+            }
+            cpu.write_guest(FIRMWARE_COMMAND, 255).unwrap();
+            assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 1);
+            cpu.prepare_image_entry();
+            assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 1);
+            assert_eq!(cpu.read_guest(FIRMWARE_SETTING + 17).unwrap(), 2);
+            assert_eq!(cpu.read_guest(FIRMWARE_OUTPUT).unwrap(), 0);
+            assert!(
+                cpu.memory[alias..alias + 0x300]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn firmware_gateway_rejects_wide_side_effects_and_oversized_responses_atomically() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_guest_u16(FIRMWARE_INDEX, 7).unwrap();
+        assert!(cpu.write_guest_u16(FIRMWARE_COMMAND, 0x0100).is_err());
+        assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 0);
+        assert_eq!(cpu.read_guest_u16(FIRMWARE_INDEX).unwrap(), 7);
+        assert!(cpu.write_guest_u32(FIRMWARE_INDEX, 0x12345678).is_err());
+        assert_eq!(cpu.read_guest_u16(FIRMWARE_INDEX).unwrap(), 7);
+        cpu.write_guest(FIRMWARE_SETTING + 41, 0x33).unwrap();
+        assert!(cpu.write_guest_u16(FIRMWARE_SETTING + 41, 0x4455).is_err());
+        assert_eq!(cpu.read_guest(FIRMWARE_SETTING + 41).unwrap(), 0x33);
+        assert!(cpu.read_guest_u16(FIRMWARE_OUTPUT + 511).is_err());
+        let request = cpu.firmware_gateway.request();
+        cpu.firmware_gateway
+            .complete(request, Some(&"x".repeat(511)))
+            .unwrap();
+        assert_eq!(cpu.read_guest_u16(FIRMWARE_OUTPUT_LENGTH).unwrap(), 511);
+        assert_eq!(cpu.read_guest(FIRMWARE_OUTPUT + 511).unwrap(), 0);
+        assert!(
+            cpu.firmware_gateway
+                .complete(request, Some(&"y".repeat(512)))
+                .is_err()
+        );
+        assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 1);
+        assert_eq!(cpu.read_guest_u16(FIRMWARE_OUTPUT_LENGTH).unwrap(), 0);
+        assert_eq!(cpu.read_guest(FIRMWARE_OUTPUT).unwrap(), b'x');
+        cpu.write_guest(FIRMWARE_SETTING + 17, 0).unwrap();
+        cpu.write_guest(FIRMWARE_COMMAND, 7).unwrap();
+        assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 1);
+        assert!(cpu.bios_settings.additional.is_empty());
+    }
+
+    #[test]
+    fn high_and_legacy_firmware_share_settings_and_validate_persistence() {
+        use crate::machine::*;
+
+        let root = std::env::temp_dir().join(format!(
+            "sc16-high-firmware-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disks = root.join("disks");
+        let app = disks.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let manifest = serde_json::json!({
+            "version": 1, "id": "app", "label": "Application",
+            "capacity_bytes": 100000, "read_only": false, "protected_files": []
+        });
+        std::fs::write(app.join("disk.json"), manifest.to_string()).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.disk_root = disks;
+        cpu.configure_bios_settings(root.join("bios.json")).unwrap();
+        cpu.bios_settings.network_name = "NODE".to_owned();
+        cpu.bios_settings
+            .additional
+            .insert("enabled".to_owned(), BiosSettingValue::Boolean(false));
+        cpu.write(FIRMWARE_COMMAND, 1);
+        cpu.write(FIRMWARE_COMMAND, 6);
+        assert_eq!(cpu.read(FIRMWARE_SETTING + 17), 0);
+        for (offset, byte) in b"Yes\0".iter().enumerate() {
+            cpu.write(FIRMWARE_SETTING + 18 + offset as u32, *byte);
+        }
+        cpu.write(FIRMWARE_COMMAND, 7);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        cpu.bios_control(6);
+        assert_eq!(
+            &cpu.memory[BIOS_SETTING_RECORD + 18..BIOS_SETTING_RECORD + 22],
+            b"Yes\0"
+        );
+        cpu.memory[BIOS_SETTING_RECORD + 18..BIOS_SETTING_RECORD + 22].copy_from_slice(b"No\0\0");
+        cpu.bios_control(7);
+        cpu.write(FIRMWARE_COMMAND, 6);
+        assert_eq!(cpu.read(FIRMWARE_SETTING + 18), b'N');
+        cpu.write(FIRMWARE_STARTUP, 1);
+        cpu.write(FIRMWARE_COMMAND, 4);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        let saved = std::fs::read(root.join("bios.json")).unwrap();
+        assert_eq!(cpu.bios_settings.preferred_disk.as_deref(), Some("app"));
+        cpu.write(FIRMWARE_STARTUP, 2);
+        cpu.write(FIRMWARE_COMMAND, 4);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 1);
+        assert_eq!(std::fs::read(root.join("bios.json")).unwrap(), saved);
+        cpu.bios_settings.network_name = "CHANGED".to_owned();
+        cpu.write(FIRMWARE_COMMAND, 5);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        assert_eq!(cpu.read(FIRMWARE_STARTUP), 1);
+        assert_eq!(cpu.bios_settings.network_name, "NODE");
+        cpu.write(FIRMWARE_COMMAND, 9);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        assert_eq!(
+            cpu.bios_settings.startup_behavior,
+            StartupBehavior::BootPreferred
+        );
+        cpu.write(FIRMWARE_COMMAND, 8);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 0);
+        let summary = b"Application | 100000 B | READ-WRITE | NOT_BOOT";
+        assert_eq!(cpu.read_u16(FIRMWARE_OUTPUT_LENGTH), summary.len() as u16);
+        for (offset, byte) in summary.iter().enumerate() {
+            assert_eq!(cpu.read(FIRMWARE_OUTPUT + offset as u32), *byte);
+        }
+        let mut oversized = manifest;
+        oversized["label"] = serde_json::Value::String("x".repeat(512));
+        std::fs::write(app.join("disk.json"), oversized.to_string()).unwrap();
+        cpu.write(FIRMWARE_COMMAND, 8);
+        assert_eq!(cpu.read(FIRMWARE_STATUS), 1);
+        assert_eq!(cpu.read_u16(FIRMWARE_OUTPUT_LENGTH), 0);
+        assert_eq!(cpu.read(FIRMWARE_OUTPUT), b'A');
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn high_firmware_boot_rejects_out_of_memory_images_before_mutation() {
+        use crate::machine::*;
+
+        let root = std::env::temp_dir().join(format!(
+            "sc16-high-firmware-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = root.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("disk.json"),
+            r#"{"version":1,"id":"app","label":"Application","capacity_bytes":65536,"read_only":false,"protected_files":[]}"#,
+        )
+        .unwrap();
+        let invalid =
+            crate::assembler::assemble("HALT\n.address 0x10000\n.data hex ff", 0x4000).unwrap();
+        crate::image::write_image(&app.join("main.bin"), &invalid).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.disk_root = root.clone();
+        cpu.pc = 0x1000;
+        cpu.registers[4] = 123;
+        cpu.memory[0x4000] = 0xa5;
+        cpu.write_guest(FIRMWARE_COMMAND, 3).unwrap();
+        assert_eq!(cpu.read_guest(FIRMWARE_STATUS).unwrap(), 1);
+        assert_eq!(cpu.pc, 0x1000);
+        assert_eq!(cpu.registers[4], 123);
+        assert_eq!(cpu.memory[0x4000], 0xa5);
+        assert_eq!(cpu.take_booted_disk_path(), None);
+        assert!(cpu.folder_disk.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11092,7 +11374,8 @@ mod tests {
         ] {
             cpu.memory[BIOS_BASE as usize + 2] = 0;
             cpu.memory[BIOS_BASE as usize + 3] = index;
-            cpu.bios_read_setting().unwrap();
+            cpu.bios_control(6);
+            assert_eq!(cpu.read(BIOS_STATUS), 0);
             let record = BIOS_SETTING_RECORD;
             let name_end = cpu.memory[record..record + 17]
                 .iter()
@@ -11107,22 +11390,26 @@ mod tests {
 
         let record = BIOS_SETTING_RECORD;
         cpu.memory[BIOS_BASE as usize + 3] = 0;
-        cpu.bios_read_setting().unwrap();
+        cpu.bios_control(6);
+        assert_eq!(cpu.read(BIOS_STATUS), 0);
         cpu.memory[record + 17] = 0;
         cpu.memory[record + 18..record + 42].fill(0);
         cpu.memory[record + 18..record + 21].copy_from_slice(b"Yes");
-        cpu.bios_write_setting().unwrap();
+        cpu.bios_control(7);
+        assert_eq!(cpu.read(BIOS_STATUS), 0);
         assert_eq!(
             cpu.bios_settings.additional.get("enabled"),
             Some(&BiosSettingValue::Boolean(true))
         );
 
         cpu.memory[BIOS_BASE as usize + 3] = 2;
-        cpu.bios_read_setting().unwrap();
+        cpu.bios_control(6);
+        assert_eq!(cpu.read(BIOS_STATUS), 0);
         cpu.memory[record + 17] = 2;
         cpu.memory[record + 18..record + 42].fill(0);
         cpu.memory[record + 18..record + 20].copy_from_slice(b"-9");
-        cpu.bios_write_setting().unwrap();
+        cpu.bios_control(7);
+        assert_eq!(cpu.read(BIOS_STATUS), 0);
         assert_eq!(
             cpu.bios_settings.additional.get("retries"),
             Some(&BiosSettingValue::Integer(-9))
@@ -11155,7 +11442,8 @@ mod tests {
             .copy_from_slice(&2u16.to_be_bytes());
         cpu.memory[BIOS_BASE as usize + 6] = 1;
 
-        cpu.bios_save_preferred_disk().unwrap();
+        cpu.bios_control(9);
+        assert_eq!(cpu.read(BIOS_STATUS), 0);
 
         assert_eq!(
             cpu.bios_settings.preferred_disk.as_deref(),
@@ -11172,7 +11460,8 @@ mod tests {
 
         cpu.memory[BIOS_BASE as usize + 2..BIOS_BASE as usize + 4]
             .copy_from_slice(&3u16.to_be_bytes());
-        assert!(cpu.bios_save_preferred_disk().is_err());
+        cpu.bios_control(9);
+        assert_eq!(cpu.read(BIOS_STATUS), 1);
         assert_eq!(
             cpu.bios_settings.preferred_disk.as_deref(),
             Some("DISK0003")
@@ -11206,7 +11495,8 @@ mod tests {
             .copy_from_slice(&0x5080u32.to_be_bytes());
         cpu.memory[BIOS_BASE as usize + 10..BIOS_BASE as usize + 12]
             .copy_from_slice(&128u16.to_be_bytes());
-        cpu.bios_disk_info().unwrap();
+        cpu.bios_control(8);
+        assert_eq!(cpu.read(BIOS_STATUS), 0);
         let firmware =
             crate::assembler::assemble(include_str!("../../firmware/bios.asm"), 0).unwrap();
         cpu.load_program(&firmware.segments, firmware.entry_point)
