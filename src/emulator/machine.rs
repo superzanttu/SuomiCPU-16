@@ -43,6 +43,29 @@ pub const CLOCK_MONOTONIC_MILLIS: u32 = CLOCK_BASE + 4;
 pub const CLOCK_FRAMES: u32 = CLOCK_BASE + 8;
 pub const CLOCK_RTC: u32 = CLOCK_BASE + 12;
 pub const CLOCK_RANDOM: u32 = CLOCK_BASE + 16;
+pub const GRAPHICS_COMMAND: u32 = GRAPHICS_BASE;
+pub const GRAPHICS_STATUS: u32 = GRAPHICS_BASE + 1;
+pub const GRAPHICS_OPERATION: u32 = GRAPHICS_BASE + 2;
+pub const GRAPHICS_COLOR: u32 = GRAPHICS_BASE + 3;
+pub const GRAPHICS_X: u32 = GRAPHICS_BASE + 4;
+pub const GRAPHICS_Y: u32 = GRAPHICS_BASE + 6;
+pub const GRAPHICS_WIDTH: u32 = GRAPHICS_BASE + 8;
+pub const GRAPHICS_HEIGHT: u32 = GRAPHICS_BASE + 10;
+pub const GRAPHICS_LENGTH: u32 = GRAPHICS_BASE + 12;
+pub const GRAPHICS_RESULT: u32 = GRAPHICS_BASE + 14;
+pub const GRAPHICS_DATA: u32 = GRAPHICS_BASE + 16;
+pub const GRAPHICS_DATA_SIZE: usize = 512;
+pub const GRAPHICS_MODE: u32 = GRAPHICS_BASE + 0x210;
+pub const GRAPHICS_OP_CLEAR: u8 = 1;
+pub const GRAPHICS_OP_PIXEL: u8 = 2;
+pub const GRAPHICS_OP_RECT: u8 = 3;
+pub const GRAPHICS_OP_LINE: u8 = 4;
+pub const GRAPHICS_OP_PRESENT: u8 = 5;
+pub const GRAPHICS_OP_BLIT: u8 = 6;
+pub const GRAPHICS_OP_PALETTE: u8 = 7;
+pub const GRAPHICS_OP_MODE: u8 = 8;
+pub const GRAPHICS_STATUS_INVALID_COMMAND: u8 = 1;
+pub const GRAPHICS_STATUS_INVALID_REQUEST: u8 = 2;
 pub const AUDIO_COMMAND: u32 = AUDIO_BASE;
 pub const AUDIO_STATUS: u32 = AUDIO_BASE + 1;
 pub const AUDIO_CHANNEL: u32 = AUDIO_BASE + 2;
@@ -96,7 +119,7 @@ pub const FILESYSTEM_DATA: u32 = FILESYSTEM_BASE + 0x120;
 pub const FILESYSTEM_DATA_SIZE: usize = 512;
 pub const MACHINE_REVISION: u32 = 1;
 pub const DEVICE_ABI: u32 = 1;
-pub const IMPLEMENTED_BANKS: u32 = 0xfdf;
+pub const IMPLEMENTED_BANKS: u32 = 0xfff;
 
 pub const fn usable_ram_size(backing_size: usize) -> usize {
     if backing_size < DEVICE_APERTURE_START as usize {
@@ -112,6 +135,7 @@ pub const fn is_device_aperture(address: u32) -> bool {
 
 pub const fn is_implemented_device_page(address: u32) -> bool {
     (address >= SYSTEM_BASE && address < CLOCK_BASE + DEVICE_BANK_SIZE)
+        || (address >= GRAPHICS_BASE && address < AUDIO_BASE)
         || (address >= AUDIO_BASE && address < NETWORK_BASE + DEVICE_BANK_SIZE)
         || (address >= FILESYSTEM_BASE && address < FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE)
 }
@@ -195,8 +219,161 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
         {
             Some(false)
         }
+        GRAPHICS_COMMAND | GRAPHICS_OPERATION | GRAPHICS_COLOR | GRAPHICS_MODE => Some(true),
+        GRAPHICS_STATUS => Some(false),
+        address if (GRAPHICS_X..GRAPHICS_RESULT).contains(&address) => Some(true),
+        address if (GRAPHICS_RESULT..GRAPHICS_RESULT + 2).contains(&address) => Some(false),
+        address
+            if (GRAPHICS_DATA..GRAPHICS_DATA + GRAPHICS_DATA_SIZE as u32).contains(&address) =>
+        {
+            Some(true)
+        }
         _ => None,
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphicsDevice {
+    operation: u8,
+    color: u8,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    length: u16,
+    mode: u8,
+    result: u16,
+    status: u8,
+    data: [u8; GRAPHICS_DATA_SIZE],
+}
+
+impl Default for GraphicsDevice {
+    fn default() -> Self {
+        Self {
+            operation: 0,
+            color: 0,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            length: 0,
+            mode: 0,
+            result: 0,
+            status: 0,
+            data: [0; GRAPHICS_DATA_SIZE],
+        }
+    }
+}
+
+impl GraphicsDevice {
+    pub fn read(&self, address: u32) -> Option<u8> {
+        device_register_writable(address)?;
+        match address {
+            GRAPHICS_COMMAND => Some(0),
+            GRAPHICS_STATUS => Some(self.status),
+            GRAPHICS_OPERATION => Some(self.operation),
+            GRAPHICS_COLOR => Some(self.color),
+            GRAPHICS_MODE => Some(self.mode),
+            address if (GRAPHICS_X..GRAPHICS_X + 2).contains(&address) => {
+                Some(self.x.to_be_bytes()[(address - GRAPHICS_X) as usize])
+            }
+            address if (GRAPHICS_Y..GRAPHICS_Y + 2).contains(&address) => {
+                Some(self.y.to_be_bytes()[(address - GRAPHICS_Y) as usize])
+            }
+            address if (GRAPHICS_WIDTH..GRAPHICS_WIDTH + 2).contains(&address) => {
+                Some(self.width.to_be_bytes()[(address - GRAPHICS_WIDTH) as usize])
+            }
+            address if (GRAPHICS_HEIGHT..GRAPHICS_HEIGHT + 2).contains(&address) => {
+                Some(self.height.to_be_bytes()[(address - GRAPHICS_HEIGHT) as usize])
+            }
+            address if (GRAPHICS_LENGTH..GRAPHICS_LENGTH + 2).contains(&address) => {
+                Some(self.length.to_be_bytes()[(address - GRAPHICS_LENGTH) as usize])
+            }
+            address if (GRAPHICS_RESULT..GRAPHICS_RESULT + 2).contains(&address) => {
+                Some(self.result.to_be_bytes()[(address - GRAPHICS_RESULT) as usize])
+            }
+            address
+                if (GRAPHICS_DATA..GRAPHICS_DATA + GRAPHICS_DATA_SIZE as u32)
+                    .contains(&address) =>
+            {
+                Some(self.data[(address - GRAPHICS_DATA) as usize])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn write(&mut self, address: u32, value: u8) {
+        match address {
+            GRAPHICS_OPERATION => self.operation = value,
+            GRAPHICS_COLOR => self.color = value,
+            GRAPHICS_MODE => self.mode = value,
+            address if (GRAPHICS_X..GRAPHICS_X + 2).contains(&address) => {
+                Self::write_u16(&mut self.x, address - GRAPHICS_X, value);
+            }
+            address if (GRAPHICS_Y..GRAPHICS_Y + 2).contains(&address) => {
+                Self::write_u16(&mut self.y, address - GRAPHICS_Y, value);
+            }
+            address if (GRAPHICS_WIDTH..GRAPHICS_WIDTH + 2).contains(&address) => {
+                Self::write_u16(&mut self.width, address - GRAPHICS_WIDTH, value);
+            }
+            address if (GRAPHICS_HEIGHT..GRAPHICS_HEIGHT + 2).contains(&address) => {
+                Self::write_u16(&mut self.height, address - GRAPHICS_HEIGHT, value);
+            }
+            address if (GRAPHICS_LENGTH..GRAPHICS_LENGTH + 2).contains(&address) => {
+                Self::write_u16(&mut self.length, address - GRAPHICS_LENGTH, value);
+            }
+            address
+                if (GRAPHICS_DATA..GRAPHICS_DATA + GRAPHICS_DATA_SIZE as u32)
+                    .contains(&address) =>
+            {
+                self.data[(address - GRAPHICS_DATA) as usize] = value;
+            }
+            _ => panic!("host write to an invalid graphics staging register"),
+        }
+    }
+
+    fn write_u16(target: &mut u16, offset: u32, value: u8) {
+        let mut bytes = target.to_be_bytes();
+        bytes[offset as usize] = value;
+        *target = u16::from_be_bytes(bytes);
+    }
+
+    pub fn request(&self) -> GraphicsRequest<'_> {
+        GraphicsRequest {
+            operation: self.operation,
+            color: self.color,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            length: self.length,
+            mode: self.mode,
+            data: &self.data,
+        }
+    }
+
+    pub fn complete(&mut self, result: u16) {
+        self.status = 0;
+        self.result = result;
+    }
+
+    pub fn fail(&mut self, status: u8) {
+        self.status = status;
+        self.result = 0;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GraphicsRequest<'a> {
+    pub operation: u8,
+    pub color: u8,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub length: u16,
+    pub mode: u8,
+    pub data: &'a [u8; GRAPHICS_DATA_SIZE],
 }
 
 #[derive(Clone, Debug)]
@@ -882,7 +1059,47 @@ mod tests {
         assert!(is_implemented_device_page(FAULT_BASE));
         assert!(is_implemented_device_page(INPUT_BASE));
         assert!(is_implemented_device_page(CLOCK_BASE));
-        assert!(!is_implemented_device_page(GRAPHICS_BASE));
+        assert!(is_implemented_device_page(GRAPHICS_BASE));
+    }
+
+    #[test]
+    fn graphics_register_contract_is_bounded_and_big_endian() {
+        let mut device = GraphicsDevice::default();
+        for (address, writable) in [
+            (GRAPHICS_COMMAND, true),
+            (GRAPHICS_STATUS, false),
+            (GRAPHICS_OPERATION, true),
+            (GRAPHICS_COLOR, true),
+            (GRAPHICS_X, true),
+            (GRAPHICS_RESULT, false),
+            (GRAPHICS_DATA, true),
+            (GRAPHICS_DATA + GRAPHICS_DATA_SIZE as u32 - 1, true),
+        ] {
+            assert_eq!(device_register_writable(address), Some(writable));
+        }
+        assert_eq!(
+            device_register_writable(GRAPHICS_DATA + GRAPHICS_DATA_SIZE as u32),
+            Some(true)
+        );
+        device.write(GRAPHICS_OPERATION, 3);
+        device.write(GRAPHICS_X, 0x12);
+        device.write(GRAPHICS_X + 1, 0x34);
+        device.write(GRAPHICS_MODE, 1);
+        device.write(GRAPHICS_DATA + 511, 0xa5);
+        assert_eq!(device.read(GRAPHICS_COMMAND), Some(0));
+        assert_eq!(device.read(GRAPHICS_OPERATION), Some(3));
+        assert_eq!(device.read(GRAPHICS_X), Some(0x12));
+        assert_eq!(device.read(GRAPHICS_X + 1), Some(0x34));
+        assert_eq!(device.read(GRAPHICS_MODE), Some(1));
+        assert_eq!(device.read(GRAPHICS_DATA + 511), Some(0xa5));
+        assert_eq!(device.read(GRAPHICS_DATA + 512), Some(1));
+        device.complete(17);
+        assert_eq!(device.read(GRAPHICS_STATUS), Some(0));
+        assert_eq!(device.read(GRAPHICS_RESULT), Some(0));
+        assert_eq!(device.read(GRAPHICS_RESULT + 1), Some(17));
+        device.fail(2);
+        assert_eq!(device.read(GRAPHICS_STATUS), Some(2));
+        assert_eq!(device.read(GRAPHICS_RESULT), Some(0));
     }
 
     #[test]
@@ -942,6 +1159,35 @@ mod tests {
             ("CLOCK_FRAMES", CLOCK_FRAMES),
             ("CLOCK_RTC", CLOCK_RTC),
             ("CLOCK_RANDOM", CLOCK_RANDOM),
+            ("GRAPHICS_COMMAND", GRAPHICS_COMMAND),
+            ("GRAPHICS_STATUS", GRAPHICS_STATUS),
+            ("GRAPHICS_OPERATION", GRAPHICS_OPERATION),
+            ("GRAPHICS_COLOR", GRAPHICS_COLOR),
+            ("GRAPHICS_X", GRAPHICS_X),
+            ("GRAPHICS_Y", GRAPHICS_Y),
+            ("GRAPHICS_WIDTH", GRAPHICS_WIDTH),
+            ("GRAPHICS_HEIGHT", GRAPHICS_HEIGHT),
+            ("GRAPHICS_LENGTH", GRAPHICS_LENGTH),
+            ("GRAPHICS_RESULT", GRAPHICS_RESULT),
+            ("GRAPHICS_DATA", GRAPHICS_DATA),
+            ("GRAPHICS_MODE", GRAPHICS_MODE),
+            ("GRAPHICS_DATA_SIZE", GRAPHICS_DATA_SIZE as u32),
+            ("GRAPHICS_OP_CLEAR", GRAPHICS_OP_CLEAR as u32),
+            ("GRAPHICS_OP_PIXEL", GRAPHICS_OP_PIXEL as u32),
+            ("GRAPHICS_OP_RECT", GRAPHICS_OP_RECT as u32),
+            ("GRAPHICS_OP_LINE", GRAPHICS_OP_LINE as u32),
+            ("GRAPHICS_OP_PRESENT", GRAPHICS_OP_PRESENT as u32),
+            ("GRAPHICS_OP_BLIT", GRAPHICS_OP_BLIT as u32),
+            ("GRAPHICS_OP_PALETTE", GRAPHICS_OP_PALETTE as u32),
+            ("GRAPHICS_OP_MODE", GRAPHICS_OP_MODE as u32),
+            (
+                "GRAPHICS_STATUS_INVALID_COMMAND",
+                GRAPHICS_STATUS_INVALID_COMMAND as u32,
+            ),
+            (
+                "GRAPHICS_STATUS_INVALID_REQUEST",
+                GRAPHICS_STATUS_INVALID_REQUEST as u32,
+            ),
             ("AUDIO_COMMAND", AUDIO_COMMAND),
             ("AUDIO_STATUS", AUDIO_STATUS),
             ("AUDIO_CHANNEL", AUDIO_CHANNEL),

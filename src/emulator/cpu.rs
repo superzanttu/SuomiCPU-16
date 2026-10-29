@@ -66,7 +66,6 @@ const GUEST_TEXT_CLEAR: u8 = 1;
 const GUEST_TEXT_ENABLE: u8 = 2;
 #[cfg(test)]
 const GUEST_TEXT_DISABLE: u8 = 3;
-const VRAM_START: u32 = 0x50000;
 const GPU_CLEAR: u8 = 1;
 const GPU_PIXEL: u8 = 2;
 const GPU_RECT: u8 = 3;
@@ -126,11 +125,10 @@ const FOLDER_FS_RENAME: u8 = 0x46;
 const FOLDER_FS_STAT: u8 = 0x47;
 const MMIO_START: u32 = 0x43000;
 const MMIO_END: u32 = 0x44000;
-const VRAM_BYTES: u32 = 640 * 480 / 2;
-const DEVICE_RAM_RANGES: [(u32, u32); 2] = [
-    (MMIO_START, MMIO_END - MMIO_START),
-    (VRAM_START, VRAM_BYTES),
-];
+const VRAM_BYTES: usize = 640 * 480 / 2;
+const DEVICE_RAM_RANGES: [(u32, u32); 1] = [(MMIO_START, MMIO_END - MMIO_START)];
+#[cfg(test)]
+const FORMER_FRAMEBUFFER_START: u32 = 0x50000;
 const GPU3D_FILL: u16 = 1;
 const GPU3D_WIREFRAME: u16 = 2;
 const GPU3D_SIN_8_8: [i32; 64] = [
@@ -197,6 +195,152 @@ pub struct Flags {
 }
 
 impl Cpu {
+    fn high_graphics_command(&mut self, command: u8) {
+        use crate::machine::*;
+
+        if command != 1 {
+            self.graphics_device.fail(GRAPHICS_STATUS_INVALID_COMMAND);
+            return;
+        }
+
+        let staged = self.graphics_device.request();
+        let data = *staged.data;
+        let request = crate::machine::GraphicsRequest {
+            operation: staged.operation,
+            color: staged.color,
+            x: staged.x,
+            y: staged.y,
+            width: staged.width,
+            height: staged.height,
+            length: staged.length,
+            mode: staged.mode,
+            data: &data,
+        };
+        match self.execute_graphics_request(request) {
+            Ok(result) => self.graphics_device.complete(result),
+            Err(()) => self.graphics_device.fail(GRAPHICS_STATUS_INVALID_REQUEST),
+        }
+    }
+
+    fn execute_graphics_request(
+        &mut self,
+        request: crate::machine::GraphicsRequest<'_>,
+    ) -> Result<u16, ()> {
+        use crate::machine::*;
+
+        let GraphicsRequest {
+            operation,
+            color,
+            x: raw_x,
+            y: raw_y,
+            width: raw_width,
+            height: raw_height,
+            length,
+            mode,
+            data,
+        } = request;
+        let (screen_width, screen_height) = self.screen_size();
+        let x = i32::from(raw_x);
+        let y = i32::from(raw_y);
+        let width = i32::from(raw_width);
+        let height = i32::from(raw_height);
+        let pixel_count = usize::from(raw_width).checked_mul(usize::from(raw_height));
+        let result = match operation {
+            GRAPHICS_OP_CLEAR if length == 0 => {
+                let pixel_count = (screen_width * screen_height) as usize;
+                if screen_width == 320 {
+                    self.vram[..pixel_count].fill(color);
+                } else {
+                    let fill = ((color & 0x0f) << 4) | (color & 0x0f);
+                    self.vram[..pixel_count / 2].fill(fill);
+                }
+                Some(0)
+            }
+            GRAPHICS_OP_PIXEL if length == 0 && x < screen_width && y < screen_height => {
+                self.gpu_pixel_on_layer(0, x, y, color);
+                Some(1)
+            }
+            GRAPHICS_OP_RECT
+                if length == 0
+                    && width > 0
+                    && height > 0
+                    && x.checked_add(width).is_some_and(|end| end <= screen_width)
+                    && y.checked_add(height)
+                        .is_some_and(|end| end <= screen_height) =>
+            {
+                for row in y..y + height {
+                    for column in x..x + width {
+                        self.gpu_pixel_on_layer(0, column, row, color);
+                    }
+                }
+                Some(u16::try_from(width * height).unwrap_or(u16::MAX))
+            }
+            GRAPHICS_OP_LINE
+                if length == 0
+                    && x < screen_width
+                    && y < screen_height
+                    && width < screen_width
+                    && height < screen_height =>
+            {
+                let (mut x0, mut y0) = (x, y);
+                let dx = (width - x0).abs();
+                let sx = if x0 < width { 1 } else { -1 };
+                let dy = -(height - y0).abs();
+                let sy = if y0 < height { 1 } else { -1 };
+                let mut error = dx + dy;
+                let mut points = 0u16;
+                loop {
+                    self.gpu_pixel_on_layer(0, x0, y0, color);
+                    points = points.saturating_add(1);
+                    if x0 == width && y0 == height {
+                        break;
+                    }
+                    let twice = 2 * error;
+                    if twice >= dy {
+                        error += dy;
+                        x0 += sx;
+                    }
+                    if twice <= dx {
+                        error += dx;
+                        y0 += sy;
+                    }
+                }
+                Some(points)
+            }
+            GRAPHICS_OP_PRESENT if length == 0 => {
+                self.frame_yield = true;
+                self.frame_presented = true;
+                Some(self.frame_count)
+            }
+            GRAPHICS_OP_BLIT
+                if width > 0
+                    && height > 0
+                    && pixel_count == Some(usize::from(length))
+                    && usize::from(length) <= GRAPHICS_DATA_SIZE
+                    && x.checked_add(width).is_some_and(|end| end <= screen_width)
+                    && y.checked_add(height)
+                        .is_some_and(|end| end <= screen_height) =>
+            {
+                for row in 0..height {
+                    for column in 0..width {
+                        let source = (row * width + column) as usize;
+                        self.gpu_pixel_on_layer(0, x + column, y + row, data[source]);
+                    }
+                }
+                Some(length)
+            }
+            GRAPHICS_OP_PALETTE if length == 3 => {
+                self.palette[color as usize] = [data[0], data[1], data[2]];
+                Some(0)
+            }
+            GRAPHICS_OP_MODE if length == 0 && mode <= 1 => {
+                self.set_graphics_mode(mode).ok().map(|()| 0)
+            }
+            _ => None,
+        };
+        result.ok_or(())
+    }
+
     fn high_filesystem_command(&mut self, command: u8) {
         use crate::machine::*;
 
@@ -516,6 +660,11 @@ pub struct Cpu {
     #[cfg(test)]
     pub(crate) test_monotonic_ms: Option<u32>,
     pub memory: MmapMut,
+    pub(crate) vram: Vec<u8>,
+    gpu_layer_select: u8,
+    gpu_layer_mask: u8,
+    gpu_layer_transparency: [u8; GPU_LAYER_COUNT],
+    gpu_layer_order: [u8; GPU_LAYER_COUNT],
     pub registers: [i64; 8],
     pub pc: u32,
     pub sp: u32,
@@ -551,6 +700,7 @@ pub struct Cpu {
     network_registers: crate::machine::NetworkDevice,
     firmware_gateway: crate::machine::FirmwareGateway,
     filesystem_device: crate::machine::FilesystemDevice,
+    graphics_device: crate::machine::GraphicsDevice,
     network_port: u16,
     scnet: Option<ScNetNode>,
     scnet_enabled: bool,
@@ -652,6 +802,11 @@ impl Cpu {
         }
         Ok(Self {
             memory,
+            vram: vec![0; VRAM_BYTES],
+            gpu_layer_select: 0,
+            gpu_layer_mask: (1 << GPU_LAYER_COUNT) - 1,
+            gpu_layer_transparency: [0; GPU_LAYER_COUNT],
+            gpu_layer_order: std::array::from_fn(|layer| layer as u8),
             registers: [0; 8],
             monotonic_epoch: std::time::Instant::now(),
             #[cfg(test)]
@@ -690,6 +845,7 @@ impl Cpu {
             network_registers: crate::machine::NetworkDevice::default(),
             firmware_gateway: crate::machine::FirmwareGateway::default(),
             filesystem_device: crate::machine::FilesystemDevice::default(),
+            graphics_device: crate::machine::GraphicsDevice::default(),
             network_port: DEFAULT_PORT,
             scnet: None,
             scnet_enabled: false,
@@ -1662,6 +1818,7 @@ impl Cpu {
                 .or_else(|| self.clock.read(address))
                 .or_else(|| self.audio.read(address))
                 .or_else(|| self.network_registers.read(address))
+                .or_else(|| self.graphics_device.read(address))
                 .or_else(|| self.firmware_gateway.read(address))
                 .or_else(|| self.filesystem_device.read(address))
                 .or_else(|| self.fault_register_byte(address))
@@ -2167,6 +2324,7 @@ impl Cpu {
                 }
                 Ok(SyscallNumber::Seek) => self.syscall_seek(task_id),
                 Ok(SyscallNumber::ScNet) => self.syscall_scnet(task_id),
+                Ok(SyscallNumber::Graphics) => self.syscall_graphics(task_id),
                 Ok(SyscallNumber::ProcessInfo | SyscallNumber::ProcessStatus) => {
                     self.syscall_process_info()
                 }
@@ -2622,6 +2780,7 @@ impl Cpu {
                             byte;
                     }
                 }
+
                 peers.len() as i64
             }
             1 => {
@@ -2725,6 +2884,83 @@ impl Cpu {
             }
             _ => crate::syscall::error::INVALID,
         }
+    }
+
+    fn syscall_graphics(&mut self, task_id: Option<TaskId>) -> i64 {
+        use crate::machine::*;
+
+        if task_id.is_none() || self.registers[5] != 0 || self.registers[6] != 0 {
+            return crate::syscall::error::INVALID;
+        }
+        let Ok(operation) = u8::try_from(self.registers[1]) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Ok(parameters_address) = u32::try_from(self.registers[2]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let Ok(data_address) = u32::try_from(self.registers[3]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let Ok(data_length) = usize::try_from(self.registers[4]) else {
+            return crate::syscall::error::INVALID;
+        };
+        let valid_data_length = match operation {
+            GRAPHICS_OP_BLIT => (1..=GRAPHICS_DATA_SIZE).contains(&data_length),
+            GRAPHICS_OP_PALETTE => data_length == 3,
+            GRAPHICS_OP_CLEAR | GRAPHICS_OP_PIXEL | GRAPHICS_OP_RECT | GRAPHICS_OP_LINE
+            | GRAPHICS_OP_PRESENT | GRAPHICS_OP_MODE => data_length == 0,
+            _ => false,
+        };
+        if !valid_data_length {
+            return crate::syscall::error::INVALID;
+        }
+
+        let parameter_addresses = match self.guest_memory_addresses(
+            parameters_address,
+            10,
+            crate::mmu::MemoryAccess::Read,
+            true,
+        ) {
+            Ok(addresses) => addresses,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let mut parameters = [0; 10];
+        for (destination, source) in parameters.iter_mut().zip(parameter_addresses) {
+            *destination = self.memory[source];
+        }
+
+        let mut data = [0; GRAPHICS_DATA_SIZE];
+        if data_length != 0 {
+            let data_addresses = match self.guest_memory_addresses(
+                data_address,
+                data_length,
+                crate::mmu::MemoryAccess::Read,
+                true,
+            ) {
+                Ok(addresses) => addresses,
+                Err(_) => return crate::syscall::error::BAD_ADDRESS,
+            };
+            for (destination, source) in data.iter_mut().zip(data_addresses) {
+                *destination = self.memory[source];
+            }
+        }
+
+        let read_u16 =
+            |offset: usize| u16::from_be_bytes([parameters[offset], parameters[offset + 1]]);
+        let request = GraphicsRequest {
+            operation,
+            color: parameters[0],
+            mode: parameters[1],
+            x: read_u16(2),
+            y: read_u16(4),
+            width: read_u16(6),
+            height: read_u16(8),
+            length: data_length as u16,
+            data: &data,
+        };
+        self.execute_graphics_request(request)
+            .map(i64::from)
+            .unwrap_or(crate::syscall::error::INVALID)
     }
 
     fn ensure_page_memory_manager(&mut self) -> Result<(), crate::mmu::PageTableError> {
@@ -3557,6 +3793,15 @@ impl Cpu {
                 } else {
                     self.filesystem_device.write(address, value);
                 }
+            } else if (crate::machine::GRAPHICS_BASE
+                ..crate::machine::GRAPHICS_BASE + crate::machine::DEVICE_BANK_SIZE)
+                .contains(&address)
+            {
+                if address == crate::machine::GRAPHICS_COMMAND {
+                    self.high_graphics_command(value);
+                } else {
+                    self.graphics_device.write(address, value);
+                }
             } else if (crate::machine::AUDIO_BASE
                 ..crate::machine::AUDIO_BASE + crate::machine::DEVICE_BANK_SIZE)
                 .contains(&address)
@@ -3610,6 +3855,20 @@ impl Cpu {
             GPU_BASE => self.gpu_command(value),
             DISK_BASE => self.disk_control(value),
             BIOS_BASE => self.bios_control(value),
+            GPU_LAYER_SELECT => self.gpu_layer_select = value,
+            GPU_LAYER_MASK => self.gpu_layer_mask = value,
+            address
+                if (GPU_LAYER_TRANSPARENCY..GPU_LAYER_TRANSPARENCY + GPU_LAYER_COUNT as u32)
+                    .contains(&address) =>
+            {
+                self.gpu_layer_transparency[(address - GPU_LAYER_TRANSPARENCY) as usize] = value;
+            }
+            address
+                if (GPU_LAYER_ORDER..GPU_LAYER_ORDER + GPU_LAYER_COUNT as u32)
+                    .contains(&address) =>
+            {
+                self.gpu_layer_order[(address - GPU_LAYER_ORDER) as usize] = value;
+            }
             GPU_MODE_ADDR => {
                 if self.layer_mode != value {
                     self.layer_mode = value;
@@ -5247,8 +5506,7 @@ impl Cpu {
     }
 
     fn gpu_world_tile(&mut self, tile: u8, origin_x: i32, origin_y: i32) {
-        let layer =
-            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
         if layer == 0 {
             self.set_gpu_result(1);
             return;
@@ -5276,8 +5534,7 @@ impl Cpu {
     }
 
     fn gpu_world_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: u8) {
-        let layer =
-            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
         if layer == 0 {
             self.set_gpu_result(1);
             return;
@@ -5294,8 +5551,7 @@ impl Cpu {
     }
 
     fn gpu_world_disc(&mut self, x: i32, y: i32, radius: i32, color: u8, opacity: i32) {
-        let layer =
-            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
         if layer == 0 || !(0..=32).contains(&radius) || !(0..=16).contains(&opacity) {
             self.set_gpu_result(1);
             return;
@@ -5332,8 +5588,7 @@ impl Cpu {
     }
 
     fn gpu_world_ammo(&mut self, world_x: i32, world_y: i32) {
-        let layer =
-            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
         if layer == 0 {
             self.set_gpu_result(1);
             return;
@@ -5372,8 +5627,7 @@ impl Cpu {
     }
 
     fn gpu_world_mask(&mut self, pixels: &[u8], width: usize, height: usize, x: i32, y: i32) {
-        let layer =
-            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
         let origin_x = x.saturating_sub((width / 2) as i32);
         let origin_y = y.saturating_sub((height / 2) as i32);
         for (left, top, right, bottom, dx, dy, stride) in
@@ -5396,8 +5650,7 @@ impl Cpu {
     }
 
     fn gpu_world_emitters(&mut self, wide: bool, source: u32, count: i32, tick: i32) {
-        let layer =
-            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
         let record_size = if wide { 12usize } else { 8 };
         if layer == 0 || count < 0 {
             self.set_gpu_result(1);
@@ -5533,11 +5786,28 @@ impl Cpu {
     }
 
     fn screen_size(&self) -> (i32, i32) {
-        if self.memory[GPU_MODE_ADDR as usize] == 1 {
+        if self.layer_mode == 1 {
             (640, 480)
         } else {
             (320, 240)
         }
+    }
+
+    pub fn graphics_mode(&self) -> u8 {
+        self.layer_mode
+    }
+
+    pub fn set_graphics_mode(&mut self, mode: u8) -> Result<(), &'static str> {
+        if mode > 1 {
+            return Err("unsupported graphics mode");
+        }
+        if self.layer_mode != mode {
+            self.layer_mode = mode;
+            for layer in &mut self.layers {
+                layer.fill(0);
+            }
+        }
+        Ok(())
     }
 
     pub fn composited_framebuffer(&self) -> Vec<u8> {
@@ -5553,24 +5823,24 @@ impl Cpu {
         let (width, height) = self.screen_size();
         let width = width as usize;
         let height = height as usize;
-        let visible = self.memory[GPU_LAYER_MASK as usize] & ((1 << GPU_LAYER_COUNT) - 1);
+        let visible = self.gpu_layer_mask & ((1 << GPU_LAYER_COUNT) - 1);
         pixels[..width * height].fill(0);
         let mut order = [0usize; GPU_LAYER_COUNT];
         for (layer, entry) in order.iter_mut().enumerate() {
             *entry = layer;
         }
-        order.sort_unstable_by_key(|&layer| (self.memory[GPU_LAYER_ORDER as usize + layer], layer));
+        order.sort_unstable_by_key(|&layer| (self.gpu_layer_order[layer], layer));
         for layer in order {
             if visible & (1 << layer) == 0 {
                 continue;
             }
-            let transparent = self.memory[GPU_LAYER_TRANSPARENCY as usize + layer];
+            let transparent = self.gpu_layer_transparency[layer];
             for (index, output) in pixels[..width * height].iter_mut().enumerate() {
                 let color = if layer == 0 {
                     if width == 320 {
-                        self.memory[VRAM_START as usize + index]
+                        self.vram[index]
                     } else {
-                        let packed = self.memory[VRAM_START as usize + index / 2];
+                        let packed = self.vram[index / 2];
                         if index & 1 == 0 {
                             packed >> 4
                         } else {
@@ -5592,8 +5862,7 @@ impl Cpu {
     }
 
     fn gpu_pixel(&mut self, x: i32, y: i32, color: u8) {
-        let layer =
-            self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8) as usize;
+        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
         self.gpu_pixel_on_layer(layer, x, y, color);
     }
 
@@ -5606,17 +5875,16 @@ impl Cpu {
             let address = (y * width + x) as usize;
             self.layers[layer][address] = color;
         } else if width == 320 {
-            let address = VRAM_START + (y * width + x) as u32;
-            self.memory[address as usize] = color;
+            let address = (y * width + x) as usize;
+            self.vram[address] = color;
         } else if layer != 0 {
             let address = (y * width + x) as usize;
             self.layers[layer][address] = color & 0x0f;
         } else {
-            let address = VRAM_START + (y * (width / 2) + x / 2) as u32;
+            let address = (y * (width / 2) + x / 2) as usize;
             let shift = if x & 1 == 0 { 4 } else { 0 };
             let mask = 0xf << shift;
-            self.memory[address as usize] =
-                (self.memory[address as usize] & !mask) | ((color & 0xf) << shift);
+            self.vram[address] = (self.vram[address] & !mask) | ((color & 0xf) << shift);
         }
     }
 
@@ -5783,8 +6051,7 @@ impl Cpu {
         match command {
             GPU_CLEAR => {
                 let (width, height) = self.screen_size();
-                let layer = self.memory[GPU_LAYER_SELECT as usize].min((GPU_LAYER_COUNT - 1) as u8)
-                    as usize;
+                let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
                 if layer != 0 {
                     self.layers[layer][..(width * height) as usize].fill(if width == 320 {
                         color
@@ -5792,12 +6059,10 @@ impl Cpu {
                         color & 0x0f
                     });
                 } else if width == 320 {
-                    let start = VRAM_START as usize;
-                    self.memory[start..start + (width * height) as usize].fill(color);
+                    self.vram[..(width * height) as usize].fill(color);
                 } else {
-                    let start = VRAM_START as usize;
                     let fill = ((color & 0xf) << 4) | (color & 0xf);
-                    self.memory[start..start + (width * height / 2) as usize].fill(fill);
+                    self.vram[..(width * height / 2) as usize].fill(fill);
                 }
             }
             GPU_PIXEL => self.gpu_pixel(x, y, color),
@@ -6047,13 +6312,11 @@ impl Cpu {
                 } else {
                     (width * height) as usize
                 };
-                self.saved_video =
-                    Some(self.memory[VRAM_START as usize..VRAM_START as usize + size].to_vec());
+                self.saved_video = Some(self.vram[..size].to_vec());
             }
             GPU_LOAD => {
                 if let Some(saved) = &self.saved_video {
-                    let end = VRAM_START as usize + saved.len();
-                    self.memory[VRAM_START as usize..end].copy_from_slice(saved);
+                    self.vram[..saved.len()].copy_from_slice(saved);
                 }
             }
             _ => {}
@@ -6652,7 +6915,10 @@ mod tests {
             let mut cpu = Cpu::with_memory_size(size).unwrap();
             for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
                 cpu.privilege_mode = mode;
-                for address in [crate::machine::GRAPHICS_BASE, ADDRESS_MASK] {
+                for address in [
+                    crate::machine::FIRMWARE_GATEWAY_BASE + crate::machine::DEVICE_BANK_SIZE,
+                    ADDRESS_MASK,
+                ] {
                     let aliased = (address & cpu.memory_mask) as usize;
                     cpu.memory[aliased] = 0xa5;
                     assert!(cpu.read_guest(address).is_err());
@@ -8018,7 +8284,7 @@ mod tests {
                 for address in [
                     SYSTEM_BASE + 20,
                     SYSTEM_BASE + 4095,
-                    GRAPHICS_BASE,
+                    FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE,
                     ADDRESS_MASK,
                 ] {
                     assert!(cpu.read_guest(address).is_err());
@@ -8082,7 +8348,7 @@ mod tests {
 
     #[test]
     fn instruction_operands_cannot_mask_reserved_devices_into_small_ram() {
-        let address = crate::machine::GRAPHICS_BASE;
+        let address = crate::machine::FIRMWARE_GATEWAY_BASE + crate::machine::DEVICE_BANK_SIZE;
         for source in [
             "LD R2, R0",
             "ST R0, R2",
@@ -8231,64 +8497,46 @@ mod tests {
     }
 
     #[test]
-    fn user_buffer_copies_reject_framebuffer_without_consuming_input_or_writing_output() {
+    fn user_buffers_use_ordinary_ram_separate_from_device_framebuffer() {
         let (mut cpu, task) = cpu_with_syscall_task_memory(1 << 20);
         cpu.console.receive(b"input");
-        cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8].fill(0xa5);
-        for destination in [VRAM_START - 1, VRAM_START, VRAM_START + 153600 - 1] {
-            invoke_syscall(
-                &mut cpu,
-                SyscallNumber::Read,
-                [0, i64::from(destination), 2, 0, 0, 0],
-            );
-            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
-            assert_eq!(
-                cpu.console
-                    .receive_buffer()
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>(),
-                b"input"
-            );
-            invoke_syscall(
-                &mut cpu,
-                SyscallNumber::Write,
-                [1, i64::from(destination), 2, 0, 0, 0],
-            );
-            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
-            assert!(cpu.console.output().is_empty());
-        }
-        assert!(
-            cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8]
-                .iter()
-                .all(|byte| *byte == 0xa5)
-        );
-        cpu.memory[VRAM_START as usize..VRAM_START as usize + 9].copy_from_slice(b"file.txt\0");
+        cpu.memory[FORMER_FRAMEBUFFER_START as usize - 1..FORMER_FRAMEBUFFER_START as usize + 8]
+            .fill(0xa5);
         invoke_syscall(
             &mut cpu,
-            SyscallNumber::Open,
-            [i64::from(VRAM_START), 1, 0, 0, 0, 0],
+            SyscallNumber::Read,
+            [0, i64::from(FORMER_FRAMEBUFFER_START), 2, 0, 0, 0],
         );
-        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        assert_eq!(cpu.registers[0], 2);
+        assert_eq!(
+            &cpu.memory[FORMER_FRAMEBUFFER_START as usize..FORMER_FRAMEBUFFER_START as usize + 2],
+            b"in"
+        );
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Write,
+            [1, i64::from(FORMER_FRAMEBUFFER_START), 2, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 2);
+        assert!(cpu.console.output().ends_with(b"in"));
+        assert_eq!(cpu.memory[FORMER_FRAMEBUFFER_START as usize - 1], 0xa5);
+        cpu.memory[FORMER_FRAMEBUFFER_START as usize] = 77;
+        assert_eq!(cpu.vram[0], 0);
         cpu.syscall_state
             .processes
             .get_mut(&task)
             .unwrap()
             .arguments = vec!["app".to_owned()];
-        invoke_syscall(
-            &mut cpu,
-            SyscallNumber::Argument,
-            [0, i64::from(VRAM_START - 1), 8, 0, 0, 0],
-        );
-        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
-        assert_eq!(cpu.memory[VRAM_START as usize - 1], 0xa5);
-        invoke_syscall(&mut cpu, SyscallNumber::Read, [0, 0x1000, 5, 0, 0, 0]);
-        assert_eq!(cpu.registers[0], 5);
-        assert_eq!(&cpu.memory[0x1000..0x1005], b"input");
+        invoke_syscall(&mut cpu, SyscallNumber::Argument, [0, 0x1000, 8, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 3);
+        assert_eq!(&cpu.memory[0x1000..0x1003], b"app");
+        invoke_syscall(&mut cpu, SyscallNumber::Read, [0, 0x1000, 3, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 3);
+        assert_eq!(&cpu.memory[0x1000..0x1003], b"put");
     }
 
     #[test]
-    fn translated_user_buffers_reject_virtual_and_physical_framebuffer_aliases() {
+    fn translated_user_buffers_can_use_former_framebuffer_frames_as_ram() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         let image = crate::assembler::assemble(&("SVC\n".repeat(32) + "HALT"), 0x100).unwrap();
         cpu.load_program(&image.segments, image.entry_point)
@@ -8313,10 +8561,14 @@ mod tests {
         }
         for (virtual_address, frame) in [
             (0x1000, 0x90),
-            (0x2000, VRAM_START / crate::mmu::PAGE_SIZE as u32),
-            (0x3000, (VRAM_START + 153599) / crate::mmu::PAGE_SIZE as u32),
-            (VRAM_START, 0x91),
-            (VRAM_START + 153600 - 2048, 0x92),
+            (
+                0x2000,
+                FORMER_FRAMEBUFFER_START / crate::mmu::PAGE_SIZE as u32,
+            ),
+            (
+                0x3000,
+                (FORMER_FRAMEBUFFER_START + 153599) / crate::mmu::PAGE_SIZE as u32,
+            ),
         ] {
             manager
                 .map_borrowed_page(
@@ -8335,42 +8587,39 @@ mod tests {
         cpu.start_task(task).unwrap();
         cpu.console.receive(b"input");
         cpu.memory[0x90fff] = 0xa5;
-        for access in [
-            crate::mmu::MemoryAccess::Read,
-            crate::mmu::MemoryAccess::Write,
-        ] {
-            for address in [0x2000, 0x3000, VRAM_START, VRAM_START + 153599] {
-                assert!(
-                    cpu.guest_memory_addresses(address, 1, access, true)
-                        .is_err(),
-                    "{address:#x} {access:?}"
-                );
-            }
-            assert_eq!(
-                cpu.guest_memory_addresses(0x1000, 2, access, true).unwrap(),
-                [0x90000, 0x90001]
-            );
-        }
-        for destination in [0x1fff, 0x2000, 0x3000, VRAM_START, VRAM_START + 153599] {
-            invoke_syscall(
-                &mut cpu,
-                SyscallNumber::Read,
-                [0, i64::from(destination), 2, 0, 0, 0],
-            );
-            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
-            assert_eq!(cpu.console.receive_buffer().len(), 5);
-            assert_eq!(cpu.memory[0x90fff], 0xa5);
-        }
-        invoke_syscall(&mut cpu, SyscallNumber::Read, [0, 0x1000, 5, 0, 0, 0]);
-        assert_eq!(cpu.registers[0], 5);
-        assert_eq!(&cpu.memory[0x90000..0x90005], b"input");
+        assert_eq!(
+            cpu.guest_memory_addresses(0x2000, 2, crate::mmu::MemoryAccess::Write, true)
+                .unwrap(),
+            [
+                FORMER_FRAMEBUFFER_START as usize,
+                FORMER_FRAMEBUFFER_START as usize + 1
+            ]
+        );
+        assert_eq!(
+            cpu.guest_memory_addresses(0x3000, 2, crate::mmu::MemoryAccess::Write, true)
+                .unwrap(),
+            [
+                (FORMER_FRAMEBUFFER_START + 153599) as usize & !0xfff,
+                ((FORMER_FRAMEBUFFER_START + 153599) as usize & !0xfff) + 1
+            ]
+        );
+        invoke_syscall(&mut cpu, SyscallNumber::Read, [0, 0x2000, 2, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 2);
+        assert_eq!(
+            &cpu.memory[FORMER_FRAMEBUFFER_START as usize..FORMER_FRAMEBUFFER_START as usize + 2],
+            b"in"
+        );
+        invoke_syscall(&mut cpu, SyscallNumber::Write, [1, 0x2000, 2, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 2);
+        assert!(cpu.console.output().ends_with(b"in"));
+        assert_eq!(cpu.memory[0x90fff], 0xa5);
     }
 
     #[test]
-    fn framebuffer_file_transfers_preserve_bytes_and_offsets_on_rejection() {
+    fn file_transfers_use_former_framebuffer_address_as_ordinary_ram() {
         let disk = folder_disk_for_test("framebuffer-transfers", false);
         std::fs::write(disk.join("note.txt"), b"original").unwrap();
-        let (mut cpu, task) = cpu_with_syscall_task_memory(1 << 20);
+        let (mut cpu, _task) = cpu_with_syscall_task_memory(1 << 20);
         cpu.mount_folder_disk(&disk).unwrap();
         cpu.memory[0x1000..0x1009].copy_from_slice(b"note.txt\0");
         invoke_syscall(
@@ -8387,28 +8636,20 @@ mod tests {
         );
         let handle = cpu.registers[0];
         assert!(handle >= 3);
-        cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8].fill(0xa5);
-        for number in [SyscallNumber::Read, SyscallNumber::Write] {
-            invoke_syscall(
-                &mut cpu,
-                number,
-                [handle, i64::from(VRAM_START - 1), 8, 0, 0, 0],
-            );
-            assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
-            assert_eq!(
-                cpu.syscall_state.file(task, handle as u32).unwrap().offset,
-                0
-            );
-            assert_eq!(std::fs::read(disk.join("note.txt")).unwrap(), b"original");
-            assert!(
-                cpu.memory[VRAM_START as usize - 1..VRAM_START as usize + 8]
-                    .iter()
-                    .all(|byte| *byte == 0xa5)
-            );
-        }
+        cpu.memory[FORMER_FRAMEBUFFER_START as usize..FORMER_FRAMEBUFFER_START as usize + 8]
+            .copy_from_slice(b"updated!");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Write,
+            [handle, i64::from(FORMER_FRAMEBUFFER_START), 8, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 8);
+        assert_eq!(std::fs::read(disk.join("note.txt")).unwrap(), b"updated!");
+        invoke_syscall(&mut cpu, SyscallNumber::Seek, [handle, 0, 0, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 0);
         invoke_syscall(&mut cpu, SyscallNumber::Read, [handle, 0x2000, 8, 0, 0, 0]);
         assert_eq!(cpu.registers[0], 8);
-        assert_eq!(&cpu.memory[0x2000..0x2008], b"original");
+        assert_eq!(&cpu.memory[0x2000..0x2008], b"updated!");
         std::fs::remove_dir_all(disk.parent().unwrap()).unwrap();
     }
 
@@ -8416,15 +8657,8 @@ mod tests {
     fn device_buffer_bounds_are_independent_of_active_graphics_mode() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         for mode in [0, 1] {
-            cpu.write(GPU_MODE_ADDR, mode);
-            for (address, length) in [
-                (MMIO_START - 1, 2),
-                (MMIO_START, 1),
-                (MMIO_END - 1, 2),
-                (VRAM_START - 1, 2),
-                (VRAM_START, 1),
-                (VRAM_START + 153599, 2),
-            ] {
+            cpu.set_graphics_mode(mode).unwrap();
+            for (address, length) in [(MMIO_START - 1, 2), (MMIO_START, 1), (MMIO_END - 1, 2)] {
                 assert!(cpu.guest_range(address, length).is_err());
                 for user in [false, true] {
                     for access in [
@@ -8438,11 +8672,21 @@ mod tests {
                     }
                 }
             }
+            for address in [MMIO_START - 1, MMIO_END] {
+                assert_eq!(
+                    cpu.guest_range(address, 1).unwrap(),
+                    address as usize..address as usize + 1
+                );
+                assert_eq!(
+                    cpu.guest_memory_addresses(address, 1, crate::mmu::MemoryAccess::Read, true)
+                        .unwrap(),
+                    [address as usize]
+                );
+            }
             for address in [
-                MMIO_START - 1,
-                MMIO_END,
-                VRAM_START - 1,
-                VRAM_START + 153600,
+                FORMER_FRAMEBUFFER_START - 1,
+                FORMER_FRAMEBUFFER_START,
+                FORMER_FRAMEBUFFER_START + 153600 - 1,
             ] {
                 assert_eq!(
                     cpu.guest_range(address, 1).unwrap(),
@@ -8461,8 +8705,7 @@ mod tests {
     fn process_allocations_never_use_device_backing_frames() {
         for memory_size in [1 << 16, 1 << 19, 1 << 20] {
             let mut cpu = Cpu::with_memory_size(memory_size).unwrap();
-            if memory_size > VRAM_START as usize {
-                cpu.memory[VRAM_START as usize..VRAM_START as usize + 153600].fill(0xa5);
+            if memory_size > MMIO_START as usize {
                 cpu.memory[MMIO_START as usize..MMIO_END as usize].fill(0x5a);
             }
             cpu.ensure_page_memory_manager().unwrap();
@@ -8478,6 +8721,7 @@ mod tests {
             for _ in 0..2 {
                 let root = manager.create_address_space(&mut cpu.memory).unwrap();
                 let mut virtual_address = 0x100000;
+                let mut allocated_former_framebuffer = false;
                 loop {
                     match manager.allocate_and_map_page(
                         &mut cpu.memory,
@@ -8488,23 +8732,23 @@ mod tests {
                         Ok(physical) => {
                             let physical = physical * crate::mmu::PAGE_SIZE as u32;
                             assert!(!(MMIO_START..MMIO_END).contains(&physical));
-                            assert!(!(VRAM_START..VRAM_START + 153600).contains(&physical));
+                            allocated_former_framebuffer |= (FORMER_FRAMEBUFFER_START
+                                ..FORMER_FRAMEBUFFER_START + 153600)
+                                .contains(&physical);
                         }
                         Err(crate::mmu::PageTableError::OutOfFrames) => break,
                         Err(error) => panic!("unexpected allocation failure: {error:?}"),
                     }
                     virtual_address += crate::mmu::PAGE_SIZE as u32;
                 }
+                if memory_size >= FORMER_FRAMEBUFFER_START as usize + 153600 {
+                    assert!(allocated_former_framebuffer);
+                }
                 manager
                     .destroy_address_space(&mut cpu.memory, root)
                     .unwrap();
                 assert_eq!(manager.free_frames(), free);
-                if memory_size > VRAM_START as usize {
-                    assert!(
-                        cpu.memory[VRAM_START as usize..VRAM_START as usize + 153600]
-                            .iter()
-                            .all(|byte| *byte == 0xa5)
-                    );
+                if memory_size > MMIO_START as usize {
                     assert!(
                         cpu.memory[MMIO_START as usize..MMIO_END as usize]
                             .iter()
@@ -8521,6 +8765,68 @@ mod tests {
             .copy_from_slice(&arguments);
         cpu.registers[crate::syscall::REGISTER_ABI_VERSION] = crate::syscall::ABI_VERSION;
         cpu.step().unwrap();
+    }
+
+    #[test]
+    fn graphics_syscall_copies_validated_user_data_before_drawing() {
+        use crate::machine::*;
+
+        let (mut cpu, _) = cpu_with_syscall_task_memory(1 << 20);
+        cpu.memory[0x400..0x40a].copy_from_slice(&[23, 0, 0, 4, 0, 7, 0, 1, 0, 1]);
+        cpu.memory[0x500..0x502].copy_from_slice(&[31, 32]);
+        cpu.graphics_device
+            .write(GRAPHICS_OPERATION, GRAPHICS_OP_LINE);
+        cpu.graphics_device.write(GRAPHICS_COLOR, 0x63);
+        cpu.graphics_device.complete(0x1234);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Graphics,
+            [i64::from(GRAPHICS_OP_PIXEL), 0x400, 0, 0, 0, 0],
+        );
+
+        assert_eq!(cpu.registers[0], 1);
+        assert_eq!(cpu.composited_framebuffer()[7 * 320 + 4], 23);
+        assert_eq!(
+            cpu.graphics_device.read(GRAPHICS_OPERATION),
+            Some(GRAPHICS_OP_LINE)
+        );
+        assert_eq!(cpu.graphics_device.read(GRAPHICS_COLOR), Some(0x63));
+        assert_eq!(cpu.graphics_device.read(GRAPHICS_STATUS), Some(0));
+        assert_eq!(cpu.graphics_device.read(GRAPHICS_RESULT), Some(0x12));
+        assert_eq!(cpu.graphics_device.read(GRAPHICS_RESULT + 1), Some(0x34));
+
+        cpu.memory[0x400..0x40a].copy_from_slice(&[0, 0, 0, 6, 0, 9, 0, 2, 0, 1]);
+        cpu.graphics_device.fail(GRAPHICS_STATUS_INVALID_REQUEST);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Graphics,
+            [i64::from(GRAPHICS_OP_BLIT), 0x400, 0x500, 2, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 2);
+        let framebuffer = cpu.composited_framebuffer();
+        assert_eq!(framebuffer[9 * 320 + 6], 31);
+        assert_eq!(framebuffer[9 * 320 + 7], 32);
+        assert_eq!(
+            cpu.graphics_device.read(GRAPHICS_STATUS),
+            Some(GRAPHICS_STATUS_INVALID_REQUEST)
+        );
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Graphics,
+            [
+                i64::from(GRAPHICS_OP_BLIT),
+                0x400,
+                i64::from(GRAPHICS_BASE + 0x10),
+                2,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::BAD_ADDRESS);
+        let framebuffer_after_rejection = cpu.composited_framebuffer();
+        assert_eq!(framebuffer_after_rejection, framebuffer);
     }
 
     #[test]
@@ -12074,9 +12380,9 @@ mod tests {
         assert_eq!(cpu.gpu_word(2), 1);
         assert_eq!(cpu.gpu_word(4), 2);
         cpu.write(GPU_BASE, GPU_RECT);
-        assert_eq!(cpu.memory[(VRAM_START + 641) as usize], 7);
-        assert_eq!(cpu.memory[(VRAM_START + 642) as usize], 7);
-        assert_eq!(cpu.memory[(VRAM_START + 961) as usize], 7);
+        assert_eq!(cpu.vram[641], 7);
+        assert_eq!(cpu.vram[642], 7);
+        assert_eq!(cpu.vram[961], 7);
         cpu.write(GPU_BASE, GPU_PRESENT);
         assert!(cpu.frame_yield);
         assert!(cpu.frame_presented);

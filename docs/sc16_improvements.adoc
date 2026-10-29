@@ -585,9 +585,10 @@ Checklist status: [x] completed; [ ] planned.
    machine/image versions, and user device-service ABI.
 ** [ ] Separate RAM from high-address, page-separated, supervisor-only MMIO;
    reject user aliases and device instruction fetches.
-*** [x] Exclude MMIO/framebuffer backing from validated buffers, event frames,
-    and emulator-managed frame allocations; verify translated aliases,
-    side-effect-free rejection, display-mode-independent bounds, and frame reuse.
+*** [x] Exclude MMIO backing from validated buffers, event frames, and
+    emulator-managed frame allocations; move framebuffer pixels to device-owned
+    storage inaccessible through guest RAM; verify translated aliases,
+    side-effect-free rejection, and frame reuse.
 *** [ ] Move device registers out of RAM and implement the revised physical
     bus, including supervisor-only access, reserved offsets, and fetch rejection.
 **** [x] Implement the RAM-independent high system bank, checked guest
@@ -614,14 +615,23 @@ Checklist status: [x] completed; [ ] planned.
 **** [x] Implement a RAM-independent folder-filesystem bank with bounded
      inline paths/transfers, existing disk protection/capacity semantics,
      atomic register checks, and compiled-C/native execution regressions.
+**** [x] Implement a RAM-independent graphics bank with device-owned
+     framebuffer storage, bounded inline pixel operations, mode selection,
+     full-region validation, protected aliases, and compiled-C/native execution
+     regressions.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup
    for ordinary user programs.
+*** [x] Add syscall 24 for bounded graphics operations; validate and copy
+    user request/data buffers before drawing, share the checked renderer with
+    supervisor MMIO, and verify C-to-CPU execution without changing staging.
 ** [ ] Version executable images and reject stale or unversioned runtime
    images with actionable diagnostics.
-** [ ] Migrate firmware, toolchain, all programs, and launch paths; rebuild
-   installed images without overwriting writable disk data or settings.
+** [ ] Migrate firmware, toolchain, all programs, and launch paths to the
+   revised ABI; remove legacy device/ABI implementation paths rather than
+   retaining compatibility shims; rebuild installed images without overwriting
+   writable disk data or settings.
 ** [ ] Pass hardware, protection, compiler-execution, BIOS, SisuOS, and
    program regressions; update the architecture and migration documentation.
 

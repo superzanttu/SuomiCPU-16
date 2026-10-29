@@ -58,7 +58,7 @@ addresses below; no shared assembly constant syntax is currently supported.
 |`0x3ff02000` |Fault status |Implemented, read-only
 |`0x3ff03000` |Input |Implemented, read-only
 |`0x3ff04000` |Clock/random |Implemented
-|`0x3ff05000` |Graphics |Reserved
+|`0x3ff05000` |Graphics |Implemented
 |`0x3ff06000` |Audio |Implemented
 |`0x3ff07000` |Game network |Implemented
 |`0x3ff08000` |Filesystem |Implemented
@@ -80,7 +80,7 @@ not change them.
 |`0x04` |Device ABI |`1`, identifying this bank contract
 |`0x08` |Usable RAM bytes |Configured backing size capped at `0x3ff00000`
 |`0x0c` |Address bits |`30`
-|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0xfdf`
+|`0x10` |Implemented high banks |Bit N denotes bank page N; currently `0xfff`
 |===
 
 The migration-time machine revision does not advertise completion of the
@@ -212,6 +212,45 @@ zero high byte. Legacy mouse byte layouts and migration-time supervisor byte
 writes are retained. Host input producers and valid destructive reads maintain
 low RAM mirrors only where backing exists; direct host RAM mutation is not an
 input API. High input access works even when no legacy backing exists.
+
+==== Graphics bank
+
+The supervisor-only graphics bank offers bounded framebuffer commands through
+typed registers. It never aliases high registers into legacy RAM, accepts no
+guest pointers, and exposes no direct framebuffer memory. Coordinates are
+unsigned pixel coordinates in the active 320x240 or 640x480 mode. Every draw
+operation validates the complete region before modifying any pixels.
+
+[cols="1,1,1,3"]
+|===
+|Offset |Bytes |Access |Meaning
+|`0x00` |1 |W/R0 |Commit staged operation with value 1; reads return zero
+|`0x01` |1 |R |Status: 0 success, 1 invalid commit value, 2 invalid operation or arguments
+|`0x02` |1 |RW |Operation: 1 clear, 2 pixel, 3 rectangle, 4 line, 5 present, 6 inline blit, 7 palette, 8 mode
+|`0x03` |1 |RW |Color index; palette operation uses this as the palette index
+|`0x04` |2 |RW |X coordinate, unsigned big-endian
+|`0x06` |2 |RW |Y coordinate, unsigned big-endian
+|`0x08` |2 |RW |Rectangle/blit width or line endpoint X, unsigned big-endian
+|`0x0a` |2 |RW |Rectangle/blit height or line endpoint Y, unsigned big-endian
+|`0x0c` |2 |RW |Inline data length, unsigned big-endian, maximum 512
+|`0x0e` |2 |R |Result: drawn pixel count, saturated at 65535; present returns frame count
+|`0x10` |512 |RW |Inline blit pixel bytes or three RGB palette bytes
+|`0x210` |1 |RW |Display mode: 0 is 320x240, 1 is 640x480
+|===
+
+All multibyte registers are big-endian. All other offsets are reserved.
+Clear fills the active base layer and returns zero. Pixel returns 1;
+rectangle and line return the number of drawn pixels; present sets the normal
+frame-yield/present flags and returns the current frame counter. Rectangle
+coordinates and dimensions must describe a nonempty region entirely inside the
+active mode. Line uses X/Y as the start and width/height as the endpoint; both
+endpoints must be inside the mode. Blit requires nonzero dimensions, an exact
+`width * height` byte length no greater than 512, and a fully in-bounds region.
+Palette requires data length 3 and sets the selected entry to RGB. Mode accepts
+only 0 or 1 and clears the auxiliary layers when the mode changes. Other
+operations require zero data length. Malformed commands leave framebuffer and
+palette state unchanged; failures clear result and set status. Staging and
+status persist across image entry, and no operation reads guest RAM.
 
 ==== Audio bank
 
@@ -756,7 +795,8 @@ Every exception or interrupt creates a 16-byte, big-endian frame on the
 supervisor stack. With the MMU enabled, SP and KSP are virtual addresses and
 event frames use supervisor translation, just like guest stack instructions.
 All frame bytes are checked before writing, including frames crossing pages;
-frames must reside in writable RAM, not MMIO or framebuffer backing. RTI reads
+frames must reside in writable RAM, not MMIO. The graphics framebuffer is
+device-owned state and has no physical RAM address. RTI reads
 the frame through the active supervisor mapping and validates the restored executable PC and writable
 stack before changing context. Invalid frames or return targets stop the CPU
 with a double fault. At the frame address, increasing offsets contain:
@@ -844,12 +884,12 @@ unmap. Unmapped pages can serve as guard pages. These are kernel primitives;
 the BIOS does not yet establish a protected address space as part of normal
 user boot.
 
-The emulator-managed process allocator reserves the current MMIO backing
-`0x43000..0x43fff` and the complete framebuffer backing
-`0x50000..0x757ff` before allocating page tables or process pages. The framebuffer
-reservation covers the maximum 640x480 packed display, independent of the active
-display mode, and includes its final partial page. Allocation, teardown, and
-frame reuse must not clear or overwrite either device range.
+The emulator-managed process allocator reserves the remaining low MMIO backing
+`0x43000..0x43fff` before allocating page tables or process pages. Graphics
+pixels live in a device-owned buffer, independent of backing RAM size and
+unaddressable by guest loads, stores, DMA-like operations or process mappings.
+Addresses formerly occupied by the framebuffer are ordinary RAM; they do not
+alias the device-owned pixels.
 
 == Device access
 
@@ -863,7 +903,7 @@ gateway remains distinct from the general syscall ABI. With translation
 disabled, ordinary RAM is not isolated from user code.
 
 Validated buffer services reject both virtual and translated physical addresses
-in the MMIO and framebuffer backing ranges above. This applies to paths,
+in the MMIO backing range above. This applies to paths,
 arguments, console and file transfers, process reports, networking, and folder
 gateway transfers, including requests made by supervisor code through those
 buffer helpers. Checks cover every requested byte before consuming input or
@@ -943,6 +983,17 @@ which the native wrappers combine before `SVC`.
   insufficient capacity returns `-EOVERFLOW`, never a truncated string.
   Capacity is limited to 4096 bytes; the entire output range is validated
   before any bytes are written.
+|24 |`graphics` |R1 operation, R2 pointer to a 10-byte parameter record, R3
+  optional readable pixel/RGB data, R4 data length; R5 and R6 must be zero.
+  The record contains color and mode bytes followed by big-endian unsigned
+  16-bit X, Y, width and height. Blit data length must equal width times height
+  and be 1..512; palette data length is 3; other operations require zero data
+  length. Buffers are validated and copied into kernel-owned memory before
+  drawing. Operations match the graphics bank (`clear`, `pixel`, `rect`, `line`,
+  `present`, `blit`, `palette`, `mode`); malformed requests return `-EINVAL`,
+  invalid user buffers return `-EFAULT`, and success returns the operation
+  result. This service does not modify supervisor graphics staging registers
+  or status.
 |===
 
 The original `spawn` and `spawn_arg` supply the executable path as argument

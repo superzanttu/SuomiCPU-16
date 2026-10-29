@@ -273,7 +273,7 @@ fn capture_frame(cpu: &Cpu, text_mode: bool) -> Vec<u8> {
         return render_console(cpu.console.output());
     }
     let framebuffer = cpu.composited_framebuffer();
-    let source_width = if cpu.memory[0x43014] == 1 {
+    let source_width = if cpu.graphics_mode() == 1 {
         WIDTH
     } else {
         WIDTH / 2

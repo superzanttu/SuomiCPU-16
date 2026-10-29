@@ -403,3 +403,28 @@ sc16_argument:
     LDI R7, 1
     SVC
     RET
+
+sc16_graphics:
+    LDWS R1, 4
+    LDWS R4, 8
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R4, 12
+    LDWS R5, 10
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R3, R4
+    LDWS R4, 14
+    AND R4, R6
+    LDI R5, 0
+    LDI R6, 0
+    LDI R0, 24
+    LDI R7, 1
+    SVC
+    RET

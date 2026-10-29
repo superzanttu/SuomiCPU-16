@@ -2,6 +2,8 @@
 #define SC16_SYSCALL_H
 
 #define SC16_SYSCALL_ABI_VERSION 1
+#define SC16_SYSCALL_GRAPHICS 24
+#define SC16_GRAPHICS_PARAMETERS_SIZE 10
 #define SC16_MAX_ARGUMENTS 16
 #define SC16_MAX_ARGUMENT_BYTES 1024
 
@@ -19,6 +21,15 @@
 #define SC16_SEM_WAIT 1
 #define SC16_SEM_POST 2
 #define SC16_SEM_DESTROY 3
+
+struct sc16_graphics_parameters {
+    unsigned char color;
+    unsigned char mode;
+    unsigned int x;
+    unsigned int y;
+    unsigned int width;
+    unsigned int height;
+};
 
 long sc16_getpid(void);
 void sc16_exit(int status);
@@ -45,5 +56,8 @@ int sc16_wait(unsigned long child_pid);
 int sc16_trywait(unsigned long child_pid);
 long sc16_semop(unsigned int operation, unsigned long semaphore_id,
                 unsigned int initial_value);
+int sc16_graphics(unsigned int operation,
+                  const struct sc16_graphics_parameters *parameters,
+                  const void *data, unsigned int length);
 
 #endif

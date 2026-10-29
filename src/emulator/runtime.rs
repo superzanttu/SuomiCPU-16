@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPEED_ADDR: usize = 0x43003;
-const GFX_MODE_ADDR: usize = 0x43014;
 const SOUND_RATE: u32 = 22_050;
 const SOUND_FPS: u32 = 60;
 const TOOLBAR_HEIGHT: f32 = 36.0;
@@ -1782,7 +1781,7 @@ fn console_toolbar_control((x, y): (f32, f32)) -> Option<RuntimeControl> {
 }
 
 fn screen_size(cpu: &Cpu) -> (usize, usize) {
-    if cpu.memory[GFX_MODE_ADDR] == 1 {
+    if cpu.graphics_mode() == 1 {
         (640, 480)
     } else {
         (320, 240)
@@ -3725,8 +3724,8 @@ mod tests {
     #[test]
     fn display_renderer_maps_vram_palette_and_resolution_to_rgb_pixels() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.memory[0x50000] = 1;
-        cpu.memory[0x50001] = 25;
+        cpu.vram[0] = 1;
+        cpu.vram[1] = 25;
         cpu.palette[1] = [255, 255, 255];
         cpu.palette[2] = [0, 0, 255];
         cpu.palette[25] = [0, 0, 255];
@@ -3737,15 +3736,15 @@ mod tests {
         assert_eq!(pixels[1], 0x0000_00ff);
         assert_eq!(pixels.len(), 640 * 480);
 
-        cpu.memory[GFX_MODE_ADDR] = 1;
-        cpu.memory[0x50000] = 0x12;
+        cpu.set_graphics_mode(1).unwrap();
+        cpu.vram[0] = 0x12;
         let mut high_resolution_pixels = vec![0; 640 * 480];
         render_cpu(&cpu, &mut high_resolution_pixels, &load_font());
         assert_eq!(high_resolution_pixels[0], 0x00ff_ffff);
         assert_eq!(high_resolution_pixels[1], 0x0000_00ff);
         assert_eq!(screen_size(&cpu), (640, 480));
 
-        cpu.memory[GFX_MODE_ADDR] = 0;
+        cpu.set_graphics_mode(0).unwrap();
         assert_eq!(screen_size(&cpu), (320, 240));
     }
 
@@ -3761,8 +3760,8 @@ mod tests {
     #[test]
     fn game_frame_integrates_gpu_mmio_layer_compositing_and_palette_rendering() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.memory[0x50000] = 2;
-        cpu.memory[0x50001] = 2;
+        cpu.vram[0] = 2;
+        cpu.vram[1] = 2;
         cpu.palette[2] = [12, 34, 56];
         cpu.palette[3] = [78, 90, 123];
 
@@ -3785,8 +3784,8 @@ mod tests {
     #[test]
     fn guest_text_overlays_graphics_at_both_display_resolutions() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GFX_MODE_ADDR as u32, 1);
-        cpu.memory[0x50000] = 0x10;
+        cpu.set_graphics_mode(1).unwrap();
+        cpu.vram[0] = 0x10;
         cpu.palette[1] = [0, 255, 0];
         cpu.palette[2] = [0, 0, 255];
         cpu.palette[3] = [255, 0, 0];
@@ -3809,8 +3808,8 @@ mod tests {
                 .contains(&rgb(255, 0, 0))
         );
 
-        cpu.write(GFX_MODE_ADDR as u32, 0);
-        cpu.memory[0x50000] = 1;
+        cpu.set_graphics_mode(0).unwrap();
+        cpu.vram[0] = 1;
         let mut low_resolution_pixels = vec![0; 640 * 480];
         render_cpu(&cpu, &mut low_resolution_pixels, &font);
         let x = (320 - crate::guest_text::GUEST_TEXT_COLUMNS * 6) / 2;
@@ -3823,7 +3822,7 @@ mod tests {
     #[test]
     fn game_frame_submits_projected_3d_fill_and_wireframe_geometry() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.memory[0x43014] = 1;
+        cpu.set_graphics_mode(1).unwrap();
         let scene = [
             3, 1, 0, 0, 0, 0, 0, 1000, 10000, 3, -1000, -1000, 0, 0, 1000, 0, 1000, -1000, 0, 0, 1,
             2, 2,

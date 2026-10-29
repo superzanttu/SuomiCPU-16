@@ -48,6 +48,7 @@ pub enum SyscallNumber {
     SpawnExec = 21,
     ArgumentCount = 22,
     Argument = 23,
+    Graphics = 24,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -79,6 +80,7 @@ impl TryFrom<i64> for SyscallNumber {
             21 => Ok(Self::SpawnExec),
             22 => Ok(Self::ArgumentCount),
             23 => Ok(Self::Argument),
+            24 => Ok(Self::Graphics),
             _ => Err(()),
         }
     }
@@ -239,7 +241,8 @@ mod tests {
             Ok(SyscallNumber::ArgumentCount)
         );
         assert_eq!(SyscallNumber::try_from(23), Ok(SyscallNumber::Argument));
-        assert_eq!(SyscallNumber::try_from(24), Err(()));
+        assert_eq!(SyscallNumber::try_from(24), Ok(SyscallNumber::Graphics));
+        assert_eq!(SyscallNumber::try_from(25), Err(()));
     }
 
     #[test]

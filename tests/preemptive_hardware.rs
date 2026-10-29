@@ -52,6 +52,95 @@ fn supervisor_executes_reads_from_the_high_system_bus_with_small_ram() {
 }
 
 #[test]
+fn supervisor_draws_to_the_high_graphics_bank_without_legacy_register_aliases() {
+    use suomicpu16::machine::*;
+
+    for translated in [false, true] {
+        let base = if translated { 0x9000 } else { GRAPHICS_BASE };
+        let source = format!(
+            "LDI30 R6, {}\nLDI R0, {}\nST R6, R0\n\
+             LDI30 R6, {}\nLDI R0, 23\nST R6, R0\n\
+             LDI30 R6, {}\nLDI R0, 5\nSTW R6, R0\n\
+             LDI30 R6, {}\nLDI R0, 7\nSTW R6, R0\n\
+             LDI30 R6, {base}\nLDI R0, 1\nST R6, R0\n\
+             LDI30 R6, {}\nLD R4, R6\n\
+             LDI30 R6, {}\nLDW R5, R6\nHALT",
+            base + 2,
+            GRAPHICS_OP_PIXEL,
+            base + 3,
+            base + 4,
+            base + 6,
+            base + 1,
+            base + 14,
+        );
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+            cpu.memory[0x3004..0x3008].copy_from_slice(&0x100bu32.to_be_bytes());
+            cpu.memory[0x3024..0x3028].copy_from_slice(&(GRAPHICS_BASE | 3).to_be_bytes());
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+
+        cpu.run(64).unwrap();
+
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[4], 0);
+        assert_eq!(cpu.registers[5], 1);
+        assert_eq!(cpu.composited_framebuffer()[7 * 320 + 5], 23);
+    }
+}
+
+#[test]
+fn user_c_draws_through_the_validated_graphics_syscall() {
+    let c_source = "#include <sc16_machine.h>\n\
+                    #include <sc16_syscall.h>\n\
+                    int main(void) {\n\
+                        struct sc16_graphics_parameters parameters;\n\
+                        parameters.color = 23;\n\
+                        parameters.mode = 0;\n\
+                        parameters.x = 5;\n\
+                        parameters.y = 7;\n\
+                        parameters.width = 1;\n\
+                        parameters.height = 1;\n\
+                        if (sc16_graphics(SC16_GRAPHICS_OP_PIXEL, &parameters, 0, 0) != 1) {\n\
+                            return 22;\n\
+                        }\n\
+                        for (;;) { }\n\
+                    }";
+    let user_assembly = suomicpu16::c_compiler::compile_minimal_program_to_assembly(
+        c_source,
+        "user-graphics-syscall.c",
+    )
+    .unwrap()
+    .unwrap();
+    let image = assemble(&user_assembly, 0).unwrap();
+    let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.load_idt(0x800).unwrap();
+    cpu.set_idt_descriptor(
+        suomicpu16::isa::SVC_VECTOR,
+        suomicpu16::interrupts::IdtDescriptor {
+            handler: 0x300,
+            present: true,
+            privilege: 3,
+            gate_type: suomicpu16::interrupts::GateType::Interrupt,
+        },
+    )
+    .unwrap();
+    let task = cpu
+        .create_user_task(image.entry_point, 0x7000, 0xf000, None)
+        .unwrap();
+    cpu.start_task(task).unwrap();
+    cpu.run(10_000).unwrap();
+
+    assert_eq!(cpu.composited_framebuffer()[7 * 320 + 5], 23);
+}
+
+#[test]
 fn high_pit_mask_latches_and_unmask_delivers_to_an_unmanaged_guest_kernel() {
     use suomicpu16::machine::*;
 
@@ -749,7 +838,7 @@ fn event_frame_validation_prevents_partial_writes() {
 
 #[test]
 fn event_frames_reject_device_backing_aliases_before_reading_or_writing() {
-    for physical in [0x43000u32, 0x50000, 0x75000] {
+    for physical in [0x43000u32] {
         let mut cpu = translated_kernel_stack(3);
         cpu.memory[0x3028..0x302c].copy_from_slice(&(physical | 3).to_be_bytes());
         cpu.memory[0x20ff8..0x21000].fill(0xa5);

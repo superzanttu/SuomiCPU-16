@@ -17873,8 +17873,8 @@ int main(void) { return VALUE; }"#
             .unwrap();
         cpu.run(4096).unwrap();
         assert!(!cpu.running);
-        assert_eq!(cpu.memory[0x50000 + 2 * 320 + 1], 7);
-        assert_eq!(cpu.memory[0x50000 + 3 * 320 + 2], 7);
+        assert_eq!(cpu.vram[2 * 320 + 1], 7);
+        assert_eq!(cpu.vram[3 * 320 + 2], 7);
         assert_eq!(cpu.registers[0], 0);
     }
 
@@ -18058,8 +18058,8 @@ int main(void) { return VALUE; }"#
             .unwrap();
         cpu.run(4096).unwrap();
         assert!(!cpu.running);
-        assert_eq!(cpu.memory[0x50000 + 11 * 320 + 10], 9);
-        assert_eq!(cpu.memory[0x50000 + 12 * 320 + 11], 12);
+        assert_eq!(cpu.vram[11 * 320 + 10], 9);
+        assert_eq!(cpu.vram[12 * 320 + 11], 12);
         assert_eq!(cpu.registers[0], 0);
     }
 
@@ -18128,7 +18128,7 @@ int main(void) { return VALUE; }"#
             .unwrap();
         cpu.run(4096).unwrap();
         assert!(!cpu.running);
-        let drawn = cpu.memory[0x50000..0x50000 + 320 * 240]
+        let drawn = cpu.vram[..320 * 240]
             .iter()
             .enumerate()
             .filter_map(|(index, color)| (*color == 1).then_some((index % 320, index / 320)))
@@ -18168,7 +18168,7 @@ int main(void) { return VALUE; }"#
             .unwrap();
         cpu.run(20_000).unwrap();
         assert!(!cpu.running);
-        let pixels = &cpu.memory[0x50000..0x50000 + 320 * 240];
+        let pixels = &cpu.vram[..320 * 240];
         assert!(pixels.iter().filter(|&&color| color == 9).count() > 40);
     }
 

@@ -33,12 +33,52 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 1UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 4063UL) return 14;\n\
+                 if (*banks != 4095UL) return 14;\n\
                  return 1;\n\
              }"
         ),
         1
     );
+}
+
+#[test]
+fn guest_c_draws_through_the_high_graphics_bank() {
+    let assembly = compile_minimal_program_to_assembly(
+        "#include <sc16_machine.h>\n\
+         int main(void) {\n\
+             volatile unsigned char *command = (volatile unsigned char *)SC16_GRAPHICS_COMMAND;\n\
+             volatile unsigned char *status = (volatile unsigned char *)SC16_GRAPHICS_STATUS;\n\
+             volatile unsigned char *operation = (volatile unsigned char *)SC16_GRAPHICS_OPERATION;\n\
+             volatile unsigned char *color = (volatile unsigned char *)SC16_GRAPHICS_COLOR;\n\
+             volatile unsigned char *mode = (volatile unsigned char *)SC16_GRAPHICS_MODE;\n\
+             volatile unsigned int *x = (volatile unsigned int *)SC16_GRAPHICS_X;\n\
+             volatile unsigned int *y = (volatile unsigned int *)SC16_GRAPHICS_Y;\n\
+             volatile unsigned int *result = (volatile unsigned int *)SC16_GRAPHICS_RESULT;\n\
+             *operation = SC16_GRAPHICS_OP_PIXEL;\n\
+             *color = 23; *x = 5; *y = 7; *command = 1;\n\
+             if (*status != 0 || *result != 1) return 11;\n\
+             *operation = SC16_GRAPHICS_OP_MODE; *mode = 1; *command = 1;\n\
+             if (*status != 0) return 12;\n\
+             *mode = 0; *command = 1;\n\
+             *x = 319; *y = 239; *operation = SC16_GRAPHICS_OP_RECT;\n\
+             *color = 99; *command = 1;\n\
+             if (*status != SC16_GRAPHICS_STATUS_INVALID_REQUEST || *result != 0) return 13;\n\
+             return 1;\n\
+         }",
+        "high-graphics.c",
+    )
+    .unwrap()
+    .unwrap();
+    let image = assemble(&assembly, 0).unwrap();
+    let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.run(1_000_000).unwrap();
+    assert!(!cpu.running);
+    assert_eq!(cpu.registers[0], 1);
+    let framebuffer = cpu.composited_framebuffer();
+    assert_eq!(framebuffer[7 * 320 + 5], 23);
+    assert_eq!(framebuffer[239 * 320 + 319], 0);
 }
 
 #[test]
