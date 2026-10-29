@@ -3,7 +3,7 @@
 //! interrupts, task/syscall integration, graphics operations, and behavioral tests.
 
 use memmap2::MmapMut;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -23,66 +23,8 @@ const EXCEPTION_ILLEGAL_INSTRUCTION: u16 = 0;
 const EXCEPTION_PRIVILEGE_VIOLATION: u16 = 1;
 const EXCEPTION_PAGE_FAULT: u16 = 2;
 const EXCEPTION_ENTRY_BYTES: u32 = 16;
-const GPU_BASE: u32 = 0x43020;
-const GPU_MODE_ADDR: u32 = GPU_BASE - 12;
-const GPU_LAYER_SELECT: u32 = GPU_BASE + 16;
-const GPU_LAYER_MASK: u32 = GPU_BASE + 17;
-const GPU_LAYER_TRANSPARENCY: u32 = GPU_BASE + 18;
-const GPU_LAYER_ORDER: u32 = GPU_BASE + 23;
-const GPU_LAYER_COUNT: usize = 5;
-const GPU_PALETTE: u8 = 27;
-const LEGACY_GRAPHICS_RANGES: [(u32, u32); 2] = [(GPU_MODE_ADDR, 1), (GPU_BASE, 0xe0)];
 pub const BIOS_FIRMWARE_MARKER: u32 = 0x4fffe;
 pub const BIOS_AUTOBOOT_WAIT_MARKER: u32 = 0x4ffff;
-const GPU_CLEAR: u8 = 1;
-const GPU_PIXEL: u8 = 2;
-const GPU_RECT: u8 = 3;
-const GPU_LINE: u8 = 4;
-const GPU_SPRITE: u8 = 5;
-const GPU_BITMAP: u8 = 6;
-const GPU_TEXT: u8 = 7;
-const GPU_PRESENT: u8 = 8;
-const GPU_RANDOM: u8 = 9;
-const GPU_POLY: u8 = 10;
-const GPU_TICKS: u8 = 11;
-const GPU_RTC: u8 = 12;
-const GPU_SOUND: u8 = 13;
-const GPU_NET_OPEN: u8 = 16;
-const GPU_NET_CLOSE: u8 = 17;
-const GPU_NET_SEND: u8 = 18;
-const GPU_NET_RECV: u8 = 19;
-const GPU_NET_INFO: u8 = 20;
-const GPU_WORLD_EMITTERS: u8 = 34;
-const GPU_TILEMAP: u8 = 21;
-const GPU_3D: u8 = 22;
-const GPU_SPRITE_UPLOAD: u8 = 23;
-const GPU_SPRITE_MOVE: u8 = 24;
-const GPU_TILE_UPLOAD: u8 = 25;
-const GPU_TILE_CAMERA: u8 = 26;
-const GPU_SAVE: u8 = 14;
-const GPU_LOAD: u8 = 15;
-const GPU_TILE_SIZE: u8 = 28;
-const GPU_SPLIT_CAMERA: u8 = 29;
-const GPU_MASK_OVERLAP: u8 = 31;
-const GPU_WORLD_TILE: u8 = 30;
-const GPU_WORLD_AMMO: u8 = 32;
-const GPU_WORLD_RECT: u8 = 33;
-const GPU_WORLD_PARTICLE: u8 = 35;
-const GPU_TILE_CAMERA_WIDE: u8 = 36;
-const GPU_SPLIT_CAMERA_WIDE: u8 = 37;
-const GPU_TILEMAP_WIDE: u8 = 38;
-const GPU_WORLD_TILE_WIDE: u8 = 39;
-const GPU_WORLD_AMMO_WIDE: u8 = 40;
-const GPU_WORLD_RECT_WIDE: u8 = 41;
-const GPU_WORLD_PARTICLE_WIDE: u8 = 42;
-const GPU_WORLD_EMITTERS_WIDE: u8 = 43;
-const GPU_SPRITE_MOVE_WIDE: u8 = 44;
-const GPU_MASK_OVERLAP_WIDE: u8 = 45;
-const GPU_SPRITE_SLOTS: usize = 64;
-const GPU_TILE_COUNT: usize = 256;
-const GPU_TILE_MAX_SIZE: usize = 64;
-const GPU_TILEMAP_MAX_SIZE: usize = 1024;
-const GPU_SPRITE_MAX_SIZE: i32 = 64;
 const FOLDER_FS_LIST: u8 = 0x41;
 const FOLDER_FS_READ: u8 = 0x42;
 const FOLDER_FS_WRITE: u8 = 0x43;
@@ -93,16 +35,6 @@ const FOLDER_FS_STAT: u8 = 0x47;
 const VRAM_BYTES: usize = 640 * 480 / 2;
 #[cfg(test)]
 const FORMER_FRAMEBUFFER_START: u32 = 0x50000;
-const GPU3D_FILL: u16 = 1;
-const GPU3D_WIREFRAME: u16 = 2;
-const GPU3D_SIN_8_8: [i32; 64] = [
-    0, 25, 50, 74, 98, 121, 142, 162, 181, 198, 213, 226, 237, 245, 251, 255, 256, 255, 251, 245,
-    237, 226, 213, 198, 181, 162, 142, 121, 98, 74, 50, 25, 0, -25, -50, -74, -98, -121, -142,
-    -162, -181, -198, -213, -226, -237, -245, -251, -255, -256, -255, -251, -245, -237, -226, -213,
-    -198, -181, -162, -142, -121, -98, -74, -50, -25,
-];
-const GPU3D_MAX_VERTICES: usize = 128;
-const GPU3D_MAX_FACES: usize = 128;
 const FONT_ADDR: usize = 0x4400;
 static FONT_DATA: OnceLock<Vec<u8>> = OnceLock::new();
 const OP_HALT: u16 = 0x00;
@@ -221,7 +153,7 @@ impl Cpu {
                 Some(0)
             }
             GRAPHICS_OP_PIXEL if length == 0 && x < screen_width && y < screen_height => {
-                self.gpu_pixel_on_layer(0, x, y, color);
+                self.graphics_pixel(x, y, color);
                 Some(1)
             }
             GRAPHICS_OP_RECT
@@ -234,7 +166,7 @@ impl Cpu {
             {
                 for row in y..y + height {
                     for column in x..x + width {
-                        self.gpu_pixel_on_layer(0, column, row, color);
+                        self.graphics_pixel(column, row, color);
                     }
                 }
                 Some(u16::try_from(width * height).unwrap_or(u16::MAX))
@@ -254,7 +186,7 @@ impl Cpu {
                 let mut error = dx + dy;
                 let mut points = 0u16;
                 loop {
-                    self.gpu_pixel_on_layer(0, x0, y0, color);
+                    self.graphics_pixel(x0, y0, color);
                     points = points.saturating_add(1);
                     if x0 == width && y0 == height {
                         break;
@@ -288,7 +220,7 @@ impl Cpu {
                 for row in 0..height {
                     for column in 0..width {
                         let source = (row * width + column) as usize;
-                        self.gpu_pixel_on_layer(0, x + column, y + row, data[source]);
+                        self.graphics_pixel(x + column, y + row, data[source]);
                     }
                 }
                 Some(length)
@@ -532,27 +464,7 @@ impl LoadableSegment for MemorySegment {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GpuTriangle {
-    pub points: [(i32, i32); 3],
-    pub color: u8,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GpuLine {
-    pub start: (i32, i32),
-    pub end: (i32, i32),
-    pub color: u8,
-}
-
 pub use crate::machine::SoundCommand as GpuSoundCommand;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GpuSprite {
-    width: usize,
-    height: usize,
-    pixels: Vec<u8>,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpuError {
@@ -625,10 +537,6 @@ pub struct Cpu {
     pub(crate) test_monotonic_ms: Option<u32>,
     pub memory: MmapMut,
     pub(crate) vram: Vec<u8>,
-    gpu_layer_select: u8,
-    gpu_layer_mask: u8,
-    gpu_layer_transparency: [u8; GPU_LAYER_COUNT],
-    gpu_layer_order: [u8; GPU_LAYER_COUNT],
     pub registers: [i64; 8],
     pub pc: u32,
     pub sp: u32,
@@ -646,12 +554,8 @@ pub struct Cpu {
     pub terminal_dirty: bool,
     pub guest_text: GuestTextDisplay,
 
-    pub saved_video: Option<Vec<u8>>,
     pub random_state: u32,
-    pub layers: [Vec<u8>; GPU_LAYER_COUNT],
     pub palette: [[u8; 3]; 256],
-    pub gpu_triangles: Vec<GpuTriangle>,
-    pub gpu_lines: Vec<GpuLine>,
     audio: crate::machine::AudioDevice,
     disk_root: PathBuf,
     bios_preselected_disk: Option<String>,
@@ -671,15 +575,6 @@ pub struct Cpu {
     scnet_port: u16,
     scnet_name: Option<String>,
     input: crate::machine::InputDevice,
-    sprites: [Option<GpuSprite>; GPU_SPRITE_SLOTS],
-    sprite_descriptors: [(i32, i32, u8); GPU_SPRITE_SLOTS],
-    tile_memory: Vec<u8>,
-    tile_pixel_size: usize,
-    tilemap: Vec<u8>,
-    tilemap_width: usize,
-    tilemap_height: usize,
-    tile_camera: (i32, i32),
-    split_cameras: Option<[(i32, i32); 2]>,
     memory_mask: u32,
     layer_mode: u8,
     interrupts: crate::machine::InterruptController,
@@ -721,14 +616,6 @@ impl Cpu {
             let font_size = font.len().min(size - FONT_ADDR);
             memory[FONT_ADDR..FONT_ADDR + font_size].copy_from_slice(&font[..font_size]);
         }
-        if size > GPU_LAYER_ORDER as usize + GPU_LAYER_COUNT {
-            memory[(GPU_BASE - 12) as usize] = 0;
-            memory[(GPU_BASE - 13) as usize] = 2;
-            memory[GPU_LAYER_MASK as usize] = (1 << GPU_LAYER_COUNT) - 1;
-            for layer in 0..GPU_LAYER_COUNT {
-                memory[(GPU_LAYER_ORDER as usize) + layer] = layer as u8;
-            }
-        }
         let mut palette = [[0; 3]; 256];
         for (index, color) in palette.iter_mut().enumerate() {
             *color = [index as u8; 3];
@@ -752,20 +639,9 @@ impl Cpu {
         ];
         palette[..PALETTE_COLORS.len()].copy_from_slice(&PALETTE_COLORS);
         palette[25] = [0, 0, 255];
-        let mut tile_memory = vec![0; GPU_TILE_COUNT * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE];
-        for tile in 1..GPU_TILE_COUNT {
-            for row in 0..16 {
-                let start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE + row * 16;
-                tile_memory[start..start + 16].fill(tile as u8);
-            }
-        }
         Ok(Self {
             memory,
             vram: vec![0; VRAM_BYTES],
-            gpu_layer_select: 0,
-            gpu_layer_mask: (1 << GPU_LAYER_COUNT) - 1,
-            gpu_layer_transparency: [0; GPU_LAYER_COUNT],
-            gpu_layer_order: std::array::from_fn(|layer| layer as u8),
             registers: [0; 8],
             monotonic_epoch: std::time::Instant::now(),
             #[cfg(test)]
@@ -786,12 +662,8 @@ impl Cpu {
             terminal_dirty: false,
             guest_text: GuestTextDisplay::new(),
 
-            saved_video: None,
             random_state: 0x16c0_ffee,
-            layers: std::array::from_fn(|_| vec![0; 640 * 480]),
             palette,
-            gpu_triangles: Vec::new(),
-            gpu_lines: Vec::new(),
             audio: crate::machine::AudioDevice::default(),
             disk_root: PathBuf::from("disks"),
             bios_preselected_disk: None,
@@ -811,15 +683,6 @@ impl Cpu {
             scnet_port: crate::sc_net::DEFAULT_PORT,
             scnet_name: None,
             input: crate::machine::InputDevice::default(),
-            sprites: std::array::from_fn(|_| None),
-            sprite_descriptors: [(0, 0, 0); GPU_SPRITE_SLOTS],
-            tile_memory,
-            tile_pixel_size: 16,
-            tilemap: Vec::new(),
-            tilemap_width: 0,
-            tilemap_height: 0,
-            tile_camera: (0, 0),
-            split_cameras: None,
             memory_mask,
             layer_mode: 0,
             interrupts: crate::machine::InterruptController::default(),
@@ -1864,9 +1727,6 @@ impl Cpu {
 
     fn is_device_backing_address(address: u32) -> bool {
         crate::machine::is_device_aperture(address)
-            || LEGACY_GRAPHICS_RANGES
-                .iter()
-                .any(|&(base, length)| address >= base && address - base < length)
     }
 
     fn read_guest_path(&self, address: u32, user_mode: bool) -> Result<Option<String>, String> {
@@ -2631,13 +2491,6 @@ impl Cpu {
             return Ok(());
         }
         let mut manager = crate::mmu::PageMemoryManager::new(self.memory.len(), 0x8000)?;
-        for (base, length) in LEGACY_GRAPHICS_RANGES {
-            let start = base as usize;
-            if start < self.memory.len() {
-                let length = (length as usize).min(self.memory.len() - start);
-                manager.reserve_physical_range(start, length)?;
-            }
-        }
         for segment in &self.loaded_image_segments {
             manager.reserve_physical_range(segment.address as usize, segment.length)?;
         }
@@ -2910,14 +2763,6 @@ impl Cpu {
         let mut mapped_user = HashMap::<u32, crate::mmu::PagePermissions>::new();
         if result.is_ok() {
             for segment in &image.segments {
-                let segment_end = segment.address as usize + segment.data.len();
-                if LEGACY_GRAPHICS_RANGES.iter().any(|&(base, length)| {
-                    (segment.address as usize) < (base + length) as usize
-                        && segment_end > base as usize
-                }) {
-                    result = Err(crate::mmu::PageTableError::InvalidVirtualAddress);
-                    break;
-                }
                 let first = segment.address & !crate::mmu::PAGE_MASK;
                 let end = match segment
                     .address
@@ -3372,64 +3217,6 @@ impl Cpu {
         }
     }
 
-    fn gpu_network(&mut self, command: u8, query: u8, argument: i16) {
-        if self.network.is_none() {
-            self.network = Some(NetNode::new(self.network_port));
-        }
-        let mut node = self.network.take().expect("network node initialized");
-        node.poll();
-        let source = self.gpu_source();
-        match command {
-            GPU_NET_OPEN => {
-                let mut title = Vec::with_capacity(16);
-                for offset in 0..16u32 {
-                    let byte = self.memory
-                        [source.wrapping_add(offset) as usize & self.memory_mask as usize];
-                    if byte == 0 {
-                        break;
-                    }
-                    title.push(byte);
-                }
-                match node.open(&title) {
-                    Ok(opened) => self.set_gpu_result(u16::from(opened)),
-                    Err(error) => {
-                        self.debug_console
-                            .log_error("network", &format!("open failed: {error}"));
-                        self.set_gpu_result(0);
-                    }
-                }
-            }
-            GPU_NET_CLOSE => node.close(),
-            GPU_NET_SEND => {
-                let length = usize::try_from(argument.max(0)).unwrap_or_default().min(48);
-                let data = (0..length)
-                    .map(|offset| {
-                        self.memory[source.wrapping_add(offset as u32) as usize
-                            & self.memory_mask as usize]
-                    })
-                    .collect::<Vec<_>>();
-                self.set_gpu_result(u16::from(node.send(&data)));
-            }
-            GPU_NET_RECV => {
-                if let Some((_, data)) = node.receive() {
-                    for (offset, byte) in data.iter().copied().enumerate() {
-                        self.memory[source.wrapping_add(offset as u32) as usize
-                            & self.memory_mask as usize] = byte;
-                    }
-                    self.set_gpu_result(data.len() as u16);
-                } else {
-                    self.set_gpu_result(0);
-                }
-            }
-            GPU_NET_INFO => {
-                let value = node.query(query, argument as u16).unwrap_or(0);
-                self.set_gpu_result(value);
-            }
-            _ => {}
-        }
-        self.network = Some(node);
-    }
-
     pub fn write(&mut self, address: u32, value: u8) {
         if crate::machine::is_device_aperture(address) {
             assert_eq!(
@@ -3503,32 +3290,6 @@ impl Cpu {
         let address = address & self.memory_mask;
         let index = address as usize;
         self.memory[index] = value;
-        match address {
-            GPU_BASE => self.gpu_command(value),
-            GPU_LAYER_SELECT => self.gpu_layer_select = value,
-            GPU_LAYER_MASK => self.gpu_layer_mask = value,
-            address
-                if (GPU_LAYER_TRANSPARENCY..GPU_LAYER_TRANSPARENCY + GPU_LAYER_COUNT as u32)
-                    .contains(&address) =>
-            {
-                self.gpu_layer_transparency[(address - GPU_LAYER_TRANSPARENCY) as usize] = value;
-            }
-            address
-                if (GPU_LAYER_ORDER..GPU_LAYER_ORDER + GPU_LAYER_COUNT as u32)
-                    .contains(&address) =>
-            {
-                self.gpu_layer_order[(address - GPU_LAYER_ORDER) as usize] = value;
-            }
-            GPU_MODE_ADDR => {
-                if self.layer_mode != value {
-                    self.layer_mode = value;
-                    for layer in &mut self.layers {
-                        layer.fill(0);
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     fn read_terminal_register(&mut self, address: u32) -> Option<u8> {
@@ -3701,20 +3462,6 @@ impl Cpu {
                 reason,
             }));
         }
-        if self.privilege_mode == PrivilegeMode::User
-            && LEGACY_GRAPHICS_RANGES
-                .iter()
-                .any(|&(base, length)| self.guest_range_contains(address, base, length))
-        {
-            return Err(CpuError::PrivilegeViolation {
-                pc: self.pc,
-                operation: match access {
-                    crate::mmu::MemoryAccess::Fetch => "legacy MMIO instruction fetch",
-                    crate::mmu::MemoryAccess::Read => "legacy MMIO read",
-                    crate::mmu::MemoryAccess::Write => "legacy MMIO write",
-                },
-            });
-        }
         Ok(())
     }
 
@@ -3821,15 +3568,6 @@ impl Cpu {
             self.write(physical_address, (value >> (24 - offset * 8)) as u8);
         }
         Ok(())
-    }
-
-    fn guest_range_contains(&self, address: u32, base: u32, length: u32) -> bool {
-        let address = if self.mmu_enabled {
-            address
-        } else {
-            address & self.memory_mask
-        };
-        (base..base + length).contains(&address)
     }
 
     fn record_page_fault(&mut self, fault: crate::mmu::PageFault) {
@@ -4715,545 +4453,6 @@ impl Cpu {
         self.audio.take_commands()
     }
 
-    fn gpu_word(&self, offset: u32) -> i16 {
-        let high = self.memory[(GPU_BASE + offset) as usize];
-        let low = self.memory[(GPU_BASE + offset + 1) as usize];
-        i16::from_be_bytes([high, low])
-    }
-
-    fn gpu_source(&self) -> u32 {
-        let high = (u32::from(self.memory[(GPU_BASE + 12) as usize]) << 8)
-            | u32::from(self.memory[(GPU_BASE + 13) as usize]);
-        let low = (u32::from(self.memory[(GPU_BASE + 10) as usize]) << 8)
-            | u32::from(self.memory[(GPU_BASE + 11) as usize]);
-        ((high & 0x3fff) << 16) | low
-    }
-
-    fn gpu_wide_field(&self, low_offset: u32, high_offset: u32) -> i32 {
-        let low = self.gpu_word(low_offset) as u16;
-        let high = self.gpu_word(high_offset) as u16;
-        (u32::from(high).wrapping_shl(16) | u32::from(low)) as i32
-    }
-
-    fn gpu_read_block(&self, source: u32, size: usize) -> Vec<u8> {
-        (0..size)
-            .map(|offset| {
-                self.memory[source.wrapping_add(offset as u32) as usize & self.memory_mask as usize]
-            })
-            .collect()
-    }
-
-    fn gpu_tilemap(&mut self, camera_x: i32, camera_y: i32, map_width: i32, map_height: i32) {
-        if !(1..=GPU_TILEMAP_MAX_SIZE as i32).contains(&map_width)
-            || !(1..=GPU_TILEMAP_MAX_SIZE as i32).contains(&map_height)
-        {
-            self.set_gpu_result(1);
-            return;
-        }
-        self.tilemap_width = map_width as usize;
-        self.tilemap_height = map_height as usize;
-        self.tilemap =
-            self.gpu_read_block(self.gpu_source(), self.tilemap_width * self.tilemap_height);
-        self.tile_camera = (camera_x, camera_y);
-        self.render_tile_layer();
-        self.set_gpu_result(0);
-    }
-
-    fn render_tile_layer(&mut self) {
-        let (screen_width, screen_height) = self.screen_size();
-        let target = &mut self.layers[1];
-        target.fill(0);
-        if self.tilemap.is_empty() {
-            return;
-        }
-        let split_x = screen_width / 2;
-        let views = self.split_cameras.map_or_else(
-            || vec![(self.tile_camera, 0, screen_width)],
-            |cameras| {
-                vec![
-                    (cameras[0], 0, split_x),
-                    (cameras[1], split_x, screen_width),
-                ]
-            },
-        );
-        let tile_size = self.tile_pixel_size as i32;
-        let color_mask = if screen_width == 640 { 0x0f } else { 0xff };
-        for ((camera_x, camera_y), clip_left, clip_right) in views {
-            let first_column = camera_x.div_euclid(tile_size);
-            let first_row = camera_y.div_euclid(tile_size);
-            let last_column = camera_x
-                .saturating_add(clip_right - clip_left - 1)
-                .div_euclid(tile_size);
-            let last_row = camera_y
-                .saturating_add(screen_height - 1)
-                .div_euclid(tile_size);
-            for map_y in first_row.max(0)..=(last_row.min(self.tilemap_height as i32 - 1)) {
-                for map_x in first_column.max(0)..=(last_column.min(self.tilemap_width as i32 - 1))
-                {
-                    let tile =
-                        self.tilemap[map_y as usize * self.tilemap_width + map_x as usize] as usize;
-                    let screen_x = (map_x * tile_size)
-                        .saturating_sub(camera_x)
-                        .saturating_add(clip_left);
-                    let screen_y = (map_y * tile_size).saturating_sub(camera_y);
-                    let source_start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
-                    for tile_y in 0..tile_size {
-                        let y = screen_y + tile_y;
-                        if !(0..screen_height).contains(&y) {
-                            continue;
-                        }
-                        for tile_x in 0..tile_size {
-                            let x = screen_x + tile_x;
-                            if x < clip_left || x >= clip_right || x < 0 || x >= screen_width {
-                                continue;
-                            }
-                            let source_index = source_start
-                                + tile_y as usize * self.tile_pixel_size
-                                + tile_x as usize;
-                            target[(y * screen_width + x) as usize] =
-                                self.tile_memory[source_index] & color_mask;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn render_sprites(&mut self) {
-        let (screen_width, screen_height) = self.screen_size();
-        let target = &mut self.layers[2];
-        target.fill(0);
-        let split_x = screen_width / 2;
-        let views = self.split_cameras.map_or_else(
-            || vec![(self.tile_camera, 0, screen_width)],
-            |cameras| {
-                vec![
-                    (cameras[0], 0, split_x),
-                    (cameras[1], split_x, screen_width),
-                ]
-            },
-        );
-        let color_mask = if screen_width == 640 { 0x0f } else { 0xff };
-        for (slot, sprite) in self.sprites.iter().enumerate() {
-            let Some(sprite) = sprite else {
-                continue;
-            };
-            let (world_x, world_y, flags) = self.sprite_descriptors[slot];
-            if flags & 1 == 0 {
-                continue;
-            }
-            for ((camera_x, camera_y), clip_left, clip_right) in &views {
-                let screen_x = world_x.saturating_sub(*camera_x).saturating_add(*clip_left);
-                let screen_y = world_y.saturating_sub(*camera_y);
-                let left = screen_x.max(*clip_left).max(0);
-                let right = screen_x
-                    .saturating_add(sprite.width as i32)
-                    .min(*clip_right)
-                    .min(screen_width);
-                let top = screen_y.max(0);
-                let bottom = screen_y
-                    .saturating_add(sprite.height as i32)
-                    .min(screen_height);
-                for y in top..bottom {
-                    let mut source_y = (y - screen_y) as usize;
-                    if flags & 4 != 0 {
-                        source_y = sprite.height - source_y - 1;
-                    }
-                    for x in left..right {
-                        let mut source_x = (x - screen_x) as usize;
-                        if flags & 2 != 0 {
-                            source_x = sprite.width - source_x - 1;
-                        }
-                        let pixel = sprite.pixels[source_y * sprite.width + source_x];
-                        if pixel != 0 {
-                            target[(y * screen_width + x) as usize] = pixel & color_mask;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn collision_mask(&self, mask: u16) -> Option<(usize, usize, Vec<u8>)> {
-        if usize::from(mask) < GPU_SPRITE_SLOTS {
-            let sprite = self.sprites[mask as usize].as_ref()?;
-            return Some((sprite.width, sprite.height, sprite.pixels.clone()));
-        }
-        let tile = usize::from(mask).checked_sub(GPU_SPRITE_SLOTS)?;
-        if tile < GPU_TILE_COUNT {
-            let size = self.tile_pixel_size;
-            let start = tile * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
-            return Some((
-                size,
-                size,
-                self.tile_memory[start..start + size * size].to_vec(),
-            ));
-        }
-        if usize::from(mask) == GPU_SPRITE_SLOTS + GPU_TILE_COUNT {
-            let pixels = (0i32..7)
-                .flat_map(|y| (0i32..7).map(move |x| u8::from((x - 3).abs() + (y - 3).abs() <= 3)))
-                .collect();
-            return Some((7, 7, pixels));
-        }
-        None
-    }
-
-    fn masks_overlap(
-        first: &(usize, usize, Vec<u8>),
-        first_x: i32,
-        first_y: i32,
-        second: &(usize, usize, Vec<u8>),
-        second_x: i32,
-        second_y: i32,
-    ) -> bool {
-        let left = i64::from(first_x).max(i64::from(second_x));
-        let top = i64::from(first_y).max(i64::from(second_y));
-        let right =
-            (i64::from(first_x) + first.0 as i64).min(i64::from(second_x) + second.0 as i64);
-        let bottom =
-            (i64::from(first_y) + first.1 as i64).min(i64::from(second_y) + second.1 as i64);
-        for y in top..bottom {
-            for x in left..right {
-                let first_index = ((y - i64::from(first_y)) as usize) * first.0
-                    + (x - i64::from(first_x)) as usize;
-                let second_index = ((y - i64::from(second_y)) as usize) * second.0
-                    + (x - i64::from(second_x)) as usize;
-                if first.2[first_index] != 0 && second.2[second_index] != 0 {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn gpu_world_views(
-        &self,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    ) -> Vec<(i64, i64, i64, i64, i64, i64, i64)> {
-        let (screen_width, screen_height) = self.screen_size();
-        let split_x = screen_width / 2;
-        let views = self.split_cameras.map_or_else(
-            || vec![(self.tile_camera, 0, screen_width)],
-            |cameras| {
-                vec![
-                    (cameras[0], 0, split_x),
-                    (cameras[1], split_x, screen_width),
-                ]
-            },
-        );
-        let mut result = Vec::with_capacity(views.len());
-        for ((camera_x, camera_y), clip_left, clip_right) in views {
-            let (camera_x, camera_y) = (i64::from(camera_x), i64::from(camera_y));
-            let mut left = i64::from(x).max(camera_x);
-            let mut right =
-                (i64::from(x) + i64::from(width)).min(camera_x + i64::from(clip_right - clip_left));
-            let mut top = i64::from(y).max(camera_y);
-            let mut bottom =
-                (i64::from(y) + i64::from(height)).min(camera_y + i64::from(screen_height));
-            if self.tilemap_width > 0 && self.tilemap_height > 0 {
-                left = left.max(0);
-                right = right.min((self.tilemap_width * self.tile_pixel_size) as i64);
-                top = top.max(0);
-                bottom = bottom.min((self.tilemap_height * self.tile_pixel_size) as i64);
-            }
-            if left < right && top < bottom {
-                result.push((
-                    left,
-                    top,
-                    right,
-                    bottom,
-                    i64::from(clip_left) - camera_x,
-                    -camera_y,
-                    i64::from(screen_width),
-                ));
-            }
-        }
-        result
-    }
-
-    fn gpu_world_tile(&mut self, tile: u8, origin_x: i32, origin_y: i32) {
-        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-        if layer == 0 {
-            self.set_gpu_result(1);
-            return;
-        }
-        let size = self.tile_pixel_size as i32;
-        let views = self.gpu_world_views(origin_x, origin_y, size, size);
-        let source_start = usize::from(tile) * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
-        for (left, top, right, bottom, dx, dy, stride) in views {
-            for pixel_y in top..bottom {
-                let source_y = (pixel_y - i64::from(origin_y)) as usize;
-                for pixel_x in left..right {
-                    let source_x = (pixel_x - i64::from(origin_x)) as usize;
-                    let pixel =
-                        self.tile_memory[source_start + source_y * self.tile_pixel_size + source_x];
-                    if pixel != 0 {
-                        let screen_x = pixel_x + dx;
-                        let screen_y = pixel_y + dy;
-                        let index = (screen_y * stride + screen_x) as usize;
-                        self.layers[layer][index] = pixel;
-                    }
-                }
-            }
-        }
-        self.set_gpu_result(0);
-    }
-
-    fn gpu_world_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: u8) {
-        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-        if layer == 0 {
-            self.set_gpu_result(1);
-            return;
-        }
-        for (left, top, right, bottom, dx, dy, stride) in self.gpu_world_views(x, y, width, height)
-        {
-            for world_y in top..bottom {
-                let start = ((world_y + dy) * stride + left + dx) as usize;
-                let end = start + (right - left) as usize;
-                self.layers[layer][start..end].fill(color);
-            }
-        }
-        self.set_gpu_result(0);
-    }
-
-    fn gpu_world_disc(&mut self, x: i32, y: i32, radius: i32, color: u8, opacity: i32) {
-        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-        if layer == 0 || !(0..=32).contains(&radius) || !(0..=16).contains(&opacity) {
-            self.set_gpu_result(1);
-            return;
-        }
-        const DITHER: [i32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-        for (left, top, right, bottom, dx, dy, stride) in self.gpu_world_views(
-            x.saturating_sub(radius),
-            y.saturating_sub(radius),
-            radius * 2 + 1,
-            radius * 2 + 1,
-        ) {
-            for world_y in top..bottom {
-                for world_x in left..right {
-                    let offset_x = world_x - i64::from(x);
-                    let offset_y = world_y - i64::from(y);
-                    let distance = offset_x * offset_x + offset_y * offset_y;
-                    if distance > i64::from(radius) * i64::from(radius) {
-                        continue;
-                    }
-                    let mut coverage = opacity;
-                    if radius > 2 && distance > i64::from(radius - 1) * i64::from(radius - 1) {
-                        coverage /= 2;
-                    }
-                    let dither_index = (world_y.rem_euclid(4) * 4 + world_x.rem_euclid(4)) as usize;
-                    if DITHER[dither_index] < coverage {
-                        let screen_x = world_x + dx;
-                        let screen_y = world_y + dy;
-                        self.layers[layer][(screen_y * stride + screen_x) as usize] = color;
-                    }
-                }
-            }
-        }
-        self.set_gpu_result(0);
-    }
-
-    fn gpu_world_ammo(&mut self, world_x: i32, world_y: i32) {
-        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-        if layer == 0 {
-            self.set_gpu_result(1);
-            return;
-        }
-        let (screen_width, screen_height) = self.screen_size();
-        let split_x = screen_width / 2;
-        let views = self.split_cameras.map_or_else(
-            || vec![(self.tile_camera, 0, screen_width)],
-            |cameras| {
-                vec![
-                    (cameras[0], 0, split_x),
-                    (cameras[1], split_x, screen_width),
-                ]
-            },
-        );
-        for ((camera_x, camera_y), clip_left, clip_right) in views {
-            for offset_y in -3i32..=3 {
-                for offset_x in -3i32..=3 {
-                    let distance = offset_x.abs() + offset_y.abs();
-                    let x = world_x
-                        .saturating_add(offset_x)
-                        .saturating_sub(camera_x)
-                        .saturating_add(clip_left);
-                    let y = world_y.saturating_add(offset_y).saturating_sub(camera_y);
-                    if distance <= 3
-                        && (clip_left..clip_right).contains(&x)
-                        && (0..screen_height).contains(&y)
-                    {
-                        self.layers[layer][(y * screen_width + x) as usize] =
-                            if distance <= 1 { 1 } else { 5 };
-                    }
-                }
-            }
-        }
-        self.set_gpu_result(0);
-    }
-
-    fn gpu_world_mask(&mut self, pixels: &[u8], width: usize, height: usize, x: i32, y: i32) {
-        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-        let origin_x = x.saturating_sub((width / 2) as i32);
-        let origin_y = y.saturating_sub((height / 2) as i32);
-        for (left, top, right, bottom, dx, dy, stride) in
-            self.gpu_world_views(origin_x, origin_y, width as i32, height as i32)
-        {
-            for world_y in top..bottom {
-                let source_y = (world_y - i64::from(origin_y)) as usize;
-                for world_x in left..right {
-                    let source_x = (world_x - i64::from(origin_x)) as usize;
-                    let pixel = pixels[source_y * width + source_x];
-                    if pixel != 0 {
-                        let color = if matches!(pixel, 1 | 10 | 11) { 10 } else { 12 };
-                        let screen_x = world_x + dx;
-                        let screen_y = world_y + dy;
-                        self.layers[layer][(screen_y * stride + screen_x) as usize] = color;
-                    }
-                }
-            }
-        }
-    }
-
-    fn gpu_world_emitters(&mut self, wide: bool, source: u32, count: i32, tick: i32) {
-        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-        let record_size = if wide { 12usize } else { 8 };
-        if layer == 0 || count < 0 {
-            self.set_gpu_result(1);
-            return;
-        }
-        let length = match (count as usize).checked_mul(record_size) {
-            Some(length) => length,
-            None => {
-                self.set_gpu_result(1);
-                return;
-            }
-        };
-        let Some(end) = (source as usize).checked_add(length) else {
-            self.set_gpu_result(1);
-            return;
-        };
-        if end > self.memory.len() {
-            self.set_gpu_result(1);
-            return;
-        }
-        let read_i16 = |address: usize| {
-            i16::from_be_bytes([self.memory[address], self.memory[address + 1]]) as i32
-        };
-        let read_i32 = |address: usize| {
-            i32::from_be_bytes([
-                self.memory[address],
-                self.memory[address + 1],
-                self.memory[address + 2],
-                self.memory[address + 3],
-            ])
-        };
-        let records = (0..count as usize)
-            .map(|index| {
-                let address = source as usize + index * record_size;
-                if wide {
-                    (
-                        read_i32(address),
-                        read_i32(address + 4),
-                        read_i16(address + 8),
-                        read_i16(address + 10),
-                    )
-                } else {
-                    (
-                        read_i16(address),
-                        read_i16(address + 2),
-                        read_i16(address + 4),
-                        read_i16(address + 6),
-                    )
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut drawn_sites = HashSet::new();
-        let mut smoke_cells = HashSet::new();
-        for (index, (x, y, life, mask)) in records.into_iter().enumerate() {
-            if life <= 0
-                || self
-                    .gpu_world_views(x.saturating_sub(24), y.saturating_sub(56), 48, 80)
-                    .is_empty()
-                || !drawn_sites.insert((x, y, mask))
-            {
-                continue;
-            }
-            let wreck = if mask >= 0 {
-                match self.collision_mask(mask as u16) {
-                    Some((width, height, pixels)) => {
-                        self.gpu_world_mask(&pixels, width, height, x, y);
-                        true
-                    }
-                    None => {
-                        self.set_gpu_result(1);
-                        return;
-                    }
-                }
-            } else {
-                false
-            };
-            self.gpu_world_disc(x, y.saturating_add(2), if wreck { 10 } else { 4 }, 10, 12);
-            self.gpu_world_disc(
-                x,
-                y,
-                if wreck { 3 } else { 1 },
-                if (tick + index as i32).rem_euclid(6) < 3 {
-                    8
-                } else {
-                    5
-                },
-                16,
-            );
-            let cell = (x.div_euclid(16), y.div_euclid(16));
-            if !smoke_cells.insert(cell) {
-                continue;
-            }
-            for particle in 0..if wreck { 8 } else { 4 } {
-                let seed =
-                    (index as i64 * 137 + particle * 71 + i64::from(x) * 13 + i64::from(y) * 7)
-                        .rem_euclid(0x1_0000) as i32;
-                let age = (tick + seed).rem_euclid(36);
-                let drift = seed.rem_euclid(7) - 3;
-                let px = x
-                    .saturating_add(seed.rem_euclid(9) - 4)
-                    .saturating_add((drift * age).div_euclid(24));
-                let py = y.saturating_sub(age * (if wreck { 2 } else { 1 }) / 3);
-                if age < 16 {
-                    let radius = ((if wreck { 5 } else { 3 }) - age / 5).max(1);
-                    self.gpu_world_disc(
-                        px,
-                        py,
-                        radius,
-                        if age < 5 {
-                            5
-                        } else if age < 11 {
-                            8
-                        } else {
-                            11
-                        },
-                        16,
-                    );
-                    if age < 5 {
-                        self.gpu_world_disc(px, py, 1, 1, 12);
-                    }
-                } else {
-                    self.gpu_world_disc(
-                        px,
-                        py,
-                        2 + age / 8,
-                        if age < 26 { 10 } else { 9 },
-                        ((36 - age) / 2).max(1),
-                    );
-                }
-            }
-        }
-        self.set_gpu_result(0);
-    }
-
     fn screen_size(&self) -> (i32, i32) {
         if self.layer_mode == 1 {
             (640, 480)
@@ -5272,9 +4471,7 @@ impl Cpu {
         }
         if self.layer_mode != mode {
             self.layer_mode = mode;
-            for layer in &mut self.layers {
-                layer.fill(0);
-            }
+            self.vram.fill(0);
         }
         Ok(())
     }
@@ -5292,36 +4489,16 @@ impl Cpu {
         let (width, height) = self.screen_size();
         let width = width as usize;
         let height = height as usize;
-        let visible = self.gpu_layer_mask & ((1 << GPU_LAYER_COUNT) - 1);
-        pixels[..width * height].fill(0);
-        let mut order = [0usize; GPU_LAYER_COUNT];
-        for (layer, entry) in order.iter_mut().enumerate() {
-            *entry = layer;
-        }
-        order.sort_unstable_by_key(|&layer| (self.gpu_layer_order[layer], layer));
-        for layer in order {
-            if visible & (1 << layer) == 0 {
-                continue;
-            }
-            let transparent = self.gpu_layer_transparency[layer];
+        if width == 320 {
+            pixels[..width * height].copy_from_slice(&self.vram[..width * height]);
+        } else {
             for (index, output) in pixels[..width * height].iter_mut().enumerate() {
-                let color = if layer == 0 {
-                    if width == 320 {
-                        self.vram[index]
-                    } else {
-                        let packed = self.vram[index / 2];
-                        if index & 1 == 0 {
-                            packed >> 4
-                        } else {
-                            packed & 0x0f
-                        }
-                    }
+                let packed = self.vram[index / 2];
+                *output = if index & 1 == 0 {
+                    packed >> 4
                 } else {
-                    self.layers[layer][index]
+                    packed & 0x0f
                 };
-                if color != transparent {
-                    *output = color;
-                }
             }
         }
     }
@@ -5330,558 +4507,19 @@ impl Cpu {
         self.palette[index as usize]
     }
 
-    fn gpu_pixel(&mut self, x: i32, y: i32, color: u8) {
-        let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-        self.gpu_pixel_on_layer(layer, x, y, color);
-    }
-
-    fn gpu_pixel_on_layer(&mut self, layer: usize, x: i32, y: i32, color: u8) {
+    fn graphics_pixel(&mut self, x: i32, y: i32, color: u8) {
         let (width, height) = self.screen_size();
         if x < 0 || y < 0 || x >= width || y >= height {
             return;
         }
-        if width == 320 && layer != 0 {
-            let address = (y * width + x) as usize;
-            self.layers[layer][address] = color;
-        } else if width == 320 {
+        if width == 320 {
             let address = (y * width + x) as usize;
             self.vram[address] = color;
-        } else if layer != 0 {
-            let address = (y * width + x) as usize;
-            self.layers[layer][address] = color & 0x0f;
         } else {
             let address = (y * (width / 2) + x / 2) as usize;
             let shift = if x & 1 == 0 { 4 } else { 0 };
             let mask = 0xf << shift;
             self.vram[address] = (self.vram[address] & !mask) | ((color & 0xf) << shift);
-        }
-    }
-
-    fn gpu_3d(&mut self, source: u32) {
-        self.gpu_triangles.clear();
-        self.gpu_lines.clear();
-        let header_bytes = 10 * 2;
-        if (source as usize).saturating_add(header_bytes) > self.memory.len() {
-            self.set_gpu_result(1);
-            return;
-        }
-        let header = (0..10)
-            .map(|index| self.read_u16(source + index * 2) as i16)
-            .collect::<Vec<_>>();
-        let vertex_count = header[0] as usize;
-        let face_count = header[1] as usize;
-        let angles = [
-            header[2] as u16 as u8,
-            header[3] as u16 as u8,
-            header[4] as u16 as u8,
-        ];
-        let translation = [
-            i32::from(header[5]),
-            i32::from(header[6]),
-            i32::from(header[7]),
-        ];
-        let focal = i32::from(header[8]);
-        let flags = header[9] as u16;
-        let word_count = 10usize
-            .saturating_add(vertex_count.saturating_mul(3))
-            .saturating_add(face_count.saturating_mul(4));
-        if !(3..=GPU3D_MAX_VERTICES).contains(&vertex_count)
-            || !(1..=GPU3D_MAX_FACES).contains(&face_count)
-            || focal <= 0
-            || flags == 0
-            || flags & !(GPU3D_FILL | GPU3D_WIREFRAME) != 0
-            || (source as usize).saturating_add(word_count.saturating_mul(2)) > self.memory.len()
-        {
-            self.set_gpu_result(1);
-            return;
-        }
-
-        let vertex_offset = source + 20;
-        let mut vertices = Vec::with_capacity(vertex_count);
-        for index in 0..vertex_count {
-            let offset = vertex_offset + (index * 3 * 2) as u32;
-            let original = [
-                i32::from(self.read_u16(offset) as i16),
-                i32::from(self.read_u16(offset + 2) as i16),
-                i32::from(self.read_u16(offset + 4) as i16),
-            ];
-            vertices.push(gpu3d_transform(original, angles, translation));
-        }
-
-        let face_offset = vertex_offset + (vertex_count * 3 * 2) as u32;
-        let mut faces = Vec::with_capacity(face_count);
-        for index in 0..face_count {
-            let offset = face_offset + (index * 4 * 2) as u32;
-            let face = [
-                self.read_u16(offset),
-                self.read_u16(offset + 2),
-                self.read_u16(offset + 4),
-            ];
-            let color = self.read_u16(offset + 6) as u8;
-            if face
-                .iter()
-                .any(|&vertex| usize::from(vertex) >= vertex_count)
-            {
-                self.set_gpu_result(2);
-                return;
-            }
-            faces.push((face, color));
-        }
-
-        let (width, height) = self.screen_size();
-        let projected = vertices
-            .iter()
-            .map(|&vertex| {
-                if vertex.2 > 0 {
-                    Some(gpu3d_project(vertex, focal, width, height))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        self.layers[3][..(width * height) as usize].fill(0);
-        let mut painter_order = (0..face_count).collect::<Vec<_>>();
-        painter_order.sort_by_key(|&index| {
-            let face = faces[index].0;
-            -face
-                .iter()
-                .map(|&vertex| vertices[usize::from(vertex)].2)
-                .sum::<i32>()
-        });
-        for index in painter_order {
-            let (face, color) = faces[index];
-            let [a, b, c] = face.map(usize::from);
-            let (Some(a), Some(b), Some(c)) = (projected[a], projected[b], projected[c]) else {
-                continue;
-            };
-            let points = [a, b, c];
-            if flags & GPU3D_FILL != 0 {
-                self.gpu_triangles.push(GpuTriangle { points, color });
-            } else if flags & GPU3D_WIREFRAME != 0 {
-                self.gpu_triangles.push(GpuTriangle { points, color: 0 });
-            }
-            if flags & GPU3D_WIREFRAME != 0 {
-                self.gpu_lines.extend([
-                    GpuLine {
-                        start: a,
-                        end: b,
-                        color,
-                    },
-                    GpuLine {
-                        start: b,
-                        end: c,
-                        color,
-                    },
-                    GpuLine {
-                        start: c,
-                        end: a,
-                        color,
-                    },
-                ]);
-            }
-        }
-        self.set_gpu_result(0);
-    }
-
-    fn set_gpu_result(&mut self, value: u16) {
-        let [high, low] = value.to_be_bytes();
-        self.memory[(GPU_BASE + 14) as usize] = high;
-        self.memory[(GPU_BASE + 15) as usize] = low;
-    }
-
-    fn gpu_command(&mut self, command: u8) {
-        if self.mmu_enabled
-            && self.privilege_mode == PrivilegeMode::User
-            && matches!(
-                command,
-                GPU_SPRITE | GPU_BITMAP | GPU_TEXT | GPU_POLY | GPU_NET_OPEN
-                    ..=GPU_NET_INFO
-                        | GPU_TILEMAP
-                        | GPU_TILEMAP_WIDE
-                        | GPU_SPRITE_UPLOAD
-                        | GPU_TILE_UPLOAD
-                        | GPU_WORLD_EMITTERS
-                        | GPU_WORLD_EMITTERS_WIDE
-                        | GPU_3D
-            )
-        {
-            self.set_gpu_result(1);
-            self.debug_console.log_error(
-                "gpu",
-                "MMU-backed user buffer commands require a validated buffer service",
-            );
-            return;
-        }
-        let color = self.memory[(GPU_BASE + 1) as usize];
-        let x = i32::from(self.gpu_word(2));
-        let y = i32::from(self.gpu_word(4));
-        let w = i32::from(self.gpu_word(6));
-        let h = i32::from(self.gpu_word(8));
-        match command {
-            GPU_CLEAR => {
-                let (width, height) = self.screen_size();
-                let layer = self.gpu_layer_select.min((GPU_LAYER_COUNT - 1) as u8) as usize;
-                if layer != 0 {
-                    self.layers[layer][..(width * height) as usize].fill(if width == 320 {
-                        color
-                    } else {
-                        color & 0x0f
-                    });
-                } else if width == 320 {
-                    self.vram[..(width * height) as usize].fill(color);
-                } else {
-                    let fill = ((color & 0xf) << 4) | (color & 0xf);
-                    self.vram[..(width * height / 2) as usize].fill(fill);
-                }
-            }
-            GPU_PIXEL => self.gpu_pixel(x, y, color),
-            GPU_RECT => {
-                for row in y.max(0)..(y + h).min(self.screen_size().1) {
-                    for column in x.max(0)..(x + w).min(self.screen_size().0) {
-                        self.gpu_pixel(column, row, color);
-                    }
-                }
-            }
-            GPU_LINE => {
-                let (mut x0, mut y0) = (x, y);
-                let (x1, y1) = (w, h);
-                let dx = (x1 - x0).abs();
-                let sx = if x0 < x1 { 1 } else { -1 };
-                let dy = -(y1 - y0).abs();
-                let sy = if y0 < y1 { 1 } else { -1 };
-                let mut error = dx + dy;
-                for _ in 0..2000 {
-                    self.gpu_pixel(x0, y0, color);
-                    if x0 == x1 && y0 == y1 {
-                        break;
-                    }
-                    let twice = 2 * error;
-                    if twice >= dy {
-                        error += dy;
-                        x0 += sx;
-                    }
-                    if twice <= dx {
-                        error += dx;
-                        y0 += sy;
-                    }
-                }
-            }
-            GPU_SPRITE => {
-                let source = self.gpu_source();
-                let (screen_width, screen_height) = self.screen_size();
-                for row in 0..h.max(0).min(screen_height) {
-                    for column in 0..w.max(0).min(screen_width) {
-                        let address =
-                            source.wrapping_add((row * w + column) as u32) & self.memory_mask;
-                        let pixel = self.memory[address as usize];
-                        if pixel != 0 {
-                            self.gpu_pixel(x + column, y + row, pixel);
-                        }
-                    }
-                }
-            }
-            GPU_BITMAP => {
-                let source = self.gpu_source();
-                let (screen_width, screen_height) = self.screen_size();
-                let draw_width = w.max(0).min(screen_width);
-                let draw_height = h.max(0).min(screen_height);
-                let row_bytes = (draw_width + 7) / 8;
-                for row in 0..draw_height {
-                    for column in 0..draw_width {
-                        let address = source.wrapping_add((row * row_bytes + column / 8) as u32)
-                            & self.memory_mask;
-                        if self.memory[address as usize] & (0x80 >> (column % 8)) != 0 {
-                            self.gpu_pixel(x + column, y + row, color);
-                        }
-                    }
-                }
-            }
-            GPU_TEXT => self.gpu_text(x, y, color),
-            GPU_PRESENT => {
-                self.frame_yield = true;
-                self.frame_presented = true;
-            }
-            GPU_RANDOM => {
-                let value = self.next_random();
-                self.memory[(GPU_BASE + 14) as usize] = value as u8;
-            }
-            GPU_POLY => self.gpu_polygon(x, y, w, color),
-            GPU_TICKS => {
-                let count = self.frame_count.to_be_bytes();
-                self.memory[(GPU_BASE + 14) as usize] = count[0];
-                self.memory[(GPU_BASE + 15) as usize] = count[1];
-            }
-            GPU_RTC => {
-                let index = color as usize;
-                self.memory[(GPU_BASE + 14) as usize] =
-                    if index < 3 { self.clock.rtc[index] } else { 0 };
-            }
-            GPU_SOUND => {
-                let command = GpuSoundCommand {
-                    channel: color & 3,
-                    frequency: self.gpu_word(2) as u16,
-                    frames: self.gpu_word(4) as u16,
-                    waveform: self.gpu_word(6) as u16,
-                    volume: self.gpu_word(8) as u16,
-                };
-                self.audio.submit(command);
-            }
-            GPU_NET_OPEN..=GPU_NET_INFO => self.gpu_network(command, color, self.gpu_word(2)),
-            GPU_PALETTE => {
-                let red = self.gpu_word(2) as u8;
-                let green = self.gpu_word(4) as u8;
-                let blue = self.gpu_word(6) as u8;
-                self.palette[color as usize] = [red, green, blue];
-                self.memory[(GPU_BASE + 14) as usize] = 0;
-                self.memory[(GPU_BASE + 15) as usize] = 0;
-            }
-            GPU_TILEMAP => self.gpu_tilemap(x, y, w, h),
-            GPU_SPRITE_UPLOAD => {
-                if usize::from(color) >= GPU_SPRITE_SLOTS
-                    || !(1..=GPU_SPRITE_MAX_SIZE).contains(&w)
-                    || !(1..=GPU_SPRITE_MAX_SIZE).contains(&h)
-                {
-                    self.set_gpu_result(1);
-                } else {
-                    let width = w as usize;
-                    let height = h as usize;
-                    let pixels = self.gpu_read_block(self.gpu_source(), width * height);
-                    self.sprites[color as usize] = Some(GpuSprite {
-                        width,
-                        height,
-                        pixels,
-                    });
-                    self.render_sprites();
-                    self.set_gpu_result(0);
-                }
-            }
-            GPU_SPRITE_MOVE => {
-                if usize::from(color) < GPU_SPRITE_SLOTS {
-                    self.sprite_descriptors[color as usize] = (x, y, w as u8 & 7);
-                    self.render_sprites();
-                }
-            }
-            GPU_TILE_UPLOAD => {
-                if usize::from(color) >= GPU_TILE_COUNT {
-                    self.set_gpu_result(1);
-                } else {
-                    let size = self.tile_pixel_size;
-                    let data = self.gpu_read_block(self.gpu_source(), size * size);
-                    let start = color as usize * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
-                    self.tile_memory[start..start + size * size].copy_from_slice(&data);
-                    self.render_tile_layer();
-                    self.set_gpu_result(0);
-                }
-            }
-            GPU_TILE_CAMERA => {
-                self.tile_camera = (x, y);
-                self.split_cameras = None;
-                self.render_tile_layer();
-                self.render_sprites();
-            }
-            GPU_TILE_SIZE => {
-                if !(1..=GPU_TILE_MAX_SIZE as i32).contains(&x) {
-                    self.set_gpu_result(1);
-                } else {
-                    self.tile_pixel_size = x as usize;
-                    self.render_tile_layer();
-                    self.set_gpu_result(0);
-                }
-            }
-            GPU_SPLIT_CAMERA => {
-                self.split_cameras = Some([(x, y), (w, h)]);
-                self.render_tile_layer();
-                self.render_sprites();
-            }
-            GPU_TILE_CAMERA_WIDE => {
-                self.tile_camera = (self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26));
-                self.split_cameras = None;
-                self.render_tile_layer();
-                self.render_sprites();
-            }
-            GPU_SPLIT_CAMERA_WIDE => {
-                self.split_cameras = Some([
-                    (self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26)),
-                    (self.gpu_wide_field(6, 28), self.gpu_wide_field(8, 30)),
-                ]);
-                self.render_tile_layer();
-                self.render_sprites();
-            }
-            GPU_TILEMAP_WIDE => {
-                self.gpu_tilemap(self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26), w, h)
-            }
-            GPU_MASK_OVERLAP => {
-                let first = self.collision_mask(self.gpu_word(10) as u16);
-                let second = self.collision_mask(self.gpu_word(12) as u16);
-                let result = match (first, second) {
-                    (Some(first), Some(second)) => {
-                        u16::from(Self::masks_overlap(&first, x, y, &second, w, h))
-                    }
-                    _ => u16::MAX,
-                };
-                self.set_gpu_result(result);
-            }
-            GPU_WORLD_TILE => self.gpu_world_tile(color, x, y),
-            GPU_WORLD_AMMO => self.gpu_world_ammo(x, y),
-            GPU_WORLD_RECT => self.gpu_world_rect(x, y, w, h, color),
-            GPU_WORLD_PARTICLE => self.gpu_world_disc(x, y, w, color, h),
-            GPU_WORLD_EMITTERS => self.gpu_world_emitters(false, self.gpu_source(), x, y),
-            GPU_SPRITE_MOVE_WIDE => {
-                let sprite_x = self.gpu_wide_field(2, 24);
-                let sprite_y = self.gpu_wide_field(4, 26);
-                if usize::from(color) < GPU_SPRITE_SLOTS {
-                    self.sprite_descriptors[color as usize] = (sprite_x, sprite_y, w as u8 & 7);
-                    self.render_sprites();
-                }
-            }
-            GPU_MASK_OVERLAP_WIDE => {
-                let first = self.collision_mask(self.gpu_word(10) as u16);
-                let second = self.collision_mask(self.gpu_word(12) as u16);
-                let result = match (first, second) {
-                    (Some(first), Some(second)) => u16::from(Self::masks_overlap(
-                        &first,
-                        self.gpu_wide_field(2, 24),
-                        self.gpu_wide_field(4, 26),
-                        &second,
-                        self.gpu_wide_field(6, 28),
-                        self.gpu_wide_field(8, 30),
-                    )),
-                    _ => u16::MAX,
-                };
-                self.set_gpu_result(result);
-            }
-            GPU_WORLD_TILE_WIDE => self.gpu_world_tile(
-                color,
-                self.gpu_wide_field(2, 24),
-                self.gpu_wide_field(4, 26),
-            ),
-            GPU_WORLD_AMMO_WIDE => {
-                self.gpu_world_ammo(self.gpu_wide_field(2, 24), self.gpu_wide_field(4, 26))
-            }
-            GPU_WORLD_RECT_WIDE => self.gpu_world_rect(
-                self.gpu_wide_field(2, 24),
-                self.gpu_wide_field(4, 26),
-                w,
-                h,
-                color,
-            ),
-            GPU_WORLD_PARTICLE_WIDE => self.gpu_world_disc(
-                self.gpu_wide_field(2, 24),
-                self.gpu_wide_field(4, 26),
-                w,
-                color,
-                h,
-            ),
-            GPU_WORLD_EMITTERS_WIDE => self.gpu_world_emitters(true, self.gpu_source(), x, y),
-            GPU_3D => self.gpu_3d(self.gpu_source()),
-            GPU_SAVE => {
-                let (width, height) = self.screen_size();
-                let size = if width == 640 {
-                    (width * height / 2) as usize
-                } else {
-                    (width * height) as usize
-                };
-                self.saved_video = Some(self.vram[..size].to_vec());
-            }
-            GPU_LOAD => {
-                if let Some(saved) = &self.saved_video {
-                    self.vram[..saved.len()].copy_from_slice(saved);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn gpu_text(&mut self, mut x: i32, mut y: i32, color: u8) {
-        let left = x;
-        let source = self.gpu_source();
-        let mut bytes = Vec::with_capacity(64);
-        for offset in 0..255u32 {
-            let address = source.wrapping_add(offset) & self.memory_mask;
-            let value = self.memory[address as usize];
-            if value == 0 {
-                break;
-            }
-            bytes.push(value);
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        for character in text.chars() {
-            if character == '\n' {
-                x = left;
-                y += 8;
-                continue;
-            }
-            let glyph = match character {
-                ' '..='~' => character as usize - 32,
-                'ö' => 95,
-                'ä' => 96,
-                'å' => 97,
-                'Ö' => 98,
-                'Ä' => 99,
-                'Å' => 100,
-                _ => '?' as usize - 32,
-            };
-            for row in 0..7 {
-                let address = FONT_ADDR + glyph * 8 + row;
-                if address >= self.memory.len() {
-                    continue;
-                }
-                let bits = self.memory[address];
-                for column in 0..5 {
-                    if bits & (0x80 >> column) != 0 {
-                        self.gpu_pixel(x + column, y + row as i32, color);
-                    }
-                }
-            }
-            x += 6;
-        }
-    }
-
-    fn gpu_polygon(&mut self, x: i32, y: i32, count: i32, color: u8) {
-        let source = self.gpu_source();
-        let point_count = count.clamp(0, 64) as u32;
-        let mut points = Vec::with_capacity(point_count as usize);
-        for index in 0..point_count {
-            let address = source.wrapping_add(index * 2) & self.memory_mask;
-            let dx = self.memory[address as usize] as i8 as i32;
-            let dy =
-                self.memory[(address.wrapping_add(1) & self.memory_mask) as usize] as i8 as i32;
-            points.push((x + dx, y + dy));
-        }
-        match points.as_slice() {
-            [] => {}
-            [point] => self.gpu_pixel(point.0, point.1, color),
-            _ => {
-                for index in 0..points.len() {
-                    let start = points[index];
-                    let end = points[(index + 1) % points.len()];
-                    self.gpu_line(start.0, start.1, end.0, end.1, color);
-                }
-            }
-        }
-    }
-
-    fn gpu_line(&mut self, x: i32, y: i32, end_x: i32, end_y: i32, color: u8) {
-        let (mut x, mut y) = (x, y);
-        let dx = (end_x - x).abs();
-        let step_x = if x < end_x { 1 } else { -1 };
-        let dy = -(end_y - y).abs();
-        let step_y = if y < end_y { 1 } else { -1 };
-        let mut error = dx + dy;
-        for _ in 0..2000 {
-            self.gpu_pixel(x, y, color);
-            if x == end_x && y == end_y {
-                break;
-            }
-            let doubled = error * 2;
-            if doubled >= dy {
-                error += dy;
-                x += step_x;
-            }
-            if doubled <= dx {
-                error += dx;
-                y += step_y;
-            }
         }
     }
 
@@ -6253,41 +4891,6 @@ impl Default for Cpu {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn gpu3d_sincos(angle: u8) -> (i32, i32) {
-    let index = usize::from((angle >> 2) & 63);
-    (GPU3D_SIN_8_8[index], GPU3D_SIN_8_8[(index + 16) & 63])
-}
-
-fn gpu3d_transform(
-    [mut x, mut y, mut z]: [i32; 3],
-    angles: [u8; 3],
-    translation: [i32; 3],
-) -> (i32, i32, i32) {
-    let (sin_x, cos_x) = gpu3d_sincos(angles[0]);
-    let (sin_y, cos_y) = gpu3d_sincos(angles[1]);
-    let (sin_z, cos_z) = gpu3d_sincos(angles[2]);
-    (y, z) = ((y * cos_x - z * sin_x) >> 8, (y * sin_x + z * cos_x) >> 8);
-    (x, z) = ((x * cos_y + z * sin_y) >> 8, (-x * sin_y + z * cos_y) >> 8);
-    (x, y) = ((x * cos_z - y * sin_z) >> 8, (x * sin_z + y * cos_z) >> 8);
-    (x + translation[0], y + translation[1], z + translation[2])
-}
-
-fn gpu3d_project(
-    (x, y, depth): (i32, i32, i32),
-    focal: i32,
-    width: i32,
-    height: i32,
-) -> (i32, i32) {
-    let projected_x = i64::from(x) * i64::from(focal);
-    let projected_y = i64::from(y) * i64::from(focal);
-    let screen_x = i64::from(width / 2) + (projected_x.div_euclid(i64::from(depth)) >> 8);
-    let screen_y = i64::from(height / 2) - (projected_y.div_euclid(i64::from(depth)) >> 8);
-    (
-        screen_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        screen_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-    )
 }
 
 #[cfg(test)]
@@ -6665,7 +5268,7 @@ mod tests {
         use crate::machine::*;
 
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_MODE_ADDR, 1);
+        cpu.set_graphics_mode(1).unwrap();
         cpu.set_mouse_position(u16::MAX, u16::MAX);
         assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_X).unwrap(), 639);
         assert_eq!(cpu.read_guest_u16(INPUT_MOUSE_Y).unwrap(), 479);
@@ -6852,6 +5455,9 @@ mod tests {
             (0x43016, 0xa4),
             (0x43018, 0xa5),
             (0x4301c, 0xa6),
+            (0x43014, 0xa7),
+            (0x43020, 0xa8),
+            (0x430ff, 0xa9),
             (0x43100, 0xa7),
             (0x431ff, 0xa8),
             (0x43200, 0xa7),
@@ -7006,46 +5612,6 @@ mod tests {
         cpu.prepare_image_entry();
         assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 2);
         assert_eq!(cpu.read_guest_u16(AUDIO_FREQUENCY).unwrap(), 440);
-        assert_eq!(
-            cpu.take_sound_commands(),
-            [GpuSoundCommand {
-                channel: 1,
-                frequency: 440,
-                frames: 0,
-                waveform: 0,
-                volume: 0,
-            }]
-        );
-    }
-
-    #[test]
-    fn legacy_gpu_and_high_audio_share_one_pending_queue_without_shared_staging() {
-        use crate::machine::*;
-
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write_guest(AUDIO_CHANNEL, 1).unwrap();
-        cpu.write_guest_u16(AUDIO_FREQUENCY, 440).unwrap();
-        cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
-        cpu.write(GPU_BASE + 1, 5);
-        cpu.write_u16(GPU_BASE + 2, 220);
-        cpu.write_u16(GPU_BASE + 4, 60);
-        cpu.write_u16(GPU_BASE + 6, 8);
-        cpu.write_u16(GPU_BASE + 8, 200);
-        cpu.write(GPU_BASE, GPU_SOUND);
-        assert_eq!(cpu.read_guest(AUDIO_PENDING).unwrap(), 2);
-        assert_eq!(cpu.read_guest_u16(AUDIO_FREQUENCY).unwrap(), 440);
-        assert_eq!(
-            cpu.take_sound_commands(),
-            [GpuSoundCommand {
-                channel: 1,
-                frequency: 220,
-                frames: 60,
-                waveform: 8,
-                volume: 200,
-            }]
-        );
-        cpu.write(GPU_BASE, GPU_SOUND);
-        cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
         assert_eq!(
             cpu.take_sound_commands(),
             [GpuSoundCommand {
@@ -7630,44 +6196,6 @@ mod tests {
     }
 
     #[test]
-    fn high_and_legacy_network_commands_share_a_node_but_not_staging() {
-        use crate::machine::*;
-
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.set_network_port(0);
-        cpu.write(NETWORK_TITLE, b'H');
-        cpu.write(NETWORK_COMMAND, 1);
-        assert_eq!(cpu.read(NETWORK_STATUS), 0);
-        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
-        cpu.write(GPU_BASE + 1, 6);
-        cpu.write(GPU_BASE, GPU_NET_INFO);
-        assert_eq!(cpu.read_u16(GPU_BASE + 14), 1);
-        cpu.write(GPU_BASE, GPU_NET_CLOSE);
-        cpu.write(NETWORK_QUERY, 6);
-        cpu.write(NETWORK_COMMAND, 5);
-        assert_eq!(cpu.read_u16(NETWORK_RESULT), 0);
-
-        cpu.memory[0x1000..0x1002].copy_from_slice(b"L\0");
-        cpu.write_u16(GPU_BASE + 10, 0x1000);
-        cpu.write(GPU_BASE, GPU_NET_OPEN);
-        cpu.write(NETWORK_COMMAND, 5);
-        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
-        cpu.write(NETWORK_TITLE, 0);
-        cpu.write(NETWORK_COMMAND, 1);
-        assert_eq!(cpu.read(NETWORK_STATUS), 3);
-        cpu.write(NETWORK_COMMAND, 5);
-        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
-        cpu.write(NETWORK_COMMAND, 4);
-        assert_eq!(cpu.read(NETWORK_STATUS), 6);
-        cpu.prepare_image_entry();
-        cpu.write(NETWORK_COMMAND, 5);
-        assert_eq!(cpu.read_u16(NETWORK_RESULT), 1);
-        cpu.write(NETWORK_COMMAND, 2);
-        cpu.write(GPU_BASE, GPU_NET_INFO);
-        assert_eq!(cpu.read_u16(GPU_BASE + 14), 0);
-    }
-
-    #[test]
     fn high_interrupt_registers_are_independent_of_legacy_ram_addresses() {
         use crate::machine::*;
 
@@ -8159,8 +6687,8 @@ mod tests {
                 }
             }
             for address in [
-                0x43000, 0x43010, 0x43016, 0x43018, 0x4301c, 0x43100, 0x431ff, 0x43200, 0x43300,
-                0x43400, 0x43fff, 0x44000,
+                0x43000, 0x43010, 0x43014, 0x43016, 0x43018, 0x4301c, 0x43020, 0x430ff, 0x43100,
+                0x431ff, 0x43200, 0x43300, 0x43400, 0x43fff, 0x44000,
             ] {
                 assert_eq!(
                     cpu.guest_memory_addresses(address, 1, crate::mmu::MemoryAccess::Read, true)
@@ -9828,22 +8356,18 @@ mod tests {
                 ));
             }
         }
-        for address in [0x43010, 0x43016, 0x43018, 0x43200, 0x43300, 0x43400] {
-            assert!(
-                cpu.check_guest_access(address, crate::mmu::MemoryAccess::Read)
-                    .is_ok()
-            );
+        for address in [
+            0x43010, 0x43014, 0x43016, 0x43018, 0x4301c, 0x43020, 0x430ff, 0x43100, 0x431ff,
+            0x43200, 0x43300, 0x43400,
+        ] {
+            for access in [
+                crate::mmu::MemoryAccess::Read,
+                crate::mmu::MemoryAccess::Write,
+                crate::mmu::MemoryAccess::Fetch,
+            ] {
+                assert!(cpu.check_guest_access(address, access).is_ok());
+            }
         }
-        for address in [GPU_MODE_ADDR, GPU_BASE] {
-            assert!(matches!(
-                cpu.check_guest_access(address, crate::mmu::MemoryAccess::Write),
-                Err(CpuError::PrivilegeViolation { .. })
-            ));
-        }
-        assert!(
-            cpu.check_guest_access(0x43100, crate::mmu::MemoryAccess::Write)
-                .is_ok()
-        );
     }
 
     #[test]
@@ -10877,319 +9401,6 @@ mod tests {
     }
 
     #[test]
-    fn layered_clear_and_transparency_keep_black_background() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_BASE + 1, 0);
-        cpu.write(GPU_BASE, GPU_CLEAR);
-        cpu.write(GPU_BASE + 1, 4);
-        cpu.write(GPU_BASE, GPU_CLEAR);
-
-        cpu.write(GPU_LAYER_SELECT, 1);
-        cpu.write(GPU_LAYER_TRANSPARENCY + 1, 255);
-        cpu.write(GPU_BASE + 1, 255);
-        cpu.write(GPU_BASE, GPU_CLEAR);
-        cpu.write(GPU_BASE + 1, 2);
-        cpu.write_u16(GPU_BASE + 2, 0);
-        cpu.write_u16(GPU_BASE + 4, 0);
-        cpu.write(GPU_BASE, GPU_PIXEL);
-
-        let framebuffer = cpu.composited_framebuffer();
-        assert_eq!(framebuffer[0], 2);
-        assert_eq!(framebuffer[1], 4);
-        assert_eq!(framebuffer[framebuffer.len() - 1], 4);
-        let mut reused = vec![0; framebuffer.len()];
-        cpu.composited_framebuffer_into(&mut reused);
-        assert_eq!(reused, framebuffer);
-    }
-
-    #[test]
-    fn gpu_palette_command_updates_selected_color() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_BASE + 1, 42);
-        cpu.write_u16(GPU_BASE + 2, 10);
-        cpu.write_u16(GPU_BASE + 4, 20);
-        cpu.write_u16(GPU_BASE + 6, 30);
-        cpu.write(GPU_BASE, GPU_PALETTE);
-        assert_eq!(cpu.palette_color(42), [10, 20, 30]);
-    }
-
-    #[test]
-    fn gpu_sound_commands_capture_unsigned_parameters_per_channel() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_BASE + 1, 5);
-        cpu.write_u16(GPU_BASE + 2, 440);
-        cpu.write_u16(GPU_BASE + 4, 60);
-        cpu.write_u16(GPU_BASE + 6, 2);
-        cpu.write_u16(GPU_BASE + 8, 75);
-        cpu.write(GPU_BASE, GPU_SOUND);
-        cpu.write(GPU_BASE + 1, 2);
-        cpu.write_u16(GPU_BASE + 2, 0);
-        cpu.write(GPU_BASE, GPU_SOUND);
-
-        assert_eq!(
-            cpu.take_sound_commands(),
-            [
-                GpuSoundCommand {
-                    channel: 1,
-                    frequency: 440,
-                    frames: 60,
-                    waveform: 2,
-                    volume: 75,
-                },
-                GpuSoundCommand {
-                    channel: 2,
-                    frequency: 0,
-                    frames: 60,
-                    waveform: 2,
-                    volume: 75,
-                },
-            ]
-        );
-        assert!(cpu.take_sound_commands().is_empty());
-    }
-
-    #[test]
-    fn tile_upload_and_tilemap_render_indexed_pixels() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        for index in 0..256 {
-            cpu.memory[0x1000 + index] = index as u8;
-        }
-        cpu.write_u16(GPU_BASE + 10, 0x1000);
-        cpu.write(GPU_BASE + 1, 1);
-        cpu.write(GPU_BASE, GPU_TILE_UPLOAD);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-
-        cpu.memory[0x2000] = 1;
-        cpu.write_u16(GPU_BASE + 10, 0x2000);
-        cpu.write_u16(GPU_BASE + 2, 0);
-        cpu.write_u16(GPU_BASE + 4, 0);
-        cpu.write_u16(GPU_BASE + 6, 1);
-        cpu.write_u16(GPU_BASE + 8, 1);
-        cpu.write(GPU_BASE, GPU_TILEMAP);
-
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        assert_eq!(cpu.layers[1][0], 0);
-        assert_eq!(cpu.layers[1][15], 15);
-        assert_eq!(cpu.layers[1][320], 16);
-        assert_eq!(cpu.layers[1][15 * 320 + 15], 255);
-        assert_eq!(cpu.layers[1][16], 0);
-    }
-
-    #[test]
-    fn finland_sized_tilemap_upload_preserves_all_ten_thousand_tiles() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        let expected: Vec<u8> = (0..10_000).map(|index| (index % 256) as u8).collect();
-        cpu.memory[0x4000..0x4000 + expected.len()].copy_from_slice(&expected);
-        cpu.write_u16(GPU_BASE + 10, 0x4000);
-        cpu.write_u16(GPU_BASE + 2, 0);
-        cpu.write_u16(GPU_BASE + 4, 0);
-        cpu.write_u16(GPU_BASE + 6, 100);
-        cpu.write_u16(GPU_BASE + 8, 100);
-        cpu.write(GPU_BASE, GPU_TILEMAP);
-
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        assert_eq!((cpu.tilemap_width, cpu.tilemap_height), (100, 100));
-        assert_eq!(cpu.tilemap, expected);
-    }
-
-    #[test]
-    fn invalid_tilemap_dimensions_return_error_without_replacing_map() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.tilemap = vec![3];
-        cpu.tilemap_width = 1;
-        cpu.tilemap_height = 1;
-        cpu.write_u16(GPU_BASE + 6, 0);
-        cpu.write_u16(GPU_BASE + 8, 1);
-        cpu.write(GPU_BASE, GPU_TILEMAP);
-
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-        assert_eq!(cpu.tilemap, [3]);
-    }
-
-    #[test]
-    fn sprite_upload_and_move_render_transparency_and_horizontal_flip() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.memory[0x1000..0x1004].copy_from_slice(&[1, 0, 2, 3]);
-        cpu.write_u16(GPU_BASE + 10, 0x1000);
-        cpu.write(GPU_BASE + 1, 0);
-        cpu.write_u16(GPU_BASE + 6, 2);
-        cpu.write_u16(GPU_BASE + 8, 2);
-        cpu.write(GPU_BASE, GPU_SPRITE_UPLOAD);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-
-        cpu.write_u16(GPU_BASE + 2, 5);
-        cpu.write_u16(GPU_BASE + 4, 6);
-        cpu.write_u16(GPU_BASE + 6, 3);
-        cpu.write(GPU_BASE, GPU_SPRITE_MOVE);
-
-        let row_start = 6 * 320 + 5;
-        assert_eq!(&cpu.layers[2][row_start..row_start + 2], &[0, 1]);
-        let next_row = row_start + 320;
-        assert_eq!(&cpu.layers[2][next_row..next_row + 2], &[3, 2]);
-    }
-
-    #[test]
-    fn collision_masks_check_opaque_pixels_and_report_missing_masks() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.memory[0x1000..0x1004].copy_from_slice(&[1, 0, 0, 0]);
-        cpu.memory[0x1100..0x1104].copy_from_slice(&[0, 1, 0, 0]);
-        for (slot, source) in [(0, 0x1000), (1, 0x1100)] {
-            cpu.write_u16(GPU_BASE + 10, source);
-            cpu.write(GPU_BASE + 1, slot);
-            cpu.write_u16(GPU_BASE + 6, 2);
-            cpu.write_u16(GPU_BASE + 8, 2);
-            cpu.write(GPU_BASE, GPU_SPRITE_UPLOAD);
-            assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        }
-
-        cpu.write_u16(GPU_BASE + 10, 0);
-        cpu.write_u16(GPU_BASE + 12, 1);
-        cpu.write_u16(GPU_BASE + 2, 10);
-        cpu.write_u16(GPU_BASE + 4, 20);
-        cpu.write_u16(GPU_BASE + 6, 10);
-        cpu.write_u16(GPU_BASE + 8, 20);
-        cpu.write(GPU_BASE, GPU_MASK_OVERLAP);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-
-        cpu.write_u16(GPU_BASE + 6, 9);
-        cpu.write(GPU_BASE, GPU_MASK_OVERLAP);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-
-        cpu.write_u16(GPU_BASE + 12, 63);
-        cpu.write(GPU_BASE, GPU_MASK_OVERLAP);
-        assert_eq!(
-            &cpu.memory[(GPU_BASE + 14) as usize..(GPU_BASE + 16) as usize],
-            &[255, 255]
-        );
-    }
-
-    #[test]
-    fn wide_collision_masks_support_signed_32_bit_coordinates() {
-        let first = (2, 2, vec![1, 0, 0, 0]);
-        let second = (2, 2, vec![0, 1, 0, 0]);
-        assert!(Cpu::masks_overlap(&first, -70_000, 0, &second, -70_001, 0));
-        assert!(!Cpu::masks_overlap(
-            &first,
-            i32::MAX,
-            0,
-            &second,
-            i32::MIN,
-            0
-        ));
-    }
-
-    #[test]
-    fn world_rect_and_ammo_draw_relative_to_the_active_camera() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_LAYER_SELECT, 1);
-        cpu.write_u16(GPU_BASE + 2, 10);
-        cpu.write_u16(GPU_BASE + 4, 20);
-        cpu.write(GPU_BASE, GPU_TILE_CAMERA);
-
-        cpu.write(GPU_BASE + 1, 6);
-        cpu.write_u16(GPU_BASE + 2, 11);
-        cpu.write_u16(GPU_BASE + 4, 21);
-        cpu.write_u16(GPU_BASE + 6, 2);
-        cpu.write_u16(GPU_BASE + 8, 1);
-        cpu.write(GPU_BASE, GPU_WORLD_RECT);
-        assert_eq!(cpu.layers[1][320 + 1], 6);
-        assert_eq!(cpu.layers[1][320 + 2], 6);
-        assert_eq!(cpu.layers[1][320], 0);
-
-        cpu.write_u16(GPU_BASE + 2, 13);
-        cpu.write_u16(GPU_BASE + 4, 22);
-        cpu.write(GPU_BASE, GPU_WORLD_AMMO);
-        assert_eq!(cpu.layers[1][2 * 320 + 3], 1);
-        assert_eq!(cpu.layers[1][2 * 320 + 5], 5);
-    }
-
-    #[test]
-    fn world_tiles_preserve_zero_transparency_and_particle_inputs_validate() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        let tile_start = 2 * GPU_TILE_MAX_SIZE * GPU_TILE_MAX_SIZE;
-        cpu.tile_memory[tile_start..tile_start + 16 * 16].fill(0);
-        cpu.tile_memory[tile_start] = 9;
-        cpu.write(GPU_LAYER_SELECT, 2);
-        cpu.write(GPU_BASE + 1, 2);
-        cpu.write_u16(GPU_BASE + 2, 0);
-        cpu.write_u16(GPU_BASE + 4, 0);
-        cpu.write(GPU_BASE, GPU_WORLD_TILE);
-        assert_eq!(cpu.layers[2][0], 9);
-        assert_eq!(cpu.layers[2][1], 0);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-
-        cpu.write(GPU_BASE + 1, 5);
-        cpu.write_u16(GPU_BASE + 2, 20);
-        cpu.write_u16(GPU_BASE + 4, 20);
-        cpu.write_u16(GPU_BASE + 6, 1);
-        cpu.write_u16(GPU_BASE + 8, 16);
-        cpu.write(GPU_BASE, GPU_WORLD_PARTICLE);
-        assert_eq!(cpu.layers[2][20 * 320 + 20], 5);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-
-        cpu.write_u16(GPU_BASE + 6, 33);
-        cpu.write(GPU_BASE, GPU_WORLD_PARTICLE);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-    }
-
-    #[test]
-    fn world_emitters_draw_fire_smoke_and_uploaded_wreck_masks() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_LAYER_SELECT, 2);
-        cpu.memory[0x1000..0x1008].copy_from_slice(&[0, 100, 0, 100, 0, 1, 0xff, 0xff]);
-        cpu.write_u16(GPU_BASE + 10, 0x1000);
-        cpu.write_u16(GPU_BASE + 2, 1);
-        cpu.write_u16(GPU_BASE + 4, 0);
-        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        assert!(cpu.layers[2][100 * 320 + 100] != 0);
-
-        let tile_mask = GPU_SPRITE_SLOTS as u16;
-        cpu.tile_memory[..16 * 16].fill(1);
-        cpu.memory[0x1010..0x1018].copy_from_slice(&[0, 120, 0, 120, 0, 1, 0, tile_mask as u8]);
-        cpu.write_u16(GPU_BASE + 10, 0x1010);
-        cpu.write_u16(GPU_BASE + 2, 1);
-        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        assert_eq!(cpu.layers[2][112 * 320 + 112], 10);
-    }
-
-    #[test]
-    fn world_emitter_commands_reject_invalid_buffers_and_layers() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write_u16(GPU_BASE + 10, 0xffff);
-        cpu.write_u16(GPU_BASE + 2, 2);
-        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-
-        cpu.write(GPU_LAYER_SELECT, 0);
-        cpu.write_u16(GPU_BASE + 10, 0);
-        cpu.write_u16(GPU_BASE + 2, 0);
-        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-    }
-
-    #[test]
-    fn wide_world_emitters_use_camera_adjusted_32_bit_coordinates() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_LAYER_SELECT, 2);
-        cpu.write_u16(GPU_BASE + 2, 69_990u32 as u16);
-        cpu.write_u16(GPU_BASE + 24, 1);
-        cpu.write_u16(GPU_BASE + 4, 90);
-        cpu.write_u16(GPU_BASE + 26, 0);
-        cpu.write(GPU_BASE, GPU_TILE_CAMERA_WIDE);
-        assert_eq!(cpu.tile_camera, (69_990, 90));
-        cpu.memory[0x2000..0x200c]
-            .copy_from_slice(&[0, 1, 0x11, 0x70, 0, 0, 0, 100, 0, 1, 0xff, 0xff]);
-        cpu.write_u16(GPU_BASE + 10, 0x2000);
-        cpu.write_u16(GPU_BASE + 2, 1);
-        cpu.write_u16(GPU_BASE + 4, 0);
-        cpu.write(GPU_BASE, GPU_WORLD_EMITTERS_WIDE);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        assert!(cpu.layers[2][10 * 320 + 10] != 0);
-    }
-
-    #[test]
     fn mounting_data_disks_preserves_the_loaded_program_and_rejects_missing_ids() {
         let root = std::env::temp_dir().join(format!(
             "sc16-cpu-data-disk-{}-{}",
@@ -11223,47 +9434,6 @@ mod tests {
         assert_eq!(cpu.memory[0x1234], 0x5a);
         assert!(cpu.folder_disk.is_some());
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn gpu_network_commands_open_query_send_and_close_peer() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.set_network_port(0);
-        cpu.memory[0x1000..0x1005].copy_from_slice(b"game\0");
-        cpu.write_u16(GPU_BASE + 10, 0x1000);
-        cpu.write(GPU_BASE, GPU_NET_OPEN);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-
-        cpu.write(GPU_BASE + 1, 0);
-        cpu.write(GPU_BASE, GPU_NET_INFO);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-        cpu.write(GPU_BASE + 1, 1);
-        cpu.write(GPU_BASE, GPU_NET_INFO);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-
-        cpu.memory[0x1100..0x1104].copy_from_slice(b"data");
-        cpu.write_u16(GPU_BASE + 10, 0x1100);
-        cpu.write_u16(GPU_BASE + 2, 4);
-        cpu.write(GPU_BASE, GPU_NET_SEND);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 1);
-
-        cpu.write(GPU_BASE, GPU_NET_CLOSE);
-        cpu.write(GPU_BASE + 1, 6);
-        cpu.write(GPU_BASE, GPU_NET_INFO);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-    }
-
-    #[test]
-    fn empty_guest_network_title_is_not_replaced_by_the_bios_node_name() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.set_network_port(0);
-        cpu.bios_settings.network_name = "SC16-0123456789A".to_owned();
-        cpu.write_u16(GPU_BASE + 10, 0x1000);
-
-        cpu.write(GPU_BASE, GPU_NET_OPEN);
-
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        cpu.write(GPU_BASE, GPU_NET_CLOSE);
     }
 
     #[test]
@@ -11585,77 +9755,11 @@ mod tests {
     }
 
     #[test]
-    fn gpu_3d_projects_scene_triangles_for_macroquad() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        let scene = [
-            3,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1000,
-            10000,
-            GPU3D_FILL as i16,
-            -1000,
-            -1000,
-            0,
-            0,
-            1000,
-            0,
-            1000,
-            -1000,
-            0,
-            0,
-            1,
-            2,
-            2,
-        ];
-        for (index, value) in scene.into_iter().enumerate() {
-            cpu.write_u16(0x1000 + (index * 2) as u32, value as u16);
-        }
-        cpu.write(GPU_BASE + 10, 0x10);
-        cpu.write(GPU_BASE + 11, 0);
-        cpu.write(GPU_BASE, GPU_3D);
-        assert_eq!(cpu.memory[(GPU_BASE + 15) as usize], 0);
-        assert_eq!(
-            cpu.gpu_triangles,
-            [GpuTriangle {
-                points: [(120, 160), (160, 81), (199, 160)],
-                color: 2,
-            }]
-        );
-    }
-
-    #[test]
     fn binary16_conversion_rounds_and_handles_special_values() {
         assert_eq!(f16_to_f32(f32_to_f16(1.5)), 1.5);
         assert_eq!(f16_to_f32(f32_to_f16(f32::INFINITY)), f32::INFINITY);
         assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
         assert_eq!(f32_to_f16(1.0 + f32::EPSILON), 0x3c00);
-    }
-
-    #[test]
-    fn gpu_rect_command_updates_vram_and_present_yields() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write(GPU_BASE + 1, 7);
-        cpu.write_u16(GPU_BASE + 2, 1);
-        cpu.write_u16(GPU_BASE + 4, 2);
-        cpu.write_u16(GPU_BASE + 6, 2);
-        cpu.write_u16(GPU_BASE + 8, 2);
-        assert_eq!(cpu.gpu_word(2), 1);
-        assert_eq!(cpu.gpu_word(4), 2);
-        cpu.write(GPU_BASE, GPU_RECT);
-        assert_eq!(cpu.vram[641], 7);
-        assert_eq!(cpu.vram[642], 7);
-        assert_eq!(cpu.vram[961], 7);
-        cpu.write(GPU_BASE, GPU_PRESENT);
-        assert!(cpu.frame_yield);
-        assert!(cpu.frame_presented);
-        cpu.begin_frame();
-        assert!(!cpu.frame_yield);
-        assert!(!cpu.frame_presented);
     }
 
     #[test]
@@ -11872,22 +9976,6 @@ mod tests {
         assert_eq!(cpu.pc, 0x200);
         cpu.step().unwrap();
         assert_eq!(cpu.pc, 4);
-    }
-
-    #[test]
-    fn pit_period_register_does_not_overlap_gpu_mode_register() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.write_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD, 2)
-            .unwrap();
-
-        cpu.write(GPU_MODE_ADDR, 1);
-
-        assert_eq!(
-            cpu.read_guest_u16(crate::machine::INTERRUPT_PIT_PERIOD)
-                .unwrap(),
-            2
-        );
-        assert_eq!(cpu.screen_size(), (640, 480));
     }
 
     #[test]
@@ -12183,46 +10271,6 @@ mod tests {
         assert_eq!(cpu.pc, code_address + 4);
         assert_eq!(cpu.sp, stack_pointer - 2);
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-    }
-
-    #[test]
-    fn mmu_user_gpu_commands_cannot_bypass_guest_buffer_permissions() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        let mut manager = crate::mmu::PageMemoryManager::new(cpu.memory.len(), 0x8000).unwrap();
-        let directory = manager.create_address_space(&mut cpu.memory).unwrap();
-        manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x1000,
-                crate::mmu::PagePermissions::USER_CODE,
-            )
-            .unwrap();
-        manager
-            .allocate_and_map_page(
-                &mut cpu.memory,
-                directory,
-                0x2000,
-                crate::mmu::PagePermissions::USER_DATA,
-            )
-            .unwrap();
-        cpu.memory[0x9000..0x9002].copy_from_slice(&0u16.to_be_bytes());
-        cpu.enable_mmu(directory).unwrap();
-        cpu.enter_user_mode(0x1000, 0x3000).unwrap();
-        cpu.memory[(GPU_BASE + 1) as usize] = 0;
-        cpu.memory[(GPU_BASE + 6) as usize] = 0;
-        cpu.memory[(GPU_BASE + 7) as usize] = 1;
-        cpu.memory[(GPU_BASE + 8) as usize] = 0;
-        cpu.memory[(GPU_BASE + 9) as usize] = 1;
-        cpu.memory[(GPU_BASE + 10) as usize] = 0x40;
-        cpu.memory[(GPU_BASE + 11) as usize] = 0;
-        cpu.memory[(GPU_BASE + 12) as usize] = 0;
-        cpu.memory[(GPU_BASE + 13) as usize] = 0;
-
-        cpu.write(GPU_BASE, GPU_SPRITE_UPLOAD);
-
-        assert!(cpu.sprites[0].is_none());
-        assert_eq!(cpu.read_u16(GPU_BASE + 14), 1);
     }
 
     #[test]

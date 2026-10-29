@@ -36,10 +36,9 @@ access.
 The system identification, interrupt/PIT, fault, input, clock/random, graphics,
 audio, game-network, filesystem, console, firmware-text and firmware-gateway
 banks are implemented in this aperture without RAM backing. All other high
-banks remain reserved. The low console/text, interrupt/PIT, RTC, fault and BIOS
-aliases have been retired and their addresses are ordinary RAM. Legacy low
-graphics and disk register windows remain reserved and supervisor-only until
-those interfaces are removed. Instruction operands retain architectural
+banks remain reserved. The low console/text, interrupt/PIT, RTC, fault, BIOS, graphics and disk
+aliases have been retired and their former addresses are ordinary RAM.
+Instruction operands retain architectural
 address bits before high-device checks, including on small-memory machines;
 device accesses cannot be masked into low RAM. Legacy wrapping of nondevice RAM
 accesses remains during migration.
@@ -272,12 +271,12 @@ sound. Stop validates the channel but ignores frequency/duration/waveform/volume
 enqueuing a zero-frequency command with the remaining parameters zero. Successful
 commands clear a previous error status. Commands do not clear or rewrite staging.
 
-The four pending slots are shared with legacy GPU sound commands. The last
-accepted command for each channel replaces any unconsumed command for that
-channel; other channels remain independent. Host consumption takes each slot
-exactly once in channel order. Pending means awaiting host consumption, not
-currently playing or successful host audio output. Reads of command, status,
-staging and pending have no side effects; no register polls yield or block.
+The four pending slots are independent per channel. The last accepted command
+for each channel replaces any unconsumed command for that channel; other
+channels remain independent. Host consumption takes each slot exactly once in
+channel order. Pending means awaiting host consumption, not currently playing
+or successful host audio output. Reads of command, status, staging and pending
+have no side effects; no register polls yield or block.
 Rejected multi-byte accesses cause CPU faults before changing staging, status
 or pending sound. There are no writable reserved bits or asynchronous device
 commands. Audio staging/status/pending state survives image-entry preparation,
@@ -288,9 +287,7 @@ renderer. Frequency zero stops that channel; other frequencies are clamped to
 20..11025 Hz at rendering. Duration uses unsigned 16-bit frames, with zero
 looping until replacement/stop; volume zero means 100%, not silence. Runtime
 audio-device failures remain host runtime errors, not an accepted-sound guarantee.
-The high bank rejects unsupported waveforms/volumes explicitly; the migration
-alias retains legacy channel masking, waveform fallback and volume clamping.
-Legacy GPU parameter bytes do not modify high audio staging or status. No audio
+The high bank rejects unsupported waveforms and volumes explicitly. No audio
 command accepts a RAM pointer, and high audio accesses never index RAM.
 
 ==== Game-network bank
@@ -343,10 +340,9 @@ The existing game protocol supports eight players, 48-byte payloads, and a
 discovery, timeouts and close semantics are unchanged. This is the game UDP
 protocol, not SC-NET, and it provides no authentication or reliable delivery.
 
-Legacy GPU network commands and the high bank share exactly one node/inbox;
-consumption through either interface removes the same packet. Their staging,
-results and status are separate. Legacy pointer/length/title handling and
-best-effort send-result semantics remain unchanged during migration.
+The high bank stages network request data in bounded device-owned buffers;
+consumption removes a packet from the shared inbox. It accepts no guest pointer
+and does not expose host memory.
 
 ==== Console bank
 
@@ -579,13 +575,9 @@ epoch, frame count and random state survive image-entry preparation.
 
 Random uses the existing deterministic xorshift32 sequence (shifts 13, 17, 5),
 initially seeded with `0x16c0ffee`. It is intended for guest games, not passwords,
-salts, security tokens or entropy. Legacy GPU random commands and high random
-captures advance the same sequence; legacy GPU commands do not overwrite a high
-snapshot. Legacy GPU ticks/RTC commands use the same frame counter/live RTC,
-without changing captured time. Runtime and gallery RTC producers update typed
-clock state and latch the existing RTC interrupt; low RTC reads use that state
-instead of RAM. Migration-time supervisor low RTC writes retain their prior
-byte-write behavior; direct host RAM mutation is no longer a clock device API.
+salts, security tokens or entropy. High random captures advance this sequence.
+Runtime and gallery RTC producers update typed clock state and latch the
+existing RTC interrupt; direct host RAM mutation is not a clock device API.
 
 The instruction decoder must distinguish an invalid or unavailable encoding
 from a halt. In the target architecture, an invalid encoding raises an illegal
@@ -734,9 +726,8 @@ It opts that task into the emulator-backed scheduling and syscall extension.
 save registers on timer entry, change its page-directory root, select a saved
 supervisor stack, and resume with `RTI`.
 High-aperture MMIO access is rejected in user mode, including translated
-aliases. The remaining low graphics register window is supervisor-only.
-Retired low console/text, interrupt/clock/fault, BIOS and disk addresses are
-ordinary RAM rather than device aliases. User programs use only typed,
+aliases. Retired low graphics, console/text, interrupt/clock/fault, BIOS and
+disk addresses are ordinary RAM rather than device aliases. User programs use only typed,
 validated syscall services; there is no generic register or physical-memory
 access syscall.
 
@@ -875,8 +866,6 @@ unmap. Unmapped pages can serve as guard pages. These are kernel primitives;
 the BIOS does not yet establish a protected address space as part of normal
 user boot.
 
-The emulator-managed process allocator reserves the remaining low graphics
-register window before allocating page tables or process pages.
 The high device aperture is excluded from usable RAM, images, and page
 allocations. Graphics pixels live in a device-owned buffer, independent of
 backing RAM size and unaddressable by guest loads, stores, DMA-like operations
@@ -886,23 +875,21 @@ alias the device-owned pixels.
 
 == Device access
 
-The emulator exposes the revised device banks through high-address,
-supervisor-only MMIO. The remaining low graphics register window is
-migration-only and supervisor-only; retired low control, terminal, BIOS and
-disk addresses are RAM. The folder-filesystem gateway validates user pointers
+The emulator exposes the device banks through high-address, supervisor-only
+MMIO. Retired low graphics, control, terminal, BIOS and disk addresses are
+ordinary RAM. The folder-filesystem gateway validates user pointers
 against the active MMU mappings, including noncontiguous buffers, when paging
 is enabled. The retired low disk window has no command handler. This device
 gateway remains distinct from the general syscall ABI. With translation
 disabled, ordinary RAM is not isolated from user code.
 
 Validated buffer services reject both virtual and translated physical addresses
-in the high device aperture and the remaining low graphics window. This applies
-to paths, arguments, console and file transfers, process reports, networking,
-and folder gateway transfers, including requests made by supervisor code through those
-buffer helpers. Checks cover every requested byte before consuming input or
-modifying output; crossing from ordinary RAM into a device range is an error,
-not a partial transfer. Direct access to the remaining legacy low graphics
-window is not a supported user interface.
+in the high device aperture. This applies to paths, arguments, console and file
+transfers, process reports, networking, graphics and folder gateway transfers,
+including requests made by supervisor code through those buffer helpers.
+Checks cover every requested byte before consuming input or modifying output;
+crossing from ordinary RAM into a device range is an error, not a partial
+transfer.
 
 == System-call ABI version 1
 

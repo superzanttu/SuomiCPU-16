@@ -619,11 +619,9 @@ Checklist status: [x] completed; [ ] planned.
      framebuffer storage, bounded inline pixel operations, mode selection,
      full-region validation, protected aliases, and compiled-C/native execution
      regressions.
-**** [x] Retire low console/text, interrupt/PIT, RTC, fault, BIOS and disk
-     aliases; verify these addresses are ordinary RAM while keeping the active
-     low graphics window reserved and supervisor-only.
-**** [ ] Retire the remaining low graphics register window and verify its
-     former addresses are ordinary RAM with no handler or buffer reservation.
+**** [x] Retire low console/text, interrupt/PIT, RTC, fault, BIOS, disk and
+     graphics aliases; verify their former addresses are ordinary RAM with no
+     handler or buffer reservation.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup

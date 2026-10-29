@@ -1484,7 +1484,9 @@ vectors, and the boot routine at +0x0006+ calls +main+. Compiled code starts at
 30-bit PC; code is no longer
 restricted to addresses below +0x10000+ for call/return correctness. Libraries use fixed
 low-memory locations: +lib_gfx+ at +0x400+, +lib_text+ at +0x700+, and
-+lib_cgfx+ at +0x1000+. The compiler/assembler reports errors when emitted
++lib_cgfx+ at +0x1000+. The legacy graphics libraries target the retired
+low-address GPU interface and are unsupported by the current emulator.
+The compiler/assembler reports errors when emitted
 sections overlap or stack frames exceed supported limits. The command-line
 compiler writes a flat +.bin+ image with address gaps zero-filled; the emulator
 loads it at address zero. In link:../examples/factorial.c[+examples/factorial.c+],
@@ -1494,193 +1496,26 @@ The preprocessor implements the directives and extensions listed above, but is
 not certified against the full C90 translation limits or conformance suite.
 For shifts, +>>+ is arithmetic for +int+ and logical for unsigned types.
 
-=== C graphics library (+gfx_*+)
+=== Graphics device
 
-link:../toolchain/include/suomi_gfx.h[+toolchain/include/suomi_gfx.h+] declares the graphics builtins and defines color
-(+RED+, +GREEN+, ...), key (+KEY_LEFT+, +KEY_FIRE+, ...) and screen-size
-constants. Using any +gfx_*+ function makes the compiler link
-link:../toolchain/runtime/lib_cgfx.asm[+toolchain/runtime/lib_cgfx.asm+], which drives the graphics coprocessor, plus the
-font. Five hardware layers are composited from lowest to highest priority:
-background/VRAM (0), tiles (1), sprites (2), 3D (3), and HUD (4) by default.
-Higher priorities cover lower ones; equal priorities are ordered by layer
-number. +gfx_layer_order()+ changes a layer's 8-bit priority. Zero is the
-default transparent color for each layer. Layer visibility is selected with a
-five-bit mask. +gfx_present()+ composites the enabled layers for display and
-ends the current emulator frame; it does not copy or overwrite VRAM. The GPU
-keeps layer, tile, and sprite storage outside the SC-16 CPU-visible address
-space.
+The emulator's graphics bank begins at +0x3ff05000+ and is supervisor-only.
+It provides bounded clear, pixel, rectangle, line, present, inline-blit,
+palette, and display-mode operations through typed registers. The device owns
+its framebuffer; guest code cannot address its pixels directly. Drawing uses
+unsigned coordinates in the active 320x240 or 640x480 mode, and every operation
+validates its complete region before changing the framebuffer.
 
-[cols="1,1"]
-|===
-|Function
-|Behavior
+Protected user programs use system-call ABI version 1, syscall 24
+(+graphics+). The call copies a 10-byte parameter record and optional pixel or
+RGB data into kernel-owned memory before drawing. The service validates user
+buffers and returns the operation result; it does not alter supervisor
+graphics registers. See the graphics-bank register table and syscall contract
+in link:sc16_architecture.adoc[SC-16 architecture].
 
-|+void gfx_clear(unsigned char color)+
-|Fill the currently selected drawing layer.
-
-|+void gfx_pixel(int x, int y, unsigned char color)+
-|Plot one pixel.
-
-|+void gfx_rect(int x, int y, int w, int h, unsigned char color)+
-|Filled rectangle.
-
-|+void gfx_line(int x0, int y0, int x1, int y1, unsigned char color)+
-|Line (clipped).
-
-|+void gfx_poly(int x, int y, int n, char *pts, unsigned char color)+
-|Closed outline through +n+ signed-byte +(dx, dy)+ pairs relative to +(x, y)+.
-
-|+void gfx_sprite(int x, int y, int w, int h, unsigned char *data)+
-|Draw +w*h+ palette bytes; 0 is transparent.
-
-|+void gfx_bitmap(int x, int y, int w, int h, unsigned char *data, unsigned char color)+
-|1 bit per pixel, MSB first, +(w\+7)/8+ bytes per row.
-
-|+void gfx_text(int x, int y, char *text, unsigned char color)+
-|6x8-cell text from the 5x7 font; UTF-8 +??????+ and +\n+ supported.
-
-|+void gfx_present(void)+
-|Composite visible layers and wait for the next frame.
-
-|+void gfx_layer_select(int layer)+
-|Select a drawing target 0-4 for ordinary drawing commands.
-
-|+void gfx_layer_visibility(unsigned int mask)+
-|Set the visible-layer bitmask (+LAYER_ALL+ enables all five layers).
-
-|+void gfx_layer_transparency(int layer, unsigned char color)+
-|Set one layer's transparent palette index.
-
-|+void gfx_layer_order(int layer, int priority)+
-|Set a layer's 8-bit composition priority; larger values are drawn on top (defaults to layer index).
-
-|+void gfx_layer_reset(unsigned int visible_layers)+
-|Reset layer selection, visibility, transparency keys, and composition priorities for a new program.
-
-|+void gfx_sprite_upload(int slot, int w, int h, unsigned char *data)+
-|Copy an indexed, zero-transparent image (up to 64x64) into one of 64 hardware sprite slots.
-
-|+void gfx_sprite_move(int slot, int x, int y, int flags)+
-|Position/show a sprite; flags include +SPRITE_VISIBLE+, +SPRITE_FLIP_X+, and +SPRITE_FLIP_Y+.
-
-|+void gfx_tile_upload(int tile, unsigned char *pixels)+
-|Copy one 16x16 indexed tile into one of 256 hardware tile slots.
-
-|+unsigned int gfx_keys(void)+
-|Held-key bitmask.
-
-|+unsigned int gfx_keys_ext(void)+
-|Second key byte: Q roll left, E roll right, X/Shift thrust, Z/Ctrl reverse.
-
-|+unsigned int gfx_keys_ext2(void)+
-|Third held-key byte for application-specific controls. Tank-16 uses C, J, L, I, K, and period.
-
-|+unsigned int gfx_random(void)+
-|Random byte (0-255).
-
-|+int gfx_mouse_x(void)+ / +int gfx_mouse_y(void)+
-|Mouse position in screen pixels (0-319, 0-239).
-
-|+unsigned int gfx_mouse_buttons(void)+
-|Held buttons: +MOUSE_LEFT+ 1, +MOUSE_RIGHT+ 2 (use with position for dragging).
-
-|+unsigned int gfx_mouse_events(void)+
-|One-frame events: press +MOUSE_LEFT_DOWN+/+RIGHT_DOWN+ 1/2, double-click +MOUSE_LEFT_DOUBLE+/+RIGHT_DOUBLE+ 4/8, release +MOUSE_LEFT_UP+/+RIGHT_UP+ 16/32.
-
-|+int gfx_mouse_wheel(void)+
-|Signed vertical wheel delta for the current frame; positive scrolls up, negative scrolls down.
-
-|+void gfx_sound(int channel, int freq, int frames, int wave, int volume)+
-|Play a tone on channel 0-3; freq 0 stops it, frames 0 loops. +WAVE_SQUARE/NOISE/TRIANGLE+.
-
-|+void gfx_tilemap(unsigned char *map, int map_w, int map_h, int cam_x, int cam_y)+
-|Copy a map of tile IDs (up to 128x128) to GPU memory and set its pixel camera; tiles are 16x16.
-
-|+void gfx_tile_camera(int cam_x, int cam_y)+
-|Move the GPU tile-map camera without re-uploading its map.
-
-|+int gfx3d_draw(int *scene)+
-|Transform, project and draw a fixed-point scene into layer 3 using GPU command 22; returns 0 on success.
-
-|+int gfx_getchar(void)+
-|Next typed ASCII character (8 backspace, 13 enter), 0 if none; consumes it.
-
-|+void gfx_save(void)+ / +void gfx_restore(void)+
-|Store/restore the currently selected layer in private GPU memory.
-|===
-
-Everything is clipped to the screen. Held keys are exposed as a bitmask at
-+0x3ff03004+: bit 0 left/A, 1 right/D, 2 up/W, 3 down/S, 4 Space, 5 Enter,
-6 Tab. +gfx_keys_ext()+ reports Q, E, X/Shift, and Z/Ctrl; +gfx_keys_ext2()+
-uses +KEYX2_*+ constants. Tank-16 assigns bit 0 C, 1 J, 2 L, 3 I, 4 K, and
-5 period. The mouse register block starts at +0x3ff03008+.
-
-Guest-controlled speed and frame-synchronization registers were removed in
-machine revision 2. CPU scheduling is controlled by the host runtime; writes
-to their former low addresses no longer change execution speed.
-
-Mouse registers (base +0x3ff03008+): +\+0+ X word, +\+2+ Y word, +\+4+ held buttons, +\+5+ events.
-A double click is a second press of the same button within 400 ms and 4 pixels; it raises
-the press bit and the double-click bit together. Drag and drop = button held while the
-position changes; the release event marks the drop.
-
-Coprocessor registers (base +0x43020+, 16-bit values big-endian and signed):
-+\+0+ CMD (writing it runs the command), +\+1+ COLOR, +\+2+ X, +\+4+ Y, +\+6+ W,
-+\+8+ H, +\+10+ SRC word, +\+12+ SRC high byte, +\+14+ RESULT. Commands: 1 clear,
-2 pixel, 3 rect, 4 line (W,H are the end point), 5 sprite, 6 bitmap, 7 text
-(NUL-terminated string at SRC), 8 present, 9 random (to RESULT), 10 polygon
-(W is the point count), 13 sound (COLOR channel, X Hz, Y frames, W wave, H volume %),
-14 save selected layer, 15 restore it, 16-20 networking (below), 21 upload tile map
-(X/Y camera, W/H dimensions, SRC map), 22 3D scene, 23 sprite upload
-(COLOR slot, W/H size, SRC pixels), 24 sprite move (COLOR slot, X/Y, W flags),
-25 tile upload (COLOR tile ID, SRC 16x16 pixels), and 26 tile camera (X/Y).
-Memory-mapped layer controls follow at +0x43030+: select layer, visible-layer
-mask, five per-layer transparent-color registers at +0x43032+-+0x43036+, then
-five composition-priority registers at +0x43037+-+0x4303B+ (one byte per layer).
-Layer indices are background 0, tiles 1, sprites 2, 3D 3, HUD 4; bit N of the
-mask enables layer N. Assembly programs can use these registers directly.
-
-GPU command 22 draws a complete 3D scene from the 30-bit address in SRC. The
-scene is an array of signed 16-bit words, in big-endian memory order:
-
-[cols="1,1"]
-|===
-|Word offset
-|Contents
-
-|0-1
-|Vertex count (3-128), triangle count (1-128)
-
-|2-4
-|Rotation around X, Y and Z; low byte is 0-255 units per full turn
-
-|5-7
-|X, Y and Z translation in signed 8.8 fixed-point
-
-|8
-|Positive focal length in 8.8 fixed-point
-
-|9
-|Flags: +GPU3D_FILL+ (1), +GPU3D_WIREFRAME+ (2), or both
-
-|10 onward
-|Vertices: X, Y, Z; each signed 8.8 fixed-point
-
-|After vertices
-|Triangles: three vertex indices and one palette color per face
-|===
-
-+GPU3D_FIXED(n)+ converts an integer coordinate to 8.8 format; +GPU3D_ONE+ is
-. These signed 16-bit values range from -128 through 127.996. Scene buffers
-may be byte-aligned at any address. The renderer performs integer X/Y/Z matrix
-rotations, perspective projection, and flat
-triangle filling. Faces are painted back-to-front by average vertex depth.
-Wireframe edges are drawn with each face, so later faces cover hidden edges.
-Triangles with a vertex at or behind the camera are skipped. +gfx3d_draw+
-returns +GPU3D_OK+ (0) when accepted, +GPU3D_ERROR_SCENE+ (1) for an invalid
-descriptor/count/flag/focal length, or +GPU3D_ERROR_FACE+ (2) for a face
-referencing a nonexistent vertex. The renderer has no per-pixel depth buffer.
-See the SC-16 showcase's 3D flight page for an example.
+The former low graphics register and framebuffer addresses are ordinary RAM.
+The low-address graphics coprocessor, layered renderer, sprite/tile storage,
+and 3D command interface are retired; those addresses no longer operate
+graphics hardware.
 
 SC-NET is separate from the game networking API below. C programs that include
 +toolchain/include/sc16_net.h+ can discover emulator node IDs, send messages to discovered

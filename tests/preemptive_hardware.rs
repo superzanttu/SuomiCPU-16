@@ -899,12 +899,12 @@ fn event_frame_validation_prevents_partial_writes() {
 }
 
 #[test]
-fn event_frames_reject_device_backing_aliases_before_reading_or_writing() {
-    for physical in [0x43020u32] {
+fn event_frames_reject_device_aperture_aliases_before_mutation() {
+    let physical = suomicpu16::machine::DEVICE_APERTURE_START;
+    {
         let mut cpu = translated_kernel_stack(3);
         cpu.memory[0x3028..0x302c].copy_from_slice(&(physical | 3).to_be_bytes());
         cpu.memory[0x20ff8..0x21000].fill(0xa5);
-        cpu.memory[physical as usize..physical as usize + 8].fill(0x5a);
         assert_eq!(cpu.step(), Err(CpuError::DoubleFault));
         assert!(!cpu.running);
         assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
@@ -914,11 +914,6 @@ fn event_frames_reject_device_backing_aliases_before_reading_or_writing() {
             cpu.memory[0x20ff8..0x21000]
                 .iter()
                 .all(|byte| *byte == 0xa5)
-        );
-        assert!(
-            cpu.memory[physical as usize..physical as usize + 8]
-                .iter()
-                .all(|byte| *byte == 0x5a)
         );
 
         let mut cpu = translated_kernel_stack(3);

@@ -16,10 +16,10 @@ link:c90_target_abi.adoc[+c90_target_abi.adoc+] for the separate language and AB
 work. The browser build is also not yet a standalone web release; see the
 browser-build note in link:../README.adoc[+README.adoc+].
 
-Recent graphics verification covers Elite's compiler-generated graphics calls,
-layer clearing and transparency, palette composition, text, and multiple
-presented frames. Elite draws its scene with 2D GPU calls; it does not use the
-separate +gfx3d_draw+ route.
+The graphics device now uses the high device bank and protected syscall 24.
+The former low-address graphics coprocessor, layered renderer, and 3D command
+route are retired; current graphics regressions exercise the bank and syscall
+interfaces instead.
 
 Run the Rust validation suite and build every bootable BIOS program with:
 

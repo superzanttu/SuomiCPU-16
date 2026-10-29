@@ -3,8 +3,7 @@
 //! input, audio, debug-monitor windows, and runtime integration tests.
 
 use crate::cpu::{
-    BIOS_AUTOBOOT_WAIT_MARKER, BIOS_FIRMWARE_MARKER, Cpu, GpuLine, GpuSoundCommand, GpuTriangle,
-    PrivilegeMode,
+    BIOS_AUTOBOOT_WAIT_MARKER, BIOS_FIRMWARE_MARKER, Cpu, GpuSoundCommand, PrivilegeMode,
 };
 use crate::disk::{FolderBootMode, FolderDisk};
 #[cfg(test)]
@@ -14,10 +13,10 @@ use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
 use macroquad::prelude::{
     BLACK, Color, Conf, DrawTextureParams, FilterMode, KeyCode, MouseButton, Rect, Texture2D,
-    WHITE, clear_background, draw_line, draw_rectangle, draw_text as draw_ui_text, draw_texture_ex,
-    draw_triangle, get_char_pressed, get_keys_down, get_keys_pressed, is_key_pressed,
-    is_mouse_button_pressed, is_mouse_button_released, is_quit_requested, mouse_position,
-    mouse_wheel, next_frame, screen_height, screen_width, set_fullscreen, vec2,
+    WHITE, clear_background, draw_rectangle, draw_text as draw_ui_text, draw_texture_ex,
+    get_char_pressed, get_keys_down, get_keys_pressed, is_key_pressed, is_mouse_button_pressed,
+    is_mouse_button_released, is_quit_requested, mouse_position, mouse_wheel, next_frame,
+    screen_height, screen_width, set_fullscreen, vec2,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use minifb::{
@@ -223,9 +222,6 @@ impl Canvas {
         &mut self,
         pixels: &[u32],
         logical_size: (usize, usize),
-        triangles: &[GpuTriangle],
-        lines: &[GpuLine],
-        palette: &[[u8; 3]; 256],
         toolbar_visible: bool,
     ) {
         let (width, height) = logical_size;
@@ -262,30 +258,6 @@ impl Canvas {
                 ..DrawTextureParams::default()
             },
         );
-        let to_screen =
-            |(x, y): (i32, i32)| vec2(position.x + x as f32 * scale, position.y + y as f32 * scale);
-        for triangle in triangles {
-            let color = palette[triangle.color as usize];
-            let points = triangle.points.map(to_screen);
-            draw_triangle(
-                points[0],
-                points[1],
-                points[2],
-                Color::from_rgba(color[0], color[1], color[2], 255),
-            );
-        }
-        for line in lines {
-            let color = palette[line.color as usize];
-            let (start, end) = (to_screen(line.start), to_screen(line.end));
-            draw_line(
-                start.x,
-                start.y,
-                end.x,
-                end.y,
-                scale,
-                Color::from_rgba(color[0], color[1], color[2], 255),
-            );
-        }
         if toolbar_visible {
             draw_toolbar();
         }
@@ -481,9 +453,6 @@ pub async fn run_with_devices(
     let mut cpu_budget_remaining = 0;
     let mut cpu_frame_started = false;
     let mut presented_size = screen_size(&cpu);
-    let mut presented_triangles = Vec::new();
-    let mut presented_lines = Vec::new();
-    let mut presented_palette = cpu.palette;
     let mut active_boot_disk = program.filter(|path| path.is_dir()).map(Path::to_path_buf);
     let runtime_started = Instant::now();
     let mut last_terminal_cursor_phase = true;
@@ -659,16 +628,11 @@ pub async fn run_with_devices(
             if cpu.terminal_active {
                 render_terminal(&cpu.console, &mut pixels, &font, cursor_phase);
                 presented_size = (640, 480);
-                presented_triangles.clear();
-                presented_lines.clear();
                 cpu.terminal_dirty = false;
                 last_terminal_cursor_phase = cursor_phase;
             } else {
                 render_cpu_with_framebuffer(&cpu, &mut pixels, &font, &mut framebuffer);
                 presented_size = screen_size(&cpu);
-                presented_triangles.clone_from(&cpu.gpu_triangles);
-                presented_lines.clone_from(&cpu.gpu_lines);
-                presented_palette = cpu.palette;
             }
         }
         let (width, height) = presented_size;
@@ -700,16 +664,7 @@ pub async fn run_with_devices(
                 console_visible = false;
             }
         }
-        canvas
-            .present(
-                &pixels,
-                (width, height),
-                &presented_triangles,
-                &presented_lines,
-                &presented_palette,
-                !fullscreen,
-            )
-            .await;
+        canvas.present(&pixels, (width, height), !fullscreen).await;
     }
     Ok(())
 }
@@ -780,9 +735,7 @@ async fn show_bios_startup_error(
 ) {
     loop {
         draw_bios_error(pixels, font, error);
-        canvas
-            .present(pixels, (640, 480), &[], &[], &[[0; 3]; 256], !fullscreen)
-            .await;
+        canvas.present(pixels, (640, 480), !fullscreen).await;
         if is_key_pressed(KeyCode::Escape) {
             return;
         }
@@ -2356,7 +2309,6 @@ mod tests {
         );
         assert_eq!(cpu.current_task(), None);
         assert_eq!(cpu.read_u16(crate::machine::INTERRUPT_PIT_PERIOD), 0);
-        assert_eq!(cpu.read_u16(0x4301e), 4);
 
         boot_target(&mut cpu, &target).unwrap();
         assert_eq!(cpu.pc, 0x4000);
@@ -2444,7 +2396,6 @@ mod tests {
         );
         assert_eq!(fs::read(boot_disk.join("result.txt")).unwrap(), b"hello");
         assert_eq!(cpu.read_u16(crate::machine::INTERRUPT_PIT_PERIOD), 0);
-        assert_eq!(cpu.read_u16(0x4301e), 4);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3782,27 +3733,27 @@ mod tests {
     }
 
     #[test]
-    fn game_frame_integrates_gpu_mmio_layer_compositing_and_palette_rendering() {
+    fn game_frame_renders_high_graphics_bank_operations() {
+        use crate::machine::*;
+
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.vram[0] = 2;
-        cpu.vram[1] = 2;
         cpu.palette[2] = [12, 34, 56];
         cpu.palette[3] = [78, 90, 123];
 
-        cpu.write(0x43030, 1);
-        cpu.write_u16(0x43022, 1);
-        cpu.write_u16(0x43024, 0);
-        cpu.write(0x43021, 3);
-        cpu.write(0x43020, 2);
+        cpu.write(GRAPHICS_COLOR, 2);
+        cpu.write_u16(GRAPHICS_X, 0);
+        cpu.write_u16(GRAPHICS_Y, 0);
+        cpu.write(GRAPHICS_OPERATION, GRAPHICS_OP_PIXEL);
+        cpu.write(GRAPHICS_COMMAND, 1);
+        cpu.write(GRAPHICS_COLOR, 3);
+        cpu.write_u16(GRAPHICS_X, 1);
+        cpu.write(GRAPHICS_OPERATION, GRAPHICS_OP_PIXEL);
+        cpu.write(GRAPHICS_COMMAND, 1);
 
         let mut pixels = vec![0; 640 * 480];
         render_cpu(&cpu, &mut pixels, &load_font());
         assert_eq!(pixels[0], rgb(12, 34, 56));
         assert_eq!(pixels[1], rgb(78, 90, 123));
-
-        cpu.write(0x43031, 1);
-        render_cpu(&cpu, &mut pixels, &load_font());
-        assert_eq!(pixels[1], rgb(12, 34, 56));
     }
 
     #[test]
@@ -3841,38 +3792,6 @@ mod tests {
         assert_eq!(low_resolution_pixels[0], rgb(0, 255, 0));
         assert_eq!(low_resolution_pixels[y * 320 + x], rgb(0, 0, 255));
         assert!(low_resolution_pixels[y * 320 + x..(y + 8) * 320].contains(&rgb(255, 0, 0)));
-    }
-
-    #[test]
-    fn game_frame_submits_projected_3d_fill_and_wireframe_geometry() {
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.set_graphics_mode(1).unwrap();
-        let scene = [
-            3, 1, 0, 0, 0, 0, 0, 1000, 10000, 3, -1000, -1000, 0, 0, 1000, 0, 1000, -1000, 0, 0, 1,
-            2, 2,
-        ];
-        for (index, value) in scene.into_iter().enumerate() {
-            cpu.write_u16(0x1000 + (index * 2) as u32, value as u16);
-        }
-        cpu.write_u16(0x4302a, 0x1000);
-        cpu.write(0x43020, 22);
-
-        assert_eq!(
-            cpu.gpu_triangles,
-            [GpuTriangle {
-                points: [(280, 280), (320, 201), (359, 280)],
-                color: 2,
-            }]
-        );
-        assert_eq!(cpu.gpu_lines.len(), 3);
-        assert_eq!(
-            cpu.gpu_lines[0],
-            GpuLine {
-                start: (280, 280),
-                end: (320, 201),
-                color: 2,
-            }
-        );
     }
 
     #[test]
@@ -4183,32 +4102,6 @@ mod tests {
     }
 
     #[test]
-    fn ana_clock_continues_presenting_frames_after_startup() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let program = root
-            .join("programs")
-            .join("anaclock")
-            .join("src")
-            .join("anaclock.c");
-        let image = load_program(&program).expect("AnaClock should compile");
-        let mut cpu = Cpu::new();
-        cpu.load_program(&image.segments, image.entry_point)
-            .expect("AnaClock should load");
-
-        for frame in 0..3 {
-            cpu.begin_frame();
-            for _ in 0..300_000 {
-                cpu.step().expect("AnaClock instruction should execute");
-                if cpu.frame_yield || !cpu.running {
-                    break;
-                }
-            }
-            assert!(cpu.running, "AnaClock halted during frame {frame}");
-            assert!(cpu.frame_yield, "AnaClock did not present frame {frame}");
-        }
-    }
-
-    #[test]
     fn instruction_slices_resume_a_sleeping_cpu_without_treating_it_as_halted() {
         let image = crate::assembler::assemble("SVC\nHALT\n.address 0x300\nRTI", 0x100).unwrap();
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
@@ -4303,39 +4196,6 @@ mod tests {
 
         assert_eq!(cpu.memory[0x43100], 0x41);
         assert_eq!(cpu.memory[0x43110], 0xa5);
-    }
-
-    #[test]
-    fn infinite_city_keeps_running_across_rendered_frames() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let program = root
-            .join("programs")
-            .join("infinite-city")
-            .join("src")
-            .join("infinite_city.c");
-        let image = load_program(&program).expect("Infinite City should compile and load");
-        let mut cpu = Cpu::new();
-        cpu.load_program(&image.segments, image.entry_point)
-            .expect("Infinite City should load");
-        cpu.set_key(2, true);
-
-        for frame in 0..120 {
-            cpu.begin_frame();
-            for _ in 0..1_000_000 {
-                cpu.step()
-                    .expect("Infinite City instruction should execute");
-                if !cpu.running {
-                    panic!("Infinite City halted during rendered frame {frame}");
-                }
-                if cpu.frame_yield {
-                    break;
-                }
-            }
-            assert!(
-                cpu.frame_yield,
-                "Infinite City did not present frame {frame}"
-            );
-        }
     }
 
     #[test]
