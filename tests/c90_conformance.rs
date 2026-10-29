@@ -33,7 +33,7 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 1UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 3807UL) return 14;\n\
+                 if (*banks != 4063UL) return 14;\n\
                  return 1;\n\
              }"
         ),
@@ -211,6 +211,74 @@ fn guest_c_uses_bounded_high_network_staging_and_explicit_status() {
         ),
         1
     );
+}
+
+#[test]
+fn guest_c_reads_writes_and_lists_files_through_high_filesystem_bank() {
+    let root = std::env::temp_dir().join(format!(
+        "sc16-c90-filesystem-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let disk = root.join("DISK0001");
+    std::fs::create_dir_all(&disk).unwrap();
+    std::fs::write(
+        disk.join("disk.json"),
+        r#"{"version":1,"id":"DISK0001","label":"Test","capacity_bytes":65536,"read_only":false,"protected_files":["protected.txt"]}"#,
+    )
+    .unwrap();
+    std::fs::write(disk.join("file.txt"), b"abc").unwrap();
+    std::fs::write(disk.join("protected.txt"), b"fixed").unwrap();
+    let assembly = compile_minimal_program_to_assembly(
+        "#include <sc16_machine.h>\n\
+         int main(void) {\n\
+             volatile unsigned char *command = (volatile unsigned char *)SC16_FILESYSTEM_COMMAND;\n\
+             volatile unsigned char *status = (volatile unsigned char *)SC16_FILESYSTEM_STATUS;\n\
+             volatile unsigned char *operation = (volatile unsigned char *)SC16_FILESYSTEM_OPERATION;\n\
+             volatile unsigned int *length = (volatile unsigned int *)SC16_FILESYSTEM_LENGTH;\n\
+             volatile unsigned int *result = (volatile unsigned int *)SC16_FILESYSTEM_RESULT;\n\
+             volatile unsigned int *outlen = (volatile unsigned int *)SC16_FILESYSTEM_OUTPUT_LENGTH;\n\
+             volatile unsigned char *path = (volatile unsigned char *)SC16_FILESYSTEM_PATH;\n\
+             volatile unsigned char *data = (volatile unsigned char *)SC16_FILESYSTEM_DATA;\n\
+             path[0] = 102; path[1] = 105; path[2] = 108; path[3] = 101;\n\
+             path[4] = 46; path[5] = 116; path[6] = 120; path[7] = 116; path[8] = 0;\n\
+             *operation = 0x42; *length = 3; *command = 1;\n\
+             if (*status != 0 || *result != 3 || *outlen != 3) return 11;\n\
+             if (data[0] != 97 || data[1] != 98 || data[2] != 99) return 12;\n\
+             *operation = 0x43; data[0] = 88; data[1] = 89; data[2] = 90;\n\
+             *command = 1;\n\
+             if (*status != 0 || *result != 3) return 13;\n\
+             *operation = 0x42; *command = 1;\n\
+             if (*status != 0 || data[0] != 88 || data[1] != 89 || data[2] != 90) return 14;\n\
+             *operation = 0x41; for (int i = 0; i < 128; i++) path[i] = 0; *command = 1;\n\
+             if (*status != 0 || *result != 2 || data[0] != 102) return 15;\n\
+             *operation = 0x47; path[0] = 112; path[1] = 114; path[2] = 111;\n\
+             path[3] = 116; path[4] = 101; path[5] = 99; path[6] = 116;\n\
+             path[7] = 101; path[8] = 100; path[9] = 46; path[10] = 116;\n\
+             path[11] = 120; path[12] = 116; path[13] = 0; *command = 1;\n\
+             if (*status != 0 || *result != 5 || data[0] != 0) return 16;\n\
+             *operation = 0x43; *length = 1; data[0] = 88; *command = 1;\n\
+             if (*status != 4 || *result != 0) return 17;\n\
+             return 1;\n\
+         }",
+        "high-filesystem.c",
+    )
+    .unwrap()
+    .unwrap();
+    let image = assemble(&assembly, 0).unwrap();
+    let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+    cpu.mount_folder_disk(&disk).unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.run(1_000_000).unwrap();
+    assert!(!cpu.running);
+    assert_eq!(cpu.registers[0], 1);
+    assert_eq!(std::fs::read(disk.join("file.txt")).unwrap(), b"XYZ");
+    assert_eq!(std::fs::read(disk.join("protected.txt")).unwrap(), b"fixed");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

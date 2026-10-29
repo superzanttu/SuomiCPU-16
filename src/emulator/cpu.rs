@@ -196,6 +196,178 @@ pub struct Flags {
     pub overflow: bool,
 }
 
+impl Cpu {
+    fn high_filesystem_command(&mut self, command: u8) {
+        use crate::machine::*;
+
+        if command != 1 {
+            self.filesystem_device.fail(1);
+            return;
+        }
+        let operation = self.filesystem_device.operation;
+        if !(FOLDER_FS_LIST..=FOLDER_FS_STAT).contains(&operation) {
+            self.filesystem_device.fail(1);
+            return;
+        }
+        if matches!(operation, FOLDER_FS_READ | FOLDER_FS_WRITE)
+            && usize::from(self.filesystem_device.length) > FILESYSTEM_DATA_SIZE
+        {
+            self.filesystem_device.fail(2);
+            return;
+        }
+        let Some(disk) = self
+            .folder_disk
+            .as_ref()
+            .or(self.program_folder_disk.as_ref())
+        else {
+            self.filesystem_device.fail(3);
+            return;
+        };
+        let path = match Self::decode_filesystem_path(&self.filesystem_device.path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.filesystem_device.fail(2);
+                self.debug_console.log_error("filesystem", &error);
+                return;
+            }
+        };
+        let output = match operation {
+            FOLDER_FS_LIST => {
+                let directory = if path.is_empty() {
+                    None
+                } else {
+                    Some(path.as_str())
+                };
+                disk.list_dir(directory).and_then(|entries| {
+                    let result = u16::try_from(entries.len()).unwrap_or(u16::MAX);
+                    let entry = entries.get(usize::from(self.filesystem_device.index));
+                    let encoded = if let Some(entry) = entry {
+                        let size = u32::try_from(entry.size_bytes)
+                            .map_err(|_| "filesystem entry exceeds 32-bit size".to_owned())?;
+                        let mut bytes = entry.name.as_bytes().to_vec();
+                        bytes.push(0);
+                        bytes.push(u8::from(entry.is_directory));
+                        bytes.extend_from_slice(&size.to_be_bytes());
+                        bytes
+                    } else {
+                        vec![0]
+                    };
+                    Ok((result, 0, encoded))
+                })
+            }
+            FOLDER_FS_READ => {
+                if path.is_empty() {
+                    Err("filesystem path is empty".to_owned())
+                } else {
+                    disk.read_file(
+                        &path,
+                        u64::from(self.filesystem_device.offset),
+                        usize::from(self.filesystem_device.length),
+                    )
+                    .and_then(|(data, file_size)| {
+                        let size = u32::try_from(file_size)
+                            .map_err(|_| "filesystem file exceeds 32-bit size".to_owned())?;
+                        let result = u16::try_from(data.len()).unwrap_or(u16::MAX);
+                        Ok((result, size, data))
+                    })
+                }
+            }
+            FOLDER_FS_WRITE => {
+                let length = usize::from(self.filesystem_device.length);
+                if path.is_empty() {
+                    Err("filesystem path is empty".to_owned())
+                } else {
+                    Self::validate_guest_mutation_path(&path)
+                        .and_then(|()| {
+                            disk.write_file(&path, &self.filesystem_device.data[..length])
+                        })
+                        .map(|()| (length as u16, length as u32, Vec::new()))
+                }
+            }
+            FOLDER_FS_CREATE_DIR => {
+                if path.is_empty() {
+                    Err("filesystem path is empty".to_owned())
+                } else {
+                    Self::validate_guest_mutation_path(&path)
+                        .and_then(|()| disk.create_dir(&path))
+                        .map(|()| (0, 0, Vec::new()))
+                }
+            }
+            FOLDER_FS_DELETE => {
+                if path.is_empty() {
+                    Err("filesystem path is empty".to_owned())
+                } else {
+                    Self::validate_guest_mutation_path(&path)
+                        .and_then(|()| disk.delete_entry(&path))
+                        .map(|()| (0, 0, Vec::new()))
+                }
+            }
+            FOLDER_FS_RENAME => {
+                let destination = Self::decode_filesystem_path(&self.filesystem_device.destination);
+                match destination {
+                    Ok(destination) if !path.is_empty() && !destination.is_empty() => {
+                        Self::validate_guest_mutation_path(&path)
+                            .and_then(|()| Self::validate_guest_mutation_path(&destination))
+                            .and_then(|()| disk.rename_entry(&path, &destination))
+                            .map(|()| (0, 0, Vec::new()))
+                    }
+                    Ok(_) => Err("filesystem rename path is empty".to_owned()),
+                    Err(error) => Err(error),
+                }
+            }
+            FOLDER_FS_STAT => {
+                if path.is_empty() {
+                    Err("filesystem path is empty".to_owned())
+                } else {
+                    disk.metadata(&path).and_then(|entry| {
+                        let size = u32::try_from(entry.size_bytes)
+                            .map_err(|_| "filesystem entry exceeds 32-bit size".to_owned())?;
+                        let mut data = vec![u8::from(entry.is_directory)];
+                        data.extend_from_slice(&size.to_be_bytes());
+                        Ok((5, size, data))
+                    })
+                }
+            }
+            _ => Err("unsupported filesystem operation".to_owned()),
+        };
+        match output {
+            Ok((result, file_size, data)) => {
+                if data.len() > FILESYSTEM_DATA_SIZE {
+                    self.filesystem_device.fail(2);
+                    self.debug_console.log_error(
+                        "filesystem",
+                        "directory entry exceeds the inline response size",
+                    );
+                } else if let Err(error) = self.filesystem_device.complete(result, file_size, &data)
+                {
+                    self.debug_console.log_error("filesystem", &error);
+                }
+            }
+            Err(error) => {
+                self.filesystem_device.fail(4);
+                self.debug_console
+                    .log_error("filesystem", &format!("operation failed: {error}"));
+            }
+        }
+    }
+
+    fn decode_filesystem_path(bytes: &[u8; 128]) -> Result<String, String> {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| "filesystem path must be NUL-terminated within 128 bytes".to_owned())?;
+        if bytes[end..].iter().any(|byte| *byte != 0) {
+            return Err("filesystem path has data after its terminator".to_owned());
+        }
+        let path = std::str::from_utf8(&bytes[..end])
+            .map_err(|_| "filesystem path is not valid UTF-8".to_owned())?;
+        if !path.is_ascii() {
+            return Err("filesystem paths must be ASCII".to_owned());
+        }
+        Ok(path.to_owned())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivilegeMode {
     Supervisor,
@@ -378,6 +550,7 @@ pub struct Cpu {
     network: Option<NetNode>,
     network_registers: crate::machine::NetworkDevice,
     firmware_gateway: crate::machine::FirmwareGateway,
+    filesystem_device: crate::machine::FilesystemDevice,
     network_port: u16,
     scnet: Option<ScNetNode>,
     scnet_enabled: bool,
@@ -516,6 +689,7 @@ impl Cpu {
             network: None,
             network_registers: crate::machine::NetworkDevice::default(),
             firmware_gateway: crate::machine::FirmwareGateway::default(),
+            filesystem_device: crate::machine::FilesystemDevice::default(),
             network_port: DEFAULT_PORT,
             scnet: None,
             scnet_enabled: false,
@@ -1489,6 +1663,7 @@ impl Cpu {
                 .or_else(|| self.audio.read(address))
                 .or_else(|| self.network_registers.read(address))
                 .or_else(|| self.firmware_gateway.read(address))
+                .or_else(|| self.filesystem_device.read(address))
                 .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
         }
@@ -3372,6 +3547,15 @@ impl Cpu {
                     self.high_firmware_command(value);
                 } else {
                     self.firmware_gateway.write(address, value);
+                }
+            } else if (crate::machine::FILESYSTEM_BASE
+                ..crate::machine::FILESYSTEM_BASE + crate::machine::DEVICE_BANK_SIZE)
+                .contains(&address)
+            {
+                if address == crate::machine::FILESYSTEM_COMMAND {
+                    self.high_filesystem_command(value);
+                } else {
+                    self.filesystem_device.write(address, value);
                 }
             } else if (crate::machine::AUDIO_BASE
                 ..crate::machine::AUDIO_BASE + crate::machine::DEVICE_BANK_SIZE)
@@ -7155,6 +7339,7 @@ mod tests {
         cpu.memory[0x303c..0x3040].copy_from_slice(&(AUDIO_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3040..0x3044].copy_from_slice(&(NETWORK_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3044..0x3048].copy_from_slice(&(FIRMWARE_GATEWAY_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x3048..0x304c].copy_from_slice(&(FILESYSTEM_BASE | 0xf).to_be_bytes());
         cpu.enable_mmu(0x2000).unwrap();
         for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
             cpu.privilege_mode = mode;
@@ -7168,6 +7353,7 @@ mod tests {
                 (0xf000, AUDIO_BASE),
                 (0x10000, NETWORK_BASE),
                 (0x11000, FIRMWARE_GATEWAY_BASE),
+                (0x12000, FILESYSTEM_BASE),
             ] {
                 for offset in 0..DEVICE_BANK_SIZE {
                     for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {
@@ -7454,6 +7640,170 @@ mod tests {
         assert_eq!(cpu.take_booted_disk_path(), None);
         assert!(cpu.folder_disk.is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_bank_uses_bounded_inline_io_and_preserves_disk_guards() {
+        use crate::machine::*;
+
+        let root = std::env::temp_dir().join(format!(
+            "sc16-high-filesystem-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk_path = root.join("DISK0001");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        std::fs::write(
+            disk_path.join("disk.json"),
+            r#"{"version":1,"id":"DISK0001","label":"Test","capacity_bytes":65536,"read_only":false,"protected_files":["protected.txt"]}"#,
+        )
+        .unwrap();
+        std::fs::write(disk_path.join("data.bin"), b"abcdef").unwrap();
+        std::fs::write(disk_path.join("protected.txt"), b"fixed").unwrap();
+        fn stage_path(cpu: &mut Cpu, address: u32, path: &[u8]) {
+            for offset in 0..128 {
+                cpu.write_guest(address + offset, 0).unwrap();
+            }
+            for (offset, byte) in path.iter().enumerate() {
+                cpu.write_guest(address + offset as u32, *byte).unwrap();
+            }
+        }
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            std::fs::write(disk_path.join("data.bin"), b"abcdef").unwrap();
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            cpu.mount_folder_disk(&disk_path).unwrap();
+            let alias = (FILESYSTEM_BASE & cpu.memory_mask) as usize;
+            cpu.memory[alias..alias + 0x400].fill(0xa5);
+
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_LIST)
+                .unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_RESULT).unwrap(), 2);
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_OUTPUT_LENGTH).unwrap(), 14);
+            assert_eq!(&cpu.filesystem_device.data[..14], b"data.bin\0\0\0\0\0\x06");
+
+            stage_path(&mut cpu, FILESYSTEM_PATH, b"data.bin\0");
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_READ)
+                .unwrap();
+            cpu.write_guest_u32(FILESYSTEM_OFFSET, 2).unwrap();
+            cpu.write_guest_u16(FILESYSTEM_LENGTH, 2).unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_RESULT).unwrap(), 2);
+            assert_eq!(cpu.read_guest_u32(FILESYSTEM_FILE_SIZE).unwrap(), 6);
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_OUTPUT_LENGTH).unwrap(), 2);
+            assert_eq!(&cpu.filesystem_device.data[..2], b"cd");
+
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_WRITE)
+                .unwrap();
+            cpu.write_guest_u16(FILESYSTEM_LENGTH, 3).unwrap();
+            for (offset, byte) in b"new".iter().enumerate() {
+                cpu.write_guest(FILESYSTEM_DATA + offset as u32, *byte)
+                    .unwrap();
+            }
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u32(FILESYSTEM_FILE_SIZE).unwrap(), 3);
+
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_STAT)
+                .unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_RESULT).unwrap(), 5);
+            assert_eq!(cpu.read_guest_u32(FILESYSTEM_FILE_SIZE).unwrap(), 3);
+            assert_eq!(cpu.filesystem_device.data[0], 0);
+
+            stage_path(&mut cpu, FILESYSTEM_PATH, b"docs\0");
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_CREATE_DIR)
+                .unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 0);
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_LIST)
+                .unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_RESULT).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_OUTPUT_LENGTH).unwrap(), 1);
+            assert_eq!(cpu.filesystem_device.data[0], 0);
+
+            stage_path(&mut cpu, FILESYSTEM_PATH, b"docs\0");
+            stage_path(&mut cpu, FILESYSTEM_DESTINATION, b"archive\0");
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_RENAME)
+                .unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 0);
+            assert!(disk_path.join("archive").is_dir());
+            stage_path(&mut cpu, FILESYSTEM_PATH, b"archive\0");
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_DELETE)
+                .unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 0);
+            assert!(!disk_path.join("archive").exists());
+
+            stage_path(&mut cpu, FILESYSTEM_PATH, b"protected.txt\0");
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_WRITE)
+                .unwrap();
+            cpu.write_guest(FILESYSTEM_LENGTH, 1).unwrap();
+            cpu.write_guest(FILESYSTEM_DATA, b'X').unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 4);
+            assert_eq!(
+                std::fs::read(disk_path.join("protected.txt")).unwrap(),
+                b"fixed"
+            );
+
+            cpu.write_guest(FILESYSTEM_OPERATION, 0xff).unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 1);
+            cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_READ)
+                .unwrap();
+            cpu.write_guest_u16(FILESYSTEM_LENGTH, 513).unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 2);
+            assert_eq!(cpu.read_guest_u16(FILESYSTEM_OUTPUT_LENGTH).unwrap(), 0);
+
+            for offset in 0..128 {
+                cpu.write_guest(FILESYSTEM_PATH + offset, b'x').unwrap();
+            }
+            cpu.write_guest(FILESYSTEM_LENGTH, 0).unwrap();
+            cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 2);
+
+            cpu.prepare_image_entry();
+            assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 2);
+            assert!(
+                cpu.memory[alias..alias + 0x400]
+                    .iter()
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_bank_rejects_wide_side_effects_and_maps_no_disk_errors() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_guest(FILESYSTEM_OPERATION, FOLDER_FS_LIST)
+            .unwrap();
+        assert!(cpu.write_guest_u16(FILESYSTEM_COMMAND, 0x0100).is_err());
+        assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 0);
+        assert!(cpu.write_guest_u32(FILESYSTEM_LENGTH, 0x12345678).is_err());
+        assert_eq!(cpu.read_guest_u16(FILESYSTEM_LENGTH).unwrap(), 0);
+        cpu.write_guest(FILESYSTEM_DATA + 511, 0x33).unwrap();
+        assert!(cpu.write_guest_u16(FILESYSTEM_DATA + 511, 0x4455).is_err());
+        assert_eq!(cpu.read_guest(FILESYSTEM_DATA + 511).unwrap(), 0x33);
+        assert!(cpu.read_guest_u16(FILESYSTEM_DATA + 511).is_err());
+        cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+        assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 3);
+        assert_eq!(cpu.read_guest_u16(FILESYSTEM_RESULT).unwrap(), 0);
+        cpu.write_guest(FILESYSTEM_OPERATION, 0xff).unwrap();
+        cpu.write_guest(FILESYSTEM_COMMAND, 1).unwrap();
+        assert_eq!(cpu.read_guest(FILESYSTEM_STATUS).unwrap(), 1);
     }
 
     #[test]

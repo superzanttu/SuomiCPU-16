@@ -405,6 +405,87 @@ fn supervisor_executes_high_network_commands_with_small_ram_and_translated_alias
 }
 
 #[test]
+fn supervisor_executes_high_filesystem_reads_with_small_ram() {
+    use suomicpu16::machine::*;
+
+    let root = std::env::temp_dir().join(format!(
+        "sc16-native-filesystem-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let disk = root.join("DISK0001");
+    std::fs::create_dir_all(&disk).unwrap();
+    std::fs::write(
+        disk.join("disk.json"),
+        r#"{"version":1,"id":"DISK0001","label":"Test","capacity_bytes":65536,"read_only":false,"protected_files":["protected.txt"]}"#,
+    )
+    .unwrap();
+    std::fs::write(disk.join("file.txt"), b"abc").unwrap();
+    std::fs::write(disk.join("protected.txt"), b"fixed").unwrap();
+    for translated in [false, true] {
+        let base = if translated { 0x9000 } else { FILESYSTEM_BASE };
+        let mut source = format!(
+            "LDI30 R2, {}\nLDI R0, 66\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 102\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 105\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 108\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 101\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 46\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 116\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 120\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 116\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 0\nST R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 3\nSTW R2, R0\n\
+             LDI30 R2, {}\nLDI R0, 1\nST R2, R0\n\
+             LDI30 R2, {}\nLD R4, R2\n\
+             LDI30 R2, {}\nLDW R5, R2\n\
+             LDI30 R2, {}\nLD R6, R2\nHALT",
+            base + 2,
+            base + 24,
+            base + 25,
+            base + 26,
+            base + 27,
+            base + 28,
+            base + 29,
+            base + 30,
+            base + 31,
+            base + 32,
+            base + 12,
+            base,
+            base + 1,
+            base + 14,
+            base + 0x120,
+        );
+        if translated {
+            source = source.replace("HALT", "");
+            source.push_str("HALT");
+        }
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.mount_folder_disk(&disk).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.memory[0x8000..0x8400].fill(0xa5);
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+            cpu.memory[0x3004..0x3008].copy_from_slice(&0x100bu32.to_be_bytes());
+            cpu.memory[0x3024..0x3028].copy_from_slice(&(FILESYSTEM_BASE | 3).to_be_bytes());
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+        cpu.run(128).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[4], 0);
+        assert_eq!(cpu.registers[5], 3);
+        assert_eq!(cpu.registers[6], i64::from(b'a'));
+        assert!(cpu.memory[0x8000..0x8400].iter().all(|byte| *byte == 0xa5));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn supervisor_executes_high_firmware_queries_and_boot_with_small_ram() {
     use suomicpu16::machine::*;
 

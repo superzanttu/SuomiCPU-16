@@ -81,9 +81,22 @@ pub const FIRMWARE_NETWORK_NAME: u32 = FIRMWARE_GATEWAY_BASE + 16;
 pub const FIRMWARE_SETTING: u32 = FIRMWARE_GATEWAY_BASE + 48;
 pub const FIRMWARE_OUTPUT: u32 = FIRMWARE_GATEWAY_BASE + 0x100;
 pub const FIRMWARE_REQUEST_BYTES: usize = 90;
+pub const FILESYSTEM_COMMAND: u32 = FILESYSTEM_BASE;
+pub const FILESYSTEM_STATUS: u32 = FILESYSTEM_BASE + 1;
+pub const FILESYSTEM_OPERATION: u32 = FILESYSTEM_BASE + 2;
+pub const FILESYSTEM_INDEX: u32 = FILESYSTEM_BASE + 4;
+pub const FILESYSTEM_OFFSET: u32 = FILESYSTEM_BASE + 8;
+pub const FILESYSTEM_LENGTH: u32 = FILESYSTEM_BASE + 12;
+pub const FILESYSTEM_RESULT: u32 = FILESYSTEM_BASE + 14;
+pub const FILESYSTEM_FILE_SIZE: u32 = FILESYSTEM_BASE + 16;
+pub const FILESYSTEM_OUTPUT_LENGTH: u32 = FILESYSTEM_BASE + 20;
+pub const FILESYSTEM_PATH: u32 = FILESYSTEM_BASE + 24;
+pub const FILESYSTEM_DESTINATION: u32 = FILESYSTEM_BASE + 152;
+pub const FILESYSTEM_DATA: u32 = FILESYSTEM_BASE + 0x120;
+pub const FILESYSTEM_DATA_SIZE: usize = 512;
 pub const MACHINE_REVISION: u32 = 1;
 pub const DEVICE_ABI: u32 = 1;
-pub const IMPLEMENTED_BANKS: u32 = 0xedf;
+pub const IMPLEMENTED_BANKS: u32 = 0xfdf;
 
 pub const fn usable_ram_size(backing_size: usize) -> usize {
     if backing_size < DEVICE_APERTURE_START as usize {
@@ -100,7 +113,7 @@ pub const fn is_device_aperture(address: u32) -> bool {
 pub const fn is_implemented_device_page(address: u32) -> bool {
     (address >= SYSTEM_BASE && address < CLOCK_BASE + DEVICE_BANK_SIZE)
         || (address >= AUDIO_BASE && address < NETWORK_BASE + DEVICE_BANK_SIZE)
-        || (address >= CONSOLE_BASE && address < FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE)
+        || (address >= FILESYSTEM_BASE && address < FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE)
 }
 
 pub fn device_register_writable(address: u32) -> Option<bool> {
@@ -150,6 +163,30 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
         {
             Some(false)
         }
+        FILESYSTEM_COMMAND | FILESYSTEM_OPERATION => Some(true),
+        FILESYSTEM_STATUS => Some(false),
+        address if (FILESYSTEM_INDEX..FILESYSTEM_INDEX + 2).contains(&address) => Some(true),
+        address
+            if (FILESYSTEM_OFFSET..FILESYSTEM_OFFSET + 4).contains(&address)
+                || (FILESYSTEM_LENGTH..FILESYSTEM_LENGTH + 2).contains(&address) =>
+        {
+            Some(true)
+        }
+        address
+            if (FILESYSTEM_RESULT..FILESYSTEM_RESULT + 2).contains(&address)
+                || (FILESYSTEM_FILE_SIZE..FILESYSTEM_FILE_SIZE + 4).contains(&address)
+                || (FILESYSTEM_OUTPUT_LENGTH..FILESYSTEM_OUTPUT_LENGTH + 2).contains(&address) =>
+        {
+            Some(false)
+        }
+        address
+            if (FILESYSTEM_PATH..FILESYSTEM_PATH + 128).contains(&address)
+                || (FILESYSTEM_DESTINATION..FILESYSTEM_DESTINATION + 128).contains(&address)
+                || (FILESYSTEM_DATA..FILESYSTEM_DATA + FILESYSTEM_DATA_SIZE as u32)
+                    .contains(&address) =>
+        {
+            Some(true)
+        }
         address
             if (CLOCK_MONOTONIC_MILLIS..CLOCK_MONOTONIC_MILLIS + 4).contains(&address)
                 || (CLOCK_FRAMES..CLOCK_FRAMES + 2).contains(&address)
@@ -159,6 +196,145 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
             Some(false)
         }
         _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FilesystemDevice {
+    pub operation: u8,
+    pub index: u16,
+    pub offset: u32,
+    pub length: u16,
+    pub path: [u8; 128],
+    pub destination: [u8; 128],
+    pub data: [u8; FILESYSTEM_DATA_SIZE],
+    status: u8,
+    result: u16,
+    file_size: u32,
+    output_length: u16,
+}
+
+impl Default for FilesystemDevice {
+    fn default() -> Self {
+        Self {
+            operation: 0,
+            index: 0,
+            offset: 0,
+            length: 0,
+            path: [0; 128],
+            destination: [0; 128],
+            data: [0; FILESYSTEM_DATA_SIZE],
+            status: 0,
+            result: 0,
+            file_size: 0,
+            output_length: 0,
+        }
+    }
+}
+
+impl FilesystemDevice {
+    pub fn read(&self, address: u32) -> Option<u8> {
+        device_register_writable(address)?;
+        match address {
+            FILESYSTEM_COMMAND => Some(0),
+            FILESYSTEM_STATUS => Some(self.status),
+            FILESYSTEM_OPERATION => Some(self.operation),
+            address if (FILESYSTEM_INDEX..FILESYSTEM_INDEX + 2).contains(&address) => {
+                Some(self.index.to_be_bytes()[(address - FILESYSTEM_INDEX) as usize])
+            }
+            address if (FILESYSTEM_OFFSET..FILESYSTEM_OFFSET + 4).contains(&address) => {
+                Some(self.offset.to_be_bytes()[(address - FILESYSTEM_OFFSET) as usize])
+            }
+            address if (FILESYSTEM_LENGTH..FILESYSTEM_LENGTH + 2).contains(&address) => {
+                Some(self.length.to_be_bytes()[(address - FILESYSTEM_LENGTH) as usize])
+            }
+            address if (FILESYSTEM_RESULT..FILESYSTEM_RESULT + 2).contains(&address) => {
+                Some(self.result.to_be_bytes()[(address - FILESYSTEM_RESULT) as usize])
+            }
+            address if (FILESYSTEM_FILE_SIZE..FILESYSTEM_FILE_SIZE + 4).contains(&address) => {
+                Some(self.file_size.to_be_bytes()[(address - FILESYSTEM_FILE_SIZE) as usize])
+            }
+            address
+                if (FILESYSTEM_OUTPUT_LENGTH..FILESYSTEM_OUTPUT_LENGTH + 2).contains(&address) =>
+            {
+                Some(
+                    self.output_length.to_be_bytes()[(address - FILESYSTEM_OUTPUT_LENGTH) as usize],
+                )
+            }
+            address if (FILESYSTEM_PATH..FILESYSTEM_PATH + 128).contains(&address) => {
+                Some(self.path[(address - FILESYSTEM_PATH) as usize])
+            }
+            address
+                if (FILESYSTEM_DESTINATION..FILESYSTEM_DESTINATION + 128).contains(&address) =>
+            {
+                Some(self.destination[(address - FILESYSTEM_DESTINATION) as usize])
+            }
+            address
+                if (FILESYSTEM_DATA..FILESYSTEM_DATA + FILESYSTEM_DATA_SIZE as u32)
+                    .contains(&address) =>
+            {
+                Some(self.data[(address - FILESYSTEM_DATA) as usize])
+            }
+            _ => None,
+        }
+    }
+
+    pub fn write(&mut self, address: u32, value: u8) {
+        match address {
+            FILESYSTEM_OPERATION => self.operation = value,
+            address if (FILESYSTEM_INDEX..FILESYSTEM_INDEX + 2).contains(&address) => {
+                self.index = u16::from_be_bytes(match address - FILESYSTEM_INDEX {
+                    0 => [value, self.index.to_be_bytes()[1]],
+                    _ => [self.index.to_be_bytes()[0], value],
+                });
+            }
+            address if (FILESYSTEM_OFFSET..FILESYSTEM_OFFSET + 4).contains(&address) => {
+                let mut bytes = self.offset.to_be_bytes();
+                bytes[(address - FILESYSTEM_OFFSET) as usize] = value;
+                self.offset = u32::from_be_bytes(bytes);
+            }
+            address if (FILESYSTEM_LENGTH..FILESYSTEM_LENGTH + 2).contains(&address) => {
+                let mut bytes = self.length.to_be_bytes();
+                bytes[(address - FILESYSTEM_LENGTH) as usize] = value;
+                self.length = u16::from_be_bytes(bytes);
+            }
+            address if (FILESYSTEM_PATH..FILESYSTEM_PATH + 128).contains(&address) => {
+                self.path[(address - FILESYSTEM_PATH) as usize] = value;
+            }
+            address
+                if (FILESYSTEM_DESTINATION..FILESYSTEM_DESTINATION + 128).contains(&address) =>
+            {
+                self.destination[(address - FILESYSTEM_DESTINATION) as usize] = value;
+            }
+            address
+                if (FILESYSTEM_DATA..FILESYSTEM_DATA + FILESYSTEM_DATA_SIZE as u32)
+                    .contains(&address) =>
+            {
+                self.data[(address - FILESYSTEM_DATA) as usize] = value;
+            }
+            _ => panic!("host write to an invalid filesystem staging register"),
+        }
+    }
+
+    pub fn complete(&mut self, result: u16, file_size: u32, output: &[u8]) -> Result<(), String> {
+        if output.len() > self.data.len() {
+            self.fail(2);
+            return Err("filesystem response exceeds 512 bytes".to_owned());
+        }
+        self.data.fill(0);
+        self.data[..output.len()].copy_from_slice(output);
+        self.status = 0;
+        self.result = result;
+        self.file_size = file_size;
+        self.output_length = output.len() as u16;
+        Ok(())
+    }
+
+    pub fn fail(&mut self, status: u8) {
+        self.status = status;
+        self.result = 0;
+        self.file_size = 0;
+        self.output_length = 0;
     }
 }
 
@@ -783,6 +959,18 @@ mod tests {
             ("NETWORK_TITLE", NETWORK_TITLE),
             ("NETWORK_TRANSMIT", NETWORK_TRANSMIT),
             ("NETWORK_RECEIVE", NETWORK_RECEIVE),
+            ("FILESYSTEM_COMMAND", FILESYSTEM_COMMAND),
+            ("FILESYSTEM_STATUS", FILESYSTEM_STATUS),
+            ("FILESYSTEM_OPERATION", FILESYSTEM_OPERATION),
+            ("FILESYSTEM_INDEX", FILESYSTEM_INDEX),
+            ("FILESYSTEM_OFFSET", FILESYSTEM_OFFSET),
+            ("FILESYSTEM_LENGTH", FILESYSTEM_LENGTH),
+            ("FILESYSTEM_RESULT", FILESYSTEM_RESULT),
+            ("FILESYSTEM_FILE_SIZE", FILESYSTEM_FILE_SIZE),
+            ("FILESYSTEM_OUTPUT_LENGTH", FILESYSTEM_OUTPUT_LENGTH),
+            ("FILESYSTEM_PATH", FILESYSTEM_PATH),
+            ("FILESYSTEM_DESTINATION", FILESYSTEM_DESTINATION),
+            ("FILESYSTEM_DATA", FILESYSTEM_DATA),
             ("CONSOLE_DATA", CONSOLE_DATA),
             ("CONSOLE_STATUS", CONSOLE_STATUS),
             ("CONSOLE_CONTROL", CONSOLE_CONTROL),

@@ -611,6 +611,9 @@ Checklist status: [x] completed; [ ] planned.
 **** [x] Implement a RAM-independent firmware gateway with request-local
      shared BIOS handlers, bounded inline responses, protected aliases,
      validated persistence, and compiled-C/native query and boot regressions.
+**** [x] Implement a RAM-independent folder-filesystem bank with bounded
+     inline paths/transfers, existing disk protection/capacity semantics,
+     atomic register checks, and compiled-C/native execution regressions.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
 ** [ ] Implement validated user device services and shared protected startup
