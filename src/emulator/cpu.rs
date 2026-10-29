@@ -397,8 +397,7 @@ pub struct Cpu {
     split_cameras: Option<[(i32, i32); 2]>,
     memory_mask: u32,
     layer_mode: u8,
-    timer_period: u16,
-    timer_countdown: u16,
+    interrupts: crate::machine::InterruptController,
     idt_base: Option<u32>,
     mmu_enabled: bool,
     page_directory: u32,
@@ -446,7 +445,9 @@ impl Cpu {
                 memory[(GPU_LAYER_ORDER as usize) + layer] = layer as u8;
             }
         }
-        memory[(PIT_CONTROL_ADDR & memory_mask) as usize] = 1;
+        if let Some(control) = memory.get_mut(PIT_CONTROL_ADDR as usize) {
+            *control = 1;
+        }
         let mut palette = [[0; 3]; 256];
         for (index, color) in palette.iter_mut().enumerate() {
             *color = [index as u8; 3];
@@ -531,8 +532,7 @@ impl Cpu {
             split_cameras: None,
             memory_mask,
             layer_mode: 0,
-            timer_period: 0,
-            timer_countdown: 0,
+            interrupts: crate::machine::InterruptController::default(),
             idt_base: None,
             mmu_enabled: false,
             page_directory: 0,
@@ -1032,6 +1032,7 @@ impl Cpu {
         self.mmu_enabled = false;
         self.page_directory = 0;
         self.last_page_fault = None;
+        self.interrupts.control = 0;
         self.idt_base = None;
         self.scheduler = Scheduler::default();
         self.syscall_state = KernelState::default();
@@ -1215,7 +1216,7 @@ impl Cpu {
             kernel_sp: self.kernel_sp,
             flags: self.flags,
             privilege_mode: self.privilege_mode,
-            interrupt_enabled: self.memory[(ICR_ADDR & self.memory_mask) as usize] & 1 != 0,
+            interrupt_enabled: self.interrupts.control & 1 != 0,
             mmu_enabled: self.mmu_enabled,
             page_directory: self.page_directory,
             state: TaskState::Running,
@@ -1437,9 +1438,17 @@ impl Cpu {
     pub fn read(&mut self, address: u32) -> u8 {
         if crate::machine::is_device_aperture(address) {
             return crate::machine::system_register_byte(address, self.memory.len())
+                .or_else(|| self.interrupts.read(address))
+                .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
         }
+        if let Some(value) = self.legacy_control_byte(address) {
+            return value;
+        }
         let address = address & self.memory_mask;
+        if let Some(value) = self.legacy_control_byte(address) {
+            return value;
+        }
         match address {
             CONSOLE_DATA => {
                 let value = self.console.read_data();
@@ -3321,20 +3330,24 @@ impl Cpu {
     }
 
     pub fn write(&mut self, address: u32, value: u8) {
-        assert!(
-            !crate::machine::is_device_aperture(address),
-            "host write to a read-only or unimplemented device register"
-        );
+        if crate::machine::is_device_aperture(address) {
+            assert_eq!(
+                crate::machine::device_register_writable(address),
+                Some(true),
+                "host write to a read-only or unimplemented device register"
+            );
+            self.interrupts.write(address, value);
+            return;
+        }
+        if self.write_legacy_control_byte(address, value) {
+            return;
+        }
         let address = address & self.memory_mask;
+        if self.write_legacy_control_byte(address, value) {
+            return;
+        }
         let index = address as usize;
         self.memory[index] = value;
-        let timer_period_address = TIMER_PERIOD_ADDR & self.memory_mask;
-        if address == timer_period_address
-            || address == (timer_period_address.wrapping_add(1) & self.memory_mask)
-        {
-            self.timer_period = self.read_u16(TIMER_PERIOD_ADDR);
-            self.timer_countdown = self.timer_period;
-        }
         match address {
             GPU_BASE => self.gpu_command(value),
             DISK_BASE => self.disk_control(value),
@@ -3381,6 +3394,84 @@ impl Cpu {
         }
     }
 
+    fn fault_register_byte(&self, address: u32) -> Option<u8> {
+        use crate::machine::*;
+        let fault_address = self
+            .last_page_fault
+            .map_or(0, |fault| fault.virtual_address);
+        match address {
+            address if (FAULT_ADDRESS..FAULT_ADDRESS + 4).contains(&address) => {
+                Some(fault_address.to_be_bytes()[(address - FAULT_ADDRESS) as usize])
+            }
+            address if (FAULT_INFO..FAULT_INFO + 2).contains(&address) => {
+                Some(self.page_fault_info().to_be_bytes()[(address - FAULT_INFO) as usize])
+            }
+            FAULT_VALID => Some(u8::from(self.last_page_fault.is_some())),
+            _ => None,
+        }
+    }
+
+    fn page_fault_info(&self) -> u16 {
+        let Some(fault) = self.last_page_fault else {
+            return 0;
+        };
+        let reason = match fault.reason {
+            crate::mmu::PageFaultReason::AddressOutOfRange => 1,
+            crate::mmu::PageFaultReason::NotPresent => 2,
+            crate::mmu::PageFaultReason::ReadOnly => 3,
+            crate::mmu::PageFaultReason::SupervisorOnly => 4,
+            crate::mmu::PageFaultReason::NotExecutable => 5,
+            crate::mmu::PageFaultReason::MalformedEntry => 6,
+            crate::mmu::PageFaultReason::PhysicalOutOfRange => 7,
+        };
+        let access = match fault.access {
+            crate::mmu::MemoryAccess::Fetch => 0,
+            crate::mmu::MemoryAccess::Read => 1,
+            crate::mmu::MemoryAccess::Write => 2,
+        };
+        (access << 8) | reason
+    }
+
+    fn legacy_control_byte(&self, address: u32) -> Option<u8> {
+        match address {
+            ICR_ADDR => Some(self.interrupts.control),
+            PIT_CONTROL_ADDR => Some(u8::from(self.interrupts.pit_enabled)),
+            address if (TIMER_PERIOD_ADDR..TIMER_PERIOD_ADDR + 2).contains(&address) => {
+                Some(self.interrupts.period.to_be_bytes()[(address - TIMER_PERIOD_ADDR) as usize])
+            }
+            address
+                if (PAGE_FAULT_ADDRESS_ADDR..PAGE_FAULT_ADDRESS_ADDR + 4).contains(&address) =>
+            {
+                self.fault_register_byte(
+                    crate::machine::FAULT_ADDRESS + address - PAGE_FAULT_ADDRESS_ADDR,
+                )
+            }
+            address if (PAGE_FAULT_INFO_ADDR..PAGE_FAULT_INFO_ADDR + 2).contains(&address) => self
+                .fault_register_byte(crate::machine::FAULT_INFO + address - PAGE_FAULT_INFO_ADDR),
+            _ => None,
+        }
+    }
+
+    fn write_legacy_control_byte(&mut self, address: u32, value: u8) -> bool {
+        match address {
+            ICR_ADDR => self.interrupts.control = value,
+            PIT_CONTROL_ADDR => self.interrupts.pit_enabled = value & 1 != 0,
+            address if (TIMER_PERIOD_ADDR..TIMER_PERIOD_ADDR + 2).contains(&address) => {
+                self.interrupts
+                    .write_legacy_period_byte(address != TIMER_PERIOD_ADDR, value);
+            }
+            _ => return false,
+        }
+        if let Some(byte) = self.memory.get_mut(address as usize) {
+            *byte = value;
+        }
+        true
+    }
+
+    pub fn raise_rtc_interrupt(&mut self) {
+        self.write(ICR_ADDR, self.interrupts.control | 8);
+    }
+
     pub fn read_u16(&mut self, address: u32) -> u16 {
         u16::from_be_bytes([self.read(address), self.read(address.wrapping_add(1))])
     }
@@ -3399,6 +3490,7 @@ impl Cpu {
             | u32::from(self.read(address.wrapping_add(3)))
     }
 
+    #[cfg(test)]
     fn write_u32(&mut self, address: u32, value: u32) {
         for offset in 0..4 {
             self.write(
@@ -3439,9 +3531,11 @@ impl Cpu {
                 crate::mmu::PageFaultReason::SupervisorOnly
             } else if access == crate::mmu::MemoryAccess::Fetch {
                 crate::mmu::PageFaultReason::NotExecutable
-            } else if crate::machine::system_register_byte(address, self.memory.len()).is_none() {
+            } else if crate::machine::device_register_writable(address).is_none() {
                 crate::mmu::PageFaultReason::PhysicalOutOfRange
-            } else if access == crate::mmu::MemoryAccess::Write {
+            } else if access == crate::mmu::MemoryAccess::Write
+                && crate::machine::device_register_writable(address) == Some(false)
+            {
                 crate::mmu::PageFaultReason::ReadOnly
             } else {
                 return Ok(());
@@ -3591,23 +3685,20 @@ impl Cpu {
     }
 
     fn record_page_fault(&mut self, fault: crate::mmu::PageFault) {
-        let reason = match fault.reason {
-            crate::mmu::PageFaultReason::AddressOutOfRange => 1,
-            crate::mmu::PageFaultReason::NotPresent => 2,
-            crate::mmu::PageFaultReason::ReadOnly => 3,
-            crate::mmu::PageFaultReason::SupervisorOnly => 4,
-            crate::mmu::PageFaultReason::NotExecutable => 5,
-            crate::mmu::PageFaultReason::MalformedEntry => 6,
-            crate::mmu::PageFaultReason::PhysicalOutOfRange => 7,
-        };
-        let access = match fault.access {
-            crate::mmu::MemoryAccess::Fetch => 0,
-            crate::mmu::MemoryAccess::Read => 1,
-            crate::mmu::MemoryAccess::Write => 2,
-        };
         self.last_page_fault = Some(fault);
-        self.write_u32(PAGE_FAULT_ADDRESS_ADDR, fault.virtual_address);
-        self.write_u16(PAGE_FAULT_INFO_ADDR, (access << 8) | reason);
+        if let Some(bytes) = self
+            .memory
+            .get_mut(PAGE_FAULT_ADDRESS_ADDR as usize..PAGE_FAULT_ADDRESS_ADDR as usize + 4)
+        {
+            bytes.copy_from_slice(&fault.virtual_address.to_be_bytes());
+        }
+        let info = self.page_fault_info().to_be_bytes();
+        if let Some(bytes) = self
+            .memory
+            .get_mut(PAGE_FAULT_INFO_ADDR as usize..PAGE_FAULT_INFO_ADDR as usize + 2)
+        {
+            bytes.copy_from_slice(&info);
+        }
     }
 
     fn read_u64_registers(&self, register: usize) -> u64 {
@@ -6005,21 +6096,9 @@ impl Cpu {
                 }
             }
         }
-        let period = self.read_u16(TIMER_PERIOD_ADDR);
-        if period != self.timer_period {
-            self.timer_period = period;
-            self.timer_countdown = period;
-        }
-        if period == 0 {
-            self.timer_countdown = 0;
-            return;
-        }
-        if self.timer_countdown <= 1 {
-            self.timer_countdown = period;
-            let icr = self.read(ICR_ADDR) | 0x10;
-            self.write(ICR_ADDR, icr);
-        } else {
-            self.timer_countdown -= 1;
+        self.interrupts.tick();
+        if let Some(byte) = self.memory.get_mut(ICR_ADDR as usize) {
+            *byte = self.interrupts.control;
         }
     }
 }
@@ -6216,7 +6295,7 @@ mod tests {
             let mut cpu = Cpu::with_memory_size(size).unwrap();
             for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
                 cpu.privilege_mode = mode;
-                for address in [crate::machine::INTERRUPT_BASE, ADDRESS_MASK] {
+                for address in [crate::machine::INPUT_BASE, ADDRESS_MASK] {
                     let aliased = (address & cpu.memory_mask) as usize;
                     cpu.memory[aliased] = 0xa5;
                     assert!(cpu.read_guest(address).is_err());
@@ -6237,6 +6316,176 @@ mod tests {
                 assert_eq!(cpu.memory[aliased], 0xa5);
             }
         }
+    }
+
+    #[test]
+    fn interrupt_and_fault_banks_have_no_ram_backing_or_read_side_effects() {
+        use crate::machine::*;
+
+        for size in [1 << 16, 1 << 20, MEMORY_SIZE] {
+            let mut cpu = Cpu::with_memory_size(size).unwrap();
+            if size == 1 << 16 {
+                assert_eq!(cpu.memory[(PIT_CONTROL_ADDR & cpu.memory_mask) as usize], 0);
+            }
+            let interrupt_alias = (INTERRUPT_BASE & cpu.memory_mask) as usize;
+            let fault_alias = (FAULT_BASE & cpu.memory_mask) as usize;
+            cpu.memory[interrupt_alias..interrupt_alias + 16].fill(0xa5);
+            cpu.memory[fault_alias..fault_alias + 8].fill(0xa5);
+            assert_eq!(cpu.read_guest(INTERRUPT_ENABLE).unwrap(), 0);
+            assert_eq!(cpu.read_guest(INTERRUPT_PIT_ENABLE).unwrap(), 1);
+            assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_PERIOD).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u32(FAULT_ADDRESS).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(FAULT_INFO).unwrap(), 0);
+            assert_eq!(cpu.read_guest(FAULT_VALID).unwrap(), 0);
+            cpu.write_guest(INTERRUPT_PIT_ENABLE, 0).unwrap();
+            cpu.write_guest_u16(INTERRUPT_PIT_PERIOD, 2).unwrap();
+            cpu.advance_timer();
+            assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_COUNTDOWN).unwrap(), 1);
+            cpu.advance_timer();
+            assert_eq!(cpu.read_guest(INTERRUPT_PENDING).unwrap(), 0x10);
+            assert_eq!(cpu.read_guest(INTERRUPT_PENDING).unwrap(), 0x10);
+            cpu.write_guest(INTERRUPT_ENABLE, 0xff).unwrap();
+            assert_eq!(cpu.read_guest(INTERRUPT_ENABLE).unwrap(), 1);
+            assert_eq!(cpu.read_guest(INTERRUPT_PENDING).unwrap(), 0x10);
+            cpu.write_guest(INTERRUPT_ACK, 8).unwrap();
+            assert_eq!(cpu.read_guest(INTERRUPT_PENDING).unwrap(), 0x10);
+            cpu.write_guest(INTERRUPT_ACK, 0xff).unwrap();
+            assert_eq!(cpu.read_guest(INTERRUPT_PENDING).unwrap(), 0);
+            assert_eq!(cpu.read_guest(INTERRUPT_ACK).unwrap(), 0);
+            assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_PERIOD).unwrap(), 2);
+            assert!(
+                cpu.memory[interrupt_alias..interrupt_alias + 16]
+                    .iter()
+                    .all(|b| *b == 0xa5)
+            );
+            assert!(
+                cpu.memory[fault_alias..fault_alias + 8]
+                    .iter()
+                    .all(|b| *b == 0xa5)
+            );
+        }
+    }
+
+    #[test]
+    fn high_pit_commits_on_low_byte_and_rejected_writes_are_atomic() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.write_guest_u16(INTERRUPT_PIT_PERIOD, 0x1234).unwrap();
+        cpu.advance_timer();
+        cpu.write_guest(INTERRUPT_PIT_PERIOD, 0xab).unwrap();
+        assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_PERIOD).unwrap(), 0x1234);
+        assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_COUNTDOWN).unwrap(), 0x1233);
+        assert!(
+            cpu.write_guest_u32(INTERRUPT_PIT_PERIOD, 0xffffffff)
+                .is_err()
+        );
+        assert!(cpu.write_guest_u16(INTERRUPT_ACK, 0xffff).is_ok());
+        assert!(cpu.write_guest_u16(INTERRUPT_PENDING, 0xff10).is_err());
+        assert!(cpu.write_guest_u16(INTERRUPT_PIT_ENABLE, 0xffff).is_err());
+        assert_eq!(cpu.read_guest(INTERRUPT_PIT_ENABLE).unwrap(), 1);
+        assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_PERIOD).unwrap(), 0x1234);
+        assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_COUNTDOWN).unwrap(), 0x1233);
+        cpu.write_guest(INTERRUPT_PIT_PERIOD + 1, 0xcd).unwrap();
+        assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_PERIOD).unwrap(), 0xabcd);
+        assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_COUNTDOWN).unwrap(), 0xabcd);
+        cpu.write_guest_u16(INTERRUPT_PIT_PERIOD, 0).unwrap();
+        cpu.advance_timer();
+        assert_eq!(cpu.read_guest_u16(INTERRUPT_PIT_COUNTDOWN).unwrap(), 0);
+        assert_eq!(cpu.read_guest(INTERRUPT_PENDING).unwrap(), 0);
+    }
+
+    #[test]
+    fn high_control_banks_validate_permissions_offsets_and_translated_aliases() {
+        use crate::machine::*;
+        use crate::mmu::{MemoryAccess, PageFaultReason};
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+        cpu.memory[0x3024..0x3028].copy_from_slice(&(INTERRUPT_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x3028..0x302c].copy_from_slice(&(FAULT_BASE | 0xf).to_be_bytes());
+        cpu.enable_mmu(0x2000).unwrap();
+        for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
+            cpu.privilege_mode = mode;
+            for (base, page) in [(0x9000, INTERRUPT_BASE), (0xa000, FAULT_BASE)] {
+                for offset in 0..DEVICE_BANK_SIZE {
+                    for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {
+                        let expected = if mode == PrivilegeMode::User {
+                            Some(PageFaultReason::SupervisorOnly)
+                        } else if access == MemoryAccess::Fetch {
+                            Some(PageFaultReason::NotExecutable)
+                        } else {
+                            match device_register_writable(page + offset) {
+                                None => Some(PageFaultReason::PhysicalOutOfRange),
+                                Some(false) if access == MemoryAccess::Write => {
+                                    Some(PageFaultReason::ReadOnly)
+                                }
+                                _ => None,
+                            }
+                        };
+                        let result = cpu.resolve_guest_range(base + offset, 1, access);
+                        if let Some(reason) = expected {
+                            assert_eq!(
+                                result,
+                                Err(CpuError::PageFault(crate::mmu::PageFault {
+                                    virtual_address: base + offset,
+                                    access,
+                                    reason,
+                                }))
+                            );
+                        } else {
+                            assert_eq!(result.unwrap(), vec![page + offset]);
+                        }
+                    }
+                }
+                for user in [false, true] {
+                    assert!(
+                        cpu.guest_memory_addresses(base, 1, MemoryAccess::Read, user)
+                            .is_err()
+                    );
+                }
+            }
+        }
+        cpu.privilege_mode = PrivilegeMode::Supervisor;
+        cpu.write_guest_u16(0x9008, 0x1234).unwrap();
+        assert_eq!(cpu.read_guest_u16(0x9008).unwrap(), 0x1234);
+        cpu.record_page_fault(crate::mmu::PageFault {
+            virtual_address: 0x9123,
+            access: MemoryAccess::Write,
+            reason: PageFaultReason::ReadOnly,
+        });
+        assert_eq!(cpu.read_guest_u32(0xa000).unwrap(), 0x9123);
+        assert_eq!(cpu.read_guest_u16(0xa004).unwrap(), 0x0203);
+        assert_eq!(cpu.read_guest(0xa006).unwrap(), 1);
+        assert_eq!(cpu.read_u16(PAGE_FAULT_INFO_ADDR), 0x0203);
+        cpu.prepare_image_entry();
+        assert_eq!(cpu.read(FAULT_VALID), 0);
+        assert_eq!(cpu.read_u32(FAULT_ADDRESS), 0);
+        assert_eq!(cpu.read_u16(FAULT_INFO), 0);
+        assert_eq!(cpu.read(INTERRUPT_ENABLE), 0);
+    }
+
+    #[test]
+    fn legacy_control_registers_share_state_with_high_banks_not_ram() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(ICR_ADDR, 0x1b);
+        assert_eq!(cpu.read(INTERRUPT_ENABLE), 1);
+        assert_eq!(cpu.read(INTERRUPT_PENDING), 0x1a);
+        cpu.write(INTERRUPT_ACK, 0x12);
+        assert_eq!(cpu.read(ICR_ADDR), 9);
+        cpu.raise_rtc_interrupt();
+        cpu.write(PIT_CONTROL_ADDR, 0);
+        assert_eq!(cpu.read(INTERRUPT_PIT_ENABLE), 0);
+        cpu.write_u16(TIMER_PERIOD_ADDR, 0x1234);
+        assert_eq!(cpu.read_u16(INTERRUPT_PIT_PERIOD), 0x1234);
+        cpu.write_u16(INTERRUPT_PIT_PERIOD, 0x5678);
+        assert_eq!(cpu.read_u16(TIMER_PERIOD_ADDR), 0x5678);
+        cpu.memory[ICR_ADDR as usize] = 0xff;
+        cpu.memory[TIMER_PERIOD_ADDR as usize..TIMER_PERIOD_ADDR as usize + 2].fill(0xff);
+        assert_eq!(cpu.read(ICR_ADDR), 9);
+        assert_eq!(cpu.read_u16(TIMER_PERIOD_ADDR), 0x5678);
     }
 
     #[test]
@@ -6302,7 +6551,7 @@ mod tests {
                 for address in [
                     SYSTEM_BASE + 20,
                     SYSTEM_BASE + 4095,
-                    INTERRUPT_BASE,
+                    INPUT_BASE,
                     ADDRESS_MASK,
                 ] {
                     assert!(cpu.read_guest(address).is_err());
@@ -6366,7 +6615,7 @@ mod tests {
 
     #[test]
     fn instruction_operands_cannot_mask_reserved_devices_into_small_ram() {
-        let address = crate::machine::INTERRUPT_BASE;
+        let address = crate::machine::INPUT_BASE;
         for source in [
             "LD R2, R0",
             "ST R0, R2",

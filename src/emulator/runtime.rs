@@ -1489,7 +1489,7 @@ fn update_rtc(cpu: &mut Cpu) {
     cpu.memory[RTC_START] = seconds as u8;
     cpu.memory[RTC_START + 1] = minutes as u8;
     cpu.memory[RTC_START + 2] = hours as u8;
-    cpu.memory[0x43002] |= 8;
+    cpu.raise_rtc_interrupt();
 }
 
 fn rate_budget(rate: f64, elapsed: f64, remainder: &mut f64) -> usize {
@@ -2341,7 +2341,7 @@ mod tests {
             cpu.registers[1] = 99;
             cpu.flags.zero = true;
             cpu.sp = 0x100;
-            cpu.memory[crate::cpu::ICR_ADDR as usize] = 1;
+            cpu.write(crate::cpu::ICR_ADDR, 1);
             boot_target(&mut cpu, &target).unwrap();
             assert!(cpu.running);
             assert_eq!(cpu.pc, 0x100);

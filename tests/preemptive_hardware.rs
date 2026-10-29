@@ -52,6 +52,108 @@ fn supervisor_executes_reads_from_the_high_system_bus_with_small_ram() {
 }
 
 #[test]
+fn high_pit_mask_latches_and_unmask_delivers_to_an_unmanaged_guest_kernel() {
+    use suomicpu16::machine::*;
+
+    for translated in [false, true] {
+        let base = if translated { 0x9000 } else { INTERRUPT_BASE };
+        let source = format!(
+            "LDI30 R6, {}\nLDI R0, 0\nST R6, R0\n\
+             LDI30 R6, {}\nLDI R0, 1\nSTW R6, R0\n\
+             EI\nINC R1\nLDI30 R6, {}\nST R6, R0\nHALT\n\
+             .address 0x1100\nINC R5\n\
+             LDI30 R6, {}\nLDI R0, 0\nSTW R6, R0\n\
+             LDI30 R6, {}\nLDI R0, 16\nST R6, R0\nRTI",
+            base + 6,
+            base + 8,
+            base + 6,
+            base + 8,
+            base + 5,
+        );
+        let image = assemble(&source, 0x1000).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.load_program(&image.segments, image.entry_point)
+            .unwrap();
+        cpu.load_idt(0x800).unwrap();
+        cpu.set_idt_descriptor(
+            suomicpu16::interrupts::IDT_VECTOR_PIT.into(),
+            suomicpu16::interrupts::IdtDescriptor {
+                handler: 0x1100,
+                present: true,
+                privilege: 0,
+                gate_type: suomicpu16::interrupts::GateType::Interrupt,
+            },
+        )
+        .unwrap();
+        if translated {
+            cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+            for (page, entry) in [(1, 0x100bu32), (9, INTERRUPT_BASE | 3), (15, 0xf003)] {
+                let offset = 0x3000 + page * 4;
+                cpu.memory[offset..offset + 4].copy_from_slice(&entry.to_be_bytes());
+            }
+            cpu.enable_mmu(0x2000).unwrap();
+        }
+        cpu.run(100).unwrap();
+        assert!(!cpu.running);
+        assert_eq!(cpu.registers[1], 1);
+        assert_eq!(cpu.registers[5], 1);
+        assert_eq!(cpu.current_task(), None);
+        assert_eq!(cpu.read(INTERRUPT_PENDING), 0);
+        assert_eq!(cpu.read_u16(INTERRUPT_PIT_PERIOD), 0);
+    }
+}
+
+#[test]
+fn guest_fault_handler_reads_the_high_fault_bank_after_a_denied_device_alias() {
+    use suomicpu16::machine::*;
+
+    let image = assemble(
+        "LDI30 R2, 0x9000\nLD R0, R2\nHALT\n\
+         .address 0x1100\nLDI R2, 0\nLDI R3, 0xa000\nLD32 R4, R2\n\
+         LDI30 R2, 0xa004\nLDW R0, R2\n\
+         LDI30 R2, 0xa006\nLD R1, R2\nHALT",
+        0x1000,
+    )
+    .unwrap();
+    let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.load_idt(0x800).unwrap();
+    cpu.set_idt_descriptor(
+        2,
+        suomicpu16::interrupts::IdtDescriptor {
+            handler: 0x1100,
+            present: true,
+            privilege: 0,
+            gate_type: suomicpu16::interrupts::GateType::Interrupt,
+        },
+    )
+    .unwrap();
+    cpu.memory[0x2000..0x2004].copy_from_slice(&0x300fu32.to_be_bytes());
+    for (page, entry) in [
+        (1, 0x100fu32),
+        (7, 0x7007),
+        (9, INTERRUPT_BASE | 0xf),
+        (10, FAULT_BASE | 3),
+        (15, 0xf003),
+    ] {
+        let offset = 0x3000 + page * 4;
+        cpu.memory[offset..offset + 4].copy_from_slice(&entry.to_be_bytes());
+    }
+    cpu.enable_mmu(0x2000).unwrap();
+    cpu.enter_user_mode(0x1000, 0x8000).unwrap();
+    cpu.run(32).unwrap();
+    assert!(!cpu.running);
+    assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+    assert_eq!(cpu.current_task(), None);
+    assert_eq!(cpu.registers[4], 0);
+    assert_eq!(cpu.registers[5], 0x9000);
+    assert_eq!(cpu.registers[0], 0x0104);
+    assert_eq!(cpu.registers[1], 1);
+    assert_eq!(cpu.last_page_fault().unwrap().virtual_address, 0x9000);
+}
+
+#[test]
 fn unmanaged_svc_always_enters_the_guest_kernel() {
     for abi_register in [0, 1, 77] {
         let image = assemble("SVC\nHALT\n.address 0x300\nINC R5\nRTI", 0x100).unwrap();
@@ -330,7 +432,7 @@ fn guest_kernel_preempts_and_switches_isolated_address_spaces_without_host_tasks
     SETSPH R0
     LDI R0, 0xb000
     SETSP R0
-    LDI30 R6, 0x4301e
+    LDI30 R6, 0x3ff01008
     LDI R0, 128
     STW R6, R0
     LDI R4, 0

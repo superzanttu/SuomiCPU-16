@@ -33,7 +33,31 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 1UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 1UL) return 14;\n\
+                 if (*banks != 7UL) return 14;\n\
+                 return 1;\n\
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
+fn guest_c_controls_the_high_pit_and_reads_fault_status() {
+    assert_eq!(
+        run_c(
+            "#include <sc16_machine.h>\n\
+             int main(void) {\n\
+                 volatile unsigned int *period = (volatile unsigned int *)SC16_INTERRUPT_PIT_PERIOD;\n\
+                 volatile unsigned char *enable = (volatile unsigned char *)SC16_INTERRUPT_PIT_ENABLE;\n\
+                 volatile unsigned char *valid = (volatile unsigned char *)SC16_FAULT_VALID;\n\
+                 volatile unsigned long *address = (volatile unsigned long *)SC16_FAULT_ADDRESS;\n\
+                 *enable = 0;\n\
+                 *period = 60000;\n\
+                 if (*period != 60000) return 11;\n\
+                 if (*enable != 0) return 12;\n\
+                 if (*valid != 0 || *address != 0UL) return 13;\n\
+                 *period = 0;\n\
+                 *enable = 1;\n\
                  return 1;\n\
              }"
         ),

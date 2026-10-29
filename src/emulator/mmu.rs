@@ -851,7 +851,7 @@ mod tests {
             &mut memory,
             0x2000,
             encode_entry(
-                crate::machine::INTERRUPT_BASE / PAGE_SIZE as u32,
+                crate::machine::INPUT_BASE / PAGE_SIZE as u32,
                 PagePermissions::USER_CODE,
             )
             .unwrap(),
@@ -905,102 +905,114 @@ mod tests {
 
     #[test]
     fn supervisor_device_mappings_do_not_own_or_reserve_device_frames() {
-        let mut memory = vec![0; 1 << 16];
-        let mut manager = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
-        let root = manager.create_address_space(&mut memory).unwrap();
-        let used = manager.used_frames();
-        let device = crate::machine::SYSTEM_BASE / PAGE_SIZE as u32;
-        for permissions in [PagePermissions::USER_DATA, PagePermissions::KERNEL_CODE] {
+        for base in [
+            crate::machine::SYSTEM_BASE,
+            crate::machine::INTERRUPT_BASE,
+            crate::machine::FAULT_BASE,
+        ] {
+            let mut memory = vec![0; 1 << 16];
+            let mut manager = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
+            let root = manager.create_address_space(&mut memory).unwrap();
+            let used = manager.used_frames();
+            let device = base / PAGE_SIZE as u32;
+            for permissions in [PagePermissions::USER_DATA, PagePermissions::KERNEL_CODE] {
+                assert_eq!(
+                    manager.map_borrowed_page(&mut memory, root, 0x9000, device, permissions),
+                    Err(PageTableError::InvalidPhysicalFrame)
+                );
+                assert_eq!(manager.used_frames(), used);
+            }
+            manager
+                .map_borrowed_page(
+                    &mut memory,
+                    root,
+                    0x9000,
+                    device,
+                    PagePermissions::KERNEL_DATA,
+                )
+                .unwrap();
+            assert_eq!(manager.used_frames(), used + 1);
             assert_eq!(
-                manager.map_borrowed_page(&mut memory, root, 0x9000, device, permissions),
-                Err(PageTableError::InvalidPhysicalFrame)
+                translate(&memory, root, 0x9008, MemoryAccess::Read, false).unwrap(),
+                base + 8
             );
+            assert_eq!(
+                translate(&memory, root, 0x9008, MemoryAccess::Read, true)
+                    .unwrap_err()
+                    .reason,
+                PageFaultReason::SupervisorOnly
+            );
+            assert!(
+                !address_space_physical_frames(&memory, root)
+                    .unwrap()
+                    .contains(&device)
+            );
+            for permissions in [PagePermissions::USER_DATA, PagePermissions::KERNEL_CODE] {
+                assert_eq!(
+                    manager.set_permissions(&mut memory, root, 0x9000, permissions),
+                    Err(PageTableError::InvalidPhysicalFrame)
+                );
+            }
+            manager
+                .set_permissions(
+                    &mut memory,
+                    root,
+                    0x9000,
+                    PagePermissions {
+                        writable: false,
+                        user: false,
+                        executable: false,
+                    },
+                )
+                .unwrap();
+            let mut adopted = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
+            adopted.adopt_address_space(&memory, root).unwrap();
+            assert_eq!(adopted.used_frames(), manager.used_frames());
+            manager.unmap_page(&mut memory, root, 0x9000).unwrap();
             assert_eq!(manager.used_frames(), used);
+            manager
+                .map_borrowed_page(
+                    &mut memory,
+                    root,
+                    0x9000,
+                    device,
+                    PagePermissions::KERNEL_DATA,
+                )
+                .unwrap();
+            manager.destroy_address_space(&mut memory, root).unwrap();
+            assert_eq!(manager.used_frames(), 2);
         }
-        manager
-            .map_borrowed_page(
-                &mut memory,
-                root,
-                0x9000,
-                device,
-                PagePermissions::KERNEL_DATA,
-            )
-            .unwrap();
-        assert_eq!(manager.used_frames(), used + 1);
-        assert_eq!(
-            translate(&memory, root, 0x9008, MemoryAccess::Read, false).unwrap(),
-            crate::machine::SYSTEM_RAM_BYTES
-        );
-        assert_eq!(
-            translate(&memory, root, 0x9008, MemoryAccess::Read, true)
-                .unwrap_err()
-                .reason,
-            PageFaultReason::SupervisorOnly
-        );
-        assert!(
-            !address_space_physical_frames(&memory, root)
-                .unwrap()
-                .contains(&device)
-        );
-        for permissions in [PagePermissions::USER_DATA, PagePermissions::KERNEL_CODE] {
-            assert_eq!(
-                manager.set_permissions(&mut memory, root, 0x9000, permissions),
-                Err(PageTableError::InvalidPhysicalFrame)
-            );
-        }
-        manager
-            .set_permissions(
-                &mut memory,
-                root,
-                0x9000,
-                PagePermissions {
-                    writable: false,
-                    user: false,
-                    executable: false,
-                },
-            )
-            .unwrap();
-        let mut adopted = PageMemoryManager::new(memory.len(), 0x2000).unwrap();
-        adopted.adopt_address_space(&memory, root).unwrap();
-        assert_eq!(adopted.used_frames(), manager.used_frames());
-        manager.unmap_page(&mut memory, root, 0x9000).unwrap();
-        assert_eq!(manager.used_frames(), used);
-        manager
-            .map_borrowed_page(
-                &mut memory,
-                root,
-                0x9000,
-                device,
-                PagePermissions::KERNEL_DATA,
-            )
-            .unwrap();
-        manager.destroy_address_space(&mut memory, root).unwrap();
-        assert_eq!(manager.used_frames(), 2);
     }
 
     #[test]
     fn forged_user_executable_device_entries_cannot_override_bus_protection() {
-        let mut memory = mapped_memory(PagePermissions::USER_CODE, PagePermissions::USER_CODE);
-        write_entry(&mut memory, 0x2000, crate::machine::SYSTEM_BASE | 0xf);
-        assert_eq!(
-            translate(&memory, 0, 0, MemoryAccess::Read, false).unwrap(),
-            crate::machine::SYSTEM_BASE
-        );
-        for (user, access, reason) in [
-            (true, MemoryAccess::Read, PageFaultReason::SupervisorOnly),
-            (true, MemoryAccess::Write, PageFaultReason::SupervisorOnly),
-            (true, MemoryAccess::Fetch, PageFaultReason::SupervisorOnly),
-            (false, MemoryAccess::Fetch, PageFaultReason::NotExecutable),
+        for base in [
+            crate::machine::SYSTEM_BASE,
+            crate::machine::INTERRUPT_BASE,
+            crate::machine::FAULT_BASE,
         ] {
+            let mut memory = mapped_memory(PagePermissions::USER_CODE, PagePermissions::USER_CODE);
+            write_entry(&mut memory, 0x2000, base | 0xf);
             assert_eq!(
-                translate(&memory, 0, 0, access, user).unwrap_err().reason,
-                reason
+                translate(&memory, 0, 0, MemoryAccess::Read, false).unwrap(),
+                base
+            );
+            for (user, access, reason) in [
+                (true, MemoryAccess::Read, PageFaultReason::SupervisorOnly),
+                (true, MemoryAccess::Write, PageFaultReason::SupervisorOnly),
+                (true, MemoryAccess::Fetch, PageFaultReason::SupervisorOnly),
+                (false, MemoryAccess::Fetch, PageFaultReason::NotExecutable),
+            ] {
+                assert_eq!(
+                    translate(&memory, 0, 0, access, user).unwrap_err().reason,
+                    reason
+                );
+            }
+            assert_eq!(
+                address_space_physical_frames(&memory, 0),
+                Err(PageTableError::InvalidPhysicalFrame)
             );
         }
-        assert_eq!(
-            address_space_physical_frames(&memory, 0),
-            Err(PageTableError::InvalidPhysicalFrame)
-        );
     }
 
     fn mapped_memory(

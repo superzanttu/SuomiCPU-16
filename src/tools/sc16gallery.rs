@@ -268,7 +268,7 @@ fn update_rtc(cpu: &mut Cpu, timestamp: u64) {
     cpu.memory[0x43010] = (timestamp % 60) as u8;
     cpu.memory[0x43011] = ((timestamp / 60) % 60) as u8;
     cpu.memory[0x43012] = ((timestamp / 3600) % 24) as u8;
-    cpu.memory[0x43002] |= 8;
+    cpu.raise_rtc_interrupt();
 }
 
 fn capture_frame(cpu: &Cpu, text_mode: bool) -> Vec<u8> {
