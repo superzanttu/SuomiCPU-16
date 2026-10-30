@@ -710,3 +710,11 @@ context are retained as implementation history.
 ** [ ] Pass full focused hardware, runtime, and SisuOS validation; the
    `sisu_os_boots_saunashell_and_runs_installed_guest_programs` regression still
    fails at logout/login (495 of 496 library tests pass).
+
+=== Phase 13 — Readable GPU text console
+
+* [x] *Improve console font readability without bypassing the SC-16 GPU*
+** [x] Design a wider bitmap font for the 80×25 guest console while preserving
+   the 640×480 GPU mode and existing terminal behavior.
+** [x] Verify glyph coverage, distinguishing letterforms, and GPU framebuffer
+   rendering; document the font and display contract.

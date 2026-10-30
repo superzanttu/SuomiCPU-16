@@ -41,6 +41,7 @@ const BIOS_TEXT_CELL_WIDTH: usize = 12;
 const BIOS_TEXT_CELL_HEIGHT: usize = 16;
 const BIOS_TEXT_LEFT: usize = (640 - BIOS_TEXT_COLUMNS * BIOS_TEXT_CELL_WIDTH) / 2;
 const BIOS_TEXT_TOP: usize = (480 - BIOS_TEXT_ROWS * BIOS_TEXT_CELL_HEIGHT) / 2;
+const CONSOLE_FONT_SOURCE_COLUMNS: [usize; 7] = [0, 0, 1, 2, 2, 3, 4];
 #[cfg(test)]
 const BIOS_MODULE_ROW_TOP: usize = BIOS_TEXT_TOP + 6 * BIOS_TEXT_CELL_HEIGHT;
 #[cfg(test)]
@@ -506,6 +507,7 @@ pub async fn run_with_devices(
     set_fullscreen(fullscreen);
 
     let font = load_font();
+    let console_font = load_console_font();
     let mut pixels = vec![0u32; 640 * 480];
     let mut framebuffer = Vec::new();
     let mut canvas = Canvas::new();
@@ -747,7 +749,7 @@ pub async fn run_with_devices(
         };
         if capture_display {
             if cpu.terminal_active {
-                render_terminal_to_gpu(&mut cpu, &font, cursor_phase)?;
+                render_terminal_to_gpu(&mut cpu, &console_font, cursor_phase)?;
                 render_gpu_framebuffer(&cpu, &mut pixels, &mut framebuffer);
                 presented_size = (640, 480);
                 cpu.terminal_dirty = false;
@@ -2005,11 +2007,11 @@ fn render_terminal_to_gpu(
                 continue;
             };
             for (glyph_row, bits) in glyph.iter().copied().enumerate().take(7) {
-                for glyph_column in 0..5 {
+                for glyph_column in 0..7 {
                     if bits & (0x80 >> glyph_column) != 0 {
                         for vertical_scale in 0..2 {
                             cpu.graphics_pixel(
-                                (column * 8 + 1 + glyph_column) as i32,
+                                (column * 8 + glyph_column) as i32,
                                 (top + row * 16 + 1 + glyph_row * 2 + vertical_scale) as i32,
                                 1,
                             );
@@ -2096,6 +2098,24 @@ fn load_font() -> Vec<[u8; 8]> {
         })
         .collect::<Vec<_>>();
     bytes.as_chunks::<8>().0.to_vec()
+}
+
+fn load_console_font() -> Vec<[u8; 8]> {
+    load_font()
+        .iter()
+        .map(|glyph| {
+            let mut wide_glyph = [0; 8];
+            for (row, bits) in glyph.iter().copied().enumerate().take(7) {
+                for column in 0..7 {
+                    let source_column = CONSOLE_FONT_SOURCE_COLUMNS[column];
+                    if bits & (0x80 >> source_column) != 0 {
+                        wide_glyph[row] |= 0x80 >> column;
+                    }
+                }
+            }
+            wide_glyph
+        })
+        .collect()
 }
 
 fn draw_text(
@@ -2332,6 +2352,39 @@ mod tests {
         render_terminal_to_gpu(&mut cpu, &font, true).unwrap();
         render_gpu_framebuffer(&cpu, &mut pixels, &mut framebuffer);
         assert_eq!(pixels[(top + 14) * 640 + 41], rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn console_font_uses_full_width_glyphs_and_distinguishes_common_letters() {
+        let font = load_console_font();
+        let glyph = |character: u8| font[usize::from(character - 32)];
+
+        assert_eq!(font.len(), load_font().len());
+        assert_eq!(glyph(b'A')[3], 0xfe);
+        assert_ne!(glyph(b'0'), glyph(b'O'));
+        assert_ne!(glyph(b'1'), glyph(b'I'));
+        assert_ne!(glyph(b'I'), glyph(b'l'));
+    }
+
+    #[test]
+    fn guest_console_draws_wide_glyph_pixels_through_the_gpu_framebuffer() {
+        let mut console = crate::console::ConsoleDevice::new();
+        console.write_data(b'A');
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.console = console;
+
+        render_terminal_to_gpu(&mut cpu, &load_console_font(), true).unwrap();
+
+        let glyph_row = ((480 - crate::console::ROWS * 16) / 2 + 1 + 3 * 2) * 640;
+        let mut pixels = vec![0; 640 * 480];
+        let mut framebuffer = Vec::new();
+        render_gpu_framebuffer(&cpu, &mut pixels, &mut framebuffer);
+        assert!(
+            pixels[glyph_row..glyph_row + 7]
+                .iter()
+                .all(|pixel| *pixel == rgb(255, 255, 255))
+        );
+        assert_eq!(pixels[glyph_row + 7], rgb(0, 0, 0));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
