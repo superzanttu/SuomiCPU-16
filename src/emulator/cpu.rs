@@ -1737,17 +1737,125 @@ impl Cpu {
         Err("guest path is not null-terminated within 128 bytes".to_owned())
     }
 
+    fn check_account_disk_access(
+        &self,
+        task_id: TaskId,
+        disk: &crate::disk::FolderDisk,
+        path: &str,
+        is_directory: bool,
+        required: u16,
+    ) -> Result<(), i64> {
+        if !disk.manifest().id.eq_ignore_ascii_case("sisuos") {
+            return Ok(());
+        }
+        let accounts =
+            crate::accounts::AccountStore::load(disk).map_err(|_| crate::syscall::error::IO)?;
+        let process = self
+            .syscall_state
+            .processes
+            .get(&task_id)
+            .ok_or(crate::syscall::error::INVALID)?;
+        let (uid, mut gids) = if process.bootstrap_authority {
+            (0, vec![0])
+        } else if let Some(credentials) = &process.credentials {
+            (
+                credentials.uid,
+                std::iter::once(credentials.primary_gid)
+                    .chain(credentials.supplementary_gids.iter().copied())
+                    .collect(),
+            )
+        } else {
+            return Err(crate::syscall::error::PERMISSION);
+        };
+        gids.sort_unstable();
+        gids.dedup();
+
+        let components: Vec<_> = path.split('/').collect();
+        let mut parent = String::new();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(component);
+            if !accounts.can_access(&parent, true, uid, &gids, 0o1) {
+                return Err(crate::syscall::error::PERMISSION);
+            }
+        }
+        if !accounts.can_access(path, is_directory, uid, &gids, required) {
+            return Err(crate::syscall::error::PERMISSION);
+        }
+        Ok(())
+    }
+
+    fn check_account_parent_access(
+        &self,
+        task_id: TaskId,
+        disk: &crate::disk::FolderDisk,
+        path: &str,
+        required: u16,
+    ) -> Result<(), i64> {
+        let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        self.check_account_disk_access(task_id, disk, parent, true, required)
+    }
+
+    fn register_created_account_path(
+        &self,
+        task_id: TaskId,
+        disk: &crate::disk::FolderDisk,
+        path: &str,
+        is_directory: bool,
+    ) -> Result<(), i64> {
+        if !disk.manifest().id.eq_ignore_ascii_case("sisuos") {
+            return Ok(());
+        }
+        let process = self
+            .syscall_state
+            .processes
+            .get(&task_id)
+            .ok_or(crate::syscall::error::INVALID)?;
+        let (uid, gid) = if process.bootstrap_authority {
+            (0, 0)
+        } else if let Some(credentials) = &process.credentials {
+            (credentials.uid, credentials.primary_gid)
+        } else {
+            return Err(crate::syscall::error::PERMISSION);
+        };
+        let mut accounts =
+            crate::accounts::AccountStore::load(disk).map_err(|_| crate::syscall::error::IO)?;
+        accounts
+            .register_created_path(path, is_directory, uid, gid)
+            .map_err(|error| match error {
+                crate::accounts::AccountError::CapacityExceeded => crate::syscall::error::NO_MEMORY,
+                _ => crate::syscall::error::INVALID,
+            })?;
+        accounts.save(disk).map_err(|_| crate::syscall::error::IO)
+    }
+
     fn dispatch_user_syscall(&mut self) -> Result<(), CpuError> {
         let version = self.registers[crate::syscall::REGISTER_ABI_VERSION];
         let number = self.registers[crate::syscall::REGISTER_NUMBER];
         let task_id = self.scheduler.current_task();
         if let Some(id) = task_id {
+            let has_bootstrap_authority = self.syscall_state.processes.is_empty()
+                && self
+                    .folder_disk
+                    .as_ref()
+                    .is_some_and(|disk| disk.manifest().id.eq_ignore_ascii_case("sisuos"));
             self.syscall_state.register_process(id, None);
             let record = self
                 .syscall_state
                 .processes
                 .get_mut(&id)
                 .expect("registered process");
+            record.bootstrap_authority |= has_bootstrap_authority;
+            if has_bootstrap_authority && record.credentials.is_none() {
+                record.credentials = Some(crate::syscall::ProcessCredentials {
+                    uid: 0,
+                    primary_gid: 0,
+                    supplementary_gids: Vec::new(),
+                    home: "root".to_owned(),
+                });
+            }
             if record.name.is_empty() {
                 record.name = self
                     .folder_disk
@@ -1804,6 +1912,23 @@ impl Cpu {
                 Ok(SyscallNumber::ScNet) => self.syscall_scnet(task_id),
                 Ok(SyscallNumber::Graphics) => self.syscall_graphics(task_id),
                 Ok(SyscallNumber::InputSnapshot) => self.syscall_input_snapshot(task_id),
+                Ok(SyscallNumber::AccountStatus) => self.syscall_account_status(task_id),
+                Ok(SyscallNumber::InitializeRootPassword) => {
+                    self.syscall_initialize_root_password(task_id)
+                }
+                Ok(SyscallNumber::Authenticate) => self.syscall_authenticate(task_id),
+                Ok(SyscallNumber::SetConsoleEcho) => self.syscall_set_console_echo(task_id),
+                Ok(SyscallNumber::AddGroup) => self.syscall_add_group(task_id),
+                Ok(SyscallNumber::AddUser) => self.syscall_add_user(task_id),
+                Ok(SyscallNumber::SetPassword) => self.syscall_set_password(task_id),
+                Ok(SyscallNumber::DirectoryEntry) => self.syscall_directory_entry(task_id),
+                Ok(SyscallNumber::MakeDirectory) => self.syscall_make_directory(task_id),
+                Ok(SyscallNumber::DeleteFile) => self.syscall_delete_file(task_id),
+                Ok(SyscallNumber::SetFileMode) => self.syscall_set_file_mode(task_id),
+                Ok(SyscallNumber::SetFileOwner) => self.syscall_set_file_owner(task_id),
+                Ok(SyscallNumber::Kill) => self.syscall_kill(task_id),
+                Ok(SyscallNumber::RenameFile) => self.syscall_rename_file(task_id),
+                Ok(SyscallNumber::ProcessAccounting) => self.syscall_process_accounting(),
                 Ok(SyscallNumber::ProcessInfo | SyscallNumber::ProcessStatus) => {
                     self.syscall_process_info()
                 }
@@ -1921,6 +2046,503 @@ impl Cpu {
         text.len() as i64
     }
 
+    fn syscall_process_accounting(&mut self) -> i64 {
+        let Ok(index) = usize::try_from(self.registers[1]) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Ok(destination) = u32::try_from(self.registers[2]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let Ok(capacity) = usize::try_from(self.registers[3]) else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[4..=6].iter().any(|argument| *argument != 0)
+            || capacity > crate::syscall::MAX_TRANSFER_BYTES
+        {
+            return crate::syscall::error::INVALID;
+        }
+        let Some(task) = self
+            .scheduler
+            .tasks()
+            .iter()
+            .filter(|task| self.syscall_state.processes.contains_key(&task.id))
+            .nth(index)
+        else {
+            return 0;
+        };
+        let instructions = self
+            .syscall_state
+            .process_instructions
+            .get(&task.id)
+            .copied()
+            .unwrap_or_default();
+        let text = format!("{} {instructions}\n", task.id);
+        if text.len() > capacity {
+            return crate::syscall::error::OVERFLOW;
+        }
+        let addresses = match self.guest_memory_addresses(
+            destination,
+            text.len(),
+            crate::mmu::MemoryAccess::Write,
+            true,
+        ) {
+            Ok(addresses) => addresses,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        for (address, byte) in addresses.into_iter().zip(text.bytes()) {
+            self.memory[address] = byte;
+        }
+        text.len() as i64
+    }
+
+    fn syscall_kill(&mut self, caller: Option<TaskId>) -> i64 {
+        let Some(caller) = caller else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[3..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let target = match u32::try_from(self.registers[1]) {
+            Ok(id) => id,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        let exit_code = match i32::try_from(self.registers[2]) {
+            Ok(code) if (0..=255).contains(&code) => code,
+            _ => return crate::syscall::error::INVALID,
+        };
+        if target == 0 || target == caller {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Some(target_record) = self.syscall_state.processes.get(&target) else {
+            return crate::syscall::error::NO_ENTRY;
+        };
+        let is_child = target_record.parent == Some(caller)
+            && self
+                .syscall_state
+                .processes
+                .get(&caller)
+                .is_some_and(|record| record.children.contains(&target));
+        let is_root = self
+            .syscall_state
+            .processes
+            .get(&caller)
+            .and_then(|record| record.credentials.as_ref())
+            .is_some_and(|credentials| credentials.uid == 0);
+        if !is_child && !is_root {
+            return crate::syscall::error::PERMISSION;
+        }
+        if target_record.exit_code.is_some() {
+            return crate::syscall::error::NO_ENTRY;
+        }
+        if !target_record.children.is_empty() {
+            return crate::syscall::error::BUSY;
+        }
+        if self.scheduler.terminate(target, exit_code).is_err() {
+            return crate::syscall::error::NO_ENTRY;
+        }
+        self.complete_process(target, exit_code);
+        0
+    }
+
+    fn syscall_directory_entry(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        let directory_address = match u32::try_from(self.registers[1]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let index = match usize::try_from(self.registers[2]) {
+            Ok(index) => index,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        let destination = match u32::try_from(self.registers[3]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let capacity = match usize::try_from(self.registers[4]) {
+            Ok(capacity) if capacity <= crate::syscall::MAX_TRANSFER_BYTES => capacity,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let directory = match self.read_guest_path(directory_address, true) {
+            Ok(Some(directory)) => directory,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let is_root = directory == "/";
+        let permission_path = if is_root { "" } else { directory.as_str() };
+        let Some(disk) = self
+            .folder_disk
+            .as_ref()
+            .or(self.program_folder_disk.as_ref())
+        else {
+            return crate::syscall::error::IO;
+        };
+        if let Err(error) =
+            self.check_account_disk_access(task_id, disk, permission_path, true, 0o5)
+        {
+            return error;
+        }
+        let entries = match disk.list_dir((!is_root).then_some(directory.as_str())) {
+            Ok(entries) => entries,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        let Some(entry) = entries.get(index) else {
+            return 0;
+        };
+        let suffix = if entry.is_directory { "/" } else { "" };
+        let length = entry.name.len() + suffix.len();
+        if capacity <= length {
+            return crate::syscall::error::OVERFLOW;
+        }
+        let addresses = match self.guest_memory_addresses(
+            destination,
+            length + 1,
+            crate::mmu::MemoryAccess::Write,
+            true,
+        ) {
+            Ok(addresses) => addresses,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        for (address, byte) in addresses
+            .into_iter()
+            .zip(entry.name.bytes().chain(suffix.bytes()).chain([0]))
+        {
+            self.memory[address] = byte;
+        }
+        length as i64
+    }
+
+    fn syscall_make_directory(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[2..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let address = match u32::try_from(self.registers[1]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let path = match self.read_guest_path(address, true) {
+            Ok(Some(path)) => path,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        if Self::validate_guest_mutation_path(&path).is_err() {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Some(disk) = self
+            .folder_disk
+            .as_ref()
+            .or(self.program_folder_disk.as_ref())
+        else {
+            return crate::syscall::error::IO;
+        };
+        if disk.manifest().read_only {
+            return crate::syscall::error::PERMISSION;
+        }
+        if let Err(error) = self.check_account_parent_access(task_id, disk, &path, 0o3) {
+            return error;
+        }
+        if disk.metadata(&path).is_ok() {
+            return crate::syscall::error::INVALID;
+        }
+        if disk.create_dir(&path).is_err() {
+            return crate::syscall::error::NO_ENTRY;
+        }
+        if let Err(error) = self.register_created_account_path(task_id, disk, &path, true) {
+            if let Err(cleanup_error) = disk.delete_entry(&path) {
+                self.debug_console.log_error(
+                    "filesystem",
+                    &format!("failed to roll back created directory {path:?}: {cleanup_error}"),
+                );
+            }
+            return error;
+        }
+        0
+    }
+
+    fn syscall_delete_file(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[2..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let address = match u32::try_from(self.registers[1]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let path = match self.read_guest_path(address, true) {
+            Ok(Some(path)) => path,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        if Self::validate_guest_mutation_path(&path).is_err() {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Some(disk) = self
+            .folder_disk
+            .as_ref()
+            .or(self.program_folder_disk.as_ref())
+        else {
+            return crate::syscall::error::IO;
+        };
+        if disk.manifest().read_only {
+            return crate::syscall::error::PERMISSION;
+        }
+        if let Err(error) = self.check_account_parent_access(task_id, disk, &path, 0o3) {
+            return error;
+        }
+        let mut accounts = if disk.manifest().id.eq_ignore_ascii_case("sisuos") {
+            let mut accounts = match crate::accounts::AccountStore::load(disk) {
+                Ok(accounts) => accounts,
+                Err(_) => return crate::syscall::error::IO,
+            };
+            if accounts.remove_file_permission(&path).is_err() {
+                return crate::syscall::error::INVALID;
+            }
+            Some(accounts)
+        } else {
+            None
+        };
+        if disk.delete_file(&path).is_err() {
+            return crate::syscall::error::NO_ENTRY;
+        }
+        if let Some(accounts) = accounts.as_mut()
+            && accounts.save(disk).is_err()
+        {
+            self.debug_console.log_error(
+                "filesystem",
+                &format!("deleted {path:?} but could not persist its permission update"),
+            );
+            return crate::syscall::error::IO;
+        }
+        0
+    }
+
+    fn syscall_rename_file(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[3..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let values = match self.account_request_strings(&[self.registers[1], self.registers[2]], 2)
+        {
+            Ok(values) => values,
+            Err(error) => return error,
+        };
+        let [source, destination]: [String; 2] = match values.try_into() {
+            Ok(values) => values,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        if Self::validate_guest_mutation_path(&source).is_err()
+            || Self::validate_guest_mutation_path(&destination).is_err()
+        {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        };
+        if !disk.manifest().id.eq_ignore_ascii_case("sisuos") {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        }
+        if disk.manifest().read_only {
+            return crate::syscall::error::PERMISSION;
+        }
+        for path in [&source, &destination] {
+            if let Err(error) = self.check_account_parent_access(task_id, disk, path, 0o3) {
+                return error;
+            }
+        }
+        match disk.metadata(&source) {
+            Ok(metadata) if !metadata.is_directory => {}
+            Ok(_) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::NO_ENTRY,
+        }
+        if disk.metadata(&destination).is_ok() {
+            return crate::syscall::error::INVALID;
+        }
+        if self
+            .syscall_state
+            .open_files
+            .values()
+            .flat_map(|files| files.values())
+            .any(|file| file.path.eq_ignore_ascii_case(&source))
+        {
+            return crate::syscall::error::BUSY;
+        }
+        let mut accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        if accounts
+            .rename_file_permission(&source, &destination)
+            .is_err()
+        {
+            return crate::syscall::error::INVALID;
+        }
+        if disk.rename_file(&source, &destination).is_err() {
+            return crate::syscall::error::NO_ENTRY;
+        }
+        if accounts.save(disk).is_err() {
+            if let Err(error) = disk.rename_file(&destination, &source) {
+                self.debug_console.log_error(
+                    "filesystem",
+                    &format!(
+                        "renamed {source:?} but failed to save permissions and rollback: {error}"
+                    ),
+                );
+            }
+            return crate::syscall::error::IO;
+        }
+        0
+    }
+
+    fn syscall_set_file_mode(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[3..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let address = match u32::try_from(self.registers[1]) {
+            Ok(address) => address,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let mode = match u16::try_from(self.registers[2]) {
+            Ok(mode) if mode <= 0o777 => mode,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let path = match self.read_guest_path(address, true) {
+            Ok(Some(path)) => path,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        };
+        if !disk.manifest().id.eq_ignore_ascii_case("sisuos") {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        }
+        if disk.manifest().read_only {
+            return crate::syscall::error::PERMISSION;
+        }
+        if Self::validate_guest_mutation_path(&path).is_err() {
+            return crate::syscall::error::PERMISSION;
+        }
+        if let Err(error) = self.check_account_parent_access(task_id, disk, &path, 0o1) {
+            return error;
+        }
+        let is_directory = match disk.metadata(&path) {
+            Ok(metadata) => metadata.is_directory,
+            Err(_) => return crate::syscall::error::NO_ENTRY,
+        };
+        let caller_uid = match self
+            .syscall_state
+            .processes
+            .get(&task_id)
+            .and_then(|process| process.credentials.as_ref())
+        {
+            Some(credentials) => credentials.uid,
+            None => return crate::syscall::error::PERMISSION,
+        };
+        let mut accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        if let Err(error) = accounts.set_file_mode(&path, is_directory, caller_uid, mode) {
+            return match error {
+                crate::accounts::AccountError::PermissionDenied => {
+                    crate::syscall::error::PERMISSION
+                }
+                crate::accounts::AccountError::CapacityExceeded => crate::syscall::error::NO_MEMORY,
+                _ => crate::syscall::error::INVALID,
+            };
+        }
+        if accounts.save(disk).is_err() {
+            return crate::syscall::error::IO;
+        }
+        0
+    }
+
+    fn syscall_set_file_owner(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[4..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let values = match self.account_request_strings(
+            &[self.registers[1], self.registers[2], self.registers[3]],
+            3,
+        ) {
+            Ok(values) => values,
+            Err(error) => return error,
+        };
+        let [path, user_name, group_name]: [String; 3] = match values.try_into() {
+            Ok(values) => values,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        };
+        if !disk.manifest().id.eq_ignore_ascii_case("sisuos") {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        }
+        if disk.manifest().read_only {
+            return crate::syscall::error::PERMISSION;
+        }
+        if Self::validate_guest_mutation_path(&path).is_err() {
+            return crate::syscall::error::PERMISSION;
+        }
+        if let Err(error) = self.check_account_parent_access(task_id, disk, &path, 0o1) {
+            return error;
+        }
+        let is_directory = match disk.metadata(&path) {
+            Ok(metadata) => metadata.is_directory,
+            Err(_) => return crate::syscall::error::NO_ENTRY,
+        };
+        let credentials = match self
+            .syscall_state
+            .processes
+            .get(&task_id)
+            .and_then(|process| process.credentials.as_ref())
+        {
+            Some(credentials) => credentials,
+            None => return crate::syscall::error::PERMISSION,
+        };
+        let mut accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        let Some(uid) = accounts.user(&user_name).map(|user| user.uid) else {
+            return crate::syscall::error::NO_ENTRY;
+        };
+        let Some(gid) = accounts.group(&group_name).map(|group| group.gid) else {
+            return crate::syscall::error::NO_ENTRY;
+        };
+        let gids = std::iter::once(credentials.primary_gid)
+            .chain(credentials.supplementary_gids.iter().copied())
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            accounts.set_file_owner(&path, is_directory, credentials.uid, uid, gid, &gids)
+        {
+            return match error {
+                crate::accounts::AccountError::PermissionDenied => {
+                    crate::syscall::error::PERMISSION
+                }
+                _ => crate::syscall::error::INVALID,
+            };
+        }
+        if accounts.save(disk).is_err() {
+            return crate::syscall::error::IO;
+        }
+        0
+    }
+
     fn syscall_open(&mut self, task_id: Option<TaskId>) -> i64 {
         let Some(task_id) = task_id else {
             return crate::syscall::error::INVALID;
@@ -1965,11 +2587,38 @@ impl Cpu {
         if flags & crate::syscall::open_flags::WRITE != 0 && disk.manifest().read_only {
             return crate::syscall::error::PERMISSION;
         }
+        let target_exists = disk.metadata(&path).is_ok();
+        if flags & crate::syscall::open_flags::READ != 0 {
+            if let Err(error) = self.check_account_disk_access(task_id, disk, &path, false, 0o4) {
+                return error;
+            }
+        }
+        if flags & crate::syscall::open_flags::WRITE != 0 {
+            let access = if flags & crate::syscall::open_flags::CREATE != 0 && !target_exists {
+                self.check_account_parent_access(task_id, disk, &path, 0o3)
+            } else {
+                self.check_account_disk_access(task_id, disk, &path, false, 0o2)
+            };
+            if let Err(error) = access {
+                return error;
+            }
+        }
         if disk
             .ensure_regular_file(&path, flags & crate::syscall::open_flags::CREATE != 0)
             .is_err()
         {
             return crate::syscall::error::NO_ENTRY;
+        }
+        if flags & crate::syscall::open_flags::CREATE != 0 && !target_exists {
+            if let Err(error) = self.register_created_account_path(task_id, disk, &path, false) {
+                if let Err(cleanup_error) = disk.delete_file(&path) {
+                    self.debug_console.log_error(
+                        "filesystem",
+                        &format!("failed to roll back created file {path:?}: {cleanup_error}"),
+                    );
+                }
+                return error;
+            }
         }
         if flags & crate::syscall::open_flags::TRUNCATE != 0 && disk.write_file(&path, &[]).is_err()
         {
@@ -2049,6 +2698,9 @@ impl Cpu {
         else {
             return crate::syscall::error::IO;
         };
+        if let Err(error) = self.check_account_disk_access(task_id, disk, &file.path, false, 0o4) {
+            return error;
+        }
         let data = match disk.read_file(&file.path, file.offset, length) {
             Ok((data, _)) => data,
             Err(_) => return crate::syscall::error::IO,
@@ -2115,6 +2767,9 @@ impl Cpu {
         else {
             return crate::syscall::error::IO;
         };
+        if let Err(error) = self.check_account_disk_access(task_id, disk, &file.path, false, 0o2) {
+            return error;
+        }
         let offset = if file.flags & crate::syscall::open_flags::APPEND != 0 {
             match disk.metadata(&file.path) {
                 Ok(metadata) => metadata.size_bytes,
@@ -2465,6 +3120,315 @@ impl Cpu {
         crate::machine::INPUT_SNAPSHOT_SIZE as i64
     }
 
+    fn syscall_account_status(&self, task_id: Option<TaskId>) -> i64 {
+        if task_id.is_none() {
+            return crate::syscall::error::INVALID;
+        }
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::IO;
+        };
+        match crate::accounts::AccountStore::load(disk) {
+            Ok(store)
+                if store
+                    .user("root")
+                    .is_some_and(|root| root.password_hash.is_some()) =>
+            {
+                1
+            }
+            Ok(store) if store.user("root").is_some() => 0,
+            Ok(_) => crate::syscall::error::IO,
+            Err(_) => crate::syscall::error::IO,
+        }
+    }
+
+    fn syscall_initialize_root_password(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[2..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        if !self
+            .syscall_state
+            .processes
+            .get(&task_id)
+            .is_some_and(|process| process.bootstrap_authority)
+        {
+            return crate::syscall::error::PERMISSION;
+        }
+        let Ok(password_address) = u32::try_from(self.registers[1]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let password = match self.read_guest_path(password_address, true) {
+            Ok(Some(password)) => password,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::IO;
+        };
+        let mut accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        if accounts.initialize_root_password(&password).is_err() {
+            return crate::syscall::error::INVALID;
+        }
+        if accounts.save(disk).is_err() {
+            return crate::syscall::error::IO;
+        }
+        self.syscall_state
+            .processes
+            .get_mut(&task_id)
+            .expect("task account record exists")
+            .bootstrap_authority = false;
+        0
+    }
+
+    fn syscall_authenticate(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[3..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let (Ok(name_address), Ok(password_address)) = (
+            u32::try_from(self.registers[1]),
+            u32::try_from(self.registers[2]),
+        ) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let name = match self.read_guest_path(name_address, true) {
+            Ok(Some(name)) => name,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let password = match self.read_guest_path(password_address, true) {
+            Ok(Some(password)) => password,
+            Ok(None) => return crate::syscall::error::INVALID,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::IO;
+        };
+        let accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        let Some(user) = accounts.authenticate(&name, &password).cloned() else {
+            return crate::syscall::error::PERMISSION;
+        };
+        let process = self
+            .syscall_state
+            .processes
+            .get_mut(&task_id)
+            .expect("task account record exists");
+        process.credentials = Some(crate::syscall::ProcessCredentials {
+            uid: user.uid,
+            primary_gid: user.primary_gid,
+            supplementary_gids: user.supplementary_gids,
+            home: user.home,
+        });
+        process.bootstrap_authority = false;
+        i64::from(user.uid)
+    }
+
+    fn syscall_set_console_echo(&mut self, task_id: Option<TaskId>) -> i64 {
+        if task_id.is_none() {
+            return crate::syscall::error::INVALID;
+        }
+        let echo = match self.registers[1] {
+            0 => false,
+            1 => true,
+            _ => return crate::syscall::error::INVALID,
+        };
+        let control = self.console.control();
+        self.console.set_control((control & !1) | u8::from(echo));
+        0
+    }
+
+    fn account_request_strings(
+        &mut self,
+        addresses: &[i64],
+        argument_count: usize,
+    ) -> Result<Vec<String>, i64> {
+        if addresses.len() != argument_count || argument_count == 0 || argument_count > 3 {
+            return Err(crate::syscall::error::INVALID);
+        }
+        let mut strings = Vec::with_capacity(argument_count);
+        for address in addresses {
+            let address = u32::try_from(*address).map_err(|_| {
+                self.debug_console.log_error(
+                    "account",
+                    "guest account-string address is outside the address range",
+                );
+                crate::syscall::error::BAD_ADDRESS
+            })?;
+            match self.read_guest_path(address, true) {
+                Ok(Some(value)) => strings.push(value),
+                Ok(None) => return Err(crate::syscall::error::INVALID),
+                Err(error) => {
+                    self.debug_console.log_error(
+                        "account",
+                        &format!("guest account string at {address:#x}: {error}"),
+                    );
+                    return Err(crate::syscall::error::BAD_ADDRESS);
+                }
+            }
+        }
+        Ok(strings)
+    }
+
+    fn is_root_process(&self, task_id: TaskId) -> bool {
+        self.syscall_state
+            .processes
+            .get(&task_id)
+            .and_then(|process| process.credentials.as_ref())
+            .is_some_and(|credentials| credentials.uid == 0)
+    }
+
+    fn syscall_add_group(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if !self.is_root_process(task_id) {
+            return crate::syscall::error::PERMISSION;
+        }
+        let name = match self.account_request_strings(&[self.registers[1]], 1) {
+            Ok(mut values) => values.remove(0),
+            Err(error) => return error,
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::IO;
+        };
+        let mut accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        let gid = match accounts.add_group(&name) {
+            Ok(gid) => gid,
+            Err(crate::accounts::AccountError::NameInUse) => {
+                return crate::syscall::error::INVALID;
+            }
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        if accounts.save(disk).is_err() {
+            return crate::syscall::error::IO;
+        }
+        i64::from(gid)
+    }
+
+    fn syscall_add_user(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if !self.is_root_process(task_id) {
+            return crate::syscall::error::PERMISSION;
+        }
+        let values = match self.account_request_strings(
+            &[self.registers[1], self.registers[2], self.registers[3]],
+            3,
+        ) {
+            Ok(values) => values,
+            Err(error) => return error,
+        };
+        let [name, group, home]: [String; 3] = match values.try_into() {
+            Ok(values) => values,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::IO;
+        };
+        let mut accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        let gid = match accounts.group(&group) {
+            Some(group) => group.gid,
+            None => return crate::syscall::error::NO_ENTRY,
+        };
+        let uid = match accounts.add_user(&name, &group, &home) {
+            Ok(uid) => uid,
+            Err(crate::accounts::AccountError::NameInUse) => {
+                return crate::syscall::error::INVALID;
+            }
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        if disk.metadata(&home).is_ok() {
+            return crate::syscall::error::INVALID;
+        }
+        let parent = home.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let mut current = String::new();
+        for component in parent.split('/').filter(|component| !component.is_empty()) {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            match disk.metadata(&current) {
+                Ok(entry) if entry.is_directory => {}
+                Ok(_) => return crate::syscall::error::INVALID,
+                Err(_) if disk.create_dir(&current).is_ok() => {}
+                Err(_) => return crate::syscall::error::IO,
+            }
+        }
+        if disk.create_dir(&home).is_err() {
+            return crate::syscall::error::IO;
+        }
+        if accounts
+            .set_file_owner(&home, true, 0, uid, gid, &[0])
+            .and_then(|()| accounts.set_file_mode(&home, true, 0, 0o700))
+            .is_err()
+            || accounts.save(disk).is_err()
+        {
+            let _ = disk.delete_entry(&home);
+            return crate::syscall::error::IO;
+        }
+        i64::from(uid)
+    }
+
+    fn syscall_set_password(&mut self, task_id: Option<TaskId>) -> i64 {
+        let Some(task_id) = task_id else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[3..=6].iter().any(|argument| *argument != 0) {
+            return crate::syscall::error::INVALID;
+        }
+        let values = match self.account_request_strings(&[self.registers[1], self.registers[2]], 2)
+        {
+            Ok(values) => values,
+            Err(error) => return error,
+        };
+        let [name, password]: [String; 2] = match values.try_into() {
+            Ok(values) => values,
+            Err(_) => return crate::syscall::error::INVALID,
+        };
+        let Some(process) = self.syscall_state.processes.get(&task_id) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Some(credentials) = process.credentials.as_ref() else {
+            return crate::syscall::error::PERMISSION;
+        };
+        let Some(disk) = self.folder_disk.as_ref() else {
+            return crate::syscall::error::IO;
+        };
+        let mut accounts = match crate::accounts::AccountStore::load(disk) {
+            Ok(accounts) => accounts,
+            Err(_) => return crate::syscall::error::IO,
+        };
+        if credentials.uid != 0
+            && accounts.user(&name).map(|user| user.uid) != Some(credentials.uid)
+        {
+            return crate::syscall::error::PERMISSION;
+        }
+        if accounts.set_password(&name, &password).is_err() {
+            return crate::syscall::error::INVALID;
+        }
+        if accounts.save(disk).is_err() {
+            return crate::syscall::error::IO;
+        }
+        0
+    }
+
     fn ensure_page_memory_manager(&mut self) -> Result<(), crate::mmu::PageTableError> {
         if self.page_memory_manager.is_some() {
             return Ok(());
@@ -2626,6 +3590,9 @@ impl Cpu {
         let Some(disk) = self.folder_disk.as_ref() else {
             return crate::syscall::error::IO;
         };
+        if let Err(error) = self.check_account_disk_access(parent, disk, &path, false, 0o5) {
+            return error;
+        }
         let image = match disk.load_executable(&path) {
             Ok(image) => image,
             Err(_) => return crate::syscall::error::NO_ENTRY,
@@ -2876,6 +3843,16 @@ impl Cpu {
                 return crate::syscall::error::NO_MEMORY;
             }
         };
+        let parent_credentials = self
+            .syscall_state
+            .processes
+            .get(&parent)
+            .and_then(|process| process.credentials.clone());
+        let bootstrap_authority = self
+            .syscall_state
+            .processes
+            .get(&parent)
+            .is_some_and(|process| process.bootstrap_authority);
         self.syscall_state.register_process(id, Some(parent));
         let record = self
             .syscall_state
@@ -2885,6 +3862,15 @@ impl Cpu {
         record.startup_argument = argument;
         record.arguments = arguments;
         record.name = path;
+        record.credentials = parent_credentials;
+        record.bootstrap_authority = bootstrap_authority;
+        if bootstrap_authority {
+            self.syscall_state
+                .processes
+                .get_mut(&parent)
+                .expect("parent account record exists")
+                .bootstrap_authority = false;
+        }
         i64::from(id)
     }
 
@@ -3152,6 +4138,7 @@ impl Cpu {
             }
         }
         self.syscall_state.processes.remove(&child);
+        self.syscall_state.process_instructions.remove(&child);
         self.syscall_state.open_files.remove(&child);
     }
 
@@ -3176,6 +4163,14 @@ impl Cpu {
         self.syscall_state.sleeping.remove(&id);
         self.syscall_state.sleeping_millis.remove(&id);
         self.syscall_state.waiting_for.remove(&id);
+        self.syscall_state.pending_results.remove(&id);
+        self.syscall_state.pending_wait_status.remove(&id);
+        for record in self.syscall_state.processes.values_mut() {
+            record.waiters.retain(|waiter| *waiter != id);
+        }
+        for semaphore in self.syscall_state.semaphores.values_mut() {
+            semaphore.waiters.retain(|waiter| *waiter != id);
+        }
         let owned_semaphores: Vec<_> = self
             .syscall_state
             .semaphores
@@ -4091,6 +5086,7 @@ impl Cpu {
         if !self.running {
             return Ok(());
         }
+        let executing_task = self.current_task();
         let saved_pc = self.pc;
         let saved_registers = self.registers;
         let saved_sp = self.sp;
@@ -4098,7 +5094,7 @@ impl Cpu {
         let saved_flags = self.flags;
         let saved_mode = self.privilege_mode;
         let saved_running = self.running;
-        match self.execute_instruction() {
+        let result = match self.execute_instruction() {
             Err(CpuError::PrivilegeViolation { operation, .. }) => {
                 self.debug_console.log_error(
                     "cpu",
@@ -4132,7 +5128,13 @@ impl Cpu {
                 self.enter_exception(EXCEPTION_PAGE_FAULT, saved_pc)
             }
             result => result,
+        };
+        if let Some(task_id) = executing_task
+            && let Some(instructions) = self.syscall_state.process_instructions.get_mut(&task_id)
+        {
+            *instructions = instructions.saturating_add(1);
         }
+        result
     }
 
     fn execute_instruction(&mut self) -> Result<(), CpuError> {
@@ -7043,6 +8045,34 @@ mod tests {
     }
 
     #[test]
+    fn process_accounting_counts_instructions_and_validates_output_buffers() {
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.syscall_state.register_process(task, None);
+        assert_eq!(cpu.syscall_state.process_instructions.get(&task), Some(&0));
+        cpu.step().unwrap();
+        assert_eq!(cpu.syscall_state.process_instructions.get(&task), Some(&1));
+
+        cpu.registers[1..4].copy_from_slice(&[0, 0x400, 32]);
+        cpu.registers[4..=6].fill(0);
+        cpu.registers[0] = SyscallNumber::ProcessAccounting as i64;
+        let length = cpu.syscall_process_accounting();
+        assert_eq!(length, 4);
+        assert_eq!(&cpu.memory[0x400..0x400 + length as usize], b"0 1\n");
+        for (index, destination, capacity, extra, expected) in [
+            (0, 0x400, 1, 0, crate::syscall::error::OVERFLOW),
+            (0, 0xffff, 32, 0, crate::syscall::error::BAD_ADDRESS),
+            (0, 0x400, 4097, 0, crate::syscall::error::INVALID),
+            (0, 0x400, 32, 1, crate::syscall::error::INVALID),
+            (1, 0x400, 32, 0, 0),
+        ] {
+            cpu.registers[1..4].copy_from_slice(&[index, destination, capacity]);
+            cpu.registers[4] = extra;
+            cpu.registers[5..=6].fill(0);
+            assert_eq!(cpu.syscall_process_accounting(), expected);
+        }
+    }
+
+    #[test]
     fn background_process_services_preserve_arguments_and_do_not_block_waiters() {
         let (mut cpu, parent) = cpu_with_syscall_task();
         let child = cpu
@@ -7286,6 +8316,374 @@ mod tests {
         assert_eq!(cpu.registers[0], crate::syscall::error::INVALID);
         assert_eq!(cpu.current_task(), Some(task));
         assert_eq!(cpu.task_context(task).unwrap().state, TaskState::Running);
+    }
+
+    #[test]
+    fn account_syscalls_initialize_root_authenticate_and_assign_credentials() {
+        let disk_root = folder_disk_for_test("syscall-accounts", false);
+        let disk = crate::disk::FolderDisk::open(&disk_root).unwrap();
+        crate::accounts::AccountStore::first_boot()
+            .save(&disk)
+            .unwrap();
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.mount_folder_disk(&disk_root).unwrap();
+        cpu.memory[0x1000..0x1005].copy_from_slice(b"root\0");
+        cpu.memory[0x1100..0x1109].copy_from_slice(b"Secret12\0");
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::AccountStatus,
+            [17, 18, 19, 20, 21, 22],
+        );
+        assert_eq!(cpu.registers[0], 0);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::InitializeRootPassword,
+            [0x1100, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .bootstrap_authority = true;
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::InitializeRootPassword,
+            [0x1100, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        assert!(!cpu.syscall_state.processes[&task].bootstrap_authority);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::AccountStatus,
+            [17, 18, 19, 20, 21, 22],
+        );
+        assert_eq!(cpu.registers[0], 1);
+        cpu.memory[0x1100..0x1107].copy_from_slice(b"Wrong1\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Authenticate,
+            [0x1000, 0x1100, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+        assert!(cpu.syscall_state.processes[&task].credentials.is_none());
+
+        cpu.memory[0x1100..0x1109].copy_from_slice(b"Secret12\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Authenticate,
+            [0x1000, 0x1100, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        assert_eq!(
+            cpu.syscall_state.processes[&task].credentials,
+            Some(crate::syscall::ProcessCredentials {
+                uid: 0,
+                primary_gid: 0,
+                supplementary_gids: Vec::new(),
+                home: "root".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn sisuos_filesystem_syscalls_enforce_account_and_parent_directory_modes() {
+        let container = std::env::temp_dir().join(format!(
+            "sc16-account-permissions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk_root = container.join("sisuos");
+        std::fs::create_dir_all(disk_root.join("private")).unwrap();
+        std::fs::create_dir_all(disk_root.join("home/alice")).unwrap();
+        std::fs::write(
+            disk_root.join("disk.json"),
+            r#"{"version":1,"id":"sisuos","label":"SisuOS","capacity_bytes":65536,"read_only":false}"#,
+        )
+        .unwrap();
+        std::fs::write(disk_root.join("public.txt"), b"hello").unwrap();
+        std::fs::write(disk_root.join("private/secret.txt"), b"hidden").unwrap();
+        let disk = crate::disk::FolderDisk::open(&disk_root).unwrap();
+        let mut accounts = crate::accounts::AccountStore::first_boot();
+        let group = accounts.add_group("users").unwrap();
+        let uid = accounts.add_user("alice", "users", "home/alice").unwrap();
+        accounts.set_password("alice", "Secret12").unwrap();
+        accounts.set_file_mode("private", true, 0, 0o700).unwrap();
+        accounts
+            .set_file_owner("home/alice", true, 0, uid, group, &[0])
+            .unwrap();
+        accounts
+            .set_file_mode("home/alice", true, 0, 0o700)
+            .unwrap();
+        accounts.save(&disk).unwrap();
+
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.mount_folder_disk(&disk_root).unwrap();
+        cpu.syscall_state.register_process(task, None);
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .credentials = Some(crate::syscall::ProcessCredentials {
+            uid,
+            primary_gid: group,
+            supplementary_gids: Vec::new(),
+            home: "home/alice".to_owned(),
+        });
+
+        cpu.memory[0x1000..0x100b].copy_from_slice(b"public.txt\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x1000,
+                i64::from(crate::syscall::open_flags::READ),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        let handle = cpu.registers[0] as u32;
+        assert!(handle >= 3);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Read,
+            [i64::from(handle), 0x2000, 5, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 5);
+        assert_eq!(&cpu.memory[0x2000..0x2005], b"hello");
+
+        cpu.memory[0x1200..0x1208].copy_from_slice(b"private\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::DirectoryEntry,
+            [0x1200, 0, 0x2000, 128, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+
+        cpu.memory[0x1200..0x1202].copy_from_slice(b"/\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::DirectoryEntry,
+            [0x1200, 0, 0x2000, 128, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 5);
+        assert_eq!(&cpu.memory[0x2000..0x2006], b"home/\0");
+
+        cpu.memory[0x1300..0x1313].copy_from_slice(b"home/alice/new.txt\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x1300,
+                i64::from(crate::syscall::open_flags::WRITE | crate::syscall::open_flags::CREATE),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(cpu.registers[0] >= 3);
+        let disk = crate::disk::FolderDisk::open(&disk_root).unwrap();
+        let accounts = crate::accounts::AccountStore::load(&disk).unwrap();
+        assert_eq!(
+            accounts.file_permission("home/alice/new.txt", false),
+            (uid, group, 0o644)
+        );
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::SetFileMode,
+            [0x1300, 0o600, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::SetFileMode,
+            [0x1000, 0o600, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+
+        cpu.memory[0x1100..0x1106].copy_from_slice(b"alice\0");
+        cpu.memory[0x1200..0x1206].copy_from_slice(b"users\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::SetFileOwner,
+            [0x1300, 0x1100, 0x1200, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        cpu.memory[0x1100..0x1105].copy_from_slice(b"root\0");
+        cpu.memory[0x1200..0x1205].copy_from_slice(b"root\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::SetFileOwner,
+            [0x1300, 0x1100, 0x1200, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+        let disk = crate::disk::FolderDisk::open(&disk_root).unwrap();
+        let accounts = crate::accounts::AccountStore::load(&disk).unwrap();
+        assert_eq!(
+            accounts.file_permission("home/alice/new.txt", false),
+            (uid, group, 0o600)
+        );
+
+        cpu.memory[0x1300..0x1313].copy_from_slice(b"home/alice/new-dir\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::MakeDirectory,
+            [0x1300, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        let disk = crate::disk::FolderDisk::open(&disk_root).unwrap();
+        let accounts = crate::accounts::AccountStore::load(&disk).unwrap();
+        assert_eq!(
+            accounts.file_permission("home/alice/new-dir", true),
+            (uid, group, 0o755)
+        );
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x1000,
+                i64::from(crate::syscall::open_flags::WRITE),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+
+        cpu.memory[0x1100..0x1113].copy_from_slice(b"private/secret.txt\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x1100,
+                i64::from(crate::syscall::open_flags::READ),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .credentials = None;
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Open,
+            [
+                0x1000,
+                i64::from(crate::syscall::open_flags::READ),
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+        drop(cpu);
+        std::fs::remove_dir_all(container).unwrap();
+    }
+
+    #[test]
+    fn account_administration_syscalls_are_authorized_persisted_and_create_home_permissions() {
+        let container = std::env::temp_dir().join(format!(
+            "sc16-account-admin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk_root = container.join("sisuos");
+        std::fs::create_dir_all(&disk_root).unwrap();
+        std::fs::write(
+            disk_root.join("disk.json"),
+            r#"{"version":1,"id":"sisuos","label":"SisuOS","capacity_bytes":65536,"read_only":false}"#,
+        )
+        .unwrap();
+        let disk = crate::disk::FolderDisk::open(&disk_root).unwrap();
+        let mut accounts = crate::accounts::AccountStore::first_boot();
+        accounts.initialize_root_password("RootPass1").unwrap();
+        accounts.save(&disk).unwrap();
+
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.mount_folder_disk(&disk_root).unwrap();
+        cpu.syscall_state.register_process(task, None);
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .credentials = Some(crate::syscall::ProcessCredentials {
+            uid: 0,
+            primary_gid: 0,
+            supplementary_gids: Vec::new(),
+            home: "root".to_owned(),
+        });
+        cpu.memory[0x1000..0x1006].copy_from_slice(b"staff\0");
+        cpu.memory[0x1100..0x1106].copy_from_slice(b"alice\0");
+        cpu.memory[0x1200..0x1206].copy_from_slice(b"staff\0");
+        cpu.memory[0x1300..0x130b].copy_from_slice(b"home/alice\0");
+        cpu.memory[0x1400..0x140a].copy_from_slice(b"UserPass1\0");
+
+        invoke_syscall(&mut cpu, SyscallNumber::AddGroup, [0x1000, 0, 0, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], 1);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::AddUser,
+            [0x1100, 0x1200, 0x1300, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 1);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::SetPassword,
+            [0x1100, 0x1400, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+
+        let accounts = crate::accounts::AccountStore::load(&disk).unwrap();
+        assert!(accounts.authenticate("alice", "UserPass1").is_some());
+        assert_eq!(accounts.file_permission("home/alice", true), (1, 1, 0o700));
+        assert!(disk.metadata("home/alice").unwrap().is_directory);
+
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .credentials
+            .as_mut()
+            .unwrap()
+            .uid = 1;
+        cpu.memory[0x1500..0x1506].copy_from_slice(b"guest\0");
+        invoke_syscall(&mut cpu, SyscallNumber::AddGroup, [0x1500, 0, 0, 0, 0, 0]);
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+        cpu.memory[0x1400..0x140a].copy_from_slice(b"UserPass2\0");
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::SetPassword,
+            [0x1100, 0x1400, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        let accounts = crate::accounts::AccountStore::load(&disk).unwrap();
+        assert!(accounts.authenticate("alice", "UserPass2").is_some());
+        assert!(accounts.authenticate("alice", "UserPass1").is_none());
+        drop(cpu);
+        std::fs::remove_dir_all(container).unwrap();
     }
 
     #[test]
@@ -7609,6 +9007,69 @@ mod tests {
     }
 
     #[test]
+    fn syscall_kill_terminates_only_children_and_preserves_wait_status() {
+        let (mut cpu, parent) = cpu_with_syscall_task();
+        let child = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        let unrelated_parent = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x120, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        let unrelated_child = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x140, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(parent, None);
+        cpu.syscall_state.register_process(child, Some(parent));
+        cpu.syscall_state.register_process(unrelated_parent, None);
+        cpu.syscall_state
+            .register_process(unrelated_child, Some(unrelated_parent));
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Kill,
+            [i64::from(unrelated_child), 137, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::PERMISSION);
+        cpu.syscall_state
+            .processes
+            .get_mut(&child)
+            .unwrap()
+            .children
+            .push(99);
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Kill,
+            [i64::from(child), 137, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], crate::syscall::error::BUSY);
+        cpu.syscall_state
+            .processes
+            .get_mut(&child)
+            .unwrap()
+            .children
+            .clear();
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Kill,
+            [i64::from(child), 137, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 0);
+        assert_eq!(cpu.scheduler.task(child).unwrap().state, TaskState::Exited);
+
+        invoke_syscall(
+            &mut cpu,
+            SyscallNumber::Wait,
+            [i64::from(child), 0, 0, 0, 0, 0],
+        );
+        assert_eq!(cpu.registers[0], 137);
+        assert_eq!(cpu.registers[1], i64::from(child));
+        assert!(!cpu.syscall_state.processes.contains_key(&child));
+    }
+
+    #[test]
     fn compiled_c_syscall_wrappers_execute_through_svc() {
         let source = "#include <sc16_syscall.h>\n\
                       int main(void) {\n\
@@ -7631,6 +9092,8 @@ mod tests {
                           if (semaphore < 0L) return 10;\n\
                           if (sc16_semop(SC16_SEM_DESTROY, (unsigned long)semaphore, 0) != 0L) return 11;\n\
                           if (sc16_semop(SC16_SEM_DESTROY, 0UL, 0) != -22L) return 13;\n\
+                          if (sc16_kill(0UL, 137) != -13) return 22;\n\
+                          if (sc16_kill(1UL, 137) != -2) return 23;\n\
                           return 0;\n\
                       }";
         let assembly =
@@ -8017,6 +9480,18 @@ mod tests {
             .create_user_task(0x100, 0x8000, 0x000f_ffff, Some(parent_root))
             .unwrap();
         cpu.start_task(parent).unwrap();
+        cpu.syscall_state.register_process(parent, None);
+        let parent_credentials = crate::syscall::ProcessCredentials {
+            uid: 42,
+            primary_gid: 7,
+            supplementary_gids: vec![8],
+            home: "users/test".to_owned(),
+        };
+        cpu.syscall_state
+            .processes
+            .get_mut(&parent)
+            .unwrap()
+            .credentials = Some(parent_credentials.clone());
         let arguments = b"child\0a file.txt\0\0";
         if with_arguments {
             cpu.memory[0x41_100..0x41_100 + arguments.len()].copy_from_slice(arguments);
@@ -8065,6 +9540,10 @@ mod tests {
         cpu.step().unwrap();
         let child = cpu.registers[0] as u32;
         assert_ne!(child, parent);
+        assert_eq!(
+            cpu.syscall_state.processes[&child].credentials,
+            Some(parent_credentials)
+        );
         assert_eq!(
             cpu.syscall_state.processes[&child].arguments,
             if with_arguments {

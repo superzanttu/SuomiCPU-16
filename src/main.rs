@@ -38,9 +38,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else if argument == "--headless" {
             headless = true;
         } else if argument == "--disk" {
-            let value = arguments
-                .next()
-                .ok_or("--disk requires an 8-character disk ID")?;
+            let value = arguments.next().ok_or("--disk requires a disk ID")?;
             disk_id = Some(value.into_string().map_err(|_| "disk ID must be ASCII")?);
         } else if argument == "--net-port" {
             let value = arguments

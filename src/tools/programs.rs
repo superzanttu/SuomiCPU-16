@@ -11,8 +11,6 @@ use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const SUPPORTED_GUEST_PROGRAMS: &[&str] = &["sisuos"];
-
 fn retry<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     for attempt in 0..5 {
         match operation() {
@@ -41,10 +39,12 @@ pub struct Executable {
 pub struct Program {
     pub slug: String,
     pub name: String,
+    pub install_disk: String,
     pub legacy_disk: String,
     pub capacity: u64,
     pub assets: Option<PathBuf>,
     pub executables: Vec<Executable>,
+    pub retired_outputs: Vec<String>,
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -120,11 +120,33 @@ fn source(root: &Path, value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn validate_file_tree<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let paths = paths
+        .into_iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    for (index, path) in paths.iter().enumerate() {
+        if paths.iter().skip(index + 1).any(|other| {
+            path == other
+                || path
+                    .strip_prefix(other)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                || other
+                    .strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(format!("conflicting package file paths include {path:?}").into());
+        }
+    }
+    Ok(())
+}
+
 pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
     let root = repository.join("programs");
     directory(&root)?;
     let mut programs = Vec::new();
     let mut ids = HashSet::new();
+    let mut install_disk_ids = HashSet::new();
     let mut legacy_ids = HashSet::new();
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
@@ -139,11 +161,13 @@ pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
                 "version",
                 "slug",
                 "name",
+                "install_disk",
                 "legacy_disk",
                 "capacity_bytes",
                 "boot",
                 "assets",
                 "executables",
+                "retired_outputs",
             ],
         )?;
         if value["version"] != 1 {
@@ -164,6 +188,19 @@ pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
         let name = text(&value, "name")?;
         if name.trim().is_empty() || name.chars().any(char::is_control) {
             return Err("invalid program display name".into());
+        }
+        let install_disk = value
+            .get("install_disk")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or("program install_disk must be a string")
+            })
+            .transpose()?
+            .unwrap_or(slug);
+        crate::disk::validate_disk_id(install_disk)?;
+        if !install_disk_ids.insert(install_disk.to_ascii_lowercase()) {
+            return Err(format!("duplicate install disk ID {install_disk:?}").into());
         }
         let legacy_disk = text(&value, "legacy_disk")?;
         crate::disk::validate_disk_id(legacy_disk)?;
@@ -195,8 +232,7 @@ pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
             fields(executable, &["source", "output", "embedded_c", "base"])?;
             let output = text(executable, "output")?;
             relative(output)?;
-            if output.contains('/')
-                || !output.ends_with(".bin")
+            if !output.ends_with(".bin")
                 || !outputs.insert(output.to_ascii_lowercase())
                 || (index == 0 && !matches!(output, "main.bin" | "kernel.bin"))
             {
@@ -227,14 +263,62 @@ pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
                 base,
             });
         }
+        let retired_outputs = value
+            .get("retired_outputs")
+            .map(|value| {
+                let values = value
+                    .as_array()
+                    .ok_or("retired_outputs must be an array of paths")?;
+                let mut paths = Vec::with_capacity(values.len());
+                let mut normalized = HashSet::new();
+                for value in values {
+                    let output = value
+                        .as_str()
+                        .ok_or("retired_outputs must contain only strings")?;
+                    relative(output)?;
+                    if !normalized.insert(output.to_ascii_lowercase()) {
+                        return Err(format!("duplicate retired output {output:?}").into());
+                    }
+                    paths.push(output.to_owned());
+                }
+                Ok::<_, Box<dyn std::error::Error>>(paths)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let output_paths = executables
+            .iter()
+            .map(|executable| executable.output.as_str())
+            .chain(retired_outputs.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        validate_file_tree(output_paths.iter().copied())?;
         programs.push(Program {
             slug: slug.to_owned(),
             name: name.to_owned(),
+            install_disk: install_disk.to_owned(),
             legacy_disk: legacy_disk.to_owned(),
             capacity,
             assets,
             executables,
+            retired_outputs,
         });
+    }
+    if programs.iter().any(|program| {
+        program
+            .install_disk
+            .eq_ignore_ascii_case(&program.legacy_disk)
+    }) {
+        return Err("install_disk must differ from legacy_disk".into());
+    }
+    if programs.iter().any(|program| {
+        programs.iter().any(|other| {
+            program.slug != other.slug
+                && (program.install_disk.eq_ignore_ascii_case(&other.slug)
+                    || program
+                        .install_disk
+                        .eq_ignore_ascii_case(&other.legacy_disk))
+        })
+    }) {
+        return Err("install_disk conflicts with another program ID".into());
     }
     programs.sort_by(|a, b| a.slug.cmp(&b.slug));
     Ok(programs)
@@ -270,6 +354,7 @@ fn files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
     }
     let mut result = BTreeMap::new();
     visit(root, root, &mut result)?;
+    validate_file_tree(result.keys().map(String::as_str))?;
     Ok(result)
 }
 
@@ -366,6 +451,7 @@ pub fn build(repository: &Path, program: &Program) -> Result<PathBuf> {
             crate::image::encode_image(&image)?,
         );
     }
+    validate_file_tree(entries.keys().map(String::as_str))?;
     let owned = inventory(&entries);
     entries.insert(
         ".sc16-owned.json".to_owned(),
@@ -396,14 +482,14 @@ pub fn build(repository: &Path, program: &Program) -> Result<PathBuf> {
     Ok(destination)
 }
 
-fn recover_install(disks: &Path, slug: &str, announce: bool) -> Result<()> {
-    let journal = disks.join(format!(".install-{slug}.json"));
+fn recover_install(disks: &Path, disk_id: &str, announce: bool) -> Result<()> {
+    let journal = disks.join(format!(".install-{disk_id}.json"));
     if !journal.exists() {
         return Ok(());
     }
-    let live = disks.join(slug);
-    let backup_root = disks.join(format!(".backup-{slug}"));
-    let backup = backup_root.join(slug);
+    let live = disks.join(disk_id);
+    let backup_root = disks.join(format!(".backup-{disk_id}"));
+    let backup = backup_root.join(disk_id);
     if !live.exists() && backup.exists() {
         retry(|| fs::rename(&backup, &live))?;
     }
@@ -417,14 +503,26 @@ fn recover_install(disks: &Path, slug: &str, announce: bool) -> Result<()> {
     if backup_root.exists() {
         retry(|| fs::remove_dir(&backup_root))?;
     }
-    let staging_root = disks.join(format!(".install-{slug}"));
+    let staging_root = disks.join(format!(".install-{disk_id}"));
     if staging_root.exists() {
         directory(&staging_root)?;
         retry(|| fs::remove_dir_all(&staging_root))?;
     }
     retry(|| fs::remove_file(&journal))?;
     if announce {
-        println!("Recovered interrupted installation of {slug}");
+        println!("Recovered interrupted installation of {disk_id}");
+    }
+    Ok(())
+}
+
+fn reject_disk_case_collision(disks: &Path, disk_id: &str) -> Result<()> {
+    for entry in fs::read_dir(disks)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case(disk_id) && name != disk_id {
+            return Err(format!("disk ID case-insensitive path conflict: {name}").into());
+        }
     }
     Ok(())
 }
@@ -433,18 +531,33 @@ pub fn install(repository: &Path, program: &Program) -> Result<()> {
     let disks = repository.join("disks");
     fs::create_dir_all(&disks)?;
     directory(&disks)?;
-    recover_install(&disks, &program.slug, true)?;
+    reject_disk_case_collision(&disks, &program.install_disk)?;
+    recover_install(&disks, &program.install_disk, true)?;
     let built = build(repository, program)?;
-    let live = disks.join(&program.slug);
+    let live = disks.join(&program.install_disk);
     let mut package = files(&built)?;
     let package_inventory: Value = serde_json::from_slice(&package[".sc16-owned.json"])?;
-    if disks.join(&program.legacy_disk).exists() {
+    let mut package_manifest: Value = serde_json::from_slice(&package["disk.json"])?;
+    package_manifest["id"] = Value::String(program.install_disk.clone());
+    package.insert(
+        "disk.json".to_owned(),
+        serde_json::to_vec_pretty(&package_manifest)?,
+    );
+    if !program
+        .legacy_disk
+        .eq_ignore_ascii_case(&program.install_disk)
+        && disks.join(&program.legacy_disk).exists()
+    {
         return Err("obsolete program disk exists; run migrate-program-disks --apply first".into());
     }
     if live.exists() {
         let mounted = crate::disk::FolderDisk::open(&live)?;
         if mounted.manifest().read_only {
-            return Err(format!("{} is read-only; installation refused", program.slug).into());
+            return Err(format!(
+                "{} is read-only; installation refused",
+                program.install_disk
+            )
+            .into());
         }
         let mut existing = files(&live)?;
         let owned: Value = match existing.get(".sc16-owned.json") {
@@ -492,6 +605,14 @@ pub fn install(repository: &Path, program: &Program) -> Result<()> {
         let protected = manifest["protected_files"]
             .as_array_mut()
             .ok_or("invalid protected_files")?;
+        protected.retain(|entry| {
+            entry.as_str().is_none_or(|path| {
+                !program
+                    .retired_outputs
+                    .iter()
+                    .any(|retired| retired.eq_ignore_ascii_case(path))
+            })
+        });
         for executable in &program.executables {
             if !protected
                 .iter()
@@ -507,12 +628,13 @@ pub fn install(repository: &Path, program: &Program) -> Result<()> {
         existing.extend(package);
         package = existing;
     }
-    let staging_root = disks.join(format!(".install-{}", program.slug));
-    let staging = staging_root.join(&program.slug);
+    validate_file_tree(package.keys().map(String::as_str))?;
+    let staging_root = disks.join(format!(".install-{}", program.install_disk));
+    let staging = staging_root.join(&program.install_disk);
     if staging_root.exists() {
         return Err(format!("unexpected install staging at {}", staging_root.display()).into());
     }
-    let journal = disks.join(format!(".install-{}.json", program.slug));
+    let journal = disks.join(format!(".install-{}.json", program.install_disk));
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -524,14 +646,14 @@ pub fn install(repository: &Path, program: &Program) -> Result<()> {
         }
         crate::disk::FolderDisk::open(&staging)?;
         if live.exists() {
-            let backup_root = disks.join(format!(".backup-{}", program.slug));
+            let backup_root = disks.join(format!(".backup-{}", program.install_disk));
             fs::create_dir(&backup_root)?;
-            retry(|| fs::rename(&live, backup_root.join(&program.slug)))?;
+            retry(|| fs::rename(&live, backup_root.join(&program.install_disk)))?;
         }
         retry(|| fs::rename(&staging, &live))?;
         Ok(())
     })();
-    if let Err(recovery) = recover_install(&disks, &program.slug, transaction.is_err()) {
+    if let Err(recovery) = recover_install(&disks, &program.install_disk, transaction.is_err()) {
         return Err(match transaction {
             Ok(()) => {
                 format!("install committed but cleanup failed: {recovery}; retry installation")
@@ -556,13 +678,13 @@ pub fn migrate(repository: &Path, apply: bool) -> Result<()> {
     let mut operations = Vec::new();
     for program in &programs {
         let old = disks.join(&program.legacy_disk);
-        let new = disks.join(&program.slug);
+        let new = disks.join(&program.install_disk);
         if old.exists()
             && disk_paths.iter().any(|path| {
                 path.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .eq_ignore_ascii_case(&program.slug)
+                    .eq_ignore_ascii_case(&program.install_disk)
             })
         {
             return Err(format!(
@@ -574,8 +696,8 @@ pub fn migrate(repository: &Path, apply: bool) -> Result<()> {
         }
         if old.exists() {
             crate::disk::FolderDisk::open(&old)?;
-            operations.push(json!({"old":program.legacy_disk,"new":program.slug}));
-            println!("{} -> {}", program.legacy_disk, program.slug);
+            operations.push(json!({"old":program.legacy_disk,"new":program.install_disk}));
+            println!("{} -> {}", program.legacy_disk, program.install_disk);
         }
     }
     let state: Value = if pending {
@@ -592,7 +714,7 @@ pub fn migrate(repository: &Path, apply: bool) -> Result<()> {
         let new = text(operation, "new")?;
         if !programs
             .iter()
-            .any(|p| p.legacy_disk == old && p.slug == new)
+            .any(|p| p.legacy_disk == old && p.install_disk == new)
         {
             return Err("migration journal contains an unknown disk mapping".into());
         }
@@ -642,7 +764,7 @@ pub fn migrate(repository: &Path, apply: bool) -> Result<()> {
             .iter()
             .find(|p| value["preferred_disk"].as_str() == Some(&p.legacy_disk))
         {
-            value["preferred_disk"] = Value::String(program.slug.clone());
+            value["preferred_disk"] = Value::String(program.install_disk.clone());
             write_json(&settings, value)?;
         }
     }
@@ -669,30 +791,44 @@ pub fn command(repository: &Path, command: &str, arguments: &[String]) -> Result
     let programs = catalog(repository)?;
     let selected: Vec<_> = programs
         .iter()
-        .filter(|p| {
-            SUPPORTED_GUEST_PROGRAMS.contains(&p.slug.as_str()) && (all || p.slug == arguments[0])
-        })
+        .filter(|program| all || program.slug == arguments[0])
         .collect();
     if selected.is_empty() {
-        if !all && programs.iter().any(|program| program.slug == arguments[0]) {
-            return Err(format!(
-                "program {:?} is archived and unsupported by the current hardware; only SisuOS is supported",
-                arguments[0]
-            )
-            .into());
-        }
         return Err(format!(
             "unknown program {:?}; use a canonical programs/<slug> name",
             arguments[0]
         )
         .into());
     }
+    let mut failures = Vec::new();
     for program in selected {
         if command.starts_with("install") {
-            install(repository, program).map_err(|error| format!("{}: {error}", program.slug))?;
+            if let Err(error) = install(repository, program) {
+                if !all {
+                    return Err(format!("{}: {error}", program.slug).into());
+                }
+                failures.push(format!("{}: {error}", program.slug));
+            }
         } else {
-            build(repository, program).map_err(|error| format!("{}: {error}", program.slug))?;
+            if let Err(error) = build(repository, program) {
+                if !all {
+                    return Err(format!("{}: {error}", program.slug).into());
+                }
+                failures.push(format!("{}: {error}", program.slug));
+            }
         }
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} program(s) failed:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|failure| format!("  {failure}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+        .into());
     }
     Ok(())
 }
@@ -765,6 +901,7 @@ mod tests {
         let fixture = Fixture::new();
         let catalog = catalog(&fixture.0).unwrap();
         assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].install_disk, "hello");
         assert!(catalog[0].executables[0].source.ends_with("src/main.c"));
         let built = build(&fixture.0, &catalog[0]).unwrap();
         let disk = crate::disk::FolderDisk::open(&built).unwrap();
@@ -775,6 +912,90 @@ mod tests {
         cpu.run(10_000).unwrap();
         assert!(!cpu.running);
         assert_eq!(cpu.registers[0], 42);
+    }
+
+    #[test]
+    fn nested_executable_outputs_install_without_replacing_local_files() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.0.join("programs/hello/src/sleeper.c"),
+            "int main(void) { return 0; }",
+        )
+        .unwrap();
+        let manifest_path = fixture.0.join("programs/hello/program.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["executables"] = json!([{"source":"src/sleeper.c","output":"bin/sleeper.bin"}]);
+        write_json(&manifest_path, &manifest).unwrap();
+
+        install(&fixture.0, &catalog(&fixture.0).unwrap()[0]).unwrap();
+        let installed = fixture.0.join("disks/hello");
+        assert!(installed.join("bin/sleeper.bin").is_file());
+
+        fs::write(installed.join("notes.txt"), b"keep this file").unwrap();
+        install(&fixture.0, &catalog(&fixture.0).unwrap()[0]).unwrap();
+        assert_eq!(
+            fs::read(installed.join("notes.txt")).unwrap(),
+            b"keep this file"
+        );
+        assert!(installed.join("bin/sleeper.bin").is_file());
+    }
+
+    #[test]
+    fn catalog_rejects_file_directory_output_conflicts() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.0.join("programs/hello/src/sleeper.c"),
+            "int main(void) { return 0; }",
+        )
+        .unwrap();
+        let manifest_path = fixture.0.join("programs/hello/program.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["executables"] = json!([
+            {"source":"src/sleeper.c","output":"bin.bin"},
+            {"source":"src/sleeper.c","output":"bin.bin/sleeper.bin"}
+        ]);
+        write_json(&manifest_path, &manifest).unwrap();
+
+        assert!(
+            catalog(&fixture.0)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("conflicting package file paths")
+        );
+    }
+
+    #[test]
+    fn retired_outputs_remove_owned_files_and_stale_protection() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.0.join("programs/hello/src/old.c"),
+            "int main(void) { return 0; }",
+        )
+        .unwrap();
+        let manifest_path = fixture.0.join("programs/hello/program.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["executables"] = json!([{"source":"src/old.c","output":"old.bin"}]);
+        write_json(&manifest_path, &manifest).unwrap();
+        install(&fixture.0, &catalog(&fixture.0).unwrap()[0]).unwrap();
+        let installed = fixture.0.join("disks/hello");
+        assert!(installed.join("old.bin").is_file());
+
+        manifest["executables"] = json!([]);
+        manifest["retired_outputs"] = json!(["old.bin"]);
+        write_json(&manifest_path, &manifest).unwrap();
+        install(&fixture.0, &catalog(&fixture.0).unwrap()[0]).unwrap();
+        assert!(!installed.join("old.bin").exists());
+        let disk = crate::disk::FolderDisk::open(&installed).unwrap();
+        assert!(
+            !disk
+                .manifest()
+                .protected_files
+                .contains(&"old.bin".to_owned())
+        );
     }
 
     #[test]
@@ -803,10 +1024,120 @@ mod tests {
             write_json(&path, &value).unwrap();
             assert!(catalog(&fixture.0).is_err());
         }
+        let mut value = original.clone();
+        value["install_disk"] = json!("../escape");
+        write_json(&path, &value).unwrap();
+        assert!(catalog(&fixture.0).is_err());
+        value["install_disk"] = Value::Null;
+        write_json(&path, &value).unwrap();
+        assert!(catalog(&fixture.0).is_err());
         let mut value = original;
         value["executables"] = json!([{"source":"src/main.c","output":"MAIN.bin"}]);
         write_json(&path, &value).unwrap();
         assert!(catalog(&fixture.0).is_err());
+    }
+
+    #[test]
+    fn custom_install_disk_receives_package_and_preserves_local_files() {
+        let fixture = Fixture::new();
+        let manifest_path = fixture.0.join("programs/hello/program.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["install_disk"] = json!("hello-live");
+        write_json(&manifest_path, &manifest).unwrap();
+        let program = fixture.program();
+
+        let built = build(&fixture.0, &program).unwrap();
+        assert_eq!(
+            crate::disk::FolderDisk::open(&built).unwrap().manifest().id,
+            program.slug
+        );
+        install(&fixture.0, &program).unwrap();
+        let live = fixture.0.join("disks/hello-live");
+        assert_eq!(
+            crate::disk::FolderDisk::open(&live).unwrap().manifest().id,
+            "hello-live"
+        );
+        fs::create_dir_all(live.join("saves")).unwrap();
+        fs::write(live.join("saves/slot.dat"), b"keep").unwrap();
+        install(&fixture.0, &program).unwrap();
+        assert_eq!(fs::read(live.join("saves/slot.dat")).unwrap(), b"keep");
+        assert!(!fixture.0.join("disks/hello").exists());
+    }
+
+    #[test]
+    fn case_insensitive_install_path_conflicts_are_rejected() {
+        let fixture = Fixture::new();
+        let manifest_path = fixture.0.join("programs/hello/program.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["install_disk"] = json!("hello-live");
+        write_json(&manifest_path, &manifest).unwrap();
+        let conflicting = fixture.0.join("disks/Hello-Live");
+        fs::create_dir(&conflicting).unwrap();
+        fs::write(conflicting.join("local.txt"), b"keep").unwrap();
+
+        assert!(
+            install(&fixture.0, &fixture.program())
+                .unwrap_err()
+                .to_string()
+                .contains("case-insensitive")
+        );
+        assert_eq!(fs::read(conflicting.join("local.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn catalog_rejects_install_disk_collisions_with_package_ids() {
+        let fixture = Fixture::new();
+        let first_path = fixture.0.join("programs/hello/program.json");
+        let mut first: Value = serde_json::from_slice(&fs::read(&first_path).unwrap()).unwrap();
+        let second_root = fixture.0.join("programs/other");
+        fs::create_dir_all(second_root.join("src")).unwrap();
+        fs::copy(
+            fixture.0.join("programs/hello/src/main.c"),
+            second_root.join("src/main.c"),
+        )
+        .unwrap();
+        let mut second = first.clone();
+        second["slug"] = json!("other");
+        second["name"] = json!("Other");
+        second["legacy_disk"] = json!("APP00002");
+        second["assets"] = Value::Null;
+        second["install_disk"] = json!("other-live");
+        write_json(&second_root.join("program.json"), &second).unwrap();
+
+        first["install_disk"] = json!("other");
+        write_json(&first_path, &first).unwrap();
+        assert!(catalog(&fixture.0).is_err());
+
+        first["install_disk"] = json!("hello-live");
+        second["install_disk"] = json!("HELLO-LIVE");
+        write_json(&first_path, &first).unwrap();
+        write_json(&second_root.join("program.json"), &second).unwrap();
+        assert!(catalog(&fixture.0).is_err());
+    }
+
+    #[test]
+    fn all_program_build_continues_after_a_package_failure() {
+        let fixture = Fixture::new();
+        let broken_root = fixture.0.join("programs/aaa-broken");
+        fs::create_dir_all(broken_root.join("src")).unwrap();
+        fs::write(broken_root.join("src/main.c"), "int main( {").unwrap();
+        let mut manifest: Value = serde_json::from_slice(
+            &fs::read(fixture.0.join("programs/hello/program.json")).unwrap(),
+        )
+        .unwrap();
+        manifest["slug"] = json!("aaa-broken");
+        manifest["name"] = json!("Broken");
+        manifest["legacy_disk"] = json!("APP00002");
+        manifest["assets"] = Value::Null;
+        write_json(&broken_root.join("program.json"), &manifest).unwrap();
+
+        let error = command(&fixture.0, "build-programs", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("aaa-broken"));
+        assert!(fixture.0.join("build/programs/hello/main.bin").is_file());
     }
 
     #[test]
@@ -964,6 +1295,11 @@ mod tests {
     #[test]
     fn migration_preserves_bytes_and_settings_and_dry_run_changes_nothing() {
         let fixture = Fixture::new();
+        let manifest = fixture.0.join("programs/hello/program.json");
+        let mut program_manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        program_manifest["install_disk"] = json!("hello-live");
+        write_json(&manifest, &program_manifest).unwrap();
         let old = fixture.legacy();
         fs::write(old.join("save.dat"), b"keep").unwrap();
         let before = files(&old).unwrap();
@@ -974,12 +1310,12 @@ mod tests {
         assert_eq!(files(&old).unwrap(), before);
         assert!(!fixture.0.join("disks/.program-migration.json").exists());
         migrate(&fixture.0, true).unwrap();
-        let live = fixture.0.join("disks/hello");
+        let live = fixture.0.join("disks/hello-live");
         let mut after = files(&live).unwrap();
         after.insert("disk.json".to_owned(), before["disk.json"].clone());
         assert_eq!(after, before);
         let mut expected = settings;
-        expected["preferred_disk"] = json!("hello");
+        expected["preferred_disk"] = json!("hello-live");
         assert_eq!(
             serde_json::from_slice::<Value>(
                 &fs::read(fixture.0.join("config").join("bios.json")).unwrap()

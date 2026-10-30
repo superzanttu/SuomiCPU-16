@@ -65,7 +65,74 @@ contracts.
 
 Checklist status: [x] completed; [ ] planned.
 
+== Remaining work
+
+The unchecked items below are the only open checklist work. Completed tasks
+and their phase history are retained under the Completed work section.
+
 === Phase 0 — Maintain target ABI and CPU compatibility
+
+* [ ] *Define and maintain the C target floating-point model*
+  (+c90-float-model+)
+** [ ] Implement general automatic initializers, floating-value loads/stores,
+   runtime conversions, arithmetic outside automatic scalar initializers,
+   complete comparison operators, and floating-point function arguments and
+   results.
+** [ ] Implement typed floating-expression analysis for literals, lvalues,
+   casts, signedness, and C90 usual arithmetic conversions. Reject unsupported
+   conversions instead of silently treating +double+ as +float+.
+** [ ] Implement 32-bit integer conversions to/from binary32, conversions
+   between integer types and binary64, and binary32/binary64 conversions in
+   both directions. Test range edges and C90's undefined conversion cases
+   without relying on CPU extensions.
+** [ ] Complete binary64 conversions, including unsigned and 32-bit integer
+  cases, and add mixed-precision operations according to C90 conversion rules.
+** [ ] Implement floating-point function arguments and results according to
+   +c90_target_abi.adoc+, including prototype and default argument promotions,
+   nested calls, and recursion.
+* [ ] *Validate floating-point execution and ABI behavior*
+  (+c90-float-validation+)
+** Test binary32/binary64 numeric boundaries, rounding, casts, constants, calls,
+   and returns after the corresponding backend tasks above are implemented.
+** Compare arithmetic and conversion results against an independent reference.
+** Verify the documented calling convention and C-visible object bytes.
+** *Depends on:* +c90-float-backend+ in
+   link:c90_todo.adoc[+c90_todo.adoc+].
+
+* [ ] *Validate the complete C target ABI* (+c90-abi-conformance+)
+** Verify data types, representations, alignment, pointers, conversions,
+   stack frames, and calling conventions.
+** Test C-visible memory, control flow, and floating-point behavior.
+** Update +c90_target_abi.adoc+ only from verified results.
+** *Depends on:* +c90-float-validation+ and the C compiler tasks
+   +c90-indirect-calls+, +c90-pointer-qualifiers+, +c90-bitfield-codegen+,
+   +c90-linkage-storage+, and +c90-initializers+ in
+   link:c90_todo.adoc[+c90_todo.adoc+].
+
+=== Phase 11 — Expand SisuOS userland
+
+* [ ] *Deliver a complete interactive SisuOS userland*
+** [x] Replace static directory output with permission-checked dynamic
+   listings; add directory and regular-file creation/removal.
+** [x] Add file viewing, line-entry editing, append, rename, mode, and
+   ownership commands; preserve metadata across renames.
+** [x] Add account-backed file ownership, group access, user login, password
+   administration, and permission enforcement for filesystem operations.
+** [x] Add process listing, child/root process termination, background-child
+   reaping, and per-process instruction accounting through +ps+, +kill+, and
+   +top+.
+** [ ] Implement multiple isolated interactive consoles and user-visible
+   console switching.
+** [ ] Replace the line-entry editor with a full-screen editor supporting
+   cursor movement and in-place text changes.
+
+
+== Completed work
+
+The following checklist items are complete. Their checked status and phase
+context are retained as implementation history.
+
+=== Phase 0 - Completed milestones
 
 * [x] *Implement the 30-bit control-flow ABI* (+sc16-control-flow-abi+)
 ** Store return PCs as four big-endian bytes; +RET+ and +RTI+ restore all 30 address bits.
@@ -118,99 +185,6 @@ Checklist status: [x] completed; [ ] planned.
 ** [x] Audit and update assembly-library argument offsets for the documented
   stack convention.
 
-* [ ] *Define and maintain the C target floating-point model*
-  (+c90-float-model+)
-** [x] Define IEEE-754 binary32 +float+ and binary64 +double+ / +long double+
-   representations, sizes, byte order, alignment, rounding, and special-value
-   behavior in +c90_target_abi.adoc+.
-** [x] Use target sizes for +sizeof(float)+, +sizeof(double)+, and
-   +sizeof(long double)+; emit binary32/binary64 global scalar and array
-   initializers in big-endian object representation.
-** [x] Reserve target-sized stack storage for uninitialized automatic floating
-   scalars and arrays; report their correct +sizeof+ values.
-** [x] Initialize automatic floating scalars and arrays of any supported
-   dimensions from numeric literal constants using the target
-   binary32/binary64 object representation; permit character-pointer
-   inspection of initialized object bytes.
-** [x] Evaluate supported arithmetic constant expressions in global and
-   automatic floating initializers, preserving binary32 operation rounding,
-   integer division semantics, operand order, and casts to binary32/binary64.
-** [ ] Implement general automatic initializers, floating-value loads/stores,
-   runtime conversions, arithmetic outside automatic scalar initializers,
-   complete comparison operators, and floating-point function arguments and
-   results.
-** [x] Verify +float.h+ limits against the target model and test binary32 /
-   binary64 maximum, minimum-normal, epsilon, subnormal, and tie-rounding
-   initializer representations, including promotion of a rounded +float+
-   constant to +double+.
-** [x] Test binary32 runtime arithmetic in automatic scalar initializers,
-   including local loads, integer subexpressions, and all four arithmetic
-   operators.
-** [x] Test binary32 runtime comparisons in automatic scalar initializers for
-   all six operators, unordered NaN cases, and conversion of comparison results
-   to +float+.
-** [x] Support binary32 scalar assignments and compound assignments, runtime
-  signed/unsigned 16-bit integer conversions, and single-binary32-parameter
-  function calls and returns; validate the call and object representations
-  end to end.
-** [x] Implement tested binary32 general expressions, conversions, and object
-   access for scalar locals/globals, indexed arrays, and float pointers,
-   including conditions, conditional expressions, and discarded expressions.
-** [x] Execute binary32 and binary64 prefix/postfix increments and decrements
-   for local/global scalars and indexed array elements; verify old values,
-   updated values, and global object bytes.
-** [x] Load, store, compound-update, and increment/decrement binary32 and
-   binary64 scalar record members and indexed floating array fields through
-   nested and pointer-member expressions; verify object bytes and live pointer
-   preservation.
-** [ ] Implement typed floating-expression analysis for literals, lvalues,
-   casts, signedness, and C90 usual arithmetic conversions. Reject unsupported
-   conversions instead of silently treating +double+ as +float+.
-** [x] Implement runtime signed/unsigned 16-bit integer-to-binary32 and
-   binary32-to-integer conversions; test negative truncation and unsigned word
-   representations.
-** [x] Convert in-range binary32/binary64 values to signed/unsigned byte types
-   by truncating to integer before target-byte normalization; reject explicit
-   floating/pointer casts instead of silently lowering them as scalar values.
-** [ ] Implement 32-bit integer conversions to/from binary32, conversions
-   between integer types and binary64, and binary32/binary64 conversions in
-   both directions. Test range edges and C90's undefined conversion cases
-   without relying on CPU extensions.
-** [x] Verify scalar signed/unsigned 32-bit conversions in both directions
-   with binary32 and binary64 at initializers, assignments, casts, fixed
-   arguments, and returns. Cover representable range edges, truncation,
-   binary32 rounding, and expression side effects using independent references.
-   General typed lvalues and undefined-conversion diagnostics remain open.
-** [x] Move verified binary32 arithmetic and comparisons from automatic
-   initializer-only code paths into general expressions, including conditions,
-   assignments, compound assignments, conditional expressions, and discarded
-   expressions.
-** [x] Implement and execute tested binary64 runtime scalar/pointer-array
-  loads and stores, arithmetic, comparisons, and signed 16-bit conversions
-  using the ABI's four-register groups.
-** [ ] Complete binary64 conversions, including unsigned and 32-bit integer
-  cases, and add mixed-precision operations according to C90 conversion rules.
-** [x] Execute mixed binary32/binary64 arithmetic and conversions, including
-  unsigned 16/32-bit boundaries, precision narrowing/widening, and live
-  integer locals across binary64 comparisons and truth tests.
-** [ ] Implement floating-point function arguments and results according to
-   +c90_target_abi.adoc+, including prototype and default argument promotions,
-   nested calls, and recursion.
-** [x] Execute fixed-signature binary32/binary64 stack calls with multiple
-   floating parameters, mixed scalar arguments, nested calls, recursion,
-   prototype/return precision conversions, and independent IEEE bit-pattern
-   checks; reject conflicting declared function types before call lowering.
-** [x] Promote variadic binary32 arguments to binary64 and byte integer
-   arguments to the target word representation; execute stack-layout checks
-   for pointers, aggregates, and wide integers.
-** [x] Add end-to-end runtime tests for the currently supported operations,
-   conversions, object accesses, comparisons, and call boundaries. Compare
-   numeric results, object bytes, and boundary rounding with independent
-   references.
-** [x] Update +c90_target_abi.adoc+ only for behavior verified by runtime
-   tests; do not claim complete C conformance until the C90 backend and ABI
-   acceptance suites pass.
-
 * [x] *Provide binary32/binary64 CPU operations* (+c90-float-isa+)
 ** [x] Add arithmetic, ordered comparisons, conversions, negation, and square
    root instructions.
@@ -218,28 +192,6 @@ Checklist status: [x] completed; [ ] planned.
    infinities, NaNs, and comparison flags.
 ** [x] Add assembler and execution regressions.
 ** *Depends on:* +c90-float-model+.
-
-* [ ] *Validate floating-point execution and ABI behavior*
-  (+c90-float-validation+)
-** Test binary32/binary64 numeric boundaries, rounding, casts, constants, calls,
-   and returns after the corresponding backend tasks above are implemented.
-** Compare arithmetic and conversion results against an independent reference.
-** Verify the documented calling convention and C-visible object bytes.
-** *Depends on:* +c90-float-backend+ in
-   link:c90_todo.adoc[+c90_todo.adoc+].
-
-* [ ] *Validate the complete C target ABI* (+c90-abi-conformance+)
-** Verify data types, representations, alignment, pointers, conversions,
-   stack frames, and calling conventions.
-** Test C-visible memory, control flow, and floating-point behavior.
-** [x] Repair and execute wide shift carry-out tests: +SHL32+, +LSR32+, and
-   +ASR32+ retain the last shifted-out bit, preserve carry for a zero count,
-   and clear overflow for immediate and register-count forms.
-** Update +c90_target_abi.adoc+ only from verified results.
-** *Depends on:* +c90-float-validation+ and the C compiler tasks
-   +c90-indirect-calls+, +c90-pointer-qualifiers+, +c90-bitfield-codegen+,
-   +c90-linkage-storage+, and +c90-initializers+ in
-   link:c90_todo.adoc[+c90_todo.adoc+].
 
 * [x] *Define C90 bit-field target layout* (+c90-bitfield-layout+)
 ** Specify allocation-unit size, bit order, signedness, alignment, packing,
@@ -251,6 +203,94 @@ Checklist status: [x] completed; [ ] planned.
    integer updates, runtime automatic initialization, recursive local records,
    and volatile read/write counts. The remaining typed conversions and
    qualifier/initializer combinations stay open under +c90-bitfield-codegen+.
+
+==== Completed children of the C target floating-point model
+
+* [x] Define IEEE-754 binary32 +float+ and binary64 +double+ / +long double+
+   representations, sizes, byte order, alignment, rounding, and special-value
+   behavior in +c90_target_abi.adoc+.
+* [x] Use target sizes for +sizeof(float)+, +sizeof(double)+, and
+   +sizeof(long double)+; emit binary32/binary64 global scalar and array
+   initializers in big-endian object representation.
+* [x] Reserve target-sized stack storage for uninitialized automatic floating
+   scalars and arrays; report their correct +sizeof+ values.
+* [x] Initialize automatic floating scalars and arrays of any supported
+   dimensions from numeric literal constants using the target
+   binary32/binary64 object representation; permit character-pointer
+   inspection of initialized object bytes.
+* [x] Evaluate supported arithmetic constant expressions in global and
+   automatic floating initializers, preserving binary32 operation rounding,
+   integer division semantics, operand order, and casts to binary32/binary64.
+* [x] Verify +float.h+ limits against the target model and test binary32 /
+   binary64 maximum, minimum-normal, epsilon, subnormal, and tie-rounding
+   initializer representations, including promotion of a rounded +float+
+   constant to +double+.
+* [x] Test binary32 runtime arithmetic in automatic scalar initializers,
+   including local loads, integer subexpressions, and all four arithmetic
+   operators.
+* [x] Test binary32 runtime comparisons in automatic scalar initializers for
+   all six operators, unordered NaN cases, and conversion of comparison results
+   to +float+.
+* [x] Support binary32 scalar assignments and compound assignments, runtime
+  signed/unsigned 16-bit integer conversions, and single-binary32-parameter
+  function calls and returns; validate the call and object representations
+  end to end.
+* [x] Implement tested binary32 general expressions, conversions, and object
+   access for scalar locals/globals, indexed arrays, and float pointers,
+   including conditions, conditional expressions, and discarded expressions.
+* [x] Execute binary32 and binary64 prefix/postfix increments and decrements
+   for local/global scalars and indexed array elements; verify old values,
+   updated values, and global object bytes.
+* [x] Load, store, compound-update, and increment/decrement binary32 and
+   binary64 scalar record members and indexed floating array fields through
+   nested and pointer-member expressions; verify object bytes and live pointer
+   preservation.
+* [x] Implement runtime signed/unsigned 16-bit integer-to-binary32 and
+   binary32-to-integer conversions; test negative truncation and unsigned word
+   representations.
+* [x] Convert in-range binary32/binary64 values to signed/unsigned byte types
+   by truncating to integer before target-byte normalization; reject explicit
+   floating/pointer casts instead of silently lowering them as scalar values.
+* [x] Verify scalar signed/unsigned 32-bit conversions in both directions
+   with binary32 and binary64 at initializers, assignments, casts, fixed
+   arguments, and returns. Cover representable range edges, truncation,
+   binary32 rounding, and expression side effects using independent references.
+   General typed lvalues and undefined-conversion diagnostics remain open.
+* [x] Move verified binary32 arithmetic and comparisons from automatic
+   initializer-only code paths into general expressions, including conditions,
+   assignments, compound assignments, conditional expressions, and discarded
+   expressions.
+* [x] Execute all six binary32 and binary64 comparison operators with ordered
+   values and mixed-precision operands, including comparison-driven conditional
+   expressions; unordered NaN cases remain covered separately.
+* [x] Execute +long double+ arithmetic, function parameters and returns, and
+   exact binary64 object-byte checks through the documented binary64 ABI.
+* [x] Implement and execute tested binary64 runtime scalar/pointer-array
+  loads and stores, arithmetic, comparisons, and signed 16-bit conversions
+  using the ABI's four-register groups.
+* [x] Execute mixed binary32/binary64 arithmetic and conversions, including
+  unsigned 16/32-bit boundaries, precision narrowing/widening, and live
+  integer locals across binary64 comparisons and truth tests.
+* [x] Execute fixed-signature binary32/binary64 stack calls with multiple
+   floating parameters, mixed scalar arguments, nested calls, recursion,
+   prototype/return precision conversions, and independent IEEE bit-pattern
+   checks; reject conflicting declared function types before call lowering.
+* [x] Promote variadic binary32 arguments to binary64 and byte integer
+   arguments to the target word representation; execute stack-layout checks
+   for pointers, aggregates, and wide integers.
+* [x] Add end-to-end runtime tests for the currently supported operations,
+   conversions, object accesses, comparisons, and call boundaries. Compare
+   numeric results, object bytes, and boundary rounding with independent
+   references.
+* [x] Update +c90_target_abi.adoc+ only for behavior verified by runtime
+   tests; do not claim complete C conformance until the C90 backend and ABI
+   acceptance suites pass.
+
+==== Completed child of complete C target ABI validation
+
+* [x] Repair and execute wide shift carry-out tests: +SHL32+, +LSR32+, and
+   +ASR32+ retain the last shifted-out bit, preserve carry for a zero count,
+   and clear overflow for immediate and register-count forms.
 
 === Phase 1 — Define architecture, disk, and image contracts
 

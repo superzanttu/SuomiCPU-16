@@ -164,8 +164,10 @@ does not establish language feature parity.
 The repository uses Rust for runtime, build, tools, and CI. Some legacy
 integration coverage has not yet been recreated as Rust tests. C programs
 outside the current native subset fail with an unsupported-program diagnostic.
-Text Demo and the other pre-migration application sources are archived; current
-program build commands support SisuOS only.
+Text Demo and the other pre-migration application sources are not evidence of
+complete C90 support. The shared program command discovers all package
+manifests, but unsupported C syntax and removed guest headers remain build
+limitations.
 
 == B — Basic C game programming
 
@@ -205,6 +207,21 @@ C90 requirements listed under C.
 ** Verified progress: binary32 and binary64 scalar truth conversions treat
    NaNs as true and positive or negative zero as false in conditions, logical
    expressions, and conditional expressions.
+** Verified progress: executing C90 regressions cover signed and unsigned
+   16-bit and 32-bit floating-to-integer conversions within the destination
+   range, truncation toward zero, signed and unsigned 32-bit integer conversion
+   edges to binary32/binary64, and IEEE unordered comparisons for both floating
+   widths. The floating-point backend and full conversion analysis remain open.
+** Verified progress: binary64 expression and comparison code preserves full
+   30-bit register values across nested evaluation. An executing C90 regression
+   verifies binary64 object bytes after runtime float-to-double conversion and
+   comparison, covering the stack-pointer truncation caused by 16-bit saves.
+** Verified progress: end-to-end execution checks all six ordered comparison
+   operators for binary32 and binary64, mixed-precision operands, and
+   comparison-driven conditional expressions; unordered NaN cases are tested
+   separately.
+** Verified progress: +long double+ runtime arithmetic, parameter/return
+   passing, and exact binary64 object bytes execute through the documented ABI.
 ** Verified progress: supported variadic prototypes apply integer promotions
    to tested signed/unsigned byte arguments and promote binary32 arguments to
    binary64. An executing linked probe verifies stack offsets, promoted bytes,

@@ -67,17 +67,19 @@ subset handles multiple +int+ functions with up to three parameters and local
 +int+ variables, assignments, arithmetic/bitwise/shift/logical and signed comparison
 expressions, conditional expressions, nested blocks, +if+/+else+, and
 +while+/+do+/+for+ loops with +break+ and +continue+, including recursion.
-Other catalog programs are archived and unsupported by the current hardware
-interface. At startup without an explicit program path, the BIOS displays the settings list
+Program packages are built and installed from their manifest with the shared
+repository command. At startup without an explicit program path, the BIOS displays the settings list
 and available ID-named disk directories in stable order. Use Up/Down to select
 a row and Enter to edit or boot. Invalid metadata, invalid images, and
 +NOT_BOOT+ errors are logged; the BIOS remains available to retry another
 disk. Close and relaunch the emulator to start a fresh BIOS session. The
 emulator requires the shared
 +firmware/bios.bin+ and displays a BIOS startup error if it is missing or invalid.
-Build/install SisuOS with +sc16build build-program sisuos+ or
-+sc16build install-program sisuos+. The all-program commands currently process
-SisuOS only; archived program sources are not supported. See
+Build and install a manifest package with supported guest sources using
++.\scripts\build-install.ps1 <slug>+; add +-Start+ to boot the installed disk
+after installation succeeds. The optional +install_disk+ manifest field
+selects the destination and defaults to the package slug. Older packages that
+reference removed guest interfaces must be migrated before they build. See
 link:programs.adoc[the program workflow] for manifests, disk-name migration,
 and updates preserving local data. One-off
 +sc16build package-disk+ still refuses an existing destination.
@@ -1208,62 +1210,89 @@ path, that option mounts the same folder filesystem for guest file operations.
 
 ==== SisuOS demonstration
 
-The checked-in +disks/sisuos+ folder contains SisuOS, a small protected,
-preemptive OS demonstration. Start the emulator with the SisuOS disk
-preselected:
+The checked-in +disks/sisuos+ folder contains SisuOS, a protected
+preemptive-system example. Start the emulator with its disk preselected:
 [source,console]
 ----
 cargo run --bin suomicpu16 -- --disk sisuos
 ----
-Press Enter in the BIOS to boot the selected disk. The kernel installs its
-IDT, enables the MMU and instruction timer, and starts the user-mode shell.
-At the +sc16>+ prompt, enter +run demo+ to start the preemptive demo as a child
-task. The shell reports the child's output and exit status, then returns to the
-prompt. Other commands are +help+, +list+, +info+, and +ps+. The +ps+ command
-lists all unreaped processes with their PID, parent PID, state, and program.
-The shell itself is +running+ while it executes +ps+. +ready+ means eligible
-to run but waiting for the CPU; +sleeping+ means blocked on a timer, +waiting+
-means waiting for a child, and +blocked+ covers other waits. +exited+ processes
-remain visible until reaped. This is a per-row state query, not CPU utilization.
+Press Enter in the BIOS to boot the selected disk. The kernel installs its IDT,
+enables the MMU and instruction timer, and starts the user-mode SaunaShell.
+Commands currently implemented:
 
-Use +run demo X+ to launch a background demo for +X+ seconds (1 through 65535).
-The shell returns immediately and accepts more commands, including additional
-background launches. Each child prints +BGP [pid] time [second]/X+ once per
-elapsed second, starting at +1/X+ and ending at +X/X+, then exits. For example:
+* +help+ displays the command list.
+* +info+ displays SisuOS and syscall ABI status.
+* +ps+ lists process IDs, parent IDs, states, and program paths. +ready+ means
+  runnable but waiting for CPU time; +sleeping+ and +waiting+ identify timer
+  and child waits.
+* +top+ snapshots instruction counts for each process since it started.
+* +kill PID+ terminates a direct child with status 137. Root may terminate any
+  non-init process. Processes with children cannot be terminated, and
+  processes cannot terminate themselves.
+* +list [DIR]+ displays the current directory entries from the mounted SisuOS
+  disk. Directories are suffixed with +/+; the disk manifest and protected
+  kernel account metadata are not exposed.
+* +mkdir DIRECTORY+ creates one directory below an existing directory.
+* +touch FILE+ creates an empty file without truncating an existing file.
+* +append FILE TEXT+ appends one line of text, creating the file if needed.
+* +cat FILE+ writes a file's contents to the console.
+* +edit FILE+ replaces a file with entered lines; a line containing only +.+
+  saves and closes it.
+* +rm FILE+ removes a regular file.
+* +mv SOURCE DESTINATION+ renames a regular file without replacing an existing
+  destination. Ownership and mode metadata follow the renamed file.
+* +chmod MODE FILE+ changes mode bits (one to three octal digits), for root
+  or the file's owner.
+* +chown FILE USER GROUP+ changes ownership; root may select any existing
+  account and group.
+* +run PROGRAM [args] [&]+ runs a packaged guest program. Program names
+  without a path resolve to +bin/NAME.bin+. A trailing +&+ starts it in the
+  background.
+* +groupadd GROUP+ creates a group (root only).
+* +useradd USER GROUP+ creates a user and its home directory (root only).
+* +passwd [USER]+ changes the current user's password, or a named user's
+  password when run by root.
+* +logout+ exits SaunaShell; the current init process starts a fresh shell.
+
+On the first boot, SaunaShell prompts to set a root password; later boots
+require root login. Password hashes and account records are stored in the
+kernel-protected +.sisuos/accounts.json+ metadata file. SisuOS checks account
+permissions for directory listings, file opens, reads, writes, and executable
+launches. The account interface supports root setup and login, group and user
+creation, password changes, and file ownership/mode changes.
+
+The +daemon+ program reports its PID and blocks in a long sleep. The +sleeper+
+program reports monotonic elapsed time at ten-second intervals. For example:
 [source,console]
 ----
-sc16> run demo 3
-Started background process 1
-sc16> ps
+sauna> run daemon &
+Started background process 2
+sauna> ps
 PID PPID STATE PROGRAM
-0 - running sisuos
-1 0 sleeping demo.bin
-running=on CPU, ready=waiting for CPU
-sleeping=timer wait, waiting=child wait
-BGP 1 time 1/3
-BGP 1 time 2/3
-BGP 1 time 3/3
+0 - waiting sisuos
+1 0 running bin/sauna.bin
+2 1 sleeping bin/daemon.bin
+sauna> kill 2
+Process terminated.
+Background process 2 exited with status 137
 ----
-Background output can appear while a command is being typed. Timing uses a
-monotonic host clock and a blocking millisecond sleep service, not busy polling,
-the instruction-tick sleep service, or emulation speed.
-Overdue lines are emitted when execution next runs. Up to 16 background
-children can be tracked at once; the shell reaps
-finished children while reading input. The program list is fixed to +demo+ and
-this example is not a general-purpose OS.
+
+The shell enforces a 255-character input limit. Multiple independent
+consoles and a full-screen text editor are not implemented yet. +edit+ is a
+simple line-entry
+replacement editor. This is not a general-purpose operating system.
 
 To build and install the SisuOS disk while preserving unrelated writable data:
 [source,powershell]
 ----
-.\programs\sisuos\tools\build.ps1 -Install
+.\scripts\build-install.ps1 sisuos
 ----
-The kernel's protected-mode, interrupt, and MMU setup remains in
-+programs/sisuos/src/preemptive_os_kernel.asm+. The interactive shell and preemptively
-scheduled child program are written in C in
-+programs/sisuos/src/preemptive_os_shell.c+ and +programs/sisuos/src/preemptive_os_demo.c+.
-The build embeds the compiled shell in the kernel image and packages the
-compiled child as +demo.bin+. A BIOS-boot integration test checks the packaged
-images against those sources and verifies that the child task runs and exits.
+The kernel's protected-mode, interrupt, and MMU setup is in
++programs/sisuos/src/preemptive_os_kernel.asm+. Init and SaunaShell, as well as
+the daemon and sleeper, are C guest programs under +programs/sisuos/src/+.
+The package places the separate executables under +bin/+ and embeds init in
+the kernel image. A BIOS-boot integration test checks the packaged images and
+executes shell commands and the background daemon.
 
 The BIOS information block starts at +0x43040+: bytes +0..3+ are the +SC16+
 signature, bytes +4..5+ are the BIOS version, bytes +6..8+ contain the memory

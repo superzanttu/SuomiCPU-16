@@ -53,6 +53,14 @@ long sc16_startup_argument(void);
 long sc16_monotonic_ms(void);
 int sc16_process_info(unsigned int index, char *buffer, unsigned int capacity);
 int sc16_process_status(unsigned int index, char *buffer, unsigned int capacity);
+int sc16_process_accounting(unsigned int index, char *buffer, unsigned int capacity);
+int sc16_directory_entry(const char *directory, unsigned int index, char *buffer,
+                         unsigned int capacity);
+int sc16_mkdir(const char *directory);
+int sc16_delete_file(const char *path);
+int sc16_rename_file(const char *source, const char *destination);
+int sc16_set_file_mode(const char *path, unsigned int mode);
+int sc16_set_file_owner(const char *path, const char *user, const char *group);
 long sc16_mmap(unsigned long length, unsigned int permissions, void *hint);
 int sc16_open(const char *path, unsigned int flags);
 int sc16_read(int handle, void *buffer, unsigned int length);
@@ -63,11 +71,19 @@ int sc16_sleep(unsigned long ticks);
 int sc16_sleep_ms(unsigned long milliseconds);
 int sc16_wait(unsigned long child_pid);
 int sc16_trywait(unsigned long child_pid);
+int sc16_kill(unsigned long process_id, int exit_status);
 long sc16_semop(unsigned int operation, unsigned long semaphore_id,
                 unsigned int initial_value);
 int sc16_graphics(unsigned int operation,
                   const struct sc16_graphics_parameters *parameters,
                   const void *data, unsigned int length);
 int sc16_input_snapshot(unsigned char *buffer);
+int sc16_account_status(void);
+int sc16_account_initialize_root(const char *password);
+int sc16_authenticate(const char *name, const char *password);
+int sc16_console_echo(int enabled);
+int sc16_group_add(const char *name);
+int sc16_user_add(const char *name, const char *group, const char *home);
+int sc16_set_password(const char *name, const char *password);
 
 #endif

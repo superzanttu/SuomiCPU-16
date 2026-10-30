@@ -1,4 +1,6 @@
 {
-  "demo.bin": "4403:f9a6c69f8928723a",
-  "kernel.bin": "13176:76f2d54ee6aba62b"
+  "bin/daemon.bin": "4299:83720eab3ee1715f",
+  "bin/sauna.bin": "58161:83afb32ebfda50e6",
+  "bin/sleeper.bin": "4982:0b540e30002604b9",
+  "kernel.bin": "3629:246f5608350868b0"
 }

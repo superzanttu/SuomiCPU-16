@@ -981,6 +981,56 @@ which the native wrappers combine before `SVC`.
   buttons; byte 10 is the consumed mouse-event latch; bytes 11-12 are the
   signed big-endian wheel delta. The entire output buffer is validated before
   either event latch is consumed. Invalid buffers return `-EFAULT`.
+|26 |`account_status` |Returns zero when root password setup is incomplete and one
+  when it is complete. An unavailable or malformed account store returns
+  `-EIO`.
+|27 |`initialize_root_password` |R1 password pointer; valid only for the
+  one-shot SisuOS bootstrap process before root setup. Persists the root
+  password hash and consumes bootstrap authority.
+|28 |`authenticate` |R1 username, R2 password. Stores the authenticated
+  process credentials and returns the UID; invalid credentials return
+  `-EACCES`.
+|29 |`set_console_echo` |R1 is zero to disable console echo or one to enable
+  it. This currently controls the shared console device, not a per-process
+  terminal.
+|30 |`add_group` |R1 group name; root only. Returns the new GID.
+|31 |`add_user` |R1 username, R2 group name, R3 home path; root only. Creates
+  the account and its home directory with owner-only access, returning the
+  new UID.
+|32 |`set_password` |R1 username, R2 new password. Root may change any user's
+  password; other users may change only their own. Passwords must contain
+  8-128 bytes.
+|33 |`directory_entry` |R1 directory path (`/` for the disk root), R2
+  zero-based entry index, R3 writable output buffer, R4 capacity. Entries are
+  sorted by name; directory names end in `/`. Returns the entry length
+  excluding its null terminator, zero at the end, or an error. The buffer must
+  fit the complete entry and terminator. SisuOS checks directory read/search
+  permissions; the disk manifest and protected kernel metadata are omitted.
+|34 |`mkdir` |R1 path; creates one directory below an existing parent. SisuOS
+  requires parent write/search permission and records the caller as owner with
+  mode `0755`. Returns zero on success or an error.
+|35 |`delete_file` |R1 file path; removes a regular file. SisuOS requires
+  parent write/search permission and removes the file's stored permission
+  record. Directories and protected boot files cannot be removed.
+|36 |`set_file_mode` |R1 path, R2 mode bits (`000`..`777`); root or the
+  current file owner only. Parent search permission is required.
+|37 |`set_file_owner` |R1 path, R2 username, R3 group name; root may select any
+  existing user/group. A non-root owner may retain only their own UID and
+  select one of their groups. Parent search permission is required.
+|38 |`kill` |R1 target process ID, R2 exit status (0..255); terminates a
+  direct child or any non-init process when called by UID 0. A process cannot
+  terminate itself or PID 0, and a process with children cannot be terminated.
+  Exit status is collected by the child's parent with `wait`/`trywait`; missing
+  or exited processes return `-ENOENT`.
+|39 |`rename_file` |R1 source path, R2 destination path; SisuOS permits
+  renaming regular files when the caller can write/search both parent
+  directories. Existing destinations and files with open handles are rejected.
+  Stored owner/group/mode metadata follows the new path.
+|40 |`process_accounting` |R1 zero-based process index, R2 writable buffer,
+  R3 capacity; R4-R6 must be zero. Returns a `PID INSTRUCTIONS\n` row, zero
+  at the end, or an error. The counter includes guest and syscall instructions
+  executed by that task since registration. Reaped processes are excluded;
+  indices may shift.
 |===
 
 The original `spawn` and `spawn_arg` supply the executable path as argument
@@ -1108,9 +1158,20 @@ operating system:
 * A BIOS-booted guest workload verifies spawn, yield, sleep, wait, console/file
   I/O, and exit together, but this sample does not establish general-kernel
   robustness.
-* SisuOS is a demonstration shell with fixed `help`, `list`, `info`, `ps`,
-  `run demo`, and `run demo X` commands. Its program list is static; it does not provide a
-  general command interpreter, package manager, or persistent user accounts.
+* SisuOS currently boots a user-mode SaunaShell with `help`, `list`, `info`,
+  `ps`, `top`, `kill PID`, `run PROGRAM [args] [&]`, and `logout`. First boot sets a root password;
+  later boots authenticate root against kernel-protected persistent account
+  metadata. The account model supports user/group records and file modes, and
+  SisuOS enforces those modes for directory listings, file opens, reads,
+  writes, and executable launches, including parent-directory traversal. Guest
+  account administration provides root-only group and user creation plus
+  password changes. Newly created files are owned by the creating user and use
+  mode `0644`; new directories use mode `0755`. The shell lists mounted
+  directory entries dynamically and supports `mkdir`, `touch`, `cat`, `edit`,
+  `append`, `rm`, `mv`, `chmod`, and `chown`, but the system has no multiple consoles or
+  general-purpose filesystem shell. `top` reports per-process instruction
+  counts since process start. Process termination is limited to direct
+  children, except that root may terminate any process other than init.
 * The BIOS-booted workload triggers a supervisor-only read and verifies that the
   sample handler skips the faulting instruction. This single recovery policy is
   not a general page-fault or process-termination policy.

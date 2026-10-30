@@ -4,7 +4,9 @@
   "label": "SisuOS",
   "protected_files": [
     "kernel.bin",
-    "demo.bin"
+    "bin/sauna.bin",
+    "bin/daemon.bin",
+    "bin/sleeper.bin"
   ],
   "read_only": false,
   "version": 1

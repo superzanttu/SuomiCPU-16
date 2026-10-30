@@ -1,6 +1,8 @@
 //! Exposes the SC-16 emulator, assembler, C compiler, and shared tooling.
 //! Declares module locations and re-exports the main CPU types and constants.
 
+#[path = "emulator/accounts.rs"]
+pub mod accounts;
 #[path = "assembler/mod.rs"]
 pub mod assembler;
 #[path = "emulator/bios_settings.rs"]

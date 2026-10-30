@@ -6,14 +6,25 @@
   "capacity_bytes": 16777216,
   "boot": {
     "source": "src/preemptive_os_kernel.asm",
-    "embedded_c": "src/preemptive_os_shell.c",
+    "embedded_c": "src/init.c",
     "output": "kernel.bin"
   },
   "assets": null,
+  "retired_outputs": ["demo.bin"],
   "executables": [
     {
-      "source": "src/preemptive_os_demo.c",
-      "output": "demo.bin",
+      "source": "src/sauna.c",
+      "output": "bin/sauna.bin",
+      "base": 196608
+    },
+    {
+      "source": "src/daemon.c",
+      "output": "bin/daemon.bin",
+      "base": 196608
+    },
+    {
+      "source": "src/sleeper.c",
+      "output": "bin/sleeper.bin",
       "base": 196608
     }
   ]

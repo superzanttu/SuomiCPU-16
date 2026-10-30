@@ -362,8 +362,11 @@ Runtime conversions between signed/unsigned 32-bit integers and binary32 /
 binary64 are tested at initializers, assignments, casts, parameters, and
 returns. Tests compare object bytes with independent Rust arithmetic and IEEE
 references, including integer range edges and binary32 rounding at +16777217+.
-Floating-to-integer cases stay within the destination's representable range;
-the CPU's out-of-range conversion extensions are not C90 guarantees.
+Executing C90 regressions also cover signed and unsigned 16-bit and 32-bit
+floating-to-integer conversions within the destination's representable range,
+truncation toward zero, signed and unsigned 32-bit integer conversion edges,
+and unordered binary32/binary64 comparisons. The CPU's out-of-range
+conversion extensions are not C90 guarantees.
 Locals whose writes produce expression values, and address-taken parameters,
 use frame storage so evaluation and call register saves cannot undo writes.
 Tests cover assignments and updates inside conversions and call arguments.

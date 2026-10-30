@@ -2,7 +2,7 @@
 :toc:
 
 This guide covers a first emulator run, booting the supported SisuOS example,
-and locating the build and architecture references. SisuOS is the only guest
+and locating the build and architecture references. SisuOS is the primary
 workload verified against the current hardware interfaces.
 
 == Requirements
@@ -42,10 +42,13 @@ To run the checked-in SisuOS disk directly on Windows:
 ----
 
 SisuOS boots a protected kernel that configures the MMU and instruction timer,
-then starts its user-mode shell. Enter +help+ in the shell to see commands;
-+list+, +info+, and +run demo+ demonstrate package listing, machine status,
-and a preempted child process. This is an instructional demonstration, not a
-general-purpose operating system.
+then starts the user-mode SaunaShell. Enter +help+ to see its commands:
++info+, +ps+, +list+, +run PROGRAM [args] [&]+, and +logout+. The package list
+currently names the three installed guest programs; it is not a dynamic
+filesystem listing. +run daemon &+ starts the blocking daemon in the background,
+while +run sleeper+ starts the monotonic timer example. SisuOS does not yet
+provide accounts, permissions, multiple consoles, or a general-purpose
+filesystem shell.
 
 == Build and install SisuOS
 
@@ -53,14 +56,14 @@ Build the package without changing the installed disk:
 
 [source,powershell]
 ----
-.\programs\sisuos\tools\build.ps1
+.\scripts\build-install.ps1 sisuos
 ----
 
 Build and safely install it:
 
 [source,powershell]
 ----
-.\programs\sisuos\tools\build.ps1 -Install
+.\scripts\build-install.ps1 sisuos
 ----
 
 The build is staged under +build/programs/sisuos/+; installation updates

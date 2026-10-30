@@ -46,37 +46,37 @@ not installed programs.
 
 [source,powershell]
 ----
-.\scripts\build-programs.ps1 sisuos -Install
+.\scripts\build-install.ps1 sisuos
 .\run.ps1 .\disks\sisuos
 ----
 
-SisuOS is the supported guest workload for the current hardware interface.
-Other program sources are left untouched and may still depend on removed
-legacy headers. See link:docs/programs.adoc[program build and disk details].
-Program disk names and IDs now match their slugs. Data disks +DISK0001+ and
-+DISK0002+ are unchanged.
+Program build and installation use the shared manifest-driven workflow. Use
++.\scripts\build-install.ps1 <slug>+ to build and install a package, or add
++-Start+ to launch its installed disk afterward. See
+link:docs/programs.adoc[program build and disk details]. Data disks +DISK0001+
+and +DISK0002+ are unchanged.
 
 == SisuOS
 
 The checked-in +disks/sisuos+ folder is a small protected, preemptive OS
 demonstration. Start the emulator with +--disk sisuos+, then press Enter in
 the BIOS to boot its trusted +kernel.bin+. The kernel enables the MMU and
-instruction timer before starting the user-mode SisuOS shell. The shell
-supports +help+, +list+, +info+, +ps+, +run demo+, and +run demo X+.
-The timed form runs a background child for X seconds, printing
-+BGP [pid] time [second]/X+ each second while the shell remains responsive.
-This is a tested demonstration, not a general-purpose OS.
+instruction timer before starting the user-mode SaunaShell. The shell supports
++help+, +info+, +ps+, +list+, +run PROGRAM [args] [&]+, and +logout+.
++list+ currently names the packaged guest programs; it is not a filesystem
+browser. +run daemon &+ starts the blocking daemon in the background, and
++run sleeper+ starts the monotonic timer example. Accounts, permissions,
+multiple consoles, and a general-purpose filesystem shell are not implemented.
 
 To rebuild and install while preserving unrelated writable disk data:
 [source,powershell]
 ----
-.\programs\sisuos\tools\build.ps1 -Install
+.\scripts\build-install.ps1 sisuos
 ----
-The script builds the C shell, C demo and assembly bootstrap from
-+programs/sisuos/src/+ using +sc16build+,
-packages the folder manifest and protects both executable files. Its output
-is a valid boot disk; the BIOS integration test checks the checked-in images
-against these sources and exercises the shell and preempted demo.
+The script builds the C init, shell, daemon, and sleeper plus the assembly
+bootstrap from +programs/sisuos/src/+ using +sc16build+. It packages the
+separate guest programs under +bin/+ and protects the kernel image. The
+BIOS-boot integration test exercises the shell commands and installed daemon.
 
 Run an example directly from the repository root:
 [source,console]
@@ -143,14 +143,14 @@ cargo run --bin sc16build -- examples\directives.asm example.sc16img
 cargo run --bin sc16build -- input.bin output.sc16img
 cargo run --bin sc16build -- build-programs
 cargo run --bin sc16build -- install-programs
-.\scripts\build-programs.ps1 sisuos -Install
+.\scripts\build-install.ps1 sisuos
 ----
 
-+build-programs+ and +install-programs+ currently process SisuOS only and write
-staging output under +build/programs/+. Installation preserves writable disk
-data, reporting conflicts instead of overwriting local edits. Other checked-in
-program disks and sources are archived and unsupported; the guest BIOS only
-loads prebuilt disk images.
++build-programs+ and +install-programs+ discover every current manifest and
+write staging output under +build/programs/+. Some archived guest sources still
+reference removed APIs and fail with an explicit compiler diagnostic until
+migrated. Installation preserves writable disk data and reports conflicts
+instead of overwriting local edits; the guest BIOS loads prebuilt disk images.
 
 In the Rust BIOS selector, choose a folder boot disk with *Up/Down* and
 *Enter*. +--disk ID+ preselects that boot disk; with an explicit program path

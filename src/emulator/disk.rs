@@ -10,6 +10,9 @@ use std::path::{Component, Path, PathBuf};
 const MAX_FILE_READ_SIZE: usize = 4096;
 const FOLDER_DISK_MANIFEST_VERSION: u64 = 1;
 const MAX_DISK_LABEL_LENGTH: usize = 64;
+const KERNEL_METADATA_DIRECTORY: &str = ".sisuos";
+const KERNEL_ACCOUNT_STORE: &str = ".sisuos/accounts.json";
+const MAX_KERNEL_METADATA_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderDiskManifest {
@@ -231,6 +234,9 @@ impl FolderDisk {
     }
 
     pub fn list_dir(&self, directory: Option<&str>) -> Result<Vec<FolderDirectoryEntry>, String> {
+        if directory.is_some_and(contains_kernel_metadata_component) {
+            return Err("kernel metadata is not guest-accessible".to_owned());
+        }
         let directory = self.resolve_existing_directory(directory)?;
         let mut entries = Vec::new();
         for entry in fs::read_dir(&directory)
@@ -245,6 +251,14 @@ impl FolderDisk {
             let file_type = entry
                 .file_type()
                 .map_err(|error| format!("cannot inspect folder disk entry: {error}"))?;
+            if directory == self.root
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(KERNEL_METADATA_DIRECTORY)
+            {
+                continue;
+            }
             if file_type.is_symlink() || (!file_type.is_dir() && !file_type.is_file()) {
                 return Err(format!("folder disk contains unsupported entry {path:?}"));
             }
@@ -308,10 +322,15 @@ impl FolderDisk {
         let mut files = Vec::new();
         collect_folder_files(&self.root, &self.root, &mut files)?;
         files.sort_by(|left, right| left.0.cmp(&right.0));
-        Ok(files.into_iter().map(|(path, _)| path).collect())
+        Ok(files
+            .into_iter()
+            .filter(|(path, _)| !contains_kernel_metadata_component(path))
+            .map(|(path, _)| path)
+            .collect())
     }
 
     pub fn metadata(&self, path: &str) -> Result<FolderDirectoryEntry, String> {
+        reject_kernel_metadata_path(path)?;
         let relative = validate_file_path(path)?;
         let (_, metadata) = self.resolve_entry(&relative)?;
         if !metadata.is_file() && !metadata.is_dir() {
@@ -349,6 +368,7 @@ impl FolderDisk {
         offset: u64,
         length: usize,
     ) -> Result<(Vec<u8>, u64), String> {
+        reject_kernel_metadata_path(file_path)?;
         if length > MAX_FILE_READ_SIZE {
             return Err("invalid virtual file read range".to_owned());
         }
@@ -367,6 +387,122 @@ impl FolderDisk {
             .map_err(|error| format!("cannot read folder disk file {file_path:?}: {error}"))?;
         data.truncate(count);
         Ok((data, file_size))
+    }
+
+    pub(crate) fn read_kernel_account_store(&self) -> Result<Option<Vec<u8>>, String> {
+        let directory = self.root.join(KERNEL_METADATA_DIRECTORY);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err("kernel metadata directory is not a real directory".to_owned());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect kernel metadata directory: {error}")),
+        }
+        let path = self.root.join(KERNEL_ACCOUNT_STORE);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err("kernel account metadata is not a regular file".to_owned());
+            }
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect kernel account metadata: {error}")),
+        };
+        if metadata.len() > MAX_KERNEL_METADATA_BYTES as u64 {
+            return Err("kernel account metadata exceeds its size limit".to_owned());
+        }
+        let resolved = fs::canonicalize(&path)
+            .map_err(|error| format!("cannot resolve kernel account metadata: {error}"))?;
+        if !resolved.starts_with(&self.root) {
+            return Err("kernel account metadata escapes the mounted disk".to_owned());
+        }
+        fs::read(resolved)
+            .map(Some)
+            .map_err(|error| format!("cannot read kernel account metadata: {error}"))
+    }
+
+    pub(crate) fn write_kernel_account_store(&self, data: &[u8]) -> Result<(), String> {
+        if self.manifest.read_only {
+            return Err("folder disk is read-only".to_owned());
+        }
+        if data.is_empty() || data.len() > MAX_KERNEL_METADATA_BYTES {
+            return Err("kernel account metadata size is invalid".to_owned());
+        }
+        let directory = self.root.join(KERNEL_METADATA_DIRECTORY);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err("kernel metadata directory is not a real directory".to_owned());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory)
+                    .map_err(|error| format!("cannot create kernel metadata directory: {error}"))?;
+            }
+            Err(error) => return Err(format!("cannot inspect kernel metadata directory: {error}")),
+        }
+        let target = self.root.join(KERNEL_ACCOUNT_STORE);
+        let old_length = match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err("kernel account metadata is not a regular file".to_owned());
+            }
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(format!("cannot inspect kernel account metadata: {error}")),
+        };
+        let next_usage = self
+            .used_bytes()?
+            .checked_sub(old_length)
+            .and_then(|usage| usage.checked_add(data.len() as u64))
+            .ok_or_else(|| "folder disk usage overflow".to_owned())?;
+        if next_usage > self.manifest.capacity_bytes {
+            return Err("folder disk capacity exceeded".to_owned());
+        }
+        let resolved_directory = fs::canonicalize(&directory)
+            .map_err(|error| format!("cannot resolve kernel metadata directory: {error}"))?;
+        if !resolved_directory.starts_with(&self.root) {
+            return Err("kernel metadata directory escapes the mounted disk".to_owned());
+        }
+        static NEXT_TEMPORARY_FILE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let mut temporary_path = None;
+        let mut temporary_file = None;
+        for _ in 0..8 {
+            let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let candidate =
+                directory.join(format!(".accounts-{}-{sequence}.tmp", std::process::id()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    temporary_path = Some(candidate);
+                    temporary_file = Some(file);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create account metadata staging file: {error}"
+                    ));
+                }
+            }
+        }
+        let temporary_path = temporary_path
+            .ok_or_else(|| "cannot reserve account metadata staging file".to_owned())?;
+        let write_result = (|| {
+            let mut file = temporary_file.expect("staging path and file are paired");
+            file.write_all(data)
+                .map_err(|error| format!("cannot write account metadata staging file: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("cannot flush account metadata staging file: {error}"))?;
+            fs::rename(&temporary_path, &target)
+                .map_err(|error| format!("cannot replace kernel account metadata: {error}"))
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        write_result
     }
 
     pub fn write_file(&self, file_path: &str, data: &[u8]) -> Result<(), String> {
@@ -451,6 +587,7 @@ impl FolderDisk {
     }
 
     pub fn ensure_regular_file(&self, file_path: &str, create: bool) -> Result<(), String> {
+        reject_kernel_metadata_path(file_path)?;
         let relative = validate_file_path(file_path)?;
         let parent = self.resolve_parent_directory(&relative)?;
         let target = parent.join(
@@ -474,6 +611,7 @@ impl FolderDisk {
     }
 
     pub fn copy_file(&self, source: &str, destination: &str) -> Result<(), String> {
+        reject_kernel_metadata_path(source)?;
         let source_path = self.resolve_regular_file(source)?;
         let destination_relative = validate_file_path(destination)?;
         self.ensure_mutable(destination)?;
@@ -651,6 +789,7 @@ impl FolderDisk {
         let Some(directory) = directory else {
             return Ok(self.root.clone());
         };
+        reject_kernel_metadata_path(directory)?;
         let relative = validate_file_path(directory)?;
         let mut current = self.root.clone();
         for component in relative.components() {
@@ -673,6 +812,7 @@ impl FolderDisk {
     }
 
     fn resolve_entry(&self, relative: &Path) -> Result<(PathBuf, fs::Metadata), String> {
+        reject_kernel_metadata_path(&relative.to_string_lossy())?;
         let parent = self.resolve_parent_directory(relative)?;
         let path = parent.join(
             relative
@@ -700,6 +840,7 @@ impl FolderDisk {
     }
 
     fn ensure_mutable(&self, file_path: &str) -> Result<(), String> {
+        reject_kernel_metadata_path(file_path)?;
         if self.manifest.read_only {
             return Err("folder disk is read-only".to_owned());
         }
@@ -806,6 +947,19 @@ fn validate_file_path(file_path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn contains_kernel_metadata_component(path: &str) -> bool {
+    path.split('/')
+        .any(|component| component.eq_ignore_ascii_case(KERNEL_METADATA_DIRECTORY))
+}
+
+fn reject_kernel_metadata_path(path: &str) -> Result<(), String> {
+    if contains_kernel_metadata_component(path) {
+        Err("kernel metadata is not guest-accessible".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +1049,88 @@ mod tests {
         fs::write(disk_root.join("data.bin"), b"four").unwrap();
 
         assert!(FolderDisk::open(&disk_root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kernel_account_store_is_atomic_bounded_and_hidden_from_guest_filesystem() {
+        let root = temp_dir("account-store");
+        let disk_root = root.join("DISK0001");
+        fs::create_dir_all(&disk_root).unwrap();
+        fs::write(
+            disk_root.join("disk.json"),
+            r#"{"version":1,"id":"DISK0001","label":"Test","capacity_bytes":65536,"read_only":false}"#,
+        )
+        .unwrap();
+        let disk = FolderDisk::open(&disk_root).unwrap();
+
+        assert_eq!(disk.read_kernel_account_store().unwrap(), None);
+        let account_data = b"{\"version\":1}";
+        disk.write_kernel_account_store(account_data).unwrap();
+        assert_eq!(
+            disk.read_kernel_account_store().unwrap(),
+            Some(account_data.to_vec())
+        );
+        disk.write_kernel_account_store(b"{\"version\":1,\"updated\":true}")
+            .unwrap();
+        assert_eq!(
+            disk.read_kernel_account_store().unwrap(),
+            Some(b"{\"version\":1,\"updated\":true}".to_vec())
+        );
+        assert!(disk.read_file(KERNEL_ACCOUNT_STORE, 0, 10).is_err());
+        assert!(disk.metadata(KERNEL_ACCOUNT_STORE).is_err());
+        assert!(disk.list_dir(Some(KERNEL_METADATA_DIRECTORY)).is_err());
+        assert!(
+            !disk
+                .list_dir(None)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name.eq_ignore_ascii_case(KERNEL_METADATA_DIRECTORY))
+        );
+        assert!(
+            !disk
+                .list_files()
+                .unwrap()
+                .iter()
+                .any(|path| contains_kernel_metadata_component(path))
+        );
+        assert!(disk.write_file(KERNEL_ACCOUNT_STORE, b"tamper").is_err());
+
+        let read_only_root = root.join("DISK0002");
+        fs::create_dir_all(&read_only_root).unwrap();
+        fs::write(
+            read_only_root.join("disk.json"),
+            r#"{"version":1,"id":"DISK0002","label":"Read only","capacity_bytes":65536,"read_only":true}"#,
+        )
+        .unwrap();
+        let read_only = FolderDisk::open(&read_only_root).unwrap();
+        assert!(read_only.write_kernel_account_store(account_data).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kernel_account_store_rejects_bad_sizes_symlinks_and_corrupt_existing_data() {
+        let root = temp_dir("account-store-validation");
+        let disk_root = root.join("DISK0001");
+        fs::create_dir_all(&disk_root).unwrap();
+        fs::write(
+            disk_root.join("disk.json"),
+            r#"{"version":1,"id":"DISK0001","label":"Test","capacity_bytes":65536,"read_only":false}"#,
+        )
+        .unwrap();
+        let disk = FolderDisk::open(&disk_root).unwrap();
+        assert!(disk.write_kernel_account_store(&[]).is_err());
+        assert!(
+            disk.write_kernel_account_store(&vec![0; MAX_KERNEL_METADATA_BYTES + 1])
+                .is_err()
+        );
+        fs::create_dir(disk_root.join(KERNEL_METADATA_DIRECTORY)).unwrap();
+        fs::write(
+            disk_root.join(KERNEL_ACCOUNT_STORE),
+            vec![0; MAX_KERNEL_METADATA_BYTES + 1],
+        )
+        .unwrap();
+        assert!(disk.read_kernel_account_store().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

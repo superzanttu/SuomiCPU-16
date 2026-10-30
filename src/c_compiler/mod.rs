@@ -588,11 +588,23 @@ fn native_argument_is_pointer(function: &str, index: usize) -> bool {
     match function {
         "sc16_spawn" | "sc16_spawn_arg" | "sc16_open" | "__stdio_mode_flags" => index == 0,
         "sc16_spawn_exec" => matches!(index, 0 | 1),
+        "sc16_account_initialize_root" => index == 0,
+        "sc16_authenticate" => matches!(index, 0 | 1),
+        "sc16_group_add" => index == 0,
+        "sc16_user_add" => matches!(index, 0 | 1 | 2),
+        "sc16_set_password" => matches!(index, 0 | 1),
+        "sc16_directory_entry" => matches!(index, 0 | 2),
+        "sc16_mkdir" => index == 0,
+        "sc16_delete_file" => index == 0,
+        "sc16_rename_file" => matches!(index, 0 | 1),
+        "sc16_set_file_mode" => index == 0,
+        "sc16_set_file_owner" => matches!(index, 0 | 1 | 2),
         "sc16_mmap" => index == 2,
         "sc16_read"
         | "sc16_write"
         | "sc16_process_info"
         | "sc16_process_status"
+        | "sc16_process_accounting"
         | "sc16_argument" => index == 1,
         "sc16_net_discover" => index == 0,
         "sc16_net_send" | "sc16_net_receive" => matches!(index, 0 | 1),
@@ -604,7 +616,12 @@ fn native_argument_is_wide_integer(function: &str, index: usize) -> bool {
     matches!(
         (function, index),
         (
-            "sc16_mmap" | "sc16_sleep" | "sc16_sleep_ms" | "sc16_wait" | "sc16_trywait",
+            "sc16_mmap"
+                | "sc16_sleep"
+                | "sc16_sleep_ms"
+                | "sc16_wait"
+                | "sc16_trywait"
+                | "sc16_kill",
             0
         ) | ("sc16_seek" | "sc16_semop" | "sc16_spawn_arg", 1)
     )
@@ -6751,10 +6768,16 @@ fn emit_native_f64_expression(
         emit_native_save_frame_pointer(assembly);
     }
     let wide_pointer = emit_native_save_r1(locals, assembly);
-    assembly.push_str("    PUSH R2\n    PUSH R3\n");
+    assembly.push_str(
+        "    ADJSP -4\n    MOVSP R0\n    STP R2, R0\n\
+         ADJSP -4\n    MOVSP R0\n    STP R3, R0\n",
+    );
     let emitted = emit_native_f64_expression_inner(expression, locals, label_counter, assembly);
     if emitted {
-        assembly.push_str("    POP R3\n    POP R2\n");
+        assembly.push_str(
+            "    MOVSP R0\n    LDP R3, R0\n    ADJSP 4\n\
+             MOVSP R0\n    LDP R2, R0\n    ADJSP 4\n",
+        );
         if wide_pointer {
             assembly.push_str("    MOV R0, R7\n");
         }
@@ -7213,7 +7236,10 @@ fn emit_native_f64_comparison(
         emit_native_save_frame_pointer(assembly);
     }
     let saved_register = emit_native_save_r1(locals, assembly);
-    assembly.push_str("    PUSH R2\n    PUSH R3\n");
+    assembly.push_str(
+        "    ADJSP -4\n    MOVSP R0\n    STP R2, R0\n\
+         ADJSP -4\n    MOVSP R0\n    STP R3, R0\n",
+    );
     let reverse_operands = matches!(operator, ">" | ">=");
     let (first, second) = if reverse_operands {
         (right, left)
@@ -7248,7 +7274,10 @@ fn emit_native_f64_comparison(
          LDI R4, 1\n\
          __c_f64cmp_{label}_end:\n"
     ));
-    assembly.push_str("    POP R3\n    POP R2\n");
+    assembly.push_str(
+        "    MOVSP R0\n    LDP R3, R0\n    ADJSP 4\n\
+         MOVSP R0\n    LDP R2, R0\n    ADJSP 4\n",
+    );
     emit_native_restore_r1(saved_register, assembly);
     if frame_pointer {
         emit_native_restore_frame_pointer(6, assembly);
@@ -15150,6 +15179,27 @@ mod tests {
             .into_iter()
             .map(|token| token.value)
             .collect()
+    }
+
+    #[test]
+    fn account_syscalls_pass_pointers_as_split_30_bit_arguments() {
+        let source = "
+            long sc16_group_add(const char *name);
+            long sc16_user_add(const char *name, const char *group, const char *password);
+            long sc16_set_password(const char *name, const char *password);
+            int main(void)
+            {
+                sc16_group_add(\"admins\");
+                sc16_user_add(\"alice\", \"staff\", \"password\");
+                sc16_set_password(\"alice\", \"password\");
+                return 0;
+            }
+        ";
+        let assembly = compile_minimal_program_to_assembly(source, "account-syscalls.c")
+            .unwrap()
+            .expect("C program assembly");
+
+        assert_eq!(assembly.matches("SPLIT30 R4, R5").count(), 6);
     }
 
     #[test]

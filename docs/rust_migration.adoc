@@ -33,5 +33,8 @@ cargo run --locked --bin sc16build -- build-programs
 cargo run --locked --bin sc16build -- install-programs
 ----
 
-The all-program commands currently process SisuOS only. Other catalog programs
-are archived because they depend on retired hardware interfaces.
+The all-program commands discover every current program manifest. Each package
+declares its executable sources and any runtime asset directory; installation
+preserves unrelated disk files and honors the optional +install_disk+ setting.
+Guest sources that reference retired interfaces remain compiler errors until
+they are migrated.

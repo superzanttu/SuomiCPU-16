@@ -150,6 +150,23 @@ impl Scheduler {
         }
         Ok(())
     }
+
+    pub fn terminate(&mut self, id: TaskId, exit_code: i32) -> Result<(), SchedulerError> {
+        if self.current == Some(id) {
+            return Err(SchedulerError::TaskNotRunnable(id));
+        }
+        let task = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id)
+            .ok_or(SchedulerError::TaskNotFound(id))?;
+        if task.state == TaskState::Exited {
+            return Err(SchedulerError::TaskNotRunnable(id));
+        }
+        task.state = TaskState::Exited;
+        task.exit_code = Some(exit_code);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +225,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next.id, first);
+    }
+
+    #[test]
+    fn scheduler_terminates_runnable_or_blocked_noncurrent_tasks() {
+        let mut scheduler = Scheduler::default();
+        let first = scheduler.create_task(user_context(0x100)).unwrap();
+        let second = scheduler.create_task(user_context(0x200)).unwrap();
+        let third = scheduler.create_task(user_context(0x300)).unwrap();
+        let current = scheduler.activate(first).unwrap();
+        scheduler.reschedule(current, TaskState::Blocked).unwrap();
+
+        assert_eq!(
+            scheduler.terminate(second, 9),
+            Err(SchedulerError::TaskNotRunnable(second))
+        );
+        assert_eq!(scheduler.terminate(first, 137), Ok(()));
+        assert_eq!(scheduler.terminate(third, 7), Ok(()));
+        assert_eq!(scheduler.task(first).unwrap().state, TaskState::Exited);
+        assert_eq!(scheduler.task(first).unwrap().exit_code, Some(137));
+        assert_eq!(scheduler.task(third).unwrap().state, TaskState::Exited);
+        assert_eq!(scheduler.task(third).unwrap().exit_code, Some(7));
+        assert_eq!(
+            scheduler.terminate(first, 0),
+            Err(SchedulerError::TaskNotRunnable(first))
+        );
     }
 }

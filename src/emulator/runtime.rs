@@ -2879,7 +2879,21 @@ mod tests {
     }
 
     #[test]
-    fn sisu_os_boots_from_bios_and_runs_preemptive_shell_commands() {
+    fn sisu_os_boots_saunashell_and_runs_installed_guest_programs() {
+        fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+            fs::create_dir_all(destination)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                let target = destination.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_tree(&entry.path(), &target)?;
+                } else if entry.file_type()?.is_file() {
+                    fs::copy(entry.path(), target)?;
+                }
+            }
+            Ok(())
+        }
+
         let root = std::env::temp_dir().join(format!(
             "sc16-sisu-os-{}-{}",
             std::process::id(),
@@ -2906,60 +2920,56 @@ mod tests {
             .to_str()
             .unwrap()
             .to_owned();
-        let kernel_source = repository
-            .join("programs")
-            .join("sisuos")
-            .join("src")
-            .join("preemptive_os_kernel.asm");
-        let shell_source = repository
-            .join("programs")
-            .join("sisuos")
-            .join("src")
-            .join("preemptive_os_shell.c");
-        let demo_source = repository
-            .join("programs")
-            .join("sisuos")
-            .join("src")
-            .join("preemptive_os_demo.c");
+        let source_root = repository.join("programs").join("sisuos").join("src");
+        let kernel_source = source_root.join("preemptive_os_kernel.asm");
+        let init_source = source_root.join("init.c");
         let kernel =
-            crate::image::build_kernel_with_embedded_c_source(&kernel_source, &shell_source)
+            crate::image::build_kernel_with_embedded_c_source(&kernel_source, &init_source)
                 .unwrap();
-        let demo = crate::image::build_c_program_at(&demo_source, 0x30000).unwrap();
         assert_eq!(
             crate::image::read_image(&checked_in_disk.join("kernel.bin")).unwrap(),
             kernel,
-            "checked-in kernel image is stale; run programs\\sisuos\\tools\\build.ps1"
+            "checked-in kernel image is stale; run scripts\\build-install.ps1 sisuos"
         );
-        assert_eq!(
-            crate::image::read_image(&checked_in_disk.join("demo.bin")).unwrap(),
-            demo,
-            "checked-in C demo image is stale; run programs\\sisuos\\tools\\build.ps1"
-        );
+        for (name, source) in [
+            ("sauna.bin", "sauna.c"),
+            ("daemon.bin", "daemon.c"),
+            ("sleeper.bin", "sleeper.c"),
+        ] {
+            let image =
+                crate::image::build_c_program_at(&source_root.join(source), 0x30000).unwrap();
+            assert_eq!(
+                crate::image::read_image(&checked_in_disk.join("bin").join(name)).unwrap(),
+                image,
+                "checked-in {name} is stale; run scripts\\build-install.ps1 sisuos"
+            );
+        }
         let manifest = crate::disk::FolderDisk::open(&checked_in_disk).unwrap();
         assert_eq!(manifest.manifest().id, boot_disk_id);
         assert_eq!(manifest.manifest().label, "SisuOS");
         assert_eq!(
             manifest.manifest().protected_files,
-            ["kernel.bin", "demo.bin"]
+            [
+                "kernel.bin",
+                "bin/sauna.bin",
+                "bin/daemon.bin",
+                "bin/sleeper.bin"
+            ]
         );
         for entry in fs::read_dir(repository.join("disks")).unwrap() {
             let source_disk = entry.unwrap().path();
             if !source_disk.is_dir() {
                 continue;
             }
-            let target_disk = disks.join(source_disk.file_name().unwrap());
-            fs::create_dir_all(&target_disk).unwrap();
-            for file in fs::read_dir(source_disk).unwrap() {
-                let source_file = file.unwrap().path();
-                if source_file.is_file() {
-                    fs::copy(
-                        &source_file,
-                        target_disk.join(source_file.file_name().unwrap()),
-                    )
-                    .unwrap();
-                }
-            }
+            copy_tree(&source_disk, &disks.join(source_disk.file_name().unwrap())).unwrap();
         }
+        let test_sisuos_disk = disks.join(&boot_disk_id);
+        fs::write(
+            test_sisuos_disk.join("user-note.txt"),
+            b"retained user data",
+        )
+        .unwrap();
+        fs::create_dir(test_sisuos_disk.join("data")).unwrap();
         let firmware =
             crate::assembler::assemble_file(&repository.join("firmware").join("bios.asm"), 0)
                 .unwrap();
@@ -2975,7 +2985,7 @@ mod tests {
         )
         .unwrap();
         let mut settings = crate::bios_settings::BiosSettings::default();
-        settings.preferred_disk = Some(boot_disk_id);
+        settings.preferred_disk = Some(boot_disk_id.clone());
         settings
             .save(&root.join("config").join("bios.json"))
             .unwrap();
@@ -3008,65 +3018,248 @@ mod tests {
         assert_eq!(
             cpu.privilege_mode,
             PrivilegeMode::User,
-            "SisuOS did not enter user mode: PC={:#x}, status={}, running={}, logs={:?}, screen={}",
+            "SisuOS did not enter user mode: PC={:#x}, status={}, running={}, logs={:?}",
             cpu.pc,
             firmware_status,
             cpu.running,
-            cpu.debug_console.text_snapshot(),
-            cpu.guest_text
-                .cells
-                .iter()
-                .map(|cell| char::from(cell.character))
-                .collect::<String>()
+            cpu.debug_console.text_snapshot()
         );
         update_rtc(&mut cpu);
         cpu.run(1000).unwrap();
         assert!(cpu.running, "SisuOS stopped after the RTC interrupt");
-        let long_command = "x".repeat(80);
-        for (index, command) in [
+
+        cpu.test_monotonic_ms = Some(1000);
+        cpu.receive_console_input(b"sisu-test-password\nsisu-test-password\n");
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            if let Err(error) = run_instruction_slice(&mut cpu, &mut budget) {
+                panic!(
+                    "{}",
+                    runtime_cpu_failure_details(&cpu, None, Some(&checked_in_disk), &error)
+                );
+            }
+        }
+        for command in [
             "help",
             "list",
+            "list bin",
+            "mkdir data/newdir",
+            "list data",
+            "groupadd staff",
+            "useradd alice staff",
+            "touch user-created.txt",
+            "append append-note.txt \"first line\"",
+            "append append-note.txt \"second line\"",
+            "cat append-note.txt",
+            "chmod 600 append-note.txt",
+            "chown append-note.txt alice staff",
+            "mv append-note.txt archive-note.txt",
+            "cat user-note.txt",
+            "list",
+            "chmod 600 user-created.txt",
+            "chown user-created.txt alice staff",
+            "mv user-created.txt user-renamed.txt",
+            "rm user-renamed.txt",
             "info",
-            "run demo",
+            "run daemon &",
+            "ps",
+            "top",
+            "kill 2",
+            "run missing",
             "unknown",
-            long_command.as_str(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if index == 0 {
-                cpu.receive_console_input(b"\x1b[A");
-                receive_typed_text(&mut cpu, "helpx".chars());
-                receive_terminal_key(&mut cpu, KeyCode::Backspace);
-            } else {
-                receive_typed_text(&mut cpu, command.chars());
-            }
+            "x",
+        ] {
+            receive_typed_text(&mut cpu, command.chars());
             receive_terminal_key(&mut cpu, KeyCode::Enter);
+            let mut executed = 0;
+            while executed < 100_000 {
+                cpu.begin_frame();
+                let mut budget = 5_000;
+                match run_instruction_slice(&mut cpu, &mut budget) {
+                    Ok(frame_executed) => executed += frame_executed,
+                    Err(error) => panic!(
+                        "{}",
+                        runtime_cpu_failure_details(&cpu, None, Some(&checked_in_disk), &error)
+                    ),
+                }
+            }
         }
-        cpu.run(500_000).unwrap();
+        receive_typed_text(&mut cpu, "edit editor.txt".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        cpu.receive_console_input(b"line from editor\n.\n");
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, "cat editor.txt".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, "passwd alice".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        cpu.receive_console_input(b"sisu-user-password\nsisu-user-password\n");
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, std::iter::repeat_n('x', 200));
+        for _ in 0..10 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, std::iter::repeat_n('x', 56));
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, "logout".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        cpu.receive_console_input(b"alice\nsisu-user-password\n");
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        for command in [
+            "cat archive-note.txt",
+            "append archive-note.txt \"third line\"",
+            "logout",
+        ] {
+            receive_typed_text(&mut cpu, command.chars());
+            receive_terminal_key(&mut cpu, KeyCode::Enter);
+            for _ in 0..100 {
+                cpu.begin_frame();
+                let mut budget = 5_000;
+                run_instruction_slice(&mut cpu, &mut budget).unwrap();
+            }
+        }
+        cpu.receive_console_input(b"root\nsisu-test-password\n");
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
 
         let output = String::from_utf8_lossy(cpu.console.output()).into_owned();
+        assert!(
+            output.matches("SaunaShell - SisuOS").count() >= 3,
+            "logout did not return to a fresh shell: {output}"
+        );
+        let accounting_output = output
+            .split_once("PID INSTRUCTIONS_SINCE_START\n")
+            .expect("top command did not print its accounting header")
+            .1;
+        let daemon_accounting = accounting_output
+            .lines()
+            .find_map(|line| {
+                let (pid, instructions) = line.split_once(' ')?;
+                (pid == "2")
+                    .then(|| instructions.parse::<u64>().ok())
+                    .flatten()
+            })
+            .expect("top command did not report the daemon's instruction count");
+        assert!(
+            daemon_accounting > 0,
+            "daemon instruction accounting did not advance"
+        );
+        let account_disk = FolderDisk::open(&disks.join(&boot_disk_id)).unwrap();
+        let accounts = crate::accounts::AccountStore::load(&account_disk).unwrap();
+        assert_eq!(
+            fs::read_to_string(test_sisuos_disk.join("editor.txt")).unwrap(),
+            "line from editor\n"
+        );
+        assert_eq!(
+            fs::read_to_string(test_sisuos_disk.join("archive-note.txt")).unwrap(),
+            "first line\nsecond line\nthird line\n",
+            "alice session did not append to the file: {output}"
+        );
+        assert!(
+            !test_sisuos_disk.join("user-created.txt").exists(),
+            "rm command did not remove the file"
+        );
+        assert!(
+            !accounts.file_permissions().iter().any(|permission| {
+                permission.path == "user-created.txt" || permission.path == "user-renamed.txt"
+            }),
+            "rm command left stale file permissions"
+        );
+        let archive_permission = accounts
+            .file_permissions()
+            .iter()
+            .find(|permission| permission.path == "archive-note.txt")
+            .expect("renamed file permission should follow the file");
+        assert_eq!(archive_permission.uid, accounts.user("alice").unwrap().uid);
+        assert_eq!(archive_permission.gid, accounts.group("staff").unwrap().gid);
+        assert_eq!(archive_permission.mode, 0o600);
+        assert!(
+            accounts
+                .authenticate("alice", "sisu-user-password")
+                .is_some(),
+            "passwd command did not persist the account password: {output}; debug={:?}",
+            cpu.debug_console.text_snapshot()
+        );
+        assert!(
+            accounts
+                .authenticate("alice", "incorrect-password")
+                .is_none(),
+            "passwd command did not persist the account password"
+        );
         for expected in [
-            "SisuOS interactive shell",
-            "Type 'run demo' to see preemptive task switching.",
-            "Commands: help, list, run demo, info",
-            "Programs: demo",
-            "SisuOS | Protected mode | Syscall ABI 1 | Preemptive scheduler active",
-            "demo task ran",
-            "demo exited with status 7",
+            "SaunaShell - SisuOS",
+            "Commands: help, info, ps, top, kill PID, list [DIR], mkdir DIRECTORY, touch FILE, append FILE TEXT, cat FILE, edit FILE, rm FILE, mv SOURCE DESTINATION, chmod MODE FILE, chown FILE USER GROUP, run PROGRAM [args] [&], groupadd GROUP, useradd USER GROUP, passwd [USER], logout",
+            "data/",
+            "data/newdir/",
+            "user-note.txt",
+            "user-created.txt",
+            "File ready.",
+            "Text appended.",
+            "first line\nsecond line",
+            "File renamed.",
+            "retained user data",
+            "File saved.",
+            "line from editor",
+            "Mode changed.",
+            "Owner changed.",
+            "File deleted.",
+            "bin/daemon.bin",
+            "bin/sauna.bin",
+            "bin/sleeper.bin",
+            "Group created.",
+            "User created. Set its password with passwd.",
+            "Password changed.",
+            "first line\nsecond line",
+            "Started background process 2",
+            "daemon pid=2 started_ms=",
+            "PID PPID STATE PROGRAM",
+            "2 1 sleeping bin/daemon.bin",
+            "PID INSTRUCTIONS_SINCE_START",
+            "Process terminated.",
+            "Background process 2 exited with status 137",
+            "Unable to start program.",
             "Unknown command. Type help.",
-            "Command too long (79 characters maximum)",
+            "Command too long (255 characters maximum).",
         ] {
             assert!(
                 output.contains(expected),
-                "missing {expected:?}; output={output}; PC={:#x}, running={}, privilege={:?}, fault={:?}, mappings={:02x?}/{:02x?}/{:02x?}, logs={:?}, screen={:?}",
+                "missing {expected:?}; output={output}; PC={:#x}, running={}, privilege={:?}, fault={:?}, logs={:?}, screen={:?}",
                 cpu.pc,
                 cpu.running,
                 cpu.privilege_mode,
                 cpu.last_page_fault(),
-                &cpu.memory[0x3040..0x3044],
-                &cpu.memory[0x3050..0x3054],
-                &cpu.memory[0x3240..0x3244],
                 cpu.debug_console.text_snapshot(),
                 cpu.console.text_snapshot()
             );
@@ -3076,134 +3269,13 @@ mod tests {
             4,
             "SisuOS kernel did not program the high-address PIT bank"
         );
-        let screen = cpu.console.text_snapshot().join("\n");
         assert!(cpu.terminal_active);
         assert!(cpu.terminal_dirty);
-        assert!(screen.contains("SisuOS interactive shell"), "{screen}");
-        assert!(
-            screen.contains("Commands: help, list, run demo, info"),
-            "{screen}"
-        );
-        assert!(
-            !screen.contains("[INFO]") && !screen.contains("[DEBUG]"),
-            "debug messages leaked into the guest console: {screen}"
-        );
-        assert!(
-            !String::from_utf8_lossy(&cpu.debug_console.output())
-                .contains("SisuOS interactive shell"),
-            "guest console output leaked into Bug Monitor"
-        );
-        let child_progress = output.find("demo task ran").unwrap();
-        let parent_wait = output.find("Waiting for demo...").unwrap();
-        assert!(
-            child_progress < parent_wait,
-            "child did not progress while the parent was runnable: {output}"
-        );
-        assert_eq!(cpu.current_task(), Some(0));
-        assert_eq!(
-            cpu.task_context(0).unwrap().state,
-            crate::scheduler::TaskState::Running
-        );
-        assert_eq!(
-            cpu.task_context(1).unwrap().state,
-            crate::scheduler::TaskState::Exited
-        );
-        assert_eq!(cpu.task_context(1).unwrap().exit_code, Some(7));
-        assert_eq!(cpu.read_u16(crate::machine::INTERRUPT_PIT_PERIOD), 4);
         assert!(cpu.is_mmu_enabled());
-
-        cpu.test_monotonic_ms = Some(1000);
-        for command in ["run demo 2", "run demo 3", "ps", "help"] {
-            receive_typed_text(&mut cpu, command.chars());
-            receive_terminal_key(&mut cpu, KeyCode::Enter);
-        }
-        cpu.run(500_000).unwrap();
-        let output = String::from_utf8_lossy(cpu.console.output()).into_owned();
-        assert!(output.contains("Started background process 2"), "{output}");
-        assert!(output.contains("Started background process 3"), "{output}");
-        assert!(
-            output.contains("PID PPID STATE PROGRAM\n0 - running sisuos\n"),
-            "{output}"
-        );
-        assert!(output.contains("2 0 sleeping demo.bin\n"), "{output}");
-        assert!(output.contains("3 0 sleeping demo.bin\n"), "{output}");
-        assert!(
-            output.contains("running=on CPU, ready=waiting for CPU\n"),
-            "{output}"
-        );
         assert_eq!(
             cpu.task_context(2).unwrap().state,
-            crate::scheduler::TaskState::Blocked
+            crate::scheduler::TaskState::Exited
         );
-        assert_eq!(
-            cpu.task_context(3).unwrap().state,
-            crate::scheduler::TaskState::Blocked
-        );
-        assert!(!output.contains("BGP "), "{output}");
-        assert!(output.ends_with("sc16> "), "{output}");
-
-        cpu.test_monotonic_ms = Some(1999);
-        cpu.run(100_000).unwrap();
-        assert!(!String::from_utf8_lossy(cpu.console.output()).contains("BGP "));
-        for second in 1..=3 {
-            cpu.test_monotonic_ms = Some(1000 + second * 1000);
-            cpu.run(200_000).unwrap();
-            let output = String::from_utf8_lossy(cpu.console.output());
-            for pid in [2, 3] {
-                let duration = pid;
-                if second <= duration {
-                    let line = format!("BGP {pid} time {second}/{duration}\n");
-                    assert_eq!(output.matches(&line).count(), 1, "{output}");
-                }
-            }
-        }
-        for pid in [2, 3] {
-            assert_eq!(cpu.task_context(pid).unwrap().exit_code, Some(0));
-        }
-        assert_eq!(
-            String::from_utf8_lossy(cpu.console.output())
-                .matches("BGP ")
-                .count(),
-            5
-        );
-        let start = cpu.console.output().len();
-        for command in [
-            "ps",
-            "run demo 0",
-            "run demo -1",
-            "run demo 65536",
-            "run demo 2x",
-        ] {
-            receive_typed_text(&mut cpu, command.chars());
-            receive_terminal_key(&mut cpu, KeyCode::Enter);
-        }
-        cpu.run(300_000).unwrap();
-        let output = String::from_utf8_lossy(&cpu.console.output()[start..]);
-        assert!(
-            output.contains("PID PPID STATE PROGRAM\n0 - running sisuos\n"),
-            "{output}"
-        );
-        assert!(
-            !output.contains("2 0 ") && !output.contains("3 0 "),
-            "{output}"
-        );
-        assert_eq!(output.matches("Usage: run demo X").count(), 4, "{output}");
-        cpu.test_monotonic_ms = Some((1 << 30) - 500);
-        receive_typed_text(&mut cpu, "run demo 1".chars());
-        receive_terminal_key(&mut cpu, KeyCode::Enter);
-        cpu.run(150_000).unwrap();
-        cpu.test_monotonic_ms = Some(499);
-        cpu.run(100_000).unwrap();
-        assert!(!String::from_utf8_lossy(cpu.console.output()).contains("BGP 4"));
-        cpu.test_monotonic_ms = Some(500);
-        cpu.run(150_000).unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(cpu.console.output())
-                .matches("BGP 4 time 1/1\n")
-                .count(),
-            1
-        );
-        assert_eq!(cpu.task_context(4).unwrap().exit_code, Some(0));
         fs::remove_dir_all(root).unwrap();
     }
 

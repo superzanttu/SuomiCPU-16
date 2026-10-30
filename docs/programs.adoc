@@ -19,14 +19,9 @@ editable source artwork may live separately in +assets/gfx/+.
 Tank-16's Rust tools remain Cargo binaries in the same package.
 
 SisuOS is an ordinary catalog entry under +programs/sisuos/+, not an emulator
-component. Its C shell, C child demo, assembly bootstrap, and build wrapper are
-all there. Educational +examples/+ are fixtures, not installed programs;
+component. Its C shell, C child demo, and assembly bootstrap are declared in
+its manifest. Educational +examples/+ are fixtures, not installed programs;
 tests may compile and execute them.
-
-SisuOS is the only supported guest workload verified against the current
-hardware interfaces. Other catalog sources remain untouched and may reference
-retired graphics or device headers. They are archived and excluded from
-build/install commands.
 
 == BIOS, program, and disk workflows
 
@@ -38,6 +33,8 @@ is assembled separately from guest programs:
 cargo run --bin sc16build -- build-bios
 cargo run --bin sc16build -- build-program sisuos
 cargo run --bin sc16build -- install-program sisuos
+.\scripts\build-install.ps1 sisuos
+.\scripts\build-install.ps1 tank-16 -Start
 ----
 
 +build-bios+ assembles +firmware/bios.asm+ into +firmware/bios.bin+ by default.
@@ -63,11 +60,15 @@ Built sisuos -> <repository>/build/programs/sisuos
 Installed sisuos -> <repository>/disks/sisuos
 ----
 
-+install-program+ builds first, then safely installs the package into
-+disks/sisuos/+. It preserves unrelated writable disk files and settings,
-updates unchanged package-owned files, and reports conflicts instead of
-overwriting modified package-owned files. The all-program commands currently
-process SisuOS only; archived catalog entries are not build targets.
++install-program+ builds first, then safely installs the package into its
+configured +install_disk+ (or +disks/<slug>/+ when that optional field is
+omitted). It preserves unrelated writable disk files and settings, updates
+unchanged package-owned files, and reports conflicts instead of overwriting
+modified package-owned files. The backend accepts all current program
+manifests, and packages compatible sources together with their declared
++assets+ trees. Some older guest sources still include removed graphics or
+disk headers, so their builds fail with an explicit compiler diagnostic until
+those programs are migrated to current interfaces.
 
 To open the BIOS selector and preselect SisuOS:
 
@@ -106,23 +107,19 @@ manifest and boot behavior.
 
 == Helper scripts and command-line reference
 
-The repository-root PowerShell wrapper builds all supported guest packages by
-default (currently SisuOS only). Pass a slug to build or install one package:
+The repository-root PowerShell wrapper builds and installs one selected
+manifest package. Use +-Start+ to launch its configured installed disk after a
+successful install:
 
 [source,powershell]
 ----
-.\scripts\build-programs.ps1
-.\scripts\build-programs.ps1 sisuos
-.\scripts\build-programs.ps1 sisuos -Install
-.\programs\sisuos\tools\build.ps1 -Install
+.\scripts\build-install.ps1 sisuos
+.\scripts\build-install.ps1 tank-16 -Start
 ----
 
-+scripts/build-programs.ps1+ accepts an optional program slug and +-Install+.
-Without a slug it invokes the all-program build/install command. The SisuOS
-wrapper, +programs/sisuos/tools/build.ps1+, builds SisuOS by default and
-installs it when +-Install+ is supplied. Successful build output identifies
-+build/programs/sisuos/+; install output identifies the destination under
-+disks/+.
++scripts/build-install.ps1+ calls the shared Rust +install-program+ command;
+it does not invoke program-specific build scripts. The backend builds into
++build/programs/<slug>/+ and safely installs into the configured disk folder.
 
 Use +sc16build --help+ to list the supported offline commands, including
 +build-bios+, +build-program+, +install-program+, +build-programs+,
@@ -152,6 +149,7 @@ defined in link:sc16_architecture.adoc[SC-16 architecture].
   "version": 1,
   "slug": "sample",
   "name": "Sample",
+  "install_disk": "sample-disk",
   "capacity_bytes": 67108864,
   "boot": {
     "source": "src/main.c",
@@ -162,10 +160,13 @@ defined in link:sc16_architecture.adoc[SC-16 architecture].
 }
 ----
 
-The slug must match the directory name. Program slugs use lowercase ASCII
-letters, digits, and hyphens; they begin with a letter/digit and do not end in a
-hyphen. Disk IDs allow 1-32 ASCII letters/digits, underscores, and hyphens;
-Windows device names and case-insensitive collisions are rejected.
+The slug must match the directory name. +install_disk+ is optional; when
+omitted, the slug is used. It must be a valid, unique disk ID and cannot
+conflict with another package's slug or legacy disk ID. Program slugs use
+lowercase ASCII letters, digits, and hyphens; they begin with a letter/digit
+and do not end in a hyphen. Disk IDs allow 1-32 ASCII letters/digits,
+underscores, and hyphens; Windows device names and case-insensitive collisions
+are rejected.
 Human display names are separate from IDs.
 
 The boot output is +main.bin+ for USER mode or +kernel.bin+ for KERNEL mode.
@@ -173,7 +174,11 @@ For embedded C user code in an assembly kernel, specify +embedded_c+ beside
 +source+, as SisuOS does. Additional +executables+ entries specify +source+,
 +output+, and optionally an integer relocation +base+. Sources, seed paths,
 and output names are validated; directory traversal and symlinks are rejected.
-+assets+ may be +null+. Each executable is installed as a protected file.
++assets+ may be +null+. Otherwise, every regular file in its declared directory
+tree is included at that relative path in the built and installed disk. Put
+runtime data in this tree; source, documentation, and build tools are not
+copied unless explicitly declared as runtime assets. Each executable is
+installed as a protected file.
 
 == Safe updates
 
@@ -210,9 +215,10 @@ cargo run --bin sc16build -- migrate-program-disks --apply
 ----
 
 The explicit +legacy_disk+ mapping renames +APP00001+ through +APP00017+
-to their program slugs and +SisuOS-1+ to +sisuos+. It also updates manifest IDs
-and the preferred disk in +config/bios.json+, preserving other settings and disk
-contents. +DISK0001+ and +DISK0002+ are data disks and stay unchanged.
+and +SisuOS-1+ to each package's configured +install_disk+ (or slug). It also
+updates manifest IDs and the preferred disk in +config/bios.json+, preserving
+other settings and disk contents. +DISK0001+ and +DISK0002+ are data disks and
+stay unchanged.
 Both old and new paths existing is an error: migration never merges them.
 Dry-run changes nothing. Apply creates a migration journal; rerun apply to
 resume after an interrupted rename. No aliases are installed for obsolete

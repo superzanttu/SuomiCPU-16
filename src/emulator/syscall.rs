@@ -50,6 +50,21 @@ pub enum SyscallNumber {
     Argument = 23,
     Graphics = 24,
     InputSnapshot = 25,
+    AccountStatus = 26,
+    InitializeRootPassword = 27,
+    Authenticate = 28,
+    SetConsoleEcho = 29,
+    AddGroup = 30,
+    AddUser = 31,
+    SetPassword = 32,
+    DirectoryEntry = 33,
+    MakeDirectory = 34,
+    DeleteFile = 35,
+    SetFileMode = 36,
+    SetFileOwner = 37,
+    Kill = 38,
+    RenameFile = 39,
+    ProcessAccounting = 40,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -83,6 +98,21 @@ impl TryFrom<i64> for SyscallNumber {
             23 => Ok(Self::Argument),
             24 => Ok(Self::Graphics),
             25 => Ok(Self::InputSnapshot),
+            26 => Ok(Self::AccountStatus),
+            27 => Ok(Self::InitializeRootPassword),
+            28 => Ok(Self::Authenticate),
+            29 => Ok(Self::SetConsoleEcho),
+            30 => Ok(Self::AddGroup),
+            31 => Ok(Self::AddUser),
+            32 => Ok(Self::SetPassword),
+            33 => Ok(Self::DirectoryEntry),
+            34 => Ok(Self::MakeDirectory),
+            35 => Ok(Self::DeleteFile),
+            36 => Ok(Self::SetFileMode),
+            37 => Ok(Self::SetFileOwner),
+            38 => Ok(Self::Kill),
+            39 => Ok(Self::RenameFile),
+            40 => Ok(Self::ProcessAccounting),
             _ => Err(()),
         }
     }
@@ -133,11 +163,21 @@ pub(crate) struct ProcessRecord {
     pub name: String,
     pub arguments: Vec<String>,
     pub startup_argument: u32,
+    pub credentials: Option<ProcessCredentials>,
+    pub bootstrap_authority: bool,
     pub parent: Option<TaskId>,
     pub children: Vec<TaskId>,
     pub exit_code: Option<i32>,
     pub waiters: VecDeque<TaskId>,
     pub next_mmap: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessCredentials {
+    pub uid: u32,
+    pub primary_gid: u32,
+    pub supplementary_gids: Vec<u32>,
+    pub home: String,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +191,7 @@ pub(crate) struct Semaphore {
 pub(crate) struct KernelState {
     pub ticks: u64,
     pub processes: HashMap<TaskId, ProcessRecord>,
+    pub process_instructions: HashMap<TaskId, u64>,
     pub open_files: HashMap<TaskId, HashMap<u32, OpenFile>>,
     pub sleeping: HashMap<TaskId, u64>,
     pub sleeping_millis: HashMap<TaskId, (u32, u32)>,
@@ -181,6 +222,7 @@ pub(crate) fn decode_arguments(bytes: &[u8], count: usize) -> Result<Vec<String>
 
 impl KernelState {
     pub fn register_process(&mut self, id: TaskId, parent: Option<TaskId>) {
+        self.process_instructions.entry(id).or_default();
         self.processes.entry(id).or_insert_with(|| ProcessRecord {
             parent,
             next_mmap: 0x2000_0000,
@@ -248,7 +290,40 @@ mod tests {
             SyscallNumber::try_from(25),
             Ok(SyscallNumber::InputSnapshot)
         );
-        assert_eq!(SyscallNumber::try_from(26), Err(()));
+        assert_eq!(
+            SyscallNumber::try_from(26),
+            Ok(SyscallNumber::AccountStatus)
+        );
+        assert_eq!(
+            SyscallNumber::try_from(27),
+            Ok(SyscallNumber::InitializeRootPassword)
+        );
+        assert_eq!(SyscallNumber::try_from(28), Ok(SyscallNumber::Authenticate));
+        assert_eq!(
+            SyscallNumber::try_from(29),
+            Ok(SyscallNumber::SetConsoleEcho)
+        );
+        assert_eq!(SyscallNumber::try_from(30), Ok(SyscallNumber::AddGroup));
+        assert_eq!(SyscallNumber::try_from(31), Ok(SyscallNumber::AddUser));
+        assert_eq!(SyscallNumber::try_from(32), Ok(SyscallNumber::SetPassword));
+        assert_eq!(
+            SyscallNumber::try_from(33),
+            Ok(SyscallNumber::DirectoryEntry)
+        );
+        assert_eq!(
+            SyscallNumber::try_from(34),
+            Ok(SyscallNumber::MakeDirectory)
+        );
+        assert_eq!(SyscallNumber::try_from(35), Ok(SyscallNumber::DeleteFile));
+        assert_eq!(SyscallNumber::try_from(36), Ok(SyscallNumber::SetFileMode));
+        assert_eq!(SyscallNumber::try_from(37), Ok(SyscallNumber::SetFileOwner));
+        assert_eq!(SyscallNumber::try_from(38), Ok(SyscallNumber::Kill));
+        assert_eq!(SyscallNumber::try_from(39), Ok(SyscallNumber::RenameFile));
+        assert_eq!(
+            SyscallNumber::try_from(40),
+            Ok(SyscallNumber::ProcessAccounting)
+        );
+        assert_eq!(SyscallNumber::try_from(41), Err(()));
     }
 
     #[test]

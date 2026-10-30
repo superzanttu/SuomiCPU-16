@@ -30,7 +30,7 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  volatile unsigned long *ram = (volatile unsigned long *)SC16_SYSTEM_RAM_BYTES;\n\
                  volatile unsigned long *bits = (volatile unsigned long *)SC16_SYSTEM_ADDRESS_BITS;\n\
                  volatile unsigned long *banks = (volatile unsigned long *)SC16_SYSTEM_BANKS;\n\
-                 if (*revision != 1UL) return 11;\n\
+                 if (*revision != 2UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
                  if (*banks != 4095UL) return 14;\n\
@@ -51,16 +51,20 @@ fn guest_c_draws_through_the_high_graphics_bank() {
              volatile unsigned char *operation = (volatile unsigned char *)SC16_GRAPHICS_OPERATION;\n\
              volatile unsigned char *color = (volatile unsigned char *)SC16_GRAPHICS_COLOR;\n\
              volatile unsigned char *mode = (volatile unsigned char *)SC16_GRAPHICS_MODE;\n\
-             volatile unsigned int *x = (volatile unsigned int *)SC16_GRAPHICS_X;\n\
-             volatile unsigned int *y = (volatile unsigned int *)SC16_GRAPHICS_Y;\n\
+             volatile unsigned char *x_high = (volatile unsigned char *)SC16_GRAPHICS_X;\n\
+             volatile unsigned char *x_low = (volatile unsigned char *)(SC16_GRAPHICS_X + 1UL);\n\
+             volatile unsigned char *y_high = (volatile unsigned char *)SC16_GRAPHICS_Y;\n\
+             volatile unsigned char *y_low = (volatile unsigned char *)(SC16_GRAPHICS_Y + 1UL);\n\
              volatile unsigned int *result = (volatile unsigned int *)SC16_GRAPHICS_RESULT;\n\
              *operation = SC16_GRAPHICS_OP_PIXEL;\n\
-             *color = 23; *x = 5; *y = 7; *command = 1;\n\
+             *color = 23; *x_high = 0; *x_low = 5; *y_high = 0; *y_low = 7; *command = 1;\n\
              if (*status != 0 || *result != 1) return 11;\n\
              *operation = SC16_GRAPHICS_OP_MODE; *mode = 1; *command = 1;\n\
              if (*status != 0) return 12;\n\
              *mode = 0; *command = 1;\n\
-             *x = 319; *y = 239; *operation = SC16_GRAPHICS_OP_RECT;\n\
+             *operation = SC16_GRAPHICS_OP_PIXEL; *color = 23;\n\
+             *x_high = 0; *x_low = 5; *y_high = 0; *y_low = 7; *command = 1;\n\
+             *x_high = 1; *x_low = 63; *y_high = 0; *y_low = 239; *operation = SC16_GRAPHICS_OP_RECT;\n\
              *color = 99; *command = 1;\n\
              if (*status != SC16_GRAPHICS_STATUS_INVALID_REQUEST || *result != 0) return 13;\n\
              return 1;\n\
@@ -702,6 +706,24 @@ fn c90_binary64_runtime_arithmetic_conversions_and_calls() {
 }
 
 #[test]
+fn c90_long_double_uses_binary64_runtime_and_call_abi() {
+    let source = "long double scale(long double value) { return value * 2.0L; } \
+                 int main(void) { long double value = 1.25L; \
+                 long double result = scale(value); \
+                 unsigned char *bytes = (unsigned char *)&result; \
+                 if (sizeof(long double) != 8 || result != 2.5L) return 11; \
+                 if (bytes[0] != 0x40 || bytes[1] != 0x04 || \
+                     bytes[2] != 0 || bytes[3] != 0 || bytes[4] != 0 || \
+                     bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0) return 12; \
+                 return 0; }";
+    assert_eq!(
+        run_c(source),
+        0,
+        "long double uses binary64 arithmetic, object representation, and calls"
+    );
+}
+
+#[test]
 fn c90_binary32_and_binary64_convert_32_bit_integer_values() {
     let source = "float observed; \
                  int main(void) { long signed_value = 65536L; \
@@ -716,6 +738,127 @@ fn c90_binary32_and_binary64_convert_32_bit_integer_values() {
                  if (unsigned_single != 131072.0f) return 30; \
                  if (unsigned_real != 131072.0) return 40; return 0; }";
     assert_eq!(run_c(source), 0, "32-bit integer to float conversions");
+}
+
+#[test]
+fn c90_floating_conversions_cover_defined_integer_boundaries() {
+    let source = "int main(void) { \
+                 long signed_minimum = -2147483647L - 1L; \
+                 unsigned long unsigned_maximum = 4294967295UL; \
+                 float rounded_signed = signed_minimum; \
+                 float rounded_unsigned = unsigned_maximum; \
+                 double exact_signed = signed_minimum; \
+                 double exact_unsigned = unsigned_maximum; \
+                 if (rounded_signed != -2147483648.0f) return 11; \
+                 if (rounded_unsigned != 4294967296.0f) return 12; \
+                 if (exact_signed != -2147483648.0) return 13; \
+                 if (exact_unsigned != 4294967295.0) return 14; \
+                 if ((long)-2147483520.75 != -2147483520L) return 21; \
+                 if ((unsigned long)4294967294.75 != 4294967294UL) return 22; \
+                 if ((int)-32767.75f != -32767) return 31; \
+                 if ((unsigned int)65534.75f != 65534U) return 32; \
+                 return 0; }";
+    assert_eq!(
+        run_c(source),
+        0,
+        "defined integer conversion boundaries and truncation"
+    );
+}
+
+#[test]
+fn c90_binary32_and_binary64_convert_between_precisions_at_runtime() {
+    let source = "int main(void) { \
+                 float single = 16777217.0; \
+                 double widened = (double)single; \
+                 double precise = 16777217.0; \
+                 float narrowed = (float)precise; \
+                 double mixed = single + 0.5; \
+                 unsigned char *single_bytes = (unsigned char *)&single; \
+                 unsigned char *widened_bytes = (unsigned char *)&widened; \
+                 double lower_halfway = 1.000000059604644775390625; \
+                 double upper_halfway = 1.000000178813934326171875; \
+                 float rounded_tie = (float)lower_halfway; \
+                 float rounded_upper_tie = (float)upper_halfway; \
+                 if (single != 16777216.0f) return 11; \
+                 if (single_bytes[0] != 0x4b || single_bytes[1] != 0x80 || \
+                     single_bytes[2] != 0 || single_bytes[3] != 0) return 18; \
+                 if (widened != 16777216.0) return 12; \
+                 if (widened_bytes[0] != 0x41) return 29; \
+                 if (widened_bytes[1] != 0x70) return 22; \
+                 if (widened_bytes[2] != 0) return 23; \
+                 if (widened_bytes[3] != 0) return 24; \
+                 if (widened_bytes[4] != 0) return 25; \
+                 if (widened_bytes[5] != 0) return 26; \
+                 if (widened_bytes[6] != 0) return 27; \
+                 if (widened_bytes[7] != 0) return 28; \
+                 if (narrowed != 16777216.0f) return 13; \
+                 if (mixed != 16777216.5) return 14; \
+                 if (rounded_tie != 1.0f) return 16; \
+                 if (rounded_upper_tie != 1.0000002384185791015625f) return 17; \
+                 single = (float)(precise + 0.75); \
+                 if (single != 16777218.0f) return 15; \
+                 if (single_bytes[0] != 0x4b || single_bytes[1] != 0x80 || \
+                     single_bytes[2] != 0 || single_bytes[3] != 1) return 20; \
+                 return 0; }";
+    assert_eq!(
+        run_c(source),
+        0,
+        "binary32/binary64 casts, assignment conversion, and mixed arithmetic"
+    );
+}
+
+#[test]
+fn c90_binary32_and_binary64_comparisons_follow_ieee_unordered_rules() {
+    let source = "int main(void) { \
+                 float single_nan = 0.0f / 0.0f; \
+                 float single_infinity = 1.0f / 0.0f; \
+                 double double_nan = 0.0 / 0.0; \
+                 double double_infinity = 1.0 / 0.0; \
+                 if (single_nan == single_nan) return 11; \
+                 if (!(single_nan != single_nan)) return 12; \
+                 if (single_nan < 0.0f || single_nan <= 0.0f || \
+                     single_nan > 0.0f || single_nan >= 0.0f) return 13; \
+                 if (!(single_infinity > 1.0f) || !(single_infinity >= 1.0f)) return 14; \
+                 if (!(double_nan != double_nan) || double_nan == double_nan) return 21; \
+                 if (double_nan < 0.0 || double_nan <= 0.0 || \
+                     double_nan > 0.0 || double_nan >= 0.0) return 22; \
+                 if (!(double_infinity > 1.0) || !(double_infinity >= 1.0)) return 23; \
+                 return 0; }";
+    assert_eq!(
+        run_c(source),
+        0,
+        "binary32 and binary64 unordered comparisons"
+    );
+}
+
+#[test]
+fn c90_binary32_and_binary64_ordered_comparisons_cover_all_operators() {
+    let source = "int main(void) { \
+                 float single_low = -2.0f; \
+                 float single_equal = 0.5f; \
+                 float single_high = 3.0f; \
+                 double double_low = -2.0; \
+                 double double_equal = 0.5; \
+                 double double_high = 3.0; \
+                 if (!(single_low < single_equal) || !(single_low <= single_low) || \
+                     !(single_equal <= single_high) || !(single_high > single_equal) || \
+                     !(single_high >= single_high) || !(single_equal >= single_low) || \
+                     single_low == single_high || !(single_low != single_high)) return 11; \
+                 if (!(double_low < double_equal) || !(double_low <= double_low) || \
+                     !(double_equal <= double_high) || !(double_high > double_equal) || \
+                     !(double_high >= double_high) || !(double_equal >= double_low) || \
+                     double_low == double_high || !(double_low != double_high)) return 21; \
+                 if (!(single_equal == double_equal) || single_equal != double_equal || \
+                     !(single_low + 3.0f > double_low) || \
+                     !(double_high - 2.5 >= single_equal)) return 31; \
+                 if ((single_low < single_high ? 1 : 0) != 1 || \
+                     (double_high < double_low ? 1 : 0) != 0) return 41; \
+                 return 0; }";
+    assert_eq!(
+        run_c(source),
+        0,
+        "all ordered comparison operators execute for both widths and mixed operands"
+    );
 }
 
 #[test]
