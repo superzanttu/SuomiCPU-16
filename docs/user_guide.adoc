@@ -1323,15 +1323,17 @@ The supervisor-only console device is in the high console bank:
 |===
 
 Guest console input and output use the main emulator display as an 80×25 text
-terminal. SisuOS standard output/error and privileged firmware console writes
-appear there; user tasks use the kernel's validated console services rather
-than direct MMIO. The retired +0x43200+ address is ordinary RAM. Keyboard input
-is echoed as the guest reads it. Carriage return, line feed,
+terminal. The emulator rasterizes its glyphs into the SC-16 GPU framebuffer
+using 8×16-pixel cells at 640×480, then presents that framebuffer through the
+normal GPU display path. SisuOS standard output/error and privileged firmware
+console writes appear there; user tasks use the kernel's validated console
+services rather than direct MMIO. The retired +0x43200+ address is ordinary
+RAM. Keyboard input is echoed as the guest reads it. Carriage return, line feed,
 backspace, tabs, wrapping, and scrolling are supported. The terminal also
 supports ANSI CSI cursor movement, cursor positioning, line/screen erase, and
 cursor save/restore sequences. A cursor marks the current insertion position.
-The guest's existing graphics display remains available until it writes to
-the console.
+Guest graphics are presented through the same GPU framebuffer until console
+output activates the text renderer.
 
 The optional *Bug Monitor* is separate from the guest terminal and displays
 emulator diagnostics only. Its *CLOSE MONITOR* button and F2 hide the monitor

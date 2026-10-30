@@ -622,7 +622,8 @@ pub async fn run_with_devices(
         };
         if capture_display {
             if cpu.terminal_active {
-                render_terminal(&cpu.console, &mut pixels, &font, cursor_phase);
+                render_terminal_to_gpu(&mut cpu, &font, cursor_phase)?;
+                render_gpu_framebuffer(&cpu, &mut pixels, &mut framebuffer);
                 presented_size = (640, 480);
                 cpu.terminal_dirty = false;
                 last_terminal_cursor_phase = cursor_phase;
@@ -1721,15 +1722,7 @@ fn render_cpu_with_framebuffer(
     framebuffer: &mut Vec<u8>,
 ) {
     let (width, height) = screen_size(cpu);
-    framebuffer.resize(width * height, 0);
-    cpu.composited_framebuffer_into(framebuffer);
-    for y in 0..height {
-        for x in 0..width {
-            let color = framebuffer[y * width + x];
-            let [red, green, blue] = cpu.palette_color(color);
-            pixels[y * width + x] = rgb(red, green, blue);
-        }
-    }
+    render_gpu_framebuffer(cpu, pixels, framebuffer);
     if cpu.guest_text.enabled {
         draw_guest_text(
             pixels,
@@ -1742,22 +1735,35 @@ fn render_cpu_with_framebuffer(
     }
 }
 
+fn render_gpu_framebuffer(cpu: &Cpu, pixels: &mut [u32], framebuffer: &mut Vec<u8>) {
+    let (width, height) = screen_size(cpu);
+    framebuffer.resize(width * height, 0);
+    cpu.composited_framebuffer_into(framebuffer);
+    for y in 0..height {
+        for x in 0..width {
+            let color = framebuffer[y * width + x];
+            let [red, green, blue] = cpu.palette_color(color);
+            pixels[y * width + x] = rgb(red, green, blue);
+        }
+    }
+}
+
 fn terminal_cursor_phase() -> bool {
     (macroquad::prelude::get_time() * 2.0) as u64 % 2 == 0
 }
 
-fn render_terminal(
-    console: &crate::console::ConsoleDevice,
-    pixels: &mut [u32],
+fn render_terminal_to_gpu(
+    cpu: &mut Cpu,
     font: &[[u8; 8]],
     cursor_phase: bool,
-) {
-    let width = 640;
-    let height = 480;
-    pixels[..width * height].fill(rgb(0, 0, 0));
-    let left = 8;
-    let top = 8;
-    for (row, line) in console.lines().enumerate() {
+) -> Result<(), RuntimeError> {
+    cpu.set_graphics_mode(1).map_err(|error| {
+        RuntimeError::Window(format!("cannot enable SC-16 text display: {error}"))
+    })?;
+    cpu.vram.fill(0);
+    let top = (480 - crate::console::ROWS * 16) / 2;
+    let lines = cpu.console.lines().cloned().collect::<Vec<_>>();
+    for (row, line) in lines.iter().enumerate() {
         for (column, byte) in line.iter().copied().enumerate() {
             if byte == b' ' {
                 continue;
@@ -1767,29 +1773,33 @@ fn render_terminal(
             } else {
                 b'?'
             };
-            draw_glyph_scaled(
-                pixels,
-                width,
-                (left + column * 6, top + row * 8),
-                character,
-                rgb(220, 220, 220),
-                font,
-                1,
-            );
+            let Some(glyph) = font.get(character.saturating_sub(32) as usize) else {
+                continue;
+            };
+            for (glyph_row, bits) in glyph.iter().copied().enumerate().take(7) {
+                for glyph_column in 0..5 {
+                    if bits & (0x80 >> glyph_column) != 0 {
+                        for vertical_scale in 0..2 {
+                            cpu.graphics_pixel(
+                                (column * 8 + 1 + glyph_column) as i32,
+                                (top + row * 16 + 1 + glyph_row * 2 + vertical_scale) as i32,
+                                1,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
-    if console.cursor_visible() && cursor_phase {
-        let (column, row) = console.cursor_position();
-        fill_rect(
-            pixels,
-            width,
-            left + column.min(crate::console::COLUMNS - 1) * 6,
-            top + row.min(crate::console::ROWS - 1) * 8 + 7,
-            5,
-            1,
-            rgb(220, 220, 220),
-        );
+    if cpu.console.cursor_visible() && cursor_phase {
+        let (column, row) = cpu.console.cursor_position();
+        let x = column.min(crate::console::COLUMNS - 1) * 8 + 1;
+        let y = top + row.min(crate::console::ROWS - 1) * 16 + 14;
+        for pixel_x in x..x + 6 {
+            cpu.graphics_pixel(pixel_x as i32, y as i32, 1);
+        }
     }
+    Ok(())
 }
 
 fn draw_guest_text(
@@ -2076,23 +2086,24 @@ mod tests {
             console.write_data(*byte);
         }
         let font = load_font();
-        let mut pixels = vec![rgb(255, 0, 0); 640 * 480];
-        render_terminal(&console, &mut pixels, &font, true);
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.console = console;
+        render_terminal_to_gpu(&mut cpu, &font, true).unwrap();
+        assert_eq!(cpu.graphics_mode(), 1);
+        let mut pixels = vec![0; 640 * 480];
+        let mut framebuffer = Vec::new();
+        render_gpu_framebuffer(&cpu, &mut pixels, &mut framebuffer);
 
         assert_eq!(pixels[0], rgb(0, 0, 0));
-        let left = 8;
-        let top = 8;
-        assert!(
-            pixels[top * 640 + left..top * 640 + left + 6]
-                .iter()
-                .any(|pixel| *pixel == rgb(220, 220, 220))
-        );
-        assert_eq!(pixels[(top + 7) * 640 + left + 5 * 6], rgb(220, 220, 220));
+        let top = (480 - crate::console::ROWS * 16) / 2;
+        assert!(pixels[top * 640..(top + 16) * 640].contains(&rgb(255, 255, 255)));
+        assert_eq!(pixels[(top + 14) * 640 + 41], rgb(255, 255, 255));
         for byte in b"\x1b[?25l" {
-            console.write_data(*byte);
+            cpu.console.write_data(*byte);
         }
-        render_terminal(&console, &mut pixels, &font, true);
-        assert_eq!(pixels[(top + 7) * 640 + left + 5 * 6], rgb(0, 0, 0));
+        render_terminal_to_gpu(&mut cpu, &font, true).unwrap();
+        render_gpu_framebuffer(&cpu, &mut pixels, &mut framebuffer);
+        assert_eq!(pixels[(top + 14) * 640 + 41], rgb(0, 0, 0));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -5488,7 +5488,7 @@ impl Cpu {
         self.palette[index as usize]
     }
 
-    fn graphics_pixel(&mut self, x: i32, y: i32, color: u8) {
+    pub(crate) fn graphics_pixel(&mut self, x: i32, y: i32, color: u8) {
         let (width, height) = self.screen_size();
         if x < 0 || y < 0 || x >= width || y >= height {
             return;
