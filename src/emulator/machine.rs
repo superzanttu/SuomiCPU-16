@@ -16,6 +16,7 @@ pub const FILESYSTEM_BASE: u32 = NETWORK_BASE + DEVICE_BANK_SIZE;
 pub const CONSOLE_BASE: u32 = FILESYSTEM_BASE + DEVICE_BANK_SIZE;
 pub const FIRMWARE_TEXT_BASE: u32 = CONSOLE_BASE + DEVICE_BANK_SIZE;
 pub const FIRMWARE_GATEWAY_BASE: u32 = FIRMWARE_TEXT_BASE + DEVICE_BANK_SIZE;
+pub const SERIAL_BASE: u32 = FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE;
 
 pub const SYSTEM_MACHINE_REVISION: u32 = SYSTEM_BASE;
 pub const SYSTEM_DEVICE_ABI: u32 = SYSTEM_BASE + 4;
@@ -105,6 +106,16 @@ pub const FIRMWARE_NETWORK_NAME: u32 = FIRMWARE_GATEWAY_BASE + 16;
 pub const FIRMWARE_SETTING: u32 = FIRMWARE_GATEWAY_BASE + 48;
 pub const FIRMWARE_OUTPUT: u32 = FIRMWARE_GATEWAY_BASE + 0x100;
 pub const FIRMWARE_REQUEST_BYTES: usize = 90;
+pub const SERIAL_DATA: u32 = SERIAL_BASE;
+pub const SERIAL_STATUS: u32 = SERIAL_BASE + 1;
+pub const SERIAL_CONTROL: u32 = SERIAL_BASE + 2;
+pub const SERIAL_RX_READY: u8 = 1;
+pub const SERIAL_TX_READY: u8 = 2;
+pub const SERIAL_RX_OVERRUN: u8 = 4;
+pub const SERIAL_TX_OVERRUN: u8 = 8;
+pub const SERIAL_RX_INTERRUPT_ENABLE: u8 = 1;
+pub const SERIAL_INTERRUPT_PENDING: u8 = 0x20;
+pub const SERIAL_FIFO_CAPACITY: usize = 256;
 pub const FILESYSTEM_COMMAND: u32 = FILESYSTEM_BASE;
 pub const FILESYSTEM_STATUS: u32 = FILESYSTEM_BASE + 1;
 pub const FILESYSTEM_OPERATION: u32 = FILESYSTEM_BASE + 2;
@@ -119,8 +130,8 @@ pub const FILESYSTEM_DESTINATION: u32 = FILESYSTEM_BASE + 152;
 pub const FILESYSTEM_DATA: u32 = FILESYSTEM_BASE + 0x120;
 pub const FILESYSTEM_DATA_SIZE: usize = 512;
 pub const MACHINE_REVISION: u32 = 2;
-pub const DEVICE_ABI: u32 = 1;
-pub const IMPLEMENTED_BANKS: u32 = 0xfff;
+pub const DEVICE_ABI: u32 = 2;
+pub const IMPLEMENTED_BANKS: u32 = 0x1fff;
 
 pub const fn usable_ram_size(backing_size: usize) -> usize {
     if backing_size < DEVICE_APERTURE_START as usize {
@@ -138,7 +149,7 @@ pub const fn is_implemented_device_page(address: u32) -> bool {
     (address >= SYSTEM_BASE && address < CLOCK_BASE + DEVICE_BANK_SIZE)
         || (address >= GRAPHICS_BASE && address < AUDIO_BASE)
         || (address >= AUDIO_BASE && address < NETWORK_BASE + DEVICE_BANK_SIZE)
-        || (address >= FILESYSTEM_BASE && address < FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE)
+        || (address >= FILESYSTEM_BASE && address < SERIAL_BASE + DEVICE_BANK_SIZE)
 }
 
 pub fn device_register_writable(address: u32) -> Option<bool> {
@@ -188,6 +199,7 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
         {
             Some(false)
         }
+        SERIAL_DATA | SERIAL_STATUS | SERIAL_CONTROL => Some(true),
         FILESYSTEM_COMMAND | FILESYSTEM_OPERATION => Some(true),
         FILESYSTEM_STATUS => Some(false),
         address if (FILESYSTEM_INDEX..FILESYSTEM_INDEX + 2).contains(&address) => Some(true),
@@ -230,6 +242,77 @@ pub fn device_register_writable(address: u32) -> Option<bool> {
             Some(true)
         }
         _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SerialDevice {
+    receive: std::collections::VecDeque<u8>,
+    transmit: std::collections::VecDeque<u8>,
+    control: u8,
+    overrun: u8,
+}
+
+impl Default for SerialDevice {
+    fn default() -> Self {
+        Self {
+            receive: std::collections::VecDeque::with_capacity(SERIAL_FIFO_CAPACITY),
+            transmit: std::collections::VecDeque::with_capacity(SERIAL_FIFO_CAPACITY),
+            control: 0,
+            overrun: 0,
+        }
+    }
+}
+
+impl SerialDevice {
+    pub fn read(&mut self, address: u32) -> Option<u8> {
+        match address {
+            SERIAL_DATA => Some(self.receive.pop_front().unwrap_or(0)),
+            SERIAL_STATUS => Some(
+                u8::from(!self.receive.is_empty()) * SERIAL_RX_READY
+                    | u8::from(self.transmit.len() < SERIAL_FIFO_CAPACITY) * SERIAL_TX_READY
+                    | self.overrun,
+            ),
+            SERIAL_CONTROL => Some(self.control),
+            _ => None,
+        }
+    }
+
+    pub fn write(&mut self, address: u32, value: u8) {
+        match address {
+            SERIAL_DATA => {
+                if self.transmit.len() < SERIAL_FIFO_CAPACITY {
+                    self.transmit.push_back(value);
+                } else {
+                    self.overrun |= SERIAL_TX_OVERRUN;
+                }
+            }
+            SERIAL_STATUS => self.overrun &= !(value & (SERIAL_RX_OVERRUN | SERIAL_TX_OVERRUN)),
+            SERIAL_CONTROL => self.control = value & SERIAL_RX_INTERRUPT_ENABLE,
+            _ => panic!("host write to an unimplemented serial register"),
+        }
+    }
+
+    pub fn receive(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if self.receive.len() == SERIAL_FIFO_CAPACITY {
+                self.overrun |= SERIAL_RX_OVERRUN;
+                break;
+            }
+            self.receive.push_back(*byte);
+        }
+    }
+
+    pub fn receive_interrupt_enabled(&self) -> bool {
+        self.control & SERIAL_RX_INTERRUPT_ENABLE != 0
+    }
+
+    pub fn receive_ready(&self) -> bool {
+        !self.receive.is_empty()
+    }
+
+    pub fn drain_transmit(&mut self) -> Vec<u8> {
+        self.transmit.drain(..).collect()
     }
 }
 
@@ -947,7 +1030,7 @@ impl InterruptController {
     pub fn read(&self, address: u32) -> Option<u8> {
         match address {
             INTERRUPT_ENABLE => Some(self.control & 1),
-            INTERRUPT_PENDING => Some(self.control & 0x1a),
+            INTERRUPT_PENDING => Some(self.control & 0x3a),
             INTERRUPT_ACK => Some(0),
             INTERRUPT_PIT_ENABLE => Some(u8::from(self.pit_enabled)),
             address if (INTERRUPT_PIT_PERIOD..INTERRUPT_PIT_PERIOD + 2).contains(&address) => {
@@ -965,7 +1048,7 @@ impl InterruptController {
     pub fn write(&mut self, address: u32, value: u8) {
         match address {
             INTERRUPT_ENABLE => self.control = (self.control & !1) | (value & 1),
-            INTERRUPT_ACK => self.control &= !(value & 0x1a),
+            INTERRUPT_ACK => self.control &= !(value & 0x3a),
             INTERRUPT_PIT_ENABLE => self.pit_enabled = value & 1 != 0,
             INTERRUPT_PIT_PERIOD => {
                 self.period_latch = (u16::from(value) << 8) | (self.period_latch & 0xff);
@@ -1062,6 +1145,7 @@ mod tests {
         assert!(is_implemented_device_page(INPUT_BASE));
         assert!(is_implemented_device_page(CLOCK_BASE));
         assert!(is_implemented_device_page(GRAPHICS_BASE));
+        assert!(is_implemented_device_page(SERIAL_BASE));
     }
 
     #[test]
@@ -1105,6 +1189,49 @@ mod tests {
     }
 
     #[test]
+    fn serial_uart_has_bounded_fifos_and_acknowledgeable_overrun() {
+        let mut device = SerialDevice::default();
+        assert_eq!(device.read(SERIAL_STATUS), Some(SERIAL_TX_READY));
+        device.write(SERIAL_DATA, b'O');
+        device.write(SERIAL_DATA, b'K');
+        assert_eq!(device.drain_transmit(), b"OK");
+
+        device.receive(b"RX");
+        assert_eq!(
+            device.read(SERIAL_STATUS),
+            Some(SERIAL_RX_READY | SERIAL_TX_READY)
+        );
+        assert_eq!(device.read(SERIAL_DATA), Some(b'R'));
+        assert_eq!(device.read(SERIAL_DATA), Some(b'X'));
+        assert_eq!(device.read(SERIAL_DATA), Some(0));
+
+        device.receive(&vec![b'a'; SERIAL_FIFO_CAPACITY + 1]);
+        assert_eq!(
+            device.read(SERIAL_STATUS),
+            Some(SERIAL_RX_READY | SERIAL_TX_READY | SERIAL_RX_OVERRUN)
+        );
+        device.write(SERIAL_STATUS, SERIAL_RX_OVERRUN);
+        assert_eq!(
+            device.read(SERIAL_STATUS),
+            Some(SERIAL_RX_READY | SERIAL_TX_READY)
+        );
+
+        for _ in 0..SERIAL_FIFO_CAPACITY {
+            device.write(SERIAL_DATA, 0x55);
+        }
+        device.write(SERIAL_DATA, 0x66);
+        assert_eq!(
+            device.read(SERIAL_STATUS),
+            Some(SERIAL_RX_READY | SERIAL_TX_OVERRUN)
+        );
+        assert_eq!(device.drain_transmit().len(), SERIAL_FIFO_CAPACITY);
+        assert_eq!(
+            device.read(SERIAL_STATUS),
+            Some(SERIAL_RX_READY | SERIAL_TX_READY | SERIAL_TX_OVERRUN)
+        );
+    }
+
+    #[test]
     fn implemented_bank_mask_matches_every_aperture_page_boundary() {
         for page in 0..(ADDRESS_SPACE_SIZE - DEVICE_APERTURE_START) / DEVICE_BANK_SIZE {
             let base = DEVICE_APERTURE_START + page * DEVICE_BANK_SIZE;
@@ -1135,6 +1262,7 @@ mod tests {
             ("CONSOLE_BASE", CONSOLE_BASE),
             ("FIRMWARE_TEXT_BASE", FIRMWARE_TEXT_BASE),
             ("FIRMWARE_GATEWAY_BASE", FIRMWARE_GATEWAY_BASE),
+            ("SERIAL_BASE", SERIAL_BASE),
             ("SYSTEM_MACHINE_REVISION", SYSTEM_MACHINE_REVISION),
             ("SYSTEM_DEVICE_ABI", SYSTEM_DEVICE_ABI),
             ("SYSTEM_RAM_BYTES", SYSTEM_RAM_BYTES),
@@ -1239,6 +1367,18 @@ mod tests {
             ("FIRMWARE_NETWORK_NAME", FIRMWARE_NETWORK_NAME),
             ("FIRMWARE_SETTING", FIRMWARE_SETTING),
             ("FIRMWARE_OUTPUT", FIRMWARE_OUTPUT),
+            ("SERIAL_DATA", SERIAL_DATA),
+            ("SERIAL_STATUS", SERIAL_STATUS),
+            ("SERIAL_CONTROL", SERIAL_CONTROL),
+            ("SERIAL_RX_READY", SERIAL_RX_READY as u32),
+            ("SERIAL_TX_READY", SERIAL_TX_READY as u32),
+            ("SERIAL_RX_OVERRUN", SERIAL_RX_OVERRUN as u32),
+            ("SERIAL_TX_OVERRUN", SERIAL_TX_OVERRUN as u32),
+            (
+                "SERIAL_RX_INTERRUPT_ENABLE",
+                SERIAL_RX_INTERRUPT_ENABLE as u32,
+            ),
+            ("SERIAL_INTERRUPT_PENDING", SERIAL_INTERRUPT_PENDING as u32),
         ];
         let definitions: Vec<_> = header
             .lines()

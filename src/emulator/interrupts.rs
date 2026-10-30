@@ -8,6 +8,7 @@ pub const IDT_ALIGNMENT: u32 = 0x800;
 pub const IDT_VECTOR_KEYBOARD: u8 = 32;
 pub const IDT_VECTOR_RTC: u8 = 33;
 pub const IDT_VECTOR_PIT: u8 = 34;
+pub const IDT_VECTOR_UART: u8 = 35;
 pub const IDT_VECTOR_SYSCALL: u8 = 0x80;
 
 const PRESENT: u8 = 0x80;

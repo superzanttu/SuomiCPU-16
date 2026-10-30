@@ -26,9 +26,9 @@ contracts.
   +disks/+ through a supervisor firmware service, validates its metadata, and
   loads its prebuilt boot image without compiling source. Explicit source
   launches remain a developer workflow.
-  Applications run in the game window; the optional Bug Monitor
-  displays emulator logs and guest serial output from the UART-style device.
-  It is separate from the text-mode BIOS.
+  Applications run in the game window; the optional Bug Monitor displays
+  emulator diagnostics, and the separate Serial Monitor displays guest UART
+  bytes. Both are separate from the text-mode BIOS.
 * Runtime storage uses folder disks with guest filesystem access. Archived
   JSON-backed 256-byte block images are inert and unsupported.
 * The CPU has supervisor and user modes, fixed interrupt vectors, an MMU with
@@ -344,9 +344,9 @@ context are retained as implementation history.
 * [x] Implement and wire a guest-visible character-cell text display for use
   by guest software. The BIOS must continue rendering in the emulator's main
   window.
-* [x] Preserve the existing game window and optional serial Bug Monitor after
-  boot; switching the BIOS to text mode must not force applications into a
-  text-only display mode.
+* [x] Preserve the existing game window and optional Bug Monitor after boot;
+  switching the BIOS to text mode must not force applications into a text-only
+  display mode.
 * [x] Provide dedicated emulator logging methods for DEBUG, INFO, WARN, and
   ERROR records. Route emulator lifecycle and device errors to the Bug Monitor;
   keep guest console I/O on the kernel console services.
@@ -688,3 +688,25 @@ context are retained as implementation history.
   install guide].
 * [x] Create an ordered onboarding guide in
   link:getting_started.adoc[Getting Started] and link it from the README.
+
+=== Phase 12 — Explicit computer lifecycle and serial hardware
+
+* [ ] *Make power-on through OS handoff an explicit machine lifecycle*
+** [x] Define cold-start and reset state, including volatile RAM/device state
+   and persistence of BIOS settings and folder-disk contents.
+** [x] Separate hardware initialization, common-BIOS validation/loading,
+   firmware boot selection, validated image loading, and kernel/user handoff
+   into testable runtime stages with actionable startup errors.
+* [ ] *Add a discoverable guest UART*
+** [x] Add one SC-16-native MMIO UART in a reserved high device page, with
+   bounded RX/TX FIFOs, status/control/overrun behavior, receive interrupt,
+   and matching system-bank discovery and guest constants.
+** [x] Connect guest TX and host input to a separate interactive serial monitor;
+   keep UART bytes distinct from the emulator diagnostic Bug Monitor.
+* [ ] *Verify and document the lifecycle and serial ABI*
+** [x] Add reset/retention, BIOS failure/boot, UART execution, FIFO, interrupt,
+   and privilege acceptance tests, including a BIOS-booted guest serial case.
+** [x] Update the architecture contract, user guide, and README.
+** [ ] Pass full focused hardware, runtime, and SisuOS validation; the
+   `sisu_os_boots_saunashell_and_runs_installed_guest_programs` regression still
+   fails at logout/login (495 of 496 library tests pass).

@@ -851,8 +851,7 @@ mod tests {
             &mut memory,
             0x2000,
             encode_entry(
-                (crate::machine::FIRMWARE_GATEWAY_BASE + crate::machine::DEVICE_BANK_SIZE)
-                    / PAGE_SIZE as u32,
+                (crate::machine::SERIAL_BASE + crate::machine::DEVICE_BANK_SIZE) / PAGE_SIZE as u32,
                 PagePermissions::USER_CODE,
             )
             .unwrap(),

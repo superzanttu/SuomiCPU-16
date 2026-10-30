@@ -1335,6 +1335,32 @@ cursor save/restore sequences. A cursor marks the current insertion position.
 Guest graphics are presented through the same GPU framebuffer until console
 output activates the text renderer.
 
+The SC-16-native serial UART occupies the supervisor-only bank at +0x3ff0c000+:
+
+[cols="1,1,1"]
+|===
+|Address |Register |Meaning
+
+|+0x3ff0c000+
+|Data
+|Read and remove one received byte; write one transmitted byte.
+
+|+0x3ff0c001+
+|Status
+|Bit 0: RX data available; bit 1: TX FIFO has space; bits 2/3: RX/TX overrun.
+Write bits 2/3 as one to clear the matching overrun.
+
+|+0x3ff0c002+
+|Control
+|Bit 0 enables the receive interrupt (IDT vector 35).
+|===
+
+Each FIFO holds 256 bytes. F3 opens or closes the separate *Serial Monitor*.
+While it is open, type in the main emulator window to send bytes to UART RX;
+guest TX appears in the monitor. This is a byte-oriented SC-16 device, not a
+cycle-accurate 16550 implementation. The *Bug Monitor* remains reserved for
+emulator diagnostics.
+
 The optional *Bug Monitor* is separate from the guest terminal and displays
 emulator diagnostics only. Its *CLOSE MONITOR* button and F2 hide the monitor
 without changing guest execution. *COPY* copies selected text or the

@@ -29,6 +29,8 @@ const TOOLBAR_HEIGHT: f32 = 36.0;
 const CONSOLE_WINDOW_WIDTH: usize = 480;
 const CONSOLE_WINDOW_HEIGHT: usize = 200;
 const CONSOLE_TOOLBAR_HEIGHT: usize = 28;
+const SERIAL_WINDOW_WIDTH: usize = 640;
+const SERIAL_WINDOW_HEIGHT: usize = 400;
 const RUNTIME_INSTRUCTION_CHUNK: usize = 5_000;
 const RUNTIME_CPU_SLICE: Duration = Duration::from_millis(30);
 const BUG_MONITOR_BUTTON: (f32, f32) = (8.0, 112.0);
@@ -279,6 +281,8 @@ enum RuntimeControl {
     FullscreenToggled(bool),
     ConsoleToggled(bool),
     ConsoleClosed,
+    SerialToggled(bool),
+    SerialClosed,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -379,6 +383,93 @@ impl ConsoleWindow {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct SerialWindow {
+    window: NativeWindow,
+    pixels: Vec<u32>,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct SerialWindow;
+
+impl SerialWindow {
+    fn new() -> Result<Self, RuntimeError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let window = NativeWindow::new(
+                "SC-16 Serial Monitor | F3 close",
+                SERIAL_WINDOW_WIDTH,
+                SERIAL_WINDOW_HEIGHT,
+                WindowOptions {
+                    resize: true,
+                    ..WindowOptions::default()
+                },
+            )
+            .map_err(|error| {
+                RuntimeError::Window(format!("cannot open SC-16 Serial Monitor window: {error}"))
+            })?;
+            Ok(Self {
+                window,
+                pixels: vec![rgb(8, 12, 18); SERIAL_WINDOW_WIDTH * SERIAL_WINDOW_HEIGHT],
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self)
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.window.is_open()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            true
+        }
+    }
+
+    fn runtime_control_pressed(&mut self) -> Option<RuntimeControl> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.window.is_open() {
+                return Some(RuntimeControl::SerialClosed);
+            }
+            self.window.update();
+            if !self.window.is_open() {
+                return Some(RuntimeControl::SerialClosed);
+            }
+            self.window
+                .is_key_pressed(NativeKey::F3, KeyRepeat::No)
+                .then_some(RuntimeControl::SerialToggled(false))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+
+    fn present(
+        &mut self,
+        console: &crate::console::ConsoleDevice,
+        font: &[[u8; 8]],
+    ) -> Result<(), RuntimeError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            draw_serial_lines(&mut self.pixels, &console.text_snapshot(), font);
+            self.window
+                .update_with_buffer(&self.pixels, SERIAL_WINDOW_WIDTH, SERIAL_WINDOW_HEIGHT)
+                .map_err(|error| {
+                    RuntimeError::Window(format!("cannot update SC-16 Serial Monitor: {error}"))
+                })?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (console, font);
+        Ok(())
+    }
+}
+
 // ...existing code...
 #[derive(Clone)]
 struct BootTarget {
@@ -436,6 +527,9 @@ pub async fn run_with_devices(
     cpu.debug_console.log_info("emulator", "BIOS started");
     let mut console_visible = false;
     let mut console_window: Option<ConsoleWindow> = None;
+    let mut serial_visible = false;
+    let mut serial_window: Option<SerialWindow> = None;
+    let mut serial_console = crate::console::ConsoleDevice::new();
     let mut fullscreen = fullscreen;
     if let Some(source) = program {
         let target = BootTarget {
@@ -494,10 +588,11 @@ pub async fn run_with_devices(
             } else if key == KeyCode::Escape {
                 return Ok(());
             }
-            if let Some(control) = apply_runtime_control(
+            if let Some(control) = apply_runtime_control_with_serial(
                 key,
                 &mut fullscreen,
                 &mut console_visible,
+                &mut serial_visible,
                 shifted,
                 controlled,
             ) {
@@ -507,6 +602,8 @@ pub async fn run_with_devices(
                     RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
                     RuntimeControl::ConsoleToggled(_) => {}
                     RuntimeControl::ConsoleClosed => {}
+                    RuntimeControl::SerialToggled(visible) => serial_visible = visible,
+                    RuntimeControl::SerialClosed => {}
                 }
             }
         }
@@ -523,6 +620,19 @@ pub async fn run_with_devices(
                         .log_debug("emulator", "Bug Monitor window closed");
                 }
                 RuntimeControl::FullscreenToggled(fullscreen) => set_fullscreen(fullscreen),
+                RuntimeControl::SerialToggled(_) | RuntimeControl::SerialClosed => {}
+            }
+        }
+        let serial_control = serial_window
+            .as_mut()
+            .and_then(|window| window.runtime_control_pressed());
+        if let Some(control) = serial_control {
+            match control {
+                RuntimeControl::SerialToggled(visible) => serial_visible = visible,
+                RuntimeControl::SerialClosed => serial_visible = false,
+                RuntimeControl::ConsoleToggled(_)
+                | RuntimeControl::ConsoleClosed
+                | RuntimeControl::FullscreenToggled(_) => {}
             }
         }
         if !fullscreen
@@ -533,15 +643,23 @@ pub async fn run_with_devices(
                 RuntimeControl::ConsoleToggled(visible) => console_visible = visible,
                 RuntimeControl::ConsoleClosed => {}
                 RuntimeControl::FullscreenToggled(_) => {}
+                RuntimeControl::SerialToggled(_) | RuntimeControl::SerialClosed => {}
             }
         }
         if fullscreen {
             console_visible = false;
             console_window = None;
+            serial_visible = false;
+            serial_window = None;
         } else if console_visible && console_window.is_none() {
             console_window = Some(ConsoleWindow::new()?);
         } else if !console_visible {
             console_window = None;
+        }
+        if serial_visible && serial_window.is_none() {
+            serial_window = Some(SerialWindow::new()?);
+        } else if !serial_visible {
+            serial_window = None;
         }
         let key_control_only = control_key_count == pressed_keys.len();
         if runtime_should_close(
@@ -581,10 +699,14 @@ pub async fn run_with_devices(
                 if handled_control_keys.contains(&key) {
                     continue;
                 }
-                receive_terminal_key(&mut cpu, key);
+                receive_terminal_key_with_serial(&mut cpu, key, serial_visible);
             }
             let typed_characters = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
-            receive_typed_text(&mut cpu, typed_characters);
+            if serial_visible {
+                receive_serial_typed_text(&mut cpu, typed_characters);
+            } else {
+                receive_typed_text(&mut cpu, typed_characters);
+            }
             update_rtc(&mut cpu);
             if cpu_budget_remaining == 0 {
                 if !cpu_frame_started {
@@ -613,6 +735,9 @@ pub async fn run_with_devices(
                 audio.apply(command).await?;
             }
             cpu.end_mouse_frame();
+        }
+        for byte in cpu.take_serial_output() {
+            serial_console.write_data(byte);
         }
         let cursor_phase = terminal_cursor_phase();
         let capture_display = if cpu.terminal_active {
@@ -659,6 +784,14 @@ pub async fn run_with_devices(
             } else {
                 console_window = None;
                 console_visible = false;
+            }
+        }
+        if let Some(window) = serial_window.as_mut() {
+            if window.is_open() {
+                window.present(&serial_console, &font)?;
+            } else {
+                serial_window = None;
+                serial_visible = false;
             }
         }
         canvas.present(&pixels, (width, height), !fullscreen).await;
@@ -1073,6 +1206,11 @@ fn fresh_runtime_cpu(
         cpu.set_bios_preselected_disk(disk_id);
     }
     let bios_path = root.join("firmware").join("bios.bin");
+    load_common_bios(&mut cpu, &bios_path)?;
+    Ok(cpu)
+}
+
+fn load_common_bios(cpu: &mut Cpu, bios_path: &Path) -> Result<(), RuntimeError> {
     if !bios_path.try_exists()? {
         return Err(RuntimeError::Window(format!(
             "required common BIOS is missing: {}",
@@ -1090,8 +1228,8 @@ fn fresh_runtime_cpu(
         .map_err(|error| RuntimeError::Window(format!("invalid common BIOS: {error}")))?;
     cpu.privilege_mode = PrivilegeMode::Supervisor;
     cpu.debug_console
-        .log_info("emulator", "trusted BIOS started in kernel mode");
-    Ok(cpu)
+        .log_info("emulator", "cold boot loaded trusted BIOS at reset vector");
+    Ok(())
 }
 
 fn boot_target(cpu: &mut Cpu, target: &BootTarget) -> Result<(), RuntimeError> {
@@ -1562,7 +1700,32 @@ fn receive_typed_text(cpu: &mut Cpu, characters: impl IntoIterator<Item = char>)
     }
 }
 
+fn receive_serial_typed_text(cpu: &mut Cpu, characters: impl IntoIterator<Item = char>) {
+    let text = characters
+        .into_iter()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    cpu.receive_serial_input(text.as_bytes());
+}
+
+#[cfg(test)]
 fn receive_terminal_key(cpu: &mut Cpu, key: KeyCode) {
+    receive_terminal_key_with_serial(cpu, key, false);
+}
+
+fn receive_terminal_key_with_serial(cpu: &mut Cpu, key: KeyCode, serial_monitor_active: bool) {
+    if serial_monitor_active {
+        match key {
+            KeyCode::Enter => cpu.receive_serial_input(b"\r"),
+            KeyCode::Backspace => cpu.receive_serial_input(b"\x08"),
+            KeyCode::Up => cpu.receive_serial_input(b"\x1b[A"),
+            KeyCode::Down => cpu.receive_serial_input(b"\x1b[B"),
+            KeyCode::Right => cpu.receive_serial_input(b"\x1b[C"),
+            KeyCode::Left => cpu.receive_serial_input(b"\x1b[D"),
+            _ => {}
+        }
+        return;
+    }
     match key {
         KeyCode::Enter => {
             if cpu.terminal_active {
@@ -1606,6 +1769,24 @@ fn apply_runtime_control(
         }
         _ => None,
     }
+}
+
+fn apply_runtime_control_with_serial(
+    key: KeyCode,
+    fullscreen: &mut bool,
+    console_visible: &mut bool,
+    serial_visible: &mut bool,
+    shifted: bool,
+    controlled: bool,
+) -> Option<RuntimeControl> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if key == KeyCode::F3 && !*fullscreen {
+        *serial_visible = !*serial_visible;
+        return Some(RuntimeControl::SerialToggled(*serial_visible));
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = serial_visible;
+    apply_runtime_control(key, fullscreen, console_visible, shifted, controlled)
 }
 
 fn toolbar_control(position: (f32, f32), console_visible: bool) -> Option<RuntimeControl> {
@@ -1683,6 +1864,53 @@ fn draw_console_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]]) {
             CONSOLE_WINDOW_WIDTH,
             0,
             CONSOLE_TOOLBAR_HEIGHT + row * 8,
+            line,
+            rgb(190, 220, 190),
+            font,
+        );
+    }
+}
+
+fn draw_serial_lines(pixels: &mut [u32], lines: &[String], font: &[[u8; 8]]) {
+    pixels.fill(rgb(8, 12, 18));
+    fill_rect(
+        pixels,
+        SERIAL_WINDOW_WIDTH,
+        0,
+        0,
+        SERIAL_WINDOW_WIDTH,
+        40,
+        rgb(16, 22, 34),
+    );
+    draw_text(
+        pixels,
+        SERIAL_WINDOW_WIDTH,
+        8,
+        8,
+        "SC-16 SERIAL MONITOR - F3 CLOSE",
+        rgb(238, 242, 248),
+        font,
+    );
+    draw_text(
+        pixels,
+        SERIAL_WINDOW_WIDTH,
+        8,
+        24,
+        "Type in the main emulator window to send UART input.",
+        rgb(130, 170, 190),
+        font,
+    );
+    let visible_rows = SERIAL_WINDOW_HEIGHT.saturating_sub(44) / 8;
+    for (row, line) in lines
+        .iter()
+        .skip(lines.len().saturating_sub(visible_rows))
+        .enumerate()
+    {
+        draw_text(
+            pixels,
+            SERIAL_WINDOW_WIDTH,
+            0,
+            44 + row * 8,
             line,
             rgb(190, 220, 190),
             font,
@@ -2541,6 +2769,42 @@ mod tests {
         assert!(!cpu.guest_text.enabled);
         cpu.write(crate::machine::FIRMWARE_COMMAND, 1);
         assert_eq!(cpu.read(crate::machine::FIRMWARE_STATUS), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bios_booted_kernel_transmits_bytes_through_the_guest_uart() {
+        let disk = boot_test_disk("uart-boot");
+        let root = disk.parent().unwrap();
+        fs::create_dir(root.join("disks")).unwrap();
+        let boot_disk = root.join("disks").join("DISK0001");
+        fs::rename(&disk, &boot_disk).unwrap();
+        let firmware =
+            crate::assembler::assemble(include_str!("../../firmware/bios.asm"), 0).unwrap();
+        fs::create_dir_all(root.join("firmware")).unwrap();
+        crate::image::write_image(&root.join("firmware/bios.bin"), &firmware).unwrap();
+        let kernel = crate::assembler::assemble(
+            ".address 0x100\n\
+             LDI30 R5, 0x3ff0c000\n\
+             LDI R0, 83\n\
+             ST R5, R0\n\
+             LDI R0, 67\n\
+             ST R5, R0\n\
+             LDI R0, 49\n\
+             ST R5, R0\n\
+             wait: JMP wait",
+            0,
+        )
+        .unwrap();
+        crate::image::write_image(&boot_disk.join("kernel.bin"), &kernel).unwrap();
+
+        let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
+        cpu.run(5000).unwrap();
+        cpu.signal_keyboard_event(13);
+        cpu.run(10_000).unwrap();
+
+        assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.take_serial_output(), b"SC1");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3483,6 +3747,21 @@ mod tests {
     }
 
     #[test]
+    fn serial_monitor_input_reaches_uart_and_special_keys_are_translated() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        receive_serial_typed_text(&mut cpu, ['h', 'i', 'ä']);
+        receive_terminal_key_with_serial(&mut cpu, KeyCode::Enter, true);
+        assert_eq!(
+            cpu.read(crate::machine::SERIAL_STATUS) & crate::machine::SERIAL_RX_READY,
+            1
+        );
+        let received = (0..5)
+            .map(|_| cpu.read(crate::machine::SERIAL_DATA))
+            .collect::<Vec<_>>();
+        assert_eq!(received, "hiä\r".as_bytes());
+    }
+
+    #[test]
     fn terminal_input_ignores_bios_keys_and_routes_keys_after_guest_boot() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         receive_terminal_key(&mut cpu, KeyCode::Enter);
@@ -3626,6 +3905,35 @@ mod tests {
             control(KeyCode::F2),
             Some(RuntimeControl::ConsoleToggled(true))
         );
+    }
+
+    #[test]
+    fn f3_toggles_the_separate_serial_monitor() {
+        let (mut fullscreen, mut console_visible, mut serial_visible) = (false, false, false);
+        assert_eq!(
+            apply_runtime_control_with_serial(
+                KeyCode::F3,
+                &mut fullscreen,
+                &mut console_visible,
+                &mut serial_visible,
+                false,
+                false,
+            ),
+            Some(RuntimeControl::SerialToggled(true))
+        );
+        assert!(serial_visible);
+        assert_eq!(
+            apply_runtime_control_with_serial(
+                KeyCode::F3,
+                &mut fullscreen,
+                &mut console_visible,
+                &mut serial_visible,
+                false,
+                false,
+            ),
+            Some(RuntimeControl::SerialToggled(false))
+        );
+        assert!(!serial_visible);
     }
 
     #[test]

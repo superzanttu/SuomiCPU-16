@@ -12,8 +12,9 @@ Runtime, tools, and tests are implemented in Rust.
   (not a fully conforming C90 implementation; see the
   link:docs/user_guide.adoc#9-ansi-c90-compiler[user guide]).
 * Memory-mapped console, BIOS folder-disk boot selection and guest filesystem,
-  protected console and graphics services, and high-bank device interfaces.
-* Keyboard, RTC, and programmable instruction-timer interrupts for
+  protected console and graphics services, and high-bank device interfaces
+  including a discoverable serial UART.
+* Keyboard, UART, RTC, and programmable instruction-timer interrupts for
   software-managed task scheduling.
 
 == Getting Started
@@ -34,6 +35,13 @@ the dedicated guide linked above. The
 link:docs/sc16_disk_format.adoc[folder-disk specification] and
 link:docs/sc16_architecture.adoc[machine architecture] define the enforced
 contracts.
+
+The emulator creates a fresh machine state and starts the common BIOS from
+reset vector zero before disk selection and OS handoff. Folder-disk contents
+and BIOS settings persist across emulator sessions; RAM and device state do
+not. Press F3 to open the separate serial monitor; type in the main emulator
+window to send UART input. The F2 Bug Monitor remains dedicated to emulator
+diagnostics.
 
 == Programs and repository layout
 

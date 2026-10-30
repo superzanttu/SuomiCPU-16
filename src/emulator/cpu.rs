@@ -567,6 +567,7 @@ pub struct Cpu {
     firmware_gateway: crate::machine::FirmwareGateway,
     filesystem_device: crate::machine::FilesystemDevice,
     graphics_device: crate::machine::GraphicsDevice,
+    serial: crate::machine::SerialDevice,
     network_port: u16,
     scnet: Option<ScNetNode>,
     scnet_enabled: bool,
@@ -675,6 +676,7 @@ impl Cpu {
             firmware_gateway: crate::machine::FirmwareGateway::default(),
             filesystem_device: crate::machine::FilesystemDevice::default(),
             graphics_device: crate::machine::GraphicsDevice::default(),
+            serial: crate::machine::SerialDevice::default(),
             network_port: DEFAULT_PORT,
             scnet: None,
             scnet_enabled: false,
@@ -1158,6 +1160,7 @@ impl Cpu {
         self.booted_disk_path = None;
         self.terminal_active = false;
         self.terminal_dirty = false;
+        self.refresh_serial_interrupt();
     }
 
     pub fn initial_user_stack_pointer(&self) -> u32 {
@@ -1551,6 +1554,23 @@ impl Cpu {
                 return value;
             }
             if let Some(value) = self.input.read(address) {
+                return value;
+            }
+            if (crate::machine::SERIAL_BASE
+                ..crate::machine::SERIAL_BASE + crate::machine::DEVICE_BANK_SIZE)
+                .contains(&address)
+            {
+                if address == crate::machine::SERIAL_STATUS
+                    && !self.serial.receive_ready()
+                    && self.running
+                {
+                    self.frame_yield = true;
+                }
+                let value = self
+                    .serial
+                    .read(address)
+                    .expect("validated serial register");
+                self.refresh_serial_interrupt();
                 return value;
             }
             return crate::machine::system_register_byte(address, self.memory.len())
@@ -4200,6 +4220,12 @@ impl Cpu {
             );
             if self.write_terminal_register(address, value) {
                 return;
+            } else if (crate::machine::SERIAL_BASE
+                ..crate::machine::SERIAL_BASE + crate::machine::DEVICE_BANK_SIZE)
+                .contains(&address)
+            {
+                self.serial.write(address, value);
+                self.refresh_serial_interrupt();
             } else if (crate::machine::FIRMWARE_GATEWAY_BASE
                 ..crate::machine::FIRMWARE_GATEWAY_BASE + crate::machine::DEVICE_BANK_SIZE)
                 .contains(&address)
@@ -4258,6 +4284,7 @@ impl Cpu {
                 }
             } else {
                 self.interrupts.write(address, value);
+                self.refresh_serial_interrupt();
             }
             return;
         }
@@ -5396,6 +5423,24 @@ impl Cpu {
         self.console.receive(bytes);
     }
 
+    pub fn receive_serial_input(&mut self, bytes: &[u8]) {
+        self.serial.receive(bytes);
+        self.refresh_serial_interrupt();
+    }
+
+    pub fn take_serial_output(&mut self) -> Vec<u8> {
+        self.serial.drain_transmit()
+    }
+
+    fn refresh_serial_interrupt(&mut self) {
+        let pending = self.serial.receive_interrupt_enabled() && self.serial.receive_ready();
+        if pending {
+            self.interrupts.control |= crate::machine::SERIAL_INTERRUPT_PENDING;
+        } else {
+            self.interrupts.control &= !crate::machine::SERIAL_INTERRUPT_PENDING;
+        }
+    }
+
     pub fn signal_keyboard_event(&mut self, keycode: u8) {
         self.input.key = keycode;
         self.interrupts.control |= 2;
@@ -5744,6 +5789,13 @@ impl Cpu {
         }
         let (pending_bit, vector) = if icr & 2 != 0 {
             (2, u16::from(crate::interrupts::IDT_VECTOR_KEYBOARD))
+        } else if icr & crate::machine::SERIAL_INTERRUPT_PENDING != 0
+            && self.serial.receive_interrupt_enabled()
+        {
+            (
+                crate::machine::SERIAL_INTERRUPT_PENDING,
+                u16::from(crate::interrupts::IDT_VECTOR_UART),
+            )
         } else if icr & 0x10 != 0 && self.interrupts.pit_enabled {
             (0x10, u16::from(crate::interrupts::IDT_VECTOR_PIT))
         } else if icr & 8 != 0 {
@@ -5752,6 +5804,9 @@ impl Cpu {
             return Ok(());
         };
         self.interrupts.control = icr & !pending_bit;
+        if pending_bit == crate::machine::SERIAL_INTERRUPT_PENDING {
+            self.refresh_serial_interrupt();
+        }
         let descriptor = match self.idt_descriptor(vector) {
             Ok(descriptor) => descriptor,
             Err(error) => {
@@ -5972,7 +6027,7 @@ mod tests {
             for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
                 cpu.privilege_mode = mode;
                 for address in [
-                    crate::machine::FIRMWARE_GATEWAY_BASE + crate::machine::DEVICE_BANK_SIZE,
+                    crate::machine::SERIAL_BASE + crate::machine::DEVICE_BANK_SIZE,
                     ADDRESS_MASK,
                 ] {
                     let aliased = (address & cpu.memory_mask) as usize;
@@ -6659,6 +6714,7 @@ mod tests {
         cpu.memory[0x3040..0x3044].copy_from_slice(&(NETWORK_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3044..0x3048].copy_from_slice(&(FIRMWARE_GATEWAY_BASE | 0xf).to_be_bytes());
         cpu.memory[0x3048..0x304c].copy_from_slice(&(FILESYSTEM_BASE | 0xf).to_be_bytes());
+        cpu.memory[0x304c..0x3050].copy_from_slice(&(SERIAL_BASE | 0xf).to_be_bytes());
         cpu.enable_mmu(0x2000).unwrap();
         for mode in [PrivilegeMode::Supervisor, PrivilegeMode::User] {
             cpu.privilege_mode = mode;
@@ -6673,6 +6729,7 @@ mod tests {
                 (0x10000, NETWORK_BASE),
                 (0x11000, FIRMWARE_GATEWAY_BASE),
                 (0x12000, FILESYSTEM_BASE),
+                (0x13000, SERIAL_BASE),
             ] {
                 for offset in 0..DEVICE_BANK_SIZE {
                     for access in [MemoryAccess::Read, MemoryAccess::Write, MemoryAccess::Fetch] {
@@ -7312,7 +7369,7 @@ mod tests {
                 for address in [
                     SYSTEM_BASE + 20,
                     SYSTEM_BASE + 4095,
-                    FIRMWARE_GATEWAY_BASE + DEVICE_BANK_SIZE,
+                    SERIAL_BASE + DEVICE_BANK_SIZE,
                     ADDRESS_MASK,
                 ] {
                     assert!(cpu.read_guest(address).is_err());
@@ -7376,7 +7433,7 @@ mod tests {
 
     #[test]
     fn instruction_operands_cannot_mask_reserved_devices_into_small_ram() {
-        let address = crate::machine::FIRMWARE_GATEWAY_BASE + crate::machine::DEVICE_BANK_SIZE;
+        let address = crate::machine::SERIAL_BASE + crate::machine::DEVICE_BANK_SIZE;
         for source in [
             "LD R2, R0",
             "ST R0, R2",
@@ -8142,7 +8199,7 @@ mod tests {
 
     #[test]
     fn reset_starts_in_supervisor_mode_with_interrupts_disabled() {
-        let cpu = Cpu::with_memory_size(1 << 19).unwrap();
+        let mut cpu = Cpu::with_memory_size(1 << 19).unwrap();
 
         assert_eq!(cpu.pc, 0);
         assert_eq!(cpu.registers, [0; 8]);
@@ -8151,8 +8208,84 @@ mod tests {
         assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
         assert_eq!(cpu.flags, Flags::default());
         assert_eq!(read_interrupt_control(&cpu) & 1, 0);
+        assert_eq!(
+            cpu.read(crate::machine::SERIAL_STATUS),
+            crate::machine::SERIAL_TX_READY
+        );
+        assert_eq!(cpu.read(crate::machine::INTERRUPT_PENDING), 0);
     }
 
+    #[test]
+    fn serial_uart_transfers_bytes_and_keeps_rx_interrupt_level_asserted_until_drained() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.write(SERIAL_CONTROL, SERIAL_RX_INTERRUPT_ENABLE);
+        cpu.receive_serial_input(b"hi");
+        assert_eq!(cpu.read(INTERRUPT_PENDING), SERIAL_INTERRUPT_PENDING);
+        assert_eq!(cpu.read(SERIAL_STATUS), SERIAL_RX_READY | SERIAL_TX_READY);
+        assert_eq!(cpu.read(SERIAL_DATA), b'h');
+        cpu.write(INTERRUPT_ACK, SERIAL_INTERRUPT_PENDING);
+        assert_eq!(cpu.read(INTERRUPT_PENDING), SERIAL_INTERRUPT_PENDING);
+        assert_eq!(cpu.read(SERIAL_DATA), b'i');
+        assert_eq!(cpu.read(INTERRUPT_PENDING), 0);
+
+        cpu.write(SERIAL_DATA, b'O');
+        cpu.write(SERIAL_DATA, b'K');
+        assert_eq!(cpu.take_serial_output(), b"OK");
+        assert_eq!(cpu.read(SERIAL_STATUS), SERIAL_TX_READY);
+
+        cpu.privilege_mode = PrivilegeMode::User;
+        assert!(cpu.read_guest(SERIAL_STATUS).is_err());
+        assert!(cpu.write_guest(SERIAL_DATA, b'!').is_err());
+        assert_eq!(cpu.take_serial_output(), b"");
+    }
+
+    #[test]
+    fn image_entry_reset_preserves_ram_and_uart_data_but_cold_reset_does_not() {
+        use crate::machine::*;
+
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.memory[0x400] = 0xa5;
+        cpu.write(SERIAL_CONTROL, SERIAL_RX_INTERRUPT_ENABLE);
+        cpu.receive_serial_input(b"R");
+        cpu.write(SERIAL_DATA, b'T');
+        cpu.prepare_image_entry();
+
+        assert_eq!(cpu.memory[0x400], 0xa5);
+        assert_eq!(cpu.read(INTERRUPT_PENDING), SERIAL_INTERRUPT_PENDING);
+        assert_eq!(cpu.read(SERIAL_DATA), b'R');
+        assert_eq!(cpu.take_serial_output(), b"T");
+
+        let mut cold_cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        assert_eq!(cold_cpu.memory[0x400], 0);
+        assert_eq!(cold_cpu.read(SERIAL_STATUS), SERIAL_TX_READY);
+    }
+
+    #[test]
+    fn enabled_uart_receive_interrupt_enters_its_idt_vector() {
+        use crate::machine::*;
+
+        let mut cpu = cpu_with_program(&[OP_EI << 11]);
+        install_test_handler(
+            &mut cpu,
+            u16::from(crate::interrupts::IDT_VECTOR_UART),
+            0x300,
+            0,
+        );
+        cpu.write_u16(0x300, OP_RTI << 11);
+        cpu.write(SERIAL_CONTROL, SERIAL_RX_INTERRUPT_ENABLE);
+        cpu.receive_serial_input(b"x");
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, 0x300);
+        assert_eq!(
+            cpu.read_u16(cpu.sp + 12),
+            u16::from(crate::interrupts::IDT_VECTOR_UART)
+        );
+        assert_eq!(cpu.read(INTERRUPT_PENDING), SERIAL_INTERRUPT_PENDING);
+    }
     #[test]
     fn user_privilege_fault_uses_kernel_stack_and_rti_restores_user_state() {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
@@ -9846,6 +9979,7 @@ mod tests {
             crate::machine::CONSOLE_DATA,
             crate::machine::FIRMWARE_TEXT_DATA,
             crate::machine::FIRMWARE_COMMAND,
+            crate::machine::SERIAL_DATA,
         ] {
             for access in [
                 crate::mmu::MemoryAccess::Read,
