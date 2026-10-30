@@ -1323,11 +1323,12 @@ The supervisor-only console device is in the high console bank:
 |===
 
 Guest console input and output use the main emulator display as an 80×25 text
-terminal. The emulator rasterizes a wider 7-pixel bitmap face into the
-SC-16 GPU framebuffer using 8×16-pixel cells at 640×480, then presents that
-framebuffer through the normal GPU display path. The terminal face uses the
-embedded printable-ASCII glyphs remapped across seven columns instead of
-stretching five-pixel glyphs vertically; no host text overlay is used.
+terminal. The emulator rasterizes its 8×10 bitmap font into the SC-16 GPU
+framebuffer using 8×16-pixel cells at 640×480, then presents that
+framebuffer through the normal GPU display path. It uses a dedicated,
+individually authored 8×10 printable-ASCII bitmap font rendered one source
+pixel to one GPU pixel, centered vertically in each cell. It does not stretch
+or duplicate the older 5×7 firmware glyphs, and no host text overlay is used.
 SisuOS standard output/error and privileged firmware console writes appear
 there; user tasks use the kernel's validated console services rather than
 direct MMIO. The retired +0x43200+ address is ordinary RAM. Keyboard input is

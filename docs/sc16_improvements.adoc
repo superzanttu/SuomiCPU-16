@@ -714,7 +714,8 @@ context are retained as implementation history.
 === Phase 13 — Readable GPU text console
 
 * [x] *Improve console font readability without bypassing the SC-16 GPU*
-** [x] Design a wider bitmap font for the 80×25 guest console while preserving
-   the 640×480 GPU mode and existing terminal behavior.
+** [x] Design an original 8×10 printable-ASCII bitmap font for the 80×25 guest
+   console; render native pixels in the existing 640×480 GPU mode without
+   scaling or duplicating the older firmware glyphs.
 ** [x] Verify glyph coverage, distinguishing letterforms, and GPU framebuffer
    rendering; document the font and display contract.

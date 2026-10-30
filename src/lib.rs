@@ -11,6 +11,8 @@ pub mod bios_settings;
 pub mod c_compiler;
 #[path = "emulator/console.rs"]
 pub mod console;
+#[path = "emulator/console_font.rs"]
+pub mod console_font;
 #[path = "emulator/cpu.rs"]
 pub mod cpu;
 #[path = "emulator/disk.rs"]
