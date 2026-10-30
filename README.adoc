@@ -17,37 +17,23 @@ Runtime, tools, and tests are implemented in Rust.
   software-managed task scheduling.
 
 == Getting Started
-Install Rust and Cargo, then start the emulator with:
+For the ordered setup and first-run guide, see
+link:docs/getting_started.adoc[Getting Started]. In brief, install Rust and
+Cargo, then start the emulator with:
 
 [source,console]
 ----
 cargo run --bin suomicpu16
 ----
 
-Start SC-16 without arguments to execute the required shared +firmware/bios.bin+ and
-show the text-mode BIOS disk selector.
-Use *Up/Down* and *Enter*, or click and double-click, to boot an ID-named
-folder under +disks/+. The mouse wheel scrolls the list. The selected disk
-must have valid +disk.json+ metadata and exactly one boot executable:
-+kernel.bin+ starts in KERNEL mode; +main.bin+ starts in USER mode.
-Both or neither produces +NOT_BOOT+; errors remain visible so another disk
-can be selected. BIOS loads prebuilt SC-16 images without compiling source.
-Use +--disk ID+ to preselect a folder boot disk in BIOS or mount that folder
-filesystem alongside a directly launched program. Folder disks are the only
-supported disk format; old JSON block-disk files are not loadable or importable.
-See +docs/sc16_disk_format.adoc+ for the folder format and kernel-code trust
-model.
-In windowed mode, the *BUG MONITOR* toolbar button opens emulator diagnostics
-in a separate resizable window. Press *F2* to toggle it. There are no host
-pause, stop, reset, or reboot controls; F1, F3, F4, and F5 are not host shortcuts.
-Close and relaunch the emulator to start a new session.
-Use _Shift+Ctrl+F_ to toggle windowed/fullscreen mode (*F11* is also
-supported). The toolbar and console window are closed in fullscreen mode.
-Start directly in fullscreen with
-+cargo run -- --fullscreen+ or +.\run.ps1 -Fullscreen+.
-Detailed stage logs are on by default and show which SC-16 component is
-processing each source file, including compiler, assembler, include, and
-memory-loading stages. Use +--quiet+ to hide these details.
+Starting without arguments executes the required shared +firmware/bios.bin+
+and opens the BIOS disk selector. Choose an ID-named folder under +disks/+;
+the BIOS validates its manifest and launches its fixed boot executable.
+For first-time users, BIOS controls, SisuOS, and build/install steps, follow
+the dedicated guide linked above. The
+link:docs/sc16_disk_format.adoc[folder-disk specification] and
+link:docs/sc16_architecture.adoc[machine architecture] define the enforced
+contracts.
 
 == Programs and repository layout
 

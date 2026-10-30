@@ -1,0 +1,82 @@
+= Getting Started with SC-16
+:toc:
+
+This guide covers a first emulator run, booting the supported SisuOS example,
+and locating the build and architecture references. SisuOS is the only guest
+workload verified against the current hardware interfaces.
+
+== Requirements
+
+Install Rust and Cargo, then open a PowerShell terminal in the repository root.
+The emulator uses the checked-in +firmware/bios.bin+ image. The Windows
++run.ps1+ launcher rebuilds it from +firmware/bios.asm+ when the image is
+missing or older than its source.
+
+== Start the emulator
+
+Run the emulator without arguments to start the guest BIOS and show its folder
+disk selector:
+
+[source,powershell]
+----
+cargo run --bin suomicpu16
+----
+
+Use Up/Down to select a disk and Enter to boot. A disk must have a valid
++disk.json+ and exactly one root executable. +kernel.bin+ starts trusted
+supervisor code; +main.bin+ starts in user mode. The BIOS runs prebuilt images
+and does not compile programs during boot.
+
+To preselect SisuOS in the BIOS:
+
+[source,powershell]
+----
+cargo run --bin suomicpu16 -- --disk sisuos
+----
+
+To run the checked-in SisuOS disk directly on Windows:
+
+[source,powershell]
+----
+.\run.ps1 .\disks\sisuos
+----
+
+SisuOS boots a protected kernel that configures the MMU and instruction timer,
+then starts its user-mode shell. Enter +help+ in the shell to see commands;
++list+, +info+, and +run demo+ demonstrate package listing, machine status,
+and a preempted child process. This is an instructional demonstration, not a
+general-purpose operating system.
+
+== Build and install SisuOS
+
+Build the package without changing the installed disk:
+
+[source,powershell]
+----
+.\programs\sisuos\tools\build.ps1
+----
+
+Build and safely install it:
+
+[source,powershell]
+----
+.\programs\sisuos\tools\build.ps1 -Install
+----
+
+The build is staged under +build/programs/sisuos/+; installation updates
++disks/sisuos/+. Existing unrelated writable files and BIOS settings are
+preserved. Modified package-owned files and conflicting seed files are errors,
+not silently overwritten. For command-line alternatives and recovery details,
+see link:programs.adoc[Building and installing SC-16 programs].
+
+== Where to go next
+
+* link:user_guide.adoc[Assembler and emulator guide] — command-line use,
+  assembly, instructions, devices, and compiler status.
+* link:programs.adoc[Build and install guide] — BIOS, SisuOS, package manifests,
+  helper scripts, and safe updates.
+* link:sc16_disk_format.adoc[Folder-disk format] — manifest, boot selection,
+  and guest disk services.
+* link:sc16_architecture.adoc[Machine architecture] — memory map, image format,
+  privilege, devices, interrupts, MMU, and syscall contracts.
+* link:sc16_improvements.adoc[Architecture roadmap] — implementation status.

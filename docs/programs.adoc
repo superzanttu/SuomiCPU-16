@@ -28,41 +28,121 @@ hardware interfaces. Other catalog sources remain untouched and may reference
 retired graphics or device headers. They are archived and excluded from
 build/install commands.
 
-== Common commands
+== BIOS, program, and disk workflows
 
-Run these commands from the repository root with Rust/Cargo on PATH:
+Run commands from the repository root with Rust/Cargo on PATH. The shared BIOS
+is assembled separately from guest programs:
 
 [source,powershell]
 ----
+cargo run --bin sc16build -- build-bios
 cargo run --bin sc16build -- build-program sisuos
 cargo run --bin sc16build -- install-program sisuos
-.\run.ps1 .\disks\sisuos
 ----
 
-Building writes only +build/programs/<slug>/. Installing first builds SisuOS,
-then installs its image and seeds into +disks/sisuos/. The all-program commands
-also process SisuOS only; archived catalog entries are not build targets.
++build-bios+ assembles +firmware/bios.asm+ into +firmware/bios.bin+ by default.
+The optional source and output arguments can select other paths. +build-program+
+compiles the manifest-selected sources into +build/programs/<slug>/+ without
+changing the installed disk. For SisuOS this creates the protected kernel and
+demo images with the manifest and package ownership record.
 
-PowerShell conveniences:
+The BIOS command reports its selected source and output; the default success
+message has this form:
 
-[source,powershell]
+[source,console]
 ----
-.\scripts\build-programs.ps1 sisuos
-.\scripts\build-programs.ps1 sisuos -Install
-.\programs\sisuos\tools\build.ps1 -Install
+Built shared BIOS firmware <source> -> <output>
 ----
 
-For BIOS selection instead of immediate disk launch:
+Successful program builds and installs report their package and resolved output
+path, for example:
+
+[source,console]
+----
+Built sisuos -> <repository>/build/programs/sisuos
+Installed sisuos -> <repository>/disks/sisuos
+----
+
++install-program+ builds first, then safely installs the package into
++disks/sisuos/+. It preserves unrelated writable disk files and settings,
+updates unchanged package-owned files, and reports conflicts instead of
+overwriting modified package-owned files. The all-program commands currently
+process SisuOS only; archived catalog entries are not build targets.
+
+To open the BIOS selector and preselect SisuOS:
 
 [source,powershell]
 ----
 cargo run --bin suomicpu16 -- --disk sisuos
 ----
 
-Rebuild firmware separately with +cargo run --bin sc16build -- build-bios+.
-Its defaults are +firmware/bios.asm+ and +firmware/bios.bin+.
-For an educational fixture or one-off disk, the existing +sc16build <source>
-<image>+ and non-overwriting +package-disk+ commands remain available.
+To launch the checked-in disk directly:
+
+[source,powershell]
+----
+.\run.ps1 .\disks\sisuos
+----
+
+The BIOS launches prebuilt images only. The Windows +run.ps1+ launcher rebuilds
+the shared BIOS when it is missing or older than its assembly source. It can
+also compile a supplied +.asm+ or supported +.c+ source to a temporary image
+before starting the emulator; that temporary image is removed when the emulator
+exits.
+
+For an educational fixture or one-off boot disk, +sc16build package-disk+
+builds source into a new destination and refuses to overwrite an existing
+destination:
+
+[source,powershell]
+----
+cargo run --bin sc16build -- package-disk examples/minimal_kernel.asm disks/KERN0001 MinimalKernel 65536 --kernel
+----
+
+Use +--kernel-user-c <source.c>+ with +--kernel+ to embed a C user program in
+an assembly kernel. The fixed boot names are +kernel.bin+ for supervisor
+startup and +main.bin+ for user startup; the manifest cannot override that
+rule. See link:sc16_disk_format.adoc[the folder-disk contract] for the complete
+manifest and boot behavior.
+
+== Helper scripts and command-line reference
+
+The repository-root PowerShell wrapper builds all supported guest packages by
+default (currently SisuOS only). Pass a slug to build or install one package:
+
+[source,powershell]
+----
+.\scripts\build-programs.ps1
+.\scripts\build-programs.ps1 sisuos
+.\scripts\build-programs.ps1 sisuos -Install
+.\programs\sisuos\tools\build.ps1 -Install
+----
+
++scripts/build-programs.ps1+ accepts an optional program slug and +-Install+.
+Without a slug it invokes the all-program build/install command. The SisuOS
+wrapper, +programs/sisuos/tools/build.ps1+, builds SisuOS by default and
+installs it when +-Install+ is supplied. Successful build output identifies
++build/programs/sisuos/+; install output identifies the destination under
++disks/+.
+
+Use +sc16build --help+ to list the supported offline commands, including
++build-bios+, +build-program+, +install-program+, +build-programs+,
++install-programs+, +package-disk+, and the explicit disk-migration command.
+Use +suomicpu16 --help+ for the emulator invocation forms:
+
+[source,console]
+----
+Usage: suomicpu16 [--fullscreen] [--disk ID] [--net-port PORT] [IMAGE.bin|IMAGE.sc16img|DISK_FOLDER]
+       suomicpu16 --headless [--disk ID] [--net-port PORT] IMAGE.bin|IMAGE.sc16img|DISK_FOLDER
+----
+
+Starting without a program opens the BIOS selector; +--disk ID+ preselects a
+folder disk for BIOS boot. +--headless+ requires an image or disk folder.
+Direct source launches and image wrapping are developer workflows; they do not
+change the fixed BIOS boot rule or add compatibility for old image formats.
+
+For an ordered first-run path, see
+link:getting_started.adoc[Getting Started]. The machine and image contract is
+defined in link:sc16_architecture.adoc[SC-16 architecture].
 
 == Manifest version 1
 

@@ -638,7 +638,13 @@ Checklist status: [x] completed; [ ] planned.
    and migration documentation.
 
 === Phase 11 - Final tasks
-* [ ] Perform a final review of all documentation, ensuring accuracy and completeness.
-* [ ] Write documentation how to compile and package the BIOS, kernel, and user programs, as well as how to create and manage bootable disks.
-* [ ] Ensure all helper tools and scripts are documented, including usage examples and expected outputs.
-* [ ] Create a "Getting Started" document to explain that documentation user should read and which order to gain understanding and skills to use SC-16.
+* [x] Review the SC-16 documentation for accuracy and completeness against the
+  implemented hardware, BIOS, SisuOS, image, and folder-disk behavior.
+* [x] Document how to build the BIOS, kernel, and user programs, and how to
+  package, install, and boot folder disks in link:programs.adoc[the build and
+  install guide].
+* [x] Document supported helper scripts and command-line tools with usage
+  examples and expected command output in link:programs.adoc[the build and
+  install guide].
+* [x] Create an ordered onboarding guide in
+  link:getting_started.adoc[Getting Started] and link it from the README.
