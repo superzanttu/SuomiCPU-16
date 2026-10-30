@@ -46,7 +46,7 @@ Build and run an image from the repository root:
 
 [source,console]
 ----
-cargo run --bin sc16build -- examples/example.asm example.sc16img
+cargo run --bin sc16build -- examples/directives.asm example.sc16img
 cargo run --bin suomicpu16 -- example.sc16img
 ----
 
@@ -54,7 +54,7 @@ On Windows, run the PowerShell launcher with a source or binary path:
 
 [source,powershell]
 ----
-.\run.ps1 .\examples\example.asm
+.\run.ps1 .\examples\directives.asm
 ----
 
 +run.ps1+ changes to the repository directory and starts the Rust emulator
@@ -67,23 +67,24 @@ subset handles multiple +int+ functions with up to three parameters and local
 +int+ variables, assignments, arithmetic/bitwise/shift/logical and signed comparison
 expressions, conditional expressions, nested blocks, +if+/+else+, and
 +while+/+do+/+for+ loops with +break+ and +continue+, including recursion.
-Other C programs are rejected until their required features are ported. At
-startup without an explicit program path, the BIOS displays the settings list
+Other catalog programs are archived and unsupported by the current hardware
+interface. At startup without an explicit program path, the BIOS displays the settings list
 and available ID-named disk directories in stable order. Use Up/Down to select
 a row and Enter to edit or boot. Invalid metadata, invalid images, and
 +NOT_BOOT+ errors are logged; the BIOS remains available to retry another
 disk. Close and relaunch the emulator to start a fresh BIOS session. The
 emulator requires the shared
 +firmware/bios.bin+ and displays a BIOS startup error if it is missing or invalid.
-Build/install one catalog entry with +sc16build build-program <slug>+ or
-+sc16build install-program <slug>+, or all entries with +build-programs+ and
-+install-programs+. See link:programs.adoc[the program workflow] for manifests,
-disk-name migration, and updates preserving local data. One-off
+Build/install SisuOS with +sc16build build-program sisuos+ or
++sc16build install-program sisuos+. The all-program commands currently process
+SisuOS only; archived program sources are not supported. See
+link:programs.adoc[the program workflow] for manifests, disk-name migration,
+and updates preserving local data. One-off
 +sc16build package-disk+ still refuses an existing destination.
 See +sc16_disk_format.adoc+ for the disk manifest and image requirements.
 Build the shared BIOS image offline with
 +cargo run --bin sc16build -- build-bios+; validate that
-all program recipes still compile with
++SisuOS's program recipe with
 +cargo run --bin sc16build -- build-programs+. Builds write only
 +build/programs/<slug>/+; installation stages and validates updates before
 switching the disk directory.
@@ -97,8 +98,8 @@ The MMU enforces mapped permissions when translation is enabled, but the
 normal BIOS USER boot path does not yet enable translation and is not an
 isolation boundary.
 The game fills the emulator's main window after BIOS startup. The optional
-80×25 *Bug Monitor* runs in a separate window and displays emulator logs and
-dedicated guest diagnostic output. The *BUG MONITOR* toolbar button opens it;
+80×25 *Bug Monitor* runs in a separate window and displays host emulator logs.
+Guest programs cannot write to it. The *BUG MONITOR* toolbar button opens it;
 its *CLOSE MONITOR* button hides it without changing guest execution.
 Close the emulator with the window close button or Escape. Select text and press Ctrl+C to copy it;
 the *COPY* button copies selected text or the visible monitor screen. The Bug
@@ -178,14 +179,13 @@ branches are supported. Backslash-newline source continuations are spliced
 before preprocessing and tokenizing. Quoted includes search beside the
 including source; angle-bracket includes search the repository +toolchain/include/+ directory.
 Function-like macros support argument substitution, stringification, and token
-pasting; variadic macros remain unsupported. The Rust C frontend also supports
-console +fgets+, +puts+, and a restricted +printf+ format subset: literal text,
-+%%+, and at most one +%s+ argument. Other +printf+ conversions remain
-unsupported. Compile C sources to segmented images with the Rust build tool:
+pasting; variadic macros remain unsupported. The native compiler does not link
+console +stdio+ functions. SisuOS uses the protected console syscall API.
+Compile supported C sources through the program build workflow:
 
 [source,console]
 ----
-cargo run --bin sc16build -- examples/example.asm build/example.sc16img
+cargo run --bin sc16build -- examples/directives.asm build/example.sc16img
 cargo run --bin suomicpu16 -- build/example.sc16img
 cargo run --bin sc16build -- examples/factorial.c examples/factorial.sc16img
 cargo run --bin suomicpu16 -- examples/factorial.sc16img
@@ -361,7 +361,7 @@ otherwise, instructions do not change the condition flags.
 
 |+LDI30+
 |+LDI30 Rd, address+
-|Load a full 30-bit address (+0+ through +0x3FFFFFFF+) into a register. +LDI19+ and +LDA+ are compatibility aliases.
+|Load a full 30-bit address (+0+ through +0x3FFFFFFF+) into a register.
 |===
 
 For example:
@@ -940,67 +940,17 @@ the end of the backing memory. The map below lists reserved low-memory and
 device ranges; other addresses are ordinary RAM. The process stack starts at
 the final valid address and grows downward.
 
-The emulator declares these addresses, which now map to distinct backing
-memory ranges:
-
-[cols="1,1,1"]
-|===
-|Name
-|Address range
-|Size
-
-|Flash
-|+0x00000+-+0x3FFFF+
-|256 KiB
-
-|Low RAM
-|+0x40000+-+0x4FFFF+
-|64 KiB
-
-|VRAM
-|+0x50000+-+0x757FF+
-|153,600 bytes
-
-|Keyboard
-|+0x3ff03000+
-|1 byte
-
-|Interrupt control (+ICR+)
-|+0x3ff01000+
-|1 byte
-
-|GPU mode
-|+0x3ff05210+
-|1 byte
-
-|Held-key bitmask
-|+0x3ff03004+
-|4 bytes
-
-|Instruction-timer period
-|+0x3ff01008+-+0x3ff01009+
-|2 bytes
-
-|Mouse registers
-|+0x3ff03008+-+0x3ff0300f+
-|8 bytes
-
-|RTC seconds/minutes/hours
-|+0x3ff0400c+-+0x3ff0400e+
-|3 bytes
-|===
+The low addresses formerly reserved for control registers, displays, disk
+devices, and framebuffers are ordinary RAM. The high device aperture
+(`0x3ff00000..0x3fffffff`) is reserved for page-separated device banks; the
+complete map is in link:sc16_architecture.adoc[SC-16 architecture].
 
 The display supports 320x240 indexed 8-bit mode and 640x480 packed 4-bit mode.
-VRAM reserves 153,600 bytes (+0x50000+-+0x757FF+), enough for the larger mode.
-At 320x240, each byte is a palette index; pixel +(x,y)+ is at
-+0x50000 \+ y * 320 \+ x+. At 640x480, two pixels share a byte (left pixel in
-the high nibble, right pixel in the low nibble), using palette indices 0-15.
-The 256-entry palette names colors 0-11; index 25 is pure blue in 320x240 mode.
-Direct CPU writes update background layer 0, shown at the next display refresh.
-No CPU-visible back buffer is reserved: compositing and the other four layers
-are held in private GPU memory. The emulator executes up to 30,000 instructions
-per display frame (capped at 60 frames per second), so long drawing routines can
-finish without requiring a separate screen update for every CPU instruction.
+The framebuffer is owned by the graphics device and cannot be addressed as
+guest RAM. Graphics-bank commands and protected syscall 24 provide validated
+clear, pixel, rectangle, line, present, blit, palette, and mode operations.
+The emulator executes up to 30,000 instructions per display frame (capped at
+60 frames per second).
 When the CPU halts, the window remains open with the final frame displayed;
 press any key to close it, or close the window using its title-bar control.
 Keyboard input is exposed through the high-bank input device. Reading its key
@@ -1014,13 +964,9 @@ directory, file and metadata operations. The former low register window at
 +0x43100+-+0x431FF+ is ordinary RAM and has no filesystem handler. See
 +docs/sc16_architecture.adoc+ for the high-bank request layout and access rules.
 
-The former guest block interface is removed. Original JSON block-disk files
-remain as import sources and can be converted with
-+sc16build import-block-disk+. +programs/disk-editor/src/disk_editor.c+ is now a
-USER-mode text-file editor for the mounted folder disk; it creates or updates
-files up to 256 bytes and leaves protected files unchanged. Tank-16's
-+toolchain/include/disk.h+ file-list helper retains recursive directory listing for legacy
-program code; file reads use the folder-filesystem read command.
+The former guest block interface and its JSON import utility are removed.
+Folder disks are the only supported disk format. Program sources that depended
+on the former block or graphics interfaces remain unsupported until migrated.
 
 == 8. Bitmap font
 
@@ -1041,12 +987,9 @@ index +character_code - 0x20+ starts at +0x4400 \+ index * 8+; the Finnish
 glyphs have indexes 95-100. Each byte describes one horizontal row:
 bits 7 through 3 are the five visible pixels (left to right), bit 2 is the
 blank sixth column, and bits 1 and 0 are unused. The eighth row is blank. Thus,
-the glyph bitmap is 5x7 inside a 6x8 cell. For +GFX_TEXT+, glyph ID is the ASCII
-code minus 31 (+1+ for space, +95+ for +~+), and IDs 96-101 select the Finnish
-letters in the order above; +0+ terminates the text. +SCREEN_PRINT+ accepts
-ordinary ASCII and UTF-8 strings containing those Finnish letters. The reusable
-graphics include provides a renderer that uses this table and a small mask
-table to unpack the pixels.
+the glyph bitmap is 5x7 inside a 6x8 cell. The bitmap is used by firmware and
+gallery text renderers; assembly code no longer draws it by writing a low
+framebuffer.
 
 == 9. ANSI C90 compiler
 
@@ -1221,16 +1164,14 @@ returns +NULL+; there is no command processor, so +system(NULL)+ returns zero
 and commands return -1. +assert+ evaluates its expression once and halts on a
 failed assertion unless +NDEBUG+ is defined.
 
-+<stdio.h>+ maps +stdin+, +stdout+, and +stderr+ to the emulator's
-non-seekable console. Character/string I/O, integer/text +printf+ formatting,
-and common +scanf+ conversions are supported. Console input has no EOF
-condition, and +feof+ therefore remains false. This runtime is unbuffered;
-+setvbuf+ only accepts +_IONBF+. Hosted file operations (+fopen+, +remove+,
-+rename+, and temporary files) fail with +ENOSYS+; seek/position operations on
-console streams fail with +ESPIPE+. Floating-point +printf+ conversions and
-+scanf+ scansets are not implemented. +fscanf+ can read the console stream but
-not files. The standard does not require a file system for freestanding
-implementations; this emulator's current data disks do not provide C streams.
++<stdio.h>+ declares the standard stream interfaces, but the native compiler
+does not link console functions such as +getchar+, +puts+, or +printf+.
+SisuOS uses protected console syscalls. The compiler links a syscall-backed
+unbuffered subset for folder-disk files when one of the supported file APIs is
+used: +fopen+, +freopen+, +fclose+, +fgetc+, +fputc+, +fread+, +fwrite+,
++fseek+, +ftell+, +ungetc+, +clearerr+, +feof+, and +ferror+. +remove+ is
+unsupported and sets +ENOSYS+; floating-point formatting and other hosted
+stdio facilities remain unavailable.
 
 +<locale.h>+ supports only the +"C"+ locale. +<time.h>+ provides calendar
 conversion, formatting, and elapsed-time conversion in UTC. +localtime+ is
@@ -1368,21 +1309,10 @@ emulator diagnostics only. Its *CLOSE MONITOR* button and F2 hide the monitor
 without changing guest execution. *COPY* copies selected text or the
 visible monitor screen; Ctrl+C copies selected text. The 1,000-row diagnostic
 scrollback can be navigated with the mouse wheel. Emulator lifecycle and
-device errors are tagged by severity. Guest C programs can include
-+<bug_monitor.h>+ and call the dedicated diagnostic logging functions:
-
-[source,c]
-----
-bug_monitor_debug("entered update loop");
-bug_monitor_info("player ready");
-bug_monitor_warning("low on memory");
-bug_monitor_error("unable to load level");
-----
-
-The functions write +[DEBUG]+, +[INFO]+, +[WARN]+, or +[ERROR]+ followed by
-the message and a newline to the Bug Monitor; they do not appear in the guest
-terminal. The guest console input path remains available to guest programs.
-To start a new BIOS session, close and relaunch the emulator.
+device errors are tagged by severity. The Bug Monitor is host-side diagnostic
+output; guest programs cannot write to it. Guest console access is provided by
+the kernel's validated console services. To start a new BIOS session, close
+and relaunch the emulator.
 Type into the main emulator window to send input to the guest terminal; Enter
 and Backspace are supported. Press F2 in the emulator window to hide/show the
 Bug Monitor. An empty console-status poll yields the current instruction frame
@@ -1408,84 +1338,28 @@ Images built and launched from a source path by +run.ps1+ without +--disk+
 use that source program's +disks/+ directory through a host-configured
 read-only mount. When a folder disk is selected, its data and policies take
 precedence. Tank-16 reads maps and tile assets from its packaged folder disk.
-The old JSON block format is no longer a guest device; original JSON files
-remain available to +sc16build import-block-disk+.
-
-Tank-16 uses this generic API to load map JSON from
-+programs/tank-16/assets/disk/maps/+ at round start. The first round prefers
-+FINLAND.json+; subsequent rounds randomly select among the JSON maps in that
-folder. Finite maps use the map editor's tile-grid format. An infinite map
-uses +"infinite": true+, a seed, row-major terrain tile IDs, and optional
-obstacle density and tile IDs; terrain and obstacles are generated
-deterministically from tile coordinates. Only graphics atlases are included in
-the Tank-16 executable, not map data. The map editor mirrors saved maps into
-the program's +disks/maps/+ folder.
+Folder-backed disks are the only supported disk format. Archived JSON block
+images are not read by the emulator or build tools.
 
 Programs booted from a folder disk access their selected disk through the
-protected syscall ABI. The former +folder_fs.h+ and +disk.h+ pointer-based
-register interfaces are not supported by the revised hardware contract.
+protected syscall ABI. The former pointer-based low-register filesystem
+interfaces and their helper headers have been removed.
 Supervisor firmware uses the separate high filesystem bank documented in
 link:sc16_architecture.adoc[+sc16_architecture.adoc+].
 
-+<stdio.h>+ currently provides console +getchar+, +putchar+, +puts+, +gets+,
-+fgetc+, +fgets+, +fputc+, +fputs+, +printf+, +fprintf+, +vprintf+, and +vfprintf+.
-+gets+ follows C90 line-reading semantics and, like the standard function, does
-not bound writes to the supplied buffer. The formatter
-handles integer, character, string, and pointer conversions (+d+, +i+, +u+,
-+o+, +x+, +X+, +c+, +s+, +p+, +n+, and +%%+) with field width and precision.
-Unsupported conversions return +EOF+. File-backed streams and floating-point
-conversions are still unimplemented; this is a useful hosted-I/O subset, not a
-claim of complete C90 +stdio+ conformance.
-
-When a screen routine is referenced, the compiler links link:../toolchain/runtime/lib_text.asm[+toolchain/runtime/lib_text.asm+], which uses
-link:../firmware/fonts/font5x7.asm[+firmware/fonts/font5x7.asm+] to provide a 53-column by 30-row text
-grid of 6x8 cells:
-
-[cols="1,1,1"]
-|===
-|Routine
-|C signature
-|Behavior
-
-|+SCREEN_CLEAR+
-|+void SCREEN_CLEAR(void)+
-|Clear the display and reset the cursor to +(0, 0)+.
-
-|+SCREEN_SET_CURSOR+
-|+void SCREEN_SET_CURSOR(unsigned char column, unsigned char row)+
-|Set the zero-based text cursor.
-
-|+SCREEN_GET_CURSOR+
-|+int SCREEN_GET_CURSOR(void)+
-|Return +(row << 8) \| column+.
-
-|+SCREEN_PUTCHAR+
-|+void SCREEN_PUTCHAR(char ch, unsigned char color)+
-|Draw one character; newline/carriage return advance to the next row.
-
-|+SCREEN_PRINT+
-|+void SCREEN_PRINT(char *text, unsigned char color)+
-|Print a zero-terminated string.
-
-|+SCREEN_INPUT+
-|+unsigned int SCREEN_INPUT(char *buffer, unsigned int capacity, unsigned char color)+
-|Read and echo a line, NUL-terminate it, and return its character count. +capacity+ is the maximum character count, so reserve at least +capacity \+ 1+ bytes for the buffer. Enter finishes and Backspace edits.
-|===
-
-Screen text input accepts printable ASCII and Latin-1 keys, echoes the entered
-glyphs, and uses Enter as the line terminator. The library reserves scratch bytes near +0x4300+;
-do not use that region for application data while a screen routine is running.
-See link:../programs/text-demo/src/text_demo.c[+programs/text-demo/src/text_demo.c+] for a C example.
+The target +<stdio.h>+ header declares C90 interfaces, but the native compiler
+only links the syscall-backed file-stream subset described above. Console
+formatted I/O, scanning, buffering, and several standard stream functions are
+not implemented by the current native runtime; this is not complete C90
++stdio+ conformance.
 
 Generated C code uses the far control instructions (+JMPX+, +CALLX+, +BZX+,
 +BCX+). Address 0 holds an entry stub; +0x0002+-+0x0005+ hold interrupt
 vectors, and the boot routine at +0x0006+ calls +main+. Compiled code starts at
 +0x4800+; global data starts at +0x80000+. Return addresses preserve the full
 30-bit PC; code is no longer
-restricted to addresses below +0x10000+ for call/return correctness. Libraries use fixed
-low-memory locations: +lib_gfx+ at +0x400+, +lib_text+ at +0x700+, and
-+lib_cgfx+ at +0x1000+. The legacy graphics libraries target the retired
-low-address GPU interface and are unsupported by the current emulator.
+restricted to addresses below +0x10000+ for call/return correctness. The
+supported hosted runtime and syscall bridge use fixed low-memory sections.
 The compiler/assembler reports errors when emitted
 sections overlap or stack frames exceed supported limits. The command-line
 compiler writes a flat +.bin+ image with address gaps zero-filled; the emulator
@@ -1517,276 +1391,29 @@ The low-address graphics coprocessor, layered renderer, sprite/tile storage,
 and 3D command interface are retired; those addresses no longer operate
 graphics hardware.
 
-SC-NET is separate from the game networking API below. C programs that include
+SC-NET is independent of the retired game networking API. C programs that include
 +toolchain/include/sc16_net.h+ can discover emulator node IDs, send messages to discovered
 peers, and receive messages nonblockingly. Node IDs are set in BIOS and
 collisions prevent disk boot. SC-NET uses a separate host UDP service on port
-47017; it is transport infrastructure, while game programs continue to use
-their own titles and application protocols.
-
-=== LAN games (+net_*+)
-
-Games can talk to other emulator instances on the local network without any server program:
-every instance is a peer and finds the others with small UDP broadcast packets (port 47016,
-change with +--net-port+; all players must use the same port). Instances only see peers that
-called +net_open+ with the *same title* (up to 16 characters), so "pacman" ignores "elite".
-At most 8 instances share a title; each gets a slot 0-7 (settled about 0.6 s after joining, +net_ready()+;
-an already settled player keeps its slot against a newcomer). Peers that vanish time out after about 3.5 s; +net_close()+ leaves immediately.
-Broadcasts are not delivered back to the sender. Delivery is UDP: messages can be lost or reordered,
-so send state continuously rather than relying on single events.
-
-[cols="1,1"]
-|===
-|Function
-|Description
-
-|+int net_open(char *title)+
-|Join the group for +title+; 1 = ok.
-
-|+void net_close(void)+
-|Leave the group.
-
-|+int net_send(unsigned char *data, int len)+
-|Broadcast 1..+NET_MAX_MSG+ (48) bytes to all other instances; 1 = sent.
-
-|+int net_recv(unsigned char *buf)+
-|Pop the next message into +buf+; returns its length, 0 if none.
-
-|+int net_sender(void)+
-|Slot of the sender of the last received message.
-
-|+int net_players(void)+
-|Live instances including this one.
-
-|+int net_slot(void)+
-|Own slot 0-7, -1 when not joined.
-
-|+int net_active(int slot)+
-|1 if a player occupies +slot+.
-
-|+int net_ready(void)+ / +int net_full(void)+ / +int net_is_open(void)+
-|Slot settled / group had no free slot / joined.
-|===
-
-Windows may need to allow the application through the firewall for private
-networks.
-link:../programs/netgame-demo/src/net_game_demo.c[+programs/netgame-demo/src/net_game_demo.c+]
-shows the pattern.
-
-=== Games
-
-link:../programs/asteroids/src/asteroids.c[+programs/asteroids/src/asteroids.c+] and
-link:../programs/space-invaders/src/space_invaders.c[+programs/space-invaders/src/space_invaders.c+]
-are complete playable games with score, lives, and restart.
-link:../programs/pacman/src/pacman.c[+programs/pacman/src/pacman.c+] is a 19x21-tile maze game
-with four ghosts, power pellets, a wrap-around tunnel, lives, and levels. Build
-and run one from the repository root:
-
-[source]
-----
-cargo run --bin sc16build -- "programs/asteroids/src/asteroids.c" asteroids.sc16img
-cargo run -- asteroids.sc16img
-----
-
-link:../examples/factorial.c[+examples/factorial.c+] and
-link:../programs/text-demo/src/text_demo.c[+programs/text-demo/src/text_demo.c+] demonstrate C
-recursion and text input/output.
-link:../programs/sc16-showcase/src/sc16_showcase.c[+programs/sc16-showcase/src/sc16_showcase.c+]
-is an eight-page tour of the SC-16's CPU, memory, graphics, text, devices, and
-benchmark features.
-
-link:../programs/hertta-3d/src/hertta3d.c[+programs/hertta-3d/src/hertta3d.c+] is a first-person
-maze game rendered with the SC-GPU. Move with W/S, turn with A/D, and throw
-treats with Space. Hertta wanders through the maze; feed her enough treats and
-she will come to you to finish the level. Later levels add maze walls and make
-Hertta faster. The connected maze is generated with a route between you and
-Hertta; she wanders through its passages and finds a path to you after the treats.
-Visible wall cells are drawn as outlined surfaces, and the minimap uses solid
-wall tiles with separate markers for you and Hertta.
-
-All games and the showcase play sound effects through +gfx_sound+ (lasers, explosions,
-engine rumble, pellet and ghost sounds, page and benchmark beeps); sound is
-synthesized by the emulator and needs a working audio device.
-
-Controls: Left/Right (A/D) steer or move; Up (W) thrusts in Asteroids; Space
-fires; Enter or Space restarts after GAME OVER. In Pac-Man, all four directions
-steer. The showcase uses Left/Right (A/D) to change pages and Enter to run the
-benchmark on page 8. Game run time is roughly 15,000-25,000 emulated
-instructions per frame.
+47017. The former title-based game network API and its compiler assembly
+library have been removed.
 
 == 10. Examples
 
-* link:../examples/example.asm[+examples/example.asm+] draws a letter +H+ into the emulated display
-  memory.
 * link:../examples/commands.asm[+examples/commands.asm+] contains at least one
   example of every supported instruction mnemonic. +EI+, +DI+, and +RTI+ are
   placed after +HALT+ so they are assembled but not executed by this tour.
 * link:../examples/directives.asm[+examples/directives.asm+] demonstrates +.address+
   and all +.data+ formats across multiple memory locations.
-* link:../examples/gfx_demo.asm[+examples/gfx_demo.asm+] demonstrates plot, line,
-  rectangle, sprite, and text routines.
 * link:../examples/factorial.c[+examples/factorial.c+] demonstrates the C compiler,
   recursive calls, local variables, arithmetic, and a +for+ loop.
-* link:../programs/anaclock/src/anaclock.c[+programs/anaclock/src/anaclock.c+] displays the emulator RTC as a
-  live clock with five classic analog faces, a Nixie-tube simulation, and a
-  split-flap flip clock. Each analog face has its own hand design, Nixie digits
-  dim and re-ignite when they change, and flip cards animate each change.
-  Press Tab to cycle through the seven faces. Run it with
-  +cargo run -- --disk anaclock+ (BIOS preselects the bundled disk).
-* link:../programs/elite/src/elitedemo.c[+programs/elite/src/elitedemo.c+] is a first-person Elite-style
-  space-combat prototype around a planet with two orbiting moons, drifting
-  asteroids and patrolling enemy fighters that dogfight and shoot back. Flight is
-  Newtonian-inspired: the ship keeps its velocity when it turns. Arrows pitch/yaw
-  (Up = nose up), Q/E roll, X or Shift thrust, Z or Ctrl reverse, Space fires a
-  heat-limited laser. It has regenerating shields, a hull, collisions with every
-  body, a 3D radar and a HUD. It needs roughly 100,000 instructions per frame.
-  Run it with +cargo run -- --disk elite+.
-* link:../programs/lunar-lander/src/lunarlander.c[+programs/lunar-lander/src/lunarlander.c+] is a Lunar Lander game with
-  gravity, inertia, limited fuel, procedural terrain with x2/x3/x5 landing pads,
-  exhaust, dust and explosion particles, a starfield with the Earth, a HUD with
-  altitude, velocity and fuel, and synthesized sound (engine, RCS, ambient drone,
-  landing jingle, crash). Modes: Classic, Practice (unlimited fuel) and Challenge
-  (rough terrain, stronger gravity), each with three difficulty levels. Space fires
-  the main engine, Left/Right (A/D) rotate; in the menu Up/Down picks the mode,
-  Left/Right the difficulty and Enter starts. Score = (fuel + speed bonus +
-  accuracy bonus) x pad multiplier. Run it with
-  +cargo run -- --disk lunar-lander+.
-* link:../programs/paint/src/paint.c[+programs/paint/src/paint.c+] is an MS Paint style drawing program driven by the
-  mouse: pen, eraser, spray, line, rectangle and filled rectangle with live shape previews,
-  four brush sizes and a 16-color palette. Left button draws with the foreground color, right
-  button with the background color; double-click a palette color to fill the canvas and
-  double-click CLR to clear it.   Images cannot be saved. Run it with +cargo run -- --disk paint+.
-* link:../programs/netgame-demo/src/net_game_demo.c[+programs/netgame-demo/src/net_game_demo.c+] is a LAN demo: start it in up to 8
-  emulator instances on one network; each player moves a coloured square (arrows) and Space
-  broadcasts a ping ring to all others. Run it with
-  +cargo run -- --disk netgame-demo --net-port 47016+.
-* link:../programs/spacecave/src/spacecave.c[+programs/spacecave/src/spacecave.c+] (SpaceCave) is an Asteroids-style LAN dogfight
-  for up to 8 pilots inside a procedurally generated cave with auto-repairing defence turrets.
-  Start it in one emulator per player (+cargo run -- --disk spacecave), type a nickname and
-  press Enter. Left/Right rotate, Up thrust, Space fire, hold Tab for the full scoreboard. The
-  lowest network slot acts as the authoritative host: clients only send their keys, the host simulates
-  and broadcasts ships, bullets, turrets and scores, and the cave is rebuilt from a broadcast seed.
-  A disconnected pilot's score stays on the board (slot reserved) for 10 s; a destroyed ship
-  respawns after 10 s at a safe random spot. If the host leaves, the next slot takes over.
-  In the menu, Left/Right switches between *Classic* (pure dogfight) and *Mission* mode; clients
-  follow the host's mode. Mission mode adds one target per map (type chosen by the map seed):
-  a *beacon* (fly into it, +150), a _reactor_ (shoot it down, +300, rebuilt elsewhere) or six
-  *crystals* (+40 each, +140 for the last), plus four roaming drones (+25 when shot; they chase
-  pilots in line of sight and damage them on contact). An edge marker points to the nearest target.
 * link:../programs/text-demo/src/text_demo.c[+programs/text-demo/src/text_demo.c+] demonstrates C text output,
-  cursor positioning, buffered keyboard input, and printing.
-* link:../programs/asteroids/src/asteroids.c[+programs/asteroids/src/asteroids.c+] and
-  link:../programs/space-invaders/src/space_invaders.c[+programs/space-invaders/src/space_invaders.c+]
-  are playable C games.
-* link:../programs/pacman/src/pacman.c[+programs/pacman/src/pacman.c+] is a tile-based maze game with ghost
-  AI, power pellets, and tunnel wrapping.
-* link:../programs/sc16-showcase/src/sc16_showcase.c[+programs/sc16-showcase/src/sc16_showcase.c+] presents an interactive
-  eight-page SC-16 feature tour and benchmark. The playable games are written in C
-  and use the graphics API; their controls are described in the Games section.
+  buffered keyboard input, and printing.
 
 These examples document the current assembler and emulator behavior. Register
 arithmetic is not strictly limited to eight bits, and the CPU's +LDI+ pair loads
 16-bit values; these are implementation details rather than guarantees of a
 conventional 8-bit processor.
-
-== 11. Reusable graphics library
-
-link:../toolchain/runtime/lib_gfx.asm[+toolchain/runtime/lib_gfx.asm+] provides assembly-callable routines.
-Include it after the main code (its routines occupy addresses starting at
-+0x0400+):
-
-[source,asm]
-----
-.address 0x0100
-start:
-    LDI R0, 20
-    LDI R1, 20
-    LDI R2, 25
-    CALL GFX_PLOT
-    HALT
-.include "toolchain/runtime/lib_gfx.asm"
-----
-
-+CALL+/+RET+ and the full-width conditional branches support reusable routines.
-The graphics library calling conventions are:
-
-[cols="1,1,1"]
-|===
-|Routine
-|Inputs
-|Effect
-
-|+GFX_PLOT+
-|+R0=x+, +R1=y+, +R2=color+
-|Write one palette index at a pixel. Preserves +R0+-+R3+; clobbers +R4+-+R7+.
-
-|+GFX_CLEAR+
-|none
-|Clear all 320x240 pixels to color 0. Clobbers all registers.
-
-|+GFX_HLINE+
-|+R0=x+, +R1=y+, +R2=length+, +R3=color+
-|Draw a horizontal line. Length must be 1-255. Clobbers +R0+, +R2+, and +R4+-+R7+.
-
-|+GFX_RECT+
-|+R0=x+, +R1=y+, +R2=width+, +R3=height+, +R4=color+
-|Draw a filled rectangle. Width and height must be 1-255. Clobbers all registers.
-
-|+GFX_SPRITE+
-|+R0=x+, +R1=y+, +R2=width+, +R3=height+, +R4=data address+
-|Draw row-major palette bytes; zero is transparent. Clobbers all registers.
-
-|+GFX_TEXT+
-|+R0=x+, +R1=y+, +R2=text-data address+, +R3=color+
-|Draw 6x8 cells using the font include. Clobbers all registers.
-|===
-
-Coordinates are pixels from the top-left. Drawing beyond the screen is not
-clipped. Pixel and sprite colors are palette indexes. A sprite is a sequence of
-+width * height+ bytes; +.data hex+ is suitable for small sprites. Text data
-consists of glyph IDs: printable ASCII uses its character code minus 31, IDs
-96-101 select +ÃƒÆ’Ã‚Â¶ÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¥ÃƒÆ’Ã¢â‚¬â€œÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Â¦+, and +0+ terminates the text. +GFX_TEXT+ accepts a full
-30-bit text pointer. Its x/y inputs are stored as bytes and therefore should be in the
-range 0-255. Its scratch bytes at +0x4300+-+0x4306+ are reserved while it runs.
-Include the glyph data so it is loaded at +0x4400+; the mask table is supplied
-by +lib_gfx.asm+ at +0x4200+.
-
-These routines are simple reference implementations rather than optimized
-renderers. In particular, +GFX_CLEAR+, +GFX_RECT+, +GFX_SPRITE+, and +GFX_TEXT+
-execute many instructions per pixel. Use them sparingly in timing-sensitive
-loops. Code, graphics scratch data, and the stack must not overlap.
-
-== SC-16 showcase and timing/interrupt additions
-
-GPU commands 11 and 12 (in addition to 1-10):
-
-[cols="1,1,1"]
-|===
-|Cmd
-|Name
-|Effect
-
-|11
-|TICKS
-|Frame counter written big-endian to RESULT (+14/+15)
-
-|12
-|RTC
-|RTC register selected by COLOR (0 sec, 1 min, 2 hour) to RESULT (+14)
-|===
-
-C builtins include +gfx_ticks()+ and +gfx_rtc(field)+. Until a guest kernel
-provides an interrupt/syscall service, +gfx_irq_init()+ is a no-op and
-+gfx_irq_ticks()+ / +gfx_irq_keys()+ return zero; USER programs cannot install
-interrupt handlers or execute +EI+. See
-link:sc16_architecture.adoc[+sc16_architecture.adoc+] for the IDT and interrupt
-frame contract. The C entry stub is +JMP __c_boot+ at 0 with boot code at 6.
-C globals start at 0x80000.
-
-Run the showcase (9 pages; Left/Right or A/D change page, Enter runs the benchmark on page 8 and a quick speed measurement on page 9, which compares the SC-16 in MIPS with the Intel 4004, 8088, 6502, 68000, 486DX2-66, CRAY-1 and Raspberry Pi A):
-
-    cargo run --bin sc16build -- "programs/sc16-showcase/src/sc16_showcase.c" showcase.sc16img
-    cargo run -- showcase.sc16img
 
 == CPU execution
 

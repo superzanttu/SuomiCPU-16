@@ -12,8 +12,7 @@ Runtime, tools, and tests are implemented in Rust.
   (not a fully conforming C90 implementation; see the
   link:docs/user_guide.adoc#9-ansi-c90-compiler[user guide]).
 * Memory-mapped console, BIOS folder-disk boot selection and guest filesystem,
-  legacy JSON disk import, a layered GPU with 640x480x4-bit VRAM, hardware
-  tile/sprite engines, and a fixed-point 3D graphics coprocessor.
+  protected console and graphics services, and high-bank device interfaces.
 * Keyboard, RTC, and programmable instruction-timer interrupts for
   software-managed task scheduling.
 
@@ -34,8 +33,8 @@ must have valid +disk.json+ metadata and exactly one boot executable:
 Both or neither produces +NOT_BOOT+; errors remain visible so another disk
 can be selected. BIOS loads prebuilt SC-16 images without compiling source.
 Use +--disk ID+ to preselect a folder boot disk in BIOS or mount that folder
-filesystem alongside a directly launched program. Legacy JSON block disks are
-kept only as import sources; use +sc16build import-block-disk+ to convert them.
+filesystem alongside a directly launched program. Folder disks are the only
+supported disk format; old JSON block-disk files are not loadable or importable.
 See +docs/sc16_disk_format.adoc+ for the folder format and kernel-code trust
 model.
 In windowed mode, the *BUG MONITOR* toolbar button opens emulator diagnostics
@@ -62,12 +61,12 @@ not installed programs.
 [source,powershell]
 ----
 .\scripts\build-programs.ps1 sisuos -Install
-.\scripts\build-programs.ps1 -Install
 .\run.ps1 .\disks\sisuos
 ----
 
-See link:docs/programs.adoc[Building, installing, and migrating programs] for
-the per-program/all-program commands, manifests, and safe disk updates.
+SisuOS is the supported guest workload for the current hardware interface.
+Other program sources are left untouched and may still depend on removed
+legacy headers. See link:docs/programs.adoc[program build and disk details].
 Program disk names and IDs now match their slugs. Data disks +DISK0001+ and
 +DISK0002+ are unchanged.
 
@@ -96,41 +95,14 @@ against these sources and exercises the shell and preempted demo.
 Run an example directly from the repository root:
 [source,console]
 ----
-cargo run --bin sc16build -- examples/example.asm example.sc16img
+cargo run --bin sc16build -- examples/directives.asm example.sc16img
 cargo run --bin suomicpu16 -- example.sc16img
 ----
-
-For five analog clock styles, a Nixie-tube display, and a flip clock, run:
-[source,console]
-----
-cargo run --bin sc16build -- programs/anaclock/src/anaclock.c anaclock.sc16img
-cargo run -- anaclock.sc16img
-----
-Press Tab to cycle through the seven clock faces.
-
-For a first-person Elite-style space combat demo, run:
-[source,console]
-----
-cargo run --bin sc16build -- programs/elite/src/elitedemo.c elitedemo.sc16img
-cargo run -- elitedemo.sc16img
-----
-Turn with Left/Right, increase or decrease throttle with Up/Down, and fire with
-Space. The ship accelerates and drifts with inertia; shields regenerate and the
-laser needs time to cool.
-
-Launch *Hertta-3D* directly with +programs/hertta-3d/src/hertta3d.c+, or package
-it into a folder disk for BIOS boot, for a first-person maze game rendered with the
-SC-GPU. Use W/S to move, A/D to turn, and Space to throw treats toward Hertta;
-feed her enough treats and wait for her to reach you to advance to a harder
-maze. Each visible wall cell is rendered as one outlined surface, and a solid-cell
-minimap shows the connected maze and marks you and Hertta. Hertta wanders through
-the passages and can find a path to you after eating enough treats. Its source is
-link:programs/hertta-3d/src/hertta3d.c[+programs/hertta-3d/src/hertta3d.c+].
 
 On Windows, the PowerShell launcher can run the same programs:
 [source,powershell]
 ----
-.\run.ps1 .\examples\example.asm
+.\run.ps1 .\examples\directives.asm
 ----
 It changes to the repository directory and starts the Rust emulator through
 Cargo. Make sure Rust and Cargo are available on +PATH+.
@@ -155,16 +127,9 @@ Quoted includes search beside the including source; angle-bracket includes
 search the repository +toolchain/include/+ directory. Function-like macros support argument
 substitution, stringification, and token pasting; backslash-newline source
 continuations are also supported. Variadic macros are not implemented in Rust
-yet. To compile a C file into a segmented image:
-
-[source,console]
-----
-cargo run --bin sc16build -- programs/asteroids/src/asteroids.c asteroids.sc16img
-cargo run -- asteroids.sc16img
-----
-
-See the link:docs/user_guide.adoc[user guide] for setup details, controls, and the full
-example catalog.
+yet. Only SisuOS is supported as a guest workload on the current hardware interface.
+See the link:docs/user_guide.adoc[user guide] for setup details and the supported
+assembly examples.
 
 == Rust emulator port
 
@@ -182,44 +147,31 @@ program file access still rely on the host filesystem. Rust builds +.asm+
 programs with its native assembler and compiles the documented subset of +.c+
 files directly. Unsupported C programs are rejected.
 
-Run a program with optional persistent data-disk and LAN settings:
-
-[source,console]
-----
-cargo run -- --disk netgame-demo --net-port 47016
-cargo run -- --headless disks\disk-editor
-----
-
 Build an SC-16 source file into a segmented image using the Rust tools:
 
 [source,console]
 ----
 cargo run --bin sc16build -- build-bios
 cargo run --bin sc16build -- examples\commands.asm
-cargo run --bin sc16build -- examples\example.asm example.sc16img
+cargo run --bin sc16build -- examples\directives.asm example.sc16img
 cargo run --bin sc16build -- input.bin output.sc16img
 cargo run --bin sc16build -- build-programs
 cargo run --bin sc16build -- install-programs
-cargo run --bin sc16build -- import-block-disk disks\DISK0001.json build\DISK0001
 .\scripts\build-programs.ps1 sisuos -Install
 ----
 
-The checked-in slug-named disks contain 18 prebuilt programs, including SisuOS
-and Tank-16's runtime assets. +build-programs+ writes staging output under
-+build/programs/+; +install-programs+ updates package-owned outputs and preserves
-writable disk data, reporting conflicts instead of overwriting local edits.
-BIOS and program builds are offline host tools; the guest BIOS only loads
-prebuilt disk images.
-DiskEditor is a USER-mode text-file editor for the currently mounted folder
-disk. It creates or updates files up to 256 bytes and respects disk read-only
-and protected-file policies.
++build-programs+ and +install-programs+ currently process SisuOS only and write
+staging output under +build/programs/+. Installation preserves writable disk
+data, reporting conflicts instead of overwriting local edits. Other checked-in
+program disks and sources are archived and unsupported; the guest BIOS only
+loads prebuilt disk images.
 
 In the Rust BIOS selector, choose a folder boot disk with *Up/Down* and
 *Enter*. +--disk ID+ preselects that boot disk; with an explicit program path
 it mounts the same folder filesystem for guest file operations.
 
-Original block-disk JSON files remain in +disks/+ only as import sources;
-converted folder disks are stored alongside them without modifying originals.
+Archived block-disk JSON files remain inert in +disks/+; the emulator and build
+tools do not load or import them. Folder disks are the only supported format.
 The emulator accepts prebuilt +.bin+ or +.sc16img+ files and validated disk
 folders; it does not compile source during launch. +run.ps1+ can accept a C or
 assembly source path and invokes +sc16build+ first to create a temporary

@@ -4,11 +4,11 @@
 
 == Status and scope
 
-This document defines the target machine contract and records the relevant
-legacy behavior during migration. Target rules are normative for new CPU,
-firmware, and kernel work; they do not imply that the emulator already enforces
-them. The guest character-cell display and guest-resident BIOS are implemented.
-The host renders an error screen only when the firmware image cannot be loaded.
+This document defines the enforced SC-16 machine contract. The revision-2
+physical map, high-address device banks, SC16IMG3 runtime checks, guest
+character-cell display, and guest-resident BIOS are implemented and covered by
+emulator regressions. Legacy image formats are documented only to describe
+their explicit rejection.
 
 == Machine model
 
@@ -38,10 +38,10 @@ audio, game-network, filesystem, console, firmware-text and firmware-gateway
 banks are implemented in this aperture without RAM backing. All other high
 banks remain reserved. The low console/text, interrupt/PIT, RTC, fault, BIOS, graphics and disk
 aliases have been retired and their former addresses are ordinary RAM.
-Instruction operands retain architectural
-address bits before high-device checks, including on small-memory machines;
-device accesses cannot be masked into low RAM. Legacy wrapping of nondevice RAM
-accesses remains during migration.
+Instruction operands retain architectural address bits before high-device
+checks, including on small-memory machines. Device accesses cannot be masked
+into low RAM, and ordinary RAM accesses beyond configured backing fault rather
+than wrapping.
 
 === High device map and register contracts
 
@@ -644,8 +644,9 @@ generated assembly/C images use read/write/execute permissions because their
 current layout can combine code and mutable data. The container does not
 select privilege: the fixed folder-disk rule selects `kernel.bin` as
 supervisor code or `main.bin` as user code. The current BIOS user boot path
-does not yet build an address space automatically; user mode without MMU
-translation is compatibility mode, not memory isolation.
+does not build an address space as part of BIOS handoff; the selected guest
+kernel controls MMU setup. A user image started without translation has
+privilege restrictions but no RAM isolation.
 
 `sc16asm` assembles an assembly source to this container. `sc16build` compiles
 the currently supported C subset, assembles source, or wraps a flat binary,
@@ -1056,7 +1057,6 @@ contract:
   data at offset 0, foreground at 1, background at 2, control at 3, row at 4,
   and column at 5. Control commands 1, 2, and 3 clear, enable, and disable the
   surface. Cursor coordinates are zero-based and clamped to the surface. The
-  register definitions are in +toolchain/include/guest_text.h+.
 * The text surface is overlaid after pixel graphics; enabling it does not
   disable or replace the existing game graphics window. It is disabled on
   reset and is not the serial diagnostics/Bug Monitor channel.

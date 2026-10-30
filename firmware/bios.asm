@@ -4,10 +4,10 @@
 bios_entry:
     LDI R4, 0
     LDI R0, 1
-    LDA R5, 0x4fffe
+    LDI30 R5, 0x4fffe
     ST R5, R0
     LDI R0, 0
-    LDA R5, 0x4ffff
+    LDI30 R5, 0x4ffff
     ST R5, R0
     LDI R0, 4
     LDI30 R5, 0x3ff0a002
@@ -27,16 +27,16 @@ bios_entry:
     LDW R0, R5
     LDI30 R5, 0x3ff0b006
     LD R2, R5
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     ST R5, R2
     LDI R2, 0
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     ST R5, R2
-    LDA R5, 0x5022
+    LDI30 R5, 0x5022
     ST R5, R2
     CMP R1, R4
     BZ empty_disks
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     LD R2, R5
     CMP R2, R4
     BNZ automatic_boot
@@ -45,10 +45,10 @@ bios_entry:
 automatic_boot:
     LDI30 R5, 0x3ff0b002
     STW R5, R0
-    LDA R6, startup_prompt
+    LDI30 R6, startup_prompt
     CALL print_string
     LDI R3, 1
-    LDA R5, 0x4ffff
+    LDI30 R5, 0x4ffff
     ST R5, R3
 autoboot_wait:
     LDI30 R5, 0x3ff03000
@@ -62,7 +62,7 @@ autoboot_wait:
     CMP R2, R3
     BNZ autoboot_wait
     LDI R3, 0
-    LDA R5, 0x4ffff
+    LDI30 R5, 0x4ffff
     ST R5, R3
     LDI30 R5, 0x3ff0b002
     LDW R0, R5
@@ -76,12 +76,12 @@ autoboot_wait:
     CMP R3, R4
     BNZX boot_failed
     LDI R3, 0
-    LDA R5, 0x4fffe
+    LDI30 R5, 0x4fffe
     ST R5, R3
     JMPX autoboot_halted
 enter_setup:
     LDI R3, 0
-    LDA R5, 0x4ffff
+    LDI30 R5, 0x4ffff
     ST R5, R3
     LDI30 R5, 0x3ff0b002
     LDW R0, R5
@@ -142,10 +142,10 @@ copy_firmware_output_done:
 render_custom_settings:
     PUSH R0
     LDI R3, 0
-    LDA R5, 0x5026
+    LDI30 R5, 0x5026
     ST R5, R3
 render_custom_loop:
-    LDA R5, 0x5026
+    LDI30 R5, 0x5026
     LD R3, R5
     LDI30 R5, 0x3ff0b00e
     LD R2, R5
@@ -159,13 +159,13 @@ render_custom_loop:
     ST R5, R2
     LDI R6, 3
     ADD R6, R3
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R2, R5
     CMP R2, R6
     BNZ render_custom_value
     PUSH R0
     PUSH R1
-    LDA R7, 0x5120
+    LDI30 R7, 0x5120
     LDI30 R6, 0x3ff0b030
     LDI R3, 42
 render_custom_edit_overlay:
@@ -179,24 +179,24 @@ render_custom_edit_overlay:
     POP R1
     POP R0
 render_custom_value:
-    LDA R5, 0x5026
+    LDI30 R5, 0x5026
     LD R3, R5
     LDI R6, 3
     ADD R6, R3
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R2, R5
     CMP R2, R6
     BNZ render_custom_unselected
     LDI R3, 5
     LDI30 R5, 0x3ff0a001
     ST R5, R3
-    LDA R6, custom_selected
+    LDI30 R6, custom_selected
     JMP render_custom_prefix
 render_custom_unselected:
     LDI R3, 1
     LDI30 R5, 0x3ff0a001
     ST R5, R3
-    LDA R6, custom_unselected
+    LDI30 R6, custom_unselected
 render_custom_prefix:
     CALL print_string
     LDI30 R6, 0x3ff0b030
@@ -208,26 +208,26 @@ render_custom_prefix:
     LDI R3, 1
     CMP R2, R3
     BZ render_custom_string
-    LDA R6, custom_number_type
+    LDI30 R6, custom_number_type
     JMP render_custom_type
 render_custom_boolean:
-    LDA R6, custom_boolean_type
+    LDI30 R6, custom_boolean_type
     JMP render_custom_type
 render_custom_string:
-    LDA R6, custom_string_type
+    LDI30 R6, custom_string_type
 render_custom_type:
     CALL print_string
     LDI30 R6, 0x3ff0b042
     CALL print_string
-    LDA R6, newline
+    LDI30 R6, newline
     CALL print_string
-    LDA R5, 0x5026
+    LDI30 R5, 0x5026
     LD R3, R5
     INC R3
     ST R5, R3
     JMP render_custom_loop
 render_custom_done:
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R3, R5
     CMP R3, R4
     BZX render_custom_done_color
@@ -258,7 +258,7 @@ empty_disks:
     LDI R0, 6
     LDI30 R5, 0x3ff0a001
     ST R5, R0
-    LDA R6, no_disks
+    LDI30 R6, no_disks
     CALL print_string
 empty_wait:
     JMP empty_wait
@@ -271,15 +271,15 @@ menu_render:
     LDI R0, 6
     LDI30 R5, 0x3ff0a001
     ST R5, R0
-    LDA R6, frame_top
+    LDI30 R6, frame_top
     CALL print_string
-    LDA R6, title
+    LDI30 R6, title
     CALL print_string
-    LDA R6, frame_middle
+    LDI30 R6, frame_middle
     CALL print_string
-    LDA R6, settings_heading
+    LDI30 R6, settings_heading
     CALL print_string
-    LDA R6, frame_middle
+    LDI30 R6, frame_middle
     CALL print_string
 
     POP R0
@@ -299,15 +299,15 @@ menu_render:
     LDI R3, 1
     LDI30 R5, 0x3ff0a001
     ST R5, R3
-    LDA R6, boot_label
-    LDA R5, 0x5021
+    LDI30 R6, boot_label
+    LDI30 R5, 0x5021
     LD R2, R5
     CMP R2, R4
     BZ render_boot_label
-    LDA R6, boot_unselected
+    LDI30 R6, boot_unselected
     JMP render_boot_label
 render_boot_label:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R2, R5
     CMP R2, R4
     BNZ render_boot_color
@@ -316,11 +316,11 @@ render_boot_label:
     ST R5, R3
 render_boot_color:
     CALL print_string
-    LDA R6, 0x5160
+    LDI30 R6, 0x5160
     CALL print_string
-    LDA R6, boot_close
+    LDI30 R6, boot_close
     CALL print_string
-    LDA R6, newline
+    LDI30 R6, newline
     CALL print_string
     LDI R3, 0
     LDI30 R5, 0x3ff0b006
@@ -335,37 +335,37 @@ render_boot_color:
     LDI R0, 0x5080
     CALL copy_firmware_output
     POP R0
-    LDA R6, disk_info_prefix
+    LDI30 R6, disk_info_prefix
     CALL print_string
-    LDA R6, 0x5080
+    LDI30 R6, 0x5080
     CALL print_string_limited
     JMP render_disk_info_done
 render_disk_info_invalid:
-    LDA R6, disk_info_prefix
+    LDI30 R6, disk_info_prefix
     CALL print_string
-    LDA R6, invalid_disk_info
+    LDI30 R6, invalid_disk_info
     CALL print_string_limited
 render_disk_info_done:
-    LDA R6, newline
+    LDI30 R6, newline
     CALL print_string
-    LDA R6, boot_suffix
+    LDI30 R6, boot_suffix
     CALL print_string
 
     LDI R3, 1
     LDI30 R5, 0x3ff0a001
     ST R5, R3
-    LDA R6, startup_label
-    LDA R5, 0x5021
+    LDI30 R6, startup_label
+    LDI30 R5, 0x5021
     LD R2, R5
     LDI R3, 1
     CMP R2, R3
     BZ render_startup_selected
-    LDA R6, startup_unselected
+    LDI30 R6, startup_unselected
     JMP render_startup_label
 render_startup_selected:
-    LDA R6, startup_label
+    LDI30 R6, startup_label
 render_startup_label:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R2, R5
     LDI R3, 1
     CMP R2, R3
@@ -381,33 +381,33 @@ render_startup_color:
     LDI R3, 1
     LDI30 R5, 0x3ff0a001
     ST R5, R3
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     LD R2, R5
     CMP R2, R4
     BNZ render_yes
-    LDA R6, value_no
+    LDI30 R6, value_no
     CALL print_string
     JMP render_node
 render_yes:
-    LDA R6, value_yes
+    LDI30 R6, value_yes
     CALL print_string
 
 render_node:
     LDI R3, 1
     LDI30 R5, 0x3ff0a001
     ST R5, R3
-    LDA R6, node_label
-    LDA R5, 0x5021
+    LDI30 R6, node_label
+    LDI30 R5, 0x5021
     LD R2, R5
     LDI R3, 2
     CMP R2, R3
     BZ render_node_selected
-    LDA R6, node_unselected
+    LDI30 R6, node_unselected
     JMP render_node_label
 render_node_selected:
-    LDA R6, node_label
+    LDI30 R6, node_label
 render_node_label:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R2, R5
     LDI R3, 2
     CMP R2, R3
@@ -425,52 +425,52 @@ render_node_color:
     ST R5, R3
     LDI30 R6, 0x3ff0b010
     CALL print_string
-    LDA R6, newline
+    LDI30 R6, newline
     CALL print_string
     CALL render_custom_settings
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R2, R5
     CMP R2, R4
     BNZ render_edit_help
-    LDA R6, help_text
+    LDI30 R6, help_text
     JMP render_help
 render_edit_help:
-    LDA R6, edit_active_help
+    LDI30 R6, edit_active_help
 render_help:
     CALL print_string
 
-    LDA R5, 0x5022
+    LDI30 R5, 0x5022
     LD R2, R5
     CMP R2, R4
     BZ render_clean
-    LDA R6, unsaved_warning
+    LDI30 R6, unsaved_warning
     CALL print_string
 render_clean:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R2, R5
     CMP R2, R4
     BNZ render_not_boot
-    LDA R5, 0x5022
+    LDI30 R5, 0x5022
     LD R2, R5
     CMP R2, R4
     BNZ render_no_start
-    LDA R6, start_hint
+    LDI30 R6, start_hint
     CALL print_string
     JMP render_bottom
 render_no_start:
-    LDA R6, dirty_hint
+    LDI30 R6, dirty_hint
     CALL print_string
     JMP render_bottom
 render_not_boot:
-    LDA R6, edit_hint
+    LDI30 R6, edit_hint
     CALL print_string
 render_bottom:
-    LDA R6, frame_bottom
+    LDI30 R6, frame_bottom
     CALL print_string
     JMP menu_input
 
 menu_input:
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R3, R5
     CMP R3, R4
     BNZ edit_input
@@ -502,7 +502,7 @@ menu_input:
     JMP menu_input
 
 select_previous:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R3, R5
     CMP R3, R4
     BZ select_last
@@ -514,11 +514,11 @@ select_last:
     LD R3, R5
     LDI R6, 2
     ADD R3, R6
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     ST R5, R3
     JMP menu_render
 select_next:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R3, R5
     LDI30 R5, 0x3ff0b00e
     LD R6, R5
@@ -527,12 +527,12 @@ select_next:
     CMP R3, R6
     BZ select_first
     INC R3
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     ST R5, R3
     JMP menu_render
 select_first:
     LDI R3, 0
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     ST R5, R3
     JMP menu_render
 
@@ -556,7 +556,7 @@ edit_input:
     LDI R6, 8
     CMP R2, R6
     BZX edit_backspace
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R3, R5
     LDI R6, 1
     CMP R3, R6
@@ -567,7 +567,7 @@ edit_input:
     JMPX edit_custom_character
 
 edit_toggle:
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R3, R5
     LDI R6, 1
     CMP R3, R6
@@ -607,7 +607,7 @@ edit_custom_set_yes:
     ST R7, R6
     JMPX edit_custom_stage
 edit_startup_toggle:
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     LD R3, R5
     LDI R6, 1
     SUB R6, R3
@@ -615,7 +615,7 @@ edit_startup_toggle:
     JMP menu_render
 
 edit_backspace:
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R3, R5
     LDI R6, 1
     CMP R3, R6
@@ -627,7 +627,7 @@ edit_backspace:
     LD R6, R5
     CMP R6, R4
     BZX menu_input
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     LD R3, R5
     CMP R3, R4
     BZX menu_input
@@ -636,12 +636,12 @@ edit_backspace:
     ADD R7, R3
     LDI R6, 0
     ST R7, R6
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     ST R5, R3
     JMPX edit_custom_stage
 
 edit_node_backspace:
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     LD R3, R5
     CMP R3, R4
     BZX menu_input
@@ -650,7 +650,7 @@ edit_node_backspace:
     ADD R7, R3
     LDI R6, 0
     ST R7, R6
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     ST R5, R3
     JMP menu_render
 
@@ -664,7 +664,7 @@ edit_node_character:
     BCX edit_node_append
     JMP menu_input
 edit_node_append:
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     LD R3, R5
     LDI R6, 16
     CMP R3, R6
@@ -676,7 +676,7 @@ edit_node_append:
     INC R7
     LDI R6, 0
     ST R7, R6
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     ST R5, R3
     JMP menu_render
 
@@ -700,7 +700,7 @@ edit_custom_character:
     BCX edit_custom_append
     JMP menu_input
 edit_custom_number_minus:
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     LD R3, R5
     CMP R3, R4
     BNZ menu_input
@@ -714,7 +714,7 @@ edit_custom_string_character:
     BCX edit_custom_append
     JMP menu_input
 edit_custom_append:
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     LD R3, R5
     LDI30 R5, 0x3ff0b041
     LD R6, R5
@@ -735,7 +735,7 @@ edit_custom_check_limit:
     INC R7
     LDI R6, 0
     ST R7, R6
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     ST R5, R3
     JMPX edit_custom_stage
 
@@ -756,7 +756,7 @@ edit_custom_stage_loop:
     JMP menu_render
 
 edit_cancel:
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R3, R5
     LDI R6, 1
     CMP R3, R6
@@ -766,13 +766,13 @@ edit_cancel:
     BZX edit_cancel_node
     JMPX edit_finish
 edit_cancel_startup:
-    LDA R5, 0x5024
+    LDI30 R5, 0x5024
     LD R3, R5
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     ST R5, R3
     JMPX edit_finish
 edit_cancel_node:
-    LDA R7, 0x5030
+    LDI30 R7, 0x5030
     LDI30 R6, 0x3ff0b010
     LDI R3, 17
 edit_cancel_node_loop:
@@ -786,7 +786,7 @@ edit_cancel_node_loop:
     JMPX edit_finish
 
 edit_confirm:
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R3, R5
     LDI R6, 1
     CMP R3, R6
@@ -796,9 +796,9 @@ edit_confirm:
     BZX edit_confirm_node
     JMPX edit_confirm_custom
 edit_confirm_startup:
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     LD R3, R5
-    LDA R5, 0x5024
+    LDI30 R5, 0x5024
     LD R2, R5
     CMP R3, R2
     BZX edit_finish
@@ -819,7 +819,7 @@ edit_confirm_node_loop:
     BNZ edit_confirm_node_loop
     JMPX edit_finish
 edit_confirm_custom:
-    LDA R7, 0x5120
+    LDI30 R7, 0x5120
     LDI R6, 0x5050
     LDI R3, 42
 edit_confirm_custom_compare:
@@ -835,7 +835,7 @@ edit_confirm_custom_compare:
     JMPX edit_finish
 edit_confirm_custom_write:
     PUSH R0
-    LDA R7, 0x5120
+    LDI30 R7, 0x5120
     LDI30 R6, 0x3ff0b030
     LDI R3, 42
 edit_confirm_custom_copy:
@@ -846,7 +846,7 @@ edit_confirm_custom_copy:
     DEC R3
     CMP R3, R4
     BNZ edit_confirm_custom_copy
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     LD R0, R5
     LDI R3, 3
     SUB R0, R3
@@ -862,16 +862,16 @@ edit_confirm_custom_copy:
     BNZ settings_failed
 edit_mark_dirty:
     LDI R3, 1
-    LDA R5, 0x5022
+    LDI30 R5, 0x5022
     ST R5, R3
 edit_finish:
     LDI R3, 0
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     ST R5, R3
     JMP menu_render
 
 disk_left:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R3, R5
     CMP R3, R4
     BNZ menu_input
@@ -886,7 +886,7 @@ disk_left_wrap:
     DEC R0
     JMPX disk_changed
 disk_right:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R3, R5
     CMP R3, R4
     BNZ menu_input
@@ -902,7 +902,7 @@ disk_changed:
     JMP menu_render
 
 activate_row:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R3, R5
     CMP R3, R4
     BZX boot_selected
@@ -932,17 +932,17 @@ activate_custom_failed:
     JMPX settings_failed
 
 edit_startup:
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     LD R3, R5
-    LDA R6, 0x5024
+    LDI30 R6, 0x5024
     ST R6, R3
     LDI R3, 1
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     ST R5, R3
     JMP menu_render
 edit_node:
     LDI R3, 0
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     ST R5, R3
     LDI30 R7, 0x3ff0b010
 node_length:
@@ -953,7 +953,7 @@ node_length:
     INC R7
     JMPX node_length
 node_length_done:
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     ST R5, R3
 node_backup:
     LDI30 R7, 0x3ff0b010
@@ -968,13 +968,13 @@ node_backup_loop:
     CMP R3, R4
     BNZX node_backup_loop
     LDI R3, 2
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     ST R5, R3
     JMP menu_render
 edit_custom:
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R3, R5
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     ST R5, R3
     PUSH R0
     PUSH R1
@@ -994,7 +994,7 @@ custom_backup_loop:
     BNZ custom_backup_loop
     POP R1
     POP R0
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     LDI R3, 0
     ST R5, R3
     LDI30 R7, 0x3ff0b042
@@ -1006,7 +1006,7 @@ custom_value_length:
     INC R7
     JMPX custom_value_length
 custom_edit_ready:
-    LDA R5, 0x5025
+    LDI30 R5, 0x5025
     ST R5, R3
     JMP menu_render
 reload_settings:
@@ -1023,21 +1023,21 @@ reload_settings:
     LDW R0, R5
     LDI30 R5, 0x3ff0b006
     LD R2, R5
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     ST R5, R2
     LDI R3, 0
-    LDA R5, 0x5022
+    LDI30 R5, 0x5022
     ST R5, R3
-    LDA R5, 0x5023
+    LDI30 R5, 0x5023
     ST R5, R3
-    LDA R6, settings_loaded
+    LDI30 R6, settings_loaded
     CALL print_string
     JMP menu_render
 
 save_settings:
     LDI30 R5, 0x3ff0b002
     STW R5, R0
-    LDA R5, 0x5020
+    LDI30 R5, 0x5020
     LD R2, R5
     LDI30 R5, 0x3ff0b006
     ST R5, R2
@@ -1049,22 +1049,22 @@ save_settings:
     CMP R3, R4
     BNZ settings_failed
     LDI R3, 0
-    LDA R5, 0x5022
+    LDI30 R5, 0x5022
     ST R5, R3
-    LDA R6, settings_saved
+    LDI30 R6, settings_saved
     CALL print_string
     JMP menu_render
 settings_failed:
-    LDA R6, settings_error
+    LDI30 R6, settings_error
     CALL print_string
     JMP menu_input
 
 boot_selected:
-    LDA R5, 0x5022
+    LDI30 R5, 0x5022
     LD R3, R5
     CMP R3, R4
     BNZ boot_unsaved
-    LDA R5, 0x5021
+    LDI30 R5, 0x5021
     LD R3, R5
     CMP R3, R4
     BNZ menu_input
@@ -1086,15 +1086,15 @@ boot_selected:
     LD R3, R5
     CMP R3, R4
     BNZ boot_failed
-    LDA R5, 0x4fffe
+    LDI30 R5, 0x4fffe
     ST R5, R4
     JMP menu_input
 boot_unsaved:
-    LDA R6, unsaved_warning
+    LDI30 R6, unsaved_warning
     CALL print_string
     JMP menu_render
 boot_failed:
-    LDA R6, boot_error
+    LDI30 R6, boot_error
     CALL print_string
     JMP menu_input
 

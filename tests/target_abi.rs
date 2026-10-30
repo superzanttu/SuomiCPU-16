@@ -932,15 +932,13 @@ fn far_and_register_pair_calls_save_exact_big_endian_return_addresses() {
 }
 
 #[test]
-fn full_width_address_aliases_and_register_pair_jump_preserve_high_bits() {
-    for mnemonic in ["LDI30", "LDI19", "LDA"] {
-        let image = assemble(&format!("{mnemonic} R2, 0x3F512345\nHALT"), 0).unwrap();
-        let mut cpu = Cpu::new();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(8).unwrap();
-        assert_eq!(cpu.registers[2], 0x3f512345);
-    }
+fn full_width_address_and_register_pair_jump_preserve_high_bits() {
+    let image = assemble("LDI30 R2, 0x3F512345\nHALT", 0).unwrap();
+    let mut cpu = Cpu::new();
+    cpu.load_program(&image.segments, image.entry_point)
+        .unwrap();
+    cpu.run(8).unwrap();
+    assert_eq!(cpu.registers[2], 0x3f512345);
     let image = assemble(
         "LDI R0, 0x2340\nLDI R1, 9\nJMPRP R0, R1\n\
          .address 0x92340\nHALT",

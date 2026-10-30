@@ -99,7 +99,6 @@ pub const MULDIV_OPERATIONS: &[(&str, u16)] = &[
     ("DIVS", 4),
     ("MOD", 5),
     ("MODS", 6),
-    ("LDI19", 7),
     ("LDI30", 7),
     ("LDP", 8),
     ("STP", 9),
@@ -207,7 +206,6 @@ pub const BASE_OPCODES: &[(&str, u16)] = &[
     ("HALT", OP_HALT),
     ("SVC", OP_HALT),
     ("LDI", OP_LDI),
-    ("LDA", OP_LDI),
     ("LD", OP_LD),
     ("ST", OP_ST),
     ("MOV", OP_MOV),
@@ -295,8 +293,7 @@ mod tests {
             .filter_map(|(name, value)| {
                 (!matches!(
                     *name,
-                    "LDA"
-                        | "MOVSP"
+                    "MOVSP"
                         | "FADD"
                         | "FSUB"
                         | "FMUL"
@@ -333,9 +330,9 @@ mod tests {
     #[test]
     fn aliases_and_extension_mnemonics_resolve_to_the_expected_opcode() {
         assert_eq!(lookup(BASE_OPCODES, "NOP"), Some(OP_MOV));
-        assert_eq!(lookup(BASE_OPCODES, "LDA"), Some(OP_LDI));
         assert_eq!(lookup(BASE_OPCODES, "JMPX"), Some(OP_SHR));
         assert_eq!(lookup(WIDE_OPERATIONS, "DIV32S"), Some(14));
+        assert_eq!(lookup(MULDIV_OPERATIONS, "LDI19"), None);
         assert_eq!(lookup(MULDIV_OPERATIONS, "LDI30"), Some(7));
         assert_eq!(lookup(FLOAT_OPERATIONS, "F64TOU32"), Some(31));
         assert_eq!(lookup(MISC_OPERATIONS, "SETSPH"), Some(13));
@@ -357,7 +354,7 @@ mod tests {
     fn opcode_lookup_covers_base_and_extension_mnemonics() {
         assert_eq!(opcode("HALT"), Some(OP_HALT));
         assert_eq!(opcode("NOP"), Some(OP_MOV));
-        assert_eq!(opcode("LDA"), Some(OP_LDI));
+        assert_eq!(opcode("LDA"), None);
         assert_eq!(opcode("MOVSP"), Some(OP_SHR));
         for table in [
             FAR_CONTROL_OPERATIONS,

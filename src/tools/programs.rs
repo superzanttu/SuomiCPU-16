@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+const SUPPORTED_GUEST_PROGRAMS: &[&str] = &["sisuos"];
+
 fn retry<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     for attempt in 0..5 {
         match operation() {
@@ -650,11 +652,6 @@ pub fn migrate(repository: &Path, apply: bool) -> Result<()> {
 }
 
 pub fn command(repository: &Path, command: &str, arguments: &[String]) -> Result<()> {
-    if matches!(command, "smoke-modules" | "package-modules") {
-        return Err(
-            "obsolete module command; use build-programs or install-programs (see --help)".into(),
-        );
-    }
     if command == "migrate-program-disks" {
         if arguments.len() != 1 || !matches!(arguments[0].as_str(), "--dry-run" | "--apply") {
             return Err("usage: sc16build migrate-program-disks --dry-run|--apply".into());
@@ -672,9 +669,18 @@ pub fn command(repository: &Path, command: &str, arguments: &[String]) -> Result
     let programs = catalog(repository)?;
     let selected: Vec<_> = programs
         .iter()
-        .filter(|p| all || p.slug == arguments[0])
+        .filter(|p| {
+            SUPPORTED_GUEST_PROGRAMS.contains(&p.slug.as_str()) && (all || p.slug == arguments[0])
+        })
         .collect();
     if selected.is_empty() {
+        if !all && programs.iter().any(|program| program.slug == arguments[0]) {
+            return Err(format!(
+                "program {:?} is archived and unsupported by the current hardware; only SisuOS is supported",
+                arguments[0]
+            )
+            .into());
+        }
         return Err(format!(
             "unknown program {:?}; use a canonical programs/<slug> name",
             arguments[0]
@@ -1040,12 +1046,12 @@ mod tests {
         assert!(
             cpu.mount_data_disk("APP00001")
                 .unwrap_err()
-                .contains("obsolete program disk")
+                .contains("does not exist")
         );
         assert!(
             cpu.mount_data_disk("SisuOS-1")
                 .unwrap_err()
-                .contains("sisuos")
+                .contains("does not exist")
         );
     }
 }

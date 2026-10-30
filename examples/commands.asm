@@ -58,8 +58,7 @@ jump_target:
     CALL sample_routine    ; CALL/RET and BZ encoding examples; also unreachable
     BZ sample_routine
     BC sample_routine
-    LDA R0, sample_routine ; Load a full memory address into a register
-    LDI19 R0, 0x12345      ; Legacy spelling for the 30-bit immediate opcode
+    LDI30 R0, sample_routine ; Load a full memory address into a register
     LDI30 R0, 0x3F51234    ; Load a 30-bit absolute address directly
     LDP R0, R1             ; Load a 30-bit pointer from the address in R1
     STP R0, R1             ; Store a 30-bit pointer through the address in R1

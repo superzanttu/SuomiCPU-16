@@ -557,28 +557,18 @@ struct NativeGlobal {
     has_initializer: bool,
 }
 
-const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 4] = [
-    (
-        "lib_cgfx.asm",
-        include_str!("../../toolchain/runtime/lib_cgfx.asm"),
-    ),
-    (
-        "lib_text.asm",
-        include_str!("../../toolchain/runtime/lib_text.asm"),
-    ),
-    (
-        "lib_stdio.asm",
-        include_str!("../../toolchain/runtime/lib_stdio.asm"),
-    ),
-    (
-        "lib_syscall.asm",
-        include_str!("../../toolchain/runtime/lib_syscall.asm"),
-    ),
-];
+const NATIVE_ASSEMBLY_LIBRARIES: [(&str, &str); 1] = [(
+    "lib_syscall.asm",
+    include_str!("../../toolchain/runtime/lib_syscall.asm"),
+)];
 
 const HOSTED_STDIO_FILE_FUNCTIONS: [&str; 14] = [
     "fopen", "fclose", "fgetc", "fputc", "fread", "fwrite", "fseek", "ftell", "ungetc", "clearerr",
     "feof", "ferror", "remove", "freopen",
+];
+
+const UNSUPPORTED_NATIVE_STDIO_FORMAT_FUNCTIONS: [&str; 8] = [
+    "printf", "fprintf", "vprintf", "vfprintf", "scanf", "fscanf", "vscanf", "vfscanf",
 ];
 
 fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
@@ -594,7 +584,7 @@ fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
-fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Expression]) -> bool {
+fn native_argument_is_pointer(function: &str, index: usize) -> bool {
     match function {
         "sc16_spawn" | "sc16_spawn_arg" | "sc16_open" | "__stdio_mode_flags" => index == 0,
         "sc16_spawn_exec" => matches!(index, 0 | 1),
@@ -606,25 +596,6 @@ fn native_argument_is_pointer(function: &str, index: usize, arguments: &[Express
         | "sc16_argument" => index == 1,
         "sc16_net_discover" => index == 0,
         "sc16_net_send" | "sc16_net_receive" => matches!(index, 0 | 1),
-        "gfx_sprite" | "gfx_bitmap" => index == 4,
-        "gfx_poly" => index == 3,
-        "gfx_sprite_upload" => index == 3,
-        "gfx_tile_upload" => index == 1,
-        "gfx_tilemap" | "gfx_tilemap_wide" | "gfx3d_draw" => index == 0,
-        "gfx_world_emitters" | "gfx_world_emitters_wide" => index == 0,
-        "gfx_text" => index == 2,
-        "puts"
-        | "bug_monitor_debug"
-        | "bug_monitor_info"
-        | "bug_monitor_warning"
-        | "bug_monitor_error" => index == 0,
-        "fgets" => matches!(index, 0 | 2),
-        "printf" if index == 0 => true,
-        "printf" => {
-            native_printf_specifiers(arguments)
-                .and_then(|specifiers| specifiers.get(index - 1).copied())
-                == Some(b's')
-        }
         _ => false,
     }
 }
@@ -637,40 +608,6 @@ fn native_argument_is_wide_integer(function: &str, index: usize) -> bool {
             0
         ) | ("sc16_seek" | "sc16_semop" | "sc16_spawn_arg", 1)
     )
-}
-
-fn native_printf_specifiers(arguments: &[Expression]) -> Option<Vec<u8>> {
-    if arguments.is_empty() {
-        return None;
-    }
-    let format = arguments
-        .first()
-        .and_then(|expression| match &expression.kind {
-            ExpressionKind::Atom(token) => decode_string_token(token),
-            _ => None,
-        })?;
-    let mut specifiers = Vec::new();
-    let mut position = 0;
-    while position < format.len() {
-        if format[position] != b'%' {
-            position += 1;
-            continue;
-        }
-        position += 1;
-        match format.get(position) {
-            Some(b'%') => position += 1,
-            Some(specifier @ (b's' | b'd' | b'i' | b'u' | b'c')) => {
-                specifiers.push(*specifier);
-                position += 1;
-            }
-            _ => return None,
-        }
-    }
-    (specifiers.len() + 1 == arguments.len() && arguments.len() <= 32).then_some(specifiers)
-}
-
-fn native_printf_call_is_supported(arguments: &[Expression]) -> bool {
-    native_printf_specifiers(arguments).is_some()
 }
 
 fn emit_native_pointer_push(assembly: &mut String) {
@@ -761,49 +698,6 @@ fn emit_native_variadic_argument(
             Some(2)
         }
         NativeArgumentKind::Byte | NativeArgumentKind::Binary32 => unreachable!(),
-    }
-}
-
-fn native_library_pointer_element_size(function: &str, index: usize) -> usize {
-    match (function, index) {
-        ("gfx3d_draw", 0) => 2,
-        _ => 1,
-    }
-}
-
-fn emit_native_library_pointer_argument(
-    function: &str,
-    index: usize,
-    expression: &Expression,
-    locals: &HashMap<String, NativeLocation>,
-    label_counter: &mut usize,
-    assembly: &mut String,
-) -> bool {
-    if let ExpressionKind::Binary {
-        operator,
-        left,
-        right,
-    } = &expression.kind
-        && matches!(operator.as_str(), "+" | "-")
-    {
-        if !emit_native_expression(left, 4, &[6, 7], locals, label_counter, assembly) {
-            return false;
-        }
-        assembly.push_str("    ADJSP -4\n    MOVSP R7\n    STP R4, R7\n");
-        if !emit_native_expression(right, 6, &[7], locals, label_counter, assembly) {
-            return false;
-        }
-        if native_library_pointer_element_size(function, index) == 2 {
-            assembly.push_str("    SHL R6, 1\n");
-        }
-        assembly.push_str("    MOVSP R7\n    LDP R4, R7\n    ADJSP 4\n");
-        assembly.push_str(&format!(
-            "    {} R4, R6\n",
-            if operator == "+" { "ADD" } else { "SUB" }
-        ));
-        true
-    } else {
-        emit_native_expression(expression, 4, &[5, 6, 7], locals, label_counter, assembly)
     }
 }
 
@@ -1868,7 +1762,10 @@ pub fn compile_minimal_program_to_assembly(
         })
         .collect();
     for (name, (arity, returns_void, variadic, has_prototype)) in &prototypes {
-        if native_library_for_symbol(name).is_some() || *variadic || !has_prototype {
+        let unsupported_stdio = UNSUPPORTED_NATIVE_STDIO_FORMAT_FUNCTIONS.contains(name);
+        if native_library_for_symbol(name).is_some()
+            || (!unsupported_stdio && (*variadic || !has_prototype))
+        {
             defined_functions.insert(
                 (*name).to_owned(),
                 (*arity, *returns_void, *variadic, *has_prototype),
@@ -2500,34 +2397,25 @@ fn expression_calls_are_defined(
             arguments,
         } => {
             let valid_target = match &function.kind {
-                ExpressionKind::Atom(name) => {
-                    defined_functions.get(name).is_some_and(
-                        |(arity, is_void, variadic, has_prototype)| {
-                            ((!has_prototype || *variadic) && arguments.len() >= *arity
-                                || *has_prototype && !variadic && *arity == arguments.len())
-                                && (allow_void_call || !is_void)
-                        },
-                    ) && (name != "printf" || native_printf_call_is_supported(arguments))
-                }
+                ExpressionKind::Atom(name) => defined_functions.get(name).is_some_and(
+                    |(arity, is_void, variadic, has_prototype)| {
+                        ((!has_prototype || *variadic) && arguments.len() >= *arity
+                            || *has_prototype && !variadic && *arity == arguments.len())
+                            && (allow_void_call || !is_void)
+                    },
+                ),
                 _ => false,
             };
             if !valid_target {
-                if matches!(&function.kind, ExpressionKind::Atom(name) if name == "printf") {
-                    eprintln!(
-                        "unsupported native printf format or argument list at line {}",
-                        expression.line
-                    );
-                } else {
-                    let target = match &function.kind {
-                        ExpressionKind::Atom(name) => name.as_str(),
-                        _ => "<indirect call>",
-                    };
-                    eprintln!(
-                        "unsupported native call {target} with {} arguments at line {}",
-                        arguments.len(),
-                        expression.line
-                    );
-                }
+                let target = match &function.kind {
+                    ExpressionKind::Atom(name) => name.as_str(),
+                    _ => "<indirect call>",
+                };
+                eprintln!(
+                    "unsupported native call {target} with {} arguments at line {}",
+                    arguments.len(),
+                    expression.line
+                );
             }
             valid_target
                 && arguments.iter().all(|argument| {
@@ -9184,13 +9072,7 @@ fn emit_native_expression(
                 return true;
             }
             let library_function = native_library_for_symbol(name).is_some();
-            let maximum_arguments = if name == "printf" {
-                32
-            } else if library_function {
-                8
-            } else {
-                32_767
-            };
+            let maximum_arguments = if library_function { 8 } else { 32_767 };
             if arguments.len() > maximum_arguments {
                 return false;
             }
@@ -9242,11 +9124,11 @@ fn emit_native_expression(
             let mut argument_bytes = 0;
             if library_function {
                 for (index, argument) in arguments.iter().enumerate().rev() {
-                    if native_argument_is_pointer(name, index, arguments) {
-                        if !emit_native_library_pointer_argument(
-                            name,
-                            index,
+                    if native_argument_is_pointer(name, index) {
+                        if !emit_native_expression(
                             argument,
+                            4,
+                            &[5, 6, 7],
                             locals,
                             label_counter,
                             assembly,
@@ -17104,92 +16986,21 @@ int main(void) { return VALUE; }"#
     }
 
     #[test]
-    fn compiles_and_runs_text_demo_stdio_subset() {
-        let image = compile_minimal_program(
-            include_str!("../../programs/text-demo/src/text_demo.c"),
-            "text-demo.c",
-        )
-        .unwrap()
-        .expect("supported Text Demo stdio calls");
-        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.receive_console_input(b"Test\n");
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(100_000).unwrap();
-        assert!(!cpu.running);
-        assert_eq!(
-            cpu.console
-                .output()
-                .windows(b"Kuka olet? Test\nHuomenta! Kohta kouluun, Test!\n".len())
-                .find(|output| *output == b"Kuka olet? Test\nHuomenta! Kohta kouluun, Test!\n"),
-            Some(&b"Kuka olet? Test\nHuomenta! Kohta kouluun, Test!\n"[..])
-        );
-    }
-
-    #[test]
-    fn printf_formats_multiple_strings_and_integer_arguments() {
-        let image = compile_minimal_program(
+    fn rejects_functions_from_the_retired_native_stdio_shim() {
+        for source in [
+            "int puts(const char *text); \
+             int main(void) { return puts(\"text\"); }",
             "int printf(const char *format, ...); \
-             int main(void) { printf(\"%s:%d,%u%%\", \"value\", -12, 34); return 0; }",
-            "printf-integers.c",
-        )
-        .unwrap()
-        .expect("supported mixed printf arguments");
-        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(10_000).unwrap();
-        assert!(!cpu.running);
-        assert!(
-            cpu.console
-                .output()
-                .windows(b"value:-12,34%".len())
-                .any(|output| output == b"value:-12,34%")
-        );
-    }
-
-    #[test]
-    fn guest_bug_monitor_functions_write_severity_tagged_serial_messages() {
-        let source = format!(
-            "{}\n{}",
-            include_str!("../../toolchain/include/bug_monitor.h"),
-            "int main(void) { \
-                bug_monitor_debug(\"step\"); \
-                bug_monitor_info(\"ready\"); \
-                bug_monitor_warning(\"slow\"); \
-                bug_monitor_error(\"failed\"); \
-                return 0; \
-            }"
-        );
-        let image = compile_minimal_program(&source, "bug-monitor.c")
-            .unwrap()
-            .expect("Bug Monitor functions should link from lib_stdio.asm");
-        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(10_000).unwrap();
-        assert!(!cpu.running);
-        assert!(
-            cpu.console
-                .output()
-                .windows(b"[DEBUG] step\n[INFO] ready\n[WARN] slow\n[ERROR] failed\n".len())
-                .any(
-                    |output| output == b"[DEBUG] step\n[INFO] ready\n[WARN] slow\n[ERROR] failed\n"
-                )
-        );
-    }
-
-    #[test]
-    fn rejects_printf_formats_outside_the_supported_stdio_subset() {
-        assert!(
-            compile_minimal_program(
-                "int printf(const char *format, ...); \
-                 int main(void) { printf(\"%f\", 5); return 0; }",
-                "unsupported-printf-format.c",
-            )
-            .unwrap()
-            .is_none()
-        );
+             int main(void) { return printf(\"text\"); }",
+            "char *fgets(char *text, int count, void *stream); \
+             int main(void) { char text[8]; return fgets(text, 8, 0) != 0; }",
+        ] {
+            assert!(
+                compile_minimal_program(source, "retired-stdio.c")
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -17917,65 +17728,6 @@ int main(void) { return VALUE; }"#
     }
 
     #[test]
-    fn stores_nul_terminated_string_literals_for_native_graphics_calls() {
-        let image = compile_minimal_program(
-            "#include <suomi_gfx.h>\n\
-             int main(void) { gfx_text(0, 0, \"Hi\", 1); return 0; }",
-            "native-gfx-string.c",
-        )
-        .unwrap()
-        .expect("supported string argument to graphics builtin");
-        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(8192).unwrap();
-        assert!(!cpu.running);
-        assert!(cpu.memory.windows(3).any(|bytes| bytes == b"Hi\0"));
-    }
-
-    #[test]
-    fn infinite_city_enemy_ai_moves_and_triggers_spring_jumps() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("programs")
-            .join("infinite-city")
-            .join("src")
-            .join("infinite_city.c");
-        let source = fs::read_to_string(path).expect("Infinite City source should load");
-        let source = source.replacen("int main(void)", "int original_game_main(void)", 1);
-        let source = format!(
-            "{source}\n\
-             int main(void) {{ \
-                 reset_game(); level = START_LEVEL; \
-                 player.x = 0; player.y = 0; player.invuln = 1000; \
-                 enemies[0].alive = 1; enemies[0].kind = ENEMY_MRSIREN; \
-                 enemies[0].x = 1000; enemies[0].y = GROUND_Y - ENEMY_H; \
-                 enemies[0].anim = 1; enemies[0].phase = 0; \
-                 enemies[1].alive = 1; enemies[1].kind = ENEMY_MEGABIRD; \
-                 enemies[1].x = 500; enemies[1].y = 100; enemies[1].phase = 0; \
-                 enemies[2].alive = 1; enemies[2].kind = ENEMY_SPRINGU; \
-                 enemies[2].x = 80; enemies[2].y = GROUND_Y - ENEMY_H; \
-                 enemies[2].on_ground = 1; enemies[2].phase = 31; \
-                 update_enemies(); \
-                 return enemies[0].alive * 4000 + enemies[0].anim * 1000 + \
-                     enemies[0].x + enemies[1].x * 10 + enemies[2].vy + 12; \
-             }}"
-        );
-        let image = compile_minimal_program(&source, "infinite-city-enemy-ai.c")
-            .unwrap()
-            .expect("Infinite City enemy AI harness should compile");
-        let mut cpu = crate::cpu::Cpu::new();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(1_000_000).unwrap();
-
-        assert!(!cpu.running, "enemy AI harness did not finish");
-        assert_eq!(
-            cpu.registers[0], 11979,
-            "MrSiren, Megabird, and Springu should perform their expected AI updates"
-        );
-    }
-
-    #[test]
     fn passes_computed_arguments_without_clobbering_operands() {
         for (source, expected) in [
             (
@@ -18003,59 +17755,6 @@ int main(void) { return VALUE; }"#
             cpu.run(1000).unwrap();
             assert_eq!(cpu.registers[0], expected, "source: {source}");
         }
-    }
-
-    #[test]
-    fn pacman_round_starts_without_a_false_collision() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("programs")
-            .join("pacman")
-            .join("src")
-            .join("pacman.c");
-        let source = std::fs::read_to_string(path).unwrap();
-        let source = source.replace("int main(void)", "int pacman_main(void)");
-        let source = format!(
-            "{source}\nint main(void) {{ int i; new_game(); \
-             for (i = 0; i < 72; i++) {{ tick++; update(0); }} \
-             return mode * 10 + lives; }}"
-        );
-        let image = compile_minimal_program(&source, "pacman-opening-round.c")
-            .unwrap()
-            .expect("supported PacMan module");
-        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(10_000_000).unwrap();
-        assert!(!cpu.running);
-        assert_eq!(
-            cpu.registers[0], 13,
-            "PacMan should be playing with 3 lives"
-        );
-    }
-
-    #[test]
-    fn pacman_stops_at_the_wall_in_its_starting_corridor() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("programs")
-            .join("pacman")
-            .join("src")
-            .join("pacman.c");
-        let source = std::fs::read_to_string(path).unwrap();
-        let source = source.replace("int main(void)", "int pacman_main(void)");
-        let source = format!(
-            "{source}\nint main(void) {{ int i; load_maze(); reset_positions(); mode = 1; \
-             for (i = 0; i < 100; i++) move_pac(0); \
-             return px; }}"
-        );
-        let image = compile_minimal_program(&source, "pacman-wall-collision.c")
-            .unwrap()
-            .expect("supported PacMan module");
-        let mut cpu = crate::cpu::Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.load_program(&image.segments, image.entry_point)
-            .unwrap();
-        cpu.run(10_000_000).unwrap();
-        assert!(!cpu.running);
-        assert_eq!(cpu.registers[0], 32, "PacMan must stop before the wall");
     }
 
     #[test]

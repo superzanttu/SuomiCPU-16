@@ -1,14 +1,12 @@
-//! Implements folder-backed disks and legacy block-disk import/export.
+//! Implements folder-backed disks and their filesystem operations.
 //! Handles manifests, disk discovery, boot images, filesystem operations, capacity,
 //! path validation, and read-only/protected-file rules.
 
-use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
-const BLOCK_SIZE: usize = 256;
 const MAX_FILE_READ_SIZE: usize = 4096;
 const FOLDER_DISK_MANIFEST_VERSION: u64 = 1;
 const MAX_DISK_LABEL_LENGTH: usize = 64;
@@ -718,63 +716,6 @@ impl FolderDisk {
     }
 }
 
-pub fn import_legacy_block_disk(source: &Path, destination: &Path) -> Result<FolderDisk, String> {
-    let disk_id = source
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| "legacy disk filename must contain a valid disk ID".to_owned())?;
-    validate_disk_id(disk_id)?;
-    if destination.file_name().and_then(|name| name.to_str()) != Some(disk_id) {
-        return Err("folder disk destination name must match the legacy disk ID".to_owned());
-    }
-    match fs::symlink_metadata(destination) {
-        Ok(_) => return Err("folder disk destination already exists".to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("cannot inspect folder disk destination: {error}")),
-    }
-    let raw = fs::read_to_string(source)
-        .map_err(|error| format!("cannot read legacy block disk: {error}"))?;
-    let (blocks, read_only) = parse_disk(&raw, disk_id)?;
-    let capacity_bytes = (blocks.len() as u64)
-        .checked_mul(BLOCK_SIZE as u64)
-        .ok_or_else(|| "legacy disk capacity overflow".to_owned())?
-        .max(1);
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create folder disk destination parent: {error}"))?;
-    }
-    fs::create_dir(destination)
-        .map_err(|error| format!("cannot create folder disk destination: {error}"))?;
-    let result = (|| {
-        let mut manifest = Map::new();
-        manifest.insert(
-            "version".to_owned(),
-            Value::from(FOLDER_DISK_MANIFEST_VERSION),
-        );
-        manifest.insert("id".to_owned(), Value::String(disk_id.to_owned()));
-        manifest.insert("label".to_owned(), Value::String(disk_id.to_owned()));
-        manifest.insert("capacity_bytes".to_owned(), Value::from(capacity_bytes));
-        manifest.insert("read_only".to_owned(), Value::Bool(read_only));
-        let manifest_bytes = serde_json::to_vec_pretty(&Value::Object(manifest))
-            .map_err(|error| format!("cannot serialize folder disk manifest: {error}"))?;
-        fs::write(destination.join("disk.json"), manifest_bytes)
-            .map_err(|error| format!("cannot write folder disk manifest: {error}"))?;
-        let block_directory = destination.join("legacy-blocks");
-        fs::create_dir(&block_directory)
-            .map_err(|error| format!("cannot create legacy block export folder: {error}"))?;
-        for (number, block) in blocks {
-            let path = block_directory.join(format!("{number:05}.bin"));
-            fs::write(path, block)
-                .map_err(|error| format!("cannot export legacy disk block: {error}"))?;
-        }
-        FolderDisk::open(destination)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(destination);
-    }
-    result
-}
-
 fn collect_folder_files(
     root: &Path,
     directory: &Path,
@@ -814,45 +755,6 @@ fn collect_folder_files(
     Ok(())
 }
 
-fn parse_disk(raw: &str, disk_id: &str) -> Result<(BTreeMap<u16, [u8; BLOCK_SIZE]>, bool), String> {
-    let value: Value = serde_json::from_str(raw)
-        .map_err(|error| format!("cannot read disk {disk_id}: {error}"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("disk {disk_id} has an invalid image format"))?;
-    let protected = object.get("protected").and_then(Value::as_bool) == Some(true);
-    let mut blocks = BTreeMap::new();
-    for (key, value) in object {
-        if key == "protected" {
-            continue;
-        }
-        let block_number = key
-            .parse::<u16>()
-            .map_err(|_| format!("disk {disk_id} has invalid block data: invalid block entry"))?;
-        let text = value
-            .as_str()
-            .ok_or_else(|| format!("disk {disk_id} has invalid block data: invalid block entry"))?;
-        let mut block = [0; BLOCK_SIZE];
-        let mut count = 0;
-        for character in text.chars() {
-            if count >= BLOCK_SIZE || character as u32 > 255 {
-                return Err(format!(
-                    "disk {disk_id} has invalid block data: disk blocks must contain exactly 256 bytes"
-                ));
-            }
-            block[count] = character as u8;
-            count += 1;
-        }
-        if count != BLOCK_SIZE {
-            return Err(format!(
-                "disk {disk_id} has invalid block data: disk blocks must contain exactly 256 bytes"
-            ));
-        }
-        blocks.insert(block_number, block);
-    }
-    Ok((blocks, protected))
-}
-
 fn valid_disk_id(disk_id: &str) -> bool {
     let upper = disk_id.to_ascii_uppercase();
     (1..=32).contains(&disk_id.len())
@@ -871,38 +773,6 @@ pub fn validate_disk_id(disk_id: &str) -> Result<(), String> {
     } else {
         Err("disk ID must be 1-32 ASCII letters, digits, '_' or '-' and not a reserved Windows name".to_owned())
     }
-}
-
-pub fn obsolete_program_disk(disk_id: &str) -> Option<&'static str> {
-    if disk_id == "SisuOS-1" {
-        return Some("sisuos");
-    }
-    let index = disk_id.strip_prefix("APP")?;
-    if index.len() != 5 || !index.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    const PROGRAMS: [&str; 17] = [
-        "anaclock",
-        "asteroids",
-        "disk-editor",
-        "elite",
-        "hertta-3d",
-        "hulio",
-        "infinite-city",
-        "lunar-lander",
-        "motorobots",
-        "netgame-demo",
-        "pacman",
-        "paint",
-        "sc16-showcase",
-        "space-invaders",
-        "spacecave",
-        "tank-16",
-        "text-demo",
-    ];
-    PROGRAMS
-        .get(index.parse::<usize>().ok()?.checked_sub(1)?)
-        .copied()
 }
 
 fn validate_file_path(file_path: &str) -> Result<PathBuf, String> {
@@ -949,44 +819,6 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sc16-{label}-{unique}"));
         fs::create_dir_all(&path).unwrap();
         path
-    }
-
-    #[test]
-    fn imports_legacy_block_disk_into_non_overwriting_folder_disk() {
-        let root = temp_dir("disk-import");
-        let source = root.join("LEGACY01.json");
-        let destination = root.join("LEGACY01");
-        fs::write(
-            &source,
-            format!(
-                r#"{{"protected":true,"3":"{}","9":"{}"}}"#,
-                "A".repeat(BLOCK_SIZE),
-                "B".repeat(BLOCK_SIZE)
-            ),
-        )
-        .unwrap();
-
-        let disk = import_legacy_block_disk(&source, &destination).unwrap();
-
-        assert_eq!(disk.manifest().id, "LEGACY01");
-        assert!(disk.manifest().read_only);
-        assert_eq!(disk.manifest().capacity_bytes, (2 * BLOCK_SIZE) as u64);
-        assert_eq!(disk.used_bytes().unwrap(), (2 * BLOCK_SIZE) as u64);
-        assert_eq!(
-            disk.read_file("legacy-blocks/00003.bin", 0, BLOCK_SIZE)
-                .unwrap()
-                .0,
-            vec![b'A'; BLOCK_SIZE]
-        );
-        assert_eq!(
-            disk.read_file("legacy-blocks/00009.bin", 0, BLOCK_SIZE)
-                .unwrap()
-                .0,
-            vec![b'B'; BLOCK_SIZE]
-        );
-        assert!(import_legacy_block_disk(&source, &destination).is_err());
-        assert!(source.exists());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

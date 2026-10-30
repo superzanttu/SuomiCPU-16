@@ -561,7 +561,7 @@ fn extended_instruction(
         ]));
     }
 
-    let muldiv = lookup(MULDIV_OPERATIONS, mnemonic).or_else(|| (mnemonic == "LDA").then_some(7));
+    let muldiv = lookup(MULDIV_OPERATIONS, mnemonic);
     if let Some(operation) = muldiv {
         if operands.len() != 2 {
             return Err(error(
@@ -996,7 +996,7 @@ fn instruction_size(text: &str, line: usize) -> Result<u32, AssemblyError> {
         "JMPX" | "CALLX" | "BZX" | "BCX" | "BNZX" | "BNCX" | "BNX" | "BNNX" | "BVX" | "BNVX"
         | "BLTX" | "BGEX" | "BGTX" | "BLEX" | "BHIX" | "BLSX" | "BNZ" | "BNC" | "BN" | "BNN"
         | "BV" | "BNV" | "BLT" | "BGE" | "BGT" | "BLE" | "BHI" | "BLS" => 6,
-        "LDI19" | "LDI30" | "LDA" => 8,
+        "LDI30" => 8,
         "F32ADD" | "F32SUB" | "F32MUL" | "F32DIV" | "F32CMP" | "F64ADD" | "F64SUB" | "F64MUL"
         | "F64DIV" | "F64CMP" | "I16TOF32" | "U16TOF32" | "I32TOF32" | "U32TOF32" | "I16TOF64"
         | "U16TOF64" | "I32TOF64" | "U32TOF64" | "F32TOF64" | "F64TOF32" | "F32NEG" | "F64NEG"
@@ -1338,14 +1338,10 @@ mod tests {
         assert_eq!(image.segments[0].address, 0x30000);
         assert_eq!(image.segments[0].data, [0x19]);
 
-        let image = assemble("LDA R2, 0x3F51234\nHALT", 0).unwrap();
+        let image = assemble("LDI30 R2, 0x3F51234\nHALT", 0).unwrap();
         assert_eq!(
             image.segments[0].data,
             b"\xfa\x1e\x70\x00\x03\xf5\x12\x34\x00\x00"
-        );
-        assert_eq!(
-            assemble("LDI30 R2, 0x3F51234\nHALT", 0).unwrap().segments[0].data,
-            image.segments[0].data
         );
 
         let image = assemble(
@@ -1609,6 +1605,7 @@ mod tests {
             "JMP nowhere",
             "JZ R0, nowhere",
             "LDA R0, nowhere",
+            "LDI19 R0, 0x12345",
             "LDI R0, -1",
             "LDI R0, 0x10000",
             "LDA R0, 0x40000000",
@@ -1671,7 +1668,7 @@ mod tests {
                 .iter()
                 .map(|segment| segment.data.len())
                 .sum::<usize>(),
-            658
+            650
         );
     }
 
@@ -1704,13 +1701,10 @@ mod tests {
     }
 
     #[test]
-    fn matches_reference_examples_and_bitmap_font() {
-        let example = assemble(include_str!("../../examples/example.asm"), 0).unwrap();
-        assert_eq!(example.entry_point, 0);
-        assert_eq!(example.segments.len(), 1);
-        assert_eq!(example.segments[0].data.len(), 94);
-        assert_eq!(&example.segments[0].data[..2], b"\x08\x0a");
-        assert_eq!(&example.segments[0].data[92..], b"\x00\x00");
+    fn matches_instruction_reference_and_bitmap_font() {
+        let example = assemble(include_str!("../../examples/commands.asm"), 0).unwrap();
+        assert_eq!(example.entry_point, 0x80);
+        assert!(!example.segments.is_empty());
 
         let font = assemble(include_str!("../../firmware/fonts/font5x7.asm"), 0).unwrap();
         let font_segment = font

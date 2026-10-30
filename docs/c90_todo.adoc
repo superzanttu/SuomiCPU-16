@@ -163,10 +163,9 @@ does not establish language feature parity.
 
 The repository uses Rust for runtime, build, tools, and CI. Some legacy
 integration coverage has not yet been recreated as Rust tests. C programs
-outside the current native subset fail with an unsupported-program diagnostic
-until their features are ported. The Rust frontend compiles Text Demo using
-console +fgets+, +puts+, and its supported +printf+ formats. The program smoke
-build compiles all 17 bootable BIOS C programs.
+outside the current native subset fail with an unsupported-program diagnostic.
+Text Demo and the other pre-migration application sources are archived; current
+program build commands support SisuOS only.
 
 == B — Basic C game programming
 

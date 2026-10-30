@@ -500,7 +500,7 @@ fn supervisor_executes_high_audio_commands_with_small_ram_and_translated_aliases
         assert_eq!(cpu.registers[5], 8);
         assert_eq!(
             cpu.take_sound_commands(),
-            [suomicpu16::cpu::GpuSoundCommand {
+            [suomicpu16::machine::SoundCommand {
                 channel: 3,
                 frequency: 440,
                 frames: 60,

@@ -2,12 +2,8 @@
 //! Handles BIOS and program startup, windowed/headless execution, rendering,
 //! input, audio, debug-monitor windows, and runtime integration tests.
 
-use crate::cpu::{
-    BIOS_AUTOBOOT_WAIT_MARKER, BIOS_FIRMWARE_MARKER, Cpu, GpuSoundCommand, PrivilegeMode,
-};
+use crate::cpu::{BIOS_AUTOBOOT_WAIT_MARKER, BIOS_FIRMWARE_MARKER, Cpu, PrivilegeMode};
 use crate::disk::{FolderBootMode, FolderDisk};
-#[cfg(test)]
-use crate::image::load_program;
 use crate::image::{ImageError, load_prebuilt_program};
 use crate::net::DEFAULT_PORT;
 use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound, stop_sound};
@@ -84,7 +80,7 @@ impl From<std::io::Error> for RuntimeError {
 }
 
 struct ActiveSound {
-    command: GpuSoundCommand,
+    command: crate::machine::SoundCommand,
     sound: Sound,
 }
 
@@ -99,7 +95,7 @@ impl AudioEngine {
         }
     }
 
-    async fn apply(&mut self, command: GpuSoundCommand) -> Result<(), RuntimeError> {
+    async fn apply(&mut self, command: crate::machine::SoundCommand) -> Result<(), RuntimeError> {
         let channel = command.channel as usize;
         if command.frequency == 0 {
             if let Some(active) = self.channels[channel].take() {
@@ -133,7 +129,7 @@ impl AudioEngine {
     }
 }
 
-fn synthesize_sound(command: GpuSoundCommand) -> Vec<u8> {
+fn synthesize_sound(command: crate::machine::SoundCommand) -> Vec<u8> {
     let frequency = u32::from(command.frequency).clamp(20, SOUND_RATE / 2);
     let period = (SOUND_RATE + frequency / 2) / frequency;
     let sample_count = if command.frames == 0 {
@@ -3231,50 +3227,6 @@ mod tests {
     }
 
     #[test]
-    fn packaged_programs_run_or_reject_legacy_images_for_revision_2() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut legacy_images_rejected = 0;
-        for program in crate::programs::catalog(root)
-            .unwrap()
-            .into_iter()
-            .filter(|p| p.slug != "sisuos")
-        {
-            let id = &program.slug;
-            let source = root.join("disks").join(id);
-            let target = BootTarget {
-                source,
-                folder_disk: true,
-            };
-            let mut cpu = fresh_runtime_cpu(root, None, None, DEFAULT_PORT).unwrap();
-            assert_eq!(cpu.privilege_mode, PrivilegeMode::Supervisor);
-            if let Err(error) = boot_target(&mut cpu, &target) {
-                assert!(
-                    error.to_string().contains("rebuild for machine revision 2"),
-                    "{id}: {error}"
-                );
-                legacy_images_rejected += 1;
-                continue;
-            }
-            assert_eq!(cpu.privilege_mode, PrivilegeMode::User);
-            let mut executed = 0;
-            while executed < 1000 && cpu.running && !cpu.frame_yield {
-                let pc = cpu.pc;
-                let sp = cpu.sp;
-                if let Err(error) = cpu.step() {
-                    let instruction = cpu.read_u16(pc);
-                    panic!(
-                        "{id} failed at PC 0x{pc:08x}, \
-                         instruction 0x{instruction:04x}, SP 0x{sp:08x}: {error}"
-                    );
-                }
-                executed += 1;
-            }
-            assert!(executed > 0, "no guest code ran for {id}");
-        }
-        assert!(legacy_images_rejected > 0);
-    }
-
-    #[test]
     fn bios_boot_reports_both_not_boot_cases_and_recovers_with_a_valid_disk() {
         let disk = boot_test_disk("not-boot");
         let target = BootTarget {
@@ -3822,7 +3774,7 @@ mod tests {
 
     #[test]
     fn sound_synthesis_produces_valid_pcm_wav_with_requested_duration() {
-        let wav = synthesize_sound(GpuSoundCommand {
+        let wav = synthesize_sound(crate::machine::SoundCommand {
             channel: 0,
             frequency: 440,
             frames: 60,
@@ -3838,7 +3790,7 @@ mod tests {
 
     #[test]
     fn looping_noise_synthesis_generates_half_second_of_pcm() {
-        let wav = synthesize_sound(GpuSoundCommand {
+        let wav = synthesize_sound(crate::machine::SoundCommand {
             channel: 3,
             frequency: 220,
             frames: 0,
@@ -4089,19 +4041,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_compiler_loads_ana_clock_module() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let program = root
-            .join("programs")
-            .join("anaclock")
-            .join("src")
-            .join("anaclock.c");
-        let image = load_program(&program).expect("Rust C compiler should load AnaClock");
-        assert_eq!(image.entry_point, 0);
-        assert!(!image.segments.is_empty());
-    }
-
-    #[test]
     fn instruction_slices_resume_a_sleeping_cpu_without_treating_it_as_halted() {
         let image = crate::assembler::assemble("SVC\nHALT\n.address 0x300\nRTI", 0x100).unwrap();
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
@@ -4144,44 +4083,6 @@ mod tests {
     }
 
     #[test]
-    fn elite_executes_between_bounded_instruction_slices() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let source = root
-            .join("programs")
-            .join("elite")
-            .join("src")
-            .join("elitedemo.c");
-        let image = crate::image::build_source(&source).unwrap();
-        let image_path = source
-            .parent()
-            .unwrap()
-            .join(format!(".sc16-test-{}.sc16img", std::process::id()));
-        crate::image::write_image(&image_path, &image).unwrap();
-        let target = BootTarget {
-            source: image_path.clone(),
-            folder_disk: false,
-        };
-        let mut cpu = fresh_runtime_cpu(root, Some(&image_path), None, DEFAULT_PORT).unwrap();
-        boot_target(&mut cpu, &target).unwrap();
-        cpu.begin_frame();
-        let mut budget_remaining = 1_000_000;
-        let first_slice = run_instruction_slice(&mut cpu, &mut budget_remaining).unwrap();
-        assert!(first_slice > 0);
-        assert!(first_slice <= 1_000_000);
-        assert!(
-            budget_remaining > 0,
-            "Elite should still have work remaining"
-        );
-
-        cpu.begin_frame();
-        budget_remaining = 1_000_000;
-        let next_slice = run_instruction_slice(&mut cpu, &mut budget_remaining).unwrap();
-        assert!(next_slice > 0);
-        assert!(cpu.running, "Elite halted between slices");
-        fs::remove_file(image_path).unwrap();
-    }
-
-    #[test]
     fn low_disk_window_is_ordinary_ram_for_user_code() {
         let source =
             "unsigned char *r = 0x43100; int main(void) { r[0] = 0x41; r[16] = 0xa5; return 0; }";
@@ -4201,7 +4102,7 @@ mod tests {
     #[test]
     fn headless_runtime_executes_retained_assembler_examples() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        for name in ["commands.asm", "directives.asm", "example.asm"] {
+        for name in ["commands.asm", "directives.asm"] {
             let source = root.join("examples").join(name);
             let (directory, program) = prebuild_test_image(&source, name);
             let count = run_headless(root, &program, 50_000).unwrap_or_else(|error| {
@@ -4255,7 +4156,7 @@ mod tests {
     #[test]
     fn headless_runtime_rejects_source_compilation() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let source = root.join("examples").join("example.asm");
+        let source = root.join("examples").join("directives.asm");
 
         let error = run_headless(root, &source, 50_000).unwrap_err();
 

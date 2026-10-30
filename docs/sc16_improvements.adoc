@@ -5,14 +5,11 @@
 
 == Goal and design boundaries
 
-This plan evolves SC-16 into a bootable computer architecture for a protected,
-preemptively multitasking operating system with virtual memory. It replaces
-emulator-side program compilation and block-oriented virtual disks with
-prebuilt programs and folder-backed disks.
-
-Implement the work in stages. Preserve the existing emulator, programs, game
-window, and serial Bug Monitor during the transition. Do not claim process
-isolation until the MMU enforces user/kernel memory permissions.
+This plan records the SC-16 hardware and runtime migration to a bootable
+computer architecture for a protected, preemptively multitasking operating
+system with virtual memory. The current design uses prebuilt programs and
+folder-backed disks; guest source compilation and legacy block-disk loading
+are not runtime features.
 
 === Current implementation baseline
 
@@ -32,13 +29,13 @@ contracts.
   Applications run in the game window; the optional Bug Monitor
   displays emulator logs and guest serial output from the UART-style device.
   It is separate from the text-mode BIOS.
-* Runtime storage uses folder disks with guest filesystem access. Legacy
-  JSON-backed 256-byte block images remain supported only as inputs to the
-  offline import tool.
-* The CPU has keyboard, RTC, and instruction-count timer interrupts with fixed
-  vectors. Interrupts save PC and flags on the current stack; the CPU has no
-  privilege modes, protected address spaces, page tables, or hardware task
-  contexts.
+* Runtime storage uses folder disks with guest filesystem access. Archived
+  JSON-backed 256-byte block images are inert and unsupported.
+* The CPU has supervisor and user modes, fixed interrupt vectors, an MMU with
+  user/kernel page permissions, protected device access, and keyboard, RTC,
+  and timer interrupts. Guest kernels can schedule tasks with interrupt and
+  address-space switching; the optional `STARTU` extension also provides
+  emulator-backed user-task scheduling.
 * The assembler and CPU provide binary32/binary64 instructions. The C compiler
   now lays out and initializes global floating objects and supports sized
   automatic floating storage plus constant initializers using those formats.
@@ -74,8 +71,7 @@ Checklist status: [x] completed; [ ] planned.
 ** Store return PCs as four big-endian bytes; +RET+ and +RTI+ restore all 30 address bits.
 ** Encode far control flow in six bytes and add +JMPRP+ / +CALLRP+ for full
    30-bit addresses.
-** Add +LDI30+ (with +LDI19+ / +LDA+ compatibility aliases) for full-width
-   addresses.
+** Add +LDI30+ for full-width addresses.
 ** [x] Preserve architectural address values independently of configured RAM
    size in +LDI30+, +STP+, and +SPLIT30+; verify high-bit round trips and explicit
    scalar long/pointer casts without changing memory-access wrapping.
@@ -311,10 +307,9 @@ Checklist status: [x] completed; [ ] planned.
 * [x] Preserve the existing game window and optional serial Bug Monitor after
   boot; switching the BIOS to text mode must not force applications into a
   text-only display mode.
-* [x] Provide dedicated emulator logging methods and guest C functions for
-  DEBUG, INFO, WARN, and ERROR records over the serial output in
-  +toolchain/include/bug_monitor.h+. Route emulator lifecycle and device errors to the Bug
-  Monitor; preserve raw guest serial output and the existing serial input path.
+* [x] Provide dedicated emulator logging methods for DEBUG, INFO, WARN, and
+  ERROR records. Route emulator lifecycle and device errors to the Bug Monitor;
+  keep guest console I/O on the kernel console services.
 * [x] Use one emulator-wide +firmware/bios.bin+ as firmware. Separate emulator
   hardware initialization from firmware execution, then transfer control to
   the BIOS at the documented
@@ -392,16 +387,12 @@ Checklist status: [x] completed; [ ] planned.
   root manifest and directory overhead.
 ** [x] Account file growth and enforce the declared capacity hard limit for
   host-side writes and file copies.
-* [x] Migrate existing JSON block disks and program data into folder-backed disk
-  images with a documented conversion tool or import path; keep all source
-  files and source disk images.
-** [x] Provide +sc16build import-block-disk+ to export JSON block contents as
-  +legacy-blocks/NNNNN.bin+, preserve read-only status, and refuse to overwrite
-  the source or an existing destination.
-** [x] Import both existing JSON disks without changing the originals, then
-   package all 17 runnable programs and their local disk assets as validated
-   boot disks. Execute all packages through the runtime; include Tank-16 maps
-   and tile assets.
+* [x] Migrate supported disk contents and program data into folder-backed disk
+  images; keep original JSON disk files only as inert archival data.
+** [x] Convert both existing JSON disks without changing the originals, then
+   package the applications and their local disk assets as folder disks.
+** [x] Remove block-level device behavior and retire the one-time JSON importer
+   after the folder-disk migration was completed.
 * [x] Remove block-level disk device behavior only after replacement APIs and
   migration are covered by tests. Update disk editor, BIOS selection, examples,
   and documentation to use disks rather than data-disk blocks.
@@ -576,20 +567,20 @@ Checklist status: [x] completed; [ ] planned.
   the shell after the demo exits.
 * [x] Document how to build a fresh disk without overwriting existing output,
   select it in BIOS, use the shell, and understand the example's limitations.
-* [ ] Analyze current memory-mapped controls and implement a revised architecture
+* [x] Analyze current memory-mapped controls and implement a revised architecture
   suitable for a guest-written preemptive operating system.
 ** [x] Verify guest-owned PIT scheduling, context/stack preservation,
    address-space switching, nonidentity user entry, and SVC handling without
    host tasks. Preserve the existing emulator-backed SisuOS demonstration.
-** [ ] Define the revised physical map, register access/side-effect contracts,
+** [x] Define the revised physical map, register access/side-effect contracts,
    machine/image versions, and user device-service ABI.
-** [ ] Separate RAM from high-address, page-separated, supervisor-only MMIO;
+** [x] Separate RAM from high-address, page-separated, supervisor-only MMIO;
    reject user aliases and device instruction fetches.
 *** [x] Exclude MMIO backing from validated buffers, event frames, and
     emulator-managed frame allocations; move framebuffer pixels to device-owned
     storage inaccessible through guest RAM; verify translated aliases,
     side-effect-free rejection, and frame reuse.
-*** [ ] Move device registers out of RAM and implement the revised physical
+*** [x] Move device registers out of RAM and implement the revised physical
     bus, including supervisor-only access, reserved offsets, and fetch rejection.
 **** [x] Implement the RAM-independent high system bank, checked guest
      constants, and supervisor device-page mappings with execution regressions.
@@ -624,7 +615,7 @@ Checklist status: [x] completed; [ ] planned.
      handler or buffer reservation.
 *** [x] Reserve the high device aperture from RAM allocation, images, page
     tables, IDTs, initial stacks, and guest RAM accesses with full/small backing.
-** [ ] Implement validated user device services and shared protected startup
+** [x] Implement validated user device services and shared protected startup
    for ordinary user programs.
 *** [x] Add syscall 24 for bounded graphics operations; validate and copy
     user request/data buffers before drawing, share the checked renderer with
@@ -632,14 +623,17 @@ Checklist status: [x] completed; [ ] planned.
 *** [x] Add syscall 25 for a validated keyboard/mouse snapshot; verify
     event-latch preservation on invalid output buffers and execute the C ABI
     from a protected guest task.
+*** [x] Start SisuOS user executables through the shared protected task loader;
+    verify user entry, stack, address-space mappings and syscall execution in
+    the BIOS boot and spawned-demo regression.
 ** [x] Version executable images and reject stale or unversioned runtime
    images with actionable diagnostics.
-** [ ] Migrate the BIOS, shared components required by SisuOS, and SisuOS
+** [x] Migrate the BIOS, shared components required by SisuOS, and SisuOS
    launch paths to the revised ABI; remove legacy device/ABI implementation
    paths rather than retaining compatibility shims; rebuild SisuOS images
    without overwriting writable disk data or settings. Do not update unrelated
    programs or images.
-** [ ] Pass hardware, protection and SisuOS acceptance regressions, adding
+** [x] Pass hardware, protection and SisuOS acceptance regressions, adding
    compiler-execution coverage only where required; update the architecture
    and migration documentation.
 

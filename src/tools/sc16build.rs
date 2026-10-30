@@ -1,6 +1,6 @@
 //! Provides offline SC-16 build and disk-packaging commands.
 //! Dispatches source/image builds, BIOS generation, program installation/migration,
-//! legacy-disk import, and kernel/user disk packaging.
+//! and kernel/user folder-disk packaging.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,11 +15,12 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let Some(source) = arguments.next() else {
-        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | build-c-at <source.c> <output.img> <base-address> | build-bios [bios.asm] [bios.bin] | build-programs | import-block-disk <legacy.json> <destination-folder> | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel] [--kernel-user-c <source.c>] | install-programs".into());
+        return Err("usage: sc16build <source.asm|source.c|source.bin|source.sc16img> [output.img] | build-c-at <source.c> <output.img> <base-address> | build-bios [bios.asm] [bios.bin] | build-programs | package-disk <source> <disk-folder> <label> <capacity-bytes> [--kernel] [--kernel-user-c <source.c>] | install-programs".into());
     };
     if source == "--help" || source == "-h" {
         println!("       sc16build build-program <slug> | install-program <slug>");
         println!("       sc16build build-programs | install-programs");
+        println!("Program build/install commands currently support SisuOS only.");
         println!("       sc16build migrate-program-disks --dry-run|--apply");
         println!("Program manifests: programs/<slug>/program.json; builds: build/programs/<slug>.");
         println!(
@@ -31,8 +32,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("Assemble the shared BIOS firmware into an SC-16 image.");
         println!("       sc16build build-c-at <source.c> <output.img> <base-address>");
         println!("Compile a C program for a relocated SC-16 address space.");
-        println!("       sc16build import-block-disk <legacy.json> <destination-folder>");
-        println!("Import a legacy JSON block disk without modifying its source.");
         println!(
             "       sc16build package-disk <source.asm|source.c|source.bin|source.sc16img> <disk-folder> <label> <capacity-bytes> [--kernel] [--kernel-user-c <source.c>]"
         );
@@ -49,8 +48,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 | "build-programs"
                 | "install-programs"
                 | "migrate-program-disks"
-                | "smoke-modules"
-                | "package-modules"
         )
     }) {
         let command = source.to_str().ok_or("command must be UTF-8")?;
@@ -119,34 +116,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Built shared BIOS firmware {} -> {}",
             bios_source.display(),
             bios_output.display()
-        );
-        return Ok(());
-    }
-    if source == "import-block-disk" {
-        let Some(legacy_disk) = arguments.next() else {
-            return Err(
-                "usage: sc16build import-block-disk <legacy.json> <destination-folder>".into(),
-            );
-        };
-        let Some(destination) = arguments.next() else {
-            return Err(
-                "usage: sc16build import-block-disk <legacy.json> <destination-folder>".into(),
-            );
-        };
-        if arguments.next().is_some() {
-            return Err(
-                "usage: sc16build import-block-disk <legacy.json> <destination-folder>".into(),
-            );
-        }
-        let destination = PathBuf::from(destination);
-        let disk =
-            suomicpu16::disk::import_legacy_block_disk(Path::new(&legacy_disk), &destination)?;
-        println!(
-            "Imported {} ({} bytes, read_only={}) -> {}",
-            disk.manifest().id,
-            disk.used_bytes()?,
-            disk.manifest().read_only,
-            destination.display()
         );
         return Ok(());
     }

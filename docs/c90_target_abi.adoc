@@ -394,13 +394,14 @@ address space. The common guest BIOS exposes a descriptor at +0x43040+, an
 interactive folder-disk selector, and a supervisor-only console at
 +0x3ff09000+.
 The BIOS loads the selected prebuilt image into memory; folder disks also
-provide the guest filesystem. The console currently supports a subset of standard
-text streams and formatted output. File-backed streams, floating-point format
-conversions, and several required C90 I/O facilities remain unimplemented.
-The shared C stdio assembly still references the retired low console address
-+0x43200+ and is not migrated to the revised machine; SisuOS uses protected
-kernel console services. Device-mapped addresses retain their documented SC-16 behavior. Compiler
-global/static data is currently placed in +0x80000..0xFFFFF+; generated
+provide the guest filesystem. SisuOS console I/O uses protected kernel
+services. The former native assembly stdio shim for the retired low console
+address +0x43200+ has been removed. The compiler links a syscall-backed
+file-stream subset on demand; the complete C stdio runtime, floating-point
+format conversions, and several required C90 I/O facilities are not yet
+available through the compiler. Device-mapped addresses retain their
+documented SC-16 behavior. Compiler global/static data is currently placed in
++0x80000..0xFFFFF+; generated
 addresses use +LDI30+ so this region and other addresses are not truncated to
 16 bits. This allocation does
 not reserve additional runtime heap or imply that every C90 translation-limit

@@ -464,8 +464,6 @@ impl LoadableSegment for MemorySegment {
     }
 }
 
-pub use crate::machine::SoundCommand as GpuSoundCommand;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpuError {
     InvalidMemorySize(usize),
@@ -576,7 +574,7 @@ pub struct Cpu {
     scnet_name: Option<String>,
     input: crate::machine::InputDevice,
     memory_mask: u32,
-    layer_mode: u8,
+    graphics_mode: u8,
     interrupts: crate::machine::InterruptController,
     clock: crate::machine::ClockDevice,
     idt_base: Option<u32>,
@@ -684,7 +682,7 @@ impl Cpu {
             scnet_name: None,
             input: crate::machine::InputDevice::default(),
             memory_mask,
-            layer_mode: 0,
+            graphics_mode: 0,
             interrupts: crate::machine::InterruptController::default(),
             clock: crate::machine::ClockDevice::default(),
             idt_base: None,
@@ -762,15 +760,6 @@ impl Cpu {
         let count = u16::try_from(paths.len())
             .map_err(|_| "firmware disk list exceeds 65535 entries".to_owned())?;
         let preselected = self.bios_preselected_disk.take();
-        if let Some((old, new)) = preselected
-            .as_deref()
-            .or(self.bios_settings.preferred_disk.as_deref())
-            .and_then(|id| crate::disk::obsolete_program_disk(id).map(|new| (id, new)))
-        {
-            return Err(format!(
-                "obsolete program disk {old:?}; use {new:?} and run sc16build migrate-program-disks --apply"
-            ));
-        }
         let find_disk = |id: &str| {
             paths.iter().position(|path| {
                 path.file_name()
@@ -1505,11 +1494,7 @@ impl Cpu {
     }
 
     fn guest_address_mask(&self) -> u32 {
-        if self.mmu_enabled {
-            crate::mmu::ADDRESS_SPACE_SIZE - 1
-        } else {
-            self.memory_mask
-        }
+        crate::mmu::ADDRESS_SPACE_SIZE - 1
     }
 
     pub fn enable_mmu(&mut self, page_directory: u32) -> Result<(), CpuError> {
@@ -1579,7 +1564,6 @@ impl Cpu {
                 .or_else(|| self.fault_register_byte(address))
                 .expect("host read from an unimplemented device register");
         }
-        let address = address & self.memory_mask;
         self.memory[address as usize]
     }
 
@@ -1607,11 +1591,6 @@ impl Cpu {
     }
 
     pub fn mount_data_disk(&mut self, disk_id: &str) -> Result<(), String> {
-        if let Some(new) = crate::disk::obsolete_program_disk(disk_id) {
-            return Err(format!(
-                "obsolete program disk {disk_id:?}; use {new:?} and run sc16build migrate-program-disks --apply"
-            ));
-        }
         if !self
             .available_disks()?
             .iter()
@@ -3287,9 +3266,7 @@ impl Cpu {
             }
             return;
         }
-        let address = address & self.memory_mask;
-        let index = address as usize;
-        self.memory[index] = value;
+        self.memory[address as usize] = value;
     }
 
     fn read_terminal_register(&mut self, address: u32) -> Option<u8> {
@@ -3473,24 +3450,16 @@ impl Cpu {
     ) -> Result<Vec<u32>, CpuError> {
         let mut physical_addresses = Vec::with_capacity(length as usize);
         for offset in 0..length {
-            self.check_guest_access(address.wrapping_add(offset), access)?;
-            let virtual_address = if self.mmu_enabled {
-                let virtual_address = address
-                    .checked_add(offset)
-                    .filter(|value| *value < crate::mmu::ADDRESS_SPACE_SIZE)
-                    .ok_or_else(|| {
-                        CpuError::PageFault(crate::mmu::PageFault {
-                            virtual_address: address.saturating_add(offset),
-                            access,
-                            reason: crate::mmu::PageFaultReason::AddressOutOfRange,
-                        })
-                    })?;
-                virtual_address
-            } else if crate::machine::is_device_aperture(address.wrapping_add(offset)) {
-                address.wrapping_add(offset)
-            } else {
-                address.wrapping_add(offset) & self.memory_mask
-            };
+            let virtual_address = address
+                .checked_add(offset)
+                .filter(|value| *value < crate::mmu::ADDRESS_SPACE_SIZE)
+                .ok_or_else(|| {
+                    CpuError::PageFault(crate::mmu::PageFault {
+                        virtual_address: address.saturating_add(offset),
+                        access,
+                        reason: crate::mmu::PageFaultReason::AddressOutOfRange,
+                    })
+                })?;
             self.check_guest_access(virtual_address, access)?;
             let physical_address = if self.mmu_enabled {
                 crate::mmu::translate(
@@ -3504,6 +3473,16 @@ impl Cpu {
             } else {
                 virtual_address
             };
+            if !self.mmu_enabled
+                && !crate::machine::is_device_aperture(physical_address)
+                && physical_address as usize >= self.memory.len()
+            {
+                return Err(CpuError::PageFault(crate::mmu::PageFault {
+                    virtual_address,
+                    access,
+                    reason: crate::mmu::PageFaultReason::PhysicalOutOfRange,
+                }));
+            }
             self.check_guest_access(physical_address, access)
                 .map_err(|error| {
                     if let CpuError::PageFault(mut fault) = error {
@@ -4425,7 +4404,7 @@ impl Cpu {
     }
 
     pub fn set_mouse_position(&mut self, x: u16, y: u16) {
-        let (width, height) = if self.layer_mode == 1 {
+        let (width, height) = if self.graphics_mode == 1 {
             (640, 480)
         } else {
             (320, 240)
@@ -4449,12 +4428,12 @@ impl Cpu {
         self.input.mouse[6..8].fill(0);
     }
 
-    pub fn take_sound_commands(&mut self) -> Vec<GpuSoundCommand> {
+    pub fn take_sound_commands(&mut self) -> Vec<crate::machine::SoundCommand> {
         self.audio.take_commands()
     }
 
     fn screen_size(&self) -> (i32, i32) {
-        if self.layer_mode == 1 {
+        if self.graphics_mode == 1 {
             (640, 480)
         } else {
             (320, 240)
@@ -4462,15 +4441,15 @@ impl Cpu {
     }
 
     pub fn graphics_mode(&self) -> u8 {
-        self.layer_mode
+        self.graphics_mode
     }
 
     pub fn set_graphics_mode(&mut self, mode: u8) -> Result<(), &'static str> {
         if mode > 1 {
             return Err("unsupported graphics mode");
         }
-        if self.layer_mode != mode {
-            self.layer_mode = mode;
+        if self.graphics_mode != mode {
+            self.graphics_mode = mode;
             self.vram.fill(0);
         }
         Ok(())
@@ -5330,8 +5309,10 @@ mod tests {
             cpu.write_guest(machine::FIRMWARE_TEXT_COLUMN, 2).unwrap();
             cpu.write_guest(machine::FIRMWARE_TEXT_CONTROL, 2).unwrap();
             cpu.write_guest(machine::FIRMWARE_TEXT_DATA, b'A').unwrap();
-            cpu.write(0x43300, b'B');
-            assert_eq!(cpu.read(0x43300), b'B');
+            if size > 0x43300 {
+                cpu.write(0x43300, b'B');
+                assert_eq!(cpu.read(0x43300), b'B');
+            }
             let cell = cpu.guest_text.cells[crate::guest_text::GUEST_TEXT_COLUMNS + 2];
             assert_eq!(
                 (cell.character, cell.foreground, cell.background),
@@ -5502,7 +5483,7 @@ mod tests {
             assert_eq!(cpu.read_guest_u16(AUDIO_VOLUME).unwrap(), 75);
             assert_eq!(
                 cpu.take_sound_commands(),
-                [GpuSoundCommand {
+                [crate::machine::SoundCommand {
                     channel: 3,
                     frequency: 60000,
                     frames: u16::MAX,
@@ -5521,14 +5502,14 @@ mod tests {
             assert_eq!(
                 cpu.take_sound_commands(),
                 [
-                    GpuSoundCommand {
+                    crate::machine::SoundCommand {
                         channel: 0,
                         frequency: 0,
                         frames: 0,
                         waveform: 0,
                         volume: 0
                     },
-                    GpuSoundCommand {
+                    crate::machine::SoundCommand {
                         channel: 3,
                         frequency: 220,
                         frames: u16::MAX,
@@ -5552,7 +5533,7 @@ mod tests {
         let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
         cpu.write_guest_u16(AUDIO_FREQUENCY, 440).unwrap();
         cpu.write_guest(AUDIO_COMMAND, 1).unwrap();
-        let expected = GpuSoundCommand {
+        let expected = crate::machine::SoundCommand {
             channel: 0,
             frequency: 440,
             frames: 0,
@@ -5582,7 +5563,7 @@ mod tests {
         assert_eq!(cpu.read_guest(AUDIO_STATUS).unwrap(), 0);
         assert_eq!(
             cpu.take_sound_commands(),
-            [GpuSoundCommand {
+            [crate::machine::SoundCommand {
                 channel: 2,
                 frequency: 0,
                 frames: 0,
@@ -5614,13 +5595,47 @@ mod tests {
         assert_eq!(cpu.read_guest_u16(AUDIO_FREQUENCY).unwrap(), 440);
         assert_eq!(
             cpu.take_sound_commands(),
-            [GpuSoundCommand {
+            [crate::machine::SoundCommand {
                 channel: 1,
                 frequency: 440,
                 frames: 0,
                 waveform: 0,
                 volume: 0,
             }]
+        );
+    }
+
+    #[test]
+    fn small_memory_guest_accesses_fault_instead_of_wrapping_into_ram() {
+        use crate::mmu::{MemoryAccess, PageFaultReason};
+
+        let mut cpu = Cpu::with_memory_size(1 << 16).unwrap();
+        cpu.memory[0] = 0x5a;
+
+        assert_eq!(
+            cpu.read_guest(1 << 16),
+            Err(CpuError::PageFault(crate::mmu::PageFault {
+                virtual_address: 1 << 16,
+                access: MemoryAccess::Read,
+                reason: PageFaultReason::PhysicalOutOfRange,
+            }))
+        );
+        assert_eq!(
+            cpu.write_guest(1 << 16, 0xa5),
+            Err(CpuError::PageFault(crate::mmu::PageFault {
+                virtual_address: 1 << 16,
+                access: MemoryAccess::Write,
+                reason: PageFaultReason::PhysicalOutOfRange,
+            }))
+        );
+        assert_eq!(cpu.memory[0], 0x5a);
+        assert_eq!(
+            cpu.read_guest(u32::MAX),
+            Err(CpuError::PageFault(crate::mmu::PageFault {
+                virtual_address: u32::MAX,
+                access: MemoryAccess::Read,
+                reason: PageFaultReason::AddressOutOfRange,
+            }))
         );
     }
 
@@ -6196,7 +6211,7 @@ mod tests {
     }
 
     #[test]
-    fn high_interrupt_registers_are_independent_of_legacy_ram_addresses() {
+    fn high_interrupt_registers_are_independent_of_retired_ram_addresses() {
         use crate::machine::*;
 
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
@@ -6665,7 +6680,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_buffers_allow_retired_aliases_but_exclude_active_device_registers() {
+    fn guest_buffers_allow_retired_ram_addresses_but_exclude_device_registers() {
         let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
         for mode in [0, 1] {
             cpu.set_graphics_mode(mode).unwrap();
@@ -7706,6 +7721,10 @@ mod tests {
                           if (fgetc(stream) != 'c') return 9;\n\
                           if (fclose(stream) != 0) return 10;\n\
                           if (fopen(\"missing.txt\", \"r\") != 0 || errno != ENOENT) return 11;\n\
+                          stream = fopen(\"stream.txt\", \"rb\");\n\
+                          if (stream == 0 || fgetc(stream) != 'a') return 24;\n\
+                          if (fclose(stream) != 0) return 25;\n\
+                          if (fopen(\"invalid.txt\", \"r++\") != 0 || errno != EINVAL) return 26;\n\
                           if (remove(\"stream.txt\") != -1 || errno != ENOSYS) return 12;\n\
                           for (index = 0; index < 4200; ++index)\n\
                               input[index] = (char)index;\n\
@@ -7722,6 +7741,12 @@ mod tests {
                           if (fputc('r', stream) != 'r') return 20;\n\
                           if (fclose(stream) != 0) return 21;\n\
                           if (fclose(stream) != EOF || errno != EBADF) return 22;\n\
+                          stream = fopen(\"append.txt\", \"a+b\");\n\
+                          if (stream == 0 || fwrite(\"xy\", 1, 2, stream) != 2) return 27;\n\
+                          if (fclose(stream) != 0) return 28;\n\
+                          stream = fopen(\"append.txt\", \"ab\");\n\
+                          if (stream == 0 || fputc('z', stream) != 'z') return 29;\n\
+                          if (fclose(stream) != 0) return 30;\n\
                           return 0;\n\
                       }";
         let assembly =
@@ -7750,6 +7775,7 @@ mod tests {
         assert_eq!(cpu.registers[0], 0, "stdio program returned an error code");
         assert_eq!(std::fs::read(disk.join("stream.txt")).unwrap(), b"abc");
         assert_eq!(std::fs::read(disk.join("reopened.txt")).unwrap(), b"r");
+        assert_eq!(std::fs::read(disk.join("append.txt")).unwrap(), b"xyz");
         let _ = std::fs::remove_dir_all(disk.parent().unwrap());
     }
 
@@ -8402,11 +8428,15 @@ mod tests {
     }
 
     #[test]
-    fn wraps_memory_reads_at_configured_limit() {
+    fn memory_accesses_fault_at_configured_limit() {
         let mut cpu = Cpu::with_memory_size(256).unwrap();
-        cpu.write(255, 0x12);
-        cpu.write(0, 0x34);
-        assert_eq!(cpu.read_u16(255), 0x1234);
+        cpu.memory[255] = 0x12;
+        cpu.memory[0] = 0x34;
+        assert_eq!(cpu.read_guest(255).unwrap(), 0x12);
+        assert!(cpu.read_guest(256).is_err());
+        assert!(cpu.read_guest_u16(255).is_err());
+        assert!(cpu.write_guest_u16(255, 0x5678).is_err());
+        assert_eq!((cpu.memory[0], cpu.memory[255]), (0x34, 0x12));
     }
 
     #[test]
@@ -8799,7 +8829,7 @@ mod tests {
     }
 
     #[test]
-    fn assembled_wide_opcodes_cover_signed_math_and_wrapping_memory() {
+    fn assembled_wide_opcodes_cover_signed_math_and_bounded_memory() {
         let cpu = run_assembly(
             "LDI R0, 0\nLDI R1, 100\nLDI R2, 0\nLDI R3, 9\nMUL32 R0, R2\n\
              LDI R4, 0\nLDI R5, 10\nDIV32 R0, R4\nHALT",
@@ -8819,23 +8849,19 @@ mod tests {
         assert_eq!((cpu.registers[0], cpu.registers[1]), (0xffff, 0xfffe));
 
         let cpu = run_assembly(
-            "LDI R0, 0x123F\nLDI R1, 0xFFFF\nLDI R2, 0x1234\nLDI R3, 0x5678\n\
+            "LDI R0, 0x000F\nLDI R1, 0xFFFC\nLDI R2, 0x1234\nLDI R3, 0x5678\n\
              ST32 R2, R0\nLD32 R4, R0\nHALT",
         );
         assert_eq!((cpu.registers[4], cpu.registers[5]), (0x1234, 0x5678));
-        assert_eq!(&cpu.memory[..3], &[0x34, 0x56, 0x78]);
-        assert_eq!(cpu.memory[cpu.memory_mask as usize], 0x12);
+        assert_eq!(&cpu.memory[0xffffc..0x100000], &[0x12, 0x34, 0x56, 0x78]);
 
         let cpu = run_assembly(
-            "LDI30 R0, 0x12345678\nLDI30 R1, 0x123FFFFD\nSTP R0, R1\n\
+            "LDI30 R0, 0x12345678\nLDI30 R1, 0x000123f0\nSTP R0, R1\n\
              LDP R2, R1\nHALT",
         );
         assert_eq!(cpu.registers[2], 0x12345678);
-        assert_eq!(
-            &cpu.memory[cpu.memory_mask as usize - 2..=cpu.memory_mask as usize],
-            &[0x12, 0x34, 0x56]
-        );
-        assert_eq!(cpu.memory[0], 0x78);
+        assert_eq!(&cpu.memory[0x123f0..0x123f3], &[0x12, 0x34, 0x56]);
+        assert_eq!(&cpu.memory[0x123f3..0x123f6], &[0x78, 0x00, 0x00]);
     }
 
     #[test]
@@ -8851,7 +8877,7 @@ mod tests {
         assert_eq!((cpu.registers[1], cpu.registers[2]), (0x3fff_1234, 0x3fff));
         assert!(cpu.flags.carry);
 
-        let cpu = run_assembly("LDA R0, 0x51234\nHALT");
+        let cpu = run_assembly("LDI30 R0, 0x51234\nHALT");
         assert_eq!(cpu.registers[0], 0x51234);
 
         let template = "LDI R0, {a}\nLDI R1, {b}\nCMP R0, R1\n{branch} yes\n\
@@ -8878,10 +8904,11 @@ mod tests {
             );
         }
 
-        let cpu = run_assembly("LDA R1, target\nJMPR R1\nLDI R0, 1\nHALT\ntarget: LDI R0, 7\nHALT");
+        let cpu =
+            run_assembly("LDI30 R1, target\nJMPR R1\nLDI R0, 1\nHALT\ntarget: LDI R0, 7\nHALT");
         assert_eq!(cpu.registers[0], 7);
 
-        let cpu = run_assembly("LDA R1, fn\nCALLR R1\nHALT\nfn: LDI R0, 9\nRET");
+        let cpu = run_assembly("LDI30 R1, fn\nCALLR R1\nHALT\nfn: LDI R0, 9\nRET");
         assert_eq!(cpu.registers[0], 9);
 
         let cpu = run_assembly("SETC\nPUSHF\nCLC\nPOPF\nHALT");
@@ -8946,10 +8973,10 @@ mod tests {
 
         cpu.write(0xffff, 0x12);
         cpu.write(0, 0x34);
-        assert_eq!(cpu.read_u16(0xffff), 0x1234);
-        cpu.write_u16(0xffff, 0x5678);
-        assert_eq!(cpu.read(0xffff), 0x56);
-        assert_eq!(cpu.read(0), 0x78);
+        assert!(cpu.read_guest_u16(0xffff).is_err());
+        assert!(cpu.write_guest_u16(0xffff, 0x5678).is_err());
+        assert_eq!(cpu.read(0xffff), 0x12);
+        assert_eq!(cpu.read(0), 0x34);
     }
 
     #[test]

@@ -4,7 +4,43 @@
 
 int errno;
 
-int __stdio_mode_flags(const char *mode);
+int __stdio_mode_flags(const char *mode)
+{
+    int flags;
+    int saw_plus;
+    int saw_binary;
+
+    if (mode == 0 || *mode == '\0')
+        return -22;
+    if (*mode == 'r')
+        flags = SC16_OPEN_READ;
+    else if (*mode == 'w')
+        flags = SC16_OPEN_WRITE | SC16_OPEN_CREATE | SC16_OPEN_TRUNCATE;
+    else if (*mode == 'a')
+        flags = SC16_OPEN_WRITE | SC16_OPEN_CREATE | SC16_OPEN_APPEND;
+    else
+        return -22;
+
+    saw_plus = 0;
+    saw_binary = 0;
+    ++mode;
+    while (*mode != '\0') {
+        if (*mode == '+') {
+            if (saw_plus)
+                return -22;
+            saw_plus = 1;
+            flags |= SC16_OPEN_READ | SC16_OPEN_WRITE;
+        } else if (*mode == 'b') {
+            if (saw_binary)
+                return -22;
+            saw_binary = 1;
+        } else {
+            return -22;
+        }
+        ++mode;
+    }
+    return flags;
+}
 
 struct __sc16_FILE {
     int __opaque;

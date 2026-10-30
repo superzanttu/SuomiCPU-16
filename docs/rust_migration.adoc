@@ -21,7 +21,7 @@ The former low-address graphics coprocessor, layered renderer, and 3D command
 route are retired; current graphics regressions exercise the bank and syscall
 interfaces instead.
 
-Run the Rust validation suite and build every bootable BIOS program with:
+Run the Rust validation suite and build the supported SisuOS guest with:
 
 [source,console]
 ----
@@ -32,3 +32,6 @@ cargo check --locked --target wasm32-unknown-unknown
 cargo run --locked --bin sc16build -- build-programs
 cargo run --locked --bin sc16build -- install-programs
 ----
+
+The all-program commands currently process SisuOS only. Other catalog programs
+are archived because they depend on retired hardware interfaces.

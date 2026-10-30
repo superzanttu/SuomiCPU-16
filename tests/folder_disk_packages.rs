@@ -1,10 +1,9 @@
 //! Verifies checked-in firmware and folder-disk packages end to end.
-//! Checks reproducible BIOS assembly, packaged-program execution, disk capacity,
-//! and legacy block-disk import/export preservation.
+//! Checks reproducible BIOS assembly, packaged-program execution, and disk capacity.
 
 use std::path::PathBuf;
 
-use suomicpu16::cpu::{Cpu, PrivilegeMode};
+use suomicpu16::cpu::Cpu;
 use suomicpu16::disk::{FolderBootMode, FolderDisk};
 
 fn repository_root() -> PathBuf {
@@ -28,44 +27,14 @@ fn shared_bios_image_matches_its_offline_assembly_source() {
 }
 
 #[test]
-fn packaged_modules_validate_and_execute_from_folder_disks() {
-    let disks = repository_root().join("disks");
-    for program in suomicpu16::programs::catalog(&repository_root())
-        .unwrap()
-        .into_iter()
-        .filter(|p| p.slug != "sisuos")
-    {
-        let id = program.slug;
-        let path = disks.join(&id);
-        let disk = FolderDisk::open(&path).unwrap();
-        assert_eq!(disk.manifest().id, id);
-        assert!(disk.used_bytes().unwrap() <= disk.manifest().capacity_bytes);
-        let boot = disk.load_boot_image().unwrap();
-        assert_eq!(boot.mode, FolderBootMode::User, "unexpected mode on {id}");
-
-        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
-        cpu.load_program(&boot.image.segments, boot.image.entry_point)
-            .unwrap();
-        cpu.mount_folder_disk(&path).unwrap();
-        cpu.privilege_mode = match boot.mode {
-            FolderBootMode::Kernel => PrivilegeMode::Supervisor,
-            FolderBootMode::User => PrivilegeMode::User,
-        };
-        assert!(cpu.run(1000).unwrap() > 0, "no guest code ran on {id}");
-    }
-}
-
-#[test]
-fn imported_block_disks_preserve_the_source_and_export_all_blocks() {
-    let disks = repository_root().join("disks");
-    for id in ["DISK0001", "DISK0002"] {
-        let source = disks.join(format!("{id}.json"));
-        let imported = FolderDisk::open(&disks.join(id)).unwrap();
-        assert!(source.is_file(), "legacy source was removed for {id}");
-        assert_eq!(imported.manifest().id, id);
-        assert_eq!(imported.used_bytes().unwrap(), 1024);
-        assert_eq!(imported.list_files().unwrap().len(), 4);
-    }
+fn supported_sisuos_disk_package_validates_as_a_kernel_boot_disk() {
+    let path = repository_root().join("disks").join("sisuos");
+    let disk = FolderDisk::open(&path).unwrap();
+    assert_eq!(disk.manifest().id, "sisuos");
+    assert!(disk.used_bytes().unwrap() <= disk.manifest().capacity_bytes);
+    let boot = disk.load_boot_image().unwrap();
+    assert_eq!(boot.mode, FolderBootMode::Kernel);
+    assert!(!boot.image.segments.is_empty());
 }
 
 #[test]
