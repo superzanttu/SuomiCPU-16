@@ -1236,8 +1236,10 @@ Commands currently implemented:
 * +touch FILE+ creates an empty file without truncating an existing file.
 * +append FILE TEXT+ appends one line of text, creating the file if needed.
 * +cat FILE+ writes a file's contents to the console.
-* +edit FILE+ replaces a file with entered lines; a line containing only +.+
-  saves and closes it.
+* +nano FILE+ opens the file in a full-screen text editor. Use the arrow keys,
+  Home, End, Backspace, and Delete to edit text. Ctrl+O saves; Ctrl+X exits,
+  prompting before discarding unsaved changes. The editor supports text files
+  up to 4095 bytes.
 * +rm FILE+ removes a regular file.
 * +mv SOURCE DESTINATION+ renames a regular file without replacing an existing
   destination. Ownership and mode metadata follow the renamed file.
@@ -1248,6 +1250,8 @@ Commands currently implemented:
 * +run PROGRAM [args] [&]+ runs a packaged guest program. Program names
   without a path resolve to +bin/NAME.bin+. A trailing +&+ starts it in the
   background.
+* +run SCRIPT.cmd+ executes a shell script one command per line. Blank lines
+  are ignored, and execution stops at the first command that fails.
 * +groupadd GROUP+ creates a group (root only).
 * +useradd USER GROUP+ creates a user and its home directory (root only).
 * +passwd [USER]+ changes the current user's password, or a named user's
@@ -1278,9 +1282,12 @@ Background process 2 exited with status 137
 ----
 
 The shell enforces a 255-character input limit. Multiple independent
-consoles and a full-screen text editor are not implemented yet. +edit+ is a
-simple line-entry
-replacement editor. This is not a general-purpose operating system.
+consoles are not implemented yet. Press Ctrl+C to stop the foreground child
+program and return to SaunaShell; at the prompt it cancels the current input.
+Press Tab to complete a filename when there is a unique match; with multiple
+matches, the shell lists the candidates and leaves the input available for
+further typing. Command input is echoed once, including its terminating
+newline. This is not a general-purpose operating system.
 
 To build and install the SisuOS disk while preserving unrelated writable data:
 [source,powershell]

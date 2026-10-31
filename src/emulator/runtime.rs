@@ -606,6 +606,12 @@ pub async fn run_with_devices(
                     RuntimeControl::SerialToggled(visible) => serial_visible = visible,
                     RuntimeControl::SerialClosed => {}
                 }
+                continue;
+            }
+            if route_control_key(&mut cpu, key, controlled, serial_visible) {
+                control_key_count += 1;
+                handled_control_keys.insert(key);
+                continue;
             }
         }
         let console_control = console_window
@@ -702,7 +708,11 @@ pub async fn run_with_devices(
                 }
                 receive_terminal_key_with_serial(&mut cpu, key, serial_visible);
             }
-            let typed_characters = std::iter::from_fn(get_char_pressed).collect::<Vec<_>>();
+            let typed_characters = if controlled {
+                Vec::new()
+            } else {
+                std::iter::from_fn(get_char_pressed).collect::<Vec<_>>()
+            };
             if serial_visible {
                 receive_serial_typed_text(&mut cpu, typed_characters);
             } else {
@@ -1355,16 +1365,48 @@ fn update_keys(
     current: &HashSet<KeyCode>,
     shifted: bool,
 ) {
+    let controlled =
+        current.contains(&KeyCode::LeftControl) || current.contains(&KeyCode::RightControl);
     for (key, mask) in key_masks() {
         let was_down = previous.contains(&key);
         let is_down = current.contains(&key);
         if was_down != is_down {
             cpu.set_key(mask, is_down);
-            if is_down && key != KeyCode::Enter {
+            if is_down && key != KeyCode::Enter && !(controlled && control_character(key).is_some())
+            {
                 cpu.signal_keyboard_event(key_to_ascii(key, shifted).unwrap_or(0));
             }
         }
     }
+}
+
+fn control_character(key: KeyCode) -> Option<u8> {
+    let character = key_to_ascii(key, false)?;
+    (character.is_ascii_lowercase()).then_some(character - b'a' + 1)
+}
+
+fn route_control_key(cpu: &mut Cpu, key: KeyCode, controlled: bool, serial_visible: bool) -> bool {
+    if !controlled {
+        return false;
+    }
+    if key == KeyCode::C {
+        if !cpu.interrupt_foreground_process() {
+            if cpu.current_task().is_none() {
+                cpu.running = false;
+            } else if cpu.terminal_active {
+                cpu.receive_console_input(&[3]);
+            }
+        }
+        return true;
+    }
+    if serial_visible || !cpu.terminal_active {
+        return false;
+    }
+    if let Some(character) = control_character(key) {
+        cpu.receive_console_input(&[character]);
+        return true;
+    }
+    false
 }
 
 fn key_masks() -> [(KeyCode, u32); 25] {
@@ -1719,6 +1761,9 @@ fn receive_terminal_key_with_serial(cpu: &mut Cpu, key: KeyCode, serial_monitor_
         match key {
             KeyCode::Enter => cpu.receive_serial_input(b"\r"),
             KeyCode::Backspace => cpu.receive_serial_input(b"\x08"),
+            KeyCode::Home => cpu.receive_serial_input(b"\x1b[H"),
+            KeyCode::End => cpu.receive_serial_input(b"\x1b[F"),
+            KeyCode::Delete => cpu.receive_serial_input(b"\x1b[3~"),
             KeyCode::Up => cpu.receive_serial_input(b"\x1b[A"),
             KeyCode::Down => cpu.receive_serial_input(b"\x1b[B"),
             KeyCode::Right => cpu.receive_serial_input(b"\x1b[C"),
@@ -1740,6 +1785,10 @@ fn receive_terminal_key_with_serial(cpu: &mut Cpu, key: KeyCode, serial_monitor_
             }
             cpu.signal_keyboard_event(8);
         }
+        KeyCode::Tab if cpu.terminal_active => cpu.receive_console_input(b"\t"),
+        KeyCode::Home if cpu.terminal_active => cpu.receive_console_input(b"\x1b[H"),
+        KeyCode::End if cpu.terminal_active => cpu.receive_console_input(b"\x1b[F"),
+        KeyCode::Delete if cpu.terminal_active => cpu.receive_console_input(b"\x1b[3~"),
         KeyCode::Up if cpu.terminal_active => cpu.receive_console_input(b"\x1b[A"),
         KeyCode::Down if cpu.terminal_active => cpu.receive_console_input(b"\x1b[B"),
         KeyCode::Right if cpu.terminal_active => cpu.receive_console_input(b"\x1b[C"),
@@ -3292,12 +3341,32 @@ mod tests {
             copy_tree(&source_disk, &disks.join(source_disk.file_name().unwrap())).unwrap();
         }
         let test_sisuos_disk = disks.join(&boot_disk_id);
+        let test_accounts = test_sisuos_disk.join(".sisuos").join("accounts.json");
+        if test_accounts.exists() {
+            fs::remove_file(&test_accounts).unwrap();
+        }
         fs::write(
             test_sisuos_disk.join("user-note.txt"),
             b"retained user data",
         )
         .unwrap();
         fs::create_dir(test_sisuos_disk.join("data")).unwrap();
+        fs::write(test_sisuos_disk.join("editor.txt"), b"line from editor\n").unwrap();
+        fs::write(
+            test_sisuos_disk.join("completion-target.txt"),
+            b"completion marker\n",
+        )
+        .unwrap();
+        fs::write(
+            test_sisuos_disk.join("completion-other.txt"),
+            b"other completion\n",
+        )
+        .unwrap();
+        fs::write(
+            test_sisuos_disk.join("commands.cmd"),
+            b"touch script-created.txt\nappend script-created.txt \"created by script\"\nunknown-command\ntouch script-after-error.txt\n",
+        )
+        .unwrap();
         let firmware =
             crate::assembler::assemble_file(&repository.join("firmware").join("bios.asm"), 0)
                 .unwrap();
@@ -3395,6 +3464,7 @@ mod tests {
             "top",
             "kill 2",
             "run missing",
+            "run commands.cmd",
             "unknown",
             "x",
         ] {
@@ -3413,16 +3483,65 @@ mod tests {
                 }
             }
         }
-        receive_typed_text(&mut cpu, "edit editor.txt".chars());
+        receive_typed_text(&mut cpu, "cat completion-tar".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Tab);
         receive_terminal_key(&mut cpu, KeyCode::Enter);
-        cpu.receive_console_input(b"line from editor\n.\n");
         for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, "cat completion-".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Tab);
+        receive_typed_text(&mut cpu, "target.txt".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, "nano editor.txt".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        cpu.receive_console_input(b"\x1b[Hnew \x0f\x18");
+        for _ in 0..200 {
             cpu.begin_frame();
             let mut budget = 5_000;
             run_instruction_slice(&mut cpu, &mut budget).unwrap();
         }
         receive_typed_text(&mut cpu, "cat editor.txt".chars());
         receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, "run daemon".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        let task_states = (0..5)
+            .map(|task| {
+                format!(
+                    "{task}:{:?}",
+                    cpu.task_context(task).map(|context| context.state)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            cpu.interrupt_foreground_process(),
+            "Ctrl+C did not find the foreground child (current={:?}, states={task_states}, output={})",
+            cpu.current_task(),
+            String::from_utf8_lossy(cpu.console.output())
+        );
         for _ in 0..100 {
             cpu.begin_frame();
             let mut budget = 5_000;
@@ -3484,6 +3603,14 @@ mod tests {
 
         let output = String::from_utf8_lossy(cpu.console.output()).into_owned();
         assert!(
+            output.contains("sauna> help\nCommands:"),
+            "shell input did not use a single Enter newline: {output}"
+        );
+        assert!(
+            !output.contains("sauna> help\n\nCommands:"),
+            "shell emitted an extra blank line after command input: {output}"
+        );
+        assert!(
             output.matches("SaunaShell - SisuOS").count() >= 3,
             "logout did not return to a fresh shell: {output}"
         );
@@ -3508,7 +3635,15 @@ mod tests {
         let accounts = crate::accounts::AccountStore::load(&account_disk).unwrap();
         assert_eq!(
             fs::read_to_string(test_sisuos_disk.join("editor.txt")).unwrap(),
-            "line from editor\n"
+            "new line from editor\n"
+        );
+        assert_eq!(
+            fs::read_to_string(test_sisuos_disk.join("script-created.txt")).unwrap(),
+            "created by script\n"
+        );
+        assert!(
+            !test_sisuos_disk.join("script-after-error.txt").exists(),
+            "script continued after its first failed command"
         );
         assert_eq!(
             fs::read_to_string(test_sisuos_disk.join("archive-note.txt")).unwrap(),
@@ -3548,7 +3683,7 @@ mod tests {
         );
         for expected in [
             "SaunaShell - SisuOS",
-            "Commands: help, info, ps, top, kill PID, list [DIR], mkdir DIRECTORY, touch FILE, append FILE TEXT, cat FILE, edit FILE, rm FILE, mv SOURCE DESTINATION, chmod MODE FILE, chown FILE USER GROUP, run PROGRAM [args] [&], groupadd GROUP, useradd USER GROUP, passwd [USER], logout",
+            "Commands: help, info, ps, top, kill PID, list [DIR], mkdir DIRECTORY, touch FILE, append FILE TEXT, cat FILE, nano FILE, rm FILE, mv SOURCE DESTINATION, chmod MODE FILE, chown FILE USER GROUP, run PROGRAM [args] [&], run SCRIPT.cmd, groupadd GROUP, useradd USER GROUP, passwd [USER], logout",
             "data/",
             "data/newdir/",
             "user-note.txt",
@@ -3558,8 +3693,12 @@ mod tests {
             "first line\nsecond line",
             "File renamed.",
             "retained user data",
-            "File saved.",
-            "line from editor",
+            "SC-16 nano: editor.txt",
+            "new line from editor",
+            "completion marker",
+            "completion-target.txt",
+            "Script stopped at line 3.",
+            "Program exited with status 130",
             "Mode changed.",
             "Owner changed.",
             "File deleted.",
@@ -3812,6 +3951,59 @@ mod tests {
             .map(|_| cpu.read(crate::machine::SERIAL_DATA))
             .collect::<Vec<_>>();
         assert_eq!(received, "hiä\r".as_bytes());
+    }
+
+    #[test]
+    fn terminal_editor_keys_are_translated_for_guest_input() {
+        let mut cpu = Cpu::with_memory_size(1 << 20).unwrap();
+        cpu.terminal_active = true;
+        for key in [KeyCode::Tab, KeyCode::Home, KeyCode::End, KeyCode::Delete] {
+            receive_terminal_key(&mut cpu, key);
+        }
+        assert_eq!(
+            cpu.console
+                .receive_buffer()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"\t\x1b[H\x1b[F\x1b[3~"
+        );
+        assert_eq!(control_character(KeyCode::O), Some(15));
+        assert_eq!(control_character(KeyCode::X), Some(24));
+        assert_eq!(control_character(KeyCode::F10), None);
+    }
+
+    #[test]
+    fn ctrl_c_stops_standalone_programs_and_reaches_shell_input() {
+        let mut standalone = Cpu::with_memory_size(1 << 20).unwrap();
+        standalone.running = true;
+        assert!(route_control_key(&mut standalone, KeyCode::C, true, false));
+        assert!(!standalone.running);
+
+        let mut shell = Cpu::with_memory_size(1 << 20).unwrap();
+        shell.terminal_active = true;
+        let task = shell.create_user_task(0x100, 0x7000, 0xf000, None).unwrap();
+        shell.start_task(task).unwrap();
+        assert!(route_control_key(&mut shell, KeyCode::C, true, false));
+        assert_eq!(
+            shell
+                .console
+                .receive_buffer()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [3]
+        );
+        assert!(route_control_key(&mut shell, KeyCode::O, true, false));
+        assert_eq!(
+            shell
+                .console
+                .receive_buffer()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [3, 15]
+        );
     }
 
     #[test]

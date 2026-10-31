@@ -5446,6 +5446,84 @@ impl Cpu {
         self.interrupts.control |= 2;
     }
 
+    pub fn interrupt_foreground_process(&mut self) -> bool {
+        let target = self
+            .syscall_state
+            .waiting_for
+            .iter()
+            .filter_map(|(waiter, child)| {
+                self.syscall_state
+                    .processes
+                    .get(waiter)
+                    .and_then(|process| process.parent)
+                    .map(|_| (*waiter, *child, self.process_depth(*waiter)))
+            })
+            .max_by_key(|(_, _, depth)| *depth)
+            .map(|(_, child, _)| child);
+        let Some(target) = target else {
+            return false;
+        };
+        if !self.terminate_process_tree(target, 130) {
+            return false;
+        }
+        if self.scheduler.current_task().is_none()
+            && let Some(task_id) = self
+                .scheduler
+                .tasks()
+                .iter()
+                .find(|task| task.state == TaskState::Runnable)
+                .map(|task| task.id)
+            && let Ok(context) = self.scheduler.activate(task_id)
+        {
+            self.restore_task_context(&context);
+            self.running = true;
+        }
+        true
+    }
+
+    fn process_depth(&self, mut task_id: TaskId) -> usize {
+        let mut depth = 0;
+        for _ in 0..self.syscall_state.processes.len() {
+            let Some(parent) = self
+                .syscall_state
+                .processes
+                .get(&task_id)
+                .and_then(|process| process.parent)
+            else {
+                break;
+            };
+            task_id = parent;
+            depth += 1;
+        }
+        depth
+    }
+
+    fn terminate_process_tree(&mut self, task_id: TaskId, exit_code: i32) -> bool {
+        let Some(process) = self.syscall_state.processes.get(&task_id) else {
+            return false;
+        };
+        if process.exit_code.is_some() {
+            return false;
+        }
+        let children = process.children.clone();
+        for child in children {
+            if self.terminate_process_tree(child, exit_code) {
+                self.reap_process(task_id, child);
+            }
+        }
+        if self.scheduler.current_task() == Some(task_id) {
+            self.complete_process(task_id, exit_code);
+            return self
+                .schedule_current_task(TaskState::Exited, Some(exit_code))
+                .is_ok();
+        }
+        if self.scheduler.terminate(task_id, exit_code).is_err() {
+            return false;
+        }
+        self.complete_process(task_id, exit_code);
+        true
+    }
+
     pub fn set_key(&mut self, mask: u32, pressed: bool) {
         self.input.set_key(mask, pressed);
     }
@@ -9200,6 +9278,38 @@ mod tests {
         assert_eq!(cpu.registers[0], 137);
         assert_eq!(cpu.registers[1], i64::from(child));
         assert!(!cpu.syscall_state.processes.contains_key(&child));
+    }
+
+    #[test]
+    fn ctrl_c_terminates_foreground_child_without_killing_init_shell() {
+        let (mut cpu, init) = cpu_with_syscall_task();
+        let shell = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(shell, Some(init));
+        cpu.syscall_state.waiting_for.insert(init, shell);
+
+        assert!(!cpu.interrupt_foreground_process());
+        assert!(cpu.syscall_state.processes.contains_key(&shell));
+
+        let child = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x120, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(child, Some(shell));
+        cpu.syscall_state.waiting_for.insert(shell, child);
+        cpu.syscall_state
+            .processes
+            .get_mut(&child)
+            .unwrap()
+            .waiters
+            .push_back(shell);
+
+        assert!(cpu.interrupt_foreground_process());
+        assert_eq!(cpu.syscall_state.processes[&child].exit_code, Some(130));
+        assert!(cpu.syscall_state.processes.contains_key(&shell));
+        assert_eq!(cpu.syscall_state.waiting_for.get(&init), Some(&shell));
     }
 
     #[test]
