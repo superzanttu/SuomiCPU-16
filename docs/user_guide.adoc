@@ -1218,17 +1218,23 @@ cargo run --bin suomicpu16 -- --disk sisuos
 ----
 Press Enter in the BIOS to boot the selected disk. The kernel installs its IDT,
 enables the MMU and instruction timer, and starts the user-mode SaunaShell.
+SisuOS starts four independent login sessions. Use Alt+F1 through Alt+F4 to
+switch consoles. They share the filesystem, accounts, and scheduler; each
+console has its own login, shell, and foreground process session.
 Commands currently implemented:
 
 * +help+ displays the command list.
 * +info+ displays SisuOS and syscall ABI status.
-* +ps+ lists process IDs, parent IDs, states, and program paths. +ready+ means
-  runnable but waiting for CPU time; +sleeping+ and +waiting+ identify timer
-  and child waits.
-* +top+ snapshots instruction counts for each process since it started.
+* +ps+ lists process IDs, parent IDs, console IDs, states, and program paths.
+  Non-root users see processes on their console; root can view processes on all
+  consoles. +ready+ means runnable but waiting for CPU time; +sleeping+ and
+  +waiting+ identify timer and child waits.
+* +top+ shows overall and per-process CPU utilization, refreshing every five
+  seconds until Ctrl+C.
 * +kill PID+ terminates a direct child with status 137. Root may terminate any
   non-init process. Processes with children cannot be terminated, and
   processes cannot terminate themselves.
+* Ctrl+C stops the foreground program and returns to the shell.
 * +list [DIR]+ displays the current directory entries from the mounted SisuOS
   disk. Directories are suffixed with +/+; the disk manifest and protected
   kernel account metadata are not exposed.

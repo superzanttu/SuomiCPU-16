@@ -567,9 +567,18 @@ pub async fn run_with_devices(
         let shifted = keys.contains(&KeyCode::LeftShift) || keys.contains(&KeyCode::RightShift);
         let controlled =
             keys.contains(&KeyCode::LeftControl) || keys.contains(&KeyCode::RightControl);
+        let alt_pressed = keys.contains(&KeyCode::LeftAlt) || keys.contains(&KeyCode::RightAlt);
         let mut control_key_count = 0;
         let mut handled_control_keys = HashSet::new();
         for key in pressed_keys.iter().copied() {
+            if let Some(console_index) =
+                terminal_switch_index(key, alt_pressed, cpu.terminal_active, serial_visible)
+            {
+                cpu.select_console(console_index);
+                control_key_count += 1;
+                handled_control_keys.insert(key);
+                continue;
+            }
             if cpu.privilege_mode == PrivilegeMode::Supervisor
                 && cpu.guest_text.enabled
                 && cpu.memory[BIOS_FIRMWARE_MARKER as usize] == 1
@@ -1385,6 +1394,24 @@ fn control_character(key: KeyCode) -> Option<u8> {
     (character.is_ascii_lowercase()).then_some(character - b'a' + 1)
 }
 
+fn terminal_switch_index(
+    key: KeyCode,
+    alt_pressed: bool,
+    terminal_active: bool,
+    serial_visible: bool,
+) -> Option<u8> {
+    if !alt_pressed || !terminal_active || serial_visible {
+        return None;
+    }
+    match key {
+        KeyCode::F1 => Some(0),
+        KeyCode::F2 => Some(1),
+        KeyCode::F3 => Some(2),
+        KeyCode::F4 => Some(3),
+        _ => None,
+    }
+}
+
 fn route_control_key(cpu: &mut Cpu, key: KeyCode, controlled: bool, serial_visible: bool) -> bool {
     if !controlled {
         return false;
@@ -1628,7 +1655,10 @@ fn run_instruction_slice(
         && !cpu.frame_yield
     {
         let chunk = (*budget_remaining).min(RUNTIME_INSTRUCTION_CHUNK);
+        let before = cpu.process_instruction_snapshot();
+        let slice_started = Instant::now();
         let executed = cpu.run(chunk)?;
+        cpu.record_cpu_slice(&before, slice_started.elapsed().as_nanos());
         *budget_remaining = budget_remaining.saturating_sub(executed);
         total_executed += executed;
         if executed == 0 {
@@ -2040,7 +2070,10 @@ fn render_terminal_to_gpu(
     })?;
     cpu.vram.fill(0);
     let top = (480 - crate::console::ROWS * 16) / 2;
-    let lines = cpu.console.lines().cloned().collect::<Vec<_>>();
+    let console = cpu.active_console_device();
+    let lines = console.lines().cloned().collect::<Vec<_>>();
+    let cursor_visible = console.cursor_visible();
+    let cursor_position = console.cursor_position();
     for (row, line) in lines.iter().enumerate() {
         for (column, byte) in line.iter().copied().enumerate() {
             if byte == b' ' {
@@ -2071,8 +2104,8 @@ fn render_terminal_to_gpu(
             }
         }
     }
-    if cpu.console.cursor_visible() && cursor_phase {
-        let (column, row) = cpu.console.cursor_position();
+    if cursor_visible && cursor_phase {
+        let (column, row) = cursor_position;
         let x = column.min(crate::console::COLUMNS - 1) * 8 + 1;
         let y = top + row.min(crate::console::ROWS - 1) * 16 + 14;
         for pixel_x in x..x + 6 {
@@ -3312,6 +3345,7 @@ mod tests {
             ("sauna.bin", "sauna.c"),
             ("daemon.bin", "daemon.c"),
             ("sleeper.bin", "sleeper.c"),
+            ("worker.bin", "worker.c"),
         ] {
             let image =
                 crate::image::build_c_program_at(&source_root.join(source), 0x30000).unwrap();
@@ -3330,7 +3364,8 @@ mod tests {
                 "kernel.bin",
                 "bin/sauna.bin",
                 "bin/daemon.bin",
-                "bin/sleeper.bin"
+                "bin/sleeper.bin",
+                "bin/worker.bin"
             ]
         );
         for entry in fs::read_dir(repository.join("disks")).unwrap() {
@@ -3423,7 +3458,10 @@ mod tests {
         );
         update_rtc(&mut cpu);
         cpu.run(1000).unwrap();
-        assert!(cpu.running, "SisuOS stopped after the RTC interrupt");
+        assert!(
+            cpu.has_pending_work(),
+            "SisuOS lost all pending tasks after RTC"
+        );
 
         cpu.test_monotonic_ms = Some(1000);
         cpu.receive_console_input(b"sisu-test-password\nsisu-test-password\n");
@@ -3436,6 +3474,23 @@ mod tests {
                     runtime_cpu_failure_details(&cpu, None, Some(&checked_in_disk), &error)
                 );
             }
+        }
+        cpu.test_monotonic_ms = Some(1100);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        for console in &cpu.additional_consoles {
+            assert!(
+                String::from_utf8_lossy(console.output()).contains("login: "),
+                "an isolated console did not reach its login prompt: {}",
+                format!(
+                    "{}; primary={}",
+                    String::from_utf8_lossy(console.output()),
+                    String::from_utf8_lossy(cpu.console.output())
+                )
+            );
         }
         for command in [
             "help",
@@ -3461,8 +3516,7 @@ mod tests {
             "info",
             "run daemon &",
             "ps",
-            "top",
-            "kill 2",
+            "kill 5",
             "run missing",
             "run commands.cmd",
             "unknown",
@@ -3568,8 +3622,52 @@ mod tests {
             let mut budget = 5_000;
             run_instruction_slice(&mut cpu, &mut budget).unwrap();
         }
+        cpu.select_console(1);
+        cpu.receive_console_input(b"alice\nsisu-user-password\n");
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        assert!(
+            String::from_utf8_lossy(cpu.additional_consoles[0].output())
+                .contains("SaunaShell - SisuOS"),
+            "console two did not establish its own authenticated shell"
+        );
+        receive_typed_text(&mut cpu, "ps".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        let console_two_output =
+            String::from_utf8_lossy(cpu.additional_consoles[0].output()).into_owned();
+        assert!(console_two_output.contains("2 0 C2 running bin/sauna.bin"));
+        assert!(!console_two_output.contains("C1 running bin/sauna.bin"));
+        receive_typed_text(&mut cpu, "cat archive-note.txt".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        assert!(
+            String::from_utf8_lossy(cpu.additional_consoles[0].output())
+                .contains("first line\nsecond line")
+        );
         receive_typed_text(&mut cpu, "logout".chars());
         receive_terminal_key(&mut cpu, KeyCode::Enter);
+        cpu.test_monotonic_ms = Some(1200);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        cpu.select_console(0);
+        receive_typed_text(&mut cpu, "logout".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        cpu.test_monotonic_ms = Some(1300);
         for _ in 0..100 {
             cpu.begin_frame();
             let mut budget = 5_000;
@@ -3588,13 +3686,45 @@ mod tests {
         ] {
             receive_typed_text(&mut cpu, command.chars());
             receive_terminal_key(&mut cpu, KeyCode::Enter);
+            if command == "logout" {
+                cpu.test_monotonic_ms = Some(1400);
+            }
             for _ in 0..100 {
                 cpu.begin_frame();
                 let mut budget = 5_000;
                 run_instruction_slice(&mut cpu, &mut budget).unwrap();
             }
         }
+        cpu.test_monotonic_ms = Some(1500);
         cpu.receive_console_input(b"root\nsisu-test-password\n");
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        receive_typed_text(&mut cpu, "run worker.bin &".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for _ in 0..100 {
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+        }
+        cpu.test_monotonic_ms = Some(1000);
+        receive_typed_text(&mut cpu, "top".chars());
+        receive_terminal_key(&mut cpu, KeyCode::Enter);
+        for sample in 0..80 {
+            cpu.test_monotonic_ms = Some(1000 + sample * 100);
+            cpu.begin_frame();
+            let mut budget = 5_000;
+            run_instruction_slice(&mut cpu, &mut budget).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            String::from_utf8_lossy(cpu.console.output()).contains("PID CPU%"),
+            "top did not render a CPU sample: {}",
+            String::from_utf8_lossy(cpu.console.output())
+        );
+        cpu.receive_console_input(b"\x03");
         for _ in 0..100 {
             cpu.begin_frame();
             let mut budget = 5_000;
@@ -3602,6 +3732,18 @@ mod tests {
         }
 
         let output = String::from_utf8_lossy(cpu.console.output()).into_owned();
+        let worker_pid = output
+            .match_indices("Started background process ")
+            .filter_map(|(offset, _)| {
+                let start = offset + "Started background process ".len();
+                let digits = output[start..]
+                    .bytes()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+                output[start..start + digits].parse::<u32>().ok()
+            })
+            .last()
+            .expect("worker process should have been started");
         assert!(
             output.contains("sauna> help\nCommands:"),
             "shell input did not use a single Enter newline: {output}"
@@ -3614,22 +3756,20 @@ mod tests {
             output.matches("SaunaShell - SisuOS").count() >= 3,
             "logout did not return to a fresh shell: {output}"
         );
-        let accounting_output = output
-            .split_once("PID INSTRUCTIONS_SINCE_START\n")
-            .expect("top command did not print its accounting header")
-            .1;
-        let daemon_accounting = accounting_output
-            .lines()
-            .find_map(|line| {
-                let (pid, instructions) = line.split_once(' ')?;
-                (pid == "2")
-                    .then(|| instructions.parse::<u64>().ok())
-                    .flatten()
-            })
-            .expect("top command did not report the daemon's instruction count");
+        let worker_prefix = format!("{worker_pid} ");
         assert!(
-            daemon_accounting > 0,
-            "daemon instruction accounting did not advance"
+            output
+                .rsplit("\x1b[2J\x1b[H")
+                .next()
+                .unwrap_or_default()
+                .lines()
+                .any(|line| {
+                    line.strip_prefix(&worker_prefix)
+                        .and_then(|percent| percent.strip_suffix('%'))
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .is_some_and(|percent| percent > 0)
+                }),
+            "top did not report CPU activity for the worker: {output}"
         );
         let account_disk = FolderDisk::open(&disks.join(&boot_disk_id)).unwrap();
         let accounts = crate::accounts::AccountStore::load(&account_disk).unwrap();
@@ -3705,17 +3845,19 @@ mod tests {
             "bin/daemon.bin",
             "bin/sauna.bin",
             "bin/sleeper.bin",
+            "bin/worker.bin",
             "Group created.",
             "User created. Set its password with passwd.",
             "Password changed.",
             "first line\nsecond line",
-            "Started background process 2",
-            "daemon pid=2 started_ms=",
-            "PID PPID STATE PROGRAM",
-            "2 1 sleeping bin/daemon.bin",
-            "PID INSTRUCTIONS_SINCE_START",
+            "Started background process 5",
+            "daemon pid=5 started_ms=",
+            "PID PPID CONSOLE STATE PROGRAM",
+            "5 1 C1 sleeping bin/daemon.bin",
             "Process terminated.",
-            "Background process 2 exited with status 137",
+            "Background process 5 exited with status 137",
+            "Started background process ",
+            "PID CPU%",
             "Unable to start program.",
             "Unknown command. Type help.",
             "Command too long (255 characters maximum).",
@@ -3740,7 +3882,7 @@ mod tests {
         assert!(cpu.terminal_dirty);
         assert!(cpu.is_mmu_enabled());
         assert_eq!(
-            cpu.task_context(2).unwrap().state,
+            cpu.task_context(5).unwrap().state,
             crate::scheduler::TaskState::Exited
         );
         fs::remove_dir_all(root).unwrap();
@@ -3971,6 +4113,22 @@ mod tests {
         assert_eq!(control_character(KeyCode::O), Some(15));
         assert_eq!(control_character(KeyCode::X), Some(24));
         assert_eq!(control_character(KeyCode::F10), None);
+    }
+
+    #[test]
+    fn alt_function_keys_switch_only_active_guest_terminals() {
+        for (key, expected) in [
+            (KeyCode::F1, Some(0)),
+            (KeyCode::F2, Some(1)),
+            (KeyCode::F3, Some(2)),
+            (KeyCode::F4, Some(3)),
+            (KeyCode::F5, None),
+        ] {
+            assert_eq!(terminal_switch_index(key, true, true, false), expected);
+        }
+        assert_eq!(terminal_switch_index(KeyCode::F1, false, true, false), None);
+        assert_eq!(terminal_switch_index(KeyCode::F1, true, false, false), None);
+        assert_eq!(terminal_switch_index(KeyCode::F1, true, true, true), None);
     }
 
     #[test]

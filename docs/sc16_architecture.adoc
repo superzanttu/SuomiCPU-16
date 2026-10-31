@@ -992,7 +992,7 @@ which the native wrappers combine before `SVC`.
   immediately; otherwise blocks until the interval has elapsed, including
   across the 30-bit clock rollover. Independent of instruction-tick +sleep+.
 |20 |`process_status` |Same arguments and buffer/error rules as +process_info+,
-  returning +PID PPID STATE PROGRAM\n+. States are +running+, +ready+,
+  returning +PID PPID CONSOLE STATE PROGRAM\n+. States are +running+, +ready+,
   +sleeping+, +waiting+, +blocked+, and +exited+. Program is the spawn path,
   or the boot disk ID for its initial process (+init+ without a disk).
   Whitespace/control characters in names are replaced by +?+.
@@ -1038,8 +1038,7 @@ which the native wrappers combine before `SVC`.
   process credentials and returns the UID; invalid credentials return
   `-EACCES`.
 |29 |`set_console_echo` |R1 is zero to disable console echo or one to enable
-  it. This currently controls the shared console device, not a per-process
-  terminal.
+  it for the calling process's console.
 |30 |`add_group` |R1 group name; root only. Returns the new GID.
 |31 |`add_user` |R1 username, R2 group name, R3 home path; root only. Creates
   the account and its home directory with owner-only access, returning the
@@ -1078,6 +1077,16 @@ which the native wrappers combine before `SVC`.
   at the end, or an error. The counter includes guest and syscall instructions
   executed by that task since registration. Reaped processes are excluded;
   indices may shift.
+|41 |`spawn_console` |R1 executable path and R2 console ID (1-3); restricted
+  to the SisuOS init process and +bin/sauna.bin+. Creates an isolated login
+  shell on that console without inheriting credentials.
+|42 |`process_cpu_time` |R1 zero-based process index, R2 writable buffer,
+  R3 capacity; R4-R6 must be zero. Returns a `PID CENTISECONDS\n` row, zero
+  at the end, or an error. CPU time is attributed to processes from executed
+  instruction slices; reaped processes are excluded and indices may shift.
+|43 |`try_read` |Same arguments as +read+; console input returns immediately
+  with zero bytes available instead of blocking. File reads use the normal
+  file behavior.
 |===
 
 The original `spawn` and `spawn_arg` supply the executable path as argument
@@ -1090,15 +1099,16 @@ quotes and constructing the argument block.
 
 Every user pointer is range-checked against the active address space before
 use. Paths are ASCII, null-terminated, and limited to 128 bytes; read/write
-transfers are limited to 4096 bytes. Handles 0, 1, and 2 are nonblocking
-console input, console output, and console error; allocated folder-file
-handles start at 3 and belong to one process. Open flags are READ=1, WRITE=2,
+transfers are limited to 4096 bytes. Handles 0, 1, and 2 are console input,
+console output, and console error; +read+ blocks on empty input while
++try_read+ returns immediately. Allocated folder-file handles start at 3 and
+belong to one process. Open flags are READ=1, WRITE=2,
 CREATE=4, TRUNCATE=8, and APPEND=16. Append writes select the current file end
 for each write. Seek is file-only, accepts signed 32-bit offsets, and rejects
 positions outside 0..2^31-1. `mmap` permission bits are READ=1, WRITE=2, EXEC=4; mapped
 pages belong to the caller's address space. Sleep advances on deterministic
-emulator instruction ticks. Wait accepts only a direct child and reaps it
-after collecting status. Semaphore CREATE returns a new ID; WAIT, POST, and
+emulator instruction ticks. Wait accepts only a direct child and reaps it after
+collecting status. Semaphore CREATE returns a new ID; WAIT, POST, and
 DESTROY return zero on success.
 
 Semaphore operations are CREATE=0, WAIT=1, POST=2, and DESTROY=3. The creating
@@ -1205,8 +1215,11 @@ operating system:
 * A BIOS-booted guest workload verifies spawn, yield, sleep, wait, console/file
   I/O, and exit together, but this sample does not establish general-kernel
   robustness.
-* SisuOS currently boots a user-mode SaunaShell with `help`, `list`, `info`,
-  `ps`, `top`, `kill PID`, `run PROGRAM [args] [&]`, and `logout`. First boot sets a root password;
+* SisuOS boots four isolated user-mode SaunaShell sessions. Alt+F1 through
+  Alt+F4 select the consoles; they share the SisuOS filesystem, accounts, and
+  scheduler. Process listings are scoped to the current console, except root
+  can inspect all consoles. The shell provides `help`, `list`, `info`, `ps`,
+  `top`, `kill PID`, `run PROGRAM [args] [&]`, and `logout`. First boot sets a root password;
   later boots authenticate root against kernel-protected persistent account
   metadata. The account model supports user/group records and file modes, and
   SisuOS enforces those modes for directory listings, file opens, reads,
@@ -1214,10 +1227,12 @@ operating system:
   account administration provides root-only group and user creation plus
   password changes. Newly created files are owned by the creating user and use
   mode `0644`; new directories use mode `0755`. The shell lists mounted
-  directory entries dynamically and supports `mkdir`, `touch`, `cat`, `edit`,
-  `append`, `rm`, `mv`, `chmod`, and `chown`, but the system has no multiple consoles or
-  general-purpose filesystem shell. `top` reports per-process instruction
-  counts since process start. Process termination is limited to direct
+  directory entries dynamically and supports `mkdir`, `touch`, `cat`, `nano`,
+  `append`, `rm`, `mv`, `chmod`, and `chown`, as well as `.cmd` scripts and
+  filename completion. This remains a demonstration userland, not a
+  general-purpose filesystem shell. `top` reports per-process CPU time and
+  utilization percentages, refreshing every five seconds until Ctrl+C.
+  Process termination is limited to direct
   children, except that root may terminate any process other than init.
 * The BIOS-booted workload triggers a supervisor-only read and verifies that the
   sample handler skips the faulting instruction. This single recovery policy is

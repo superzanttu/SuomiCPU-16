@@ -32,6 +32,25 @@ sc16_spawn:
     SVC
     JMPX __sc16_id_result_long
 
+sc16_spawn_console:
+    LDWS R4, 6
+    LDWS R5, 4
+    LDI R6, 0xFFFF
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R1, R4
+    LDWS R2, 8
+    AND R2, R6
+    LDI R3, 0
+    LDI R4, 0
+    LDI R5, 0
+    LDI R6, 0
+    LDI R0, 41
+    LDI R7, 1
+    SVC
+    JMPX __sc16_id_result_long
+
 sc16_mmap:
     LDWS R4, 12
     LDWS R5, 10
@@ -81,6 +100,23 @@ sc16_read:
     LDWS R3, 10
     AND R3, R6
     LDI R0, 6
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_try_read:
+    LDWS R1, 4
+    LDWS R4, 8
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 10
+    AND R3, R6
+    LDI R0, 43
     LDI R7, 1
     SVC
     RET
@@ -393,6 +429,26 @@ sc16_process_accounting:
     LDI R5, 0
     LDI R6, 0
     LDI R0, 40
+    LDI R7, 1
+    SVC
+    RET
+
+sc16_process_cpu_time:
+    LDWS R1, 4
+    LDWS R4, 8
+    LDWS R5, 6
+    LDI R6, 0xFFFF
+    AND R1, R6
+    AND R4, R6
+    AND R5, R6
+    JOIN30 R4, R5
+    MOV R2, R4
+    LDWS R3, 10
+    AND R3, R6
+    LDI R4, 0
+    LDI R5, 0
+    LDI R6, 0
+    LDI R0, 42
     LDI R7, 1
     SVC
     RET

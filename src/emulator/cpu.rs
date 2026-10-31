@@ -547,6 +547,8 @@ pub struct Cpu {
     pub frame_presented: bool,
     pub frame_count: u16,
     pub console: ConsoleDevice,
+    pub additional_consoles: [ConsoleDevice; 3],
+    pub active_console_index: u8,
     pub debug_console: ConsoleDevice,
     pub terminal_active: bool,
     pub terminal_dirty: bool,
@@ -656,6 +658,8 @@ impl Cpu {
             frame_presented: false,
             frame_count: 0,
             console: ConsoleDevice::new(),
+            additional_consoles: std::array::from_fn(|_| ConsoleDevice::new()),
+            active_console_index: 0,
             debug_console: ConsoleDevice::new(),
             terminal_active: false,
             terminal_dirty: false,
@@ -1907,11 +1911,17 @@ impl Cpu {
                     0
                 }
                 Ok(SyscallNumber::Open) => self.syscall_open(task_id),
-                Ok(SyscallNumber::Read) => self.syscall_read(task_id),
+                Ok(SyscallNumber::Read) => self.syscall_read(task_id, &mut scheduled_state, true),
+                Ok(SyscallNumber::TryRead) => {
+                    self.syscall_read(task_id, &mut scheduled_state, false)
+                }
                 Ok(SyscallNumber::Write) => self.syscall_write(task_id),
                 Ok(SyscallNumber::Close) => self.syscall_close(task_id),
                 Ok(
-                    SyscallNumber::Spawn | SyscallNumber::SpawnArgument | SyscallNumber::SpawnExec,
+                    SyscallNumber::Spawn
+                    | SyscallNumber::SpawnArgument
+                    | SyscallNumber::SpawnExec
+                    | SyscallNumber::SpawnConsole,
                 ) => self.syscall_spawn(task_id),
                 Ok(SyscallNumber::ArgumentCount) => task_id
                     .and_then(|id| self.syscall_state.processes.get(&id))
@@ -1948,9 +1958,10 @@ impl Cpu {
                 Ok(SyscallNumber::SetFileOwner) => self.syscall_set_file_owner(task_id),
                 Ok(SyscallNumber::Kill) => self.syscall_kill(task_id),
                 Ok(SyscallNumber::RenameFile) => self.syscall_rename_file(task_id),
-                Ok(SyscallNumber::ProcessAccounting) => self.syscall_process_accounting(),
+                Ok(SyscallNumber::ProcessAccounting) => self.syscall_process_accounting(task_id),
+                Ok(SyscallNumber::ProcessCpuTime) => self.syscall_process_cpu_time(task_id),
                 Ok(SyscallNumber::ProcessInfo | SyscallNumber::ProcessStatus) => {
-                    self.syscall_process_info()
+                    self.syscall_process_info(task_id)
                 }
                 Ok(SyscallNumber::StartupArgument) => task_id
                     .and_then(|id| self.syscall_state.processes.get(&id))
@@ -1984,7 +1995,18 @@ impl Cpu {
         (self.monotonic_epoch.elapsed().as_millis() & u128::from(ADDRESS_MASK)) as i64
     }
 
-    fn syscall_process_info(&mut self) -> i64 {
+    fn syscall_process_info(&mut self, caller: Option<TaskId>) -> i64 {
+        let Some(caller) = caller else {
+            return crate::syscall::error::INVALID;
+        };
+        let Some(caller_record) = self.syscall_state.processes.get(&caller) else {
+            return crate::syscall::error::INVALID;
+        };
+        let caller_console = caller_record.console_id;
+        let is_root = caller_record
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.uid == 0);
         let Ok(index) = usize::try_from(self.registers[1]) else {
             return crate::syscall::error::INVALID;
         };
@@ -2001,7 +2023,12 @@ impl Cpu {
             .scheduler
             .tasks()
             .iter()
-            .filter(|task| self.syscall_state.processes.contains_key(&task.id))
+            .filter(|task| {
+                self.syscall_state
+                    .processes
+                    .get(&task.id)
+                    .is_some_and(|record| is_root || record.console_id == caller_console)
+            })
             .nth(index)
         else {
             return 0;
@@ -2044,7 +2071,11 @@ impl Cpu {
                     }
                 })
                 .collect();
-            format!("{} {parent} {state} {name}\n", task.id)
+            format!(
+                "{} {parent} C{} {state} {name}\n",
+                task.id,
+                record.console_id + 1
+            )
         } else {
             format!("{} {parent} {state}\n", task.id)
         };
@@ -2066,7 +2097,18 @@ impl Cpu {
         text.len() as i64
     }
 
-    fn syscall_process_accounting(&mut self) -> i64 {
+    fn syscall_process_accounting(&mut self, caller: Option<TaskId>) -> i64 {
+        let Some(caller) = caller else {
+            return crate::syscall::error::INVALID;
+        };
+        let Some(caller_record) = self.syscall_state.processes.get(&caller) else {
+            return crate::syscall::error::INVALID;
+        };
+        let caller_console = caller_record.console_id;
+        let is_root = caller_record
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.uid == 0);
         let Ok(index) = usize::try_from(self.registers[1]) else {
             return crate::syscall::error::INVALID;
         };
@@ -2085,7 +2127,12 @@ impl Cpu {
             .scheduler
             .tasks()
             .iter()
-            .filter(|task| self.syscall_state.processes.contains_key(&task.id))
+            .filter(|task| {
+                self.syscall_state
+                    .processes
+                    .get(&task.id)
+                    .is_some_and(|record| is_root || record.console_id == caller_console)
+            })
             .nth(index)
         else {
             return 0;
@@ -2097,6 +2144,73 @@ impl Cpu {
             .copied()
             .unwrap_or_default();
         let text = format!("{} {instructions}\n", task.id);
+        if text.len() > capacity {
+            return crate::syscall::error::OVERFLOW;
+        }
+        let addresses = match self.guest_memory_addresses(
+            destination,
+            text.len(),
+            crate::mmu::MemoryAccess::Write,
+            true,
+        ) {
+            Ok(addresses) => addresses,
+            Err(_) => return crate::syscall::error::BAD_ADDRESS,
+        };
+        for (address, byte) in addresses.into_iter().zip(text.bytes()) {
+            self.memory[address] = byte;
+        }
+        text.len() as i64
+    }
+
+    fn syscall_process_cpu_time(&mut self, caller: Option<TaskId>) -> i64 {
+        let Some(caller) = caller else {
+            return crate::syscall::error::INVALID;
+        };
+        let Some(caller_record) = self.syscall_state.processes.get(&caller) else {
+            return crate::syscall::error::INVALID;
+        };
+        let caller_console = caller_record.console_id;
+        let is_root = caller_record
+            .credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.uid == 0);
+        let Ok(index) = usize::try_from(self.registers[1]) else {
+            return crate::syscall::error::INVALID;
+        };
+        let Ok(destination) = u32::try_from(self.registers[2]) else {
+            return crate::syscall::error::BAD_ADDRESS;
+        };
+        let Ok(capacity) = usize::try_from(self.registers[3]) else {
+            return crate::syscall::error::INVALID;
+        };
+        if self.registers[4..=6].iter().any(|argument| *argument != 0)
+            || capacity > crate::syscall::MAX_TRANSFER_BYTES
+        {
+            return crate::syscall::error::INVALID;
+        }
+        let Some(task) = self
+            .scheduler
+            .tasks()
+            .iter()
+            .filter(|task| {
+                self.syscall_state
+                    .processes
+                    .get(&task.id)
+                    .is_some_and(|record| is_root || record.console_id == caller_console)
+            })
+            .nth(index)
+        else {
+            return 0;
+        };
+        let cpu_centiseconds = self
+            .syscall_state
+            .process_cpu_time_ns
+            .get(&task.id)
+            .copied()
+            .unwrap_or_default()
+            / 10_000_000;
+        let cpu_centiseconds = cpu_centiseconds as u16;
+        let text = format!("{} {cpu_centiseconds}\n", task.id);
         if text.len() > capacity {
             return crate::syscall::error::OVERFLOW;
         }
@@ -2136,6 +2250,9 @@ impl Cpu {
         let Some(target_record) = self.syscall_state.processes.get(&target) else {
             return crate::syscall::error::NO_ENTRY;
         };
+        let Some(caller_record) = self.syscall_state.processes.get(&caller) else {
+            return crate::syscall::error::INVALID;
+        };
         let is_child = target_record.parent == Some(caller)
             && self
                 .syscall_state
@@ -2148,7 +2265,7 @@ impl Cpu {
             .get(&caller)
             .and_then(|record| record.credentials.as_ref())
             .is_some_and(|credentials| credentials.uid == 0);
-        if !is_child && !is_root {
+        if !is_root && (!is_child || target_record.console_id != caller_record.console_id) {
             return crate::syscall::error::PERMISSION;
         }
         if target_record.exit_code.is_some() {
@@ -2665,7 +2782,12 @@ impl Cpu {
         }
     }
 
-    fn syscall_read(&mut self, task_id: Option<TaskId>) -> i64 {
+    fn syscall_read(
+        &mut self,
+        task_id: Option<TaskId>,
+        scheduled_state: &mut Option<(TaskState, i32)>,
+        block_when_empty: bool,
+    ) -> i64 {
         let Some(task_id) = task_id else {
             return crate::syscall::error::INVALID;
         };
@@ -2691,13 +2813,24 @@ impl Cpu {
             Err(_) => return crate::syscall::error::BAD_ADDRESS,
         };
         if handle == 0 {
-            let bytes_read = length.min(self.console.receive_buffer().len());
+            let console_id = self.task_console_index(Some(task_id));
+            let bytes_read = length.min(self.console_by_index(console_id).receive_buffer().len());
+            if bytes_read == 0 && length != 0 {
+                if !block_when_empty {
+                    return 0;
+                }
+                self.syscall_state
+                    .console_reading
+                    .insert(task_id, console_id);
+                scheduled_state.replace((TaskState::Blocked, 0));
+                return 0;
+            }
             for address in output.iter().take(bytes_read) {
-                let byte = self.console.read_data();
+                let byte = self.console_by_index_mut(console_id).read_data();
                 self.memory[*address] = byte;
-                if self.console.control() & 1 != 0 && byte != 0 {
+                if self.console_by_index(console_id).control() & 1 != 0 && byte != 0 {
                     self.terminal_active = true;
-                    self.terminal_dirty = true;
+                    self.terminal_dirty |= console_id == self.active_console_index;
                 }
             }
             return bytes_read as i64;
@@ -2762,12 +2895,13 @@ impl Cpu {
             .collect();
         if handle == 1 || handle == 2 {
             let has_output = !data.is_empty();
+            let console_id = self.task_console_index(Some(task_id));
             for byte in data {
-                self.console.write_data(byte);
+                self.console_by_index_mut(console_id).write_data(byte);
             }
             if has_output {
                 self.terminal_active = true;
-                self.terminal_dirty = true;
+                self.terminal_dirty |= console_id == self.active_console_index;
             }
             return length as i64;
         }
@@ -3254,16 +3388,17 @@ impl Cpu {
     }
 
     fn syscall_set_console_echo(&mut self, task_id: Option<TaskId>) -> i64 {
-        if task_id.is_none() {
+        let Some(task_id) = task_id else {
             return crate::syscall::error::INVALID;
-        }
+        };
         let echo = match self.registers[1] {
             0 => false,
             1 => true,
             _ => return crate::syscall::error::INVALID,
         };
-        let control = self.console.control();
-        self.console.set_control((control & !1) | u8::from(echo));
+        let console = self.task_console_device_mut(task_id);
+        let control = console.control();
+        console.set_control((control & !1) | u8::from(echo));
         0
     }
 
@@ -3547,6 +3682,18 @@ impl Cpu {
     }
 
     fn syscall_spawn(&mut self, parent: Option<TaskId>) -> i64 {
+        let console_spawn = self.registers[0] == SyscallNumber::SpawnConsole as i64;
+        let console_id = if console_spawn {
+            if self.registers[3..=6].iter().any(|argument| *argument != 0) {
+                return crate::syscall::error::INVALID;
+            }
+            match u8::try_from(self.registers[2]) {
+                Ok(console_id) if (1..4).contains(&console_id) => Some(console_id),
+                _ => return crate::syscall::error::INVALID,
+            }
+        } else {
+            None
+        };
         let argument = if self.registers[0] == SyscallNumber::SpawnArgument as i64 {
             match u32::try_from(self.registers[2]) {
                 Ok(argument) if argument <= ADDRESS_MASK => argument,
@@ -3607,11 +3754,19 @@ impl Cpu {
         } else {
             vec![path.clone()]
         };
+        if console_spawn && (parent != 0 || path != "bin/sauna.bin") {
+            return crate::syscall::error::PERMISSION;
+        }
         let Some(disk) = self.folder_disk.as_ref() else {
             return crate::syscall::error::IO;
         };
-        if let Err(error) = self.check_account_disk_access(parent, disk, &path, false, 0o5) {
-            return error;
+        if console_spawn && !disk.manifest().id.eq_ignore_ascii_case("sisuos") {
+            return crate::syscall::error::NOT_IMPLEMENTED;
+        }
+        if !console_spawn {
+            if let Err(error) = self.check_account_disk_access(parent, disk, &path, false, 0o5) {
+                return error;
+            }
         }
         let image = match disk.load_executable(&path) {
             Ok(image) => image,
@@ -3879,12 +4034,17 @@ impl Cpu {
             .processes
             .get_mut(&id)
             .expect("registered child");
-        record.startup_argument = argument;
+        record.startup_argument = console_id.map_or(argument, u32::from);
         record.arguments = arguments;
         record.name = path;
-        record.credentials = parent_credentials;
-        record.bootstrap_authority = bootstrap_authority;
-        if bootstrap_authority {
+        record.console_id = console_id.unwrap_or(record.console_id);
+        record.credentials = if console_spawn {
+            None
+        } else {
+            parent_credentials
+        };
+        record.bootstrap_authority = bootstrap_authority && !console_spawn;
+        if bootstrap_authority && !console_spawn {
             self.syscall_state
                 .processes
                 .get_mut(&parent)
@@ -4159,6 +4319,8 @@ impl Cpu {
         }
         self.syscall_state.processes.remove(&child);
         self.syscall_state.process_instructions.remove(&child);
+        self.syscall_state.process_cpu_time_ns.remove(&child);
+        self.syscall_state.console_reading.remove(&child);
         self.syscall_state.open_files.remove(&child);
     }
 
@@ -4183,6 +4345,7 @@ impl Cpu {
         self.syscall_state.sleeping.remove(&id);
         self.syscall_state.sleeping_millis.remove(&id);
         self.syscall_state.waiting_for.remove(&id);
+        self.syscall_state.console_reading.remove(&id);
         self.syscall_state.pending_results.remove(&id);
         self.syscall_state.pending_wait_status.remove(&id);
         for record in self.syscall_state.processes.values_mut() {
@@ -5420,7 +5583,127 @@ impl Cpu {
     }
 
     pub fn receive_console_input(&mut self, bytes: &[u8]) {
-        self.console.receive(bytes);
+        let console_id = self.active_console_index;
+        self.active_console_mut().receive(bytes);
+        if self
+            .console_by_index(console_id)
+            .receive_buffer()
+            .is_empty()
+        {
+            return;
+        }
+        let readers = self
+            .syscall_state
+            .console_reading
+            .iter()
+            .filter_map(|(task_id, waiting_console)| {
+                (*waiting_console == console_id).then_some(*task_id)
+            })
+            .collect::<Vec<_>>();
+        for task_id in readers {
+            self.syscall_state.console_reading.remove(&task_id);
+            let _ = self.scheduler.wake(task_id);
+        }
+        self.resume_runnable_task_if_idle();
+    }
+
+    fn resume_runnable_task_if_idle(&mut self) {
+        if self.scheduler.current_task().is_none()
+            && let Some(task_id) = self
+                .scheduler
+                .tasks()
+                .iter()
+                .find(|task| task.state == TaskState::Runnable)
+                .map(|task| task.id)
+            && let Ok(context) = self.scheduler.activate(task_id)
+        {
+            self.restore_task_context(&context);
+            self.running = true;
+        }
+    }
+
+    pub fn select_console(&mut self, index: u8) -> bool {
+        if index >= 4 {
+            return false;
+        }
+        self.active_console_index = index;
+        self.terminal_dirty = true;
+        true
+    }
+
+    pub fn active_console_device(&self) -> &ConsoleDevice {
+        self.console_by_index(self.active_console_index)
+    }
+
+    fn active_console_mut(&mut self) -> &mut ConsoleDevice {
+        self.console_by_index_mut(self.active_console_index)
+    }
+
+    fn console_by_index(&self, index: u8) -> &ConsoleDevice {
+        if index == 0 {
+            &self.console
+        } else {
+            &self.additional_consoles[usize::from(index - 1)]
+        }
+    }
+
+    fn console_by_index_mut(&mut self, index: u8) -> &mut ConsoleDevice {
+        if index == 0 {
+            &mut self.console
+        } else {
+            &mut self.additional_consoles[usize::from(index - 1)]
+        }
+    }
+
+    fn task_console_index(&self, task_id: Option<TaskId>) -> u8 {
+        task_id
+            .and_then(|id| self.syscall_state.processes.get(&id))
+            .map_or(0, |process| process.console_id)
+    }
+
+    fn task_console_device_mut(&mut self, task_id: TaskId) -> &mut ConsoleDevice {
+        let console_id = self.task_console_index(Some(task_id));
+        self.console_by_index_mut(console_id)
+    }
+
+    pub(crate) fn process_instruction_snapshot(&self) -> HashMap<TaskId, u64> {
+        self.syscall_state.process_instructions.clone()
+    }
+
+    pub(crate) fn record_cpu_slice(
+        &mut self,
+        before: &HashMap<TaskId, u64>,
+        elapsed_nanoseconds: u128,
+    ) {
+        if elapsed_nanoseconds == 0 {
+            return;
+        }
+        let deltas = self
+            .syscall_state
+            .process_instructions
+            .iter()
+            .filter_map(|(task_id, instructions)| {
+                let delta = instructions.saturating_sub(before.get(task_id).copied().unwrap_or(0));
+                (delta != 0).then_some((*task_id, delta))
+            })
+            .collect::<Vec<_>>();
+        let total_instructions = deltas
+            .iter()
+            .map(|(_, delta)| u128::from(*delta))
+            .sum::<u128>();
+        if total_instructions == 0 {
+            return;
+        }
+        for (task_id, instructions) in deltas {
+            let elapsed =
+                elapsed_nanoseconds.saturating_mul(u128::from(instructions)) / total_instructions;
+            let accumulated = self
+                .syscall_state
+                .process_cpu_time_ns
+                .entry(task_id)
+                .or_default();
+            *accumulated = accumulated.saturating_add(elapsed);
+        }
     }
 
     pub fn receive_serial_input(&mut self, bytes: &[u8]) {
@@ -5455,6 +5738,7 @@ impl Cpu {
                 self.syscall_state
                     .processes
                     .get(waiter)
+                    .filter(|process| process.console_id == self.active_console_index)
                     .and_then(|process| process.parent)
                     .map(|_| (*waiter, *child, self.process_depth(*waiter)))
             })
@@ -5466,18 +5750,7 @@ impl Cpu {
         if !self.terminate_process_tree(target, 130) {
             return false;
         }
-        if self.scheduler.current_task().is_none()
-            && let Some(task_id) = self
-                .scheduler
-                .tasks()
-                .iter()
-                .find(|task| task.state == TaskState::Runnable)
-                .map(|task| task.id)
-            && let Ok(context) = self.scheduler.activate(task_id)
-        {
-            self.restore_task_context(&context);
-            self.running = true;
-        }
+        self.resume_runnable_task_if_idle();
         true
     }
 
@@ -8091,18 +8364,18 @@ mod tests {
             }
             cpu.registers[0] = SyscallNumber::ProcessStatus as i64;
             cpu.registers[1..4].copy_from_slice(&[1, 0x400, 64]);
-            let length = cpu.syscall_process_info();
+            let length = cpu.syscall_process_info(Some(parent));
             assert!(length > 0);
             assert_eq!(
                 &cpu.memory[0x400..0x400 + length as usize],
-                format!("1 0 {expected} demo.bin\n").as_bytes(),
+                format!("1 0 C1 {expected} demo.bin\n").as_bytes(),
             );
             cpu.registers[1] = 0;
-            let length = cpu.syscall_process_info();
+            let length = cpu.syscall_process_info(Some(parent));
             assert!(length > 0);
             assert_eq!(
                 &cpu.memory[0x400..0x400 + length as usize],
-                b"0 - running init\n"
+                b"0 - C1 running init\n"
             );
         }
     }
@@ -8162,7 +8435,7 @@ mod tests {
         );
         assert_eq!(
             &cpu.memory[0x400..0x400 + cpu.registers[0] as usize],
-            b"0 - running a?b?c\n"
+            b"0 - C1 running a?b?c\n"
         );
         for (index, destination, capacity, expected) in [
             (0, 0x400, 1, crate::syscall::error::OVERFLOW),
@@ -8180,6 +8453,134 @@ mod tests {
     }
 
     #[test]
+    fn console_sessions_keep_terminal_io_separate() {
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.syscall_state.register_process(task, None);
+        cpu.syscall_state
+            .processes
+            .get_mut(&task)
+            .unwrap()
+            .console_id = 2;
+        cpu.memory[0x300..0x305].copy_from_slice(b"hello");
+        cpu.registers[1..4].copy_from_slice(&[1, 0x300, 5]);
+        assert_eq!(cpu.syscall_write(Some(task)), 5);
+        assert!(cpu.console.output().is_empty());
+        assert_eq!(cpu.additional_consoles[1].output(), b"hello");
+
+        cpu.registers[1..4].copy_from_slice(&[0, 0x400, 1]);
+        let mut scheduled_state = None;
+        assert_eq!(cpu.syscall_read(Some(task), &mut scheduled_state, false), 0);
+        assert_eq!(scheduled_state, None);
+        assert!(!cpu.syscall_state.console_reading.contains_key(&task));
+
+        cpu.additional_consoles[1].receive(b"x");
+        cpu.registers[1..4].copy_from_slice(&[0, 0x400, 1]);
+        assert_eq!(cpu.syscall_read(Some(task), &mut None, true), 1);
+        assert_eq!(cpu.memory[0x400], b'x');
+        assert_eq!(cpu.additional_consoles[1].output(), b"hellox");
+        assert!(!cpu.terminal_dirty);
+        assert!(cpu.select_console(2));
+        assert!(cpu.terminal_dirty);
+        assert_eq!(cpu.active_console_device().output(), b"hellox");
+        assert_eq!(cpu.console.receive_buffer().len(), 0);
+    }
+
+    #[test]
+    fn process_listing_is_scoped_to_the_console_except_for_root() {
+        let (mut cpu, caller) = cpu_with_syscall_task();
+        cpu.syscall_state.register_process(caller, None);
+        let caller_record = cpu.syscall_state.processes.get_mut(&caller).unwrap();
+        caller_record.console_id = 2;
+        caller_record.credentials = Some(crate::syscall::ProcessCredentials {
+            uid: 100,
+            primary_gid: 100,
+            supplementary_gids: Vec::new(),
+            home: "user".to_owned(),
+        });
+
+        let local = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(local, Some(caller));
+        cpu.syscall_state.processes.get_mut(&local).unwrap().name = "local.bin".to_owned();
+
+        let remote = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(remote, Some(caller));
+        let remote_record = cpu.syscall_state.processes.get_mut(&remote).unwrap();
+        remote_record.console_id = 1;
+        remote_record.name = "remote.bin".to_owned();
+
+        cpu.registers[0] = SyscallNumber::ProcessStatus as i64;
+        cpu.registers[1..4].copy_from_slice(&[0, 0x400, 64]);
+        let length = cpu.syscall_process_info(Some(caller));
+        assert!(length > 0);
+        assert!(
+            String::from_utf8_lossy(&cpu.memory[0x400..0x400 + length as usize])
+                .contains("running init")
+        );
+        cpu.registers[1] = 1;
+        let length = cpu.syscall_process_info(Some(caller));
+        assert!(length > 0);
+        assert_eq!(
+            &cpu.memory[0x400..0x400 + length as usize],
+            format!("{local} {caller} C3 ready local.bin\n").as_bytes(),
+        );
+        cpu.registers[1] = 2;
+        assert_eq!(cpu.syscall_process_info(Some(caller)), 0);
+
+        cpu.syscall_state
+            .processes
+            .get_mut(&caller)
+            .unwrap()
+            .credentials
+            .as_mut()
+            .unwrap()
+            .uid = 0;
+        cpu.registers[1] = 2;
+        let length = cpu.syscall_process_info(Some(caller));
+        assert!(length > 0);
+        assert_eq!(
+            &cpu.memory[0x400..0x400 + length as usize],
+            format!("{remote} {caller} C2 ready remote.bin\n").as_bytes(),
+        );
+    }
+
+    #[test]
+    fn non_root_cannot_kill_a_child_in_another_console() {
+        let (mut cpu, caller) = cpu_with_syscall_task();
+        cpu.syscall_state.register_process(caller, None);
+        let caller_record = cpu.syscall_state.processes.get_mut(&caller).unwrap();
+        caller_record.console_id = 2;
+        caller_record.credentials = Some(crate::syscall::ProcessCredentials {
+            uid: 100,
+            primary_gid: 100,
+            supplementary_gids: Vec::new(),
+            home: "user".to_owned(),
+        });
+        let child = cpu
+            .scheduler
+            .create_task(TaskContext::user(0x100, 0x6000, 0xe000, false, 0))
+            .unwrap();
+        cpu.syscall_state.register_process(child, Some(caller));
+        cpu.syscall_state
+            .processes
+            .get_mut(&child)
+            .unwrap()
+            .console_id = 1;
+        cpu.registers[1..3].copy_from_slice(&[i64::from(child), 137]);
+        cpu.registers[3..=6].fill(0);
+        assert_eq!(
+            cpu.syscall_kill(Some(caller)),
+            crate::syscall::error::PERMISSION
+        );
+        assert_eq!(cpu.task_context(child).unwrap().state, TaskState::Runnable);
+    }
+
+    #[test]
     fn process_accounting_counts_instructions_and_validates_output_buffers() {
         let (mut cpu, task) = cpu_with_syscall_task();
         cpu.syscall_state.register_process(task, None);
@@ -8190,7 +8591,7 @@ mod tests {
         cpu.registers[1..4].copy_from_slice(&[0, 0x400, 32]);
         cpu.registers[4..=6].fill(0);
         cpu.registers[0] = SyscallNumber::ProcessAccounting as i64;
-        let length = cpu.syscall_process_accounting();
+        let length = cpu.syscall_process_accounting(Some(task));
         assert_eq!(length, 4);
         assert_eq!(&cpu.memory[0x400..0x400 + length as usize], b"0 1\n");
         for (index, destination, capacity, extra, expected) in [
@@ -8203,8 +8604,21 @@ mod tests {
             cpu.registers[1..4].copy_from_slice(&[index, destination, capacity]);
             cpu.registers[4] = extra;
             cpu.registers[5..=6].fill(0);
-            assert_eq!(cpu.syscall_process_accounting(), expected);
+            assert_eq!(cpu.syscall_process_accounting(Some(task)), expected);
         }
+    }
+
+    #[test]
+    fn process_cpu_time_tracks_scheduled_guest_execution() {
+        let (mut cpu, task) = cpu_with_syscall_task();
+        cpu.syscall_state.register_process(task, None);
+        let before = cpu.process_instruction_snapshot();
+        cpu.step().unwrap();
+        cpu.record_cpu_slice(&before, 2_500_000_000);
+        cpu.registers[1..4].copy_from_slice(&[0, 0x400, 32]);
+        cpu.registers[4..=6].fill(0);
+        assert_eq!(cpu.syscall_process_cpu_time(Some(task)), 6);
+        assert_eq!(&cpu.memory[0x400..0x406], b"0 250\n");
     }
 
     #[test]

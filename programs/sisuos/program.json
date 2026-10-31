@@ -26,6 +26,11 @@
       "source": "src/sleeper.c",
       "output": "bin/sleeper.bin",
       "base": 196608
+    },
+    {
+      "source": "src/worker.c",
+      "output": "bin/worker.bin",
+      "base": 196608
     }
   ]
 }

@@ -1,6 +1,7 @@
 {
-  "bin/daemon.bin": "4299:83720eab3ee1715f",
-  "bin/sauna.bin": "91622:0089edced8261243",
-  "bin/sleeper.bin": "4982:0b540e30002604b9",
-  "kernel.bin": "3629:246f5608350868b0"
+  "bin/daemon.bin": "4415:2bb95ad952eb9009",
+  "bin/sauna.bin": "100118:a97e5b8502dfe850",
+  "bin/sleeper.bin": "5098:4b28641b62d5ab3f",
+  "bin/worker.bin": "2650:b04efa7c304e797b",
+  "kernel.bin": "4456:1cd01b2dcde6128e"
 }

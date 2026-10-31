@@ -595,7 +595,7 @@ static void show_processes(void)
     char row[128];
     int length;
 
-    write_text("PID PPID STATE PROGRAM\n");
+    write_text("PID PPID CONSOLE STATE PROGRAM\n");
     for (index = 0;; index++)
     {
         length = sc16_process_status(index, row, sizeof(row) - 1);
@@ -612,26 +612,213 @@ static void show_processes(void)
     }
 }
 
-static void show_process_accounting(void)
+#define TOP_PROCESS_CAPACITY 64
+
+static long top_previous_ids[TOP_PROCESS_CAPACITY];
+static long top_current_ids[TOP_PROCESS_CAPACITY];
+static unsigned int top_previous_times[TOP_PROCESS_CAPACITY];
+static unsigned int top_current_times[TOP_PROCESS_CAPACITY];
+static unsigned int top_elapsed_intervals;
+
+static int parse_cpu_time_row(
+    const char *row,
+    long *process_id,
+    unsigned int *cpu_time)
+{
+    char pid_text[12];
+    unsigned int index = 0;
+    unsigned int value = 0;
+    long parsed_pid;
+
+    while (row[index] != 0 && row[index] != ' ')
+    {
+        if (index + 1 >= sizeof(pid_text))
+            return 0;
+        pid_text[index] = row[index];
+        index++;
+    }
+    if (index == 0 || row[index] != ' ')
+        return 0;
+    pid_text[index] = 0;
+    parsed_pid = parse_process_id(pid_text);
+    if (parsed_pid < 0)
+        return 0;
+    while (row[index] == ' ')
+        index++;
+    if (row[index] == 0)
+        return 0;
+    while (row[index] != 0 && row[index] != '\n')
+    {
+        unsigned int digit;
+
+        if (row[index] < '0' || row[index] > '9')
+            return 0;
+        digit = (unsigned int)(row[index] - '0');
+        if (value > 6553U || (value == 6553U && digit > 5U))
+            return 0;
+        value = value * 10U + digit;
+        index++;
+    }
+    *process_id = parsed_pid;
+    *cpu_time = value;
+    return 1;
+}
+
+static unsigned int read_cpu_sample(
+    long *process_ids,
+    unsigned int *cpu_times)
 {
     unsigned int index;
     char row[48];
     int length;
 
-    write_text("PID INSTRUCTIONS_SINCE_START\n");
-    for (index = 0;; index++)
+    for (index = 0; index < TOP_PROCESS_CAPACITY; index++)
     {
-        length = sc16_process_accounting(index, row, sizeof(row) - 1);
+        length = sc16_process_cpu_time(index, row, sizeof(row) - 1);
         if (length == 0)
-            return;
-        if (length < 0)
+            return index;
+        if (length < 0 || (unsigned int)length >= sizeof(row))
         {
             command_failed = 1;
-            write_text("Unable to read process accounting.\n");
-            return;
+            write_text("Unable to read process CPU accounting.\n");
+            return 0;
         }
         row[length] = 0;
-        write_text(row);
+        if (!parse_cpu_time_row(row, &process_ids[index], &cpu_times[index]))
+        {
+            command_failed = 1;
+            write_text("Invalid process CPU accounting data.\n");
+            return 0;
+        }
+    }
+    command_failed = 1;
+    write_text("Too many processes for top.\n");
+    return 0;
+}
+
+static unsigned int cpu_time_delta(unsigned int current, unsigned int previous)
+{
+    return (current - previous) & 0xffffU;
+}
+
+static unsigned int process_cpu_percent(
+    long process_id,
+    const long *previous_ids,
+    const unsigned int *previous_times,
+    unsigned int previous_count,
+    unsigned int current_time,
+    unsigned long elapsed_ms)
+{
+    unsigned int index;
+
+    if (elapsed_ms == 0)
+        return 0;
+    for (index = 0; index < previous_count; index++)
+    {
+        if (previous_ids[index] == process_id)
+        {
+            unsigned long delta =
+                cpu_time_delta(current_time, previous_times[index]);
+            return (unsigned int)((delta * 1000UL) / elapsed_ms);
+        }
+    }
+    return 0;
+}
+
+static void show_top(void)
+{
+    unsigned int previous_count;
+    unsigned int current_count;
+    unsigned int index;
+    unsigned int total_percent;
+    unsigned long elapsed_ms;
+    unsigned int offset;
+    char line[96];
+    int input_result;
+
+    previous_count = read_cpu_sample(top_previous_ids, top_previous_times);
+    if (command_failed)
+        return;
+    top_elapsed_intervals = 0;
+    for (;;)
+    {
+        unsigned char input;
+
+        input_result = sc16_try_read(0, &input, 1);
+        if (input_result < 0)
+        {
+            command_failed = 1;
+            write_text("Unable to read top input.\n");
+            return;
+        }
+        if (input_result > 0 && input == 3)
+            return;
+        if (sc16_sleep_ms(100UL) < 0)
+        {
+            command_failed = 1;
+            write_text("Unable to wait for the next top sample.\n");
+            return;
+        }
+        top_elapsed_intervals++;
+        if (top_elapsed_intervals < 50U)
+            continue;
+        elapsed_ms = 5000UL;
+        current_count = read_cpu_sample(top_current_ids, top_current_times);
+        if (command_failed)
+            return;
+        total_percent = 0;
+        for (index = 0; index < current_count; index++)
+        {
+            total_percent += process_cpu_percent(
+                top_current_ids[index],
+                top_previous_ids,
+                top_previous_times,
+                previous_count,
+                top_current_times[index],
+                elapsed_ms);
+        }
+        if (total_percent > 100U)
+            total_percent = 100U;
+        write_text("\033[2J\033[H");
+        offset = 0;
+        line[offset++] = 'C';
+        line[offset++] = 'P';
+        line[offset++] = 'U';
+        line[offset++] = ' ';
+        offset = append_number(line, offset, total_percent);
+        line[offset++] = '%';
+        line[offset++] = ' ';
+        line[offset++] = '(';
+        offset = append_number(line, offset, elapsed_ms / 1000UL);
+        line[offset++] = 's';
+        line[offset++] = ')';
+        line[offset] = 0;
+        write_text(line);
+        write_text("\nPID CPU%\n");
+        for (index = 0; index < current_count; index++)
+        {
+            unsigned int percent = process_cpu_percent(
+                top_current_ids[index],
+                top_previous_ids,
+                top_previous_times,
+                previous_count,
+                top_current_times[index],
+                elapsed_ms);
+            offset = append_number(line, 0, (unsigned long)top_current_ids[index]);
+            line[offset++] = ' ';
+            offset = append_number(line, offset, percent);
+            line[offset++] = '%';
+            line[offset++] = '\n';
+            line[offset] = 0;
+            write_text(line);
+        }
+        for (index = 0; index < current_count; index++)
+        {
+            top_previous_ids[index] = top_current_ids[index];
+            top_previous_times[index] = top_current_times[index];
+        }
+        previous_count = current_count;
+        top_elapsed_intervals = 0;
     }
 }
 
@@ -1794,7 +1981,7 @@ static int execute_command(char *line, unsigned int count)
     }
     else if (strings_equal(ARGUMENT(0), "top"))
     {
-        show_process_accounting();
+        show_top();
     }
     else if (strings_equal(ARGUMENT(0), "kill"))
     {
@@ -2008,10 +2195,28 @@ static int run_script(const char *path)
 int main(void)
 {
     long command_memory;
+    long startup_console;
     char *command;
     int length;
     int count;
+    int account_status;
 
+    startup_console = sc16_startup_argument();
+    if (startup_console > 0L)
+    {
+        do
+        {
+            account_status = sc16_account_status();
+            if (account_status < 0)
+            {
+                write_text("SisuOS: account service unavailable.\n");
+                sc16_exit(1);
+                return 1;
+            }
+            if (account_status == 0)
+                sc16_sleep_ms(100UL);
+        } while (account_status == 0);
+    }
     command_memory = sc16_mmap(4096UL, SC16_PROT_READ | SC16_PROT_WRITE, (void *)0);
     if (command_memory < 0L)
     {

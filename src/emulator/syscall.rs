@@ -65,6 +65,9 @@ pub enum SyscallNumber {
     Kill = 38,
     RenameFile = 39,
     ProcessAccounting = 40,
+    SpawnConsole = 41,
+    ProcessCpuTime = 42,
+    TryRead = 43,
 }
 
 impl TryFrom<i64> for SyscallNumber {
@@ -113,6 +116,9 @@ impl TryFrom<i64> for SyscallNumber {
             38 => Ok(Self::Kill),
             39 => Ok(Self::RenameFile),
             40 => Ok(Self::ProcessAccounting),
+            41 => Ok(Self::SpawnConsole),
+            42 => Ok(Self::ProcessCpuTime),
+            43 => Ok(Self::TryRead),
             _ => Err(()),
         }
     }
@@ -164,6 +170,7 @@ pub(crate) struct ProcessRecord {
     pub arguments: Vec<String>,
     pub startup_argument: u32,
     pub credentials: Option<ProcessCredentials>,
+    pub console_id: u8,
     pub bootstrap_authority: bool,
     pub parent: Option<TaskId>,
     pub children: Vec<TaskId>,
@@ -192,6 +199,8 @@ pub(crate) struct KernelState {
     pub ticks: u64,
     pub processes: HashMap<TaskId, ProcessRecord>,
     pub process_instructions: HashMap<TaskId, u64>,
+    pub process_cpu_time_ns: HashMap<TaskId, u128>,
+    pub console_reading: HashMap<TaskId, u8>,
     pub open_files: HashMap<TaskId, HashMap<u32, OpenFile>>,
     pub sleeping: HashMap<TaskId, u64>,
     pub sleeping_millis: HashMap<TaskId, (u32, u32)>,
@@ -223,8 +232,12 @@ pub(crate) fn decode_arguments(bytes: &[u8], count: usize) -> Result<Vec<String>
 impl KernelState {
     pub fn register_process(&mut self, id: TaskId, parent: Option<TaskId>) {
         self.process_instructions.entry(id).or_default();
+        let console_id = parent
+            .and_then(|parent| self.processes.get(&parent))
+            .map_or(0, |process| process.console_id);
         self.processes.entry(id).or_insert_with(|| ProcessRecord {
             parent,
+            console_id,
             next_mmap: 0x2000_0000,
             ..ProcessRecord::default()
         });
@@ -323,7 +336,13 @@ mod tests {
             SyscallNumber::try_from(40),
             Ok(SyscallNumber::ProcessAccounting)
         );
-        assert_eq!(SyscallNumber::try_from(41), Err(()));
+        assert_eq!(SyscallNumber::try_from(41), Ok(SyscallNumber::SpawnConsole));
+        assert_eq!(
+            SyscallNumber::try_from(42),
+            Ok(SyscallNumber::ProcessCpuTime)
+        );
+        assert_eq!(SyscallNumber::try_from(43), Ok(SyscallNumber::TryRead));
+        assert_eq!(SyscallNumber::try_from(44), Err(()));
     }
 
     #[test]

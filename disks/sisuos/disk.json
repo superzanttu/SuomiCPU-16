@@ -6,7 +6,8 @@
     "kernel.bin",
     "bin/sauna.bin",
     "bin/daemon.bin",
-    "bin/sleeper.bin"
+    "bin/sleeper.bin",
+    "bin/worker.bin"
   ],
   "read_only": false,
   "version": 1

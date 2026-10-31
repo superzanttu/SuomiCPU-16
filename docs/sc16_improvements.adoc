@@ -111,7 +111,7 @@ and their phase history are retained under the Completed work section.
 
 === Phase 11 — Expand SisuOS userland
 
-* [ ] *Deliver a complete interactive SisuOS userland*
+* [x] *Deliver a complete interactive SisuOS userland*
 ** [x] Replace static directory output with permission-checked dynamic
    listings; add directory and regular-file creation/removal.
 ** [x] Add file viewing, append, rename, mode, and ownership commands;
@@ -119,12 +119,13 @@ and their phase history are retained under the Completed work section.
 ** [x] Add account-backed file ownership, group access, user login, password
    administration, and permission enforcement for filesystem operations.
 ** [x] Add process listing, child/root process termination, background-child
-   reaping, and per-process instruction accounting through +ps+, +kill+, and
-   +top+.
+   reaping, per-process instruction/CPU accounting, and a live utilization view
+   through +ps+, +kill+, and +top+.
 ** [x] Stop foreground programs with Ctrl+C, add filename Tab completion and
    +.cmd+ scripts, and avoid duplicate command-line newlines.
-** [ ] Implement multiple isolated interactive consoles and user-visible
-   console switching.
+** [x] Implement four isolated interactive consoles with Alt+F1-F4 switching,
+   independent login/process sessions, root-wide process visibility, and
+   shared filesystem/accounts/scheduling.
 ** [x] Replace the line-entry editor with +nano+, a full-screen editor
    supporting cursor movement, in-place text changes, and save/discard prompts.
 

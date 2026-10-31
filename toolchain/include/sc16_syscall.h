@@ -47,6 +47,7 @@ long sc16_spawn(const char *path);
 long sc16_spawn_arg(const char *path, unsigned long argument);
 long sc16_spawn_exec(const char *path, const char *arguments,
                      unsigned int length, unsigned int count);
+long sc16_spawn_console(const char *path, unsigned int console_id);
 int sc16_argument_count(void);
 int sc16_argument(unsigned int index, char *buffer, unsigned int capacity);
 long sc16_startup_argument(void);
@@ -54,6 +55,7 @@ long sc16_monotonic_ms(void);
 int sc16_process_info(unsigned int index, char *buffer, unsigned int capacity);
 int sc16_process_status(unsigned int index, char *buffer, unsigned int capacity);
 int sc16_process_accounting(unsigned int index, char *buffer, unsigned int capacity);
+int sc16_process_cpu_time(unsigned int index, char *buffer, unsigned int capacity);
 int sc16_directory_entry(const char *directory, unsigned int index, char *buffer,
                          unsigned int capacity);
 int sc16_mkdir(const char *directory);
@@ -64,6 +66,7 @@ int sc16_set_file_owner(const char *path, const char *user, const char *group);
 long sc16_mmap(unsigned long length, unsigned int permissions, void *hint);
 int sc16_open(const char *path, unsigned int flags);
 int sc16_read(int handle, void *buffer, unsigned int length);
+int sc16_try_read(int handle, void *buffer, unsigned int length);
 int sc16_write(int handle, const void *buffer, unsigned int length);
 int sc16_close(int handle);
 long sc16_seek(int handle, long offset, int origin);

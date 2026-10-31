@@ -586,7 +586,8 @@ fn native_library_for_symbol(symbol: &str) -> Option<&'static str> {
 
 fn native_argument_is_pointer(function: &str, index: usize) -> bool {
     match function {
-        "sc16_spawn" | "sc16_spawn_arg" | "sc16_open" | "__stdio_mode_flags" => index == 0,
+        "sc16_spawn" | "sc16_spawn_arg" | "sc16_spawn_console" | "sc16_open"
+        | "__stdio_mode_flags" => index == 0,
         "sc16_spawn_exec" => matches!(index, 0 | 1),
         "sc16_account_initialize_root" => index == 0,
         "sc16_authenticate" => matches!(index, 0 | 1),
@@ -601,10 +602,12 @@ fn native_argument_is_pointer(function: &str, index: usize) -> bool {
         "sc16_set_file_owner" => matches!(index, 0 | 1 | 2),
         "sc16_mmap" => index == 2,
         "sc16_read"
+        | "sc16_try_read"
         | "sc16_write"
         | "sc16_process_info"
         | "sc16_process_status"
         | "sc16_process_accounting"
+        | "sc16_process_cpu_time"
         | "sc16_argument" => index == 1,
         "sc16_net_discover" => index == 0,
         "sc16_net_send" | "sc16_net_receive" => matches!(index, 0 | 1),
