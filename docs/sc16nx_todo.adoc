@@ -288,6 +288,21 @@ software responsibilities, not additional hardware to rename.
 passes, failures, and untested cases; outputs use isolated directories/images.
 Legacy sources and historical evidence remain retrievable without promising
 a maintained legacy emulator.
++
+*Initial execution evidence (2026-11-04, revision
++cb4c08e741bc992fb59190820effe01552627440+; Windows):*
++cargo fmt --check+ and +cargo check --lib+ passed. +
++cargo test --no-fail-fast -- --test-threads=1+ ran all test targets: 642
+passed and one failed. The failure is
++guest_c_machine_header_reads_the_supervisor_system_bank+ in
++tests/c90_conformance.rs+; it returns 14 at the +*banks != 4095UL+ branch,
+which conflicts with the audited +0x1fff+ discovery mask. The remaining test
+targets passed. +
+All 18 +programs/<slug>/program.json+ files parsed as JSON. Program builds
+were not run because +build/programs/+ already contains generated outputs
+for all 18 programs and the build command writes there. xv6 execution and
+per-program runtime scenarios remain untested. This is a partial baseline;
+the task remains open.
 
 ** [ ] [[nx-sisuos-freeze]] *P0 / Preserve the frozen SisuOS example.*
    Retain SisuOS/SaunaShell sources and revision-bound historical build
