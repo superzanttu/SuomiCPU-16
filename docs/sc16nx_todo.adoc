@@ -564,11 +564,14 @@ jumps, aligned integer loads/stores, and integer multiply/divide operations
 including word sign extension, zero divisors, and signed overflow. It also
 executes RV64A LR/SC and word/doubleword AMOs against RAM; bus writes
 conservatively invalidate the single-hart reservation. The aq/rl bits have no
-inter-hart ordering effect in the current one-hart, synchronous core. It
-explicitly traps on unsupported compressed encodings; FENCE/FENCE.I are safe
-no-ops for this synchronous, uncached core. Execution tests exercise
-arithmetic, word results, branches, RAM store/load, M-extension edge cases,
-atomic operations/reservations, and faults. C, floating point,
+inter-hart ordering effect in the current one-hart, synchronous core. RV64C
+integer forms now execute through compressed fetch/decode, including
+arithmetic, branches/jumps, word/doubleword memory, stack-pointer forms,
+indirect jumps, hints, and C.EBREAK. Reserved encodings and unsupported
+compressed floating-point forms trap. FENCE/FENCE.I are safe no-ops for this
+synchronous, uncached core. Execution tests exercise integer arithmetic,
+compressed control flow and memory, M-extension edge cases, atomic
+operations/reservations, breakpoint, and faults. Floating point,
 privilege/trap delivery, Sv39, and full acceptance coverage remain
 unimplemented; this is not RV64GC and the task remains unchecked.
 

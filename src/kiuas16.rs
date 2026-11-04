@@ -382,6 +382,7 @@ pub enum CoreTrapCause {
     InstructionAddressMisaligned,
     InstructionAccessFault,
     IllegalInstruction,
+    Breakpoint,
     LoadAddressMisaligned,
     LoadAccessFault,
     StoreAddressMisaligned,
@@ -432,21 +433,32 @@ impl Rv64Core {
             value: pc,
         })?;
         let halfword = u16::from_le_bytes(halfword);
-        if halfword & 0b11 != 0b11 {
-            return Err(CoreTrap {
+        let (instruction, instruction_length) = if halfword & 0b11 == 0b11 {
+            let mut bytes = [0; 4];
+            bus.fetch(pc, &mut bytes).map_err(|_| CoreTrap {
+                pc,
+                cause: CoreTrapCause::InstructionAccessFault,
+                value: pc,
+            })?;
+            (u32::from_le_bytes(bytes), 4)
+        } else {
+            let instruction = decompress_rv64c(halfword).ok_or(CoreTrap {
                 pc,
                 cause: CoreTrapCause::IllegalInstruction,
                 value: halfword as u64,
-            });
-        }
+            })?;
+            (instruction, 2)
+        };
+        self.execute_instruction(bus, pc, instruction, instruction_length)
+    }
 
-        let mut bytes = [0; 4];
-        bus.fetch(pc, &mut bytes).map_err(|_| CoreTrap {
-            pc,
-            cause: CoreTrapCause::InstructionAccessFault,
-            value: pc,
-        })?;
-        let instruction = u32::from_le_bytes(bytes);
+    fn execute_instruction(
+        &mut self,
+        bus: &mut Kiuas16Bus,
+        pc: u64,
+        instruction: u32,
+        instruction_length: u64,
+    ) -> Result<(), CoreTrap> {
         let opcode = instruction & 0x7f;
         let rd = ((instruction >> 7) & 0x1f) as usize;
         let funct3 = (instruction >> 12) & 0x7;
@@ -454,10 +466,17 @@ impl Rv64Core {
         let rs2 = ((instruction >> 20) & 0x1f) as usize;
         let left = self.integer_registers[rs1];
         let right = self.integer_registers[rs2];
-        let mut next_pc = pc.wrapping_add(4);
+        let mut next_pc = pc.wrapping_add(instruction_length);
         let mut result = None;
 
         match opcode {
+            0x73 if instruction == 0x0010_0073 => {
+                return Err(CoreTrap {
+                    pc,
+                    cause: CoreTrapCause::Breakpoint,
+                    value: 0,
+                });
+            }
             0x03 => {
                 let address = left.wrapping_add(sign_extend(instruction >> 20, 12) as u64);
                 let (length, signed) = match funct3 {
@@ -824,6 +843,212 @@ impl Rv64Core {
     }
 }
 
+fn decompress_rv64c(instruction: u16) -> Option<u32> {
+    let quadrant = instruction & 0b11;
+    let funct3 = instruction >> 13;
+    let rd = ((instruction >> 7) & 0x1f) as u32;
+    let rs2 = ((instruction >> 2) & 0x1f) as u32;
+    let rd_prime = ((instruction >> 2) & 0x7) as u32 + 8;
+    let rs1_prime = ((instruction >> 7) & 0x7) as u32 + 8;
+    let rs2_prime = rd_prime;
+    let ci_imm = sign_extend(
+        (((instruction >> 12) as u32 & 1) << 5) | ((instruction >> 2) as u32 & 0x1f),
+        6,
+    );
+    let encode_i = |imm: i64, rs1: u32, funct3: u32, rd: u32, opcode: u32| {
+        (((imm as u32) & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    };
+    let encode_s = |imm: u32, rs1: u32, rs2: u32, funct3: u32| {
+        ((imm >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | ((imm & 0x1f) << 7) | 0x23
+    };
+    let encode_b = |imm: i64, rs1: u32, rs2: u32, funct3: u32| {
+        let imm = imm as u32;
+        (((imm >> 12) & 1) << 31)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | (((imm >> 1) & 0xf) << 8)
+            | (((imm >> 11) & 1) << 7)
+            | 0x63
+    };
+    let encode_j = |imm: i64, rd: u32| {
+        let imm = imm as u32;
+        (((imm >> 20) & 1) << 31)
+            | (((imm >> 1) & 0x3ff) << 21)
+            | (((imm >> 11) & 1) << 20)
+            | (((imm >> 12) & 0xff) << 12)
+            | (rd << 7)
+            | 0x6f
+    };
+
+    match (quadrant, funct3) {
+        (0b00, 0b000) => {
+            let immediate = (((instruction as u32 >> 11) & 0x3) << 4)
+                | (((instruction as u32 >> 7) & 0xf) << 6)
+                | (((instruction as u32 >> 6) & 0x1) << 2)
+                | (((instruction as u32 >> 5) & 0x1) << 3);
+            (immediate != 0).then(|| encode_i(immediate as i64, 2, 0, rd_prime, 0x13))
+        }
+        (0b00, 0b010 | 0b110) => {
+            let offset = (((instruction as u32 >> 10) & 0x7) << 3)
+                | (((instruction as u32 >> 6) & 0x1) << 2)
+                | (((instruction as u32 >> 5) & 0x1) << 6);
+            let store = funct3 == 0b110;
+            Some(if store {
+                encode_s(offset, rs1_prime, rs2_prime, 0b010)
+            } else {
+                encode_i(offset as i64, rs1_prime, 0b010, rd_prime, 0x03)
+            })
+        }
+        (0b00, 0b011 | 0b111) => {
+            let offset = (((instruction as u32 >> 10) & 0x7) << 3)
+                | (((instruction as u32 >> 5) & 0x3) << 6);
+            let store = funct3 == 0b111;
+            Some(if store {
+                encode_s(offset, rs1_prime, rs2_prime, 0b011)
+            } else {
+                encode_i(offset as i64, rs1_prime, 0b011, rd_prime, 0x03)
+            })
+        }
+        (0b01, 0b000) => Some(encode_i(ci_imm, rd, 0, rd, 0x13)),
+        (0b01, 0b001) if rd != 0 => Some(encode_i(ci_imm, rd, 0, rd, 0x1b)),
+        (0b01, 0b010) => Some(encode_i(ci_imm, 0, 0, rd, 0x13)),
+        (0b01, 0b011) if rd == 2 => {
+            let immediate = sign_extend(
+                (((instruction as u32 >> 12) & 1) << 9)
+                    | (((instruction as u32 >> 6) & 1) << 4)
+                    | (((instruction as u32 >> 5) & 1) << 6)
+                    | (((instruction as u32 >> 3) & 0x3) << 7)
+                    | (((instruction as u32 >> 2) & 1) << 5),
+                10,
+            );
+            (immediate != 0).then(|| encode_i(immediate, 2, 0, 2, 0x13))
+        }
+        (0b01, 0b011) if rd != 0 && rd != 2 && ci_imm != 0 => {
+            Some(((ci_imm as u32 & 0xfffff) << 12) | (rd << 7) | 0x37)
+        }
+        (0b01, 0b100) => {
+            let operation = (instruction >> 10) & 0x3;
+            let shift =
+                (((instruction >> 12) as u32 & 1) << 5) | ((instruction as u32 >> 2) & 0x1f);
+            match operation {
+                0b00 => Some(encode_i(shift as i64, rs1_prime, 0b101, rs1_prime, 0x13)),
+                0b01 => Some(encode_i(
+                    (0x400 | shift) as i64,
+                    rs1_prime,
+                    0b101,
+                    rs1_prime,
+                    0x13,
+                )),
+                0b10 => Some(encode_i(ci_imm, rs1_prime, 0b111, rs1_prime, 0x13)),
+                0b11 => {
+                    let selector = (instruction >> 5) & 0x3;
+                    let word_operation = instruction & 0x1000 != 0;
+                    let (funct3, funct7, opcode) = match (word_operation, selector) {
+                        (false, 0b00) => (0b000, 0b0100000, 0x33),
+                        (false, 0b01) => (0b100, 0, 0x33),
+                        (false, 0b10) => (0b110, 0, 0x33),
+                        (false, 0b11) => (0b111, 0, 0x33),
+                        (true, 0b00) => (0b000, 0b0100000, 0x3b),
+                        (true, 0b01) => (0b000, 0, 0x3b),
+                        _ => return None,
+                    };
+                    Some(
+                        (funct7 << 25)
+                            | (rs2_prime << 20)
+                            | (rs1_prime << 15)
+                            | (funct3 << 12)
+                            | (rs1_prime << 7)
+                            | opcode,
+                    )
+                }
+                _ => None,
+            }
+        }
+        (0b01, 0b101) => {
+            let immediate = sign_extend(
+                (((instruction as u32 >> 12) & 1) << 11)
+                    | (((instruction as u32 >> 11) & 1) << 4)
+                    | (((instruction as u32 >> 9) & 0x3) << 8)
+                    | (((instruction as u32 >> 8) & 1) << 10)
+                    | (((instruction as u32 >> 7) & 1) << 6)
+                    | (((instruction as u32 >> 6) & 1) << 7)
+                    | (((instruction as u32 >> 3) & 0x7) << 1)
+                    | (((instruction as u32 >> 2) & 1) << 5),
+                12,
+            );
+            Some(encode_j(immediate, 0))
+        }
+        (0b01, 0b110 | 0b111) => {
+            let immediate = sign_extend(
+                (((instruction as u32 >> 12) & 1) << 8)
+                    | (((instruction as u32 >> 10) & 0x3) << 3)
+                    | (((instruction as u32 >> 5) & 0x3) << 6)
+                    | (((instruction as u32 >> 3) & 0x3) << 1)
+                    | (((instruction as u32 >> 2) & 1) << 5),
+                9,
+            );
+            Some(encode_b(
+                immediate,
+                rs1_prime,
+                0,
+                if funct3 == 0b110 { 0 } else { 1 },
+            ))
+        }
+        (0b10, 0b000) => {
+            let shift =
+                (((instruction >> 12) as u32 & 1) << 5) | ((instruction as u32 >> 2) & 0x1f);
+            Some(encode_i(shift as i64, rd, 0b001, rd, 0x13))
+        }
+        (0b10, 0b010) if rd != 0 => {
+            let offset = (((instruction as u32 >> 12) & 1) << 5)
+                | (((instruction as u32 >> 4) & 0x7) << 2)
+                | (((instruction as u32 >> 2) & 0x3) << 6);
+            Some(encode_i(offset as i64, 2, 0b010, rd, 0x03))
+        }
+        (0b10, 0b011) if rd != 0 => {
+            let offset = (((instruction as u32 >> 12) & 1) << 5)
+                | (((instruction as u32 >> 5) & 0x3) << 3)
+                | (((instruction as u32 >> 2) & 0x7) << 6);
+            Some(encode_i(offset as i64, 2, 0b011, rd, 0x03))
+        }
+        (0b10, 0b100) => {
+            let high_bit = instruction & 0x1000 != 0;
+            if !high_bit && rs2 == 0 {
+                (rd != 0).then(|| encode_i(0, rd, 0, 0, 0x67))
+            } else if !high_bit {
+                Some(if rd == 0 {
+                    encode_i(0, 0, 0, 0, 0x13)
+                } else {
+                    (rs2 << 20) | (rd << 15) | (rd << 7) | 0x33
+                })
+            } else if rd == 0 && rs2 == 0 {
+                Some(0x0010_0073)
+            } else if rs2 == 0 {
+                Some(encode_i(0, rd, 0, 1, 0x67))
+            } else {
+                Some(if rd == 0 {
+                    encode_i(0, 0, 0, 0, 0x13)
+                } else {
+                    (rs2 << 20) | (rd << 15) | (rd << 7) | 0x33
+                })
+            }
+        }
+        (0b10, 0b110) => {
+            let offset =
+                (((instruction as u32 >> 9) & 0xf) << 2) | (((instruction as u32 >> 7) & 0x3) << 6);
+            Some(encode_s(offset, 2, rs2, 0b010))
+        }
+        (0b10, 0b111) => {
+            let offset = (((instruction as u32 >> 10) & 0x7) << 3)
+                | (((instruction as u32 >> 7) & 0x7) << 6);
+            Some(encode_s(offset, 2, rs2, 0b011))
+        }
+        _ => None,
+    }
+}
+
 fn illegal_instruction(pc: u64, instruction: u32) -> CoreTrap {
     CoreTrap {
         pc,
@@ -899,6 +1124,15 @@ mod tests {
         Kiuas16Bus::new_with_ram_size(rom, ram_bytes).unwrap()
     }
 
+    fn bus_with_compressed_program(instructions: &[u16]) -> Kiuas16Bus {
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        for (index, instruction) in instructions.iter().enumerate() {
+            let start = index * 2;
+            rom[start..start + 2].copy_from_slice(&instruction.to_le_bytes());
+        }
+        Kiuas16Bus::new_with_ram_size(rom, 32).unwrap()
+    }
+
     fn encode_r(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
         (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
     }
@@ -959,10 +1193,176 @@ mod tests {
         );
 
         core.pc = BOOT_ROM.start;
-        let mut compressed = bus_with_program(&[0x0000_0001]);
+        let mut compressed = bus_with_program(&[0x0000_0000]);
         let trap = core.step(&mut compressed).unwrap_err();
         assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
-        assert_eq!(trap.value, 1);
+        assert_eq!(trap.value, 0);
+    }
+
+    #[test]
+    fn rv64c_executes_compressed_integer_and_memory_instructions() {
+        let instructions = [
+            0x4415, 0x040d, 0x44a1, 0x94a2, 0x0486, 0xc144, 0x414c, 0x367d,
+        ];
+        let mut bus = bus_with_compressed_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[10] = RAM.start;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.pc, BOOT_ROM.start + instructions.len() as u64 * 2);
+        assert_eq!(core.register(8), Some(8));
+        assert_eq!(core.register(9), Some(32));
+        assert_eq!(core.register(11), Some(32));
+        assert_eq!(core.register(12), Some(u64::MAX));
+        let mut stored = [0; 4];
+        bus.read(RAM.start + 4, &mut stored).unwrap();
+        assert_eq!(u32::from_le_bytes(stored), 32);
+    }
+
+    #[test]
+    fn rv64c_branches_jumps_and_mixed_instruction_lengths_update_pc() {
+        let compressed = [0xc011u16, 0x0405, 0x4485, 0xa011, 0x0485];
+        let word = 0x0010_0513u32;
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        for (index, instruction) in compressed.iter().enumerate() {
+            let start = index * 2;
+            rom[start..start + 2].copy_from_slice(&instruction.to_le_bytes());
+        }
+        rom[10..14].copy_from_slice(&word.to_le_bytes());
+        let mut bus = Kiuas16Bus::new_with_ram_size(rom, 16).unwrap();
+        let mut core = Rv64Core::cold_reset();
+        for _ in 0..3 {
+            core.step(&mut bus).unwrap();
+        }
+        assert_eq!(core.pc, BOOT_ROM.start + 10);
+        core.step(&mut bus).unwrap();
+
+        assert_eq!(core.register(8), Some(0));
+        assert_eq!(core.register(9), Some(1));
+        assert_eq!(core.register(10), Some(1));
+        assert_eq!(core.pc, BOOT_ROM.start + 14);
+    }
+
+    #[test]
+    fn rv64c_executes_stack_pointer_and_doubleword_memory_forms() {
+        let instructions = [0x0800, 0xe500, 0x6504, 0xe426, 0x65a2, 0xc226, 0x4612];
+        let mut bus = bus_with_compressed_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[2] = RAM.start;
+        core.integer_registers[10] = RAM.start;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(8), Some(RAM.start + 16));
+        assert_eq!(core.register(9), Some(RAM.start + 16));
+        assert_eq!(core.register(11), Some(RAM.start + 16));
+        assert_eq!(core.register(12), Some(0xffff_ffff_8000_0010));
+        let mut stored = [0; 8];
+        bus.read(RAM.start + 8, &mut stored).unwrap();
+        assert_eq!(u64::from_le_bytes(stored), RAM.start + 16);
+        let mut stored_word = [0; 4];
+        bus.read(RAM.start + 4, &mut stored_word).unwrap();
+        assert_eq!(u32::from_le_bytes(stored_word), 0x8000_0010);
+    }
+
+    #[test]
+    fn rv64c_executes_shift_alu_and_nonzero_branch_forms() {
+        let instructions = [0x443d, 0x881d, 0x8005, 0x8405, 0x4489, 0x9c05, 0x9c25];
+        let mut bus = bus_with_compressed_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+        assert_eq!(core.register(8), Some(1));
+
+        let instructions = [0x4405, 0xe011, 0x0405, 0x4485];
+        let mut bus = bus_with_compressed_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        for _ in 0..2 {
+            core.step(&mut bus).unwrap();
+        }
+        assert_eq!(core.pc, BOOT_ROM.start + 6);
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.register(8), Some(1));
+        assert_eq!(core.register(9), Some(1));
+    }
+
+    #[test]
+    fn rv64c_executes_stack_adjustment_lui_and_indirect_jumps() {
+        let instructions = [0x717d, 0x6405, 0x74fd];
+        let mut bus = bus_with_compressed_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[2] = RAM.start + 16;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+        assert_eq!(core.register(2), Some(RAM.start));
+        assert_eq!(core.register(8), Some(0x1000));
+        assert_eq!(core.register(9), Some(0xffff_ffff_ffff_f000));
+
+        let mut bus = bus_with_compressed_program(&[0x8282, 0x0001, 0x4405]);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[5] = BOOT_ROM.start + 4;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, BOOT_ROM.start + 4);
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.register(8), Some(1));
+
+        let mut bus = bus_with_compressed_program(&[0x9282, 0x0001]);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[5] = BOOT_ROM.start + 4;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, BOOT_ROM.start + 4);
+        assert_eq!(core.register(1), Some(BOOT_ROM.start + 2));
+    }
+
+    #[test]
+    fn rv64c_handles_legal_hints_and_reports_reserved_encodings() {
+        let mut bus = bus_with_compressed_program(&[0x0001, 0x0005, 0x8006, 0x9006, 0x2000]);
+        let mut core = Rv64Core::cold_reset();
+        core.step(&mut bus).unwrap();
+        core.step(&mut bus).unwrap();
+        core.step(&mut bus).unwrap();
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, BOOT_ROM.start + 8);
+
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(
+            trap,
+            CoreTrap {
+                pc: BOOT_ROM.start + 8,
+                cause: CoreTrapCause::IllegalInstruction,
+                value: 0x2000,
+            }
+        );
+    }
+
+    #[test]
+    fn rv64c_ebreak_and_fetch_at_rom_end_have_architectural_results() {
+        let mut bus = bus_with_compressed_program(&[0x9002]);
+        let mut core = Rv64Core::cold_reset();
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(
+            trap,
+            CoreTrap {
+                pc: BOOT_ROM.start,
+                cause: CoreTrapCause::Breakpoint,
+                value: 0,
+            }
+        );
+
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        let last_instruction = (BOOT_ROM_BYTES - 2) as u64;
+        rom[BOOT_ROM_BYTES - 2..].copy_from_slice(&0x0001u16.to_le_bytes());
+        let mut bus = Kiuas16Bus::new_with_ram_size(rom, 16).unwrap();
+        core.pc = BOOT_ROM.start + last_instruction;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, BOOT_ROM.end);
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::InstructionAccessFault);
     }
 
     #[test]
