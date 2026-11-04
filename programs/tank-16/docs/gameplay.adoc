@@ -1,47 +1,67 @@
-= Tank-16 TODO List
+= Tank-16 historical gameplay and asset reference
 
 :experimental:
-== Completed
-=== Gameplay
-* [x] Implement the game in SC-16 C in +main.c+ for a 640×480 display.
-* [x] Support two players in a top-down tank battle; start Player 1 on the left and Player 2 on the right.
-* [x] Keep tanks within screen bounds and let players drive, avoid obstacles, and fire projectiles.
-* [x] Allow tanks to slide along obstacle edges when a diagonal movement is blocked.
-* [x] Map controls: Player 1 uses A/D to turn, W/S to adjust throttle, and C to fire; Player 2 uses J/L to turn, I/K to adjust throttle, and period to fire.
-* [x] Give each player one life and 100 health; apply 10 damage for an ammunition hit, 25 for a mine, and 5 for a tank collision.
-* [x] End a round when a player's health reaches zero.
-* [x] Render terrain only for the cells visible in each camera view.
-* [x] Load finite JSON maps and seeded, effectively unbounded terrain from the program's +disks/maps/+ folder through the generic file API.
-* [x] Keep map and terrain/object pixel data out of the executable; load map JSON and the tile-atlas JSON from the program disk at runtime.
-* [x] Store finite runtime maps as compact flat terrain indices and sparse object layers so large map JSON files fit the SC-16 heap.
-* [x] Let players select a valid JSON map from +disks/maps/+ when the game starts and at the beginning of every new round, with a RANDOM option; keep map data out of the executable.
-* [x] Preserve the tileset's source RGB colors through per-program palette entries.
-* [x] Convert terrain and object PNG atlases into a JSON manifest and per-tile JSON pixel files, then upload only map/game-used tiles from disk on demand.
-* [x] Use 64×64 cells in +gfx/tiles_objects.png+ and +gfx/tiles_terrain.png+ as the source sprite/tile size.
-* [x] Scale 64×64 terrain atlas cells to 16×16 runtime tiles when preparing map assets.
-* [x] Provide the Rust +sc16sprites+ viewer to inspect 64×64 cells, atlas coordinates, and row-major IDs.
-* [x] Provide +gfx/tiles_template.png+ as a transparent, numbered 64×64-cell atlas template.
-* [x] Precalculate 32 tank sprite rotations and projectile directions.
-* [x] Show both players' health and the game timer and win count in the HUD.
-* [x] Show the active map name beneath the timer in the existing top bar.
-* [x] Show a centered minimap below the unchanged 30-pixel HUD bar, across both viewports.
-* [x] Keep the visible map area below the HUD bar and make wall/building objects block tanks.
-* [x] Use the Tank-16 military-stencil font in the existing SC-16 5x7 font format.
-* [x] Apply terrain-dependent tank speed and deep-water damage.
-* [x] Limit each round to five minutes; decide the winner by remaining health and declare a draw on equal health.
-* [x] Start a new round automatically after each round and retain wins; reset the win count when the game restarts.
-* [x] Add short muzzle flashes, shot-impact sparks, damage flashes, destruction bursts, and shooting/hit/healing sounds.
-* [x] Show reload progress below health bars, warn on low health, and separate the two camera views with a divider.
-* [x] Show round results and the next-round countdown inside each player's viewport.
-* [x] Use opaque-pixel collision masks for rotated tanks, obstacles, map objects, and ammunition; sweep moving shots to detect thin obstacles.
-* [x] Draw larger 7x7 ammunition with a white core and yellow outline, using the same shape for collision detection.
-* [x] Emit moving sparks and rising smoke from explosions and impacts, and flames/smoke from destroyed tanks during the round countdown.
-* [x] Keep burning wrecks and ammunition impact fires throughout ten subsequent rounds.
-* [x] Add inertial throttle, reverse, slower moving turns, recoil, blast knockback, and per-player camera shake.
-* [x] Retain three times as many track marks and show forward/reverse throttle in the HUD.
-* [x] Add timed health, speed, and shot-damage power-ups.
-* [x] Add periodic tank movement sounds.
-* [x] Pause the match with Tab and show both players' controls while paused.
+
+This document preserves the earlier gameplay, map, asset, and font notes as
+historical reference, not a current build or execution report. Some constants,
+controls, asset formats, and retired graphics/disk API descriptions differ
+between these notes and the current sources. In particular, historical
+GPU-owned world effects are not the generic AinoGPU contract.
+
+All recovery work and acceptance criteria are tracked in the sole
+link:../../../docs/sc16nx_todo.adoc#nx-program-tank-16[SC16NX roadmap].
+Reconcile these notes with source and execution evidence during that port;
+the former completed status does not certify a runnable xv6 version.
+
+== Historical gameplay summary
+
+The SC-16 C game in +main.c+ targeted a 640×480 top-down battle, with Player 1
+starting on the left and Player 2 on the right. Tanks drove within the play
+bounds, avoided obstacles, fired projectiles, and slid along blocked diagonal
+obstacle edges. Player 1 used A/D to turn, W/S for throttle, and C to fire;
+Player 2 used J/L, I/K, and period respectively.
+
+The recorded rules gave each player one life and 100 health, with 10 damage
+per ammunition hit, 25 per mine, and 5 per tank collision. A round ended at
+zero health or after five minutes; remaining health determined the timed
+winner, with equal health producing a draw. New rounds started automatically
+and retained wins; restarting the game reset the win count.
+
+Finite JSON maps and seeded, effectively unbounded terrain came from the
+program's +disks/maps/+ directory through the generic file API. Startup and
+each new round offered map selection and a RANDOM option. Map and terrain/
+object pixel data lived outside the executable; compact flat terrain indices
+and sparse object layers reduced the runtime map footprint. Rendering visited
+only cells visible in each camera.
+
+Earlier asset preparation converted terrain/object PNG atlases into a JSON
+manifest and per-tile JSON pixel files, uploading used tiles on demand and
+preserving source RGB colors through per-program palette entries. Source
+cells in +gfx/tiles_objects.png+ and +gfx/tiles_terrain.png+ were 64×64; one
+recorded pipeline scaled terrain to 16×16 runtime tiles. The Rust
++sc16sprites+ viewer exposed atlas coordinates and row-major IDs, and
++gfx/tiles_template.png+ supplied a transparent numbered 64×64-cell template.
+Tank sprites and projectile directions used 32 precalculated rotations.
+
+The HUD showed health, reload progress, low-health warnings, throttle/direction,
+timer, wins, and the active map name. A centered minimap spanned both viewports
+below the 30-pixel HUD bar, with a divider between cameras and the play area
+below the bar. Results and next-round countdowns appeared in each viewport.
+Text used the Tank-16 military-stencil font in the SC-16 5x7 format.
+
+Collision used opaque-pixel masks for rotated tanks, obstacles, map objects,
+and ammunition, with swept shots detecting thin obstacles. Wall/building
+objects blocked tanks. The 7x7 projectile had a white core and yellow outline,
+with the same shape used for collision. Terrain affected speed and deep-water
+damage. Driving included inertial throttle, reverse, slower turns while moving,
+recoil, blast knockback, and per-player camera shake.
+
+Recorded effects included muzzle flashes, impact sparks, damage flashes,
+destruction bursts, moving sparks/rising smoke, shooting/hit/healing sounds,
+and periodic movement tones. Wreck and impact fires persisted through ten
+subsequent rounds; track retention was increased threefold. Timed health,
+speed, and shot-damage power-ups affected play. Tab paused the match and
+displayed both players' controls.
 
 == Driving and battle reactions
 

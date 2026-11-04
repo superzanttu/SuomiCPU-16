@@ -1,0 +1,1347 @@
+= SC16NX: Kiuas16 and the xv6-capable computer
+:toc: left
+:toclevels: 2
+:experimental:
+
+This is the sole development roadmap for SuomiCPU-16. It replaces the former
+architecture, C90, and Tank-16 checklists. Specifications, usage instructions,
+licenses, and historical reference material remain separate documents; new
+development tasks belong here.
+
+The processor is named *Kiuas16* and the graphics device *AinoGPU*. The selected
+successor is an RV64-compatible computer capable of running the actual
+https://github.com/mit-pdos/xv6-riscv[MIT xv6-riscv operating system], built with
+this project's Rust toolchain. It is not real Linux and not merely a Unix-like
+shell implemented by the emulator.
+
+IMPORTANT: This document plans future implementation. Creating the roadmap did
+not implement RV64, port xv6, rebuild firmware, or repair the applications.
+All implementation tasks start unchecked.
+
+== Scope and completion rules
+
+=== Confirmed direction
+
+* SuomiCPU-16 remains the project name. Kiuas16's name does not impose a
+  16-bit instruction, register, pointer, or address limit.
+* Select RV64 RISC-V compatibility rather than porting xv6 to the custom
+  SC-16 ISA. Preserve upstream xv6 behavior and keep changes small, explicit,
+  versioned, and independently testable.
+* The project's Rust compiler and assembler must build xv6. Production guest
+  linking, syscall-stub generation, filesystem construction, and image
+  packaging must also use Rust-native tools. No external C compiler,
+  assembler, linker, Python, or Perl fallback may satisfy a production build.
+  Ordinary Rust host-toolchain prerequisites are allowed.
+* QEMU and GCC/binutils may serve as optional independent verification tools,
+  never as production guest-build dependencies or substitutes for Rust-built
+  release artifacts.
+* PC-like BIOS means POST, discovery, setup, persistent configuration, boot
+  selection, disk reads, loading, recovery, and a defined OS handoff. It does
+  not mean x86 BIOS interrupts or UEFI compatibility.
+* Use separate sector-backed boot-volume and root-filesystem images. The
+  boot volume contains the kernel ELF; an upstream xv6 root image alone does
+  not contain a firmware-loadable kernel.
+* Keep an upstream-compatible xv6 configuration and filesystem format.
+  Maintain the practical computer's device drivers and versioned larger-file,
+  longer-filename filesystem extension as an auditable extension set.
+* AinoGPU includes generic hardware-accelerated 3D as well as text, 2D, and
+  framebuffer functionality. Software-only guest 3D is not the final target.
+* Restore all 17 non-OS programs as xv6 userspace applications. Standalone
+  source/image launches remain development and bring-up facilities, not the
+  production application model. Old executable compatibility is not required.
+* The existing example called SaunaOS in the project request is
+  *SisuOS/SaunaShell*. Keep its sources and historical build instructions;
+  do not extend it, port it to RV64, or maintain a legacy runner for it.
+  It is the explicit exception to the runnable-application requirement.
+* Give every emulated hardware device a Finnish sauna-related name. Names
+  are presentation identities, not permission to change protocol IDs.
+
+Initial xv6 bring-up uses one hart and 128 MiB of RAM. Multicore is a later
+milestone. Real Linux, full POSIX certification, x86 compatibility,
+hypervisor/vector extensions, and a complete USB/PCI ecosystem are outside
+the required baseline. Browser support is separate from native desktop
+acceptance.
+
+=== How to use this checklist
+
+P0:: Required for genuine Rust-built xv6 execution and firmware boot.
+P1:: Required for the complete interactive computer and all active programs.
+P2:: Broader C90 certification, multicore, and secondary-platform work.
+
+Each nested task has a stable +nx-*+ anchor, affected components, explicit
+dependencies, and acceptance criteria. Dependencies refer to completed
+behavior, not merely a merged patch or a position in this document.
+Independent work may proceed in parallel; section order is not an implicit
+dependency. Each parent milestone additionally depends on all its children.
+
+Keep a parent unchecked until every child and its acceptance tests pass.
+When closing a task, record the tested revision, target/configuration, exact
+command, expected result, and reproducible evidence here. Keep commands,
+fixtures, and machine-readable results with their owning tests; do not create
+another task list. A parser pass, successful assembly, screenshot, shell
+prompt, or old checked box is not sufficient execution evidence.
+
+Required instructions, language features, devices, and input formats that are
+not implemented must fail explicitly. Never silently truncate addresses,
+invent successful device responses, substitute a host OS service, or hide a
+failure behind an external compiler.
+
+== Static project audit
+
+The source audit used repository revision
++d3dac794347af01017027df536ea37fa2ab134ec+. It covered the Rust emulator,
+compiler, assembler, runtime and tools; firmware and shared guest libraries;
+all 18 program manifests and their application requirements; tests, scripts,
+and documentation. Builds, tests, and programs were not executed during this
+documentation-only audit. Historical test results are not fresh validation.
+
+[cols="1,3,2",options="header"]
+|===
+| Area | Observed baseline and gap | Evidence
+| CPU and memory
+| Custom 16-bit instruction words, eight general registers, 30-bit byte
+  addressing, big-endian objects, and a 1 GiB physical address space. Register
+  storage using host +i64+ does not make the machine RV64. Revision 2 exposes
+  13 high MMIO banks starting at +0x3ff00000+ with discovery mask +0x1fff+.
+| link:../src/emulator/cpu.rs[CPU],
+  link:../src/emulator/machine.rs[machine contract],
+  link:sc16_architecture.adoc[current architecture]
+| Privilege and OS ownership
+| Supervisor/user modes and a custom two-level MMU exist: 4 KiB pages,
+  512 entries per level, 32-bit PTEs, and 2 KiB tables. CPU-owned scheduling,
+  process records, account/file services, allocation bookkeeping, and syscall
+  dispatch are not substitutes for an xv6 kernel.
+| link:../src/emulator/mmu.rs[MMU],
+  link:../src/emulator/scheduler.rs[scheduler],
+  link:../src/emulator/syscall.rs[syscalls],
+  link:../src/emulator/accounts.rs[accounts]
+| Firmware and disks
+| Guest BIOS assembly calls a host gateway to discover disks and load images.
+  Boot automation uses RAM markers and host-injected input. Folder-backed
+  filesystem access is not sector/block hardware or firmware-driven loading.
+| link:../firmware/bios.asm[BIOS],
+  link:../src/emulator/disk.rs[disks],
+  link:../src/emulator/runtime.rs[runtime]
+| Compiler, assembler, and ABI
+| The target is SC-16/SC16IMG3, not RISC-V ELF64. The existing C model has
+  16-bit +int+, 32-bit +long+, four-byte pointers carrying 30-bit addresses,
+  signed plain +char+, binary32 +float+, and binary64 +double+/+long double+.
+  C90 support is partial; remaining math code contains binary16 assumptions.
+| link:../src/c_compiler/mod.rs[compiler],
+  link:../src/assembler/mod.rs[assembler],
+  link:../src/emulator/image.rs[images],
+  link:c90_target_abi.adoc[legacy target ABI],
+  link:../toolchain/[guest libraries]
+| Refactoring
+| Including tests, the compiler module has 19,016 lines, CPU 12,555, and
+  runtime 4,989 at the audited revision. Machine execution, host presentation,
+  OS policy, toolchain stages, and game-specific tooling need clearer
+  boundaries without discarding useful execution regressions.
+| link:../src/lib.rs[library exports],
+  link:../src/tools/[host tools]
+| Applications and graphics
+| All 18 program directories have manifests, but discovery does not imply
+  buildability. Sixteen active programs include a removed graphics header;
+  DiskEditor and Tank-16 also include a removed disk header. Text Demo needs
+  working standard streams. Existing graphics exposes bounded basic drawing,
+  not the retired layers, sprite/tile stores, or 3D path.
+| link:../programs/[program catalog],
+  link:programs.adoc[packaging reference]
+| Storage and resource limits
+| +TANK16_TILES.bin+ is 606,208 bytes with a 16-character basename. Baseline
+  xv6 permits 274,432 bytes per file and 14-byte names; its default image is
+  2,048,000 bytes. +MAXPATH=128+, +NOFILE=16+, and +USERSTACK=1+ also require
+  workload-based auditing, not assumptions that current games fit.
+| link:../programs/tank-16/assets/disk/assets/TANK16_TILES.bin[tile asset],
+  upstream filesystem and limits references below
+| Validation and documentation
+| Rust execution, ABI, preemption, packaging, and asset-tool tests exist.
+  Old documentation disagrees about SisuOS/library capabilities and includes
+  a stale no-protection description. One old report records a SisuOS
+  logout/login failure with 495/496 library tests passing; this is unverified
+  historical evidence, not a current result or new SisuOS work item.
+| link:../tests/c90_conformance.rs[C execution tests],
+  link:../tests/target_abi.rs[ABI tests],
+  link:../tests/preemptive_hardware.rs[guest kernel tests],
+  link:user_guide.adoc[user guide]
+| Developer workflow
+| Program installation already detects conflicts and preserves unrelated
+  writable data. Build/install scripts, launchers, gallery capture, and
+  Tank-16 asset tools need target-aware integration. No checked-in CI
+  workflow was found in the audit.
+| link:../src/tools/programs.rs[program tools],
+  link:../scripts/build-install.ps1[build/install wrapper],
+  link:../run.ps1[launcher],
+  link:../src/tools/sc16gallery.rs[gallery tool]
+|===
+
+=== Why RV64
+
+A custom-ISA xv6 port would replace architecture-dependent assembly, traps,
+page tables, atomics, drivers, ABI assumptions, and substantial toolchain
+support. RV64 compatibility retains more upstream behavior and enables
+independent reference execution. It is the selected approach, but does not
+remove the Rust compiler/assembler/linker work from the critical path.
+
+=== Pinned upstream requirements
+
+The audited xv6-riscv revision is
++e93dabeb98431235c6e1a101cb96c73c923fdbc4+. Pin and record the actual imported
+source, license, and local delta before implementation; do not silently
+switch to a moving upstream branch.
+
+The build uses +rv64gc+, GNU C99, and +medany+. Required behavior includes
+M/S/U privilege, PMP, Sv39, atomics, CSR operations, memory/instruction
+fences, Sstc supervisor timer comparison through +stimecmp+, and page-table
+A/D updates enabled by +menvcfg.ADUE+. Designing only for an older xv6 timer
+implementation is insufficient.
+
+[cols="2,2,3",options="header"]
+|===
+| Resource | Compatibility value | Requirement
+| RAM | +0x80000000+, initially 128 MiB | Sparse physical mapping; no old 30-bit wrapping.
+| Höyry UART | +0x10000000+, IRQ 10 | 16550 register/interrupt behavior.
+| Root Kiulu controller | +0x10001000+, IRQ 1 | Virtio-MMIO version 2 block device.
+| Vihta interrupt controller | +0x0c000000+ | PLIC priority, enable, threshold, claim/complete.
+| Virtio identity | Magic +0x74726976+, version 2, device 2, vendor +0x554d4551+ | Match the actual checks in the pinned driver, despite Finnish display names.
+| Disk geometry | 512-byte device sectors; 1024-byte xv6 blocks | Keep the two units distinct throughout DMA, images, and drivers.
+| Initial hart count | 1 | Upstream defaults to 3; record this deliberate bring-up configuration.
+|===
+
+The LP64D/RISC-V psABI target has 32-bit +int+, 64-bit +long+ and pointers,
+little-endian objects, unsigned plain +char+, 16-byte stack alignment, and
+the specified integer/floating argument conventions. Standard +long double+
+is binary128 with size/alignment 16; it must not silently inherit SC-16's
+binary64 representation. Unsupported long-double operations may remain
+diagnosed until the broader conformance milestone, not falsely advertised.
+
+== Finnish hardware catalog
+
+These names apply to the target computer. The catalog is not an implemented
+device inventory. Use Finnish display spelling and stable ASCII identifiers;
+integrated blocks do not need invented independent MMIO banks just to have
+a name. DMA engines, buffers, and VRAM belong to their owning device unless
+a separate device is deliberately introduced and documented.
+
+[cols="1,1,3,2",options="header"]
+|===
+| Finnish name | Identifier | Role | Owning work
+| Kiuas16 | +kiuas16+ | RV64 processor, architectural traps and control state | <<nx-rv64-core>>, <<nx-privilege>>
+| Kiuaskivet | +kiuaskivet+ | Integrated MMU and physical-memory protection | <<nx-sv39>>, <<nx-privilege>>
+| Löyly | +loyly+ | Main RAM | <<nx-core-boundaries>>, <<nx-machine-contract>>
+| Lauteet | +lauteet+ | Physical bus/interconnect | <<nx-core-boundaries>>, <<nx-device-contract>>
+| Saunamestari | +saunamestari+ | Machine identification and device/resource inventory | <<nx-device-contract>>, <<nx-support-devices>>
+| Sytyke | +sytyke+ | Protected boot ROM and BIOS identity | <<nx-bios>>, <<nx-bios-handoff>>
+| Vihta | +vihta+ | PLIC-compatible interrupt controller | <<nx-interrupt-time>>
+| Tiimalasi | +tiimalasi+ | Core-local timers, counters, and Sstc facilities | <<nx-interrupt-time>>
+| Saunakello | +saunakello+ | Real-time clock | <<nx-support-devices>>
+| Höyry | +hoyry+ | 16550-compatible serial UART | <<nx-uart>>
+| Kiulu | +kiulu+ | Virtio block controller | <<nx-virtio-block>>
+| Saavi | +saavi+ | Attached sector-backed media, with numbered instances | <<nx-boot-images>>, <<nx-virtio-block>>
+| AinoGPU | +ainogpu+ | Text, VRAM, framebuffer, 2D, and generic 3D | <<nx-boot-display>>, <<nx-ainogpu>>, <<nx-ainogpu-3d>>
+| Vasta | +vasta+ | Keyboard input | <<nx-input>>
+| Laudeliina | +laudeliina+ | Mouse/pointer input | <<nx-input>>
+| Sihinä | +sihina+ | Audio | <<nx-audio>>
+| Saunapolku | +saunapolku+ | Packet network interface | <<nx-network>>
+| Kipinä | +kipina+ | Entropy source | <<nx-support-devices>>
+| Löylymuisti | +loylymuisti+ | Persistent firmware configuration/NVRAM | <<nx-lifecycle>>, <<nx-support-devices>>
+| Hiillos | +hiillos+ | Reset, power-off, and any advertised watchdog facilities | <<nx-lifecycle>>, <<nx-support-devices>>
+|===
+
+=== Disposition of all 13 existing high banks
+
+[cols="2,3",options="header"]
+|===
+| Legacy bank | Successor or retirement
+| +SYSTEM_BASE+ | Saunamestari inventory; Löyly capacity and the versioned machine contract.
+| +INTERRUPT_BASE+ | Vihta and Tiimalasi, with architectural Kiuas16 interrupt state.
+| +FAULT_BASE+ | Kiuas16 trap CSRs and Kiuaskivet translation/protection faults.
+| +INPUT_BASE+ | Vasta and Laudeliina queues/state.
+| +CLOCK_BASE+ | Tiimalasi monotonic time, Saunakello civil time, and Kipinä entropy.
+| +GRAPHICS_BASE+ | AinoGPU; replace retired APIs through guest drivers/SDK, not magic compatibility addresses.
+| +AUDIO_BASE+ | Sihinä generic audio.
+| +NETWORK_BASE+ | Saunapolku packets; game discovery and protocols move into guest software.
+| +FILESYSTEM_BASE+ | Retire host filesystem services; Kiulu/Saavi provide blocks and xv6 owns files.
+| +CONSOLE_BASE+ | Guest console software over Höyry/AinoGPU.
+| +FIRMWARE_TEXT_BASE+ | AinoGPU text output owned first by Sytyke, then by the guest.
+| +FIRMWARE_GATEWAY_BASE+ | Retire host discovery/load shortcuts; Sytyke executes firmware and uses hardware, Löylymuisti, and Hiillos.
+| +SERIAL_BASE+ | Höyry with the upstream-compatible UART interface.
+|===
+
+Host scheduling, accounts, filesystem policy, and process management are
+software responsibilities, not additional hardware to rename.
+
+== Implementation checklist
+
+=== Phase 0: baseline and contracts
+
+* [ ] [[nx-stage-0]] *P0 / Baseline and target contracts.* Complete every child
+  and resolve contradictions before treating the target specifications as stable.
+
+** [ ] [[nx-baseline]] *P0 / Record a reproducible baseline.*
+   Audit real build/test results and all manifests at a preserved source
+   revision, including existing failures and unported test coverage.
++
+*Components:* Rust tests, program catalog, current specifications. +
+*Dependencies:* none. +
+*Acceptance:* Exact commands and categorized results distinguish executed
+passes, failures, and untested cases; outputs use isolated directories/images.
+Legacy sources and historical evidence remain retrievable without promising
+a maintained legacy emulator.
+
+** [ ] [[nx-sisuos-freeze]] *P0 / Preserve the frozen SisuOS example.*
+   Retain SisuOS/SaunaShell sources and revision-bound historical build
+   instructions; mark its manifest/catalog status archived during migration.
++
+*Components:* +programs/sisuos/+, program catalog and legacy documentation. +
+*Dependencies:* <<nx-baseline>>. +
+*Acceptance:* Sources and instructions can be located at the preserved
+revision; no RV64 port, new feature, or legacy-runner obligation is scheduled.
+Reports account for 17 active applications plus this one archived example.
+
+** [ ] [[nx-machine-contract]] *P0 / Specify Kiuas16 and the physical machine.*
+   Define RV64GC and required privileged facilities, reset state, hart
+   identity, sparse RAM/ROM/MMIO map, clocks, access/fault rules, and limits.
+   Include Sstc and the pinned startup's +menvcfg.ADUE+ behavior.
++
+*Components:* machine/ISA specification, CPU and configuration types. +
+*Dependencies:* <<nx-baseline>>. +
+*Acceptance:* Boundary fixtures cover full-width addresses, RAM limits,
+unmapped accesses, reset, and capability reporting. Supported and unsupported
+extensions are explicit; the initial one-hart/128 MiB configuration is reproducible.
+
+** [ ] [[nx-abi-contract]] *P0 / Define the RV64 guest ABI and language profiles.*
+   Specify scalar/aggregate layout, alignment, endianness, qualifiers,
+   register/stack calls, returns, varargs, startup, and ELF conventions.
+   Separate the xv6-required GNU C99 subset, project application extensions,
+   and eventual C90 conformance.
++
+*Components:* target ABI documentation, compiler type/layout and call rules. +
+*Dependencies:* <<nx-machine-contract>>. +
+*Acceptance:* Independent layout/call fixtures cover LP64D, unsigned plain
++char+, 16-byte stack alignment, and target-specific constant/header values.
+Binary128 +long double+ requirements or unsupported-operation diagnostics
+are explicit. Legacy SC-16 ABI results are not relabeled RV64 results.
+
+** [ ] [[nx-device-contract]] *P0 / Establish one device contract source of truth.*
+   Define addresses, access widths, IRQs, protocol identities, discovery,
+   reset, side effects, DMA bounds, ownership, and interface versions.
+   Generate or check guest definitions against Rust device definitions.
++
+*Components:* +src/emulator/machine.rs+, guest headers, firmware/device docs. +
+*Dependencies:* <<nx-machine-contract>>. +
+*Acceptance:* All named devices and all retired banks have a disposition;
+register/IRQ definitions agree across host, firmware, and kernel. Invalid
+widths, addresses, queue descriptors, and unmapped DMA have explicit outcomes.
+The additional boot controller cannot displace the upstream root controller.
+
+=== Phase 1: focused Rust refactoring
+
+* [ ] [[nx-stage-1]] *P0 / Separate machine, host, OS, and toolchain concerns.*
+  Keep mechanical extraction distinct from deliberate ISA/ABI behavior changes.
+
+** [ ] [[nx-core-boundaries]] *P0 / Separate CPU, translation, bus, and devices.*
+   Extract execution, CSR/traps, address translation, physical memory/ROM,
+   and device access from host presentation. Isolate window/input ingestion,
+   audio output, media backing, clocks, logging, and monitor adapters.
++
+*Components:* +src/emulator/cpu.rs+, +mmu.rs+, +machine.rs+, +runtime.rs+. +
+*Dependencies:* <<nx-machine-contract>>, <<nx-device-contract>>. +
+*Acceptance:* A deterministic headless machine runs without a graphics
+context; adapters can be replaced in tests. Existing retained execution
+regressions pass through extraction, with intentional target changes tested separately.
+
+** [ ] [[nx-os-boundary]] *P0 / Remove host OS policy from the successor CPU.*
+   Keep scheduling, allocation policy, authentication, processes, files,
+   and syscall interpretation in guest software. Quarantine legacy helpers
+   only during an explicit transition, then remove new-target dependence on them.
++
+*Components:* CPU, scheduler, syscall, account, disk, and MMU responsibilities. +
+*Dependencies:* <<nx-core-boundaries>>. +
+*Acceptance:* Architectural +ecall+ reaches guest trap handling; the machine
+does not create guest processes or perform guest filesystem syscalls for xv6.
+Execution tests demonstrate guest-owned context switches and allocation.
+
+** [ ] [[nx-compiler-boundaries]] *P0 / Introduce shared typed compiler stages.*
+   Separate preprocessing/lexing, parsing, semantic types/layout, typed
+   lowering, calls/ABI, target backends, and diagnostics. Replace scattered
+   string-based type decisions incrementally, retaining regression fixtures.
++
+*Components:* +src/c_compiler/mod.rs+, target definitions, compiler tests. +
+*Dependencies:* <<nx-abi-contract>>. +
+*Acceptance:* Declarations, expressions, object layout, conversions, and
+calls share type rules; invalid constructs report source-located diagnostics.
+Extraction preserves supported behavior before RV64-specific changes are applied.
+
+** [ ] [[nx-tool-boundaries]] *P0 / Separate build tools from runtime and games.*
+   Isolate compilation/linking/image construction from runtime loading and
+   game asset tools from emulator core exports. Reuse shared parsing/layout helpers.
++
+*Components:* +src/lib.rs+, +src/tools/+, assembler and image modules. +
+*Dependencies:* <<nx-baseline>>. +
+*Acceptance:* Core execution has no Tank-16/game dependency; existing public
+commands retain behavior or an explicit versioned migration. Asset and package
+tests verify outputs and safe failure paths.
+
+=== Phase 2: Rust-native xv6 toolchain
+
+* [ ] [[nx-stage-2]] *P0 / Build and execute the required guest code with Rust tools.*
+  A frontend or object-file demonstration alone cannot close this milestone.
+
+** [ ] [[nx-c-xv6]] *P0 / Implement the pinned xv6 language corpus.*
+   Cover required C99 declarations and designated initializers, function
+   pointers/dispatch tables, integer/pointer conversions, static/extern
+   linkage, separate translation units, and varargs. Support the used GNU
+   inline assembly, register/immediate constraints, and +"memory"+ clobbers;
+   handle +aligned+, +noreturn+, +format+, and +nonstring+ attributes explicitly.
+   Implement +__atomic_exchange_n+, +__atomic_store_n+, and +__atomic_load_n+
+   with the required acquire/release semantics.
++
+*Components:* typed compiler frontend, semantic diagnostics, corpus tests. +
+*Dependencies:* <<nx-compiler-boundaries>>, <<nx-abi-contract>>. +
+*Acceptance:* Every required construct has positive, invalid-input, and
+behavioral fixtures; kernel/user source inventories identify remaining
+unsupported input. GNU extensions are not mislabeled C90 language features.
+
+** [ ] [[nx-rv64-codegen]] *P0 / Emit correct RV64 code and calls.*
+   Implement instruction selection, registers/spills, addresses, stack
+   frames, aggregates, direct/indirect calls, returns, varargs, atomic
+   operations, and floating operations required by the target ABI.
+   Remove fixed SC-16 global-address and word-size assumptions.
++
+*Components:* compiler RV64 backend and shared ABI lowering. +
+*Dependencies:* <<nx-c-xv6>>, <<nx-abi-contract>>. +
+*Acceptance:* Execute mixed-width conversions, pointer arithmetic, nested
+and recursive calls, register exhaustion, side effects, aggregate copies,
+indirect calls, and varargs. Assert object bytes, results, stack alignment,
+cleanup, and preserved registers rather than assembly substrings alone.
+
+** [ ] [[nx-rv64-assembler]] *P0 / Assemble RISC-V source and relocatable objects.*
+   Support compiler output and preprocessed upstream +.S+ files: aliases,
+   pseudo-instructions, labels, sections, alignment/data directives,
+   CSR names/numbers, compressed instructions, and relocation records.
++
+*Components:* +src/assembler/+, shared preprocessing, object emission. +
+*Dependencies:* <<nx-abi-contract>>, <<nx-tool-boundaries>>. +
+*Acceptance:* Independent instruction bytes, branch ranges, relocation
+fixtures, and executed assembly agree. Unknown directives, illegal operands,
+misalignment, and out-of-range encodings diagnose instead of being dropped.
+
+** [ ] [[nx-elf-linker]] *P0 / Link and validate ELF64 entirely in Rust.*
+   Resolve symbols across translation units and implement required
+   RISC-V/medany relocations and kernel/user layouts. Define permissions,
+   entry points, BSS, segment alignment, and the one-page trampoline constraint.
++
+*Components:* Rust object/link/image tooling and developer ELF loader. +
+*Dependencies:* <<nx-rv64-assembler>>, <<nx-abi-contract>>. +
+*Acceptance:* Independent ELF fixtures and Rust-linked programs execute with
+correct addresses and zeroed BSS. Reject overlapping/out-of-range segments,
+unresolved or duplicate symbols, relocation overflow, malformed files, and
+oversized trampolines. No external linker is invoked.
+
+** [ ] [[nx-rust-build-driver]] *P0 / Build firmware, kernel, userland, and images.*
+   Add explicit target/dialect/header/runtime selection. Implement Rust
+   syscall-stub generation and filesystem/image creation instead of upstream
+   Perl and host-C build steps. Keep kernel support code separate from the
+   application libc and never auto-inject the old SC-16 library into xv6.
++
+*Components:* +sc16build+, +src/tools/programs.rs+, image and guest build tools. +
+*Dependencies:* <<nx-rv64-codegen>>, <<nx-elf-linker>>, <<nx-boot-images>>, <<nx-tool-boundaries>>. +
+*Acceptance:* A clean staged build accounts for firmware, the kernel, and
+every pinned upstream user executable with reproducible inputs and hashes.
+Unknown targets and missing tools/assets fail explicitly without external
+guest-build fallbacks.
+
+** [ ] [[nx-toolchain-validation]] *P0 / Validate code generation through execution.*
+   Compile C, assemble, link/load ELF, execute Kiuas16, and assert observable
+   results. Keep independent encoding, ABI, and numeric fixtures; use optional
+   reference-tool comparisons without making them the production path.
++
+*Components:* execution tests and target-aware build validation. +
+*Dependencies:* <<nx-rv64-codegen>>, <<nx-elf-linker>>, <<nx-rv64-core>>, <<nx-privilege>>. +
+*Acceptance:* Required corpus tests execute, invalid inputs diagnose, and a
+production guest build works without external RISC-V build tools on its
+execution path. Direct ELF loading is labeled a development test, not BIOS acceptance.
+
+=== Phase 3: Kiuas16 and xv6-required hardware
+
+* [ ] [[nx-stage-3]] *P0 / Execute the specified ISA and privileged machine correctly.*
+  A working shell must not conceal missing architectural behavior.
+
+** [ ] [[nx-rv64-core]] *P0 / Implement RV64 execution.*
+   Bring up I/M/A/C first, including 64-bit registers/addresses, +x0+,
+   word-operation sign extension, compressed fetch/decode, multiply/divide
+   edges, LR/SC reservations, AMOs, fences, alignment, and faults.
+   Complete F/D, NaN boxing, rounding modes, and floating flags before
+   advertising RV64GC.
++
+*Components:* Kiuas16 decoder/executor, register state, instruction tests. +
+*Dependencies:* <<nx-core-boundaries>>, <<nx-abi-contract>>. +
+*Acceptance:* Independent instruction/exception fixtures cover integer and
+floating boundary values, unsupported encodings, page-boundary fetches,
+atomic reservations, and memory/instruction ordering. High addresses cannot
+wrap through old 16/30/32-bit paths.
+
+** [ ] [[nx-privilege]] *P0 / Implement M/S/U traps, control state, and PMP.*
+   Define exception/interrupt delegation, status/counter access, trap
+   entry/return, CSR privilege/WARL behavior, PMP, and +WFI+ wakeup.
++
+*Components:* Kiuas16 CSR/trap/PMP logic and guest exception fixtures. +
+*Dependencies:* <<nx-rv64-core>>, <<nx-os-boundary>>. +
+*Acceptance:* Invalid CSR access and forbidden memory/device access trap
+with correct cause/address/state. Guest handlers recover where specified;
+privilege transitions and interrupt masking do not bypass protection.
+
+** [ ] [[nx-sv39]] *P0 / Implement Sv39 translation.*
+   Add three-level 64-bit PTEs, canonical addresses, permission/status
+   interactions, superpages, A/D updates, instruction/load/store faults,
+   and correct +satp+/+sfence.vma+ invalidation behavior.
++
+*Components:* Kiuaskivet translation and protection, physical bus access. +
+*Dependencies:* <<nx-privilege>>. +
+*Acceptance:* Guest-created page tables exercise valid/invalid mappings,
+superpage alignment, page boundaries, A/D state, stale translations, and
+isolation. The guest owns physical-page allocation and address-space policy.
+
+** [ ] [[nx-interrupt-time]] *P0 / Implement Vihta and Tiimalasi.*
+   Implement PLIC priorities, pending/enables/thresholds, claim/complete,
+   level reassertion, and core-local counters/timers including Sstc.
+   Publish timebase and counter behavior independently of rendering.
++
+*Components:* interrupt controller, virtual clock, Kiuas16 interrupt lines. +
+*Dependencies:* <<nx-privilege>>, <<nx-device-contract>>. +
+*Acceptance:* Guest timer and external-interrupt handlers make progress
+headlessly; simultaneous sources, masking, completion, rollover, and
+rearming behave correctly. Host wall-clock changes cannot reverse monotonic time.
+
+** [ ] [[nx-uart]] *P0 / Implement Höyry's 16550 behavior.*
+   Support register aliases, divisor latch, FIFO, status, RX/TX interrupt
+   behavior, overrun/reset, and headless/windowed serial adapters.
++
+*Components:* serial device, upstream UART integration, Serial Monitor. +
+*Dependencies:* <<nx-interrupt-time>>. +
+*Acceptance:* The actual pinned xv6 driver works without UART-source
+shortcuts. Tests cover RX/TX, queue limits, reset, interrupt timing, privilege,
+and clean separation from emulator diagnostics.
+
+=== Phase 4: sector storage and PC-like BIOS
+
+* [ ] [[nx-stage-4]] *P0 / Boot by executing Sytyke and real device I/O.*
+  Complete every child through the firmware path, not a host image-load shortcut.
+
+** [ ] [[nx-virtio-block]] *P0 / Implement Kiulu and Saavi block hardware.*
+   Provide raw sector-backed media and virtio-MMIO v2 feature negotiation,
+   descriptor/available/used rings, DMA, completion IRQs, reset, capacity,
+   read-only state, and defined flush/durability behavior.
++
+*Components:* storage device/transport, media adapter, block tests. +
+*Dependencies:* <<nx-core-boundaries>>, <<nx-device-contract>>, <<nx-interrupt-time>>. +
+*Acceptance:* Match the pinned driver's identities and queue behavior;
+exercise reads/writes, ring wrap, invalid chains/addresses, out-of-range
+sectors, failed host I/O, reset during requests, and persistence. No guest
+request can escape its media image or access arbitrary host files.
+
+** [ ] [[nx-boot-images]] *P0 / Define separate boot and root volumes.*
+   Specify versioned boot metadata containing the kernel ELF and validated
+   entry/extent information. Keep the root volume and controller at the
+   upstream contract; describe the additional boot controller explicitly.
++
+*Components:* disk/image specifications and Rust image readers/writers. +
+*Dependencies:* <<nx-elf-linker>>, <<nx-device-contract>>. +
+*Acceptance:* Round-trip valid images and reject wrong versions, truncated
+payloads, overlapping/out-of-range extents, and capacity errors. Tools never
+guess that a root filesystem image is a boot volume or rewrite old disks implicitly.
+
+** [ ] [[nx-boot-display]] *P0 / Provide AinoGPU's firmware text path.*
+   Implement the minimal device-owned text/framebuffer/VRAM contract needed
+   by Sytyke, including readable Finnish glyphs and deterministic rendering.
+   This bootstrap hardware must not depend on an xv6 graphics driver.
++
+*Components:* AinoGPU base registers, ROM font, host display adapter. +
+*Dependencies:* <<nx-core-boundaries>>, <<nx-device-contract>>. +
+*Acceptance:* Guest firmware writes readable text and clears/updates the
+display through hardware; glyph coverage includes ä/ö/Ä/Ö. Headless tests
+inspect device output. Full 2D/3D and OS integration remain separate tasks.
+
+** [ ] [[nx-lifecycle]] *P0 / Define power, reset, and persistent firmware state.*
+   Implement ROM reset entry, volatile-device/RAM reset policy,
+   Löylymuisti persistence, and Hiillos power controls as hardware primitives.
+   Define media ownership and shutdown behavior without relying on a guest OS.
++
+*Components:* machine construction/reset, NVRAM, power and media adapters. +
+*Dependencies:* <<nx-core-boundaries>>, <<nx-device-contract>>. +
+*Acceptance:* Cold start, warm reset, device reset, pending requests,
+interrupted/failed settings writes, corrupt NVRAM, and recovery have explicit
+results. Tests prove exactly which state persists and do not touch unrelated
+host files. Firmware-level scenarios additionally belong to <<nx-bios>>.
+
+** [ ] [[nx-bios]] *P0 / Execute a PC-like Sytyke BIOS from protected ROM.*
+   Build guest C/assembly with the Rust toolchain. Perform POST, device/RAM
+   discovery, serial and AinoGPU setup, persistent configuration, boot
+   order/selection, sector reads, ELF loading/BSS clearing, and recovery.
+   Use emulated timers and input, not host-injected keys or magic RAM markers.
++
+*Components:* +firmware/+, device discovery, boot-volume reader, setup UI. +
+*Dependencies:* <<nx-boot-display>>, <<nx-lifecycle>>, <<nx-virtio-block>>, <<nx-uart>>, <<nx-boot-images>>, <<nx-rust-build-driver>>, <<nx-toolchain-validation>>. +
+*Acceptance:* ROM execution loads the kernel using observable Kiulu sector
+requests. Missing/corrupt media, invalid ELF, unsupported devices, and setup
+save failures produce actionable serial/display errors and recovery choices.
+Reset/retry works; a host direct-ELF loader cannot satisfy these tests.
+
+** [ ] [[nx-bios-handoff]] *P0 / Specify and test firmware-to-kernel ownership.*
+   Define M-mode entry, hart identity, stack/register expectations,
+   memory/device description, reserved regions, interrupt/DMA queue state,
+   and transfer of hardware ownership. Do not impose an x86/UEFI ABI.
++
+*Components:* Sytyke entry/handoff contract and guest kernel boot fixtures. +
+*Dependencies:* <<nx-bios>>, <<nx-sv39>>, <<nx-interrupt-time>>. +
+*Acceptance:* The pinned xv6 startup can initialize PMP, translation,
+timers, interrupts, and devices itself. Reinitializing a firmware-used device
+does not leak a pending request or stale interrupt into the kernel.
+
+=== Phase 5: actual xv6 bring-up
+
+* [ ] [[nx-stage-5]] *P0 / Pass the real upstream xv6 compatibility gate.*
+  Firmware, hardware, and the Rust toolchain must all participate.
+
+** [ ] [[nx-xv6-build]] *P0 / Build the pinned kernel and complete userland.*
+   Preserve upstream licensing/provenance and track every local source,
+   build, and configuration delta. Produce the boot and root images.
++
+*Components:* xv6 import/patch set, Rust guest build, image inventory. +
+*Dependencies:* <<nx-rust-build-driver>>, <<nx-toolchain-validation>>, <<nx-boot-images>>. +
+*Acceptance:* The expected kernel and every upstream user executable are
+present with reproducible build records. No missing program is disguised by
+a successful partial build; the clean compatibility configuration is explicit.
+
+** [ ] [[nx-xv6-boot]] *P0 / Boot ROM to the xv6 shell.*
+   Execute ROM -> Sytyke -> boot-volume kernel -> privilege/Sv39/timer/block
+   initialization -> init -> an interactive shell.
++
+*Components:* headless/native machine, firmware, pinned xv6 boot. +
+*Dependencies:* <<nx-xv6-build>>, <<nx-bios-handoff>>, <<nx-virtio-block>>, <<nx-uart>>. +
+*Acceptance:* Boot traces show firmware sector loading and guest
+initialization; scripted serial input executes commands. Panic, timeout,
+early halt, or a host-generated prompt is failure.
+
+** [ ] [[nx-xv6-execution]] *P0 / Verify guest-owned operating-system behavior.*
+   Exercise fork/exec/wait, pipes, files, allocation, traps, process
+   isolation, timer preemption, and concurrent UART input/output.
++
+*Components:* xv6 integration tests and machine observability. +
+*Dependencies:* <<nx-xv6-boot>>, <<nx-os-boundary>>. +
+*Acceptance:* Parent/child results, pipe bytes, file data, scheduling
+progress, and fault isolation are asserted. Guest code performs OS work;
+host scheduler/syscall/filesystem helpers are absent from the xv6 execution path.
+
+** [ ] [[nx-xv6-usertests]] *P0 / Run the complete upstream test inventory.*
+   Run the full pinned +usertests+, including slow tests, plus filesystem
+   stress and reboot/persistence cases on disposable images.
++
+*Components:* xv6 test runner, serial capture, isolated media fixtures. +
+*Dependencies:* <<nx-xv6-execution>>. +
+*Acceptance:* Match the independently recorded expected test names/count,
+successful completion/exit, +ALL TESTS PASSED+, and a subsequent working shell
+command. Missing tests, quick-only runs, timeout, panic, or matching the final
+string alone cannot pass. Preserve full categorized results.
+
+=== Phase 6: complete computer peripherals
+
+* [ ] [[nx-stage-6]] *P1 / Deliver every advertised device end to end.*
+  Device models may be developed before xv6; guest-driver integration is
+  required to close the relevant task. The common SDK is deliberately
+  independent of completion of these devices to avoid a bootstrap cycle.
+
+** [ ] [[nx-ainogpu]] *P1 / Implement generic AinoGPU text and 2D graphics.*
+   Provide device-owned VRAM, palette/RGB formats, text/framebuffer modes,
+   clipping, 2D commands, sprites, tiles, layers, command submission,
+   presentation, and completion/VSYNC signaling.
++
+*Components:* AinoGPU, host renderer, protected guest graphics driver. +
+*Dependencies:* <<nx-boot-display>>, <<nx-guest-drivers-sdk>>. +
+*Acceptance:* Guest-rendered 320x240 and 640x480 scenes verify pixel formats,
+clipping, transparency, layers, resource limits, reset, IRQs, and invalid
+buffers/commands. Rendering does not bypass device memory/protection.
+
+** [ ] [[nx-ainogpu-3d]] *P1 / Add hardware-accelerated generic 3D.*
+   Implement vertex/index submission, transforms, projection, clipping,
+   viewport, depth testing, and shading/texturing primitives needed by the
+   existing scenes. Provide an accelerated desktop backend and a deterministic
+   reference path for validation; software-only 3D is not task completion.
++
+*Components:* AinoGPU 3D command engine, renderer, guest driver/SDK. +
+*Dependencies:* <<nx-ainogpu>>. +
+*Acceptance:* Guest submissions render clipped and occluded scenes with
+asserted output. Test invalid indices/buffers, degenerate primitives, depth,
+resource ownership, and bounded completion; report unavailable acceleration.
+No Tank-16, dog, maze, or game-world rules live inside the device.
+
+** [ ] [[nx-input]] *P1 / Implement Vasta and Laudeliina input.*
+   Provide keyboard held-key/event semantics and pointer coordinates,
+   buttons, wheel, bounded queues, and interrupts. Define focus, capture,
+   console ownership, and overflow/disconnect behavior.
++
+*Components:* input devices/adapters, xv6 drivers and userspace events. +
+*Dependencies:* <<nx-core-boundaries>>, <<nx-interrupt-time>>, <<nx-guest-drivers-sdk>>. +
+*Acceptance:* Script press/hold/release, simultaneous controls, focus loss,
+queue overflow, and mouse motion/button/wheel cases. State cannot stick after
+reset or leak between protected clients; the host does not perform application actions.
+
+** [ ] [[nx-audio]] *P1 / Implement Sihinä audio.*
+   Provide generic tone/PCM functionality, channels/mixing, buffering,
+   timing, guest controls, completion, and underrun behavior.
++
+*Components:* audio device, testable host audio adapter, xv6 driver/SDK. +
+*Dependencies:* <<nx-core-boundaries>>, <<nx-interrupt-time>>, <<nx-guest-drivers-sdk>>. +
+*Acceptance:* Capture samples to verify duration, frequency, volume,
+mixing, buffer ownership, reset, and underrun/error signaling; perform an
+interactive audio smoke check without making physical audio output a unit-test dependency.
+
+** [ ] [[nx-network]] *P1 / Implement Saunapolku packet networking.*
+   Prefer the shared virtio transport for a packet NIC. Define queue,
+   packet-size, completion, link-state, and error behavior; implement the
+   guest ARP/IPv4/UDP and socket-like subset needed by the LAN applications.
+   Keep discovery, player slots, and game protocols in guest software.
++
+*Components:* NIC/transport, isolated network adapter, xv6 network driver/stack. +
+*Dependencies:* <<nx-virtio-block>>, <<nx-guest-drivers-sdk>>. +
+*Acceptance:* Two or more isolated machines exchange actual packets.
+Test malformed frames/descriptors, queue pressure, packet loss/reordering,
+disconnect/rejoin, reset, and unavailable networking with bounded execution.
+No host-side game session service substitutes for the NIC/guest stack.
+
+** [ ] [[nx-support-devices]] *P1 / Complete clock, entropy, configuration, and control.*
+   Finish Saunakello, Kipinä, Saunamestari, Löylymuisti, and Hiillos
+   guest-visible interfaces, including any advertised watchdog.
+   Keep monotonic time distinct from civil time; deterministic test entropy
+   must be explicit and not presented as secure runtime randomness.
++
+*Components:* supporting devices, host adapters, xv6 drivers and access policy. +
+*Dependencies:* <<nx-lifecycle>>, <<nx-guest-drivers-sdk>>. +
+*Acceptance:* Verify RTC rollover/adjustment, entropy readiness/failure,
+inventory identity, configuration persistence, reset/power authorization,
+and error/IRQ/protection behavior. Unsupported facilities are not advertised.
+
+** [ ] [[nx-finnish-display]] *P1 / Carry Finnish device names through every UI.*
+   Define encoding/glyph handling for BIOS, setup, consoles, discovery
+   commands, Serial Monitor, and diagnostics without changing wire identities.
++
+*Components:* firmware fonts, guest text rendering, host monitor adapters. +
+*Dependencies:* <<nx-boot-display>>, <<nx-ainogpu>>, <<nx-uart>>, <<nx-support-devices>>. +
+*Acceptance:* All catalog names render without replacement boxes or
+truncation, including ä/ö/Ä/Ö; text round-trips through the declared serial
+encoding and stable ASCII identifiers remain usable by tools.
+
+=== Phase 7: xv6 application environment
+
+* [ ] [[nx-stage-7]] *P1 / Supply a protected application SDK, runtime, and storage.*
+  Keep the upstream kernel library distinct from the project application libc.
+
+** [ ] [[nx-guest-drivers-sdk]] *P1 / Define the common protected driver/userspace ABI.*
+   Add versioned device handles, resource/buffer ownership, error reporting,
+   and userspace API conventions for graphics/3D, input, sound, clocks,
+   and networking. Device-specific implementation and tests remain in Phase 6.
++
+*Components:* xv6 driver framework/syscall extensions, +toolchain/+ target SDK. +
+*Dependencies:* <<nx-xv6-execution>>, <<nx-abi-contract>>, <<nx-device-contract>>. +
+*Acceptance:* Common access-control and buffer-validation fixtures execute;
+bad handles/pointers, unsupported operations, and process exit clean up
+correctly. Wrappers cannot use retired MMIO addresses, host syscall
+interception, or game-specific machine shortcuts.
+
+** [ ] [[nx-fp-context]] *P1 / Preserve application floating-point state.*
+   Implement guest-owned F/D context and status handling across traps,
+   scheduling, fork/exec, and process lifetime. Define FS state and the
+   policy for first FP use instead of relying on stock integer-only xv6 startup.
++
+*Components:* xv6 trap/context-switch code, Kiuas16 FP state tests. +
+*Dependencies:* <<nx-xv6-execution>>, <<nx-rv64-core>>. +
+*Acceptance:* Preempt multiple FP-using processes and verify registers,
+rounding/flags, and isolation; illegal or unsupported FP use has a defined
+guest-visible outcome rather than corrupting another process.
+
+** [ ] [[nx-guest-libc]] *P1 / Implement the practical application C runtime.*
+   Provide the required standard streams, formatting, allocation, memory/
+   string, math, file/seek, time, and termination subset using xv6 services.
+   Replace binary16 math assumptions and document limits, errors, and EOF.
++
+*Components:* application headers/runtime under +toolchain/+, xv6 glue. +
+*Dependencies:* <<nx-c-xv6>>, <<nx-rv64-codegen>>, <<nx-xv6-execution>>, <<nx-fp-context>>. +
+*Acceptance:* Run supported function and boundary/error tests in guest
+processes, including +stdin+/+stdout+/+stderr+, bounded +fgets+, +printf+,
+allocation failure, seeks, EOF, and exit status. This practical subset is not
+a claim of complete hosted C90.
+
+** [ ] [[nx-extended-fs]] *P1 / Version larger-file and longer-name storage.*
+   Publish limits and a distinct format/version; update xv6 allocation,
+   directory handling, logging, truncation, and Rust filesystem tools together.
+   Size the volume from real binaries/assets, not upstream's small default.
++
+*Components:* extended xv6 filesystem, Rust image tools, disk specification. +
+*Dependencies:* <<nx-xv6-usertests>>, <<nx-rust-build-driver>>. +
+*Acceptance:* Round-trip all 606,208 bytes of +TANK16_TILES.bin+ under its
+16-character basename. Test published name/file limits and one beyond them,
+directory collisions, full media, allocation rollback, truncation, crash/
+recovery, reboot persistence, and actual package-capacity calculations.
+
+** [ ] [[nx-fs-compatibility]] *P1 / Keep upstream and extended filesystem tests distinct.*
+   Retain upstream-format images and unchanged semantics in the compatibility
+   configuration; document only deliberate extended-format differences.
++
+*Components:* image format detection, guest filesystem configuration, test matrix. +
+*Dependencies:* <<nx-extended-fs>>, <<nx-xv6-usertests>>. +
+*Acceptance:* Wrong-format media is rejected clearly. Full upstream tests
+remain unchanged and pass in compatibility mode; extended-mode tests cover
+intentional name/size differences without suppressing unrelated failures.
+
+** [ ] [[nx-guest-resources]] *P1 / Audit process and package resource requirements.*
+   Measure stacks, heaps, image/segment sizes, open files, paths, argument
+   space, graphics buffers, and asset working sets. Define explicit extended
+   xv6 limits and failure behavior, retaining the clean compatibility profile.
++
+*Components:* xv6 process/exec limits, linker layouts, package inventory checks. +
+*Dependencies:* <<nx-xv6-execution>>, <<nx-rust-build-driver>>. +
+*Acceptance:* Representative workloads and boundary fixtures prove stack/
+heap separation, allocation/exec failures, and correct paths/file counts.
+No hidden fixed RAM/font pointer or legacy global-data window is required.
+Recheck measured capacity against every final application build.
+
+** [ ] [[nx-program-packaging]] *P1 / Make program manifests and image installation safe.*
+   Version target/executable/asset/archive metadata, stage builds, and install
+   into fresh or explicitly selected images. Preserve writable data and
+   expose conflicts, capacity failures, and unsupported formats.
++
+*Components:* +program.json+ schema, Rust program tools, build/install scripts. +
+*Dependencies:* <<nx-rust-build-driver>>, <<nx-fs-compatibility>>, <<nx-guest-resources>>, <<nx-sisuos-freeze>>. +
+*Acceptance:* Representative packages and full asset fixtures install,
+launch, update, and fail safely on conflicts/full media. No silent truncation,
+name rewriting, or automatic conversion of existing disks occurs. The final
+all-program inventory is verified again after the individual ports.
+
+=== Phase 8: every active program
+
+The catalog below accounts for every program directory at the audited
+revision. Each active program has its own unchecked task; SisuOS has only
+the archive task. Preserve existing useful prototype scope rather than
+silently requiring unrelated new game features.
+
+[cols="2,2,3",options="header"]
+|===
+| Program directory | Recovery task | Principal interfaces
+| link:../programs/anaclock/[anaclock] | <<nx-program-anaclock>> | 2D, keyboard, RTC
+| link:../programs/asteroids/[asteroids] | <<nx-program-asteroids>> | 2D, controls, audio
+| link:../programs/disk-editor/[disk-editor] | <<nx-program-disk-editor>> | Files, process memory, display/input
+| link:../programs/elite/[elite] | <<nx-program-elite>> | Generic 3D, flight/combat controls
+| link:../programs/hertta-3d/[hertta-3d] | <<nx-program-hertta-3d>> | Generic 3D, maze input/state
+| link:../programs/hulio/[hulio] | <<nx-program-hulio>> | Sprites/tiles, platform-game controls
+| link:../programs/infinite-city/[infinite-city] | <<nx-program-infinite-city>> | Scrolling 2D, keyboard/mouse
+| link:../programs/lunar-lander/[lunar-lander] | <<nx-program-lunar-lander>> | 2D, timed physics/input
+| link:../programs/motorobots/[motorobots] | <<nx-program-motorobots>> | 2D, pointer, allocation, separate translation units
+| link:../programs/netgame-demo/[netgame-demo] | <<nx-program-netgame-demo>> | Packets, display/input
+| link:../programs/pacman/[pacman] | <<nx-program-pacman>> | Tiles/sprites, game input
+| link:../programs/paint/[paint] | <<nx-program-paint>> | Canvas, pointer, 2D operations
+| link:../programs/sc16-showcase/[sc16-showcase] | <<nx-program-sc16-showcase>> | Device inventory, 2D/3D, input/audio/network
+| link:../programs/space-invaders/[space-invaders] | <<nx-program-space-invaders>> | Sprites, controls, audio
+| link:../programs/spacecave/[spacecave] | <<nx-program-spacecave>> | Networked world, input, 2D
+| link:../programs/tank-16/[tank-16] | <<nx-program-tank-16>> | Large assets/maps, 2D, two-player input, audio
+| link:../programs/text-demo/[text-demo] | <<nx-program-text-demo>> | Standard streams and process return
+| link:../programs/sisuos/[sisuos] | <<nx-sisuos-freeze>> | Archived source/instructions; not an RV64 application port
+|===
+
+For each port, trace failures through generated assembly and CPU execution
+before changing guest logic. Audit unsigned plain +char+ and signed lookup
+tables, +long+/pointer widths, struct padding, fixed-width serialization,
+overflow, hardcoded RAM/font addresses, and timing assumptions. Preserve
+source-level convenience where sensible without reviving retired hardware
+shortcuts. Each task additionally depends on any device its restored feature
+inventory actually uses; record that dependency before closing it.
+
+* [ ] [[nx-stage-8]] *P1 / Pass 17/17 active application recovery gates.*
+  For every child: Rust build -> stage/package -> launch under xv6 ->
+  scripted input -> meaningful state/output assertions -> bounded run and
+  interactive smoke check. Verify reset/relaunch or process exit according
+  to the program's interface and useful behavior on resource errors.
+  Build success and a nonblank frame alone do not pass.
+
+** [ ] [[nx-program-anaclock]] *P1 / Restore AnaClock.*
+   Replace obsolete clock/device assumptions and restore all seven faces.
++
+*Components:* +programs/anaclock/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>, <<nx-support-devices>>. +
+*Acceptance:* Tab cycles all seven faces; scripted RTC values and rollover
+produce the correct visible time while the application remains responsive.
+
+** [ ] [[nx-program-asteroids]] *P1 / Restore Asteroids.*
+   Port rendering, input, timing, and existing sound effects.
++
+*Components:* +programs/asteroids/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>, <<nx-audio>>. +
+*Acceptance:* Rotate/thrust/fire, world wrap, hits and asteroid splitting,
+score/lives, game-over/restart, and sound all produce asserted state changes.
+
+** [ ] [[nx-program-disk-editor]] *P1 / Restore DiskEditor safely.*
+   Use guest file APIs and valid process memory instead of the absolute
+   +0x40000+ scratch pointer and retired disk interface.
++
+*Components:* +programs/disk-editor/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>. +
+*Acceptance:* List/open/edit/save/reopen a disposable guest file and verify
+exact changed bytes after reboot. Missing files, permissions, allocation, and
+full-media errors are visible; arbitrary host files are never exposed.
+
+** [ ] [[nx-program-elite]] *P1 / Restore the Elite flight/combat prototype.*
+   Port the existing scene to generic AinoGPU 3D and preserve its actual scope.
++
+*Components:* +programs/elite/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu-3d>>, <<nx-input>>. +
+*Acceptance:* Flight axes/thrust, clipped visible geometry, combat/collisions,
+HUD state, destruction, and restart work through the hardware 3D path.
+
+** [ ] [[nx-program-hertta-3d]] *P1 / Restore Hertta-3D.*
+   Keep maze/game rules in guest code and use the generic hardware 3D interface.
++
+*Components:* +programs/hertta-3d/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu-3d>>, <<nx-input>>. +
+*Acceptance:* Menu navigation, maze movement/collision, treat/dog interaction,
+and level/completion transitions produce correct gameplay and rendered state.
+
+** [ ] [[nx-program-hulio]] *P1 / Restore Hulio.*
+   Reconnect sprites/tiles, controls, and platform-game state to the new SDK.
++
+*Components:* +programs/hulio/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>. +
+*Acceptance:* Movement/jumping, terrain/enemy collisions, coin collection,
+lives, and progression/restart work with asserted sprite and gameplay state.
+
+** [ ] [[nx-program-infinite-city]] *P1 / Restore Infinite City.*
+   Port scrolling, pointer aiming, controls, and incremental world generation.
++
+*Components:* +programs/infinite-city/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>. +
+*Acceptance:* City scrolling, jumping/climbing, mouse aim/fire, enemy damage/
+score, and continued generation remain correct during a bounded extended run.
+
+** [ ] [[nx-program-lunar-lander]] *P1 / Restore Lunar Lander.*
+   Reconcile physics/time assumptions with Tiimalasi and the new target ABI.
++
+*Components:* +programs/lunar-lander/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>. +
+*Acceptance:* Menu modes/difficulty, rotation/throttle, safe landing versus
+crash, fuel/scoring, and continue/restart follow repeatable input trajectories.
+
+** [ ] [[nx-program-motorobots]] *P1 / Restore the MotoRobots production prototype.*
+   Build real separate translation units instead of including C implementation
+   files; preserve the documented production simulation.
++
+*Components:* +programs/motorobots/+, its build manifest. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>. +
+*Acceptance:* Build a mine/robot/factory/storage route including refining
+and robot production; assert resource transfers, blocked-route replanning,
+zoom/pan, and HUD updates. Unimplemented save/progression ambitions are not
+prerequisites for repairing the existing prototype.
+
+** [ ] [[nx-program-netgame-demo]] *P1 / Restore Netgame Demo.*
+   Move discovery/session behavior onto guest packet/network APIs.
++
+*Components:* +programs/netgame-demo/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>, <<nx-network>>. +
+*Acceptance:* At least two isolated machines exchange position/ping messages;
+verify slot capacity, disconnect/rejoin, invalid packets, and useful
+unavailable-network behavior without host game-service shortcuts.
+
+** [ ] [[nx-program-pacman]] *P1 / Restore PacMan.*
+   Port maze/tile/sprite drawing and game controls without changing game rules
+   to hide machine/compiler defects.
++
+*Components:* +programs/pacman/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>. +
+*Acceptance:* Movement, pellets, ghosts/power pellets, collision/lives/score,
+maze completion, and restart have deterministic scenario checks.
+
+** [ ] [[nx-program-paint]] *P1 / Restore Paint.*
+   Reconnect the canvas, pointer tools, palette, and drawing operations.
++
+*Components:* +programs/paint/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>. +
+*Acceptance:* Tools, colors/brush sizes, shape preview/cancel, clipping,
+clear, and canvas persistence between frames work. Save/load is not an
+existing feature and is not a recovery prerequisite.
+
+** [ ] [[nx-program-sc16-showcase]] *P1 / Restore and correct SC-16 Showcase.*
+   Retain program identity while updating architectural facts and device
+   demonstrations for Kiuas16/AinoGPU. Remove fixed instruction-count
+   benchmark claims in favor of measured work.
++
+*Components:* +programs/sc16-showcase/+, capability/benchmark reporting. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu-3d>>, <<nx-input>>, <<nx-audio>>, <<nx-network>>, <<nx-support-devices>>. +
+*Acceptance:* All 14 pages work, report accurate machine/device information,
+and exercise input/network/3D/stress behavior. Benchmark results state actual
+measurement and configuration rather than inherited SC-16 constants.
+
+** [ ] [[nx-program-space-invaders]] *P1 / Restore Space Invaders.*
+   Port sprites, input, timing, and existing audio effects.
++
+*Components:* +programs/space-invaders/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>, <<nx-audio>>. +
+*Acceptance:* Movement/fire, waves/hits, lives/score, game-over or wave
+completion, restart, and audio are verified by gameplay scenarios.
+
+** [ ] [[nx-program-spacecave]] *P1 / Restore SpaceCave multiplayer.*
+   Keep authority, world generation, discovery, and host handover in the
+   guest protocol, transported by Saunapolku.
++
+*Components:* +programs/spacecave/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>, <<nx-network>>. +
+*Acceptance:* Menu/nickname, shared cave seed, Classic/Mission play,
+authoritative movement/combat, scoring/respawn, and host handover work
+between isolated machines, including packet loss and disconnect cases.
+
+** [ ] [[nx-program-tank-16]] *P1 / Restore Tank-16 and its asset workflow.*
+   Wire its actual runtime-asset pipeline into the manifest; keep map/game
+   rules and effects in guest code over generic graphics. Reconcile
+   link:../programs/tank-16/docs/gameplay.adoc[historical gameplay notes]
+   against source before making feature claims.
++
+*Components:* +programs/tank-16/+, +sc16tank+, +sc16maps+, +sc16mapedit+, +sc16sprites+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>, <<nx-ainogpu>>, <<nx-input>>, <<nx-audio>>, <<nx-extended-fs>>, <<nx-tool-boundaries>>. +
+*Acceptance:* Load complete assets and finite/seeded maps; verify two-player
+controls, palettes/rotations, collision/cameras/minimap, coordinates beyond
+signed 16-bit range, rounds/pause/restart, power-ups/audio, and map/asset-tool
+round trips. Publish and test real supported map/resource limits.
+
+** [ ] [[nx-program-text-demo]] *P1 / Restore Text Demo.*
+   Use functioning standard streams and normal xv6 process startup/return.
++
+*Components:* +programs/text-demo/+. +
+*Dependencies:* <<nx-program-packaging>>, <<nx-guest-libc>>. +
+*Acceptance:* Bounded name input produces the exact greeting; EOF/error
+paths behave correctly and normal completion returns successfully to the
+xv6 shell. No graphics, mouse, audio, or network dependency is introduced.
+
+=== Phase 9: remaining C90 and ABI completeness
+
+The xv6-required subset is P0; practical application runtime support is P1.
+The following work closes the remaining C90 requirements, not a duplicate
+compiler or platform design. Legacy execution results must be revalidated
+for the RV64 ABI. Existing partial progress remains useful test input, not
+permission to check these tasks automatically.
+
+* [ ] [[nx-stage-9]] *P2 / Complete and independently validate C90 requirements.*
+  Do not remove the nonconformance disclaimer before every child passes.
+
+** [ ] [[nx-c90-declarators]] *P2 / Complete declarators, types, and calls.*
+   Close nested/abstract declarators, typedefs, records/unions/enums,
+   array/function parameter adjustment, pointer-to-array lowering, function
+   pointer conversions/returns, compatible declarations, old-style/K&R
+   metadata, prototype/default promotions, and semantic constraints.
++
+*Components:* typed frontend, semantic/call lowering, C90 tests. +
+*Dependencies:* <<nx-c-xv6>>, <<nx-rv64-codegen>>. +
+*Acceptance:* Positive and diagnostic cases cover all declaration/expression
+paths and object/function-pointer distinctions. Execute indirect/nested/
+recursive calls, aggregates, side effects, and default promotions with ABI assertions.
+
+** [ ] [[nx-c90-numerics]] *P2 / Complete typed numeric and floating semantics.*
+   Finish lvalues, casts, signedness, usual arithmetic conversions, mixed
+   precision, all arithmetic/comparisons/conditions/updates, initializers,
+   and call boundaries. Cover 16/32/64-bit integer conversions, binary32/
+   binary64, and binary128 +long double+ support required by the target ABI.
++
+*Components:* typed numeric lowering, constant evaluation, runtime helpers. +
+*Dependencies:* <<nx-c90-declarators>>, <<nx-toolchain-validation>>. +
+*Acceptance:* Independent references verify object bytes, range edges,
+subnormals, signed zero, infinities, NaNs, rounding, casts, calls, and results.
+Distinguish undefined/out-of-range C conversions from promised CPU behavior;
+do not silently narrow unsupported types or retain binary16 library arithmetic.
+
+** [ ] [[nx-c90-linkage]] *P2 / Complete linkage and storage duration.*
+   Cover file/block +static+, +extern+, +auto+, +register+, and +volatile+;
+   internal/external/no linkage, tentative/multiple definitions, static local
+   lifetime/initialization, register address-taking, and cross-unit compatibility.
++
+*Components:* frontend symbol/storage model and Rust linker integration. +
+*Dependencies:* <<nx-c90-declarators>>, <<nx-elf-linker>>. +
+*Acceptance:* Execute separate-unit and repeated-call lifetime tests;
+invalid redeclarations, duplicates, and storage-class combinations diagnose.
+Volatile accesses obey documented object/device width and access-count rules.
+
+** [ ] [[nx-c90-initializers]] *P2 / Complete scalar and aggregate initialization.*
+   Support arrays, structures/unions, brace elision, nested aggregates,
+   string arrays, omitted outer bounds, zero fill, automatic side effects,
+   and static constant-expression restrictions.
++
+*Components:* typed initializer/layout lowering and object emission. +
+*Dependencies:* <<nx-c90-linkage>>, <<nx-c90-numerics>>. +
+*Acceptance:* Inspect final object bytes and runtime evaluation order for
+all forms; invalid static expressions and incompatible initializers diagnose.
+Designated initialization remains an intentional GNU C99-mode extension.
+
+** [ ] [[nx-c90-qualifiers]] *P2 / Complete pointer and object qualification.*
+   Track +const+/+volatile+ at every level through declarations, typedefs,
+   casts, members, conditional/comma expressions, calls, arguments, and returns.
++
+*Components:* semantic types, conversions, lvalues, volatile lowering. +
+*Dependencies:* <<nx-c90-declarators>>. +
+*Acceptance:* Positive/negative tests distinguish qualified pointers from
+pointers to qualified data; reject qualifier loss and const writes across
+all paths and preserve required volatile reads/writes.
+
+** [ ] [[nx-c90-bitfields]] *P2 / Finish RV64 bit-field layout and operations.*
+   Revalidate allocation units, signedness, widths, zero-width fields,
+   unions, nested/indexed objects, initializers, and numeric compound conversions.
++
+*Components:* record layout and bit-field load/read-modify-write lowering. +
+*Dependencies:* <<nx-c90-initializers>>, <<nx-c90-qualifiers>>. +
+*Acceptance:* Assert exact little-endian object bytes, neighboring bits,
+single lvalue evaluation, promotion/conversion results, and volatile access
+counts. Invalid types/widths, address-taking, and +sizeof+ of a bit-field diagnose.
+
+** [ ] [[nx-c90-preprocessor]] *P2 / Complete C90 preprocessing and translation phases.*
+   Audit trigraph/splice/token order, macro prescan, stringification, pasting,
+   rescanning, +defined+, conditionals, includes, predefined values,
+   +#line+, +#error+, +#pragma+, null directives, and diagnostic locations.
++
+*Components:* shared Rust preprocessor/lexer and standalone fixtures. +
+*Dependencies:* <<nx-compiler-boundaries>>. +
+*Acceptance:* Independent preprocessing-only fixtures cover active/inactive
+directives, include order, line/file mapping, integer expressions, and
+recursive expansion. C90 and GNU/xv6 modes have explicit extension policies.
+
+** [ ] [[nx-c90-limits]] *P2 / Verify every required translation minimum.*
+   Audit identifiers, nested blocks/declarations, parameters/arguments,
+   macros/includes, expressions, strings, records, objects, and source lines.
++
+*Components:* compiler/preprocessor limits and resource diagnostics. +
+*Dependencies:* <<nx-c90-declarators>>, <<nx-c90-preprocessor>>. +
+*Acceptance:* Test at and immediately beyond each documented minimum/limit.
+Historical 65,535-byte object and preprocessor boundary tests do not stand
+in for the complete standard limit inventory.
+
+** [ ] [[nx-c90-headers]] *P2 / Complete required C90 headers.*
+   Audit +assert.h+, +ctype.h+, +errno.h+, +float.h+, +limits.h+,
+   +locale.h+, +math.h+, +setjmp.h+, +signal.h+, +stdarg.h+, +stddef.h+,
+   +stdio.h+, +stdlib.h+, +string.h+, and +time.h+ declarations/macros/types.
++
+*Components:* target-selected guest headers and header tests. +
+*Dependencies:* <<nx-guest-libc>>, <<nx-c90-numerics>>, <<nx-c90-preprocessor>>. +
+*Acceptance:* Standalone, permitted repeat inclusion, and varied include
+orders work with correct target values/types. Resolve conflicting historical
++setjmp+/+signal+ claims through execution; header smoke tests alone do not
+establish the corresponding library behavior.
+
+** [ ] [[nx-c90-hosted]] *P2 / Specify and implement hosted execution semantics.*
+   Complete stream/device mapping, buffering, file operations, pushback,
+   EOF/error state, temporary files, environment/command behavior, and
+   termination/status on guest OS services rather than folder-disk host syscalls.
++
+*Components:* application libc, xv6 services and hosted capability documentation. +
+*Dependencies:* <<nx-c90-headers>>, <<nx-fs-compatibility>>. +
+*Acceptance:* Test available/unavailable resources and all documented
+stream/process outcomes, including errors. Standard interfaces remain distinct
+from machine/game extensions; a documented unsupported requirement still
+blocks a full hosted-conformance claim.
+
+** [ ] [[nx-c90-library]] *P2 / Complete the required library functions.*
+   Finish math, stdio, signal, stdlib, string, time/locale, and remaining
+   facilities; validate setjmp/longjmp and signal-handler behavior separately.
+   Specify domains, ranges, accuracy, boundaries, +errno+, and resource limits.
++
+*Components:* guest libc/math runtime and execution tests. +
+*Dependencies:* <<nx-c90-hosted>>, <<nx-c90-numerics>>. +
+*Acceptance:* Independently checked results and failure cases cover each
+required function/macro. Screen/graphics routines do not substitute for
+standard C interfaces; approximate binary16 math cannot pass as C90 +double+.
+
+** [ ] [[nx-c90-abi]] *P2 / Validate the complete C-visible ABI.*
+   Cover scalar/aggregate representations, alignment, pointer/qualifier
+   conversions, bit-fields, stack frames, calling conventions, and control flow.
++
+*Components:* target ABI tests, compiler/assembler/execution integration. +
+*Dependencies:* <<nx-c90-numerics>>, <<nx-c90-bitfields>>, <<nx-c90-linkage>>. +
+*Acceptance:* Independent memory/call fixtures execute on every supported
+Rust execution path. Update ABI capability claims only from results,
+including floating arguments/returns and variadic/default promotions.
+
+** [ ] [[nx-c90-independent]] *P2 / Integrate an independent conformance suite.*
+   Review licensing and harness requirements; keep tests independent of
+   compiler internals and preserve categorized output.
++
+*Components:* Rust test runner, licensed external corpus integration. +
+*Dependencies:* <<nx-toolchain-validation>>. +
+*Acceptance:* A repeatable runner executes the selected corpus on Kiuas16,
+accounts for its test inventory, and distinguishes harness failure, timeout,
+unsupported cases, and actual semantic failures.
+
+** [ ] [[nx-c90-conformance]] *P2 / Resolve independent conformance findings.*
+   Exercise language, ABI, preprocessing, limits, and hosted facilities.
+   Classify defects, implementation-defined/unspecified behavior, unsupported
+   requirements, and invalid test assumptions without discarding failures.
++
+*Components:* conformance results, compiler/runtime regressions, target docs. +
+*Dependencies:* <<nx-c90-abi>>, <<nx-c90-limits>>, <<nx-c90-library>>, <<nx-c90-independent>>. +
+*Acceptance:* Defects have fixes and behavioral regressions; classifications
+are justified and repeatable. Unsupported required features remain visible
+and prevent certification.
+
+** [ ] [[nx-c90-release]] *P2 / Close the C90 compatibility release gate.*
+   Run repository and independent suites and reconcile all capability claims.
++
+*Components:* compiler/ABI/library documentation and release validation. +
+*Dependencies:* <<nx-c90-conformance>>. +
+*Acceptance:* Required language constraints, ranges/precision, ABI, headers,
+library, translation limits, and supported execution paths pass with
+independent evidence. Only then remove the nonconformance disclaimer.
+
+=== Phase 10: documentation, workflow, and release
+
+* [ ] [[nx-stage-10]] *P1 / Release the documented, reproducible complete computer.*
+  Completion requires all children, not merely a new-machine announcement.
+
+** [ ] [[nx-documentation-refactor]] *P1 / Align documentation with verified behavior.*
+   Separate current specifications, successor contracts, and legacy history.
+   Refactor ISA/architecture, ABI/compiler support, BIOS, devices, image/
+   filesystem formats, program builds, onboarding, troubleshooting, and examples.
+   Keep this document as the only development checklist.
++
+*Components:* +README.adoc+, +docs/+, program references and contributor guidance. +
+*Dependencies:* <<nx-stage-0>>, <<nx-xv6-usertests>>, <<nx-stage-6>>, <<nx-stage-7>>, <<nx-stage-8>>. +
+*Acceptance:* Documented commands and examples match tested outputs;
+legacy/current/target claims cannot be confused. Remove stale statements,
+broken links, and duplicate task lists without discarding useful historical
+reference, provenance, or licensing material.
+
+** [ ] [[nx-workflow]] *P1 / Wire every supported host/developer surface.*
+   Integrate Rust build/image tools, launcher, installation, headless runner,
+   Serial/Bug Monitors, gallery capture, and asset tools with new targets.
++
+*Components:* Rust CLIs, +run.ps1+, +scripts/build-install.ps1+, monitors/gallery. +
+*Dependencies:* <<nx-tool-boundaries>>, <<nx-program-packaging>>, <<nx-stage-8>>. +
+*Acceptance:* Native Windows workflows reproduce builds/boots and preserve
+writable data on update/failure. New captures identify their tested revision
+and configuration; historical GIFs are not presented as current acceptance.
+
+** [ ] [[nx-validation-ci]] *P0 / Automate deterministic execution gates.*
+   Add appropriate CI and isolated headless runners using existing Rust
+   compile/assemble/CPU-test patterns, actual firmware boot, bounded serial
+   interaction, disposable media, and isolated multi-machine networking.
++
+*Components:* Rust tests, CI configuration, fixture/result handling. +
+*Dependencies:* <<nx-baseline>>, <<nx-toolchain-validation>>, <<nx-xv6-usertests>>. +
+*Acceptance:* Run focused selectors first, then required integration/full
+gates: +cargo fmt --check+, +cargo check --lib+, applicable compiler/ABI/
+hardware/program tests, and +cargo test -- --test-threads=1+. Fail on panic,
+timeout, missing inventory, or unexpected output; keep native Windows
+validation explicit. Later device/application gates are added as they land.
+
+** [ ] [[nx-computer-release]] *P1 / Prove the complete-computer target.*
+   Produce a reproducible release with source/provenance, boot/root images,
+   firmware, documentation, application inventory, and execution evidence.
++
+*Components:* complete platform release and acceptance runner. +
+*Dependencies:* <<nx-stage-1>>, <<nx-stage-2>>, <<nx-stage-3>>, <<nx-stage-4>>, <<nx-stage-5>>, <<nx-stage-6>>, <<nx-stage-7>>, <<nx-stage-8>>, <<nx-documentation-refactor>>, <<nx-workflow>>, <<nx-validation-ci>>. +
+*Acceptance:* Rust-produced firmware/kernel/full upstream userland, real
+BIOS sector boot, full upstream compatibility tests, every advertised device's
+success/error/reset/IRQ/protection gates, filesystem persistence, and
+*17/17 active program behavioral passes*. Explicitly account for the archived
+SisuOS source example. Do not claim real Linux, full POSIX, or full C90 unless
+their separate requirements have actually been met.
+
+* [ ] [[nx-follow-ons]] *P2 / Validate separately advertised follow-on platforms.*
+  These children do not block the P0/P1 computer release. Broader C90 work is
+  owned by <<nx-stage-9>>, not copied here. Neither follow-on status nor
+  partial progress may hide an unfinished required milestone.
+
+** [ ] [[nx-multicore]] *P2 / Add and verify multiple harts.*
+   Specify hart startup, per-hart CSR/timer/PLIC contexts, interprocessor
+   signaling, memory ordering, LR/SC/AMO contention, and guest scheduling.
++
+*Components:* Kiuas16 machine execution, interrupt/timer routing, xv6 SMP tests. +
+*Dependencies:* <<nx-xv6-usertests>>, <<nx-interrupt-time>>, <<nx-rv64-core>>. +
+*Acceptance:* Run the full applicable xv6 inventory on the advertised hart
+counts with contention/isolation fixtures and bounded progress. Single-hart
+behavior remains verified; multicore is not advertised from one successful boot.
+
+** [ ] [[nx-browser-portability]] *P2 / Validate any advertised browser target.*
+   Audit rendering, storage persistence, audio/input permissions, networking,
+   threading, and image/build distribution without weakening native contracts.
++
+*Components:* browser/host adapters, packaging and platform documentation. +
+*Dependencies:* <<nx-computer-release>>. +
+*Acceptance:* A runnable browser distribution passes its declared feature
+matrix and reports unavailable facilities explicitly. A wasm compile alone
+does not establish a standalone browser release.
+
+== Migration crosswalk
+
+The former checklists are retained in Git history at the audited revision,
+not as competing archive task files. Existing completed SC-16 work provides
+baseline/reference tests; it is not automatically complete on RV64.
+The old identifiers below remain addressable here.
+
+[cols="2,3,3",options="header"]
+|===
+| Former identity or decision | New owner | Migration meaning
+| [[c90-type-abi]] +c90-type-abi+ | <<nx-abi-contract>>, <<nx-c90-declarators>>, <<nx-c90-abi>> | Redefine the target explicitly; preserve semantic/layout test intent.
+| [[c90-stack-call-abi]] +c90-stack-call-abi+ | <<nx-rv64-codegen>>, <<nx-c90-abi>> | RV64 register/stack calls replace the SC-16 convention; revalidate aggregates and promotions.
+| [[c90-float-model]] +c90-float-model+ | <<nx-abi-contract>>, <<nx-c90-numerics>> | Typed floating model, initializers, conversions, and long-double representation.
+| [[c90-float-isa]] +c90-float-isa+ | <<nx-rv64-core>>, <<nx-toolchain-validation>> | Historical custom opcodes are not RISC-V F/D certification.
+| [[c90-float-backend]] +c90-float-backend+ | <<nx-rv64-codegen>>, <<nx-c90-numerics>> | General lvalues/expressions, mixed precision, signed/unsigned conversions, calls/results.
+| [[c90-float-validation]] +c90-float-validation+ | <<nx-toolchain-validation>>, <<nx-c90-numerics>>, <<nx-c90-abi>> | Independent numeric/object-byte/call execution evidence.
+| [[c90-abi-conformance]] +c90-abi-conformance+ | <<nx-c90-abi>> | Complete C-visible representation, conversion, and call validation.
+| [[c90-function-pointer-types]] +c90-function-pointer-types+ | <<nx-c-xv6>>, <<nx-c90-declarators>> | Required xv6 dispatch first; full nested/abstract/compatible function types later.
+| [[c90-indirect-calls]] +c90-indirect-calls+ | <<nx-rv64-codegen>>, <<nx-c90-declarators>> | Function conversions, pointers, arguments/results, clobbers, and executed indirect calls.
+| [[c90-declarators]] +c90-declarators+ | <<nx-c-xv6>>, <<nx-c90-declarators>> | Array/function adjustment, records/enums/typedefs, prototypes and old-style metadata.
+| [[c90-linkage-storage]] +c90-linkage-storage+ | <<nx-c-xv6>>, <<nx-elf-linker>>, <<nx-c90-linkage>> | Required separate-unit linkage first; complete storage duration and constraints later.
+| [[c90-initializers]] +c90-initializers+ | <<nx-c-xv6>>, <<nx-c90-initializers>> | C90 aggregate/constant rules retained; GNU C99 designated initialization is intentional for xv6.
+| [[c90-pointer-qualifiers]] +c90-pointer-qualifiers+ | <<nx-c90-qualifiers>> | Full multilevel qualifiers and all expression/declaration paths.
+| [[c90-bitfield-layout]] +c90-bitfield-layout+ | <<nx-abi-contract>>, <<nx-c90-bitfields>> | Revalidate allocation and bytes for the little-endian RV64 target.
+| [[c90-bitfield-codegen]] +c90-bitfield-codegen+ | <<nx-c90-bitfields>> | Keep existing operation tests and finish typed conversions/initializers/qualifiers.
+| [[c90-preprocessor]] +c90-preprocessor+ | <<nx-c90-preprocessor>> | Complete translation phases, macros/includes, predefined values, and diagnostics.
+| [[c90-translation-limits]] +c90-translation-limits+ | <<nx-c90-limits>> | All required minima, boundary tests, and explicit resource limits.
+| [[c90-required-headers]] +c90-required-headers+ | <<nx-guest-libc>>, <<nx-c90-headers>> | Required application subset first, complete C90 header inventory later.
+| [[c90-hosted-runtime]] +c90-hosted-runtime+ | <<nx-guest-libc>>, <<nx-c90-hosted>> | Guest xv6 services replace host folder-disk assumptions; streams/errors remain required.
+| [[c90-library-functions]] +c90-library-functions+ | <<nx-guest-libc>>, <<nx-c90-library>> | Practical math/string/allocation/file needs plus complete library behavior and accuracy.
+| [[c90-independent-suite]] +c90-independent-suite+ | <<nx-c90-independent>> | Independent, license-reviewed executable test corpus.
+| [[c90-conformance-tests]] +c90-conformance-tests+ | <<nx-c90-conformance>> | Categorized findings, fixes, regressions, and repeatable evidence.
+| [[c90-release-gate]] +c90-release-gate+ | <<nx-c90-release>> | Retain the nonconformance disclaimer until every required gate passes.
+| [[sc16-game-c-runtime]] +sc16-game-c-runtime+ | <<nx-guest-drivers-sdk>>, <<nx-guest-libc>>, <<nx-stage-8>> | One practical runtime and all-program execution gate, not another platform roadmap.
+| Old lifecycle/UART parents and remaining validation | <<nx-baseline>>, <<nx-lifecycle>>, <<nx-uart>>, <<nx-bios-handoff>>, <<nx-validation-ci>> | Preserve the historical failed SisuOS regression as baseline evidence; do not infer a fresh pass.
+| SisuOS expansion and maintained legacy execution | <<nx-sisuos-freeze>> | Explicitly retired from future development by project direction.
+| Folder-only disks, SC16IMG3, and custom ISA retention | <<nx-machine-contract>>, <<nx-elf-linker>>, <<nx-virtio-block>>, <<nx-boot-images>> | Superseded target decisions; old specifications remain labeled legacy.
+| Tank-16 completed checklist | <<nx-program-tank-16>> and link:../programs/tank-16/docs/gameplay.adoc[historical gameplay reference] | Preserve controls, maps/assets/fonts and provenance as prose; no claim that the old checks certify the port.
+| Old multi-implementation conformance wording | <<nx-toolchain-validation>>, <<nx-c90-abi>> | Compare all supported Rust execution paths; do not restore a Python implementation.
+|===
+
+== Release evidence and source references
+
+The P0 gate is <<nx-stage-5>> with its completed toolchain, hardware, and
+firmware prerequisites. The P1 complete-computer gate is
+<<nx-computer-release>>. Full C90 is a separate <<nx-c90-release>> gate;
+SMP/browser claims require their own follow-on results.
+
+Every advertised device requires success, error, reset, interrupt where
+applicable, and protection tests. Every active application requires the
+shared Phase 8 gate and its individual scenario. Keep disposable test images
+separate from user disks and preserve original data on failed builds/installs.
+
+The following pinned sources establish the upstream requirements, not proof
+that SuomiCPU-16 already meets them:
+
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/Makefile[xv6 build and user-program inventory].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/start.c[M-mode startup, Sstc, and A/D configuration].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/memlayout.h[Physical memory map].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/riscv.h[Architectural state and operations].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/virtio_disk.c[Virtio transport and block-driver checks].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/fs.h[Filesystem structures and file/name bounds].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/param.h[Filesystem and process resource defaults].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/user/usertests.c[Complete usertests inventory and result contract].
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/LICENSE[Upstream license to preserve].
+* https://riscv-non-isa.github.io/riscv-elf-psabi-doc/[RISC-V ELF psABI].
+
+Local specifications remain useful descriptions of the existing machine:
+link:sc16_architecture.adoc[SC-16 architecture],
+link:c90_target_abi.adoc[SC-16 C ABI],
+link:sc16_disk_format.adoc[folder-disk format], and
+link:rust_migration.adoc[Rust migration history]. Update each only as its
+own target behavior is implemented and verified; do not rewrite historical
+SC-16 contracts to imply that RV64 already exists.
