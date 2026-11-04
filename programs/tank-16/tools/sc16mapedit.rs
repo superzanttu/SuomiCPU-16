@@ -9,7 +9,7 @@ use macroquad::prelude::{
 };
 use serde_json::Value;
 use std::path::PathBuf;
-use suomicpu16::tank16_map::{
+use tank16_tools::tank16_map::{
     LayerTileEdit, TilesetDimensions, default_game_dir, load_map, new_map, save_map,
     set_layer_tile, set_map_tile, tileset_dimensions,
 };

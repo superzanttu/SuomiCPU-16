@@ -446,6 +446,17 @@ Extraction preserves supported behavior before RV64-specific changes are applied
 *Acceptance:* Core execution has no Tank-16/game dependency; existing public
 commands retain behavior or an explicit versioned migration. Asset and package
 tests verify outputs and safe failure paths.
++
+*Implementation progress (2026-11-04, workspace based on revision
++30bcae90ec5eeebf7c2f56f1f710850cebd7f378+):* Moved Tank-16 map, atlas, and
+sprite utilities plus their CLI targets into the
++programs/tank-16/tools/+ workspace package. Removed their exports from the
+emulator library and removed the game-specific source-compilation branch from
+the generic image loader; the Tank-16 runtime build remains available through
++sc16tank build-runtime+. Gameplay command examples now use the package
+manifest. +cargo test --workspace -- --test-threads=1+ passed (656 tests).
+This only isolates game tooling. General build/image tools are still exposed
+through the emulator crate, so keep this task unchecked.
 
 === Phase 2: Rust-native xv6 toolchain
 

@@ -227,15 +227,6 @@ pub fn load_program(path: &Path) -> Result<ProgramImage, ImageError> {
     }) {
         return read_image(path);
     }
-    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("c")) {
-        let tank16_main = crate::tank16_map::default_game_dir().join("main.c");
-        if path.canonicalize().ok() == tank16_main.canonicalize().ok() {
-            return crate::tank16_map::compile_runtime_tank16(
-                &crate::tank16_map::default_game_dir(),
-            )
-            .map_err(ImageError::CCompiler);
-        }
-    }
     build_source(path)
 }
 

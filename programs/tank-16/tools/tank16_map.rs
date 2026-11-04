@@ -26,9 +26,7 @@ pub struct TilesetDimensions {
 }
 
 pub fn default_game_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("programs")
-        .join("tank-16")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 pub fn tileset_dimensions(path: &Path, pad_edges: bool) -> Result<TilesetDimensions, String> {
@@ -1161,7 +1159,7 @@ pub fn runtime_assets_header(game_dir: &Path) -> Result<String, String> {
         .to_owned())
 }
 
-pub fn compile_runtime_tank16(game_dir: &Path) -> Result<crate::image::ProgramImage, String> {
+pub fn compile_runtime_tank16(game_dir: &Path) -> Result<suomicpu16::image::ProgramImage, String> {
     let source_path = game_dir.join("src/main.c");
     let source = fs::read_to_string(&source_path)
         .map_err(|error| format!("cannot read {}: {error}", source_path.display()))?;
@@ -1177,8 +1175,8 @@ pub fn compile_runtime_tank16(game_dir: &Path) -> Result<crate::image::ProgramIm
 fn compile_with_rust_c_compiler(
     source: &str,
     source_path: &Path,
-) -> Result<crate::image::ProgramImage, String> {
-    crate::c_compiler::compile_minimal_program(source, &source_path.to_string_lossy())
+) -> Result<suomicpu16::image::ProgramImage, String> {
+    suomicpu16::c_compiler::compile_minimal_program(source, &source_path.to_string_lossy())
         .map_err(|error| error.to_string())?
         .ok_or_else(|| {
             format!(
@@ -1654,7 +1652,7 @@ pub fn compile_map_file(
     game_dir: &Path,
     map_path: &Path,
     randomize_rounds: bool,
-) -> Result<crate::image::ProgramImage, String> {
+) -> Result<suomicpu16::image::ProgramImage, String> {
     let source_path = game_dir.join("src/main.c");
     let source = fs::read_to_string(&source_path)
         .map_err(|error| format!("cannot read {}: {error}", source_path.display()))?;

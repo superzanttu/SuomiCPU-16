@@ -1,0 +1,10 @@
+#[path = "sprite_viewer.rs"]
+pub mod sprite_viewer;
+#[path = "tank16_assets.rs"]
+pub mod tank16_assets;
+#[path = "tank16_finland.rs"]
+pub mod tank16_finland;
+#[path = "tank16_map.rs"]
+pub mod tank16_map;
+#[path = "tank_maps.rs"]
+pub mod tank_maps;

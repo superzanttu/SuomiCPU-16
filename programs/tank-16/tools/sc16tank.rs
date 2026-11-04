@@ -39,13 +39,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("       sc16tank extend-atlas [--path <tiles_terrain.png>]");
         return Ok(());
     }
-    let game_dir = suomicpu16::tank16_map::default_game_dir();
+    let game_dir = tank16_tools::tank16_map::default_game_dir();
     if command == "validate-map" {
         let path = PathBuf::from(arguments.next().ok_or("validate-map needs a map path")?);
         if arguments.next().is_some() {
             return Err("usage: sc16tank validate-map <map.json>".into());
         }
-        let map = suomicpu16::tank16_map::load_map(&game_dir, &path)?;
+        let map = tank16_tools::tank16_map::load_map(&game_dir, &path)?;
         println!(
             "{}",
             serde_json::json!({
@@ -62,7 +62,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if arguments.next().is_some() {
             return Err("usage: sc16tank load-map <map.json>".into());
         }
-        let map = suomicpu16::tank16_map::load_map(&game_dir, &path)?;
+        let map = tank16_tools::tank16_map::load_map(&game_dir, &path)?;
         println!("{}", serde_json::to_string(&map)?);
         return Ok(());
     }
@@ -79,8 +79,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let output_dir = output_dir.ok_or("save-map requires --output-dir <directory>")?;
-        let source = suomicpu16::tank16_map::load_map(&game_dir, &path)?;
-        let saved = suomicpu16::tank16_map::save_map(&game_dir, &source, &output_dir)?;
+        let source = tank16_tools::tank16_map::load_map(&game_dir, &path)?;
+        let saved = tank16_tools::tank16_map::save_map(&game_dir, &source, &output_dir)?;
         println!("{}", saved.display());
         return Ok(());
     }
@@ -97,9 +97,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let output = output.ok_or("encode-map requires --output <runtime-map.json>")?;
-        let map = suomicpu16::tank16_map::load_map(&game_dir, &path)?;
-        let document = suomicpu16::tank16_map::runtime_document(&map, &game_dir)?;
-        let serialized = suomicpu16::tank16_map::serialize_runtime_map(&document)?;
+        let map = tank16_tools::tank16_map::load_map(&game_dir, &path)?;
+        let document = tank16_tools::tank16_map::runtime_document(&map, &game_dir)?;
+        let serialized = tank16_tools::tank16_map::serialize_runtime_map(&document)?;
         std::fs::write(&output, serialized)?;
         println!("{}", output.display());
         return Ok(());
@@ -109,7 +109,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if arguments.next().is_some() {
             return Err("usage: sc16tank round-maps <map.json>".into());
         }
-        let maps = suomicpu16::tank16_map::discover_round_maps(&game_dir, &path)?;
+        let maps = tank16_tools::tank16_map::discover_round_maps(&game_dir, &path)?;
         println!("{}", serde_json::to_string(&maps)?);
         return Ok(());
     }
@@ -119,7 +119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .ok_or("inspect-map-assets needs a map path")?,
         );
-        let mut tile_size = suomicpu16::tank16_map::map_tile_pixel_size(&game_dir)?;
+        let mut tile_size = tank16_tools::tank16_map::map_tile_pixel_size(&game_dir)?;
         while let Some(option) = arguments.next() {
             if option == "--tile-size" {
                 tile_size = arguments
@@ -131,8 +131,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("unknown option: {}", option.to_string_lossy()).into());
             }
         }
-        let map = suomicpu16::tank16_map::load_map(&game_dir, &path)?;
-        let assets = suomicpu16::tank16_map::load_map_assets(&game_dir, &path, tile_size)?;
+        let map = tank16_tools::tank16_map::load_map(&game_dir, &path)?;
+        let assets = tank16_tools::tank16_map::load_map_assets(&game_dir, &path, tile_size)?;
         println!(
             "{}",
             serde_json::json!({
@@ -154,7 +154,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .ok_or("build-map-header needs a map path")?,
         );
-        let mut tile_size = suomicpu16::tank16_map::map_tile_pixel_size(&game_dir)?;
+        let mut tile_size = tank16_tools::tank16_map::map_tile_pixel_size(&game_dir)?;
         let mut round_maps = Vec::new();
         while let Some(option) = arguments.next() {
             if option == "--tile-size" {
@@ -171,7 +171,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("unknown option: {}", option.to_string_lossy()).into());
             }
         }
-        let header = suomicpu16::tank16_map::build_map_header_with_tile_size(
+        let header = tank16_tools::tank16_map::build_map_header_with_tile_size(
             &game_dir,
             &path,
             &round_maps,
@@ -184,13 +184,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if arguments.next().is_some() {
             return Err("runtime-assets-header accepts no options".into());
         }
-        let header = suomicpu16::tank16_map::runtime_assets_header(&game_dir)?;
+        let header = tank16_tools::tank16_map::runtime_assets_header(&game_dir)?;
         print!("{header}");
         return Ok(());
     }
     if command == "build-runtime-assets" {
         let mut output = game_dir.join("assets/disk/assets/TANK16_TILES.json");
-        let mut tile_size = suomicpu16::tank16_map::map_tile_pixel_size(&game_dir)?;
+        let mut tile_size = tank16_tools::tank16_map::map_tile_pixel_size(&game_dir)?;
         while let Some(option) = arguments.next() {
             if option == "--output" {
                 output = PathBuf::from(arguments.next().ok_or("--output needs a path")?);
@@ -204,7 +204,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("unknown option: {}", option.to_string_lossy()).into());
             }
         }
-        let path = suomicpu16::tank16_map::convert_tilesets_to_json(&game_dir, &output, tile_size)?;
+        let path =
+            tank16_tools::tank16_map::convert_tilesets_to_json(&game_dir, &output, tile_size)?;
         println!("Generated runtime tile assets: {}", path.display());
         return Ok(());
     }
@@ -220,7 +221,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let output = output.ok_or("build-runtime requires --output <image.img>")?;
-        let image = suomicpu16::tank16_map::compile_runtime_tank16(&game_dir)
+        let image = tank16_tools::tank16_map::compile_runtime_tank16(&game_dir)
             .map_err(std::io::Error::other)?;
         suomicpu16::image::write_image(&output, &image)?;
         println!(
@@ -248,7 +249,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("unknown option: {}", option.to_string_lossy()).into());
             }
         }
-        let image = suomicpu16::tank16_map::compile_map_file(&game_dir, &path, randomize_rounds)?;
+        let image = tank16_tools::tank16_map::compile_map_file(&game_dir, &path, randomize_rounds)?;
         suomicpu16::image::write_image(&output, &image)?;
         println!(
             "Built {} bytes across {} segment(s): {}",
@@ -287,7 +288,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err(format!("unknown option: {}", option.to_string_lossy()).into()),
             }
         }
-        let options = suomicpu16::tank16_finland::FinlandMapOptions {
+        let options = tank16_tools::tank16_finland::FinlandMapOptions {
             countries: countries.ok_or("--countries is required")?,
             lakes: lakes.ok_or("--lakes is required")?,
             roads,
@@ -297,7 +298,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             preview,
             size,
         };
-        let document = suomicpu16::tank16_finland::generate_finland_map(&options)?;
+        let document = tank16_tools::tank16_finland::generate_finland_map(&options)?;
         println!(
             "{}",
             serde_json::json!({
@@ -316,7 +317,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             atlas = PathBuf::from(arguments.next().ok_or("--path needs a file")?);
         }
-        suomicpu16::tank16_finland::extend_terrain_atlas(
+        tank16_tools::tank16_finland::extend_terrain_atlas(
             &atlas,
             &game_dir.join("assets/gfx/tiles_terrain.png"),
         )?;

@@ -38,18 +38,8 @@ pub mod runtime;
 pub mod sc_net;
 #[path = "emulator/scheduler.rs"]
 pub mod scheduler;
-#[path = "../programs/tank-16/tools/sprite_viewer.rs"]
-pub mod sprite_viewer;
 #[path = "emulator/syscall.rs"]
 pub mod syscall;
-#[path = "../programs/tank-16/tools/tank16_assets.rs"]
-pub mod tank16_assets;
-#[path = "../programs/tank-16/tools/tank16_finland.rs"]
-pub mod tank16_finland;
-#[path = "../programs/tank-16/tools/tank16_map.rs"]
-pub mod tank16_map;
-#[path = "../programs/tank-16/tools/tank_maps.rs"]
-pub mod tank_maps;
 
 pub use cpu::{ADDRESS_MASK, Cpu, CpuError, Flags, MEMORY_SIZE, MemorySegment};
 

@@ -3,6 +3,11 @@ name = "suomicpu16"
 version = "0.2.0"
 edition = "2024"
 
+[workspace]
+members = ["programs/tank-16/tools"]
+default-members = [".", "programs/tank-16/tools"]
+resolver = "3"
+
 [dependencies]
 gif = "0.13"
 image = { version = "0.24.9", default-features = false, features = ["gif", "png"] }
@@ -29,23 +34,3 @@ path = "src/tools/sc16build.rs"
 [[bin]]
 name = "sc16gallery"
 path = "src/tools/sc16gallery.rs"
-
-[[bin]]
-name = "sc16mapedit"
-path = "programs/tank-16/tools/sc16mapedit.rs"
-
-[[bin]]
-name = "sc16maps"
-path = "programs/tank-16/tools/sc16maps.rs"
-
-[[bin]]
-name = "sc16objects"
-path = "programs/tank-16/tools/sc16objects.rs"
-
-[[bin]]
-name = "sc16sprites"
-path = "programs/tank-16/tools/sc16sprites.rs"
-
-[[bin]]
-name = "sc16tank"
-path = "programs/tank-16/tools/sc16tank.rs"

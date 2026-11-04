@@ -77,9 +77,7 @@ fn editor_help_describes_rust_workflows() {
 
 #[test]
 fn map_load_save_round_trip_uses_rust_validation() {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("programs")
-        .join("tank-16")
+    let source = tank16_tools::tank16_map::default_game_dir()
         .join("assets/disk")
         .join("maps")
         .join("FINLAND.json");
@@ -107,9 +105,7 @@ fn map_load_save_round_trip_uses_rust_validation() {
 
 #[test]
 fn generated_maps_are_installed_in_the_runtime_folder() {
-    let runtime_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("programs")
-        .join("tank-16")
+    let runtime_dir = tank16_tools::tank16_map::default_game_dir()
         .join("assets/disk")
         .join("maps");
     for name in MAP_NAMES {
@@ -121,9 +117,7 @@ fn generated_maps_are_installed_in_the_runtime_folder() {
 
 #[test]
 fn finland_map_has_runtime_ready_features_and_compact_encoding() {
-    let map_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("programs")
-        .join("tank-16")
+    let map_path = tank16_tools::tank16_map::default_game_dir()
         .join("assets/disk")
         .join("maps")
         .join("FINLAND.json");
@@ -278,9 +272,7 @@ fn finland_map_has_runtime_ready_features_and_compact_encoding() {
 
 #[test]
 fn finland_validation_and_atlas_extension_preserve_source_pixels() {
-    let game_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("programs")
-        .join("tank-16");
+    let game_dir = tank16_tools::tank16_map::default_game_dir();
     let map_path = game_dir
         .join("assets/disk")
         .join("maps")

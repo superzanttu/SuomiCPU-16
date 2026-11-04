@@ -12,7 +12,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
-    let mut maps_dir = suomicpu16::tank_maps::default_maps_dir();
+    let mut maps_dir = tank16_tools::tank_maps::default_maps_dir();
     while let Some(argument) = arguments.next() {
         if argument == "--help" || argument == "-h" {
             println!("Usage: sc16maps [--maps-dir <directory>]");
@@ -25,7 +25,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("unknown argument: {}", argument.to_string_lossy()).into());
         }
     }
-    let paths = suomicpu16::tank_maps::generate_maps(&maps_dir)?;
+    let paths = tank16_tools::tank_maps::generate_maps(&maps_dir)?;
     println!(
         "{}",
         serde_json::json!({

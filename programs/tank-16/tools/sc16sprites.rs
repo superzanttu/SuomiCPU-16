@@ -8,7 +8,7 @@ use macroquad::prelude::{
     vec2,
 };
 use std::path::PathBuf;
-use suomicpu16::sprite_viewer::{AtlasSize, SpriteBounds};
+use tank16_tools::sprite_viewer::{AtlasSize, SpriteBounds};
 
 const HEADER_HEIGHT: f32 = 54.0;
 const FOOTER_HEIGHT: f32 = 54.0;
@@ -28,7 +28,7 @@ fn window_conf() -> Conf {
 }
 
 fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
 #[macroquad::main(window_conf)]

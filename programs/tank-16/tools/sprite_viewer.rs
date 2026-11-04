@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn tank16_atlases_keep_their_expected_cell_layouts() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         for (relative_path, expected) in [
             (
                 "programs/tank-16/assets/gfx/tiles_objects.png",

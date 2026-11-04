@@ -554,8 +554,7 @@ pub fn generate_maps(maps_dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 pub fn default_maps_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("programs")
-        .join("tank-16")
+        .join("..")
         .join("assets/disk")
         .join("maps")
 }
