@@ -374,6 +374,309 @@ pub const COLD_RESET_STATE: ColdResetState = ColdResetState {
     time: 0,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreTrapCause {
+    InstructionAddressMisaligned,
+    InstructionAccessFault,
+    IllegalInstruction,
+    LoadAddressMisaligned,
+    LoadAccessFault,
+    StoreAddressMisaligned,
+    StoreAccessFault,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoreTrap {
+    pub pc: u64,
+    pub cause: CoreTrapCause,
+    pub value: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Rv64Core {
+    pub pc: u64,
+    integer_registers: [u64; 32],
+}
+
+impl Rv64Core {
+    pub const fn cold_reset() -> Self {
+        Self {
+            pc: COLD_RESET_STATE.pc,
+            integer_registers: COLD_RESET_STATE.integer_registers,
+        }
+    }
+
+    pub fn register(&self, index: usize) -> Option<u64> {
+        self.integer_registers.get(index).copied()
+    }
+
+    pub fn step(&mut self, bus: &mut Kiuas16Bus) -> Result<(), CoreTrap> {
+        let pc = self.pc;
+        if pc & 1 != 0 {
+            return Err(CoreTrap {
+                pc,
+                cause: CoreTrapCause::InstructionAddressMisaligned,
+                value: pc,
+            });
+        }
+
+        let mut halfword = [0; 2];
+        bus.fetch(pc, &mut halfword).map_err(|_| CoreTrap {
+            pc,
+            cause: CoreTrapCause::InstructionAccessFault,
+            value: pc,
+        })?;
+        let halfword = u16::from_le_bytes(halfword);
+        if halfword & 0b11 != 0b11 {
+            return Err(CoreTrap {
+                pc,
+                cause: CoreTrapCause::IllegalInstruction,
+                value: halfword as u64,
+            });
+        }
+
+        let mut bytes = [0; 4];
+        bus.fetch(pc, &mut bytes).map_err(|_| CoreTrap {
+            pc,
+            cause: CoreTrapCause::InstructionAccessFault,
+            value: pc,
+        })?;
+        let instruction = u32::from_le_bytes(bytes);
+        let opcode = instruction & 0x7f;
+        let rd = ((instruction >> 7) & 0x1f) as usize;
+        let funct3 = (instruction >> 12) & 0x7;
+        let rs1 = ((instruction >> 15) & 0x1f) as usize;
+        let rs2 = ((instruction >> 20) & 0x1f) as usize;
+        let left = self.integer_registers[rs1];
+        let right = self.integer_registers[rs2];
+        let mut next_pc = pc.wrapping_add(4);
+        let mut result = None;
+
+        match opcode {
+            0x03 => {
+                let address = left.wrapping_add(sign_extend(instruction >> 20, 12) as u64);
+                let (length, signed) = match funct3 {
+                    0 => (1, true),
+                    1 => (2, true),
+                    2 => (4, true),
+                    3 => (8, true),
+                    4 => (1, false),
+                    5 => (2, false),
+                    6 => (4, false),
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                };
+                if address & (length - 1) != 0 {
+                    return Err(CoreTrap {
+                        pc,
+                        cause: CoreTrapCause::LoadAddressMisaligned,
+                        value: address,
+                    });
+                }
+                let mut data = [0; 8];
+                bus.read(address, &mut data[..length as usize])
+                    .map_err(|_| CoreTrap {
+                        pc,
+                        cause: CoreTrapCause::LoadAccessFault,
+                        value: address,
+                    })?;
+                let value = u64::from_le_bytes(data);
+                result = Some(if signed {
+                    if length == 8 {
+                        value
+                    } else {
+                        sign_extend(value as u32, (length * 8) as u32) as u64
+                    }
+                } else {
+                    value
+                });
+            }
+            0x23 => {
+                let immediate = ((instruction >> 7) & 0x1f) | (((instruction >> 25) & 0x7f) << 5);
+                let address = left.wrapping_add(sign_extend(immediate, 12) as u64);
+                let length = match funct3 {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    3 => 8,
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                };
+                if address & (length - 1) != 0 {
+                    return Err(CoreTrap {
+                        pc,
+                        cause: CoreTrapCause::StoreAddressMisaligned,
+                        value: address,
+                    });
+                }
+                bus.write(address, &right.to_le_bytes()[..length as usize])
+                    .map_err(|_| CoreTrap {
+                        pc,
+                        cause: CoreTrapCause::StoreAccessFault,
+                        value: address,
+                    })?;
+            }
+            0x13 => {
+                let immediate = sign_extend(instruction >> 20, 12) as u64;
+                result = Some(match funct3 {
+                    0 => left.wrapping_add(immediate),
+                    2 => u64::from((left as i64) < (immediate as i64)),
+                    3 => u64::from(left < immediate),
+                    4 => left ^ immediate,
+                    6 => left | immediate,
+                    7 => left & immediate,
+                    1 if instruction >> 26 == 0 => left.wrapping_shl((instruction >> 20) & 0x3f),
+                    5 if instruction >> 26 == 0 => left.wrapping_shr((instruction >> 20) & 0x3f),
+                    5 if instruction >> 26 == 0x10 => {
+                        ((left as i64) >> ((instruction >> 20) & 0x3f)) as u64
+                    }
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                });
+            }
+            0x1b => {
+                let immediate = sign_extend(instruction >> 20, 12) as u64;
+                let word = match funct3 {
+                    0 => left.wrapping_add(immediate) as u32,
+                    1 if instruction >> 25 == 0 => {
+                        (left as u32).wrapping_shl((instruction >> 20) & 0x1f)
+                    }
+                    5 if instruction >> 25 == 0 => {
+                        (left as u32).wrapping_shr((instruction >> 20) & 0x1f)
+                    }
+                    5 if instruction >> 25 == 0x20 => {
+                        ((left as i32) >> ((instruction >> 20) & 0x1f)) as u32
+                    }
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                };
+                result = Some(word as i32 as i64 as u64);
+            }
+            0x33 => {
+                let shift = (right & 0x3f) as u32;
+                let funct7 = instruction >> 25;
+                result = Some(match (funct3, funct7) {
+                    (0, 0) => left.wrapping_add(right),
+                    (0, 0x20) => left.wrapping_sub(right),
+                    (1, 0) => left.wrapping_shl(shift),
+                    (2, 0) => u64::from((left as i64) < (right as i64)),
+                    (3, 0) => u64::from(left < right),
+                    (4, 0) => left ^ right,
+                    (5, 0) => left.wrapping_shr(shift),
+                    (5, 0x20) => ((left as i64) >> shift) as u64,
+                    (6, 0) => left | right,
+                    (7, 0) => left & right,
+                    (0, 1) => left.wrapping_mul(right),
+                    (1, 1) => ((left as i64 as i128 * right as i64 as i128) >> 64) as u64,
+                    (2, 1) => multiply_high_signed_unsigned(left, right),
+                    (3, 1) => ((left as u128 * right as u128) >> 64) as u64,
+                    (4, 1) if right == 0 => u64::MAX,
+                    (4, 1) if left == 1 << 63 && right == u64::MAX => left,
+                    (4, 1) => ((left as i64) / (right as i64)) as u64,
+                    (5, 1) if right == 0 => u64::MAX,
+                    (5, 1) => left / right,
+                    (6, 1) if right == 0 => left,
+                    (6, 1) if left == 1 << 63 && right == u64::MAX => 0,
+                    (6, 1) => ((left as i64) % (right as i64)) as u64,
+                    (7, 1) if right == 0 => left,
+                    (7, 1) => left % right,
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                });
+            }
+            0x3b => {
+                let shift = (right & 0x1f) as u32;
+                let funct7 = instruction >> 25;
+                let word = match (funct3, funct7) {
+                    (0, 0) => (left as u32).wrapping_add(right as u32),
+                    (0, 0x20) => (left as u32).wrapping_sub(right as u32),
+                    (1, 0) => (left as u32).wrapping_shl(shift),
+                    (5, 0) => (left as u32).wrapping_shr(shift),
+                    (5, 0x20) => ((left as i32) >> shift) as u32,
+                    (0, 1) => (left as u32).wrapping_mul(right as u32),
+                    (4, 1) if right as u32 == 0 => u32::MAX,
+                    (4, 1) if left as u32 == 1 << 31 && right as u32 == u32::MAX => left as u32,
+                    (4, 1) => ((left as i32) / (right as i32)) as u32,
+                    (5, 1) if right as u32 == 0 => u32::MAX,
+                    (5, 1) => (left as u32) / (right as u32),
+                    (6, 1) if right as u32 == 0 => left as u32,
+                    (6, 1) if left as u32 == 1 << 31 && right as u32 == u32::MAX => 0,
+                    (6, 1) => ((left as i32) % (right as i32)) as u32,
+                    (7, 1) if right as u32 == 0 => left as u32,
+                    (7, 1) => (left as u32) % (right as u32),
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                };
+                result = Some(word as i32 as i64 as u64);
+            }
+            0x0f if funct3 == 0 && rd == 0 && rs1 == 0 && instruction >> 28 == 0 => {}
+            0x0f if funct3 == 1 && rd == 0 && rs1 == 0 && instruction >> 20 == 0 => {}
+            0x37 => {
+                result = Some(sign_extend(instruction & 0xffff_f000, 32) as u64);
+            }
+            0x17 => {
+                result = Some(pc.wrapping_add(sign_extend(instruction & 0xffff_f000, 32) as u64));
+            }
+            0x63 => {
+                let immediate = ((instruction >> 31) << 12)
+                    | (((instruction >> 7) & 1) << 11)
+                    | (((instruction >> 25) & 0x3f) << 5)
+                    | (((instruction >> 8) & 0xf) << 1);
+                let take = match funct3 {
+                    0 => left == right,
+                    1 => left != right,
+                    4 => (left as i64) < (right as i64),
+                    5 => (left as i64) >= (right as i64),
+                    6 => left < right,
+                    7 => left >= right,
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                };
+                if take {
+                    next_pc = pc.wrapping_add(sign_extend(immediate, 13) as u64);
+                }
+            }
+            0x6f => {
+                let immediate = ((instruction >> 31) << 20)
+                    | (((instruction >> 12) & 0xff) << 12)
+                    | (((instruction >> 20) & 1) << 11)
+                    | (((instruction >> 21) & 0x3ff) << 1);
+                result = Some(next_pc);
+                next_pc = pc.wrapping_add(sign_extend(immediate, 21) as u64);
+            }
+            0x67 if funct3 == 0 => {
+                let target = left.wrapping_add(sign_extend(instruction >> 20, 12) as u64) & !1;
+                result = Some(next_pc);
+                next_pc = target;
+            }
+            _ => return Err(illegal_instruction(pc, instruction)),
+        }
+
+        if let Some(value) = result {
+            if rd != 0 {
+                self.integer_registers[rd] = value;
+            }
+        }
+        self.integer_registers[0] = 0;
+        self.pc = next_pc;
+        Ok(())
+    }
+}
+
+fn illegal_instruction(pc: u64, instruction: u32) -> CoreTrap {
+    CoreTrap {
+        pc,
+        cause: CoreTrapCause::IllegalInstruction,
+        value: instruction as u64,
+    }
+}
+
+fn sign_extend(value: u32, bits: u32) -> i64 {
+    ((value << (32 - bits)) as i32 >> (32 - bits)) as i64
+}
+
+fn multiply_high_signed_unsigned(left: u64, right: u64) -> u64 {
+    let high = ((left as u128 * right as u128) >> 64) as u64;
+    if left >> 63 == 0 {
+        high
+    } else {
+        high.wrapping_sub(right)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +716,137 @@ mod tests {
                 PrivilegedFeature::Adue,
             ]
         );
+    }
+
+    fn bus_with_program(instructions: &[u32]) -> Kiuas16Bus {
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        for (index, instruction) in instructions.iter().enumerate() {
+            let start = index * 4;
+            rom[start..start + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        Kiuas16Bus::new_with_ram_size(rom, 16).unwrap()
+    }
+
+    fn encode_r(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    }
+
+    #[test]
+    fn rv64_core_executes_integer_word_and_memory_operations() {
+        let mut bus = bus_with_program(&[
+            0x7fff_f317,
+            0x0070_0093,
+            0xffe0_8113,
+            0x0020_81b3,
+            0xfff0_021b,
+            0x02a0_0393,
+            0x0073_2023,
+            0x0003_2403,
+        ]);
+        let mut core = Rv64Core::cold_reset();
+        for _ in 0..8 {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(0), Some(0));
+        assert_eq!(core.register(1), Some(7));
+        assert_eq!(core.register(2), Some(5));
+        assert_eq!(core.register(3), Some(12));
+        assert_eq!(core.register(4), Some(u64::MAX));
+        assert_eq!(core.register(8), Some(42));
+        let mut stored = [0; 4];
+        bus.read(RAM.start, &mut stored).unwrap();
+        assert_eq!(u32::from_le_bytes(stored), 42);
+    }
+
+    #[test]
+    fn rv64_core_branches_and_traps_on_unsupported_instructions() {
+        let mut bus = bus_with_program(&[0x0010_8493, 0x0010_8463, 0x0630_0493, 0x0010_8493]);
+        let mut core = Rv64Core::cold_reset();
+        core.step(&mut bus).unwrap();
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, BOOT_ROM.start + 12);
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.register(9), Some(1));
+
+        let mut unsupported = bus_with_program(&[0x0000_a1af]);
+        core.pc = BOOT_ROM.start;
+        let trap = core.step(&mut unsupported).unwrap_err();
+        assert_eq!(
+            trap,
+            CoreTrap {
+                pc: BOOT_ROM.start,
+                cause: CoreTrapCause::IllegalInstruction,
+                value: 0x0000_a1af,
+            }
+        );
+
+        core.pc = BOOT_ROM.start;
+        let mut compressed = bus_with_program(&[0x0000_0001]);
+        let trap = core.step(&mut compressed).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
+        assert_eq!(trap.value, 1);
+    }
+
+    #[test]
+    fn rv64_m_extension_handles_division_edges_and_word_sign_extension() {
+        let instructions = [
+            0x0070_0093,
+            0x0030_0113,
+            encode_r(1, 2, 1, 0, 3, 0x33),
+            encode_r(1, 2, 1, 4, 4, 0x33),
+            encode_r(1, 2, 1, 6, 5, 0x33),
+            encode_r(1, 0, 1, 4, 6, 0x33),
+            encode_r(1, 0, 1, 6, 7, 0x33),
+            encode_r(1, 2, 1, 4, 8, 0x3b),
+            encode_r(1, 2, 1, 6, 9, 0x3b),
+            0x8000_00b7,
+            0x0200_9093,
+            0xfff0_0113,
+            encode_r(1, 2, 1, 4, 10, 0x33),
+            encode_r(1, 2, 1, 6, 11, 0x33),
+            encode_r(1, 2, 1, 1, 12, 0x33),
+            encode_r(1, 2, 1, 2, 13, 0x33),
+            encode_r(1, 2, 1, 3, 14, 0x33),
+            0x8000_07b7,
+            0xfff0_0813,
+            encode_r(1, 16, 15, 4, 17, 0x3b),
+            encode_r(1, 16, 15, 6, 18, 0x3b),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(3), Some(21));
+        assert_eq!(core.register(4), Some(2));
+        assert_eq!(core.register(5), Some(1));
+        assert_eq!(core.register(6), Some(u64::MAX));
+        assert_eq!(core.register(7), Some(7));
+        assert_eq!(core.register(8), Some(2));
+        assert_eq!(core.register(9), Some(1));
+        assert_eq!(core.register(10), Some(1 << 63));
+        assert_eq!(core.register(11), Some(0));
+        assert_eq!(core.register(12), Some(0));
+        assert_eq!(core.register(13), Some(1 << 63));
+        assert_eq!(core.register(14), Some(0x7fff_ffff_ffff_ffff));
+        assert_eq!(core.register(17), Some(0xffff_ffff_8000_0000));
+        assert_eq!(core.register(18), Some(0));
+    }
+
+    #[test]
+    fn rv64_core_reports_alignment_and_memory_access_faults() {
+        let mut bus = bus_with_program(&[0x0010_2083]);
+        let mut core = Rv64Core::cold_reset();
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::LoadAddressMisaligned);
+        assert_eq!(trap.value, 1);
+
+        core.pc = PHYSICAL_ADDRESS_LIMIT;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::InstructionAccessFault);
+        assert_eq!(trap.value, PHYSICAL_ADDRESS_LIMIT);
     }
 
     #[test]

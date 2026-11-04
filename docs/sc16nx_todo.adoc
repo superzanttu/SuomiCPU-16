@@ -556,6 +556,18 @@ execution path. Direct ELF loading is labeled a development test, not BIOS accep
 floating boundary values, unsupported encodings, page-boundary fetches,
 atomic reservations, and memory/instruction ordering. High addresses cannot
 wrap through old 16/30/32-bit paths.
++
+*Implementation progress (2026-11-04):* Added a standalone, executable
+RV64I integer-core slice over the Kiuas16 ROM/RAM bus. It currently handles
+integer immediate/register operations, word sign extension, branches and
+jumps, aligned integer loads/stores, and integer multiply/divide operations
+including word sign extension, zero divisors, and signed overflow. It
+explicitly traps on unsupported compressed encodings; FENCE/FENCE.I are safe
+no-ops for this synchronous, uncached core. Execution tests exercise
+arithmetic, word results, branches, RAM store/load, M-extension edge cases,
+and faults. A/C, floating point, privilege/trap delivery, Sv39, and full
+acceptance coverage remain unimplemented; this is not RV64GC and the task
+remains unchecked.
 
 ** [ ] [[nx-privilege]] *P0 / Implement M/S/U traps, control state, and PMP.*
    Define exception/interrupt delegation, status/counter access, trap
