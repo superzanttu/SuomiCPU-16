@@ -362,6 +362,17 @@ map, pinned xv6 handoff, Sv39/PMP/ADUE/Sstc requirements, fault behavior, DMA
 bounds, and a deterministic 10 MHz virtual timebase. This document-only
 progress does not satisfy the boundary-fixture or execution acceptance
 criteria; keep this item unchecked until implementation tests pass.
++
+*Implementation progress (2026-11-04):* Added the separate Rust
+link:../src/kiuas16.rs[+kiuas16+ module] with the fixed xv6 board profile,
+explicit supported and unsupported ISA extensions, required privileged
+features, a cold-reset state, and whole-range physical-access and RAM-only DMA
+validators. The six focused
++kiuas16::tests+ passed; +cargo fmt --check+ and +cargo check --lib+ passed.
+These are contract/profile fixtures, not a functioning bus or CPU: instruction
+execution, real reset effects, device register semantics, translation,
+interrupts, and runtime capability reporting remain unimplemented. Keep this
+item unchecked.
 
 ** [ ] [[nx-abi-contract]] *P0 / Define the RV64 guest ABI and language profiles.*
    Specify scalar/aggregate layout, alignment, endianness, qualifiers,
