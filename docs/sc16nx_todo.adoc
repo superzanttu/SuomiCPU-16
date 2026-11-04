@@ -278,7 +278,7 @@ software responsibilities, not additional hardware to rename.
 * [ ] [[nx-stage-0]] *P0 / Baseline and target contracts.* Complete every child
   and resolve contradictions before treating the target specifications as stable.
 
-** [ ] [[nx-baseline]] *P0 / Record a reproducible baseline.*
+** [x] [[nx-baseline]] *P0 / Record a reproducible baseline.*
    Audit real build/test results and all manifests at a preserved source
    revision, including existing failures and unported test coverage.
 +
@@ -301,10 +301,24 @@ targets passed. +
 All 18 +programs/<slug>/program.json+ files parsed as JSON. Program builds
 were not run because +build/programs/+ already contains generated outputs
 for all 18 programs and the build command writes there. xv6 execution and
-per-program runtime scenarios remain untested. This is a partial baseline;
-the task remains open.
+per-program runtime scenarios were untested at this revision.
++
+*Follow-up execution evidence (2026-11-04, workspace based on revision
++da0a5b54e198b43ea55df756289872440a1df32b+):*
+Updated the stale expected system-bank mask in
++tests/c90_conformance.rs+ from 4095 to 8191, matching
++src/emulator/machine.rs+ and +docs/sc16_architecture.adoc+. The focused
++guest_c_machine_header_reads_the_supervisor_system_bank+ test passed.
++cargo fmt --check+, +cargo check --lib+, and
++cargo test -- --test-threads=1+ passed; the full run reported 644 passed,
+zero failed. New +repository_program_manifests_validate+ coverage runs every
+checked-in manifest through the production catalog parser and confirms all
+18 current slugs. Existing program build outputs were left untouched, so
+program buildability and interactive scenarios remain untested. xv6 is not
+implemented and has no execution coverage. The legacy mismatch recorded
+above is fixed; these untested areas remain explicit follow-up work.
 
-** [ ] [[nx-sisuos-freeze]] *P0 / Preserve the frozen SisuOS example.*
+** [x] [[nx-sisuos-freeze]] *P0 / Preserve the frozen SisuOS example.*
    Retain SisuOS/SaunaShell sources and revision-bound historical build
    instructions; mark its manifest/catalog status archived during migration.
 +
@@ -313,6 +327,19 @@ the task remains open.
 *Acceptance:* Sources and instructions can be located at the preserved
 revision; no RV64 port, new feature, or legacy-runner obligation is scheduled.
 Reports account for 17 active applications plus this one archived example.
++
+*Execution evidence (2026-11-04, workspace based on revision
++da0a5b54e198b43ea55df756289872440a1df32b+):*
++programs/sisuos/program.json+ now declares +status: archived+. Catalog tests
+validate all 18 manifests and confirm 17 active entries plus SisuOS archived.
+Archived entries are omitted from batch build/install commands; a direct
+SisuOS build/install returns an explicit archived diagnostic. Historical
+commands are retained in the guides and pinned to the prior runnable revision
++da0a5b54e198b43ea55df756289872440a1df32b+; the SisuOS source tree and existing
+disk image were not changed. +
++cargo test --lib programs::tests::+ passed (21 tests); the full
++cargo test -- --test-threads=1+ suite passed (646 tests); +cargo fmt --check+,
++cargo check --lib+, and the direct CLI refusal check passed.
 
 ** [ ] [[nx-machine-contract]] *P0 / Specify Kiuas16 and the physical machine.*
    Define RV64GC and required privileged facilities, reset state, hart

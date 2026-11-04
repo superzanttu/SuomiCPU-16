@@ -3339,7 +3339,7 @@ mod tests {
         assert_eq!(
             crate::image::read_image(&checked_in_disk.join("kernel.bin")).unwrap(),
             kernel,
-            "checked-in kernel image is stale; run scripts\\build-install.ps1 sisuos"
+            "frozen SisuOS kernel image differs from its archived source output"
         );
         for (name, source) in [
             ("sauna.bin", "sauna.c"),
@@ -3352,7 +3352,7 @@ mod tests {
             assert_eq!(
                 crate::image::read_image(&checked_in_disk.join("bin").join(name)).unwrap(),
                 image,
-                "checked-in {name} is stale; run scripts\\build-install.ps1 sisuos"
+                "frozen SisuOS {name} differs from its archived source output"
             );
         }
         let manifest = crate::disk::FolderDisk::open(&checked_in_disk).unwrap();

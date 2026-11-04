@@ -65,22 +65,25 @@ not installed programs.
 
 [source,powershell]
 ----
-.\scripts\build-install.ps1 sisuos
 .\run.ps1 .\disks\sisuos
+.\scripts\build-install.ps1 <active-slug>
 ----
 
-Program build and installation use the shared manifest-driven workflow. Use
-+.\scripts\build-install.ps1 <slug>+ to build and install a package, or add
-+-Start+ to launch its installed disk afterward. See
+The SisuOS command above launches its checked-in prebuilt disk; its source
+manifest is archived and cannot be built or installed by current tooling.
+Active program builds and installation use the shared manifest-driven
+workflow. Use +.\scripts\build-install.ps1 <active-slug>+ to build and install
+a package, or add +-Start+ to launch its installed disk afterward. See
 link:docs/programs.adoc[program build and disk details]. Data disks +DISK0001+
 and +DISK0002+ are unchanged.
 
 == SisuOS
 
-This section preserves the legacy SC-16 workflow. The
+This section preserves the legacy SC-16 example. The
 link:docs/sc16nx_todo.adoc#nx-sisuos-freeze[SisuOS archive boundary] retains
-source and historical build instructions only; it does not promise a
-maintained legacy runner or a working RV64 port.
+source and revision-bound historical build instructions only; the manifest is
+archived, and current build/install commands reject it. Existing disk launches
+remain a legacy emulator workflow, not a maintained successor-machine port.
 
 The checked-in +disks/sisuos+ folder is a small protected, preemptive OS
 demonstration. Start the emulator with +--disk sisuos+, then press Enter in
@@ -92,15 +95,16 @@ browser. +run daemon &+ starts the blocking daemon in the background, and
 +run sleeper+ starts the monotonic timer example. Accounts, permissions,
 multiple consoles, and a general-purpose filesystem shell are not implemented.
 
-To rebuild and install while preserving unrelated writable disk data:
+Historical build/install commands (recorded at revision
++da0a5b54e198b43ea55df756289872440a1df32b+):
 [source,powershell]
 ----
-.\scripts\build-install.ps1 sisuos
+cargo run --bin sc16build -- build-program sisuos
+cargo run --bin sc16build -- install-program sisuos
 ----
-The script builds the C init, shell, daemon, and sleeper plus the assembly
-bootstrap from +programs/sisuos/src/+ using +sc16build+. It packages the
-separate guest programs under +bin/+ and protects the kernel image. The
-BIOS-boot integration test exercises the shell commands and installed daemon.
+Those commands are no longer supported at the current revision. The archived
+manifest, C sources, and assembly bootstrap remain available under
++programs/sisuos/+.
 
 Run an example directly from the repository root:
 [source,console]
@@ -137,9 +141,9 @@ Quoted includes search beside the including source; angle-bracket includes
 search the repository +toolchain/include/+ directory. Function-like macros support argument
 substitution, stringification, and token pasting; backslash-newline source
 continuations are also supported. Variadic macros are not implemented in Rust
-yet. Only SisuOS is supported as a guest workload on the current hardware interface.
-See the link:docs/user_guide.adoc[user guide] for setup details and the supported
-assembly examples.
+yet. SisuOS remains a legacy guest example; its archived manifest is excluded
+from current program builds. See the link:docs/user_guide.adoc[user guide] for
+setup details and the supported assembly examples.
 
 == Rust emulator port
 
@@ -167,14 +171,14 @@ cargo run --bin sc16build -- examples\directives.asm example.sc16img
 cargo run --bin sc16build -- input.bin output.sc16img
 cargo run --bin sc16build -- build-programs
 cargo run --bin sc16build -- install-programs
-.\scripts\build-install.ps1 sisuos
 ----
 
-+build-programs+ and +install-programs+ discover every current manifest and
-write staging output under +build/programs/+. Some archived guest sources still
-reference removed APIs and fail with an explicit compiler diagnostic until
-migrated. Installation preserves writable disk data and reports conflicts
-instead of overwriting local edits; the guest BIOS loads prebuilt disk images.
++build-programs+ and +install-programs+ discover active manifests, skip
+archived entries, and write staging output under +build/programs/+. Some active
+guest sources still reference removed APIs and fail with an explicit compiler
+diagnostic until migrated. Installation preserves writable disk data and
+reports conflicts instead of overwriting local edits; the guest BIOS loads
+prebuilt disk images.
 
 In the Rust BIOS selector, choose a folder boot disk with *Up/Down* and
 *Enter*. +--disk ID+ preselects that boot disk; with an explicit program path

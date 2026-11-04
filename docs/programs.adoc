@@ -11,17 +11,20 @@ Shared guest headers live in +toolchain/include/+ and their C/assembly
 implementations in +toolchain/runtime/+. BIOS source, image, and shared fonts
 live in +firmware/+. Writable host settings remain in +config/bios.json+.
 
-Each installable workload has a canonical lowercase +programs/<slug>/+
-directory, an explicit +program.json+, guest sources/local headers in +src/+,
-and any program-specific tools in +tools/+. Existing program documentation
-lives in its +docs/+ directory. Seed disk files are in +assets/disk/+;
+Each workload has a canonical lowercase +programs/<slug>/+ directory and an
+explicit +program.json+; active entries are buildable/installable candidates,
+while archived entries are retained as source examples. Guest sources/local
+headers live in +src/+ and program-specific tools in +tools/+. Existing
+program documentation lives in +docs/+. Seed disk files are in +assets/disk/+;
 editable source artwork may live separately in +assets/gfx/+.
 Tank-16's Rust tools remain Cargo binaries in the same package.
 
-SisuOS is an ordinary catalog entry under +programs/sisuos/+, not an emulator
-component. Its C shell, C child demo, and assembly bootstrap are declared in
-its manifest. Educational +examples/+ are fixtures, not installed programs;
-tests may compile and execute them.
+SisuOS under +programs/sisuos/+ is marked +status: archived+. Its source and
+manifest remain for reference, but program build/install commands reject it
+when selected directly and omit it from batch operations. The checked-in
++disks/sisuos/+ image remains a separate existing example. Educational
++examples/+ are fixtures, not installed programs; tests may compile and execute
+them.
 
 == BIOS, program, and disk workflows
 
@@ -31,17 +34,16 @@ is assembled separately from guest programs:
 [source,powershell]
 ----
 cargo run --bin sc16build -- build-bios
-cargo run --bin sc16build -- build-program sisuos
-cargo run --bin sc16build -- install-program sisuos
-.\scripts\build-install.ps1 sisuos
+cargo run --bin sc16build -- build-program <active-slug>
+cargo run --bin sc16build -- install-program <active-slug>
 .\scripts\build-install.ps1 tank-16 -Start
 ----
 
 +build-bios+ assembles +firmware/bios.asm+ into +firmware/bios.bin+ by default.
 The optional source and output arguments can select other paths. +build-program+
-compiles the manifest-selected sources into +build/programs/<slug>/+ without
-changing the installed disk. For SisuOS this creates the protected kernel and
-demo images with the manifest and package ownership record.
+compiles an active manifest's sources into +build/programs/<slug>/+ without
+changing the installed disk. The optional +status+ field accepts +active+ or
++archived+; it defaults to +active+.
 
 The BIOS command reports its selected source and output; the default success
 message has this form:
@@ -56,17 +58,17 @@ path, for example:
 
 [source,console]
 ----
-Built sisuos -> <repository>/build/programs/sisuos
-Installed sisuos -> <repository>/disks/sisuos
+Built <slug> -> <repository>/build/programs/<slug>
+Installed <slug> -> <repository>/disks/<slug>
 ----
 
 +install-program+ builds first, then safely installs the package into its
 configured +install_disk+ (or +disks/<slug>/+ when that optional field is
 omitted). It preserves unrelated writable disk files and settings, updates
 unchanged package-owned files, and reports conflicts instead of overwriting
-modified package-owned files. The backend accepts all current program
-manifests, and packages compatible sources together with their declared
-+assets+ trees. Some older guest sources still include removed graphics or
+modified package-owned files. The backend validates all current program
+manifests and packages active entries' compatible sources together with their
+declared +assets+ trees. Some older guest sources still include removed graphics or
 disk headers, so their builds fail with an explicit compiler diagnostic until
 those programs are migrated to current interfaces.
 
@@ -77,7 +79,8 @@ To open the BIOS selector and preselect SisuOS:
 cargo run --bin suomicpu16 -- --disk sisuos
 ----
 
-To launch the checked-in disk directly:
+This boots the existing prebuilt example; it does not rebuild the archived
+SisuOS source. To launch the checked-in disk directly:
 
 [source,powershell]
 ----
@@ -113,7 +116,6 @@ successful install:
 
 [source,powershell]
 ----
-.\scripts\build-install.ps1 sisuos
 .\scripts\build-install.ps1 tank-16 -Start
 ----
 

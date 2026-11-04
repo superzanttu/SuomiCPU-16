@@ -20,9 +20,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if source == "--help" || source == "-h" {
         println!("       sc16build build-program <slug> | install-program <slug>");
         println!("       sc16build build-programs | install-programs");
-        println!("Program build/install commands use every programs/<slug>/program.json manifest.");
+        println!(
+            "Program build/install commands use active programs/<slug>/program.json manifests."
+        );
         println!("       sc16build migrate-program-disks --dry-run|--apply");
         println!("Program manifests: programs/<slug>/program.json; builds: build/programs/<slug>.");
+        println!(
+            "Archived programs are retained as source examples and are not built or installed."
+        );
         println!(
             "Installation preserves local disk data; conflicting modified package files are errors."
         );

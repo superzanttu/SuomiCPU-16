@@ -2,6 +2,7 @@
   "version": 1,
   "slug": "sisuos",
   "name": "SisuOS",
+  "status": "archived",
   "legacy_disk": "SisuOS-1",
   "capacity_bytes": 16777216,
   "boot": {

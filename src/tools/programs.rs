@@ -35,10 +35,17 @@ pub struct Executable {
     pub base: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramStatus {
+    Active,
+    Archived,
+}
+
 #[derive(Debug)]
 pub struct Program {
     pub slug: String,
     pub name: String,
+    pub status: ProgramStatus,
     pub install_disk: String,
     pub legacy_disk: String,
     pub capacity: u64,
@@ -161,6 +168,7 @@ pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
                 "version",
                 "slug",
                 "name",
+                "status",
                 "install_disk",
                 "legacy_disk",
                 "capacity_bytes",
@@ -189,6 +197,12 @@ pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
         if name.trim().is_empty() || name.chars().any(char::is_control) {
             return Err("invalid program display name".into());
         }
+        let status = match value.get("status").and_then(Value::as_str) {
+            None if value.get("status").is_none() => ProgramStatus::Active,
+            Some("active") => ProgramStatus::Active,
+            Some("archived") => ProgramStatus::Archived,
+            _ => return Err("program status must be \"active\" or \"archived\"".into()),
+        };
         let install_disk = value
             .get("install_disk")
             .map(|value| {
@@ -294,6 +308,7 @@ pub fn catalog(repository: &Path) -> Result<Vec<Program>> {
         programs.push(Program {
             slug: slug.to_owned(),
             name: name.to_owned(),
+            status,
             install_disk: install_disk.to_owned(),
             legacy_disk: legacy_disk.to_owned(),
             capacity,
@@ -789,16 +804,42 @@ pub fn command(repository: &Path, command: &str, arguments: &[String]) -> Result
         .into());
     }
     let programs = catalog(repository)?;
+    if !all {
+        if let Some(program) = programs
+            .iter()
+            .find(|program| program.slug == arguments[0])
+            .filter(|program| program.status == ProgramStatus::Archived)
+        {
+            return Err(format!(
+                "program {} is archived and cannot be built or installed",
+                program.slug
+            )
+            .into());
+        }
+    }
     let selected: Vec<_> = programs
         .iter()
-        .filter(|program| all || program.slug == arguments[0])
+        .filter(|program| {
+            program.status == ProgramStatus::Active && (all || program.slug == arguments[0])
+        })
         .collect();
     if selected.is_empty() {
+        if all {
+            return Err("no active programs found".into());
+        }
         return Err(format!(
             "unknown program {:?}; use a canonical programs/<slug> name",
             arguments[0]
         )
         .into());
+    }
+    if all {
+        for program in programs
+            .iter()
+            .filter(|program| program.status == ProgramStatus::Archived)
+        {
+            println!("Skipping archived program {}", program.slug);
+        }
     }
     let mut failures = Vec::new();
     for program in selected {
@@ -894,6 +935,100 @@ mod tests {
         fn drop(&mut self) {
             retry(|| fs::remove_dir_all(&self.0)).unwrap();
         }
+    }
+
+    #[test]
+    fn repository_program_manifests_validate() {
+        let programs = catalog(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut slugs = programs
+            .iter()
+            .map(|program| program.slug.as_str())
+            .collect::<Vec<_>>();
+        slugs.sort();
+        assert_eq!(
+            slugs,
+            [
+                "anaclock",
+                "asteroids",
+                "disk-editor",
+                "elite",
+                "hertta-3d",
+                "hulio",
+                "infinite-city",
+                "lunar-lander",
+                "motorobots",
+                "netgame-demo",
+                "pacman",
+                "paint",
+                "sc16-showcase",
+                "sisuos",
+                "space-invaders",
+                "spacecave",
+                "tank-16",
+                "text-demo",
+            ]
+        );
+        assert_eq!(
+            programs
+                .iter()
+                .filter(|program| program.status == ProgramStatus::Active)
+                .count(),
+            17
+        );
+        assert_eq!(
+            programs
+                .iter()
+                .find(|program| program.slug == "sisuos")
+                .unwrap()
+                .status,
+            ProgramStatus::Archived
+        );
+    }
+
+    #[test]
+    fn archived_programs_are_excluded_from_build_and_install_commands() {
+        let fixture = Fixture::new();
+        let manifest = fixture.0.join("programs/hello/program.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["status"] = json!("archived");
+        write_json(&manifest, &value).unwrap();
+        let active = fixture.0.join("programs/active");
+        fs::create_dir_all(active.join("src")).unwrap();
+        fs::write(active.join("src/main.c"), "int main(void) { return 0; }").unwrap();
+        write_json(
+            &active.join("program.json"),
+            &json!({
+                "version":1,"slug":"active","name":"Active","legacy_disk":"APP00002",
+                "capacity_bytes":65536,"boot":{"source":"src/main.c","output":"main.bin"},
+                "assets":null,"executables":[],
+            }),
+        )
+        .unwrap();
+
+        for command_name in ["build-program", "install-program"] {
+            let error = command(&fixture.0, command_name, &["hello".to_owned()])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("archived"), "{error}");
+        }
+
+        command(&fixture.0, "build-programs", &[]).unwrap();
+        command(&fixture.0, "install-programs", &[]).unwrap();
+        assert!(!fixture.0.join("build/programs/hello").exists());
+        assert!(!fixture.0.join("disks/hello").exists());
+        assert!(fixture.0.join("build/programs/active").exists());
+        assert!(fixture.0.join("disks/active").exists());
+    }
+
+    #[test]
+    fn catalog_rejects_unknown_program_status() {
+        let fixture = Fixture::new();
+        let manifest = fixture.0.join("programs/hello/program.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["status"] = json!("retired");
+        write_json(&manifest, &value).unwrap();
+
+        assert!(catalog(&fixture.0).is_err());
     }
 
     #[test]

@@ -33,7 +33,7 @@ fn guest_c_machine_header_reads_the_supervisor_system_bank() {
                  if (*revision != 2UL) return 11;\n\
                  if (*ram != 1048576UL) return 12;\n\
                  if (*bits != 30UL) return 13;\n\
-                 if (*banks != 4095UL) return 14;\n\
+                 if (*banks != 8191UL) return 14;\n\
                  return 1;\n\
              }"
         ),

@@ -84,12 +84,10 @@ link:programs.adoc[the program workflow] for manifests, disk-name migration,
 and updates preserving local data. One-off
 +sc16build package-disk+ still refuses an existing destination.
 See +sc16_disk_format.adoc+ for the disk manifest and image requirements.
-Build the shared BIOS image offline with
-+cargo run --bin sc16build -- build-bios+; validate that
-+SisuOS's program recipe with
-+cargo run --bin sc16build -- build-programs+. Builds write only
-+build/programs/<slug>/+; installation stages and validates updates before
-switching the disk directory.
+Build the shared BIOS image offline with +cargo run --bin sc16build -- build-bios+.
+Batch program commands use active manifests and skip archived entries such as
+SisuOS. Builds write under +build/programs/<slug>/+; installation stages and
+validates updates before switching the disk directory.
 Offline images use the version 3 +SC16IMG3+ container for machine revision 2,
 with fixed load addresses, an executable entry point, and explicit segment
 alignment and permissions. +sc16asm+ and +sc16build+ emit this format; the
@@ -1210,6 +1208,10 @@ path, that option mounts the same folder filesystem for guest file operations.
 
 ==== SisuOS demonstration
 
+This section records the legacy example's historical behavior. Its source
+manifest is archived, so current build/install commands reject SisuOS; the
+checked-in prebuilt disk remains available to the current SC-16 emulator.
+
 The checked-in +disks/sisuos+ folder contains SisuOS, a protected
 preemptive-system example. Start the emulator with its disk preselected:
 [source,console]
@@ -1295,11 +1297,14 @@ matches, the shell lists the candidates and leaves the input available for
 further typing. Command input is echoed once, including its terminating
 newline. This is not a general-purpose operating system.
 
-To build and install the SisuOS disk while preserving unrelated writable data:
+Historical build/install instructions (recorded at revision
++da0a5b54e198b43ea55df756289872440a1df32b+):
 [source,powershell]
 ----
-.\scripts\build-install.ps1 sisuos
+cargo run --bin sc16build -- build-program sisuos
+cargo run --bin sc16build -- install-program sisuos
 ----
+Current tooling rejects these commands because the SisuOS manifest is archived.
 The kernel's protected-mode, interrupt, and MMU setup is in
 +programs/sisuos/src/preemptive_os_kernel.asm+. Init and SaunaShell, as well as
 the daemon and sleeper, are C guest programs under +programs/sisuos/src/+.

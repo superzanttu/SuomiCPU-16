@@ -6,6 +6,8 @@ SisuOS/SaunaShell is preserved as source and historical build instructions,
 with no further feature development or RV64 port. The
 link:sc16nx_todo.adoc[SC16NX roadmap] defines the future Kiuas16/AinoGPU
 computer and xv6 target; the commands below do not launch that future platform.
+The checked-in SisuOS disk remains bootable by the current SC-16 emulator, but
+its manifest is now archived and current build/install commands reject it.
 
 == Requirements
 
@@ -52,23 +54,20 @@ while +run sleeper+ starts the monotonic timer example. This introductory
 walkthrough does not cover accounts, permissions, multiple consoles, or a
 general-purpose filesystem shell.
 
-== Build and install SisuOS
+== Historical SisuOS build and install instructions
 
-Build the package without changing the installed disk:
-
-[source,powershell]
-----
-.\scripts\build-install.ps1 sisuos
-----
-
-Build and safely install it:
+At revision
++da0a5b54e198b43ea55df756289872440a1df32b+, these commands built and installed
+SisuOS. They are retained as historical instructions; current tooling rejects
+the archived manifest.
 
 [source,powershell]
 ----
-.\scripts\build-install.ps1 sisuos
+cargo run --bin sc16build -- build-program sisuos
+cargo run --bin sc16build -- install-program sisuos
 ----
 
-The build is staged under +build/programs/sisuos/+; installation updates
+The build was staged under +build/programs/sisuos/+; installation updated
 +disks/sisuos/+. Existing unrelated writable files and BIOS settings are
 preserved. Modified package-owned files and conflicting seed files are errors,
 not silently overwritten. For command-line alternatives and recovery details,
@@ -78,8 +77,8 @@ see link:programs.adoc[Building and installing SC-16 programs].
 
 * link:user_guide.adoc[Assembler and emulator guide] — command-line use,
   assembly, instructions, devices, and compiler status.
-* link:programs.adoc[Build and install guide] — BIOS, SisuOS, package manifests,
-  helper scripts, and safe updates.
+* link:programs.adoc[Build and install guide] — BIOS, package manifests, helper
+  scripts, active workloads, and safe updates.
 * link:sc16_disk_format.adoc[Folder-disk format] — manifest, boot selection,
   and guest disk services.
 * link:sc16_architecture.adoc[Machine architecture] — memory map, image format,
