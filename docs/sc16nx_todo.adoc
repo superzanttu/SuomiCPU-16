@@ -188,7 +188,10 @@ remove the Rust compiler/assembler/linker work from the critical path.
 The audited xv6-riscv revision is
 +e93dabeb98431235c6e1a101cb96c73c923fdbc4+. Pin and record the actual imported
 source, license, and local delta before implementation; do not silently
-switch to a moving upstream branch.
+switch to a moving upstream branch. The planned processor, reset, physical
+map, translation, trap, and timebase contracts are defined in
+link:kiuas16_machine_contract.adoc[Kiuas16 RV64 Machine Contract]; that
+specification does not claim implementation.
 
 The build uses +rv64gc+, GNU C99, and +medany+. Required behavior includes
 M/S/U privilege, PMP, Sv39, atomics, CSR operations, memory/instruction
@@ -346,11 +349,19 @@ disk image were not changed. +
    identity, sparse RAM/ROM/MMIO map, clocks, access/fault rules, and limits.
    Include Sstc and the pinned startup's +menvcfg.ADUE+ behavior.
 +
-*Components:* machine/ISA specification, CPU and configuration types. +
+*Components:* link:kiuas16_machine_contract.adoc[machine contract],
+CPU and configuration types. +
 *Dependencies:* <<nx-baseline>>. +
 *Acceptance:* Boundary fixtures cover full-width addresses, RAM limits,
 unmapped accesses, reset, and capability reporting. Supported and unsupported
 extensions are explicit; the initial one-hart/128 MiB configuration is reproducible.
++
+*Design progress (2026-11-04):* Added a planned RV64GC and privilege contract,
+including reset values, a 56-bit physical address bus, sparse ROM/MMIO/RAM
+map, pinned xv6 handoff, Sv39/PMP/ADUE/Sstc requirements, fault behavior, DMA
+bounds, and a deterministic 10 MHz virtual timebase. This document-only
+progress does not satisfy the boundary-fixture or execution acceptance
+criteria; keep this item unchecked until implementation tests pass.
 
 ** [ ] [[nx-abi-contract]] *P0 / Define the RV64 guest ABI and language profiles.*
    Specify scalar/aggregate layout, alignment, endianness, qualifiers,

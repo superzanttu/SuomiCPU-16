@@ -1,0 +1,213 @@
+= Kiuas16 RV64 Machine Contract
+:toc: left
+:toclevels: 2
+
+== Status
+
+This document defines the selected Kiuas16 machine contract for the planned
+RV64 target. It is a design specification, not evidence of an implemented
+processor, bus, ROM, BIOS, memory system, or device. The existing emulator
+continues to implement the separate SC-16 contract in
+link:sc16_architecture.adoc[SC-16 Machine Architecture].
+
+The initial configuration is fixed for xv6 bring-up: one hart, 128 MiB of
+RAM, and the pinned xv6-riscv revision
++e93dabeb98431235c6e1a101cb96c73c923fdbc4+. Extending the configuration
+requires explicit compatibility tests; it must not change this baseline
+silently.
+
+== Processor and execution environment
+
+Kiuas16 implements RV64GC: RV64I, M, A, F, D, C, Zicsr, and Zifencei, with
+XLEN 64. Instructions and data are little-endian. Instruction alignment is
+two bytes. The base integer register file has x0 through x31; x0 always reads
+zero and discards writes. F and D registers and their architectural status
+state are present. All arithmetic wraps as specified by RISC-V; address
+arithmetic does not wrap at a narrower legacy SC-16 width.
+
+The privileged execution environment has Machine, Supervisor, and User modes.
+It implements the CSR, trap, interrupt, delegation, counter, and return
+behavior required by xv6 and the privileged architecture. At minimum it
+supports PMP, Sv39, supervisor timer compare (Sstc), and the hardware page-table
+accessed/dirty-bit updates enabled by +menvcfg.ADUE+. Hypervisor and vector
+extensions are not implemented or advertised.
+
+Unsupported instruction encodings, privilege operations, CSR accesses, and
+translation modes trap or read back architecturally defined WARL values; they
+must never be treated as successful no-ops when software can observe the
+difference. +misa+ reports MXL and the implemented single-letter extensions;
+Zicsr and Zifencei are guaranteed by this contract independently of +misa+.
+The initial board has one hart, with +mhartid+ equal to zero; hart IDs are
+stable and are not reused.
+
+=== Privileged features required by xv6
+
+* +satp+ supports Bare and Sv39. Sv39 uses 4 KiB pages, three levels, and
+  512 64-bit PTEs per page-table page. Noncanonical virtual addresses fault.
+* PMP implements the NAPOT matching and permissions needed by the pinned
+  kernel. Its sequence writing +0x3fffffffffffff+ to +pmpaddr0+ and +0x0f+
+  to +pmpcfg0+ allows S/U accesses to the physical address range; PMP checks
+  still do not make unmapped physical addresses valid.
+* +menvcfg.ADUE+, when set by M-mode, enables hardware setting of Sv39 PTE
+  accessed and dirty bits. When clear, access to a PTE requiring an unset bit
+  raises the architecturally required page fault. Updates are atomic with
+  respect to competing page-table accesses.
+* Sstc provides +stimecmp+ at CSR +0x14d+. M-mode controls S-mode access with
+  +menvcfg.STCE+; +mcounteren.TIME+ controls S-mode reads of +time+. A timer
+  interrupt is pending exactly when the time comparison and interrupt-enable
+  conditions require it, and is delivered through the delegated supervisor
+  timer interrupt path.
+* Atomic memory operations are coherent between harts. The initial one-hart
+  configuration still implements the architectural A extension and ordering
+  semantics; it does not emulate atomic operations as ordinary, reorderable
+  loads and stores.
+* +fence+, +fence.i+, and +sfence.vma+ have the required ordering and
+  translation/instruction-cache effects. No guest-visible cache may retain
+  stale instructions or translations across the corresponding fences.
+
+== Physical address space
+
+Physical addresses are unsigned 56-bit values, matching the maximum address
+width expressible by Sv39 PPNs and a 4 KiB page offset. The bus preserves every
+implemented physical-address bit. It never wraps, masks to 30 bits, aliases
+unmapped space into RAM, or uses host allocation size as a substitute for the
+guest map.
+
+The following half-open ranges define the initial board. Undefined portions
+of each device's register interface remain governed by the device contract;
+an address inside an aperture is not by itself a valid register access.
+
+[cols="1,1,2,2",options="header"]
+|===
+|Physical range |Size |Owner |Behavior
+|+0x00000000..0x00001000+ |4 KiB |Lauteet |Unmapped; access fault
+|+0x00001000..0x00010000+ |60 KiB |Sytyke |Read/execute boot ROM; writes fault
+|+0x00010000..0x0c000000+ |Reserved |Lauteet |Unmapped; access fault
+|+0x0c000000..0x10000000+ |64 MiB |Vihta |PLIC aperture; register behavior defined by device contract
+|+0x10000000..0x10001000+ |4 KiB |Höyry |16550-compatible UART aperture
+|+0x10001000..0x10002000+ |4 KiB |Kiulu |Virtio-MMIO v2 root block controller
+|+0x10002000..0x80000000+ |Reserved |Lauteet |Unmapped; access fault
+|+0x80000000..0x88000000+ |128 MiB |Löyly |RAM; usable and DMA-addressable
+|+0x88000000..0x0100000000000000+ |Reserved |Lauteet |Unmapped; access fault
+|===
+
+The PLIC aperture follows the pinned +qemu -machine virt+ physical layout.
+Only implemented registers and contexts are accessible; the full aperture is
+not backing RAM. The root disk controller remains at +0x10001000+ with the
+identity expected by upstream xv6, regardless of Finnish presentation names.
+This map does not allocate an address for an additional boot-volume controller;
+that choice belongs to the boot-image/device design and must not displace the
+xv6 root controller.
+
+RAM is contiguous from +0x80000000+ through +0x87ffffff+. The initial firmware
+loads the kernel ELF into that RAM; kernel allocation and all DMA are bounded
+by the same configured RAM limit. Reads, writes, fetches, page-table walks, and
+DMA outside a mapped range fail explicitly. A transfer crossing a region
+boundary is checked as a whole and cannot partially modify memory or a device.
+RAM may be smaller only in isolated tests that declare their non-xv6 purpose;
+it may not be smaller in the xv6 acceptance configuration.
+
+== Reset and firmware entry
+
+A cold machine reset has the following defined state:
+
+* Privilege is M-mode, PC is +0x00001000+, and +mhartid+ is zero.
+* Integer and floating-point registers are zero; x0 remains hardwired to zero.
+  The ROM establishes its own stack before using one.
+* Software-writable architectural CSRs start at zero, subject to their
+  specified WARL masks and read-only identity fields. In particular,
+  +mstatus+, +mie+, +medeleg+, +mideleg+, +mtvec+, +mepc+, +mcause+,
+  +mtval+, +stvec+, +sepc+, +scause+, +stval+, +satp+, +pmpcfg0+, and
+  +pmpaddr0+ are zero. +satp+ is Bare, traps are delegated nowhere, and PMP
+  starts disabled.
+* +mip+ device-pending sources start clear. +stimecmp+ starts at
+  +0xffffffffffffffff+, so the Sstc timer is not pending at reset.
+* +fcsr+ is zero and floating-point status is Off.
+* +menvcfg+ and +mcounteren+ are zero. Firmware must explicitly enable ADUE,
+  Sstc, and the +time+ counter before relying on them from S-mode.
+* +mcycle+, +minstret+, and the virtual +time+ counter start at zero. Device
+  reset state is defined by each device contract; reset does not initialize
+  guest RAM to a promised value.
+
+The Sytyke ROM is immutable to guest stores and executable at reset. Fetches
+from unmapped physical addresses and stores to ROM fault. BIOS implementation,
+ROM image format, recovery behavior, and the exact M-to-S handoff protocol are
+specified by the separate BIOS tasks; they are not inferred from this memory
+map.
+
+For upstream xv6 handoff, the firmware loads the kernel at its ELF physical
+addresses beginning at +0x80000000+, starts the kernel entry in M-mode, and
+preserves hart identity in +mhartid+. xv6's entry code establishes its stack,
+then its +start()+ configures PMP, delegation, Sv39, ADUE, and Sstc before
+returning to S-mode. The firmware must not enter the kernel directly in
+S-mode or enable paging before the kernel performs this setup. No device-tree
+pointer is required by this pinned kernel's entry path.
+
+== Address translation, access faults, and ordering
+
+Instruction fetches, loads, and stores use 64-bit virtual addresses. With
++satp.MODE=Sv39+, the MMU checks canonicality and each PTE's validity,
+permissions, privilege, and accessed/dirty state. A page fault reports the
+faulting virtual address and the correct instruction/load/store page-fault
+cause. With Bare mode, the virtual address is used as the physical address,
+then checked against the physical map and PMP.
+
+Misaligned instruction targets and misaligned data accesses raise their
+architectural misaligned exceptions; a misaligned store has no partial
+effects. An access to an unmapped physical address raises the corresponding
+instruction/load/store access fault. +mtval+/+stval+ contains the faulting
+effective address for address-related faults; trap cause and privilege follow
+the architectural delegation and priority rules. Device access-width,
+alignment, side-effect, and interrupt behavior is specified per device.
+Invalid device accesses must not be completed as zero-valued reads or ignored
+writes.
+
+CPU and device accesses are coherent and ordered according to the RISC-V
+memory model and explicit fence instructions. Device DMA may read or write
+RAM only, must validate the complete physical range without integer overflow,
+and must not bypass PMP, access-fault, or protection checks. No implicit
+host-file or host-memory service is part of the guest physical bus.
+
+== Counters and virtual time
+
++cycle+ and +instret+ are 64-bit counters with architectural privilege-enable
+checks; they wrap modulo 2^64. +time+ is a 64-bit monotonically increasing
+machine timebase with a 10 MHz frequency. It starts at zero on cold reset and
+advances from virtual machine execution, not host wall-clock time, so headless
+tests are reproducible. One emulated core cycle advances one timebase tick;
+idle advancement and timer delivery use the same virtual clock. Timer compare
+and pending state are evaluated against that counter without 32-bit truncation.
+
+RTC civil time is not the +time+ CSR and does not change this monotonic timer
+contract. Any later wall-clock device has a separate interface and cannot
+replace Sstc or alter the timebase frequency.
+
+== Limits and conformance
+
+The initial configuration has exactly one hart and 128 MiB of RAM. Multicore,
+hypervisor/vector extensions, 32-bit execution, physical address aliasing,
+and implicit legacy SC-16 devices are outside this contract. The machine is
+not advertised as real Linux or as complete RISC-V platform compatibility.
+
+This contract is accepted only when the implementation has executable tests
+for reset values and ROM access, the full-width physical-address boundary,
+every RAM edge and unmapped hole, one-hart capability reporting, privilege
+transitions, Sv39 faults and ADUE updates, PMP checks, Sstc compare/interrupt
+behavior, DMA boundary rejection, and the pinned xv6 kernel handoff. Tests
+must show failed accesses do not wrap, alias, or partially commit. Until those
+tests pass, both this contract and the corresponding roadmap task remain
+planned rather than implemented.
+
+== Pinned compatibility sources
+
+These upstream files define the initial xv6 assumptions; they do not prove
+Kiuas16 conformance:
+
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/memlayout.h[+memlayout.h+]
+  fixes RAM at +0x80000000+, its 128 MiB extent, and QEMU-compatible device bases.
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/entry.S[+entry.S+]
+  expects the kernel at +0x80000000+ and obtains hart identity from +mhartid+.
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/start.c[+start.c+]
+  configures PMP, delegation, ADUE, Sstc, and the M-to-S handoff.
+* https://github.com/mit-pdos/xv6-riscv/blob/e93dabeb98431235c6e1a101cb96c73c923fdbc4/kernel/riscv.h[+riscv.h+]
+  defines the CSR, fence, and Sv39 operations used by this kernel.
