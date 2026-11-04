@@ -383,6 +383,9 @@ pub enum CoreTrapCause {
     InstructionAccessFault,
     IllegalInstruction,
     Breakpoint,
+    EnvironmentCallFromUser,
+    EnvironmentCallFromSupervisor,
+    EnvironmentCallFromMachine,
     LoadAddressMisaligned,
     LoadAccessFault,
     StoreAddressMisaligned,
@@ -400,23 +403,243 @@ pub struct CoreTrap {
 pub struct Rv64Core {
     pub pc: u64,
     integer_registers: [u64; 32],
+    privilege: PrivilegeMode,
+    mstatus: u64,
+    mie: u64,
+    medeleg: u64,
+    mideleg: u64,
+    mtvec: u64,
+    scounteren: u64,
+    mscratch: u64,
+    mepc: u64,
+    mcause: u64,
+    mtval: u64,
+    mip: u64,
+    mcounteren: u64,
+    menvcfg: u64,
+    stvec: u64,
+    sscratch: u64,
+    sepc: u64,
+    scause: u64,
+    stval: u64,
+    satp: u64,
+    mcycle: u64,
+    minstret: u64,
     reservation: Option<(u64, u8, u64)>,
 }
 
+const MSTATUS_SIE: u64 = 1 << 1;
+const MSTATUS_MIE: u64 = 1 << 3;
+const MSTATUS_SPIE: u64 = 1 << 5;
+const MSTATUS_MPIE: u64 = 1 << 7;
+const MSTATUS_SPP: u64 = 1 << 8;
+const MSTATUS_MPP_MASK: u64 = 0b11 << 11;
+const MSTATUS_TVM: u64 = 1 << 20;
+const MSTATUS_SSTATUS_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
+const SSTATUS_MASK: u64 = MSTATUS_SSTATUS_MASK;
+const MSTATUS_WRITABLE_MASK: u64 =
+    MSTATUS_SSTATUS_MASK | MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK;
+const MIE_MASK: u64 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11);
+const MIP_SOFTWARE: u64 = 1 << 1;
+const MIDELEG_MASK: u64 = (1 << 1) | (1 << 5) | (1 << 9);
+const MEDELEG_MASK: u64 = (1 << 16) - 1;
+const SCOUNTEREN_MASK: u64 = 0b111;
+const MENVCFG_MASK: u64 = (1 << 61) | (1 << 63);
+
 impl Rv64Core {
+    fn read_csr(&self, csr: u16) -> Result<u64, ()> {
+        if !self.csr_access_allowed(csr) {
+            return Err(());
+        }
+        let value = match csr {
+            0x100 => self.mstatus & SSTATUS_MASK,
+            0x104 => self.mie & self.mideleg,
+            0x105 => self.stvec,
+            0x106 => self.scounteren,
+            0x140 => self.sscratch,
+            0x141 => self.sepc,
+            0x142 => self.scause,
+            0x143 => self.stval,
+            0x144 => self.mip & self.mideleg,
+            0x180 => self.satp,
+            0x300 => self.mstatus,
+            0x301 => (2u64 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12),
+            0x302 => self.medeleg,
+            0x303 => self.mideleg,
+            0x304 => self.mie,
+            0x305 => self.mtvec,
+            0x306 => self.mcounteren,
+            0x30a => self.menvcfg,
+            0x340 => self.mscratch,
+            0x341 => self.mepc,
+            0x342 => self.mcause,
+            0x343 => self.mtval,
+            0x344 => self.mip,
+            0xb00 | 0xc00 => self.mcycle,
+            0xb02 | 0xc02 => self.minstret,
+            0xf14 => 0,
+            _ => return Err(()),
+        };
+        Ok(value)
+    }
+
+    fn write_csr(&mut self, csr: u16, value: u64) -> Result<(), ()> {
+        if !self.csr_access_allowed(csr) || (csr >> 10) & 0x3 == 0x3 {
+            return Err(());
+        }
+        match csr {
+            0x100 => {
+                self.mstatus = (self.mstatus & !SSTATUS_MASK) | (value & SSTATUS_MASK);
+            }
+            0x104 => self.mie = (self.mie & !self.mideleg) | (value & self.mideleg),
+            0x105 => self.stvec = normalize_tvec(value),
+            0x106 => self.scounteren = value & SCOUNTEREN_MASK,
+            0x140 => self.sscratch = value,
+            0x141 => self.sepc = value & !1,
+            0x142 => self.scause = value,
+            0x143 => self.stval = value,
+            0x144 => self.mip = (self.mip & !self.mideleg) | (value & self.mideleg & MIP_SOFTWARE),
+            0x180 => {
+                let mode = value >> 60;
+                self.satp = if mode == 0 || mode == 8 { value } else { 0 };
+            }
+            0x300 => {
+                let mpp = (value & MSTATUS_MPP_MASK) >> 11;
+                let value = if mpp == 2 {
+                    value & !MSTATUS_MPP_MASK
+                } else {
+                    value
+                };
+                self.mstatus =
+                    (self.mstatus & !MSTATUS_WRITABLE_MASK) | (value & MSTATUS_WRITABLE_MASK);
+            }
+            0x302 => self.medeleg = value & MEDELEG_MASK,
+            0x303 => self.mideleg = value & MIDELEG_MASK,
+            0x304 => self.mie = value & MIE_MASK,
+            0x305 => self.mtvec = normalize_tvec(value),
+            0x306 => self.mcounteren = value & SCOUNTEREN_MASK,
+            0x30a => self.menvcfg = value & MENVCFG_MASK,
+            0x340 => self.mscratch = value,
+            0x341 => self.mepc = value & !1,
+            0x342 => self.mcause = value,
+            0x343 => self.mtval = value,
+            0x344 => self.mip = (self.mip & !MIP_SOFTWARE) | (value & MIP_SOFTWARE),
+            0xb00 => self.mcycle = value,
+            0xb02 => self.minstret = value,
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+
+    fn csr_access_allowed(&self, csr: u16) -> bool {
+        let required_privilege = (csr >> 8) & 0x3;
+        privilege_encoding(self.privilege) >= u64::from(required_privilege)
+            && !(self.privilege == PrivilegeMode::Supervisor
+                && csr == 0x180
+                && self.mstatus & MSTATUS_TVM != 0)
+            && match csr {
+                0xc00 if self.privilege == PrivilegeMode::Supervisor => self.mcounteren & 1 != 0,
+                0xc02 if self.privilege == PrivilegeMode::Supervisor => self.mcounteren & 4 != 0,
+                0xc00 if self.privilege == PrivilegeMode::User => {
+                    self.mcounteren & 1 != 0 && self.scounteren & 1 != 0
+                }
+                0xc02 if self.privilege == PrivilegeMode::User => {
+                    self.mcounteren & 4 != 0 && self.scounteren & 4 != 0
+                }
+                _ => true,
+            }
+    }
+
     pub const fn cold_reset() -> Self {
         Self {
             pc: COLD_RESET_STATE.pc,
             integer_registers: COLD_RESET_STATE.integer_registers,
+            privilege: COLD_RESET_STATE.privilege,
+            mstatus: COLD_RESET_STATE.mstatus,
+            mie: COLD_RESET_STATE.mie,
+            medeleg: COLD_RESET_STATE.medeleg,
+            mideleg: COLD_RESET_STATE.mideleg,
+            mtvec: COLD_RESET_STATE.mtvec,
+            scounteren: 0,
+            mscratch: 0,
+            mepc: COLD_RESET_STATE.mepc,
+            mcause: COLD_RESET_STATE.mcause,
+            mtval: COLD_RESET_STATE.mtval,
+            mip: COLD_RESET_STATE.mip,
+            mcounteren: COLD_RESET_STATE.mcounteren,
+            menvcfg: COLD_RESET_STATE.menvcfg,
+            stvec: COLD_RESET_STATE.stvec,
+            sscratch: 0,
+            sepc: COLD_RESET_STATE.sepc,
+            scause: COLD_RESET_STATE.scause,
+            stval: COLD_RESET_STATE.stval,
+            satp: COLD_RESET_STATE.satp,
+            mcycle: COLD_RESET_STATE.mcycle,
+            minstret: COLD_RESET_STATE.minstret,
             reservation: None,
         }
+    }
+
+    pub fn privilege(&self) -> PrivilegeMode {
+        self.privilege
     }
 
     pub fn register(&self, index: usize) -> Option<u64> {
         self.integer_registers.get(index).copied()
     }
 
+    pub fn deliver_trap(&mut self, trap: CoreTrap) -> Result<(), CoreTrap> {
+        let cause = exception_code(trap.cause).ok_or(trap)?;
+        let delegated =
+            self.privilege != PrivilegeMode::Machine && self.medeleg & (1 << cause) != 0;
+        if delegated {
+            let previous_interrupt_enable = self.mstatus & MSTATUS_SIE != 0;
+            self.mstatus = (self.mstatus & !(MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP))
+                | if previous_interrupt_enable {
+                    MSTATUS_SPIE
+                } else {
+                    0
+                }
+                | if self.privilege == PrivilegeMode::Supervisor {
+                    MSTATUS_SPP
+                } else {
+                    0
+                };
+            self.sepc = trap.pc & !1;
+            self.scause = cause;
+            self.stval = trap.value;
+            self.privilege = PrivilegeMode::Supervisor;
+            self.pc = self.stvec & !3;
+        } else {
+            let previous_interrupt_enable = self.mstatus & MSTATUS_MIE != 0;
+            let previous_privilege = privilege_encoding(self.privilege);
+            self.mstatus = (self.mstatus & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK))
+                | if previous_interrupt_enable {
+                    MSTATUS_MPIE
+                } else {
+                    0
+                }
+                | (previous_privilege << 11);
+            self.mepc = trap.pc & !1;
+            self.mcause = cause;
+            self.mtval = trap.value;
+            self.privilege = PrivilegeMode::Machine;
+            self.pc = self.mtvec & !3;
+        }
+        self.reservation = None;
+        Ok(())
+    }
+
     pub fn step(&mut self, bus: &mut Kiuas16Bus) -> Result<(), CoreTrap> {
+        self.mcycle = self.mcycle.wrapping_add(1);
+        let result = self.step_inner(bus);
+        if result.is_ok() {
+            self.minstret = self.minstret.wrapping_add(1);
+        }
+        result
+    }
+
+    fn step_inner(&mut self, bus: &mut Kiuas16Bus) -> Result<(), CoreTrap> {
         let pc = self.pc;
         if pc & 1 != 0 {
             return Err(CoreTrap {
@@ -476,6 +699,77 @@ impl Rv64Core {
                     cause: CoreTrapCause::Breakpoint,
                     value: 0,
                 });
+            }
+            0x73 if instruction == 0x0000_0073 => {
+                let cause = match self.privilege {
+                    PrivilegeMode::User => CoreTrapCause::EnvironmentCallFromUser,
+                    PrivilegeMode::Supervisor => CoreTrapCause::EnvironmentCallFromSupervisor,
+                    PrivilegeMode::Machine => CoreTrapCause::EnvironmentCallFromMachine,
+                };
+                return Err(CoreTrap {
+                    pc,
+                    cause,
+                    value: 0,
+                });
+            }
+            0x73 if instruction == 0x3020_0073 => {
+                if self.privilege != PrivilegeMode::Machine {
+                    return Err(illegal_instruction(pc, instruction));
+                }
+                let target_privilege = match (self.mstatus & MSTATUS_MPP_MASK) >> 11 {
+                    0 => PrivilegeMode::User,
+                    1 => PrivilegeMode::Supervisor,
+                    _ => PrivilegeMode::Machine,
+                };
+                self.mstatus = (self.mstatus & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK))
+                    | if self.mstatus & MSTATUS_MPIE != 0 {
+                        MSTATUS_MIE
+                    } else {
+                        0
+                    }
+                    | MSTATUS_MPIE;
+                self.privilege = target_privilege;
+                next_pc = self.mepc;
+            }
+            0x73 if instruction == 0x1020_0073 => {
+                if self.privilege == PrivilegeMode::User {
+                    return Err(illegal_instruction(pc, instruction));
+                }
+                let target_privilege = if self.mstatus & MSTATUS_SPP != 0 {
+                    PrivilegeMode::Supervisor
+                } else {
+                    PrivilegeMode::User
+                };
+                self.mstatus = (self.mstatus & !(MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP))
+                    | if self.mstatus & MSTATUS_SPIE != 0 {
+                        MSTATUS_SIE
+                    } else {
+                        0
+                    }
+                    | MSTATUS_SPIE;
+                self.privilege = target_privilege;
+                next_pc = self.sepc;
+            }
+            0x73 if instruction == 0x1050_0073 => {}
+            0x73 if funct3 != 0 => {
+                let csr = (instruction >> 20) as u16;
+                let old = self
+                    .read_csr(csr)
+                    .map_err(|_| illegal_instruction(pc, instruction))?;
+                let immediate_form = funct3 >= 5;
+                let source = if immediate_form { rs1 as u64 } else { left };
+                let write_value = match funct3 {
+                    1 | 5 => Some(source),
+                    2 | 6 if rs1 != 0 => Some(old | source),
+                    3 | 7 if rs1 != 0 => Some(old & !source),
+                    2 | 3 | 6 | 7 => None,
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                };
+                if let Some(value) = write_value {
+                    self.write_csr(csr, value)
+                        .map_err(|_| illegal_instruction(pc, instruction))?;
+                }
+                result = Some(old);
             }
             0x03 => {
                 let address = left.wrapping_add(sign_extend(instruction >> 20, 12) as u64);
@@ -1057,6 +1351,35 @@ fn illegal_instruction(pc: u64, instruction: u32) -> CoreTrap {
     }
 }
 
+fn privilege_encoding(privilege: PrivilegeMode) -> u64 {
+    match privilege {
+        PrivilegeMode::User => 0,
+        PrivilegeMode::Supervisor => 1,
+        PrivilegeMode::Machine => 3,
+    }
+}
+
+fn normalize_tvec(value: u64) -> u64 {
+    let mode = value & 0x3;
+    (value & !0x3) | u64::from(mode <= 1) * mode
+}
+
+fn exception_code(cause: CoreTrapCause) -> Option<u64> {
+    Some(match cause {
+        CoreTrapCause::InstructionAddressMisaligned => 0,
+        CoreTrapCause::InstructionAccessFault => 1,
+        CoreTrapCause::IllegalInstruction => 2,
+        CoreTrapCause::Breakpoint => 3,
+        CoreTrapCause::LoadAddressMisaligned => 4,
+        CoreTrapCause::LoadAccessFault => 5,
+        CoreTrapCause::StoreAddressMisaligned => 6,
+        CoreTrapCause::StoreAccessFault => 7,
+        CoreTrapCause::EnvironmentCallFromUser => 8,
+        CoreTrapCause::EnvironmentCallFromSupervisor => 9,
+        CoreTrapCause::EnvironmentCallFromMachine => 11,
+    })
+}
+
 fn sign_extend(value: u32, bits: u32) -> i64 {
     ((value << (32 - bits)) as i32 >> (32 - bits)) as i64
 }
@@ -1139,6 +1462,10 @@ mod tests {
 
     fn encode_atomic(funct5: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
         (funct5 << 27) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x2f
+    }
+
+    fn encode_csr(csr: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (csr << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x73
     }
 
     #[test]
@@ -1363,6 +1690,192 @@ mod tests {
         assert_eq!(core.pc, BOOT_ROM.end);
         let trap = core.step(&mut bus).unwrap_err();
         assert_eq!(trap.cause, CoreTrapCause::InstructionAccessFault);
+    }
+
+    #[test]
+    fn rv64_core_executes_machine_and_supervisor_csr_operations() {
+        let instructions = [
+            encode_csr(0x305, 2, 1, 1),
+            encode_csr(0x305, 0, 2, 3),
+            encode_csr(0x100, 3, 5, 5),
+            encode_csr(0x100, 0, 2, 6),
+            encode_csr(0x301, 0, 2, 7),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[2] = BOOT_ROM.start + 0x101;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(1), Some(0));
+        assert_eq!(core.register(3), Some(BOOT_ROM.start + 0x101));
+        assert_eq!(core.register(5), Some(0));
+        assert_eq!(core.register(6), Some(MSTATUS_SIE));
+        assert_eq!(
+            core.register(7),
+            Some((2u64 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12))
+        );
+        assert_eq!(core.mtvec, BOOT_ROM.start + 0x101);
+    }
+
+    #[test]
+    fn rv64_core_rejects_privilege_violations_and_read_only_csr_writes() {
+        let instruction = encode_csr(0x300, 1, 1, 2);
+        let mut bus = bus_with_program(&[instruction]);
+        let mut core = Rv64Core::cold_reset();
+        core.privilege = PrivilegeMode::Supervisor;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
+        assert_eq!(trap.value, instruction as u64);
+
+        let instruction = encode_csr(0x301, 1, 1, 2);
+        let mut bus = bus_with_program(&[instruction]);
+        let mut core = Rv64Core::cold_reset();
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
+        assert_eq!(trap.value, instruction as u64);
+    }
+
+    #[test]
+    fn rv64_core_counts_retired_instructions_and_gates_supervisor_counters() {
+        let instructions = [
+            encode_csr(0xc00, 0, 2, 1),
+            encode_csr(0xc00, 0, 2, 2),
+            encode_csr(0xc02, 0, 2, 3),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+        assert_eq!(core.register(1), Some(1));
+        assert_eq!(core.register(2), Some(2));
+        assert_eq!(core.register(3), Some(2));
+        assert_eq!(core.mcycle, 3);
+        assert_eq!(core.minstret, 3);
+
+        core.privilege = PrivilegeMode::Supervisor;
+        core.pc = BOOT_ROM.start;
+        let mut bus = bus_with_program(&[encode_csr(0xc02, 0, 2, 4)]);
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
+
+        core.mcounteren = 1 << 2;
+        core.pc = BOOT_ROM.start;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.register(4), Some(3));
+    }
+
+    #[test]
+    fn rv64_core_applies_csr_warl_masks_and_user_counter_gates() {
+        let instructions = [
+            encode_csr(0x300, 1, 1, 2),
+            encode_csr(0x302, 3, 1, 4),
+            encode_csr(0x305, 5, 1, 6),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = 2 << 11;
+        core.integer_registers[3] = u64::MAX;
+        core.integer_registers[5] = BOOT_ROM.start + 0x203;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+        assert_eq!(core.mstatus & MSTATUS_MPP_MASK, 0);
+        assert_eq!(core.medeleg, MEDELEG_MASK);
+        assert_eq!(core.mtvec, BOOT_ROM.start + 0x200);
+
+        let mut bus = bus_with_program(&[encode_csr(0xc00, 0, 2, 7)]);
+        core.privilege = PrivilegeMode::User;
+        core.pc = BOOT_ROM.start;
+        core.mcounteren = 1;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
+
+        core.scounteren = 1;
+        core.pc = BOOT_ROM.start;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.register(7), Some(core.mcycle));
+    }
+
+    #[test]
+    fn rv64_core_delivers_machine_traps_and_executes_mret() {
+        let mut bus = bus_with_program(&[0x3020_0073]);
+        let mut core = Rv64Core::cold_reset();
+        core.pc = RAM.start + 0x124;
+        core.mtvec = BOOT_ROM.start + 0x200;
+        core.mstatus = MSTATUS_MIE;
+        let trap = CoreTrap {
+            pc: core.pc,
+            cause: CoreTrapCause::LoadAccessFault,
+            value: 0xffff_8000_1234_5678,
+        };
+        core.deliver_trap(trap).unwrap();
+
+        assert_eq!(core.privilege(), PrivilegeMode::Machine);
+        assert_eq!(core.pc, BOOT_ROM.start + 0x200);
+        assert_eq!(core.mepc, RAM.start + 0x124);
+        assert_eq!(core.mcause, 5);
+        assert_eq!(core.mtval, 0xffff_8000_1234_5678);
+        assert_eq!(core.mstatus & MSTATUS_MIE, 0);
+        assert_ne!(core.mstatus & MSTATUS_MPIE, 0);
+        assert_eq!((core.mstatus & MSTATUS_MPP_MASK) >> 11, 3);
+
+        core.pc = BOOT_ROM.start;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.privilege(), PrivilegeMode::Machine);
+        assert_eq!(core.pc, RAM.start + 0x124);
+        assert_ne!(core.mstatus & MSTATUS_MIE, 0);
+        assert_ne!(core.mstatus & MSTATUS_MPIE, 0);
+        assert_eq!(core.mstatus & MSTATUS_MPP_MASK, 0);
+    }
+
+    #[test]
+    fn rv64_core_delegates_supervisor_traps_and_executes_sret_to_user() {
+        let mut bus = bus_with_program(&[0x1020_0073]);
+        let mut core = Rv64Core::cold_reset();
+        core.privilege = PrivilegeMode::User;
+        core.pc = RAM.start + 0x20;
+        core.medeleg = 1 << 2;
+        core.stvec = BOOT_ROM.start + 0x300;
+        core.mstatus = MSTATUS_SIE;
+        core.deliver_trap(CoreTrap {
+            pc: core.pc,
+            cause: CoreTrapCause::IllegalInstruction,
+            value: 0xdead_beef,
+        })
+        .unwrap();
+
+        assert_eq!(core.privilege(), PrivilegeMode::Supervisor);
+        assert_eq!(core.pc, BOOT_ROM.start + 0x300);
+        assert_eq!(core.sepc, RAM.start + 0x20);
+        assert_eq!(core.scause, 2);
+        assert_eq!(core.stval, 0xdead_beef);
+        assert_eq!(core.mstatus & MSTATUS_SIE, 0);
+        assert_ne!(core.mstatus & MSTATUS_SPIE, 0);
+        assert_eq!(core.mstatus & MSTATUS_SPP, 0);
+
+        core.pc = BOOT_ROM.start;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.privilege(), PrivilegeMode::User);
+        assert_eq!(core.pc, RAM.start + 0x20);
+        assert_ne!(core.mstatus & MSTATUS_SIE, 0);
+        assert_eq!(core.mstatus & MSTATUS_SPP, 0);
+    }
+
+    #[test]
+    fn rv64_core_ecall_reports_current_privilege_and_wfi_is_a_nop() {
+        let mut bus = bus_with_program(&[0x0000_0073, 0x1050_0073]);
+        let mut core = Rv64Core::cold_reset();
+        core.privilege = PrivilegeMode::Supervisor;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::EnvironmentCallFromSupervisor);
+        assert_eq!(trap.pc, BOOT_ROM.start);
+        assert_eq!(exception_code(trap.cause), Some(9));
+        core.pc += 4;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, BOOT_ROM.start + 8);
     }
 
     #[test]

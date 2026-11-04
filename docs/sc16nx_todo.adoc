@@ -571,9 +571,13 @@ indirect jumps, hints, and C.EBREAK. Reserved encodings and unsupported
 compressed floating-point forms trap. FENCE/FENCE.I are safe no-ops for this
 synchronous, uncached core. Execution tests exercise integer arithmetic,
 compressed control flow and memory, M-extension edge cases, atomic
-operations/reservations, breakpoint, and faults. Floating point,
-privilege/trap delivery, Sv39, and full acceptance coverage remain
-unimplemented; this is not RV64GC and the task remains unchecked.
+operations/reservations, breakpoint, and faults. A privileged slice now
+provides M/S/U state, a bounded Zicsr set with privilege/read-only checks and
+WARL handling, exception delegation/state capture through explicit trap
+delivery, MRET/SRET, ECALL, WFI, and cycle/retirement counters. This does not
+yet route every execution fault automatically, deliver interrupts, protect
+memory with PMP, or implement Sv39, floating point, and the remaining
+architectural behavior. It is not RV64GC and the task remains unchecked.
 
 ** [ ] [[nx-privilege]] *P0 / Implement M/S/U traps, control state, and PMP.*
    Define exception/interrupt delegation, status/counter access, trap
@@ -584,6 +588,17 @@ unimplemented; this is not RV64GC and the task remains unchecked.
 *Acceptance:* Invalid CSR access and forbidden memory/device access trap
 with correct cause/address/state. Guest handlers recover where specified;
 privilege transitions and interrupt masking do not bypass protection.
++
+*Implementation progress (2026-11-04):* The Kiuas16 core now models
+M/S/U privilege state, a bounded machine/supervisor CSR set, CSR privilege
+and read-only checks, selected WARL masks, synchronous exception delegation
+and CSR capture through an explicit trap-delivery call, and MRET/SRET
+transitions. The tests cover return-state restoration and privilege/counter
+access gates. The time CSR remains unavailable until virtual time is wired to
+the machine clock. Trap delivery is not yet wired automatically into every
+execution fault; interrupt delivery, full CSR semantics, PMP enforcement,
+memory privilege checks, WFI wakeup, and architectural acceptance fixtures
+remain incomplete. Keep this task unchecked.
 
 ** [ ] [[nx-sv39]] *P0 / Implement Sv39 translation.*
    Add three-level 64-bit PTEs, canonical addresses, permission/status
