@@ -1,9 +1,20 @@
 = SuomiCPU-16
 
-SuomiCPU-16 is an emulator for the SC-16, a small, byte-addressed machine.
-Runtime, tools, and tests are implemented in Rust.
+SuomiCPU-16 is an emulator project with the *Kiuas16* processor and *AinoGPU*
+graphics device. The current implementation uses the legacy SC-16
+byte-addressed architecture. Runtime, tools, and tests are implemented in Rust.
 
-== Features
+== SC16NX direction
+
+The sole development checklist is the
+link:docs/sc16nx_todo.adoc[SC16NX roadmap]. It targets RV64-compatible Kiuas16,
+Rust-built xv6, PC-like BIOS firmware, Finnish-named hardware, AinoGPU
+hardware-accelerated 3D, and working xv6 versions of all 17 active programs.
+These are planned capabilities, not features of the current emulator.
+SisuOS/SaunaShell remains a frozen source example, not an OS being developed
+or ported to the successor machine.
+
+== Current SC-16 features
 * Full emulation of the SC-16 architecture.
 * Integrated assembler for SC-16 assembly language.
 * C90-oriented compiler for SC-16 with partial language/preprocessor and
@@ -65,6 +76,11 @@ link:docs/programs.adoc[program build and disk details]. Data disks +DISK0001+
 and +DISK0002+ are unchanged.
 
 == SisuOS
+
+This section preserves the legacy SC-16 workflow. The
+link:docs/sc16nx_todo.adoc#nx-sisuos-freeze[SisuOS archive boundary] retains
+source and historical build instructions only; it does not promise a
+maintained legacy runner or a working RV64 port.
 
 The checked-in +disks/sisuos+ folder is a small protected, preemptive OS
 demonstration. Start the emulator with +--disk sisuos+, then press Enter in

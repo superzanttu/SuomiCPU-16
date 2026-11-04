@@ -1,9 +1,11 @@
 = Getting Started with SC-16
 :toc:
 
-This guide covers a first emulator run, booting the supported SisuOS example,
-and locating the build and architecture references. SisuOS is the primary
-workload verified against the current hardware interfaces.
+This guide records the legacy SC-16 setup and SisuOS example workflow.
+SisuOS/SaunaShell is preserved as source and historical build instructions,
+with no further feature development or RV64 port. The
+link:sc16nx_todo.adoc[SC16NX roadmap] defines the future Kiuas16/AinoGPU
+computer and xv6 target; the commands below do not launch that future platform.
 
 == Requirements
 
@@ -46,9 +48,9 @@ then starts the user-mode SaunaShell. Enter +help+ to see its commands:
 +info+, +ps+, +list+, +run PROGRAM [args] [&]+, and +logout+. The package list
 currently names the three installed guest programs; it is not a dynamic
 filesystem listing. +run daemon &+ starts the blocking daemon in the background,
-while +run sleeper+ starts the monotonic timer example. SisuOS does not yet
-provide accounts, permissions, multiple consoles, or a general-purpose
-filesystem shell.
+while +run sleeper+ starts the monotonic timer example. This introductory
+walkthrough does not cover accounts, permissions, multiple consoles, or a
+general-purpose filesystem shell.
 
 == Build and install SisuOS
 
@@ -82,4 +84,5 @@ see link:programs.adoc[Building and installing SC-16 programs].
   and guest disk services.
 * link:sc16_architecture.adoc[Machine architecture] — memory map, image format,
   privilege, devices, interrupts, MMU, and syscall contracts.
-* link:sc16_improvements.adoc[Architecture roadmap] — implementation status.
+* link:sc16nx_todo.adoc[SC16NX roadmap] — the sole development checklist for
+  Kiuas16, AinoGPU, firmware/devices, xv6, program recovery, and refactoring.

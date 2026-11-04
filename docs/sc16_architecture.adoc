@@ -1130,7 +1130,8 @@ its supported file APIs: `fopen`, `freopen`, `fclose`, `fgetc`, `fputc`,
 `ferror`. These streams use the current folder-backed disk and syscall ABI;
 they are unbuffered. `remove` is explicitly unsupported and reports `ENOSYS`.
 This is a limited hosted-C subset, not complete C90 `stdio` or a hosted
-environment; see `docs/c90_todo.adoc`.
+environment; see the
+link:sc16nx_todo.adoc#nx-c90-hosted[consolidated hosted-runtime roadmap].
 
 == Firmware text display
 

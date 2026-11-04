@@ -19,4 +19,4 @@ Don't add comments to code unless the user asks for them.
 
 - Keep compiler and emulator implementation paths Rust-native. Unsupported C input should be rejected by the Rust compiler with a diagnostic; do not restore or add a Python compiler/runtime fallback.
 - Treat C90 support as a tested subset, not a blanket compatibility claim. Keep documentation aligned with verified behavior and list unsupported requirements explicitly.
-- In `docs/sc16_improvements.adoc` and `docs/c90_todo.adoc`, leave a parent task unchecked until every child task is complete and its acceptance tests pass. Update task status only after validating the corresponding behavior.
+- In `docs/sc16nx_todo.adoc`, leave a parent task unchecked until every child task is complete and its acceptance tests pass. Update task status only after validating the corresponding behavior.
