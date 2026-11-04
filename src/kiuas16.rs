@@ -6,6 +6,7 @@ pub const PLIC: AddressRange = AddressRange::new(0x0c00_0000, 0x1000_0000);
 pub const UART: AddressRange = AddressRange::new(0x1000_0000, 0x1000_1000);
 pub const ROOT_BLOCK: AddressRange = AddressRange::new(0x1000_1000, 0x1000_2000);
 pub const RAM: AddressRange = AddressRange::new(0x8000_0000, 0x8800_0000);
+pub const BOOT_ROM_BYTES: usize = (BOOT_ROM.end - BOOT_ROM.start) as usize;
 
 pub const RESET_PC: u64 = BOOT_ROM.start;
 pub const XV6_HART_COUNT: u32 = 1;
@@ -86,6 +87,8 @@ pub enum PhysicalAccessError {
     RegionBoundary,
     PermissionDenied,
     DmaOutsideRam,
+    InvalidConfiguration,
+    DeviceNotImplemented,
 }
 
 pub fn check_physical_access(
@@ -140,6 +143,102 @@ fn checked_end(address: u64, length: u64) -> Result<u64, PhysicalAccessError> {
         return Err(PhysicalAccessError::AddressOutOfRange);
     }
     Ok(end)
+}
+
+pub struct Kiuas16Bus {
+    boot_rom: Vec<u8>,
+    ram: Vec<u8>,
+    ram_end: u64,
+}
+
+impl Kiuas16Bus {
+    pub fn new(boot_rom: Vec<u8>) -> Result<Self, PhysicalAccessError> {
+        Self::new_with_ram_size(boot_rom, XV6_RAM_BYTES as usize)
+    }
+
+    pub fn new_with_ram_size(
+        boot_rom: Vec<u8>,
+        ram_bytes: usize,
+    ) -> Result<Self, PhysicalAccessError> {
+        if boot_rom.len() != BOOT_ROM_BYTES || ram_bytes == 0 || ram_bytes as u64 > XV6_RAM_BYTES {
+            return Err(PhysicalAccessError::InvalidConfiguration);
+        }
+        let ram_end = RAM
+            .start
+            .checked_add(ram_bytes as u64)
+            .ok_or(PhysicalAccessError::InvalidConfiguration)?;
+        Ok(Self {
+            boot_rom,
+            ram: vec![0; ram_bytes],
+            ram_end,
+        })
+    }
+
+    pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), PhysicalAccessError> {
+        self.transfer(address, output, PhysicalAccess::Read)
+    }
+
+    pub fn fetch(&self, address: u64, output: &mut [u8]) -> Result<(), PhysicalAccessError> {
+        self.transfer(address, output, PhysicalAccess::Execute)
+    }
+
+    pub fn write(&mut self, address: u64, data: &[u8]) -> Result<(), PhysicalAccessError> {
+        let length =
+            u64::try_from(data.len()).map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
+        let region = self.check_access(address, length, PhysicalAccess::Write)?;
+        if region != PhysicalRegion::Ram {
+            return Err(PhysicalAccessError::DeviceNotImplemented);
+        }
+        let start = usize::try_from(address - RAM.start)
+            .map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
+        let end = start
+            .checked_add(data.len())
+            .ok_or(PhysicalAccessError::AddressOverflow)?;
+        self.ram[start..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn transfer(
+        &self,
+        address: u64,
+        output: &mut [u8],
+        access: PhysicalAccess,
+    ) -> Result<(), PhysicalAccessError> {
+        let length =
+            u64::try_from(output.len()).map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
+        let region = self.check_access(address, length, access)?;
+        let region_range = region.address_range();
+        let start = usize::try_from(address - region_range.start)
+            .map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
+        let end = start
+            .checked_add(output.len())
+            .ok_or(PhysicalAccessError::AddressOverflow)?;
+        let backing = match region {
+            PhysicalRegion::BootRom => &self.boot_rom,
+            PhysicalRegion::Ram => &self.ram,
+            PhysicalRegion::Plic | PhysicalRegion::Uart | PhysicalRegion::RootBlock => {
+                return Err(PhysicalAccessError::DeviceNotImplemented);
+            }
+        };
+        output.copy_from_slice(&backing[start..end]);
+        Ok(())
+    }
+
+    fn check_access(
+        &self,
+        address: u64,
+        length: u64,
+        access: PhysicalAccess,
+    ) -> Result<PhysicalRegion, PhysicalAccessError> {
+        let region = check_physical_access(address, length, access)?;
+        let end = address
+            .checked_add(length)
+            .ok_or(PhysicalAccessError::AddressOverflow)?;
+        if region == PhysicalRegion::Ram && end > self.ram_end {
+            return Err(PhysicalAccessError::Unmapped);
+        }
+        Ok(region)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -409,6 +508,71 @@ mod tests {
         assert_eq!(
             check_dma_range(u64::MAX, 2),
             Err(PhysicalAccessError::AddressOverflow)
+        );
+    }
+
+    #[test]
+    fn bus_reads_rom_and_fetches_without_allowing_rom_mutation() {
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        rom[0] = 0x13;
+        let mut bus = Kiuas16Bus::new_with_ram_size(rom, 16).unwrap();
+        let mut byte = [0];
+        assert_eq!(bus.read(BOOT_ROM.start, &mut byte), Ok(()));
+        assert_eq!(byte, [0x13]);
+        assert_eq!(bus.fetch(BOOT_ROM.start, &mut byte), Ok(()));
+        assert_eq!(
+            bus.write(BOOT_ROM.start, &[0]),
+            Err(PhysicalAccessError::PermissionDenied)
+        );
+        assert_eq!(
+            bus.read(BOOT_ROM.start, &mut []),
+            Err(PhysicalAccessError::EmptyAccess)
+        );
+    }
+
+    #[test]
+    fn bus_ram_operations_obey_configured_bounds_atomically() {
+        let mut bus = Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 8).unwrap();
+        assert_eq!(bus.write(RAM.start, &[1, 2, 3, 4]), Ok(()));
+        let mut bytes = [0; 4];
+        assert_eq!(bus.read(RAM.start, &mut bytes), Ok(()));
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert_eq!(
+            bus.write(RAM.start + 7, &[9, 8]),
+            Err(PhysicalAccessError::Unmapped)
+        );
+        assert_eq!(
+            bus.read(RAM.start + 8, &mut [0]),
+            Err(PhysicalAccessError::Unmapped)
+        );
+        let mut unchanged = [0; 4];
+        assert_eq!(bus.read(RAM.start, &mut unchanged), Ok(()));
+        assert_eq!(unchanged, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn bus_does_not_fake_unimplemented_mmio() {
+        let bus = Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 8).unwrap();
+        assert_eq!(
+            bus.read(UART.start, &mut [0]),
+            Err(PhysicalAccessError::DeviceNotImplemented)
+        );
+    }
+
+    #[test]
+    fn bus_rejects_invalid_backing_configuration() {
+        assert_eq!(
+            Kiuas16Bus::new_with_ram_size(vec![], 8).err(),
+            Some(PhysicalAccessError::InvalidConfiguration)
+        );
+        assert_eq!(
+            Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 0).err(),
+            Some(PhysicalAccessError::InvalidConfiguration)
+        );
+        assert_eq!(
+            Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], XV6_RAM_BYTES as usize + 1)
+                .err(),
+            Some(PhysicalAccessError::InvalidConfiguration)
         );
     }
 
