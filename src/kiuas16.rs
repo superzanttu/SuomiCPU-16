@@ -149,6 +149,7 @@ pub struct Kiuas16Bus {
     boot_rom: Vec<u8>,
     ram: Vec<u8>,
     ram_end: u64,
+    write_epoch: u64,
 }
 
 impl Kiuas16Bus {
@@ -171,6 +172,7 @@ impl Kiuas16Bus {
             boot_rom,
             ram: vec![0; ram_bytes],
             ram_end,
+            write_epoch: 0,
         })
     }
 
@@ -195,6 +197,7 @@ impl Kiuas16Bus {
             .checked_add(data.len())
             .ok_or(PhysicalAccessError::AddressOverflow)?;
         self.ram[start..end].copy_from_slice(data);
+        self.write_epoch = self.write_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -396,6 +399,7 @@ pub struct CoreTrap {
 pub struct Rv64Core {
     pub pc: u64,
     integer_registers: [u64; 32],
+    reservation: Option<(u64, u8, u64)>,
 }
 
 impl Rv64Core {
@@ -403,6 +407,7 @@ impl Rv64Core {
         Self {
             pc: COLD_RESET_STATE.pc,
             integer_registers: COLD_RESET_STATE.integer_registers,
+            reservation: None,
         }
     }
 
@@ -513,6 +518,169 @@ impl Rv64Core {
                         cause: CoreTrapCause::StoreAccessFault,
                         value: address,
                     })?;
+                self.reservation = None;
+            }
+            0x2f => {
+                let length = match funct3 {
+                    2 => 4,
+                    3 => 8,
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                };
+                let address = left;
+                if address & (length - 1) != 0 {
+                    return Err(CoreTrap {
+                        pc,
+                        cause: if (instruction >> 27) & 0x1f == 2 {
+                            CoreTrapCause::LoadAddressMisaligned
+                        } else {
+                            CoreTrapCause::StoreAddressMisaligned
+                        },
+                        value: address,
+                    });
+                }
+
+                let operation = (instruction >> 27) & 0x1f;
+                let mut data = [0; 8];
+                match operation {
+                    0b00010 if rs2 == 0 => {
+                        let region = bus
+                            .check_access(address, length, PhysicalAccess::Read)
+                            .map_err(|_| CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::LoadAccessFault,
+                                value: address,
+                            })?;
+                        if region != PhysicalRegion::Ram {
+                            return Err(CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::LoadAccessFault,
+                                value: address,
+                            });
+                        }
+                        bus.read(address, &mut data[..length as usize])
+                            .map_err(|_| CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::LoadAccessFault,
+                                value: address,
+                            })?;
+                        self.reservation = Some((address, length as u8, bus.write_epoch));
+                        let old = u64::from_le_bytes(data);
+                        result = Some(if length == 4 {
+                            old as u32 as i32 as i64 as u64
+                        } else {
+                            old
+                        });
+                    }
+                    0b00011 => {
+                        let region = bus
+                            .check_access(address, length, PhysicalAccess::Write)
+                            .map_err(|_| CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::StoreAccessFault,
+                                value: address,
+                            })?;
+                        if region != PhysicalRegion::Ram {
+                            return Err(CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::StoreAccessFault,
+                                value: address,
+                            });
+                        }
+                        let reserved = self.reservation.take();
+                        let succeeded = reserved == Some((address, length as u8, bus.write_epoch));
+                        if succeeded {
+                            bus.write(address, &right.to_le_bytes()[..length as usize])
+                                .map_err(|_| CoreTrap {
+                                    pc,
+                                    cause: CoreTrapCause::StoreAccessFault,
+                                    value: address,
+                                })?;
+                        }
+                        result = Some(u64::from(!succeeded));
+                    }
+                    0b00001 | 0b00000 | 0b00100 | 0b01100 | 0b01000 | 0b10000 | 0b10100
+                    | 0b11000 | 0b11100 => {
+                        let region = bus
+                            .check_access(address, length, PhysicalAccess::Write)
+                            .map_err(|_| CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::StoreAccessFault,
+                                value: address,
+                            })?;
+                        if region != PhysicalRegion::Ram {
+                            return Err(CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::StoreAccessFault,
+                                value: address,
+                            });
+                        }
+                        bus.read(address, &mut data[..length as usize])
+                            .map_err(|_| CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::LoadAccessFault,
+                                value: address,
+                            })?;
+                        let old = u64::from_le_bytes(data);
+                        let mask = if length == 4 {
+                            u32::MAX as u64
+                        } else {
+                            u64::MAX
+                        };
+                        let old_width = old & mask;
+                        let operand = right & mask;
+                        let new = match operation {
+                            0b00001 => operand,
+                            0b00000 => old_width.wrapping_add(operand) & mask,
+                            0b00100 => old_width ^ operand,
+                            0b01100 => old_width & operand,
+                            0b01000 => old_width | operand,
+                            0b10000 if length == 4 => {
+                                if (old_width as i32) < (operand as i32) {
+                                    old_width
+                                } else {
+                                    operand
+                                }
+                            }
+                            0b10000 => {
+                                if (old_width as i64) < (operand as i64) {
+                                    old_width
+                                } else {
+                                    operand
+                                }
+                            }
+                            0b10100 if length == 4 => {
+                                if (old_width as i32) > (operand as i32) {
+                                    old_width
+                                } else {
+                                    operand
+                                }
+                            }
+                            0b10100 => {
+                                if (old_width as i64) > (operand as i64) {
+                                    old_width
+                                } else {
+                                    operand
+                                }
+                            }
+                            0b11000 => old_width.min(operand),
+                            0b11100 => old_width.max(operand),
+                            _ => return Err(illegal_instruction(pc, instruction)),
+                        };
+                        bus.write(address, &new.to_le_bytes()[..length as usize])
+                            .map_err(|_| CoreTrap {
+                                pc,
+                                cause: CoreTrapCause::StoreAccessFault,
+                                value: address,
+                            })?;
+                        self.reservation = None;
+                        result = Some(if length == 4 {
+                            old_width as u32 as i32 as i64 as u64
+                        } else {
+                            old_width
+                        });
+                    }
+                    _ => return Err(illegal_instruction(pc, instruction)),
+                }
             }
             0x13 => {
                 let immediate = sign_extend(instruction >> 20, 12) as u64;
@@ -719,16 +887,24 @@ mod tests {
     }
 
     fn bus_with_program(instructions: &[u32]) -> Kiuas16Bus {
+        bus_with_program_and_ram_size(instructions, 16)
+    }
+
+    fn bus_with_program_and_ram_size(instructions: &[u32], ram_bytes: usize) -> Kiuas16Bus {
         let mut rom = vec![0; BOOT_ROM_BYTES];
         for (index, instruction) in instructions.iter().enumerate() {
             let start = index * 4;
             rom[start..start + 4].copy_from_slice(&instruction.to_le_bytes());
         }
-        Kiuas16Bus::new_with_ram_size(rom, 16).unwrap()
+        Kiuas16Bus::new_with_ram_size(rom, ram_bytes).unwrap()
     }
 
     fn encode_r(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
         (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+    }
+
+    fn encode_atomic(funct5: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
+        (funct5 << 27) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x2f
     }
 
     #[test]
@@ -769,7 +945,8 @@ mod tests {
         core.step(&mut bus).unwrap();
         assert_eq!(core.register(9), Some(1));
 
-        let mut unsupported = bus_with_program(&[0x0000_a1af]);
+        let invalid_atomic = encode_atomic(0b11111, 0, 0, 2, 3);
+        let mut unsupported = bus_with_program(&[invalid_atomic]);
         core.pc = BOOT_ROM.start;
         let trap = core.step(&mut unsupported).unwrap_err();
         assert_eq!(
@@ -777,7 +954,7 @@ mod tests {
             CoreTrap {
                 pc: BOOT_ROM.start,
                 cause: CoreTrapCause::IllegalInstruction,
-                value: 0x0000_a1af,
+                value: invalid_atomic as u64,
             }
         );
 
@@ -833,6 +1010,161 @@ mod tests {
         assert_eq!(core.register(14), Some(0x7fff_ffff_ffff_ffff));
         assert_eq!(core.register(17), Some(0xffff_ffff_8000_0000));
         assert_eq!(core.register(18), Some(0));
+    }
+
+    #[test]
+    fn rv64_a_extension_executes_word_amos_with_sign_extended_results() {
+        let instructions = [
+            0xffd0_0113,
+            encode_atomic(0b00000, 2, 1, 2, 3),
+            encode_atomic(0b00001, 2, 1, 2, 4),
+            encode_atomic(0b00100, 2, 1, 2, 5),
+            encode_atomic(0b01000, 2, 1, 2, 6),
+            encode_atomic(0b01100, 2, 1, 2, 7),
+            encode_atomic(0b10000, 2, 1, 2, 8),
+            encode_atomic(0b10100, 2, 1, 2, 9),
+            encode_atomic(0b11000, 2, 1, 2, 10),
+            encode_atomic(0b11100, 2, 1, 2, 11),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        bus.write(RAM.start, &5i32.to_le_bytes()).unwrap();
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = RAM.start;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(3), Some(5));
+        assert_eq!(core.register(4), Some(2));
+        assert_eq!(core.register(5), Some(0xffff_ffff_ffff_fffd));
+        assert_eq!(core.register(6), Some(0));
+        assert_eq!(core.register(7), Some(0xffff_ffff_ffff_fffd));
+        assert_eq!(core.register(8), Some(0xffff_ffff_ffff_fffd));
+        assert_eq!(core.register(9), Some(0xffff_ffff_ffff_fffd));
+        assert_eq!(core.register(10), Some(0xffff_ffff_ffff_fffd));
+        assert_eq!(core.register(11), Some(0xffff_ffff_ffff_fffd));
+        let mut stored = [0; 4];
+        bus.read(RAM.start, &mut stored).unwrap();
+        assert_eq!(i32::from_le_bytes(stored), -3);
+    }
+
+    #[test]
+    fn rv64_a_extension_distinguishes_signed_and_unsigned_min_max() {
+        let instructions = [
+            encode_atomic(0b10000, 5, 1, 2, 6),
+            encode_atomic(0b10100, 5, 2, 2, 7),
+            encode_atomic(0b11000, 5, 3, 2, 8),
+            encode_atomic(0b11100, 5, 4, 2, 9),
+        ];
+        let mut bus = bus_with_program_and_ram_size(&instructions, 32);
+        for offset in [0, 8, 16, 24] {
+            bus.write(RAM.start + offset, &0x8000_0000u32.to_le_bytes())
+                .unwrap();
+        }
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = RAM.start;
+        core.integer_registers[2] = RAM.start + 8;
+        core.integer_registers[3] = RAM.start + 16;
+        core.integer_registers[4] = RAM.start + 24;
+        core.integer_registers[5] = 0x7fff_ffff;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(6), Some(0xffff_ffff_8000_0000));
+        assert_eq!(core.register(7), Some(0xffff_ffff_8000_0000));
+        assert_eq!(core.register(8), Some(0xffff_ffff_8000_0000));
+        assert_eq!(core.register(9), Some(0xffff_ffff_8000_0000));
+        let mut signed_min = [0; 4];
+        let mut signed_max = [0; 4];
+        let mut unsigned_min = [0; 4];
+        let mut unsigned_max = [0; 4];
+        bus.read(RAM.start, &mut signed_min).unwrap();
+        bus.read(RAM.start + 8, &mut signed_max).unwrap();
+        bus.read(RAM.start + 16, &mut unsigned_min).unwrap();
+        bus.read(RAM.start + 24, &mut unsigned_max).unwrap();
+        assert_eq!(u32::from_le_bytes(signed_min), 0x8000_0000);
+        assert_eq!(u32::from_le_bytes(signed_max), 0x7fff_ffff);
+        assert_eq!(u32::from_le_bytes(unsigned_min), 0x7fff_ffff);
+        assert_eq!(u32::from_le_bytes(unsigned_max), 0x8000_0000);
+    }
+
+    #[test]
+    fn rv64_a_extension_tracks_lr_sc_address_width_and_intervening_stores() {
+        let instructions = [
+            0x0070_0113,
+            encode_atomic(0b00010, 0, 1, 2, 3),
+            encode_atomic(0b00011, 2, 1, 2, 4),
+            encode_atomic(0b00010, 0, 1, 2, 5),
+            0x0020_a023,
+            encode_atomic(0b00011, 2, 1, 2, 6),
+            encode_atomic(0b00010, 0, 1, 2, 7),
+            encode_atomic(0b00011, 2, 1, 3, 8),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        bus.write(RAM.start, &0x8000_0000u32.to_le_bytes()).unwrap();
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = RAM.start;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(3), Some(0xffff_ffff_8000_0000));
+        assert_eq!(core.register(4), Some(0));
+        assert_eq!(core.register(5), Some(7));
+        assert_eq!(core.register(6), Some(1));
+        assert_eq!(core.register(7), Some(7));
+        assert_eq!(core.register(8), Some(1));
+        let mut stored = [0; 4];
+        bus.read(RAM.start, &mut stored).unwrap();
+        assert_eq!(u32::from_le_bytes(stored), 7);
+    }
+
+    #[test]
+    fn rv64_a_extension_executes_doubleword_lr_sc_and_amo() {
+        let instructions = [
+            0x0010_0113,
+            encode_atomic(0b00010, 0, 1, 3, 3),
+            encode_atomic(0b00011, 2, 1, 3, 4),
+            encode_atomic(0b00000, 2, 1, 3, 5),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        bus.write(RAM.start, &0x8000_0000_0000_0000u64.to_le_bytes())
+            .unwrap();
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = RAM.start;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.register(3), Some(0x8000_0000_0000_0000));
+        assert_eq!(core.register(4), Some(0));
+        assert_eq!(core.register(5), Some(1));
+        let mut stored = [0; 8];
+        bus.read(RAM.start, &mut stored).unwrap();
+        assert_eq!(u64::from_le_bytes(stored), 2);
+    }
+
+    #[test]
+    fn rv64_a_extension_external_bus_write_invalidates_lr_reservation() {
+        let instructions = [
+            encode_atomic(0b00010, 0, 1, 2, 3),
+            encode_atomic(0b00011, 2, 1, 2, 4),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        bus.write(RAM.start, &5u32.to_le_bytes()).unwrap();
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = RAM.start;
+        core.integer_registers[2] = 9;
+        core.step(&mut bus).unwrap();
+        bus.write(RAM.start + 8, &1u32.to_le_bytes()).unwrap();
+        core.step(&mut bus).unwrap();
+
+        assert_eq!(core.register(3), Some(5));
+        assert_eq!(core.register(4), Some(1));
+        let mut stored = [0; 4];
+        bus.read(RAM.start, &mut stored).unwrap();
+        assert_eq!(u32::from_le_bytes(stored), 5);
     }
 
     #[test]

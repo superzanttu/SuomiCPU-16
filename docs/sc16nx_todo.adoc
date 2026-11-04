@@ -561,13 +561,16 @@ wrap through old 16/30/32-bit paths.
 RV64I integer-core slice over the Kiuas16 ROM/RAM bus. It currently handles
 integer immediate/register operations, word sign extension, branches and
 jumps, aligned integer loads/stores, and integer multiply/divide operations
-including word sign extension, zero divisors, and signed overflow. It
+including word sign extension, zero divisors, and signed overflow. It also
+executes RV64A LR/SC and word/doubleword AMOs against RAM; bus writes
+conservatively invalidate the single-hart reservation. The aq/rl bits have no
+inter-hart ordering effect in the current one-hart, synchronous core. It
 explicitly traps on unsupported compressed encodings; FENCE/FENCE.I are safe
 no-ops for this synchronous, uncached core. Execution tests exercise
 arithmetic, word results, branches, RAM store/load, M-extension edge cases,
-and faults. A/C, floating point, privilege/trap delivery, Sv39, and full
-acceptance coverage remain unimplemented; this is not RV64GC and the task
-remains unchecked.
+atomic operations/reservations, and faults. C, floating point,
+privilege/trap delivery, Sv39, and full acceptance coverage remain
+unimplemented; this is not RV64GC and the task remains unchecked.
 
 ** [ ] [[nx-privilege]] *P0 / Implement M/S/U traps, control state, and PMP.*
    Define exception/interrupt delegation, status/counter access, trap
