@@ -195,6 +195,66 @@ delivers the pending trap/interrupt. The machine also exposes the core and bus
 for observation or device setup, plus headless UART input/output methods.
 This is a headless integration surface, not a complete host runtime or BIOS.
 
+[[headless-runner]]
+=== Bounded headless host runner
+
+The Rust +kiuas16::runtime::run_headless()+ adapter and separate
++kiuas16-run+ binary execute this same machine stepping path without a
+graphics context or the legacy SC-16 runtime. They do not interpret guest
+syscalls, construct processes, generate a shell prompt, load an ELF directly,
+or initialize guest queues. Execution always starts at the protected ROM
+reset vector with the standard one-hart/128 MiB board.
+
+[source,powershell]
+----
+cargo run --bin kiuas16-run -- --rom C:\path\kiuas16-rom.bin --steps 1000000 --root C:\path\root.raw --serial-input C:\path\serial.bin
+----
+
+The caller supplies a raw ROM of exactly +BOOT_ROM_BYTES+ (61440 bytes),
+mapped at +0x1000+. This is not the legacy SC-16 +firmware/bios.bin+ format.
+The runner does not build or supply Sytyke firmware. +--steps+ is a required,
+nonzero 64-bit budget of attempted/idle machine cycles; virtual time advances
+without consulting host wall time. Budget exhaustion is reported explicitly,
+not interpreted as boot completion or guest shutdown.
+
+Only +--root+ attaches a disk. It opens an existing nonempty, 512-byte-aligned
+raw image read-only by default. +--root-writable+ is an explicit opt-in and
+requires +--root+; use disposable copies for writable experiments. The
+runner never creates, formats, guesses, or rewrites an image at startup.
+Guest requests can access only sectors of that explicitly opened media.
+Successful guest writes follow the negotiated Kiulu durability rules;
+stopping at the cycle budget does not synthesize a guest flush or shutdown.
+Dropping the machine closes its media handles.
+
++--serial-input+ supplies binary bytes from a file, queued in order only
+when the UART has room. This host-side backpressure avoids overflowing the
+hardware FIFO; it does not simulate baud timing or terminal key events.
+The report counts bytes accepted into the FIFO, not bytes consumed by guest
+software. Unaccepted input at budget exhaustion is an explicit CLI error.
+Only guest UART output goes to stdout, including binary bytes. Host
+diagnostics, cycle/outcome counts, final PC/time, and the most recent
+synchronous trap go to stderr.
+
+Guest traps are delivered to guest handlers normally, including ECALL;
+their presence alone is not an OS-level failure. +--deny-traps+ makes any
+synchronous trap a CLI error after the bounded run, for strict exception-free
+fixtures. Media backend errors, unhandled core errors, serial output/flush
+failures, invalid inputs, and attachment failures are explicit errors.
+A successful command means the requested bounded run completed under these
+rules, never that a BIOS, kernel, shell, or acceptance workload succeeded.
+Callers must assert the required guest output and state independently.
+
+The integration tests in +tests/kiuas16_runtime.rs+ execute ROM instructions
+that negotiate modern Virtio, construct RAM descriptor/ring metadata, perform
+raw-sector reads/writes/flushes, acknowledge interrupts, and reset the device.
+A separate fixture loads an executable sector through Kiulu DMA, jumps to
+that RAM payload in M-mode, reads +mhartid+, resets the firmware-used
+controller, and performs a new read using fresh device state. This is a
+fixed-encoding hardware/handoff fixture, not Rust-compiled Sytyke, an ELF
+loader, a specified boot volume, or the pinned xv6 kernel.
+
+=== Memory ordering
+
 CPU and device accesses are coherent and ordered according to the RISC-V
 memory model and explicit fence instructions. Device DMA may read or write
 RAM only, must validate the complete physical range without integer overflow,

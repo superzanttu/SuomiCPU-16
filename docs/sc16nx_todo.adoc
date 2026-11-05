@@ -434,9 +434,20 @@ descriptors fail before a chain is returned. Focused valid/malformed-chain
 regressions pass. An initial Kiulu queue engine now executes explicitly
 attached sector media, with checked MMIO negotiation, split rings, DMA,
 completion IRQs, and reset. Guest-header checks cover its register offsets
-and queue limit as well as board constants. Firmware and xv6 consumers do not
-exist yet, so cross-consumer and firmware/kernel execution acceptance remain
+and queue limit as well as board constants. Rust-compiled firmware and xv6
+consumers do not exist yet, so cross-consumer and firmware/kernel execution acceptance remain
 open. Keep this child unchecked.
++
+*ROM/runtime integration progress:* The separate +kiuas16-run+ binary
+attaches explicitly selected raw media and executes protected ROM through
+the deterministic headless machine, without the legacy runtime, graphics,
+host queue initialization, or direct executable loading. Production CLI
+tests now execute ROM-owned Virtio negotiation and queue setup, file-backed
+read/write/flush, interrupt acknowledgement, and reset. A sector-loaded
+M-mode payload reads +mhartid+, resets the ROM-used controller, renegotiates,
+and reads a new sector. This adds executable consumer evidence using fixed
+RV64 encodings; it is not Rust-compiled Sytyke or the pinned xv6 kernel.
+Cross-consumer acceptance remains open and this task remains unchecked.
 
 === Phase 1: focused Rust refactoring
 
@@ -453,6 +464,16 @@ open. Keep this child unchecked.
 *Acceptance:* A deterministic headless machine runs without a graphics
 context; adapters can be replaced in tests. Existing retained execution
 regressions pass through extraction, with intentional target changes tested separately.
++
+*Headless host-adapter progress:* +src/kiuas16/runtime.rs+ provides bounded
+execution with scripted UART input backpressure, binary output through a
+replaceable Rust writer, and explicit media/output errors. The separate
++kiuas16-run+ command owns filesystem/media attachment and stdout/stderr
+presentation. Guest traps remain architectural guest behavior, not host
+syscalls. Integration tests cover recovered ECALL, WFI, exact virtual-cycle
+accounting, serial input longer than the FIFO, injectable writer/media
+failures, and production command execution. This establishes a replaceable
+headless adapter; it does not complete the broader core/device extraction.
 
 ** [ ] [[nx-os-boundary]] *P0 / Remove host OS policy from the successor CPU.*
    Keep scheduling, allocation policy, authentication, processes, files,
@@ -776,8 +797,15 @@ still missing; keep this task unchecked.
 *Headless guest-I/O integration (2026-11-05):* +Kiuas16Machine+ now routes
 host serial input to the bus and exposes captured output while executing guest
 instructions through MMIO. The regression verifies an RX-to-guest-to-TX
-round trip. Runtime/windowed adapters, baud timing, complete UART semantics,
+round trip. Windowed adapters, baud timing, complete UART semantics,
 and pinned-driver acceptance remain open.
++
+*Bounded runtime adapter progress:* The new +kiuas16-run+ command accepts a
+serial byte script and sends bytes only when the hardware RX FIFO has room.
+Binary guest TX goes only to stdout; machine diagnostics go only to stderr.
+Tests round-trip a script longer than the FIFO without overrun and reject
+unaccepted input at budget exhaustion. Windowed adapters, baud timing,
+complete 16550 semantics, and actual pinned-driver acceptance remain open.
 
 === Phase 4: sector storage and PC-like BIOS
 
@@ -814,8 +842,28 @@ The pinned xv6 driver only negotiates low feature bits; an explicit future
 driver change must accept upper-page +VIRTIO_F_VERSION_1+. The regression
 +pinned_xv6_low_feature_page_alone_is_not_modern_negotiation+ records this
 remaining integration gap rather than silently accepting invalid features.
-Runtime image attachment, firmware/kernel consumers, and their production
-execution tests remain open. Keep this child unchecked.
+Rust-compiled firmware/kernel consumers and their production execution tests
+remain open. Keep this child unchecked.
++
+*ROM-to-media execution progress:* Runtime root-image attachment is now
+implemented by +kiuas16-run+, read-only unless explicitly opted into writes.
+ROM instructions perform negotiation, all queue initialization, sector
+read/write/flush, IRQ acknowledgement, and reset against disposable raw
+files through the production CLI. Tests verify exact UART bytes, used-ring
+counts, persisted bytes after process exit, read-only rejection without
+media mutation, invalid media, and explicit backend errors. A loaded
+M-mode payload reinitializes the firmware-used device and completes another
+read with fresh indices, without stale completion replay. The remaining
+Rust-compiled firmware/kernel consumers and pinned-driver negotiation
+adjustment are not complete; keep this task unchecked.
++
+*Runtime validation:* +cargo test --test kiuas16_runtime --bin kiuas16-run
+-j 1 -- --test-threads=1+ passes 11 integration tests and 2 CLI unit tests.
+The full serial workspace suite passes, including all 582 library tests
+and every integration/tool target. +cargo check --lib --bin kiuas16-run -j 1+,
++cargo fmt --check+, and +git diff --check+ pass. This adds verified
+implementation progress without closing a roadmap child or parent:
+27 P0 children and 6 P0 parents remain unchecked.
 +
 *Validation:* On the Windows native host with the current working tree,
 +cargo test --lib kiuas16:: -j 1 -- --test-threads=1+ passes all 83
@@ -882,6 +930,16 @@ Reset/retry works; a host direct-ELF loader cannot satisfy these tests.
 *Acceptance:* The pinned xv6 startup can initialize PMP, translation,
 timers, interrupts, and devices itself. Reinitializing a firmware-used device
 does not leak a pending request or stale interrupt into the kernel.
++
+*Hardware handoff fixture:* A ROM-executed Kiulu read loads an executable
+sector into RAM and transfers control using guest +jalr+. The payload can
+read the machine-only +mhartid+ CSR, resets the firmware-used controller,
+observes cleared interrupt/readiness state, renegotiates modern features,
+and reads a different sector with a fresh used index. The production CLI
+test asserts all output bytes and unchanged read-only media. This validates
+the current hardware ownership transition, not compiled Sytyke, an ELF
+handoff, reserved memory/stack conventions, or pinned xv6 startup acceptance.
+The task remains unchecked.
 
 === Phase 5: actual xv6 bring-up
 

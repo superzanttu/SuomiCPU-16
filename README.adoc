@@ -14,6 +14,12 @@ These are planned capabilities, not features of the current emulator.
 SisuOS/SaunaShell remains a frozen source example, not an OS being developed
 or ported to the successor machine.
 
+The separate +kiuas16-run+ command executes an explicitly supplied RV64 ROM
+headlessly with optional raw-sector media and scripted serial input. It is
+an initial hardware runner, not the finished Sytyke BIOS or an xv6 boot path.
+See the link:docs/kiuas16_machine_contract.adoc#headless-runner[headless runner]
+for its input format, bounded execution, and media safety rules.
+
 == Current SC-16 features
 * Full emulation of the SC-16 architecture.
 * Integrated assembler for SC-16 assembly language.

@@ -280,3 +280,16 @@ malformed/DMA rejection, IRQ acknowledgement/suppression, host I/O failures,
 device/cold reset, and raw-file persistence after reopen. An RV64 store
 instruction notifies the device and a subsequent load observes read DMA.
 These are device/core fixtures, not Rust-compiled firmware or xv6 execution.
+
+The separate +kiuas16-run+ host runner now attaches explicitly named raw
+root media, read-only by default. Its production CLI and runtime integration
+tests run ROM-owned feature negotiation, queue construction, reads, writes,
+flushes, interrupt acknowledgement, and reset against disposable files.
+A sector-loaded M-mode payload resets the ROM-used controller and reads
+another sector after renegotiating; host code does not seed its RAM queues
+or directly load the executable payload. Other tests cover serial
+backpressure, separate UART/diagnostic streams, handled guest traps, explicit
+backend/output errors, malformed inputs, persistence, and closed media
+handles. Run these with
++cargo test --test kiuas16_runtime --bin kiuas16-run -j 1 -- --test-threads=1+.
+These fixtures still do not provide actual Sytyke or xv6 consumers.

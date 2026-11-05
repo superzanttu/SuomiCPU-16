@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 pub mod kiulu;
+pub mod runtime;
 pub use kiulu::{FileSectorMedia, SectorMedia};
 
 pub const PHYSICAL_ADDRESS_BITS: u32 = 56;
@@ -417,14 +418,9 @@ impl Uart16550 {
     }
 
     fn receive(&mut self, input: &[u8]) -> usize {
-        let capacity = if self.fifo_control & 1 != 0 {
-            Self::FIFO_CAPACITY
-        } else {
-            1
-        };
         let mut accepted = 0;
         for &byte in input {
-            if self.receive_fifo.len() >= capacity {
+            if self.receive_capacity() == 0 {
                 self.line_status_errors |= 0x02;
             } else {
                 self.receive_fifo.push_back(byte);
@@ -432,6 +428,15 @@ impl Uart16550 {
             }
         }
         accepted
+    }
+
+    fn receive_capacity(&self) -> usize {
+        let capacity: usize = if self.fifo_control & 1 != 0 {
+            Self::FIFO_CAPACITY
+        } else {
+            1
+        };
+        capacity.saturating_sub(self.receive_fifo.len())
     }
 
     fn take_output(&mut self) -> Vec<u8> {
@@ -706,6 +711,10 @@ impl Kiuas16Bus {
 
     pub fn take_uart_output(&mut self) -> Vec<u8> {
         self.uart.take_output()
+    }
+
+    pub fn uart_input_capacity(&self) -> usize {
+        self.uart.receive_capacity()
     }
 
     pub fn attach_root_block(

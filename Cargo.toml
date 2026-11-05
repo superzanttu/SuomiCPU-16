@@ -34,3 +34,7 @@ path = "src/tools/sc16build.rs"
 [[bin]]
 name = "sc16gallery"
 path = "src/tools/sc16gallery.rs"
+
+[[bin]]
+name = "kiuas16-run"
+path = "src/tools/kiuas16_run.rs"
