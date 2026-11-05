@@ -253,6 +253,66 @@ controller, and performs a new read using fresh device state. This is a
 fixed-encoding hardware/handoff fixture, not Rust-compiled Sytyke, an ELF
 loader, a specified boot volume, or the pinned xv6 kernel.
 
+[[rom-assembler]]
+=== Initial Rust-native ROM assembler
+
++kiuas16-asm+ and +assembler::rv64::assemble_boot_rom()+ assemble a
+single source unit directly into the 61440-byte raw ROM accepted by the
+runner. Source starts at +0x1000+; remaining ROM bytes are zero-filled.
+No external assembler or linker is invoked. The existing +sc16asm+ command
+and legacy SC-16 image format are unchanged.
+
+[source,powershell]
+----
+cargo run --bin kiuas16-asm -- .\tests\fixtures\kiuas16_storage.S C:\path\storage-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\storage-rom.bin --root C:\path\disposable.raw --steps 300 --deny-traps
+cargo test --test kiuas16_assembler -j 1 -- --test-threads=1
+----
+
+The storage fixture needs at least two sectors and reads sector 1. Its binary
+UART output is +4b 52 00 01 00 01 03 00+ when that sector contains +R+ bytes
+and media is read-only. Adding +--root-writable+ changes the fourth output
+byte to zero and persists +W+ as the first byte of sector 1; the remaining
+sector bytes are retained. The guest negotiates modern Virtio including
+flush, builds RAM queues, reads/writes/flushes, observes completion/IRQ state,
+acknowledges the IRQ, and resets the controller. Nested calls save/restore
++ra+ on a 16-byte-aligned RAM stack. The integration test creates disposable
+media, checks both exact output variants and persisted disk bytes, and never
+uses a user disk.
+
+Supported syntax is intentionally limited:
+
+* Lowercase RV64 integer register names +x0..x31+ and standard ABI aliases,
+  including +fp+; comma-separated operands and +offset(register)+ memory.
+* +lui+, +auipc+, integer immediate arithmetic/logical/comparison/shift
+  instructions, base register arithmetic/logical/comparison/shift instructions,
+  +addw/subw+, +mul/div/divu/rem/remu+, integer loads/stores, all six base
+  conditional branches, +jal rd,target+, and +jalr rd,offset(base)+.
+* +nop+, +mv+, +ret+, +j+, +call+, +li+, and +la+.
+  +li+ accepts signed 32-bit constants and emits +lui/addiw+.
+  +la+ emits checked local PC-relative +auipc/addi+.
+  +call+ is a checked local +jal+, not a long-call relocation.
+* +wfi+, +ecall+, +ebreak+, +mret+, +sret+, +fence+, and +fence.i+
+  with no operands. Explicit fence predecessor/successor lists are unsupported.
+* Named forward/backward labels; branch/jump numbers are byte displacements
+  from the instruction PC. Instructions and direct branch/jump targets must
+  be four-byte aligned; compressed instructions are not supported.
+* +.text+, +.globl/.global+, +.byte+, +.word+ (32 bits), +.dword+ (64 bits),
+  +.zero+, and power-of-two +.balign+. Data is little-endian; label data
+  operands resolve to absolute ROM addresses. Global declarations require a
+  definition, but do not select an entry point or export an object symbol.
+  Numeric operands reuse the shared assembler's integer-literal parser.
+* +#+ comments. Preprocessor directives, expressions, numeric local labels,
+  other sections/directives, CSR operands, F/D/A/C instructions, external
+  symbols, relocatable objects, and ELF output are not supported.
+
+Malformed input, unknown operations, unresolved/duplicate labels, immediate
+and ROM overflow, and misaligned instructions diagnose with source line
+numbers. The CLI assembles successfully before touching the destination and
+rejects overwriting the source path. These source-built assembly fixtures
+advance the toolchain path, but do not provide compiled-C, independent LP64D
+call certification, Sytyke, or xv6 acceptance.
+
 === Memory ordering
 
 CPU and device accesses are coherent and ordered according to the RISC-V

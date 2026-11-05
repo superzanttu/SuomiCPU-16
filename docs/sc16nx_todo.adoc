@@ -639,6 +639,27 @@ cleanup, and preserved registers rather than assembly substrings alone.
 *Acceptance:* Independent instruction bytes, branch ranges, relocation
 fixtures, and executed assembly agree. Unknown directives, illegal operands,
 misalignment, and out-of-range encodings diagnose instead of being dropped.
++
+*Initial ROM-assembly slice:* +src/assembler/rv64.rs+ and the separate
++kiuas16-asm+ command now assemble one source unit into the protected raw ROM
+accepted by +kiuas16-run+. The checked subset includes integer operations,
+loads/stores, local labels and PC-relative addresses, stack calls, alignment,
+and little-endian data directives. No external build tool is invoked and the
+legacy SC-16 assembler remains unchanged. See
+link:kiuas16_machine_contract.adoc#rom-assembler[supported syntax and limits].
++
+*Execution evidence:* +cargo test --test kiuas16_assembler --test kiuas16_runtime
+--bin kiuas16-asm -j 1 -- --test-threads=1+ checks independent instruction
+bytes and branch/jump bounds, signed constant edges, label/data layout,
+line-numbered invalid-input diagnostics, source/output preservation, and
+production CLI execution. +tests/fixtures/kiuas16_storage.S+ performs nested
+stack calls and UART output, then guest-owned modern Virtio negotiation,
+RAM queue construction, read/write/flush, completion/IRQ observation,
+acknowledgement, and reset. Disposable read-only and writable images have
+exact UART and persisted-byte assertions. These are source-assembled guests,
+not fixed-encoding ROM builders or compiled C. Preprocessing, CSR/compressed
+instruction syntax, relocatable objects, ELF linking, and compiler-produced
+guests remain open; keep this task and its parent unchecked.
 
 ** [ ] [[nx-elf-linker]] *P0 / Link and validate ELF64 entirely in Rust.*
    Resolve symbols across translation units and implement required

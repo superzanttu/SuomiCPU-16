@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod rv64;
+
 const MEMORY_SIZE: u32 = 1 << 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
