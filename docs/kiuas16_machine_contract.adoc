@@ -223,7 +223,11 @@ Its context outputs feed the core's external interrupt pending state. Höyry
 drives source 10; the other board-device sources are not wired yet. The
 headless +Kiuas16Machine+ single-step interface now connects this core and bus,
 so timer and PLIC behavior use one deterministic execution loop. Timed device
-peripherals and a host runtime remain unimplemented.
+peripherals and a host runtime remain unimplemented. Machine-level tests now
+execute an S-mode timer handler that rearms +stimecmp+ and returns to guest
+code, and a UART external-interrupt handler that claims the PLIC source,
+consumes RX data, completes the claim, and resumes guest execution. Time
+advances exactly once per machine step; no host wall clock is consulted.
 
 == Höyry UART
 
@@ -250,14 +254,16 @@ hypervisor/vector extensions, 32-bit execution, physical address aliasing,
 and implicit legacy SC-16 devices are outside this contract. The machine is
 not advertised as real Linux or as complete RISC-V platform compatibility.
 
-This contract is accepted only when the implementation has executable tests
-for reset values and ROM access, the full-width physical-address boundary,
-every RAM edge and unmapped hole, one-hart capability reporting, privilege
-transitions, Sv39 faults and ADUE updates, PMP checks, Sstc compare/interrupt
-behavior, DMA boundary rejection, and the pinned xv6 kernel handoff. Tests
-must show failed accesses do not wrap, alias, or partially commit. Until those
-tests pass, both this contract and the corresponding roadmap task remain
-planned rather than implemented.
+The +nx-machine-contract+ roadmap item tracks completion of this target
+specification and its physical-boundary, reset, and capability fixtures; it
+does not claim implementation of every architectural requirement above.
+Current tests cover reset values and ROM access, the full-width physical
+address boundary, configured RAM limits and unmapped holes, one-hart
+capability reporting, partial privilege transitions, Sv39 faults and ADUE
+updates, the implemented PMP entry, Sstc compare/interrupt behavior, and DMA
+boundary rejection. They must show failed accesses do not wrap, alias, or
+partially commit. Full RV64GC and xv6 handoff conformance remain separate
+implementation gates; the pinned kernel handoff is tracked by the BIOS tasks.
 
 == Pinned compatibility sources
 

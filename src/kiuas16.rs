@@ -3436,6 +3436,115 @@ mod tests {
     }
 
     #[test]
+    fn kiuas16_machine_runs_supervisor_timer_handler_and_rearms_compare() {
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        let guest: [u32; 3] = [0x0013_0313; 3];
+        for (index, instruction) in guest.iter().enumerate() {
+            let start = index * 4;
+            rom[start..start + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let handler = [encode_csr(0x14d, 7, 0b001, 0), 0x0012_8293, 0x1020_0073];
+        for (index, instruction) in handler.iter().enumerate() {
+            let start = 0x100 + index * 4;
+            rom[start..start + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 32).unwrap();
+        allow_full_physical_range(&mut machine.core);
+        machine.core.privilege = PrivilegeMode::Supervisor;
+        machine.core.mideleg = 1 << 5;
+        machine.core.mie = 1 << 5;
+        machine.core.mstatus = MSTATUS_SIE;
+        machine.core.menvcfg = 1 << 63;
+        machine.core.stvec = BOOT_ROM.start + 0x100;
+        machine.core.stimecmp = 2;
+        machine.core.integer_registers[7] = 10;
+
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(
+            machine.step().unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorTimer)
+        );
+        assert_eq!(machine.core.scause, (1 << 63) | 5);
+        assert_eq!(machine.core.minstret, 2);
+
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.stimecmp, 10);
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.register(5), Some(1));
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.privilege(), PrivilegeMode::Supervisor);
+        assert_eq!(machine.core.pc, BOOT_ROM.start + 8);
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.register(6), Some(3));
+        assert_eq!(machine.virtual_time(), 7);
+        assert_eq!(machine.core.mcycle, 7);
+        assert_eq!(machine.core.minstret, 6);
+    }
+
+    #[test]
+    fn kiuas16_machine_runs_uart_external_handler_claim_and_completion() {
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        rom[..4].copy_from_slice(&0x0013_0313u32.to_le_bytes());
+        let handler: [u32; 5] = [
+            (4 << 20) | (11 << 15) | (0b010 << 12) | (12 << 7) | 0x03,
+            (14 << 15) | (0b100 << 12) | (13 << 7) | 0x03,
+            (12 << 20) | (11 << 15) | (0b010 << 12) | (4 << 7) | 0x23,
+            0x0012_8293,
+            0x1020_0073,
+        ];
+        for (index, instruction) in handler.iter().enumerate() {
+            let start = 0x100 + index * 4;
+            rom[start..start + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 32).unwrap();
+        allow_full_physical_range(&mut machine.core);
+        machine.core.privilege = PrivilegeMode::Supervisor;
+        machine.core.mideleg = 1 << 9;
+        machine.core.mie = 1 << 9;
+        machine.core.mstatus = MSTATUS_SIE;
+        machine.core.stvec = BOOT_ROM.start + 0x100;
+        machine.core.integer_registers[11] =
+            PLIC.start + VihtaPlic::CONTEXT_BASE + VihtaPlic::CONTEXT_STRIDE;
+        machine.core.integer_registers[14] = UART.start;
+        machine
+            .bus
+            .write(
+                PLIC.start + u64::from(UART_PLIC_SOURCE) * 4,
+                &1u32.to_le_bytes(),
+            )
+            .unwrap();
+        machine
+            .bus
+            .write(
+                PLIC.start + VihtaPlic::ENABLE_BASE + VihtaPlic::ENABLE_STRIDE,
+                &(1u32 << UART_PLIC_SOURCE).to_le_bytes(),
+            )
+            .unwrap();
+        machine.bus.write(UART.start + 1, &[1]).unwrap();
+        assert_eq!(machine.receive_uart_input(b"x").unwrap(), 1);
+
+        assert_eq!(
+            machine.step().unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorExternal)
+        );
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.register(12), Some(u64::from(UART_PLIC_SOURCE)));
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.register(13), Some(u64::from(b'x')));
+        assert!(!machine.bus.plic_interrupt_pending(1));
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert!(!machine.bus.plic_interrupt_pending(1));
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.register(5), Some(1));
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.pc, BOOT_ROM.start);
+        assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+        assert_eq!(machine.core.register(6), Some(1));
+        assert_eq!(machine.virtual_time(), 7);
+    }
+
+    #[test]
     fn kiuas16_machine_reset_preserves_memory_and_clears_volatile_state() {
         let mut rom = vec![0; BOOT_ROM_BYTES];
         rom[..4].copy_from_slice(&0x0070_0093u32.to_le_bytes());
