@@ -399,6 +399,16 @@ pub enum CoreTrapCause {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreInterruptCause {
+    SupervisorSoftware,
+    MachineSoftware,
+    SupervisorTimer,
+    MachineTimer,
+    SupervisorExternal,
+    MachineExternal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoreTrap {
     pub pc: u64,
     pub cause: CoreTrapCause,
@@ -409,6 +419,8 @@ pub struct CoreTrap {
 pub enum StepOutcome {
     Retired,
     TrapDelivered(CoreTrap),
+    InterruptDelivered(CoreInterruptCause),
+    WaitingForInterrupt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,6 +451,7 @@ pub struct Rv64Core {
     satp: u64,
     mcycle: u64,
     minstret: u64,
+    waiting_for_interrupt: bool,
     reservation: Option<(u64, u8, u64)>,
 }
 
@@ -459,6 +472,7 @@ const MSTATUS_WRITABLE_MASK: u64 =
     MSTATUS_SSTATUS_MASK | MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK | MSTATUS_MPRV;
 const MIE_MASK: u64 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11);
 const MIP_SOFTWARE: u64 = 1 << 1;
+const MIP_MASK: u64 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11);
 const MIDELEG_MASK: u64 = (1 << 1) | (1 << 5) | (1 << 9);
 const MEDELEG_MASK: u64 = (1 << 16) - 1;
 const SCOUNTEREN_MASK: u64 = 0b111;
@@ -834,6 +848,7 @@ impl Rv64Core {
             satp: COLD_RESET_STATE.satp,
             mcycle: COLD_RESET_STATE.mcycle,
             minstret: COLD_RESET_STATE.minstret,
+            waiting_for_interrupt: false,
             reservation: None,
         }
     }
@@ -844,6 +859,15 @@ impl Rv64Core {
 
     pub fn register(&self, index: usize) -> Option<u64> {
         self.integer_registers.get(index).copied()
+    }
+
+    pub fn set_interrupt_pending(&mut self, cause: CoreInterruptCause, pending: bool) {
+        let bit = interrupt_bit(cause);
+        if pending {
+            self.mip |= bit;
+        } else {
+            self.mip &= !bit;
+        }
     }
 
     pub fn deliver_trap(&mut self, trap: CoreTrap) -> Result<(), CoreTrap> {
@@ -901,6 +925,18 @@ impl Rv64Core {
         &mut self,
         bus: &mut Kiuas16Bus,
     ) -> Result<StepOutcome, CoreTrap> {
+        if let Some(cause) = self.pending_interrupt() {
+            self.mcycle = self.mcycle.wrapping_add(1);
+            self.deliver_interrupt(cause);
+            return Ok(StepOutcome::InterruptDelivered(cause));
+        }
+        if self.waiting_for_interrupt {
+            if self.mip & MIP_MASK == 0 {
+                self.mcycle = self.mcycle.wrapping_add(1);
+                return Ok(StepOutcome::WaitingForInterrupt);
+            }
+            self.waiting_for_interrupt = false;
+        }
         match self.step(bus) {
             Ok(()) => Ok(StepOutcome::Retired),
             Err(trap) => {
@@ -908,6 +944,83 @@ impl Rv64Core {
                 Ok(StepOutcome::TrapDelivered(trap))
             }
         }
+    }
+
+    fn pending_interrupt(&self) -> Option<CoreInterruptCause> {
+        const PRIORITY: [CoreInterruptCause; 6] = [
+            CoreInterruptCause::MachineExternal,
+            CoreInterruptCause::MachineSoftware,
+            CoreInterruptCause::MachineTimer,
+            CoreInterruptCause::SupervisorExternal,
+            CoreInterruptCause::SupervisorSoftware,
+            CoreInterruptCause::SupervisorTimer,
+        ];
+        PRIORITY.into_iter().find(|cause| {
+            let bit = interrupt_bit(*cause);
+            if self.mip & self.mie & bit == 0 {
+                return false;
+            }
+            let delegated = self.mideleg & bit != 0;
+            if self.privilege == PrivilegeMode::Machine && delegated {
+                return false;
+            }
+            let target = if delegated {
+                PrivilegeMode::Supervisor
+            } else {
+                PrivilegeMode::Machine
+            };
+            privilege_encoding(self.privilege) < privilege_encoding(target)
+                || (self.privilege == target
+                    && self.mstatus
+                        & (if target == PrivilegeMode::Machine {
+                            MSTATUS_MIE
+                        } else {
+                            MSTATUS_SIE
+                        })
+                        != 0)
+        })
+    }
+
+    fn deliver_interrupt(&mut self, cause: CoreInterruptCause) {
+        let code = interrupt_code(cause);
+        let delegated =
+            self.privilege != PrivilegeMode::Machine && self.mideleg & interrupt_bit(cause) != 0;
+        if delegated {
+            let previous_interrupt_enable = self.mstatus & MSTATUS_SIE != 0;
+            self.mstatus = (self.mstatus & !(MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP))
+                | if previous_interrupt_enable {
+                    MSTATUS_SPIE
+                } else {
+                    0
+                }
+                | if self.privilege == PrivilegeMode::Supervisor {
+                    MSTATUS_SPP
+                } else {
+                    0
+                };
+            self.sepc = self.pc & !1;
+            self.scause = (1 << 63) | code;
+            self.stval = 0;
+            self.privilege = PrivilegeMode::Supervisor;
+            self.pc = trap_vector(self.stvec, code, true);
+        } else {
+            let previous_interrupt_enable = self.mstatus & MSTATUS_MIE != 0;
+            let previous_privilege = privilege_encoding(self.privilege);
+            self.mstatus = (self.mstatus & !(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK))
+                | if previous_interrupt_enable {
+                    MSTATUS_MPIE
+                } else {
+                    0
+                }
+                | (previous_privilege << 11);
+            self.mepc = self.pc & !1;
+            self.mcause = (1 << 63) | code;
+            self.mtval = 0;
+            self.privilege = PrivilegeMode::Machine;
+            self.pc = trap_vector(self.mtvec, code, true);
+        }
+        self.waiting_for_interrupt = false;
+        self.reservation = None;
     }
 
     fn step_inner(&mut self, bus: &mut Kiuas16Bus) -> Result<(), CoreTrap> {
@@ -1064,7 +1177,9 @@ impl Rv64Core {
                     return Err(illegal_instruction(pc, instruction));
                 }
             }
-            0x73 if instruction == 0x1050_0073 => {}
+            0x73 if instruction == 0x1050_0073 => {
+                self.waiting_for_interrupt = true;
+            }
             0x73 if funct3 != 0 => {
                 let csr = (instruction >> 20) as u16;
                 let old = self
@@ -1710,6 +1825,30 @@ fn privilege_encoding(privilege: PrivilegeMode) -> u64 {
         PrivilegeMode::User => 0,
         PrivilegeMode::Supervisor => 1,
         PrivilegeMode::Machine => 3,
+    }
+}
+
+fn interrupt_bit(cause: CoreInterruptCause) -> u64 {
+    1 << interrupt_code(cause)
+}
+
+fn interrupt_code(cause: CoreInterruptCause) -> u64 {
+    match cause {
+        CoreInterruptCause::SupervisorSoftware => 1,
+        CoreInterruptCause::MachineSoftware => 3,
+        CoreInterruptCause::SupervisorTimer => 5,
+        CoreInterruptCause::MachineTimer => 7,
+        CoreInterruptCause::SupervisorExternal => 9,
+        CoreInterruptCause::MachineExternal => 11,
+    }
+}
+
+fn trap_vector(vector: u64, cause: u64, interrupt: bool) -> u64 {
+    let base = vector & !3;
+    if interrupt && vector & 3 == 1 {
+        base.wrapping_add(cause.wrapping_mul(4))
+    } else {
+        base
     }
 }
 
@@ -2578,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn rv64_core_ecall_reports_current_privilege_and_wfi_is_a_nop() {
+    fn rv64_core_ecall_reports_current_privilege_and_diagnostic_wfi_retires() {
         let mut bus = bus_with_program(&[0x0000_0073, 0x1050_0073]);
         let mut core = Rv64Core::cold_reset();
         allow_full_physical_range(&mut core);
@@ -2590,6 +2729,108 @@ mod tests {
         core.pc += 4;
         core.step(&mut bus).unwrap();
         assert_eq!(core.pc, BOOT_ROM.start + 8);
+    }
+
+    #[test]
+    fn rv64_step_delivers_delegated_interrupts_with_vectored_entry_and_no_retirement() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::User;
+        core.mideleg = 1 << 5;
+        core.mie = 1 << 5;
+        core.mstatus = MSTATUS_SIE;
+        core.stvec = BOOT_ROM.start + 0x100 | 1;
+        core.set_interrupt_pending(CoreInterruptCause::SupervisorTimer, true);
+
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorTimer)
+        );
+        assert_eq!(core.privilege(), PrivilegeMode::Supervisor);
+        assert_eq!(core.pc, BOOT_ROM.start + 0x100 + 5 * 4);
+        assert_eq!(core.sepc, BOOT_ROM.start);
+        assert_eq!(core.scause, (1 << 63) | 5);
+        assert_eq!(core.stval, 0);
+        assert_eq!(core.mstatus & MSTATUS_SIE, 0);
+        assert_ne!(core.mstatus & MSTATUS_SPIE, 0);
+        assert_eq!(core.mstatus & MSTATUS_SPP, 0);
+        assert_eq!(core.mcycle, 1);
+        assert_eq!(core.minstret, 0);
+    }
+
+    #[test]
+    fn rv64_step_respects_global_interrupt_mask_and_source_priority() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.mie = (1 << 3) | (1 << 7);
+        core.mtvec = BOOT_ROM.start + 0x100;
+        core.set_interrupt_pending(CoreInterruptCause::MachineTimer, true);
+        core.set_interrupt_pending(CoreInterruptCause::MachineSoftware, true);
+
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::Retired
+        );
+        assert_eq!(core.register(10), Some(1));
+        assert_eq!(core.mcycle, 1);
+        assert_eq!(core.minstret, 1);
+
+        core.mstatus |= MSTATUS_MIE;
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::MachineSoftware)
+        );
+        assert_eq!(core.pc, BOOT_ROM.start + 0x100);
+        assert_eq!(core.mepc, BOOT_ROM.start + 4);
+        assert_eq!(core.mcause, (1 << 63) | 3);
+        assert_eq!(core.mstatus & MSTATUS_MIE, 0);
+        assert_ne!(core.mstatus & MSTATUS_MPIE, 0);
+        assert_eq!(core.mcycle, 2);
+        assert_eq!(core.minstret, 1);
+    }
+
+    #[test]
+    fn rv64_wfi_waits_and_wakes_for_a_pending_interrupt() {
+        let mut bus = bus_with_program(&[0x1050_0073, 0x0010_0513]);
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::Supervisor;
+        core.mideleg = 1 << 1;
+        core.mie = 1 << 1;
+        core.mstatus = MSTATUS_SIE;
+        core.stvec = BOOT_ROM.start + 0x100;
+
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::Retired
+        );
+        assert_eq!(core.pc, BOOT_ROM.start + 4);
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::WaitingForInterrupt
+        );
+        assert_eq!(core.mcycle, 2);
+        assert_eq!(core.minstret, 1);
+
+        core.set_interrupt_pending(CoreInterruptCause::SupervisorSoftware, true);
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorSoftware)
+        );
+        assert_eq!(core.privilege(), PrivilegeMode::Supervisor);
+        assert_eq!(core.pc, BOOT_ROM.start + 0x100);
+        assert_eq!(core.sepc, BOOT_ROM.start + 4);
+        assert_eq!(core.scause, (1 << 63) | 1);
+        assert_eq!(core.mcycle, 3);
+        assert_eq!(core.minstret, 1);
+
+        core.set_interrupt_pending(CoreInterruptCause::SupervisorSoftware, false);
+        core.sepc = BOOT_ROM.start + 4;
+        core.pc = BOOT_ROM.start;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, BOOT_ROM.start + 4);
     }
 
     #[test]

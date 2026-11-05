@@ -164,10 +164,14 @@ writes.
 
 The core exposes a diagnostic single-step operation that returns synchronous
 traps to its caller, and a trap-delivering single-step operation that captures
-the architectural state and enters the selected handler. A faulting
-instruction increments +mcycle+ but not +minstret+. Machine integration must
-use the trap-delivering path; asynchronous interrupt delivery is a separate
-requirement.
+the architectural state and enters the selected handler. The trap-delivering
+path also checks pending, enabled interrupts before executing the next
+instruction, applies delegation and privilege-level interrupt enables, and
+supports direct or vectored interrupt entry. Its WFI state suspends stepping
+until an interrupt becomes pending. A faulting instruction or delivered
+interrupt increments +mcycle+ but not +minstret+. Machine integration must use
+the trap-delivering path; device-driven pending lines and the virtual timer
+remain separate requirements.
 
 CPU and device accesses are coherent and ordered according to the RISC-V
 memory model and explicit fence instructions. Device DMA may read or write

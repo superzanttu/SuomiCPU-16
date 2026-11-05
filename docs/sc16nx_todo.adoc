@@ -607,7 +607,19 @@ The existing +step()+ API remains available for callers that need the raw
 diagnostic trap. A regression verifies user ECALL delegation, handler
 execution, SRET recovery, and that trapped instructions increment +mcycle+
 but not +minstret+. Asynchronous interrupts and machine integration remain
-unimplemented; this does not complete the privilege task.
+incomplete; this does not complete the privilege task.
++
+*Interrupt delivery progress (2026-11-05):* Added pending-source injection for
+the six supervisor/machine software, timer, and external interrupt causes.
+The trap-delivering step now selects enabled sources in architectural priority
+order, applies delegation and global-enable rules, records interrupt trap
+state, supports vectored entry, and leaves pending-source clearing to the
+source owner. +WFI+ now suspends the trap-delivering step until an interrupt is
+pending; interrupt and wait cycles increment +mcycle+ without +minstret+.
+Tests cover delegated vectored delivery, non-retirement, and WFI wakeup.
+PLIC/timer sources, time CSR integration, device-driven lines, and broader
+interrupt acceptance remain unimplemented; keep both privilege and
+interrupt-time tasks unchecked.
 +
 *PMP progress (2026-11-04):* Added the first PMP entry's +pmpcfg0+ and
 +pmpaddr0+ CSR state and OFF/TOR/NA4/NAPOT matching for instruction fetches,
