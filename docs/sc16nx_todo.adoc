@@ -1092,13 +1092,177 @@ Floating casts and preprocessor NULL macros remain unsupported. Records,
 function pointers, preprocessing, ELF/separate-unit linking, complete firmware/
 xv6 compilation, and incomplete P0 gates remain open.
 +
-*Validation checkpoint:* Working tree based on +dee5081+; one hart, M-mode
+*Sparse array-designator slice:* Out-of-order indexed entries in the text
+guest's fragment table reproduced a shared-parser rejection. An RV64-only
+parser evaluator now accepts C99-style +[constant] = value+ array entries
+with scope-independent LP64 integer constants. Omitted bounds use the highest
+initialized index plus one; positional entries resume after the preceding
+index. Typed array lowering retains index/value pairs in source order,
+converts each explicit expression once, and fills sparse holes with integer
+zero or null pointers. Global integer/pointer images write entries at their
+indexed offsets, with symbolic addresses resolved after final RAM layout.
+The legacy SC-16 parser explicitly rejects the new syntax.
+The production text guest retains UART +Kiuas16: ROM ready\n+ followed by
++80 ff 0a+, result 19, exact string/table/null bytes, no traps, and restored
+stack/frame registers within 10000 steps. Established storage UART/memory/
+media acceptance still passes unchanged.
+Regressions poison global and stack RAM, assert exact bytes for all supported
+integer widths, preserve neighboring RAM, execute ordinary/volatile
+object-pointer and void-pointer tables, ninth-argument calls, recursive
+initialization, and left-to-right observable side effects despite reordered
+indices. Enumerator/typedef/cast/sizeof/short-circuit indices and inferred
+bounds execute. A 960-byte automatic array executes at the frame limit;
+57344 initialized global bytes plus 8192 BSS bytes execute at the RAM limit
+within 1000000 steps. Oversized raw-ROM payloads preserve existing output.
+Repeated indices, nested/member designators, runtime/negative/undefined/
+oversized indices, out-of-bounds continuations, incompatible values, and
+unsupported scalar/aggregate/nested-pointer uses diagnose without replacing
+an existing ROM. Repeated indices are an explicit subset restriction,
+not a claim that C99 rejects them. Records, full designated initialization,
+function pointers, preprocessing, ELF/separate-unit linking, complete
+firmware/xv6 execution, and all incomplete P0 gates remain open.
++
+*Read-only pointer-view slice:* Giving the text guest's UART helper a
++const char *+ input reproduced the backend's blanket const rejection.
+Const-pointee types now preserve the existing scalar load widths and pointer
+address bits, including volatile-qualified views and exact inner qualifiers
+on two-level pointers. Shared conversions add const/volatile qualification,
+reject implicit loss, and combine both arms' qualifiers in conditional
+object/void-pointer expressions. A shared modifiable-lvalue check rejects
+assignments and scalar updates through read-only dereferences/subscripts;
+the pointer objects and table entries themselves remain writable.
+Atomic loads accept const integer views; atomic stores/exchanges reject them.
+File-scope pointer typedefs now preserve const/volatile pointee qualifiers.
+RV64-only shared-parser guards reject qualifying a pointer typedef or an
+abstract pointer object rather than silently moving/erasing that qualifier;
+legacy parser behavior remains unchanged.
+The production text fixture uses read-only cursor/table/helper types and
+retains UART +Kiuas16: ROM ready\n+ followed by +80 ff 0a+, result 19, exact
+reported text/table/null bytes, no traps, and restored registers within
+10000 steps. Established storage UART/memory/media acceptance still passes.
+Regressions execute every supported integer width and const/volatile
+specifier ordering, qualified aliases, static address tables, generic
+qualification unions, null conversions, pointer arithmetic, recursive stack
+views, two-level returns, and ninth-argument calls. An independent assembly
+caller checks the stack pointer argument, signed word read, pointer return,
+and preserved registers. Atomic loads check independently expected signed/
+unsigned values, exact object bytes, zero padding, and poisoned neighboring
+RAM. Unevaluated calls/reads are skipped; a const-volatile UART view consumes
+exactly two input bytes and leaves the third pending.
+Writes/updates (also in unevaluated/unreachable paths), implicit qualification
+loss through initialization/assignment/calls/returns/conditionals, incompatible
+nested qualifiers, and const atomic writes diagnose. Const scalar/array
+objects and outer pointer qualification, including qualified pointer aliases
+and abstract cast/sizeof forms, remain unsupported. Explicit casts can remove
+qualification; this slice does not provide runtime memory protection.
+Records, function pointers, preprocessing, ELF/separate-unit linking,
+complete firmware/xv6 execution, and all incomplete P0 gates remain open.
++
+*Atomic arithmetic/counter slice:* Replacing the text helper's ordinary
+byte-counter increment with +__atomic_fetch_add+ reproduced a missing builtin
+diagnostic. The CPU already implemented atomic addition; the Rust assembler
+now exposes checked +amoadd.w/d+ instructions and ordering suffixes.
+Shared typed atomic lowering supports GNU +__atomic_fetch_add+ and
++__atomic_fetch_sub+ for modifiable signed/unsigned 32/64-bit integer pointers.
+Operands convert to the declared object width and execute once in source order.
+Fetch operations return the normalized old value; subtraction negates the
+converted operand before atomic addition. Atomic signed/unsigned arithmetic
+wraps in two's complement at object width without changing ordinary signed
+C overflow rules. Existing order validation, acquire/release bits, consume
+strengthening, and sequentially consistent full fences are reused.
+The production text guest retains UART +Kiuas16: ROM ready\n+ followed by
++80 ff 0a+, result 19, exact reported text/table/null bytes, no traps, and
+restored registers within 10000 steps. Established read-only/writable storage
+UART/memory/media acceptance still passes.
+Regressions independently calculate old/new bits at signed boundaries,
+unsigned rollover, and minimum-value subtraction for both widths and every
+memory order; poisoned neighboring RAM proves exact four/eight-byte writes.
+Instruction tests assert AMOADD opcode/register/width/order fields and adjacent
+sequential-consistency fence words. Independent assembled execution verifies
+ISA word-result sign extension, wrapping updates, and every ordering suffix.
+Nested pointer/value calls emit exactly +PVPV+; recursive counters, ninth
+operand calls, pointer-table destinations, narrowing, guest-owned ticket
+allocation/rollback, and release/acquire publication execute.
+Wrong widths/types, const destinations, invalid/runtime orders, arity errors,
+and reserved names in object/function/local/parameter/typedef/enum namespaces
+diagnose without replacing an existing ROM. Misaligned/non-RAM accesses trap.
+This is one-hart synchronous RAM execution, not multi-hart certification.
+Compare-exchange, other atomic arithmetic, narrow/pointer/aggregate atomics,
+records, function pointers, preprocessing, ELF/separate-unit linking,
+complete firmware/xv6 execution, and all incomplete P0 gates remain open.
++
+*Atomic allocation-bitmap slice:* A compiled guest-owned bitmap allocator
+reproduced missing +__atomic_fetch_or+ call support. The CPU already executed
+bitwise AMOs; the Rust assembler now exposes checked +amoand.w/d+,
++amoor.w/d+, and +amoxor.w/d+ with existing zero-offset and ordering checks.
+Typed atomic lowering supports GNU +__atomic_fetch_and/or/xor+ for modifiable
+signed/unsigned 32/64-bit integer pointers. It reuses mask conversion,
+single operand evaluation, normalized old-value returns, six constant memory
+orders, acquire/release bits, and sequential-consistency fences.
++tests/fixtures/kiuas16_bitmap.c+ reserves/releases slots with bitwise AMOs,
+rejects duplicate/invalid reservations, toggles a high-bit event mask, and
+publishes payload readiness using release/acquire operations. Production
+Rust compiler/runner execution yields UART +42 09 09 0a+, result 59,
+no traps, and restored stack/frame registers within 10000 steps.
+With poisoned global RAM, tests inspect all 28 report bytes: allocated mask
+9, event mask +0x8000000000000000+, readiness 9, and payloads 17 and 42.
+Established text and read-only/writable storage acceptance remains unchanged.
+Regressions independently compute old/new bits for zero/full/high/mixed masks
+at both widths with every order and signed/unsigned result normalization.
+They check opcode/register/width/order fields, adjacent sequential-consistency
+fence words, exact object updates, and poisoned neighboring bytes. Independent
+assembled execution covers all three instructions, both widths, all ordering
+suffixes, and ISA word-result sign extension. Nested pointer/stack operand
+calls emit exactly +PVPVPV+; recursive bitmap updates, pointer-table
+destinations, sign extension, and mask narrowing execute.
+Existing invalid-input tests now cover all bitwise names, unsupported types,
+const destinations, wrong arity, invalid/runtime orders, and reserved
+object/function/local/parameter/typedef/enum declarations without replacing
+an existing ROM. Misaligned/non-RAM bitwise accesses trap.
+This is one-hart synchronous execution, not multi-hart allocation or
+memory-model certification. Compare-exchange, narrow/pointer/aggregate atomics,
+records, function pointers, preprocessing, ELF/separate-unit linking,
+complete firmware/xv6 execution, and all incomplete P0 gates remain open.
++
+*Boolean allocator-result slice:* Returning +_Bool+ from the bitmap guest's
+reservation/release helpers reproduced unsupported RV64 function signatures.
+The Rust typed backend now supports C99 boolean scalars and ordinary/const/
+volatile pointers, matching the shared ABI's one-byte boolean layout.
+Runtime and integer-constant conversions normalize full-width integer values
+to zero/one; runtime pointer conversions test the address against null.
+Boolean arithmetic/switch operands promote to signed +int+, while assignment,
+scalar updates, parameters, and returns normalize back to zero/one.
+Globals and arrays reuse existing initializer, layout, and guest startup paths;
+boolean pointer arithmetic scales by one byte. Two-level pointers, pointer
+tables, aliases, null constants, and qualification checking remain consistent.
+The production bitmap guest retains UART +42 09 09 0a+, result 59, exact
+28-byte mask/readiness/payload report, no traps, and restored registers within
+10000 steps. Established text and storage acceptance still passes.
+Regressions execute zero/negative/high-bit/full-width conversions, pointer
+truth, integer promotions, prefix/postfix/compound updates, constant
+enumerators/designated indices, and switch promotion. Poisoned global/stack
+RAM proves exact boolean array bytes, data/BSS zero padding, and unchanged
+neighboring RAM. Qualified boolean views, tables, and two-level cursors execute.
+Recursive boolean calls and ninth arguments preserve normalized values;
+independent assembly caller/callee fixtures check register/stack values,
+alignment, returns, and preserved registers. Boolean conversion of volatile
+UART input consumes zero/high-bit bytes once, emits +00 01+, leaves a third
+byte pending, and skips unevaluated calls/reads.
+Invalid specifiers, pointer mismatches, const writes, nested qualifier changes,
+void-value conversion, boolean byte-width atomic operations, and converted
+duplicate switch cases diagnose without replacing an existing ROM.
+Qualified scalar objects, symbolic-address-to-integer global initializers,
+preprocessing/+stdbool.h+, records, function pointers, ELF/separate-unit
+linking, complete firmware/xv6 execution, and all incomplete P0 gates remain
+open. This is a tested C99 scalar extension, not full C99 conformance.
++
+*Validation checkpoint:* Working tree based on +ea83f43+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 110
++cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 138
 compiler integration tests, including independently assembled call partners
 and compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
-+cargo test --workspace -j 1 -- --test-threads=1+ passes all 864 tests in the serial workspace suite.
++cargo test --workspace -j 1 -- --test-threads=1+ passes all 895 tests in the serial workspace suite, including all 9 assembler integration tests.
 +cargo check --lib --bin kiuas16-cc --bin kiuas16-asm --bin kiuas16-run -j 1+,
 +cargo fmt --check+, and +git diff --check+ pass. Remaining P0 completion
 gates are unchanged.

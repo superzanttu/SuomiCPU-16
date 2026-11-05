@@ -60,6 +60,12 @@ this does not provide separate-unit linking.
 Word/doubleword +__atomic_load_n+, +__atomic_store_n+, and
 +__atomic_exchange_n+ use RV64 atomic instructions and validated memory orders;
 the storage guest protects request submission with an acquire/release RAM lock.
++__atomic_fetch_add/sub+ return the old word/doubleword value and perform
+wrapping atomic arithmetic; the text helper counts bytes with relaxed fetch-add.
++__atomic_fetch_and/or/xor+ expose atomic bit operations for a compiled
+guest-owned allocation bitmap, retaining old-value and memory-order semantics.
+C99 +_Bool+ scalars and qualified pointers use byte storage and zero/one
+conversion; the allocation guest returns boolean reservation/release results.
 Automatic/global arrays of supported object pointers and two-level pointer
 cursors enable text tables; global entries resolve final RAM addresses and
 omitted entries become null. Function-pointer tables remain unsupported.
@@ -67,6 +73,12 @@ Function-scoped +goto+ labels support shared error cleanup, including the
 storage guest's acquire/release request lock.
 Null-pointer constants now convert in scalar initialization, calls/returns,
 equality, and conditional arms; the text guest uses a zero-terminated table.
+One-dimensional array designators (+[constant] = value+) support sparse
+integer/object-pointer tables, inferred bounds, and source-order evaluation.
+Repeated indices and nested/member designators remain unsupported.
+Const-qualified integer/void pointee views preserve read widths and reject
+writes or implicit qualification loss. The text helper and table use read-only
+views; const objects and outer pointer qualification remain unsupported.
 This is initial bring-up,
 not the complete xv6 compiler or ELF build pipeline.
 

@@ -101,7 +101,10 @@ fn encode(
         }
     };
     let word = match op {
-        op if op.starts_with("amoswap.") || op.starts_with("lr.") => {
+        op if ["amoswap.", "amoadd.", "amoand.", "amoor.", "amoxor.", "lr."]
+            .iter()
+            .any(|prefix| op.starts_with(prefix)) =>
+        {
             let parts: Vec<_> = op.split('.').collect();
             let width = match parts.get(1).copied() {
                 Some("w") => 2,
@@ -122,7 +125,15 @@ fn encode(
                 return Err(error(line, "atomic address requires zero offset"));
             }
             let source = if load { 0 } else { reg(1)? };
-            (if load { 2 } else { 1 }) << 27
+            (match parts[0] {
+                "lr" => 2,
+                "amoswap" => 1,
+                "amoadd" => 0,
+                "amoxor" => 4,
+                "amoor" => 8,
+                "amoand" => 12,
+                _ => return Err(error(line, "unsupported atomic instruction")),
+            }) << 27
                 | ordering << 25
                 | source << 20
                 | base << 15

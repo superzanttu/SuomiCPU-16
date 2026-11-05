@@ -1,16 +1,16 @@
 static char banner[] = "Kiuas16: ";
-static char *cursor = "ROM ";
+static const char *cursor = "ROM ";
 static signed char high[] = "\200\377";
-static char *fragments[] = { banner, "ROM ", "rea" "dy\n", 0 };
+static const char *fragments[] = { [2] = "rea" "dy\n", [0] = banner, "ROM ", [3] = 0 };
 extern char banner[10];
-extern char *cursor;
+extern const char *cursor;
 
-static int puts_uart(char *text)
+static int puts_uart(const char *text)
 {
     int count = 0;
     while (*text) {
         *(volatile unsigned char *)0x10000000UL = *text++;
-        ++count;
+        __atomic_fetch_add(&count, 1, 0);
     }
     return count;
 }
@@ -18,7 +18,7 @@ static int puts_uart(char *text)
 int main(void)
 {
     char scratch[4] = "OK";
-    char **fragment = fragments;
+    const char **fragment = fragments;
     int count = 0;
     while (*fragment != 0) {
         count += puts_uart(*fragment++);

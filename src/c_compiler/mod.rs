@@ -81,6 +81,10 @@ pub enum ExpressionKind {
     SizeofType(String),
     SizeofExpression(Box<Expression>),
     InitializerList(Vec<Expression>),
+    ArrayDesignator {
+        index: usize,
+        value: Box<Expression>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +109,18 @@ fn infer_incomplete_array_length(c_type: &str, initializer: &Expression) -> Opti
         return bytes.len().checked_add(1);
     }
     match &initializer.kind {
-        ExpressionKind::InitializerList(values) => Some(values.len()),
+        ExpressionKind::InitializerList(values) => {
+            let mut next = 0usize;
+            let mut length = 0;
+            for value in values {
+                if let ExpressionKind::ArrayDesignator { index, .. } = &value.kind {
+                    next = *index;
+                }
+                next = next.checked_add(1)?;
+                length = length.max(next);
+            }
+            Some(length)
+        }
         _ => None,
     }
 }
@@ -1024,7 +1039,7 @@ fn scalar_initializer(expression: &Expression) -> Option<&Expression> {
         ExpressionKind::InitializerList(elements) if elements.len() == 1 => {
             scalar_initializer(&elements[0])
         }
-        ExpressionKind::InitializerList(_) => None,
+        ExpressionKind::InitializerList(_) | ExpressionKind::ArrayDesignator { .. } => None,
         _ => Some(expression),
     }
 }
@@ -1043,6 +1058,7 @@ fn collect_string_literals_expression(expression: &Expression, literals: &mut Ha
             expression: operand,
             ..
         }
+        | ExpressionKind::ArrayDesignator { value: operand, .. }
         | ExpressionKind::SizeofExpression(operand) => {
             collect_string_literals_expression(operand, literals);
         }
@@ -2461,6 +2477,9 @@ fn expression_calls_are_defined(
         | ExpressionKind::SizeofExpression(operand) => {
             expression_calls_are_defined(operand, defined_functions, false)
         }
+        ExpressionKind::ArrayDesignator { value, .. } => {
+            expression_calls_are_defined(value, defined_functions, false)
+        }
         ExpressionKind::Binary { left, right, .. }
         | ExpressionKind::Assignment {
             target: left,
@@ -2583,6 +2602,9 @@ fn rewrite_native_local_expression(
         }
         | ExpressionKind::SizeofExpression(operand) => {
             rewrite_native_local_expression(operand, scopes);
+        }
+        ExpressionKind::ArrayDesignator { value, .. } => {
+            rewrite_native_local_expression(value, scopes);
         }
         ExpressionKind::Binary { left, right, .. }
         | ExpressionKind::Assignment {
@@ -2853,6 +2875,9 @@ fn native_stack_required_locals(statement: &Statement) -> HashSet<String> {
             }
             ExpressionKind::Member { expression, .. }
             | ExpressionKind::Cast { expression, .. }
+            | ExpressionKind::ArrayDesignator {
+                value: expression, ..
+            }
             | ExpressionKind::SizeofExpression(expression) => collect_expression(expression, names),
             ExpressionKind::InitializerList(expressions) => {
                 for expression in expressions {
@@ -5084,6 +5109,9 @@ fn native_const_write_line_expression(
         | ExpressionKind::SizeofExpression(operand) => {
             native_const_write_line_expression(operand, locals, const_objects)
         }
+        ExpressionKind::ArrayDesignator { value, .. } => {
+            native_const_write_line_expression(value, locals, const_objects)
+        }
         ExpressionKind::Binary { left, right, .. } => {
             native_const_write_line_expression(left, locals, const_objects)
                 .or_else(|| native_const_write_line_expression(right, locals, const_objects))
@@ -5185,6 +5213,9 @@ fn native_pointer_qualifier_loss_line_expression(
         }
         | ExpressionKind::SizeofExpression(operand) => {
             native_pointer_qualifier_loss_line_expression(operand, locals, const_objects)
+        }
+        ExpressionKind::ArrayDesignator { value, .. } => {
+            native_pointer_qualifier_loss_line_expression(value, locals, const_objects)
         }
         ExpressionKind::Binary { left, right, .. } => {
             native_pointer_qualifier_loss_line_expression(left, locals, const_objects).or_else(
@@ -5603,6 +5634,9 @@ fn validate_native_bitfield_expression(
             ..
         } => {
             validate_native_bitfield_expression(operand, locals)?;
+        }
+        ExpressionKind::ArrayDesignator { value, .. } => {
+            validate_native_bitfield_expression(value, locals)?;
         }
         ExpressionKind::Binary { left, right, .. }
         | ExpressionKind::Assignment {
@@ -7731,6 +7765,9 @@ fn native_expression_has_side_effects(expression: &Expression) -> bool {
         }
         ExpressionKind::Member { expression, .. }
         | ExpressionKind::Cast { expression, .. }
+        | ExpressionKind::ArrayDesignator {
+            value: expression, ..
+        }
         | ExpressionKind::SizeofExpression(expression) => {
             native_expression_has_side_effects(expression)
         }
@@ -11831,6 +11868,7 @@ pub struct StatementParser {
     expressions: ExpressionParser,
     enum_values: HashMap<String, i64>,
     array_length_evaluator: Option<fn(&Expression) -> Result<usize, CCompilerError>>,
+    array_designator_evaluator: Option<fn(&Expression) -> Result<usize, CCompilerError>>,
 }
 
 pub struct TranslationUnitParser {
@@ -12064,6 +12102,12 @@ impl ExpressionParser {
             return Err(self.fail("record types are not supported here yet"));
         }
         let mut c_type = if let Some(alias) = self.typedefs.get(&self.token().value).cloned() {
+            if self.resolved_enumerators.is_some()
+                && !alias_qualifiers.is_empty()
+                && alias.contains('*')
+            {
+                return Err(self.fail("qualifiers on pointer typedefs are not supported"));
+            }
             self.advance();
             alias
         } else {
@@ -12091,6 +12135,9 @@ impl ExpressionParser {
                 self.token().value.as_str(),
                 "const" | "volatile" | "restrict"
             ) {
+                if self.resolved_enumerators.is_some() {
+                    return Err(self.fail("qualifiers on pointer objects are not supported"));
+                }
                 self.advance();
             }
         }
@@ -12419,6 +12466,7 @@ impl StatementParser {
             expressions: ExpressionParser::new(tokens),
             enum_values: HashMap::new(),
             array_length_evaluator: None,
+            array_designator_evaluator: None,
         }
     }
 
@@ -12731,7 +12779,23 @@ impl StatementParser {
             let mut values = Vec::new();
             if !self.at("}") {
                 loop {
-                    values.push(self.parse_initializer()?);
+                    if let Some(open_index) = self.accept("[") {
+                        let evaluate = self.array_designator_evaluator.ok_or_else(|| {
+                            self.expressions
+                                .fail("array designators are not supported by this target")
+                        })?;
+                        let expression = self.expressions.parse_expression(1)?;
+                        self.expect("]")?;
+                        let index = evaluate(&expression)?;
+                        self.expect("=")?;
+                        let value = Box::new(self.parse_initializer()?);
+                        values.push(self.expressions.make(
+                            &open_index,
+                            ExpressionKind::ArrayDesignator { index, value },
+                        ));
+                    } else {
+                        values.push(self.parse_initializer()?);
+                    }
                     if self.accept(",").is_none() || self.at("}") {
                         break;
                     }
@@ -12786,6 +12850,14 @@ impl StatementParser {
             .get(&self.expressions.token().value)
             .cloned()
         {
+            if self.expressions.resolved_enumerators.is_some()
+                && !type_qualifiers.is_empty()
+                && alias.contains('*')
+            {
+                return Err(self
+                    .expressions
+                    .fail("qualifiers on pointer typedefs are not supported"));
+            }
             self.expressions.advance();
             alias
         } else {
@@ -13214,6 +13286,15 @@ impl TranslationUnitParser {
             .get(&self.statements.expressions.token().value)
             .cloned()
         {
+            if self.statements.expressions.resolved_enumerators.is_some()
+                && !qualifiers.is_empty()
+                && alias.contains('*')
+            {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("qualifiers on pointer typedefs are not supported"));
+            }
             self.statements.expressions.advance();
             let c_type = if qualifiers.is_empty() {
                 alias
@@ -16791,6 +16872,21 @@ int main(void) { return VALUE; }"#
             Some(ExternalDeclaration::FunctionDefinition(definition))
                 if definition.declaration.name == "main"
         ));
+    }
+
+    #[test]
+    fn legacy_parser_rejects_rv64_array_designators_explicitly() {
+        let tokens = lex_unexpanded(
+            "int array[] = { [2] = 1 }; int main(void) { return 0; }",
+            "legacy-designator.c",
+        )
+        .unwrap();
+        let diagnostic = TranslationUnitParser::new(tokens)
+            .parse()
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.contains("legacy-designator.c:1:"));
+        assert!(diagnostic.contains("array designators are not supported by this target"));
     }
 
     #[test]

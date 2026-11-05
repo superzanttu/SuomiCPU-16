@@ -1912,6 +1912,580 @@ fn compiled_polling_and_nested_loop_guest_executes_through_production_cli() {
 }
 
 #[test]
+fn const_pointer_reads_preserve_all_integer_widths_and_qualifier_spellings() {
+    for (ty, value, expected) in [
+        ("char", "255", 255u64),
+        ("signed char", "255", u64::MAX),
+        ("unsigned char", "255", 255),
+        ("short", "65535", u64::MAX),
+        ("unsigned short", "65535", 65535),
+        ("int", "-7", (-7i64) as u64),
+        ("unsigned int", "0x80000001U", 0x80000001),
+        ("long", "-4294967297L", (-4294967297i64) as u64),
+        ("unsigned long", "0xfedcba9876543210UL", 0xfedcba9876543210),
+    ] {
+        for qualified in [
+            format!("const {ty}"),
+            format!("{ty} const"),
+            format!("const volatile {ty}"),
+            format!("volatile {ty} const"),
+        ] {
+            let source = format!(
+                "{ty} object[] = {{ [1] = {value} }};
+                 {qualified} *view = object + 1;
+                 unsigned long read({qualified} *p) {{ return *p; }}
+                 int main(void) {{
+                     {qualified} *local = view;
+                     {qualified} *table[] = {{ [1] = local }};
+                     if (table[0] || &*local != view || &table[1][0] != local) return 1;
+                     if (sizeof(local) != 8 || sizeof(*local) != sizeof({ty})) return 2;
+                     *(volatile unsigned long *)0x80000000UL = read(table[1]);
+                     *(volatile unsigned long *)0x80000008UL = (unsigned long)object;
+                     return local - object;
+                 }}"
+            );
+            let (mut machine, _) = execute(&source);
+            assert_eq!(machine.core().register(10), Some(1), "{source}");
+            let mut report = [0; 16];
+            machine.bus_mut().read(0x80000000, &mut report).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(report[..8].try_into().unwrap()),
+                expected,
+                "{source}"
+            );
+            let size = match ty {
+                "char" | "signed char" | "unsigned char" => 1,
+                "short" | "unsigned short" => 2,
+                "int" | "unsigned int" => 4,
+                _ => 8,
+            };
+            let mut bytes = vec![0; size * 2];
+            machine
+                .bus_mut()
+                .read(
+                    u64::from_le_bytes(report[8..].try_into().unwrap()),
+                    &mut bytes,
+                )
+                .unwrap();
+            assert_eq!(&bytes[..size], vec![0; size]);
+            assert_eq!(&bytes[size..], &expected.to_le_bytes()[..size]);
+        }
+    }
+}
+
+#[test]
+fn const_pointer_tables_aliases_and_generic_qualification_unions_execute() {
+    let (machine, output) = execute(
+        "typedef const char *text;
+         typedef text *texts;
+         typedef const volatile char *read_only_mmio;
+         typedef volatile char *writable_mmio;
+         char bytes[] = \"AB\";
+         text table[] = { [2] = bytes + 1, [0] = \"X\" };
+         text choose(int n, text a, text b) { return n ? a : b; }
+         text ninth(int a,int b,int c,int d,int e,int f,int g,int h,text p) { return p; }
+         int main(void) {
+             texts cursor = table;
+             text p = choose(0, 0, ninth(1,2,3,4,5,6,7,8,cursor[2]));
+             const void *generic = p;
+             const char *q = generic;
+             volatile char *writable = bytes;
+             read_only_mmio combined = 1 ? p : writable;
+             const volatile void *both = 0 ? generic : writable;
+             const volatile char *roundtrip = both;
+             writable_mmio alias = writable;
+             *alias = 'C';
+             cursor[1] = q;
+             ++cursor;
+             if (cursor - table != 1 || &*cursor != &table[1]) return 1;
+             if (*cursor != p || combined != q || *roundtrip != 'C') return 2;
+             if (choose(1, 0, p) != 0 || (0 ? p : 0) != 0) return 3;
+             *(volatile unsigned char *)0x10000000UL = *table[0];
+             *(volatile unsigned char *)0x10000000UL = *cursor[0];
+             *(volatile unsigned char *)0x10000000UL = *roundtrip;
+             char *explicit_view = (char *)p;
+             *explicit_view = 'D';
+             return *p;
+         }",
+    );
+    assert_eq!(output, b"XBC");
+    assert_eq!(machine.core().register(10), Some(b'D' as u64));
+}
+
+#[test]
+fn const_volatile_views_skip_unevaluated_reads_and_read_uart_once() {
+    let source =
+        "int calls;
+         const volatile unsigned char *uart(void) { ++calls; return (const volatile unsigned char *)0x10000000UL; }
+         int main(void) {
+             sizeof(*uart());
+             0 && *uart();
+             1 || *uart();
+             const volatile unsigned char *p = 1 ? uart() : 0;
+             unsigned char a = *p++;
+             --p;
+             unsigned char b = *p;
+             *(volatile unsigned char *)0x10000000UL = a;
+             *(volatile unsigned char *)0x10000000UL = b;
+             return calls;
+         }";
+    let rom = assemble_boot_rom(&compile_to_assembly(source, "const-uart.c").unwrap()).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, b"ABC", &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"AB");
+    assert_eq!(machine.core().register(10), Some(1));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut next = [0; 1];
+    machine.bus_mut().read(0x10000000, &mut next).unwrap();
+    assert_eq!(next, *b"C");
+}
+
+#[test]
+fn const_atomic_loads_execute_without_changing_objects_or_neighbor_bytes() {
+    for (ty, value, expected, size) in [
+        ("int", "0x80000001U", (-2147483647i64) as u64, 4),
+        ("unsigned int", "0x80000001U", 0x80000001, 4),
+        ("long", "-4294967297L", (-4294967297i64) as u64, 8),
+        (
+            "unsigned long",
+            "0xfedcba9876543210UL",
+            0xfedcba9876543210,
+            8,
+        ),
+    ] {
+        let source = format!(
+            "{ty} object = {value};
+             int main(void) {{
+                 const volatile {ty} *p = &object;
+                 {ty} old = __atomic_load_n(p, 2);
+                 if (old != object) return 1;
+                 *(volatile unsigned long *)0x80000000UL = old;
+                 *(volatile unsigned long *)0x80000008UL = object;
+                 {ty} *mutable = &object;
+                 __atomic_store_n(mutable, 7, 3);
+                 if (__atomic_load_n(p, 5) != 7) return 2;
+                 return object;
+             }}"
+        );
+        let rom =
+            assemble_boot_rom(&compile_to_assembly(&source, "const-atomic.c").unwrap()).unwrap();
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+        machine.bus_mut().write(0x80010000, &[0xa5; 16]).unwrap();
+        let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+        assert_eq!(report.traps, 0);
+        assert!(report.waiting > 0);
+        assert_eq!(machine.core().register(10), Some(7));
+        assert_eq!(machine.core().register(2), Some(0x80010000));
+        assert_eq!(machine.core().register(8), Some(0));
+        let mut bytes = [0; 16];
+        machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+        assert_eq!(&bytes[..8], &expected.to_le_bytes());
+        assert_eq!(&bytes[8..], &expected.to_le_bytes());
+        machine.bus_mut().read(0x80010000, &mut bytes).unwrap();
+        assert_eq!(&bytes[..size], &7u64.to_le_bytes()[..size]);
+        assert_eq!(&bytes[size..8], vec![0; 8 - size]);
+        assert_eq!(&bytes[8..], &[0xa5; 8]);
+    }
+}
+
+#[test]
+fn const_pointer_recursive_stack_views_and_two_level_returns_execute() {
+    let (machine, _) = execute(
+        "const int **pass(const int **p) { return p; }
+         const int *read(const int **p) { return *p; }
+         int recurse(int n, const int *parent) {
+             int local = n;
+             const int *view = &local;
+             const int **table = pass(&view);
+             int result = *read(table) + (parent ? *parent : 0);
+             if (n) result += recurse(n - 1, view);
+             if (view != &local || *view != n) return 99;
+             return result;
+         }
+         int main(void) { return recurse(4, 0); }",
+    );
+    assert_eq!(machine.core().register(10), Some(20));
+}
+
+#[test]
+fn const_pointer_register_and_stack_abi_interoperate_with_independent_caller() {
+    let mut assembly = compile_to_assembly(
+        "const int *probe(int a,int b,int c,int d,int e,int f,int g,int h,const int *p) {
+             if (a + b + c + d + e + f + g + h != 36 || *p != -17) return 0;
+             return p + 1;
+         }
+         int main(void) { return 0; }",
+        "const-abi.c",
+    )
+    .unwrap()
+    .replacen("call main\n", "call .Lconst_entry\n", 1);
+    assembly.push_str(
+        ".Lconst_entry:
+         addi sp, sp, -32
+         sd ra, 24(sp)
+         li s0, 123
+         li s1, 456
+         li t0, 1
+         slli t0, t0, 31
+         sd t0, 0(sp)
+         li t1, -17
+         sw t1, 0(t0)
+         li a0, 1
+         li a1, 2
+         li a2, 3
+         li a3, 4
+         li a4, 5
+         li a5, 6
+         li a6, 7
+         li a7, 8
+         call probe
+         ld ra, 24(sp)
+         addi sp, sp, 32
+         ret",
+    );
+    let rom = assemble_boot_rom(&assembly).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    for (register, value) in [(2, 0x80010000), (8, 123), (9, 456), (10, 0x80000004)] {
+        assert_eq!(machine.core().register(register), Some(value));
+    }
+}
+
+#[test]
+fn const_writes_qualifier_loss_and_unsupported_objects_preserve_existing_rom() {
+    for body in [
+        "*p = 1;",
+        "p[0] = 1;",
+        "*p += 1;",
+        "++*p;",
+        "(*p)++;",
+        "p[0]--;",
+        "*(&*p) = 1;",
+        "*(&p[0]) = 1;",
+        "int *q = p;",
+        "int *q = 0; q = p;",
+        "consume(p);",
+        "int *q = 1 ? p : &object;",
+        "int *q = 0 ? p : 0;",
+        "void *q = p;",
+        "const void *v = p; int *q = v;",
+        "volatile int *q = p;",
+        "const int **q = &mutable;",
+        "int **q = &p;",
+        "const volatile int **q = &p;",
+        "int **q = 1 ? &p : &mutable;",
+        "**(&p) = 1;",
+        "sizeof((*p)++);",
+        "if (0) *p = 1;",
+        "__atomic_store_n(p, 1, 3);",
+        "__atomic_exchange_n(p, 1, 2);",
+        "const int value = 1;",
+        "const int a[2] = {1};",
+        "int *const q = &object;",
+        "sizeof(int *const);",
+        "(int *const)&object;",
+        "typedef int *ip; const ip q = &object;",
+        "typedef int *ip; sizeof(const ip);",
+        "typedef int *ip; (const ip)&object;",
+        "typedef const int *cp; volatile cp q = p;",
+        "const void *v = p; *v;",
+        "const void *v = p; v++;",
+    ] {
+        let source = format!(
+            "int object;
+             int consume(int *p) {{ return *p; }}
+             int main(void) {{
+                 int *mutable = &object;
+                 const int *p = mutable;
+                 {body}
+                 return 0;
+             }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "const.c")
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.contains("const.c:"), "{body}: {diagnostic}");
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{body}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    for source in [
+        "int object; const int *p = &object; int *bad(void) { return p; } int main(void) { return 0; }",
+        "int object; const int *p = &object; int *q = p; int main(void) { return 0; }",
+        "int object; const int *p = &object; int *a[] = { [0] = p }; int main(void) { return 0; }",
+        "const int object = 1; int main(void) { return 0; }",
+        "typedef int *ip; const ip q; int main(void) { return 0; }",
+        "typedef const int *cp; typedef const cp bad; int main(void) { return 0; }",
+        "const int *p; extern int *p; int main(void) { return 0; }",
+        "int f(const int *p); int f(int *p) { return 0; } int main(void) { return 0; }",
+    ] {
+        assert!(
+            compile_to_assembly(source, "const-global.c").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn designated_integer_arrays_preserve_widths_sparse_zeroes_and_inferred_bounds() {
+    for (ty, size, last) in [
+        ("char", 1, 35u64),
+        ("signed char", 1, 35),
+        ("unsigned char", 1, 35),
+        ("short", 2, 291),
+        ("unsigned short", 2, 291),
+        ("int", 4, 291),
+        ("unsigned int", 4, 291),
+        ("long", 8, 291),
+        ("unsigned long", 8, 291),
+    ] {
+        let source = format!(
+            "{ty} global[] = {{ [4] = 0x123, [1] = {{7}}, 9 }};
+             int main(void) {{
+                 {ty} local[] = {{ [4] = 0x123, [1] = {{7}}, 9 }};
+                 *(volatile unsigned long *)0x80000000UL = (unsigned long)global;
+                 *(volatile unsigned long *)0x80000008UL = (unsigned long)local;
+                 return sizeof(global) + sizeof(local);
+             }}"
+        );
+        let rom = assemble_boot_rom(&compile_to_assembly(&source, "sparse.c").unwrap()).unwrap();
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+        machine.bus_mut().write(0x80010000, &[0xa5; 64]).unwrap();
+        machine.bus_mut().write(0x8000fc00, &[0xa5; 1024]).unwrap();
+        let mut output = Vec::new();
+        let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+        assert_eq!(report.traps, 0, "{ty}: {:?}", report.last_trap);
+        assert!(report.waiting > 0);
+        assert!(output.is_empty());
+        assert_eq!(machine.core().register(10), Some(10 * size as u64));
+        assert_eq!(machine.core().register(2), Some(0x80010000));
+        assert_eq!(machine.core().register(8), Some(0));
+        let mut addresses = [0; 16];
+        machine.bus_mut().read(0x80000000, &mut addresses).unwrap();
+        let expected: Vec<_> = [0u64, 7, 9, 0, last]
+            .iter()
+            .flat_map(|number| number.to_le_bytes()[..size].to_vec())
+            .collect();
+        for address in addresses.chunks_exact(8) {
+            let address = u64::from_le_bytes(address.try_into().unwrap());
+            let mut actual = vec![0; expected.len()];
+            machine.bus_mut().read(address, &mut actual).unwrap();
+            assert_eq!(actual, expected, "{ty}");
+        }
+        let padded = expected.len().div_ceil(8) * 8;
+        let mut neighbor = [0; 8];
+        machine
+            .bus_mut()
+            .read(0x80010000 + padded as u64, &mut neighbor)
+            .unwrap();
+        assert_eq!(neighbor, [0xa5; 8], "{ty}");
+    }
+}
+
+#[test]
+fn designated_pointer_tables_resolve_addresses_null_holes_and_stack_arguments() {
+    let (mut machine, output) = execute(
+        "static char bytes[] = \"AB\";
+         static char *table[] = { [3] = \"X\", [0] = bytes + 1, 0 };
+         char *ninth(int a,int b,int c,int d,int e,int f,int g,int h,char *p) { return p; }
+         int main(void) {
+             char *local[4] = { [2] = ninth(1,2,3,4,5,6,7,8,table[3]), [0] = bytes };
+             void *generic[] = { [2] = local[2], [0] = bytes };
+             if (sizeof(table) != 32 || sizeof(generic) != 24) return 1;
+             if (table[1] || table[2] || local[1] || local[3] || generic[1]) return 2;
+             if (generic[0] != bytes || generic[2] != local[2]) return 3;
+             *(volatile unsigned long *)0x80000000UL = (unsigned long)table;
+             *(volatile unsigned long *)0x80000008UL = (unsigned long)(bytes + 1);
+             *(volatile unsigned char *)0x10000000UL = *table[0];
+             *(volatile unsigned char *)0x10000000UL = *local[0];
+             *(volatile unsigned char *)0x10000000UL = *local[2];
+             return 42;
+         }",
+    );
+    assert_eq!(output, b"BAX");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut addresses = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut addresses).unwrap();
+    let mut entries = [0; 32];
+    machine
+        .bus_mut()
+        .read(
+            u64::from_le_bytes(addresses[..8].try_into().unwrap()),
+            &mut entries,
+        )
+        .unwrap();
+    assert_eq!(&entries[..8], &addresses[8..]);
+    assert_eq!(&entries[8..24], &[0; 16]);
+    let mut text = [0; 2];
+    machine
+        .bus_mut()
+        .read(
+            u64::from_le_bytes(entries[24..].try_into().unwrap()),
+            &mut text,
+        )
+        .unwrap();
+    assert_eq!(text, *b"X\0");
+}
+
+#[test]
+fn designated_initializers_evaluate_once_in_source_order_across_recursive_calls() {
+    let (machine, output) = execute(
+        "int mark(int n) { *(volatile unsigned char *)0x10000000UL = n; return n; }
+         int recurse(int n) {
+             int values[3] = { [2] = n, [0] = n ? recurse(n - 1) : 0 };
+             return values[0] + values[1] + values[2];
+         }
+         int main(void) {
+             int values[] = { [4] = mark(65), [0] = mark(66), mark(67) };
+             int total = 0;
+             for (int i = 0; i < 2; ++i) {
+                 int again[3] = { [2] = mark(68 + i), [0] = recurse(4) };
+                 total += again[0] + again[1] + again[2];
+             }
+             if (sizeof(values) != 20 || values[2] || values[3]) return 1;
+             return total + values[0] + values[1] + values[4];
+         }",
+    );
+    assert_eq!(output, b"ABCDE");
+    assert_eq!(machine.core().register(10), Some(355));
+}
+
+#[test]
+fn designated_indices_use_lp64_constants_aliases_enumerators_and_continuations() {
+    let (machine, _) = execute(
+        "typedef unsigned long index_t;
+         enum { LAST = 7 };
+         unsigned char global[] = { [LAST] = 255, [sizeof(long) - 6] = 17, 18,
+             [(index_t)-1 + 1] = 19 };
+         int main(void) {
+             int local[] = { [(unsigned char)258] = 3, [1 ? 4 : 1/0] = 5, 6,
+                 [0 && 1/0] = 7 };
+             if (sizeof(global) != 8 || sizeof(local) != 24) return 1;
+             if (global[1] || global[4] || global[5] || global[6]) return 2;
+             if (local[1] || local[3]) return 3;
+             return global[0] + global[2] + global[3] + global[7]
+                 + local[0] + local[2] + local[4] + local[5];
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(330));
+}
+
+#[test]
+fn designated_pointer_arrays_preserve_pointee_widths_and_volatile_qualification() {
+    for ty in [
+        "char",
+        "signed char",
+        "unsigned char",
+        "short",
+        "unsigned short",
+        "int",
+        "unsigned int",
+        "long",
+        "unsigned long",
+    ] {
+        for qualifier in ["", "volatile "] {
+            let source = format!(
+                "{ty} object[2] = {{ [1] = 42 }};
+                 {qualifier}{ty} *table[] = {{ [2] = object + 1 }};
+                 int main(void) {{
+                     {qualifier}{ty} *local[] = {{ [2] = table[2] }};
+                     if (table[0] || table[1] || local[0] || local[1]) return 1;
+                     if (sizeof(table) != 24 || sizeof(local) != 24) return 2;
+                     *local[2] += 1;
+                     return object[1] + *table[2];
+                 }}"
+            );
+            let (machine, _) = execute(&source);
+            assert_eq!(machine.core().register(10), Some(86), "{source}");
+        }
+    }
+}
+
+#[test]
+fn designated_array_limits_execute_and_invalid_forms_preserve_existing_rom() {
+    let (machine, _) = execute_with_budget(
+        "unsigned char full[] = { [57343] = 99 };
+         unsigned char tail[8192];
+         int main(void) { return sizeof(full) == 57344 && full[0] == 0 && full[57343] == 99 && tail[8191] == 0; }",
+        1000000,
+    );
+    assert_eq!(machine.core().register(10), Some(1));
+    let (machine, _) = execute(
+        "int main(void) { unsigned char full[] = { [959] = 99 }; return sizeof(full) == 960 && full[0] == 0 && full[959] == 99; }",
+    );
+    assert_eq!(machine.core().register(10), Some(1));
+    for source in [
+        "int a[3] = { [3] = 1 }; int main(void) { return 0; }",
+        "int a[3] = { [2] = 1, 2 }; int main(void) { return 0; }",
+        "int a[] = { [-1] = 1 }; int main(void) { return 0; }",
+        "int a[] = { [1 / 0] = 1 }; int main(void) { return 0; }",
+        "int a[] = { [65536] = 1 }; int main(void) { return 0; }",
+        "int a[] = { [0xffffffffffffffffUL] = 1 }; int main(void) { return 0; }",
+        "int a[] = { [2] = 1, [2] = 2 }; int main(void) { return 0; }",
+        "int a[] = { [2] = 1, [1] = 2, 3 }; int main(void) { return 0; }",
+        "int a[] = { [0][1] = 1 }; int main(void) { return 0; }",
+        "int a[] = { .field = 1 }; int main(void) { return 0; }",
+        "int a[] = { [0] = { [0] = 1 } }; int main(void) { return 0; }",
+        "int a[] = { [0] 1 }; int main(void) { return 0; }",
+        "int a[] = { [0] = }; int main(void) { return 0; }",
+        "int a = { [0] = 1 }; int main(void) { return 0; }",
+        "int *a[] = { [0] = 1 }; int main(void) { return 0; }",
+        "int **a[] = { [0] = 0 }; int main(void) { return 0; }",
+        "int a[1][1] = { [0] = {1} }; int main(void) { return 0; }",
+        "int a[] = { [0] = unknown }; int main(void) { return 0; }",
+        "int a[] = { [0] = 1, [0] = unknown }; int main(void) { return 0; }",
+        "long a[] = { [8192] = 1 }; int main(void) { return 0; }",
+        "int main(void) { int n = 0; int a[] = { [n] = 1 }; return 0; }",
+        "int f(void) { return 0; } int main(void) { int a[] = { [f()] = 1 }; return 0; }",
+        "int f(void) { return 0; } int main(void) { int a[] = { [1 ? 0 : f()] = 1 }; return 0; }",
+        "int main(void) { int n = 0; int a[] = { [1 ? 0 : n] = 1 }; return 0; }",
+        "int main(void) { int n = 0; int a[] = { [sizeof(n)] = 1 }; return 0; }",
+        "int main(void) { unsigned char a[] = { [960] = 1 }; return 0; }",
+        "int main(void) { if (0) { int a[1] = { [1] = 1 }; } return 0; }",
+        "int main(void) { int a[] = { [0] = 1, [0] = 2 }; return 0; }",
+        "int main(void) { volatile int *a[] = { [0] = (volatile long *)0 }; return 0; }",
+    ] {
+        let diagnostic = compile_to_assembly(source, "designator.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("designator.c:"),
+            "{source}: {diagnostic}"
+        );
+        let files = Files::new(source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty(), "{source}");
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    let files = Files::new(
+        "unsigned char full[] = { [65535] = 99 }; int main(void) { return full[65535]; }",
+    );
+    std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+    assert!(!files.compile().status.success());
+    assert_eq!(
+        std::fs::read(files.0.join("rom.bin")).unwrap(),
+        b"previous ROM"
+    );
+}
+
+#[test]
 fn null_pointer_constants_convert_all_supported_pointer_categories() {
     for ty in [
         "char *",
@@ -1929,6 +2503,18 @@ fn null_pointer_constants_convert_all_supported_pointer_categories() {
         "int **",
         "void **",
         "volatile int **",
+        "const int *",
+        "const volatile int *",
+        "const void *",
+        "const volatile void *",
+        "const int **",
+        "const volatile int **",
+        "_Bool *",
+        "volatile _Bool *",
+        "const _Bool *",
+        "const volatile _Bool *",
+        "_Bool **",
+        "const _Bool **",
     ] {
         for zero in [
             "0",
@@ -2456,6 +3042,723 @@ fn invalid_pointer_table_types_initializers_qualifications_and_capacity_preserve
 }
 
 #[test]
+fn boolean_conversions_promotions_and_scalar_updates_execute() {
+    for (body, expected) in [
+        ("_Bool b = 256; return b;", 1u64),
+        ("_Bool b = -1; return b;", 1),
+        ("_Bool b = 0x8000000000000000UL; return b;", 1),
+        ("_Bool b = 0; return b;", 0),
+        ("_Bool b = (int *)0; return b;", 0),
+        ("_Bool b = (int *)0x80000000UL; return b;", 1),
+        ("int n = 0; _Bool b = &n; return b;", 1),
+        ("_Bool b = 1; return b + b;", 2),
+        ("_Bool b = 1; return -b;", u64::MAX),
+        ("_Bool b = 1; return sizeof(b + b);", 4),
+        (
+            "_Bool b = 1; return sizeof(b) + sizeof(_Bool) + sizeof(_Bool *);",
+            10,
+        ),
+        ("_Bool b = 1; return (1 ? b : 5) + (0 ? b : 7U);", 8),
+        ("_Bool b = 0; return b++ + b;", 1),
+        ("_Bool b = 1; return b++ + b;", 2),
+        ("_Bool b = 1; return b-- + b;", 1),
+        ("_Bool b = 0; return --b;", 1),
+        ("_Bool b = 1; b += 256; return b;", 1),
+        ("_Bool b = 1; b -= 1; return b;", 0),
+        ("_Bool b = 1; b ^= 1; return b;", 0),
+        ("_Bool b = 1; b <<= 8; return b;", 1),
+        ("_Bool b = 1; b >>= 1; return b;", 0),
+        ("_Bool b = 1; b *= 0; return b;", 0),
+        ("_Bool b = 1; b %= 1; return b;", 0),
+        ("_Bool b = 1; b = 512; return b;", 1),
+        ("_Bool b = 1; return ~b;", (-2i64) as u64),
+        ("return (_Bool)(unsigned char)256;", 0),
+        ("return (_Bool)256;", 1),
+        ("return (_Bool)0xffffffffffffffffUL == 1;", 1),
+    ] {
+        let (machine, _) = execute(&format!("int main(void) {{ {body} }}"));
+        assert_eq!(machine.core().register(10), Some(expected), "{body}");
+    }
+}
+
+#[test]
+fn boolean_arrays_globals_and_qualified_views_preserve_exact_byte_storage() {
+    let source = "typedef _Bool flag;
+         flag initialized[] = { [4] = 256, [0] = -1, 0, 0x8000000000000000UL };
+         flag zero[5];
+         const flag *view = initialized;
+         int main(void) {
+             flag local[] = { [4] = 256, [0] = -1, 0, 0x8000000000000000UL };
+             volatile flag *p = (volatile flag *)0x80000020UL;
+             p[0] = 256; p[1] = 0; p[2] = -1; p[3] = 1;
+             if (p[0]++ != 1 || p[1]-- != 0) return 1;
+             p[2] -= 1;
+             p[3] <<= 8;
+             const volatile flag *read = p;
+             if (read[0] != 1 || read[1] != 1 || read[2] != 0 || read[3] != 1) return 2;
+             flag *table[] = { [1] = local };
+             const flag **cursor = &view;
+             if (**cursor != 1 || table[1][4] != 1 || read - p != 0) return 3;
+             if (sizeof(initialized) != 5 || sizeof(local) != 5 || sizeof(flag) != 1) return 4;
+             *(volatile unsigned long *)0x80000000UL = (unsigned long)initialized;
+             *(volatile unsigned long *)0x80000008UL = (unsigned long)zero;
+             *(volatile unsigned long *)0x80000010UL = (unsigned long)local;
+             return local[0] + local[1] + local[2] + local[3] + local[4];
+         }";
+    let rom = assemble_boot_rom(&compile_to_assembly(source, "bool-bytes.c").unwrap()).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    machine.bus_mut().write(0x80010000, &[0xa5; 64]).unwrap();
+    machine.bus_mut().write(0x80000020, &[0xa5; 8]).unwrap();
+    machine.bus_mut().write(0x8000fc00, &[0xa5; 1024]).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(3));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut addresses = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut addresses).unwrap();
+    for (address, expected) in addresses.chunks_exact(8).zip([
+        &[1u8, 0, 1, 0, 1][..],
+        &[0u8; 5][..],
+        &[1u8, 0, 1, 0, 1][..],
+    ]) {
+        let mut bytes = [0; 5];
+        machine
+            .bus_mut()
+            .read(u64::from_le_bytes(address.try_into().unwrap()), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, expected);
+    }
+    let mut bytes = [0; 8];
+    machine.bus_mut().read(0x80000020, &mut bytes).unwrap();
+    assert_eq!(bytes, [1, 1, 0, 1, 0xa5, 0xa5, 0xa5, 0xa5]);
+    machine.bus_mut().read(0x80010000, &mut bytes).unwrap();
+    assert_eq!(bytes, [1, 0, 1, 0, 1, 0, 0, 0]);
+    machine.bus_mut().read(0x80010010, &mut bytes).unwrap();
+    assert_eq!(bytes, [0; 8]);
+    machine.bus_mut().read(0x80010018, &mut bytes).unwrap();
+    assert_eq!(bytes, [0xa5; 8]);
+}
+
+#[test]
+fn boolean_volatile_input_conversion_reads_each_uart_byte_once() {
+    let source =
+        "static int calls;
+         volatile unsigned char *address(void) { ++calls; return (volatile unsigned char *)0x10000000UL; }
+         int main(void) {
+             sizeof((_Bool)*address());
+             0 && (_Bool)*address();
+             _Bool a = *address();
+             _Bool b = *address();
+             *(volatile unsigned char *)0x10000000UL = a;
+             *(volatile unsigned char *)0x10000000UL = b;
+             return calls;
+         }";
+    let rom = assemble_boot_rom(&compile_to_assembly(source, "bool-uart.c").unwrap()).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, &[0, 128, 255], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(output, [0, 1]);
+    assert_eq!(machine.core().register(10), Some(2));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut next = [0; 1];
+    machine.bus_mut().read(0x10000000, &mut next).unwrap();
+    assert_eq!(next, [255]);
+}
+
+#[test]
+fn boolean_pointer_conversion_calls_recursion_and_side_effects_execute_once() {
+    let (machine, output) = execute(
+        "static int calls;
+         static int object;
+         int *address(void) { ++calls; *(volatile unsigned char *)0x10000000UL = 'P'; return &object; }
+         _Bool accept(_Bool flag) { return flag; }
+         _Bool recurse(int n, _Bool value) {
+             if (n) return recurse(n - 1, value);
+             return value;
+         }
+         _Bool ninth(int a,int b,int c,int d,int e,int f,int g,int h,_Bool value) {
+             return value && a + b + c + d + e + f + g + h == 36;
+         }
+         _Bool pointer_result(void) { return address(); }
+         int main(void) {
+             _Bool value = accept(address());
+             if (!value || !pointer_result() || calls != 2) return 1;
+             if (!recurse(4, 0x8000000000000000UL)) return 2;
+             if (!ninth(1,2,3,4,5,6,7,8,address()) || calls != 3) return 3;
+             if (accept((const volatile void *)0)) return 4;
+             sizeof((_Bool)address());
+             0 && accept(address());
+             if (calls != 3) return 5;
+             value = 0;
+             value += pointer_result();
+             return value + calls;
+         }"
+    );
+    assert_eq!(output, b"PPPP");
+    assert_eq!(machine.core().register(10), Some(5));
+}
+
+#[test]
+fn boolean_constant_indices_enumerators_and_switch_promotions_execute() {
+    let (machine, _) = execute(
+        "enum { TRUE_VALUE = (_Bool)0x100000000UL, FALSE_VALUE = (_Bool)0 };
+         _Bool global = (_Bool)-1;
+         int numbers[(_Bool)256 + 1] = { [(_Bool)256] = 42 };
+         int main(void) {
+             _Bool flag = global;
+             switch (flag) { case 0: return 99; case 1: break; default: return 98; }
+             if (TRUE_VALUE != 1 || FALSE_VALUE != 0 || sizeof(numbers) != 8) return 97;
+             _Bool flags[] = { 0, 256, -2 };
+             int total = 0;
+             for (int i = 0; i < 3; ++i) total += flags[i];
+             return numbers[TRUE_VALUE] + total;
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(44));
+}
+
+#[test]
+fn boolean_scalar_register_stack_abi_interoperates_with_independent_assembly() {
+    let mut assembly = compile_to_assembly(
+        "_Bool probe(_Bool a,int b,int c,int d,int e,int f,int g,int h,_Bool last) {
+             return a && last && b + c + d + e + f + g + h == 35;
+         }
+         int main(void) { return probe(256,2,3,4,5,6,7,8,0x100000000UL); }",
+        "bool-abi.c",
+    )
+    .unwrap();
+    assembly = assembly.replacen("\nprobe:\n", "\n.Lunused_bool_probe:\n", 1);
+    assembly.push_str(
+        "probe:
+         andi t0, sp, 15
+         bne t0, zero, .Lbool_bad
+         li t0, 1
+         bne a0, t0, .Lbool_bad
+         ld t1, 0(sp)
+         bne t1, t0, .Lbool_bad
+         li a0, 1
+         ret
+         .Lbool_bad:
+         li a0, 0
+         ret",
+    );
+    let rom = assemble_boot_rom(&assembly).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(1));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut assembly = compile_to_assembly(
+        "_Bool probe(_Bool a,int b,int c,int d,int e,int f,int g,int h,_Bool last) {
+             return a && last && b + c + d + e + f + g + h == 35;
+         }
+         int main(void) { return 0; }",
+        "bool-caller.c",
+    )
+    .unwrap()
+    .replacen("call main\n", "call .Lbool_entry\n", 1);
+    assembly.push_str(
+        ".Lbool_entry:
+         addi sp, sp, -32
+         sd ra, 24(sp)
+         li s0, 123
+         li s1, 456
+         li t0, 1
+         sd t0, 0(sp)
+         li a0, 1
+         li a1, 2
+         li a2, 3
+         li a3, 4
+         li a4, 5
+         li a5, 6
+         li a6, 7
+         li a7, 8
+         call probe
+         ld ra, 24(sp)
+         addi sp, sp, 32
+         ret",
+    );
+    let rom = assemble_boot_rom(&assembly).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    for (register, value) in [(2, 0x80010000), (8, 123), (9, 456), (10, 1)] {
+        assert_eq!(machine.core().register(register), Some(value));
+    }
+}
+
+#[test]
+fn boolean_invalid_types_qualifications_and_atomic_widths_preserve_rom() {
+    for source in [
+        "unsigned _Bool object; int main(void) { return 0; }",
+        "signed _Bool object; int main(void) { return 0; }",
+        "long _Bool object; int main(void) { return 0; }",
+        "const _Bool object = 1; int main(void) { return 0; }",
+        "volatile _Bool object; int main(void) { return 0; }",
+        "int main(void) { _Bool a[2] = \"AB\"; return 0; }",
+        "int main(void) { _Bool *p = (int *)0; return 0; }",
+        "int main(void) { int *p = (_Bool *)0; return 0; }",
+        "int main(void) { _Bool *p = (const _Bool *)0; return 0; }",
+        "int main(void) { const _Bool *p = (const _Bool *)0; *p = 1; return 0; }",
+        "int main(void) { const _Bool *p = (const _Bool *)0; ++*p; return 0; }",
+        "int main(void) { _Bool *p = (_Bool *)0; const _Bool **q = &p; return 0; }",
+        "int main(void) { _Bool b = 1; int *p = b; return 0; }",
+        "void f(void) {} int main(void) { _Bool b = f(); return 0; }",
+        "int main(void) { _Bool b = 0; __atomic_load_n(&b,0); return 0; }",
+        "int main(void) { _Bool b = 0; __atomic_exchange_n(&b,1,0); return 0; }",
+        "int main(void) { _Bool b = 0; __atomic_fetch_or(&b,1,0); return 0; }",
+        "int main(void) { _Bool b = 0; __atomic_fetch_add(&b,1,0); return 0; }",
+        "int main(void) { _Bool b = 0; switch(b) { case 1: break; case (_Bool)256: break; } return 0; }",
+    ] {
+        let diagnostic = compile_to_assembly(source, "bool-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("bool-invalid.c:"),
+            "{source}: {diagnostic}"
+        );
+        let files = Files::new(source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn compiled_atomic_bitmap_allocator_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_bitmap.c");
+    let rom = assemble_boot_rom(&compile_to_assembly(source, "bitmap.c").unwrap()).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    machine.bus_mut().write(0x80010000, &[0xa5; 64]).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(59));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    assert_eq!(output, b"B\x09\x09\n");
+    let mut bytes = [0; 28];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    let expected: Vec<_> = 9u64
+        .to_le_bytes()
+        .into_iter()
+        .chain(0x8000000000000000u64.to_le_bytes())
+        .chain(9u32.to_le_bytes())
+        .chain(17u32.to_le_bytes())
+        .chain(42u32.to_le_bytes())
+        .collect();
+    assert_eq!(bytes.as_slice(), expected);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn atomic_fetch_arithmetic_widths_wrapping_old_values_and_neighbors_execute() {
+    for (ty, width, signed) in [
+        ("int", 4, true),
+        ("unsigned int", 4, false),
+        ("long", 8, true),
+        ("unsigned long", 8, false),
+    ] {
+        let mask = if width == 4 {
+            u32::MAX as u64
+        } else {
+            u64::MAX
+        };
+        for old in [mask, mask >> 1, 1u64 << (width * 8 - 1)] {
+            for (operation, operand) in [("add", 1u64), ("sub", 1), ("sub", 1u64 << 63)] {
+                for order in 0..=5 {
+                    let expected = if operation == "add" {
+                        old.wrapping_add(operand) & mask
+                    } else {
+                        old.wrapping_sub(operand) & mask
+                    };
+                    let returned = if width == 4 && signed {
+                        old as u32 as i32 as i64 as u64
+                    } else {
+                        old
+                    };
+                    let source = format!(
+                        "int main(void) {{
+                             volatile {ty} *p = (volatile {ty} *)0x80000008UL;
+                             *p = 0x{old:x}UL;
+                             {ty} prior = __atomic_fetch_{operation}(p, 0x{operand:x}UL, {order});
+                             *(volatile unsigned long *)0x80000020UL = prior;
+                             return 7;
+                         }}"
+                    );
+                    let rom = assemble_boot_rom(&compile_to_assembly(&source, "fetch.c").unwrap())
+                        .unwrap();
+                    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+                    machine.bus_mut().write(0x80000000, &[0xa5; 48]).unwrap();
+                    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+                    assert_eq!(report.traps, 0, "{source}: {:?}", report.last_trap);
+                    assert!(report.waiting > 0);
+                    assert_eq!(machine.core().register(10), Some(7));
+                    assert_eq!(machine.core().register(2), Some(0x80010000));
+                    assert_eq!(machine.core().register(8), Some(0));
+                    let mut bytes = [0; 24];
+                    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+                    assert_eq!(&bytes[..8], &[0xa5; 8]);
+                    assert_eq!(
+                        &bytes[8..8 + width],
+                        &expected.to_le_bytes()[..width],
+                        "{source}"
+                    );
+                    assert!(bytes[8 + width..].iter().all(|byte| *byte == 0xa5));
+                    let mut actual = [0; 8];
+                    machine.bus_mut().read(0x80000020, &mut actual).unwrap();
+                    assert_eq!(u64::from_le_bytes(actual), returned, "{source}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn atomic_fetch_arithmetic_emits_exact_width_ordering_and_fence_words() {
+    for width in [4, 8] {
+        for operation in ["add", "sub"] {
+            for order in 0..=5 {
+                let ty = if width == 4 {
+                    "unsigned int"
+                } else {
+                    "unsigned long"
+                };
+                let source = format!(
+                    "enum {{ ORDER = {order} }};
+                     int main(void) {{ {ty} object = 7;
+                         {ty} old = __atomic_fetch_{operation}(&object, 9, ORDER);
+                         return old == 7 && object == ({ty})(7 - 9 + {offset});
+                     }}",
+                    offset = if operation == "add" { 18 } else { 0 }
+                );
+                let rom = assemble_boot_rom(&compile_to_assembly(&source, "fetch-bits.c").unwrap())
+                    .unwrap();
+                let words: Vec<_> = rom
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                let atomics: Vec<_> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, word)| **word & 0x7f == 0x2f)
+                    .collect();
+                assert_eq!(atomics.len(), 1, "{source}");
+                let (index, word) = atomics[0];
+                assert_eq!(word >> 27, 0);
+                assert_eq!((word >> 12) & 7, if width == 4 { 2 } else { 3 });
+                assert_eq!((word >> 7) & 31, 10);
+                assert_eq!((word >> 20) & 31, 10);
+                assert_eq!(
+                    (word >> 25) & 3,
+                    match order {
+                        0 => 0,
+                        1 | 2 => 2,
+                        3 => 1,
+                        _ => 3,
+                    }
+                );
+                assert_eq!(
+                    words.iter().filter(|word| **word == 0x0ff0000f).count(),
+                    if order == 5 { 2 } else { 0 }
+                );
+                if order == 5 {
+                    assert_eq!(words[index - 1], 0x0ff0000f);
+                    assert_eq!(words[index + 1], 0x0ff0000f);
+                }
+                let (machine, _) = execute(&source);
+                assert_eq!(machine.core().register(10), Some(1));
+            }
+        }
+    }
+}
+
+#[test]
+fn atomic_fetch_arithmetic_evaluates_operands_once_across_nested_stack_calls() {
+    let (mut machine, output) = execute(
+        "static unsigned long counter;
+         static int calls;
+         unsigned long *address(void) {
+             ++calls;
+             *(volatile unsigned char *)0x10000000UL = 'P';
+             return &counter;
+         }
+         unsigned long ninth(long a,long b,long c,long d,long e,long f,long g,long h,unsigned long value) {
+             ++calls;
+             *(volatile unsigned char *)0x10000000UL = 'V';
+             return value;
+         }
+         unsigned long operand(void) { return ninth(1,2,3,4,5,6,7,8,5); }
+         unsigned long recurse(int n) {
+             unsigned long old = __atomic_fetch_add(&counter, 1, 2);
+             if (n) return old + recurse(n - 1);
+             return old;
+         }
+         int main(void) {
+             if (__atomic_fetch_add(address(), operand(), 4) != 0) return 1;
+             if (__atomic_fetch_sub(address(), operand(), 5) != 5) return 2;
+             if (counter || calls != 4) return 3;
+             if (recurse(4) != 10 || counter != 5) return 4;
+             unsigned int local = 0x80000001U;
+             unsigned int *table[] = { [1] = &local };
+             unsigned int old = __atomic_fetch_add(table[1], (signed char)-1, 0);
+             if (old != 0x80000001U || local != 0x80000000U) return 5;
+             *(volatile unsigned long *)0x80000000UL = counter;
+             return __atomic_fetch_sub(&local, 0x100000000UL, 3) == 0x80000000U;
+         }"
+    );
+    assert_eq!(output, b"PVPV");
+    assert_eq!(machine.core().register(10), Some(1));
+    let mut bytes = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    assert_eq!(bytes, 5u64.to_le_bytes());
+}
+
+#[test]
+fn atomic_fetch_ticket_counter_uses_old_values_for_slots_and_publication() {
+    let (machine, _) = execute(
+        "static unsigned int next;
+         static unsigned int published;
+         static unsigned int entries[4];
+         int publish(unsigned int value) {
+             unsigned int ticket = __atomic_fetch_add(&next, 1, 0);
+             if (ticket >= 4) {
+                 __atomic_fetch_sub(&next, 1, 0);
+                 return 0;
+             }
+             entries[ticket] = value;
+             __atomic_fetch_add(&published, 1, 3);
+             return 1;
+         }
+         int main(void) {
+             if (!publish(11) || !publish(22) || !publish(33) || !publish(44)) return 1;
+             if (publish(99) || next != 4) return 2;
+             if (__atomic_load_n(&published, 2) != 4) return 3;
+             if (entries[0] != 11 || entries[1] != 22 || entries[2] != 33 || entries[3] != 44) return 4;
+             return __atomic_fetch_sub(&published, 4, 4);
+         }"
+    );
+    assert_eq!(machine.core().register(10), Some(4));
+}
+
+#[test]
+fn atomic_fetch_bitwise_widths_orders_old_values_and_neighbor_bytes_execute() {
+    for (ty, size, signed) in [
+        ("int", 4, true),
+        ("unsigned int", 4, false),
+        ("long", 8, true),
+        ("unsigned long", 8, false),
+    ] {
+        let mask = if size == 4 { u32::MAX as u64 } else { u64::MAX };
+        for (operation, funct5) in [("and", 12u32), ("or", 8), ("xor", 4)] {
+            for (old, operand) in [
+                (mask, 0u64),
+                (0, mask),
+                (0xfedcba9880000001, 0x1234567887654321),
+                (0x8000000000000000, u64::MAX),
+            ] {
+                for order in 0..=5 {
+                    let old = old & mask;
+                    let expected = match operation {
+                        "and" => old & operand,
+                        "or" => old | operand,
+                        _ => old ^ operand,
+                    } & mask;
+                    let returned = if size == 4 && signed {
+                        old as u32 as i32 as i64 as u64
+                    } else {
+                        old
+                    };
+                    let source = format!(
+                        "int main(void) {{
+                             volatile {ty} *p = (volatile {ty} *)0x80000008UL;
+                             *p = 0x{old:x}UL;
+                             {ty} prior = __atomic_fetch_{operation}(p, 0x{operand:x}UL, {order});
+                             *(volatile unsigned long *)0x80000020UL = prior;
+                             return 7;
+                         }}"
+                    );
+                    let rom = assemble_boot_rom(&compile_to_assembly(&source, "bits.c").unwrap())
+                        .unwrap();
+                    let words: Vec<_> = rom
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect();
+                    let atomics: Vec<_> = words
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, word)| **word & 0x7f == 0x2f)
+                        .collect();
+                    assert_eq!(atomics.len(), 1);
+                    let (index, word) = atomics[0];
+                    assert_eq!(word >> 27, funct5);
+                    assert_eq!((word >> 12) & 7, if size == 4 { 2 } else { 3 });
+                    assert_eq!((word >> 7) & 31, 10);
+                    assert_eq!((word >> 20) & 31, 10);
+                    assert_eq!(
+                        (word >> 25) & 3,
+                        match order {
+                            0 => 0,
+                            1 | 2 => 2,
+                            3 => 1,
+                            _ => 3,
+                        }
+                    );
+                    assert_eq!(
+                        words.iter().filter(|word| **word == 0x0ff0000f).count(),
+                        if order == 5 { 2 } else { 0 }
+                    );
+                    if order == 5 {
+                        assert_eq!(words[index - 1], 0x0ff0000f);
+                        assert_eq!(words[index + 1], 0x0ff0000f);
+                    }
+                    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+                    machine.bus_mut().write(0x80000000, &[0xa5; 48]).unwrap();
+                    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+                    assert_eq!(report.traps, 0, "{source}: {:?}", report.last_trap);
+                    assert!(report.waiting > 0);
+                    assert_eq!(machine.core().register(10), Some(7));
+                    assert_eq!(machine.core().register(2), Some(0x80010000));
+                    assert_eq!(machine.core().register(8), Some(0));
+                    let mut bytes = [0; 24];
+                    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+                    assert_eq!(&bytes[..8], &[0xa5; 8]);
+                    assert_eq!(
+                        &bytes[8..8 + size],
+                        &expected.to_le_bytes()[..size],
+                        "{source}"
+                    );
+                    assert!(bytes[8 + size..].iter().all(|byte| *byte == 0xa5));
+                    let mut actual = [0; 8];
+                    machine.bus_mut().read(0x80000020, &mut actual).unwrap();
+                    assert_eq!(u64::from_le_bytes(actual), returned, "{source}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn atomic_fetch_bitwise_nested_stack_operands_tables_and_recursive_updates_execute() {
+    let (machine, output) = execute(
+        "typedef unsigned long word;
+         static word object;
+         static int calls;
+         word *address(void) {
+             ++calls; *(volatile unsigned char *)0x10000000UL = 'P'; return &object;
+         }
+         word ninth(long a,long b,long c,long d,long e,long f,long g,long h,word value) {
+             ++calls; *(volatile unsigned char *)0x10000000UL = 'V'; return value;
+         }
+         word operand(void) { return ninth(1,2,3,4,5,6,7,8,0x8000000000000001UL); }
+         word recurse(int n) {
+             word old = __atomic_fetch_or(&object, 1UL << n, 2);
+             if (n) return old ^ recurse(n - 1);
+             return old;
+         }
+         int main(void) {
+             if (__atomic_fetch_or(address(), operand(), 4) != 0) return 1;
+             if (__atomic_fetch_xor(address(), operand(), 5) != 0x8000000000000001UL) return 2;
+             if (__atomic_fetch_and(address(), operand(), 0) != 0 || calls != 6) return 3;
+             if (recurse(3) != 10 || object != 15) return 4;
+             unsigned int local = 0x80000001U;
+             unsigned int *table[] = { [1] = &local };
+             if (__atomic_fetch_and(table[1], (signed char)-2, 3) != 0x80000001U) return 5;
+             if (local != 0x80000000U) return 6;
+             if (__atomic_fetch_or(table[1], 0x100000001UL, 1) != 0x80000000U) return 7;
+             return __atomic_fetch_xor(table[1], 0x80000000U, 2) == 0x80000001U && local == 1;
+         }",
+    );
+    assert_eq!(output, b"PVPVPV");
+    assert_eq!(machine.core().register(10), Some(1));
+}
+
+#[test]
+fn atomic_fetch_invalid_inputs_and_reserved_names_preserve_rom() {
+    for operation in ["add", "sub", "and", "or", "xor"] {
+        let builtin = format!("__atomic_fetch_{operation}");
+        let mut sources: Vec<_> = [
+            format!("{builtin}((char *)0, 1, 0);"),
+            format!("{builtin}((short *)0, 1, 0);"),
+            format!("{builtin}((void *)0, 1, 0);"),
+            format!("{builtin}((int **)0, 1, 0);"),
+            format!("{builtin}((const int *)0, 1, 0);"),
+            format!("{builtin}((const volatile long *)0, 1, 0);"),
+            format!("{builtin}(1, 1, 0);"),
+            format!("{builtin}((int *)0, (void *)0, 0);"),
+            format!("{builtin}((int *)0, 1, 6);"),
+            format!("{builtin}((int *)0, 1, -1);"),
+            format!("int order = 0; {builtin}((int *)0, 1, order);"),
+            format!("{builtin}((int *)0, 1, 1 / 0);"),
+            format!("{builtin}((int *)0, 1);"),
+            format!("{builtin}((int *)0, 1, 0, 0);"),
+            format!("if (0) {builtin}((const int *)0, 1, 0);"),
+            format!("int {builtin} = 0;"),
+        ]
+        .iter()
+        .map(|body| format!("int main(void) {{ {body} return 0; }}"))
+        .collect();
+        sources.extend([
+            format!("int {builtin}; int main(void) {{ return 0; }}"),
+            format!("int {builtin}(void) {{ return 0; }} int main(void) {{ return 0; }}"),
+            format!("typedef int {builtin}; int main(void) {{ return 0; }}"),
+            format!("enum {{ {builtin} = 0 }}; int main(void) {{ return 0; }}"),
+            format!("int f(int {builtin}) {{ return 0; }} int main(void) {{ return 0; }}"),
+        ]);
+        for source in sources {
+            let diagnostic = compile_to_assembly(&source, "fetch-invalid.c")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                diagnostic.contains("fetch-invalid.c:"),
+                "{source}: {diagnostic}"
+            );
+            let files = Files::new(&source);
+            std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+            let build = files.compile();
+            assert!(!build.status.success(), "{source}");
+            assert!(!build.stderr.is_empty());
+            assert_eq!(
+                std::fs::read(files.0.join("rom.bin")).unwrap(),
+                b"previous ROM"
+            );
+        }
+    }
+}
+
+#[test]
 fn atomic_integer_widths_orders_and_exact_neighbor_bytes_execute() {
     for ty in ["int", "unsigned int", "long", "unsigned long"] {
         for order in 0..=5 {
@@ -2609,6 +3912,14 @@ fn atomic_misaligned_and_nonram_addresses_trap_in_guest() {
         "__atomic_store_n((int *)0x80000001UL, 1, 3)",
         "__atomic_load_n((int *)0x10000000UL, 0)",
         "__atomic_exchange_n((long *)0x1000UL, 1, 0)",
+        "__atomic_fetch_add((int *)0x80000001UL, 1, 0)",
+        "__atomic_fetch_sub((long *)0x80000004UL, 1, 0)",
+        "__atomic_fetch_add((int *)0x10000000UL, 1, 0)",
+        "__atomic_fetch_sub((long *)0x1000UL, 1, 0)",
+        "__atomic_fetch_and((int *)0x80000001UL, 1, 0)",
+        "__atomic_fetch_or((long *)0x80000004UL, 1, 0)",
+        "__atomic_fetch_xor((int *)0x10000000UL, 1, 0)",
+        "__atomic_fetch_and((long *)0x1000UL, 1, 0)",
     ] {
         let source = format!("int main(void) {{ {expression}; return 0; }}");
         let assembly = compile_to_assembly(&source, "trap.c").unwrap();
@@ -3536,7 +4847,7 @@ fn unsupported_typedef_targets_and_namespace_conflicts_diagnose() {
         "typedef int word; int f(int word) { return word; } int main(void) { return 0; }",
         "typedef int word; int word(void) { return 1; } int main(void) { return 0; }",
         "int word(void) { return 1; } typedef int word; int main(void) { return 0; }",
-        "typedef volatile int *pointer; int main(void) { return 0; }",
+        "typedef volatile int object; int main(void) { return 0; }",
         "typedef int *pointer; int main(void) { volatile pointer p; return 0; }",
         "typedef int *pointer; int main(void) { sizeof(volatile pointer); return 0; }",
         "int main(void) { typedef int word; return 0; }",

@@ -15,10 +15,16 @@ enum AtomicOperation {
     Load,
     Store,
     Exchange,
+    FetchAdd,
+    FetchSub,
+    FetchAnd,
+    FetchOr,
+    FetchXor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PointerBase {
+    Bool,
     Char,
     SignedChar,
     Byte,
@@ -34,6 +40,7 @@ enum PointerBase {
 impl PointerBase {
     fn from_type(ty: Type) -> Option<Self> {
         Some(match ty {
+            Type::Bool => Self::Bool,
             Type::Char => Self::Char,
             Type::SignedChar => Self::SignedChar,
             Type::Byte => Self::Byte,
@@ -50,6 +57,7 @@ impl PointerBase {
 
     fn scalar(self) -> Type {
         match self {
+            Self::Bool => Type::Bool,
             Self::Char => Type::Char,
             Self::SignedChar => Type::SignedChar,
             Self::Byte => Type::Byte,
@@ -69,12 +77,18 @@ fn atomic_operation(name: &str) -> Option<AtomicOperation> {
         "__atomic_load_n" => Some(AtomicOperation::Load),
         "__atomic_store_n" => Some(AtomicOperation::Store),
         "__atomic_exchange_n" => Some(AtomicOperation::Exchange),
+        "__atomic_fetch_add" => Some(AtomicOperation::FetchAdd),
+        "__atomic_fetch_sub" => Some(AtomicOperation::FetchSub),
+        "__atomic_fetch_and" => Some(AtomicOperation::FetchAnd),
+        "__atomic_fetch_or" => Some(AtomicOperation::FetchOr),
+        "__atomic_fetch_xor" => Some(AtomicOperation::FetchXor),
         _ => None,
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Type {
+    Bool,
     Int,
     UInt,
     Short,
@@ -85,6 +99,7 @@ enum Type {
     SignedChar,
     Byte,
     PlainCharPointer,
+    PlainBoolPointer,
     PlainSignedCharPointer,
     PlainBytePointer,
     PlainIntPointer,
@@ -95,6 +110,7 @@ enum Type {
     PlainULongPointer,
     PlainVoidPointer,
     CharPointer,
+    BoolPointer,
     SignedCharPointer,
     BytePointer,
     IntPointer,
@@ -104,7 +120,15 @@ enum Type {
     LongPointer,
     ULongPointer,
     VoidPointer,
-    PointerPointer { base: PointerBase, volatile: bool },
+    ConstPointer {
+        base: PointerBase,
+        volatile: bool,
+    },
+    PointerPointer {
+        base: PointerBase,
+        volatile: bool,
+        read_only: bool,
+    },
     Void,
 }
 
@@ -114,7 +138,21 @@ impl Type {
         if compact.ends_with("**") {
             return Self::parse(compact.strip_suffix('*')?)?.pointer();
         }
+        if compact.contains("const") {
+            let pointee = compact.strip_suffix('*')?;
+            if pointee.contains('*') {
+                return None;
+            }
+            let pointer = Self::parse(&format!("{}*", pointee.replace("const", "")))?;
+            return Some(Self::ConstPointer {
+                base: PointerBase::from_type(pointer.pointee()?)?,
+                volatile: pointer.volatile_pointee(),
+            });
+        }
         Some(match compact.as_str() {
+            "_Bool" => Self::Bool,
+            "_Bool*" => Self::PlainBoolPointer,
+            "volatile_Bool*" | "_Boolvolatile*" => Self::BoolPointer,
             "int" | "signed" | "signedint" => Self::Int,
             "unsigned" | "unsignedint" => Self::UInt,
             "short" | "shortint" | "signedshort" | "signedshortint" => Self::Short,
@@ -183,7 +221,8 @@ impl Type {
     fn integer(self) -> bool {
         matches!(
             self,
-            Self::Int
+            Self::Bool
+                | Self::Int
                 | Self::UInt
                 | Self::Short
                 | Self::UShort
@@ -196,8 +235,10 @@ impl Type {
     }
 
     fn unsigned(self) -> bool {
-        matches!(self, Self::UInt | Self::UShort | Self::ULong | Self::Byte)
-            || self == Self::Char && PLAIN_CHAR_IS_UNSIGNED
+        matches!(
+            self,
+            Self::Bool | Self::UInt | Self::UShort | Self::ULong | Self::Byte
+        ) || self == Self::Char && PLAIN_CHAR_IS_UNSIGNED
             || self.pointee().is_some()
     }
 
@@ -207,7 +248,7 @@ impl Type {
 
     fn size(self) -> Option<u64> {
         match self {
-            Self::Char | Self::SignedChar | Self::Byte => Some(1),
+            Self::Bool | Self::Char | Self::SignedChar | Self::Byte => Some(1),
             Self::Short | Self::UShort => Some(2),
             Self::Int | Self::UInt => Some(4),
             Self::Long | Self::ULong => Some(8),
@@ -219,7 +260,7 @@ impl Type {
     fn promote(self) -> Self {
         if matches!(
             self,
-            Self::Char | Self::SignedChar | Self::Byte | Self::Short | Self::UShort
+            Self::Bool | Self::Char | Self::SignedChar | Self::Byte | Self::Short | Self::UShort
         ) {
             Self::Int
         } else {
@@ -250,12 +291,20 @@ impl Type {
                     || self.pointee() == Some(Self::Void)
                     || other.pointee() == Some(Self::Void))
                 && (self.volatile_pointee() || !other.volatile_pointee())
+                && (self.const_pointee() || !other.const_pointee())
     }
 
     fn volatile_pointee(self) -> bool {
+        if let Self::ConstPointer { volatile, .. } = self {
+            return volatile;
+        }
         self.pointee()
             .and_then(Self::pointer)
             .is_some_and(|plain| self != plain)
+    }
+
+    fn const_pointee(self) -> bool {
+        matches!(self, Self::ConstPointer { .. })
     }
 
     fn qualified_pointer(self, volatile: bool) -> Option<Self> {
@@ -263,6 +312,7 @@ impl Type {
             return self.pointer();
         }
         Some(match self {
+            Self::Bool => Self::BoolPointer,
             Self::Char => Self::CharPointer,
             Self::SignedChar => Self::SignedCharPointer,
             Self::Byte => Self::BytePointer,
@@ -287,11 +337,20 @@ impl Type {
         } else {
             return None;
         };
-        pointee.qualified_pointer(self.volatile_pointee() || other.volatile_pointee())
+        let volatile = self.volatile_pointee() || other.volatile_pointee();
+        if self.const_pointee() || other.const_pointee() {
+            Some(Self::ConstPointer {
+                base: PointerBase::from_type(pointee)?,
+                volatile,
+            })
+        } else {
+            pointee.qualified_pointer(volatile)
+        }
     }
 
     fn pointer(self) -> Option<Self> {
         Some(match self {
+            Self::Bool => Self::PlainBoolPointer,
             Self::Char => Self::PlainCharPointer,
             Self::SignedChar => Self::PlainSignedCharPointer,
             Self::Byte => Self::PlainBytePointer,
@@ -305,6 +364,7 @@ impl Type {
             _ if self.pointee().is_some() => Self::PointerPointer {
                 base: PointerBase::from_type(self.pointee()?)?,
                 volatile: self.volatile_pointee(),
+                read_only: self.const_pointee(),
             },
             _ => return None,
         })
@@ -312,7 +372,19 @@ impl Type {
 
     fn pointee(self) -> Option<Self> {
         match self {
-            Self::PointerPointer { base, volatile } => base.scalar().qualified_pointer(volatile),
+            Self::PlainBoolPointer | Self::BoolPointer => Some(Self::Bool),
+            Self::ConstPointer { base, .. } => Some(base.scalar()),
+            Self::PointerPointer {
+                base,
+                volatile,
+                read_only,
+            } => {
+                if read_only {
+                    Some(Self::ConstPointer { base, volatile })
+                } else {
+                    base.scalar().qualified_pointer(volatile)
+                }
+            }
             Self::PlainCharPointer | Self::CharPointer => Some(Self::Char),
             Self::PlainSignedCharPointer | Self::SignedCharPointer => Some(Self::SignedChar),
             Self::PlainBytePointer | Self::BytePointer => Some(Self::Byte),
@@ -376,6 +448,14 @@ struct Value {
 }
 
 impl Value {
+    fn modifiable(&self) -> bool {
+        match &self.kind {
+            ValueKind::Local(_) | ValueKind::Global(_, _) => true,
+            ValueKind::Load(pointer) => !pointer.ty.const_pointee(),
+            _ => false,
+        }
+    }
+
     fn integer_constant_expression(&self) -> bool {
         if !self.ty.integer() {
             return false;
@@ -537,6 +617,7 @@ impl Value {
             _ => return None,
         };
         Some(match self.ty {
+            Type::Bool => u64::from(number != 0),
             Type::Int => number as i32 as i64 as u64,
             Type::UInt => number as u32 as u64,
             Type::Short => number as i16 as i64 as u64,
@@ -585,7 +666,7 @@ enum Action {
     InitializeArray {
         slot: usize,
         element: Type,
-        values: Vec<Value>,
+        values: Vec<(usize, Value)>,
     },
     Return(Option<Value>),
     If(Value, Box<Action>, Option<Box<Action>>),
@@ -618,7 +699,7 @@ struct Global {
     address: u64,
     bytes: usize,
     initializer: Option<Vec<u8>>,
-    pointer_initializer: Option<(usize, Vec<Value>)>,
+    pointer_initializer: Option<(usize, Vec<(usize, Value)>)>,
 }
 
 impl Global {
@@ -726,7 +807,9 @@ impl Lower<'_> {
     fn convert(&self, value: Value, ty: Type, line: usize) -> Result<Value, CCompilerError> {
         if value.ty == Type::Void
             || ty == Type::Void
-            || !(ty.compatible(value.ty) || ty.pointee().is_some() && value.null_pointer_constant())
+            || !(ty.compatible(value.ty)
+                || ty == Type::Bool && value.ty.scalar()
+                || ty.pointee().is_some() && value.null_pointer_constant())
         {
             return Err(self.fail(line, "incompatible RV64 subset types"));
         }
@@ -1087,10 +1170,7 @@ impl Lower<'_> {
                 value,
             } if operator == "=" => {
                 let target = self.value(target)?;
-                if !matches!(
-                    target.kind,
-                    ValueKind::Local(_) | ValueKind::Global(_, _) | ValueKind::Load(_)
-                ) {
+                if !target.modifiable() {
                     return Err(self.fail(line, "assignment requires a modifiable object"));
                 }
                 let value = self.value(value)?;
@@ -1177,6 +1257,9 @@ impl Lower<'_> {
             return Err(self.fail(line, "atomic builtin argument count mismatch"));
         }
         let pointer = self.value(&arguments[0])?;
+        if !load && pointer.ty.const_pointee() {
+            return Err(self.fail(line, "atomic write requires a modifiable pointee"));
+        }
         let ty = pointer
             .ty
             .pointee()
@@ -1228,7 +1311,7 @@ impl Lower<'_> {
         initializer: &Expression,
         ty: Type,
         length: usize,
-    ) -> Result<Vec<Value>, CCompilerError> {
+    ) -> Result<Vec<(usize, Value)>, CCompilerError> {
         let line = initializer.line;
         if let Some(Expression {
             kind: ExpressionKind::Atom(token),
@@ -1257,6 +1340,7 @@ impl Lower<'_> {
                         ty,
                         line,
                     )
+                    .map(|value| (index, value))
                 })
                 .collect();
         }
@@ -1266,11 +1350,26 @@ impl Lower<'_> {
         if initializers.is_empty() {
             return Err(self.fail(line, "array initializer list must not be empty"));
         }
-        if initializers.len() > length {
-            return Err(self.fail(line, "too many array initializers"));
-        }
         let mut values = Vec::with_capacity(length);
+        let mut initialized = BTreeSet::new();
+        let mut next = 0usize;
         for initializer in initializers {
+            let (index, initializer) = match &initializer.kind {
+                ExpressionKind::ArrayDesignator { index, value } => (*index, value.as_ref()),
+                _ => (next, initializer),
+            };
+            if index >= length {
+                return Err(self.fail(
+                    initializer.line,
+                    "array initializer index is outside the array",
+                ));
+            }
+            if !initialized.insert(index) {
+                return Err(self.fail(
+                    initializer.line,
+                    "repeated array initializer index is not supported",
+                ));
+            }
             let initializer = scalar_initializer(initializer).ok_or_else(|| {
                 self.fail(
                     initializer.line,
@@ -1278,19 +1377,28 @@ impl Lower<'_> {
                 )
             })?;
             let value = self.value(initializer)?;
-            values.push(self.convert(value, ty, initializer.line)?);
+            values.push((index, self.convert(value, ty, initializer.line)?));
+            next = index + 1;
         }
-        values.resize_with(length, || Value {
-            ty,
-            kind: if ty.pointee().is_some() {
-                ValueKind::Convert(Box::new(Value {
-                    ty: Type::Int,
-                    kind: ValueKind::Constant(0),
-                }))
-            } else {
-                ValueKind::Constant(0)
-            },
-        });
+        for index in 0..length {
+            if initialized.contains(&index) {
+                continue;
+            }
+            values.push((
+                index,
+                Value {
+                    ty,
+                    kind: if ty.pointee().is_some() {
+                        ValueKind::Convert(Box::new(Value {
+                            ty: Type::Int,
+                            kind: ValueKind::Constant(0),
+                        }))
+                    } else {
+                        ValueKind::Constant(0)
+                    },
+                },
+            ));
+        }
         Ok(values)
     }
 
@@ -1302,10 +1410,7 @@ impl Lower<'_> {
         postfix: bool,
         line: usize,
     ) -> Result<Value, CCompilerError> {
-        if !matches!(
-            target.kind,
-            ValueKind::Local(_) | ValueKind::Global(_, _) | ValueKind::Load(_)
-        ) {
+        if !target.modifiable() {
             return Err(self.fail(line, "update requires a modifiable scalar object"));
         }
         let ty = target.ty;
@@ -1601,6 +1706,7 @@ impl Emit {
 
     fn normalize(&mut self, ty: Type) {
         match ty {
+            Type::Bool => self.line("sltu a0, zero, a0"),
             Type::Int => self.line("addiw a0, a0, 0"),
             Type::UInt => self.line("slli a0, a0, 32\nsrli a0, a0, 32"),
             Type::Short => self.line("slli a0, a0, 48\nsrai a0, a0, 48"),
@@ -1656,6 +1762,7 @@ impl Emit {
 
     fn load(&mut self, ty: Type) {
         self.line(match ty {
+            Type::Bool => "lbu a0, 0(a0)",
             Type::Char if PLAIN_CHAR_IS_UNSIGNED => "lbu a0, 0(a0)",
             Type::Char | Type::SignedChar => "lb a0, 0(a0)",
             Type::Byte => "lbu a0, 0(a0)",
@@ -1671,7 +1778,7 @@ impl Emit {
 
     fn store(&mut self, ty: Type) {
         self.line(match ty {
-            Type::Char | Type::SignedChar | Type::Byte => "sb a0, 0(t0)",
+            Type::Bool | Type::Char | Type::SignedChar | Type::Byte => "sb a0, 0(t0)",
             Type::Int | Type::UInt => "sw a0, 0(t0)",
             Type::Short | Type::UShort => "sh a0, 0(t0)",
             Type::Long | Type::ULong => "sd a0, 0(t0)",
@@ -1785,6 +1892,9 @@ impl Emit {
                 } else {
                     self.line("mv t0, a0");
                 }
+                if matches!(operation, AtomicOperation::FetchSub) {
+                    self.line("sub a0, zero, a0");
+                }
                 if *order == 5 {
                     self.line("fence");
                 }
@@ -1804,7 +1914,17 @@ impl Emit {
                     } else {
                         "a0"
                     };
-                    self.line(format!("amoswap.{width}{suffix} {destination}, a0, (t0)"));
+                    let instruction = match operation {
+                        AtomicOperation::FetchAdd | AtomicOperation::FetchSub => "amoadd",
+                        AtomicOperation::FetchAnd => "amoand",
+                        AtomicOperation::FetchOr => "amoor",
+                        AtomicOperation::FetchXor => "amoxor",
+                        AtomicOperation::Store | AtomicOperation::Exchange => "amoswap",
+                        AtomicOperation::Load => unreachable!("load handled above"),
+                    };
+                    self.line(format!(
+                        "{instruction}.{width}{suffix} {destination}, a0, (t0)"
+                    ));
                 }
                 if *order == 5 {
                     self.line("fence");
@@ -1883,7 +2003,7 @@ impl Emit {
                 values,
             } => {
                 let size = element.size().expect("integer element size") as usize;
-                for (index, value) in values.iter().enumerate() {
+                for (index, value) in values {
                     self.value(value);
                     self.line(format!("addi t0, s0, -{}", 24 + slot * 8 - index * size));
                     self.store(*element);
@@ -1996,6 +2116,14 @@ fn signature(declaration: &FunctionDeclaration) -> Option<Signature> {
 }
 
 fn array_length(expression: &Expression) -> Result<usize, CCompilerError> {
+    array_constant(expression, false)
+}
+
+fn array_designator(expression: &Expression) -> Result<usize, CCompilerError> {
+    array_constant(expression, true)
+}
+
+fn array_constant(expression: &Expression, allow_zero: bool) -> Result<usize, CCompilerError> {
     let filename = expression.filename.as_deref().unwrap_or("<source>");
     let signatures = BTreeMap::new();
     let globals = BTreeMap::new();
@@ -2014,10 +2142,25 @@ fn array_length(expression: &Expression) -> Result<usize, CCompilerError> {
         jumps: Vec::new(),
     };
     let value = lower.value(expression)?;
-    value.constant_integer()
-        .filter(|number| *number > 0 && (value.ty.unsigned() || (*number as i64) > 0))
+    value
+        .constant_integer()
+        .filter(|_| !allow_zero || value.integer_constant_expression())
+        .filter(|number| {
+            (allow_zero || *number > 0) && (value.ty.unsigned() || (*number as i64) >= 0)
+        })
         .and_then(|number| usize::try_from(number).ok())
-        .ok_or_else(|| error(filename, expression.line, "array length requires a positive LP64 integer constant without undefined arithmetic"))
+        .filter(|number| !allow_zero || *number < GLOBAL_BYTES)
+        .ok_or_else(|| {
+            error(
+                filename,
+                expression.line,
+                if allow_zero {
+                    "array designator requires a nonnegative LP64 integer constant below 65536 without undefined arithmetic"
+                } else {
+                    "array length requires a positive LP64 integer constant without undefined arithmetic"
+                },
+            )
+        })
 }
 
 fn enumerator(expression: &Expression) -> Result<i64, CCompilerError> {
@@ -2138,22 +2281,20 @@ fn global(
             let initializer = scalar_initializer(initializer)
                 .ok_or_else(|| error(filename, line, "global requires a scalar initializer"))?;
             let value = lower.value(initializer)?;
-            vec![lower.convert(value, ty, line)?]
+            vec![(0, lower.convert(value, ty, line)?)]
         };
         if ty.pointee().is_some() {
             object.pointer_initializer = Some((line, values));
             return Ok(object);
         }
-        let mut image = Vec::with_capacity(object.bytes);
-        for value in values {
+        let mut image = vec![0; object.bytes];
+        let size = ty.size().expect("integer size") as usize;
+        for (index, value) in values {
             let number = value.constant_integer().ok_or_else(|| {
                 error(filename, line, "global initializer requires an LP64 integer constant without undefined arithmetic")
             })?;
-            image.extend_from_slice(
-                &number.to_le_bytes()[..ty.size().expect("integer size") as usize],
-            );
+            image[index * size..(index + 1) * size].copy_from_slice(&number.to_le_bytes()[..size]);
         }
-        image.resize(object.bytes, 0);
         object.initializer = Some(image);
     }
     Ok(object)
@@ -2164,12 +2305,12 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
     for token in &tokens {
         if matches!(
             token.value.as_str(),
-            "const" | "struct" | "union" | "register" | "auto" | "restrict" | "#"
+            "struct" | "union" | "register" | "auto" | "restrict" | "#"
         ) {
             return Err(error(
                 filename,
                 token.line,
-                "preprocessing, automatic storage classes, records and const are not supported by initial RV64 subset",
+                "preprocessing, automatic storage classes and records are not supported by initial RV64 subset",
             ));
         }
     }
@@ -2200,6 +2341,7 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
     }
     let mut parser = TranslationUnitParser::new(tokens.clone());
     parser.statements.array_length_evaluator = Some(array_length);
+    parser.statements.array_designator_evaluator = Some(array_designator);
     parser.enumerator_evaluator = Some(enumerator);
     parser.statements.expressions.resolved_enumerators = Some(HashMap::new());
     parser.file_scope_storage = Some(Vec::new());
@@ -2279,7 +2421,7 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
                 "typedef name conflicts with an enumerator",
             ));
         }
-        if Type::parse(target).is_none_or(|ty| ty.volatile_pointee()) {
+        if Type::parse(target).is_none() {
             return Err(error(
                 filename,
                 1,
@@ -2421,11 +2563,14 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         if let Some(bytes) = &object.initializer {
             image.extend_from_slice(bytes);
         } else if let Some((line, values)) = &object.pointer_initializer {
-            for value in values {
+            let start = image.len();
+            image.resize(start + object.bytes, 0);
+            for (index, value) in values {
                 let address = value.static_pointer(&globals).ok_or_else(|| {
                     error(filename, *line, "pointer initializer requires a static object address or an explicit integer constant cast")
                 })?;
-                image.extend_from_slice(&address.to_le_bytes());
+                let offset = start + index * 8;
+                image[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
             }
         }
     }

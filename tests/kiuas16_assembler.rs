@@ -39,6 +39,14 @@ fn independent_instruction_bytes() {
         ("amoswap.w a0, a1, (t0)", 0x08b2a52f),
         ("amoswap.d.rl zero, a0, (t0)", 0x0aa2b02f),
         ("amoswap.w.aqrl a0, a1, (t0)", 0x0eb2a52f),
+        ("amoadd.w a0, a1, (t0)", 0x00b2a52f),
+        ("amoadd.d.aq a0, a1, (t0)", 0x04b2b52f),
+        ("amoadd.w.rl zero, a0, (t0)", 0x02a2a02f),
+        ("amoadd.d.aqrl a0, a1, (t0)", 0x06b2b52f),
+        ("amoxor.w a0, a1, (t0)", 0x20b2a52f),
+        ("amoor.d.aq a0, a1, (t0)", 0x44b2b52f),
+        ("amoand.w.rl zero, a0, (t0)", 0x62a2a02f),
+        ("amoxor.d.aqrl a0, a1, (t0)", 0x26b2b52f),
         ("wfi", 0x10500073),
     ];
     for (source, expected) in cases {
@@ -46,6 +54,103 @@ fn independent_instruction_bytes() {
         assert_eq!(&rom[..4], &expected.to_le_bytes(), "{source}");
         assert_eq!(rom.len(), BOOT_ROM_BYTES);
         assert!(rom[4..].iter().all(|byte| *byte == 0));
+    }
+}
+
+#[test]
+fn assembled_atomic_add_returns_old_bits_and_updates_only_the_addressed_width() {
+    for (width, old, operand) in [
+        ("w", 0x7fffffff_u64, 1i64),
+        ("w", 0x80000000, -1),
+        ("d", u64::MAX, 1),
+        ("d", 0x8000000000000000, -1),
+    ] {
+        for suffix in ["", ".aq", ".rl", ".aqrl"] {
+            let rom = assemble_boot_rom(&format!(
+                "li t0, 1
+                 slli t0, t0, 31
+                 addi t0, t0, 8
+                 li a1, {operand}
+                 amoadd.{width}{suffix} a0, a1, (t0)
+                 wfi"
+            ))
+            .unwrap();
+            let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+            machine.bus_mut().write(0x80000000, &[0xa5; 24]).unwrap();
+            let size = if width == "w" { 4 } else { 8 };
+            machine
+                .bus_mut()
+                .write(0x80000008, &old.to_le_bytes()[..size])
+                .unwrap();
+            let report = run_headless(&mut machine, 20, &[], &mut Vec::new()).unwrap();
+            assert_eq!(report.traps, 0);
+            assert!(report.waiting > 0);
+            let expected_old = if size == 4 {
+                old as u32 as i32 as i64 as u64
+            } else {
+                old
+            };
+            assert_eq!(machine.core().register(10), Some(expected_old));
+            let mut bytes = [0; 24];
+            machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+            assert_eq!(&bytes[..8], &[0xa5; 8]);
+            assert_eq!(
+                &bytes[8..8 + size],
+                &old.wrapping_add(operand as u64).to_le_bytes()[..size]
+            );
+            assert!(bytes[8 + size..].iter().all(|byte| *byte == 0xa5));
+        }
+    }
+}
+
+#[test]
+fn assembled_bitwise_atomics_match_independent_bytes_and_memory_results() {
+    for (op, funct5) in [("amoand", 12u32), ("amoor", 8), ("amoxor", 4)] {
+        for (width, funct3, size) in [("w", 2u32, 4), ("d", 3, 8)] {
+            for (suffix, order) in [("", 0u32), (".aq", 2), (".rl", 1), (".aqrl", 3)] {
+                let instruction = format!("{op}.{width}{suffix} a0, a1, (t0)");
+                let rom = assemble_boot_rom(&instruction).unwrap();
+                let expected =
+                    funct5 << 27 | order << 25 | 11 << 20 | 5 << 15 | funct3 << 12 | 10 << 7 | 0x2f;
+                assert_eq!(&rom[..4], &expected.to_le_bytes(), "{instruction}");
+                let rom = assemble_boot_rom(&format!(
+                    "li t0, 1
+                     slli t0, t0, 31
+                     addi t0, t0, 8
+                     li a1, -2
+                     {instruction}
+                     wfi"
+                ))
+                .unwrap();
+                let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+                machine.bus_mut().write(0x80000000, &[0xa5; 24]).unwrap();
+                let old = 0xfedcba9880000001u64;
+                machine
+                    .bus_mut()
+                    .write(0x80000008, &old.to_le_bytes()[..size])
+                    .unwrap();
+                let report = run_headless(&mut machine, 20, &[], &mut Vec::new()).unwrap();
+                assert_eq!(report.traps, 0);
+                assert!(report.waiting > 0);
+                let returned = if size == 4 {
+                    old as u32 as i32 as i64 as u64
+                } else {
+                    old
+                };
+                assert_eq!(machine.core().register(10), Some(returned));
+                let operand = (-2i64) as u64;
+                let expected = match op {
+                    "amoand" => old & operand,
+                    "amoor" => old | operand,
+                    _ => old ^ operand,
+                };
+                let mut bytes = [0; 24];
+                machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+                assert_eq!(&bytes[..8], &[0xa5; 8]);
+                assert_eq!(&bytes[8..8 + size], &expected.to_le_bytes()[..size]);
+                assert!(bytes[8 + size..].iter().all(|byte| *byte == 0xa5));
+            }
+        }
     }
 }
 
@@ -93,6 +198,15 @@ fn malformed_sources_diagnose_with_line_numbers() {
         ("amoswap.d.aq.rl a0, a1, (t0)", "suffix"),
         ("lr.d a0, a1, (t0)", "operands"),
         ("amoswap.w a0, (t0)", "operands"),
+        ("amoadd.b a0, a1, (t0)", "width"),
+        ("amoadd.d.aq.rl a0, a1, (t0)", "suffix"),
+        ("amoadd.w a0, a1, 4(t0)", "zero offset"),
+        ("amoadd.d a0, (t0)", "operands"),
+        ("amoand.b a0, a1, (t0)", "width"),
+        ("amoor.d.aq.rl a0, a1, (t0)", "suffix"),
+        ("amoxor.w a0, a1, 4(t0)", "zero offset"),
+        ("amoand.d a0, (t0)", "operands"),
+        ("amoor.w a0, a1, (x32)", "register"),
         ("slli a0, a0, 64", "shift amount"),
         ("slliw a0, a0, 32", "shift amount"),
         ("j missing", "undefined label"),
