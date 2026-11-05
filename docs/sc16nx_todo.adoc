@@ -484,8 +484,12 @@ Rust test. A new host-side layout model and fixed expected-layout regressions
 cover scalar, array, structure, union, member offset, and tail-padding rules,
 including binary128 alignment and overflow rejection. The model is not yet
 consumed by a Kiuas16 compiler, and these tests are not independent guest
-execution fixtures. Call/ELF execution fixtures cannot run until the
-Kiuas16 compiler and linker exist. Keep this child unchecked.
+execution fixtures. Initial typed RV64 C lowering now executes signed
+integer/byte calls against independently handwritten RV64 callers and callees,
+including eight register arguments, stack alignment, and saved registers
+(+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+).
+Aggregate layout, floating/LP64D, varargs, and ELF execution fixtures still
+need the corresponding compiler/linker capabilities. Keep this child unchecked.
 
 ** [ ] [[nx-device-contract]] *P0 / Establish one device contract source of truth.*
    Define addresses, access widths, IRQs, protocol identities, discovery,
@@ -526,6 +530,16 @@ M-mode payload reads +mhartid+, resets the ROM-used controller, renegotiates,
 and reads a new sector. This adds executable consumer evidence using fixed
 RV64 encodings; it is not Rust-compiled Sytyke or the pinned xv6 kernel.
 Cross-consumer acceptance remains open and this task remains unchecked.
++
+*Compiled-C bring-up:* +kiuas16-cc+ now builds the source fixture
++tests/fixtures/kiuas16_storage.c+ through typed RV64 lowering and the Rust ROM
+assembler. Production runtime tests execute its guest-owned byte/word/
+doubleword MMIO and RAM accesses, queue setup, read/write/flush, completion
+and IRQ observation, acknowledgement, and reset. Exact serial bytes and
+persisted disposable-media contents are checked in both read-only and
+writable modes. This small standalone guest uses explicit register constants;
+it is not Sytyke or a pinned-kernel consumer of the shared headers.
+The firmware/kernel agreement gate remains open.
 
 === Phase 1: focused Rust refactoring
 
@@ -574,6 +588,14 @@ Execution tests demonstrate guest-owned context switches and allocation.
 *Acceptance:* Declarations, expressions, object layout, conversions, and
 calls share type rules; invalid constructs report source-located diagnostics.
 Extraction preserves supported behavior before RV64-specific changes are applied.
++
+*Incremental RV64 backend boundary:* +src/c_compiler/rv64.rs+ reuses the
+existing lexer/parser and lowers its supported syntax to explicitly typed
+values/actions before emitting RV64 assembly. Call signatures, local scopes,
+integer promotions/conversions, memory widths, and diagnostics share these
+typed rules. The legacy backend remains unchanged. This bounded bring-up
+does not complete shared semantic-stage extraction, aggregate layout
+integration, preprocessing/header selection, or the xv6 language corpus.
 
 ** [ ] [[nx-tool-boundaries]] *P0 / Separate build tools from runtime and games.*
    Isolate compilation/linking/image construction from runtime loading and
@@ -628,6 +650,30 @@ unsupported input. GNU extensions are not mislabeled C90 language features.
 and recursive calls, register exhaustion, side effects, aggregate copies,
 indirect calls, and varargs. Assert object bytes, results, stack alignment,
 cleanup, and preserved registers rather than assembly substrings alone.
++
+*Initial executable subset:* +kiuas16-cc+ now compiles freestanding C to
+raw protected ROM through typed RV64 lowering and the Rust assembler.
+Signed +int/long+, +unsigned char+, scalar register calls/returns, recursion,
+locals/scopes, +if/while+, and explicit volatile byte/word/doubleword accesses
+execute in +tests/kiuas16_compiler.rs+. Independent handwritten caller/callee
+fixtures check integer call interoperability rather than relying solely on
+compiler-generated callers and callees. The C storage fixture drives the
+production runner's attached media with exact UART and persisted-byte
+assertions. See
+link:kiuas16_machine_contract.adoc#rom-c-compiler[commands and subset limits].
+This is not ELF output, full LP64D, or pinned xv6 compilation. Unsupported
+input diagnoses and the complete code-generation acceptance remains open.
++
+*Validation checkpoint:* Working tree based on +39146da+; one hart, M-mode
+raw-ROM startup, standard runner RAM/media profile.
++cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all nine
+compiler integration tests, including independently assembled call partners
+and compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
+(write status changes to zero on writable media and sector 1 starts with +W+).
++cargo test -j 1 -- --test-threads=1+ passes the full serial workspace suite.
++cargo check --lib --bin kiuas16-cc --bin kiuas16-asm --bin kiuas16-run -j 1+,
++cargo fmt --check+, and +git diff --check+ pass. Remaining P0 completion
+gates are unchanged.
 
 ** [ ] [[nx-rv64-assembler]] *P0 / Assemble RISC-V source and relocatable objects.*
    Support compiler output and preprocessed upstream +.S+ files: aliases,

@@ -313,6 +313,85 @@ rejects overwriting the source path. These source-built assembly fixtures
 advance the toolchain path, but do not provide compiled-C, independent LP64D
 call certification, Sytyke, or xv6 acceptance.
 
+[[rom-c-compiler]]
+=== Initial compiled C ROM guests
+
++kiuas16-cc+ reuses the C compiler's existing lexer and translation-unit
+parser, then lowers supported source to typed RV64 values/actions in
++src/c_compiler/rv64.rs+. That backend emits assembly for the Rust ROM
+assembler; the CLI writes a raw ROM only after both stages succeed. It does
+not invoke an external tool, inject the legacy SC-16 runtime, link ELF, or
+translate SC-16 assembly into RV64.
+
+[source,powershell]
+----
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_uart.c C:\path\uart-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\uart-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_storage.c C:\path\storage-c-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\storage-c-rom.bin --root C:\path\disposable.raw --steps 20000 --deny-traps
+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1
+----
+
+The UART fixture prints +KK=+ followed by a newline and returns 120 in
++a0+. It exercises recursion, nested argument evaluation, eight-argument
+calls, loops, conversions, and shadowed locals. The storage C fixture
+constructs its own queues and negotiates, reads, writes, flushes, acknowledges,
+and resets Kiulu. With a disposable image of at least two sectors and +R+
+bytes in sector 1, its exact binary UART output is
++43 00 52 01 00 01 03 00+ for read-only media. Adding +--root-writable+
+changes the fourth byte to zero and persists +W+ as the first byte of sector 1.
+The host neither initializes queues nor performs guest operations on its behalf.
+
+The initial language/backend subset is deliberately bounded:
+
+* Signed 32-bit +int+, signed 64-bit +long+, +unsigned char+, +void+ returns,
+  and pointers to +volatile unsigned char+, +volatile int+, or +volatile long+.
+  Dereferences use byte, word, or doubleword accesses respectively.
+  Integer literals must fit a positive signed 32-bit value, optionally with
+  an +L+ suffix; unary minus supplies negative expressions. Larger +long+
+  values can be formed by supported arithmetic. Unsigned integer suffixes,
+  character/string literals, other scalar types, and floating point diagnose.
+* Integer promotions, signed mixed +int/long+ arithmetic, scalar conversions,
+  explicit integer-to-volatile-pointer casts, assignment expressions, direct
+  calls, unary +plus/minus/bitwise-not/logical-not+, binary +add/subtract/
+  multiply/bitwise-and/or/xor+, and signed/equality comparisons.
+  Pointer arithmetic/comparisons, pointer-to-integer casts, division,
+  remainder, shifts, short-circuit operators, and increment operators
+  are not yet supported.
+* Automatic scalar locals, nested scopes, compound/expression/return
+  statements, +if/else+, and +while+. Each function has at most 120
+  parameter/local slots; arrays, globals, records, enums, typedefs, storage
+  class specifiers, +const+, and other statements diagnose.
+* Prototyped functions with at most eight scalar register arguments.
+  Every declared function must be defined in the same source unit; a call
+  needs an earlier declaration or definition. Recursive calls are supported.
+  Parameter/return conversions and typed expression temporaries preserve
+  values across nested calls. Stack frames and temporary argument slots
+  retain 16-byte alignment, with saved +ra/s0+ restored on return.
+  Stack arguments, indirect calls, aggregates, and varargs remain unsupported.
+* Preprocessor directives, including includes and macros, are rejected
+  before parsing. No legacy header search or legacy target macros are
+  used for this RV64 path.
+
+Startup begins at the ROM reset vector in M-mode, sets +sp+ to +0x80010000+,
+and calls +int main(void)+. Returning from +main+ leaves its result in +a0+
+and enters WFI; it is not host process exit or firmware boot acceptance.
+The fixed bring-up stack has no allocator or overflow guard. Falling through
++main+ returns zero; reaching the end of another non-void function executes
+an explicit breakpoint instead of inventing a return value. Use the runner's
++--deny-traps+ for exception-free fixtures.
+
++tests/kiuas16_compiler.rs+ compiles, assembles, and executes the sources,
+checks observable UART/disk bytes and restored registers, and tests invalid
+inputs and CLI output preservation. Independent handwritten RV64 callers and
+callees also check integer register arguments, signed/byte conversions,
+stack alignment, and saved registers against generated functions.
+These are initial integer-call fixtures, not complete LP64D certification.
+The backend does not yet consume the aggregate ABI layout model. C source
+diagnostics identify the input file/line; assembly range/ROM overflow errors
+identify the generated assembly line. Sytyke, the pinned kernel, relocatable
+objects, and ELF linking remain separate open requirements.
+
 === Memory ordering
 
 CPU and device accesses are coherent and ordered according to the RISC-V

@@ -42,3 +42,7 @@ path = "src/tools/kiuas16_run.rs"
 [[bin]]
 name = "kiuas16-asm"
 path = "src/tools/kiuas16_asm.rs"
+
+[[bin]]
+name = "kiuas16-cc"
+path = "src/tools/kiuas16_cc.rs"

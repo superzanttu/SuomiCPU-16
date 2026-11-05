@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod rv64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
     pub value: String,
