@@ -101,6 +101,35 @@ fn encode(
         }
     };
     let word = match op {
+        op if op.starts_with("amoswap.") || op.starts_with("lr.") => {
+            let parts: Vec<_> = op.split('.').collect();
+            let width = match parts.get(1).copied() {
+                Some("w") => 2,
+                Some("d") => 3,
+                _ => return Err(error(line, "atomic width must be w or d")),
+            };
+            let ordering = match &parts[2..] {
+                [] => 0,
+                ["aq"] => 2,
+                ["rl"] => 1,
+                ["aqrl"] => 3,
+                _ => return Err(error(line, "invalid atomic ordering suffix")),
+            };
+            let load = parts[0] == "lr";
+            count(if load { 2 } else { 3 })?;
+            let (base, offset) = memory(args[if load { 1 } else { 2 }], line)?;
+            if offset != 0 {
+                return Err(error(line, "atomic address requires zero offset"));
+            }
+            let source = if load { 0 } else { reg(1)? };
+            (if load { 2 } else { 1 }) << 27
+                | ordering << 25
+                | source << 20
+                | base << 15
+                | width << 12
+                | reg(0)? << 7
+                | 0x2f
+        }
         "nop" | "ret" | "wfi" | "ecall" | "ebreak" | "mret" | "sret" | "fence" | "fence.i" => {
             count(0)?;
             match op {

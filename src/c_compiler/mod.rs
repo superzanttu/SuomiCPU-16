@@ -95,13 +95,17 @@ pub struct Declaration {
 const INCOMPLETE_ARRAY_LENGTH: usize = usize::MAX;
 
 fn infer_incomplete_array_length(c_type: &str, initializer: &Expression) -> Option<usize> {
+    if matches!(c_type.trim(), "char" | "signed char" | "unsigned char")
+        && let Some(Expression {
+            kind: ExpressionKind::Atom(value),
+            ..
+        }) = scalar_initializer(initializer)
+        && let Some(bytes) = decode_string_token(value)
+    {
+        return bytes.len().checked_add(1);
+    }
     match &initializer.kind {
         ExpressionKind::InitializerList(values) => Some(values.len()),
-        ExpressionKind::Atom(value)
-            if matches!(c_type.trim(), "char" | "signed char" | "unsigned char") =>
-        {
-            decode_string_token(value)?.len().checked_add(1)
-        }
         _ => None,
     }
 }
@@ -933,6 +937,7 @@ pub struct ExpressionParser {
     tokens: Vec<Token>,
     position: usize,
     typedefs: HashMap<String, String>,
+    resolved_enumerators: Option<HashMap<String, i64>>,
 }
 
 fn evaluate_integer_constant_with_names(
@@ -11833,6 +11838,14 @@ pub struct TranslationUnitParser {
     enumerators: HashMap<String, i64>,
     anonymous_record_counter: usize,
     records: HashMap<String, NativeRecordLayout>,
+    enumerator_evaluator: Option<fn(&Expression) -> Result<i64, CCompilerError>>,
+    file_scope_storage: Option<Vec<FileScopeStorage>>,
+}
+
+struct FileScopeStorage {
+    class: Option<String>,
+    declaration_only: bool,
+    line: usize,
 }
 
 const ASSIGNMENTS: [&str; 11] = [
@@ -11879,6 +11892,7 @@ impl ExpressionParser {
             tokens,
             position: 0,
             typedefs: HashMap::new(),
+            resolved_enumerators: None,
         }
     }
 
@@ -12013,7 +12027,25 @@ impl ExpressionParser {
     }
 
     fn parse_type_name(&mut self) -> Result<String, CCompilerError> {
+        let qualifier_end = self.tokens[self.position..]
+            .iter()
+            .take_while(|token| matches!(token.value.as_str(), "const" | "volatile" | "restrict"))
+            .count();
+        let mut alias_qualifiers = Vec::new();
+        if qualifier_end > 0
+            && self
+                .tokens
+                .get(self.position + qualifier_end)
+                .is_some_and(|token| self.typedefs.contains_key(&token.value))
+        {
+            for _ in 0..qualifier_end {
+                alias_qualifiers.push(self.advance().value);
+            }
+        }
         if self.accept("enum").is_some() {
+            if self.resolved_enumerators.is_some() {
+                return Err(self.fail("enum object types are not supported by RV64 subset"));
+            }
             if self.token().value != "<eof>"
                 && self
                     .token()
@@ -12049,6 +12081,9 @@ impl ExpressionParser {
             }
             words.join(" ")
         };
+        if !alias_qualifiers.is_empty() {
+            c_type = format!("{} {c_type}", alias_qualifiers.join(" "));
+        }
         let mut pointer_count = 0;
         while self.accept("*").is_some() {
             pointer_count += 1;
@@ -12346,6 +12381,34 @@ impl ExpressionParser {
                 "expected an expression",
             ));
         }
+        if let Some(value) = self
+            .resolved_enumerators
+            .as_ref()
+            .and_then(|names| names.get(&token.value))
+        {
+            let magnitude = self.make(
+                &token,
+                ExpressionKind::Atom(value.unsigned_abs().to_string()),
+            );
+            let expression = if *value < 0 {
+                self.make(
+                    &token,
+                    ExpressionKind::Unary {
+                        operator: "-".to_owned(),
+                        operand: Box::new(magnitude),
+                    },
+                )
+            } else {
+                magnitude
+            };
+            return Ok(self.make(
+                &token,
+                ExpressionKind::Cast {
+                    c_type: "int".to_owned(),
+                    expression: Box::new(expression),
+                },
+            ));
+        }
         Ok(self.make(&token, ExpressionKind::Atom(token.value.clone())))
     }
 }
@@ -12407,6 +12470,21 @@ impl StatementParser {
             }
             self.expect("}")?;
             return Ok(self.statement(&open, StatementKind::Compound(statements)));
+        }
+        if self.expressions.resolved_enumerators.is_some()
+            && self.is_label_identifier()
+            && self.peek_value(1) == ":"
+        {
+            let name = self.expressions.advance();
+            self.expressions.advance();
+            let statement = Box::new(self.parse_statement()?);
+            return Ok(self.statement(
+                &name,
+                StatementKind::Label {
+                    name: name.value.clone(),
+                    statement,
+                },
+            ));
         }
         if self.starts_declaration() {
             return self.parse_declaration();
@@ -12505,11 +12583,21 @@ impl StatementParser {
             return Ok(self.statement(&start, StatementKind::Continue));
         }
         if self.accept("goto").is_some() {
-            let name = self.expect_identifier("expected a label name")?;
+            let name = if self.expressions.resolved_enumerators.is_some() {
+                if !self.is_label_identifier() {
+                    return Err(self.expressions.fail("expected a label name"));
+                }
+                self.expressions.advance()
+            } else {
+                self.expect_identifier("expected a label name")?
+            };
             self.expect(";")?;
             return Ok(self.statement(&start, StatementKind::Goto(name.value)));
         }
-        if self.is_identifier() && self.peek_value(1) == ":" {
+        if self.expressions.resolved_enumerators.is_none()
+            && self.is_identifier()
+            && self.peek_value(1) == ":"
+        {
             let name = self.expressions.advance();
             self.expressions.advance();
             let statement = Box::new(self.parse_statement()?);
@@ -12593,6 +12681,36 @@ impl StatementParser {
             && !STORAGE_WORDS.contains(&self.expressions.token().value.as_str())
     }
 
+    fn is_label_identifier(&self) -> bool {
+        let name = self.expressions.token().value.as_str();
+        let mut characters = name.chars();
+        characters
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !TYPE_WORDS.contains(&name)
+            && !STORAGE_WORDS.contains(&name)
+            && !matches!(
+                name,
+                "break"
+                    | "case"
+                    | "continue"
+                    | "default"
+                    | "do"
+                    | "else"
+                    | "for"
+                    | "goto"
+                    | "if"
+                    | "return"
+                    | "sizeof"
+                    | "struct"
+                    | "switch"
+                    | "union"
+                    | "while"
+                    | "inline"
+            )
+    }
+
     fn peek_value(&self, distance: usize) -> &str {
         self.expressions
             .tokens
@@ -12629,6 +12747,11 @@ impl StatementParser {
 
     fn parse_declaration(&mut self) -> Result<Statement, CCompilerError> {
         let start = self.expressions.token().clone();
+        if self.expressions.resolved_enumerators.is_some() && start.value == "enum" {
+            return Err(self
+                .expressions
+                .fail("block-scope enums are not supported by RV64 subset"));
+        }
         let mut unsupported_storage_class = None;
         let mut type_qualifiers = Vec::new();
         while matches!(
@@ -12806,6 +12929,8 @@ impl TranslationUnitParser {
             enumerators: HashMap::new(),
             anonymous_record_counter: 0,
             records: HashMap::new(),
+            enumerator_evaluator: None,
+            file_scope_storage: None,
         }
     }
 
@@ -12827,9 +12952,32 @@ impl TranslationUnitParser {
 
     fn parse_external_declaration(&mut self) -> Result<Vec<ExternalDeclaration>, CCompilerError> {
         let token = self.statements.expressions.token().clone();
+        let enumerator_count = self.enumerators.len();
         let (base_type, storage_class) = self.parse_base_type()?;
+        if self.enumerator_evaluator.is_some()
+            && self.enumerators.len() != enumerator_count
+            && (storage_class.is_some() || !self.statements.at(";"))
+        {
+            return Err(self
+                .statements
+                .expressions
+                .fail("RV64 enum declarations must only declare constants"));
+        }
         if self.statements.accept(";").is_some() {
+            if self.file_scope_storage.is_some() && storage_class.is_some() {
+                return Err(error(
+                    token.filename.as_deref().unwrap_or("<source>"),
+                    token.line,
+                    "file-scope storage class requires a declarator",
+                ));
+            }
             return Ok(Vec::new());
+        }
+        if self.enumerator_evaluator.is_some() && token.value == "enum" {
+            return Err(self
+                .statements
+                .expressions
+                .fail("RV64 enum declarations must only declare constants"));
         }
         let (declarator_type, name, declarator_dimensions) = self.parse_declarator(&base_type)?;
         if self.statements.accept("(").is_some() {
@@ -12847,6 +12995,13 @@ impl TranslationUnitParser {
                 variadic,
                 has_prototype,
             };
+            if let Some(storage) = &mut self.file_scope_storage {
+                storage.push(FileScopeStorage {
+                    class: storage_class.clone(),
+                    declaration_only: false,
+                    line: token.line,
+                });
+            }
             if self.statements.accept(";").is_some() {
                 return Ok(vec![ExternalDeclaration::FunctionPrototype(declaration)]);
             }
@@ -12874,7 +13029,10 @@ impl TranslationUnitParser {
             } else {
                 None
             };
-            if storage_class.as_deref() == Some("extern") && initializer.is_none() {
+            if storage_class.as_deref() == Some("extern")
+                && initializer.is_none()
+                && self.file_scope_storage.is_none()
+            {
                 next = if self.statements.accept(",").is_some() {
                     Some(self.parse_declarator(&base_type)?)
                 } else {
@@ -12958,6 +13116,14 @@ impl TranslationUnitParser {
                         name.line,
                         "declaration conflicts with a typedef name",
                     ));
+                }
+                if let Some(storage) = &mut self.file_scope_storage {
+                    storage.push(FileScopeStorage {
+                        class: storage_class.clone(),
+                        declaration_only: storage_class.as_deref() == Some("extern")
+                            && initializer.is_none(),
+                        line: name.line,
+                    });
                 }
                 globals.push(ExternalDeclaration::Global(Declaration {
                     c_type: declarator_type.clone(),
@@ -13380,6 +13546,12 @@ impl TranslationUnitParser {
     }
 
     fn parse_enum_specifier(&mut self) -> Result<(), CCompilerError> {
+        if self.enumerator_evaluator.is_some() && !self.statements.at("{") {
+            return Err(self
+                .statements
+                .expressions
+                .fail("RV64 subset supports only anonymous file-scope enum constants"));
+        }
         let mut has_tag = false;
         if !self.statements.at("{")
             && self
@@ -13417,11 +13589,20 @@ impl TranslationUnitParser {
                 .expect_identifier("expected an enumerator name")?;
             let value = if self.statements.accept("=").is_some() {
                 let expression = self.statements.expressions.parse_expression(1)?;
-                evaluate_integer_constant_with_names(&expression, &self.enumerators)?
+                if let Some(evaluate) = self.enumerator_evaluator {
+                    evaluate(&expression)?
+                } else {
+                    evaluate_integer_constant_with_names(&expression, &self.enumerators)?
+                }
             } else {
                 next_value
             };
-            if !(i16::MIN as i64..=u16::MAX as i64).contains(&value) {
+            let range = if self.enumerator_evaluator.is_some() {
+                i32::MIN as i64..=i32::MAX as i64
+            } else {
+                i16::MIN as i64..=u16::MAX as i64
+            };
+            if !range.contains(&value) {
                 return Err(error(
                     name.filename.as_deref().unwrap_or("<source>"),
                     name.line,
@@ -13434,6 +13615,9 @@ impl TranslationUnitParser {
                     name.line,
                     &format!("duplicate enumerator {:?}", name.value),
                 ));
+            }
+            if let Some(names) = &mut self.statements.expressions.resolved_enumerators {
+                names.insert(name.value.clone(), value);
             }
             next_value = value.checked_add(1).ok_or_else(|| {
                 error(

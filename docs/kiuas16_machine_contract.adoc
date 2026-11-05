@@ -294,6 +294,10 @@ Supported syntax is intentionally limited:
   +call+ is a checked local +jal+, not a long-call relocation.
 * +wfi+, +ecall+, +ebreak+, +mret+, +sret+, +fence+, and +fence.i+
   with no operands. Explicit fence predecessor/successor lists are unsupported.
+* +lr.w/lr.d+ and +amoswap.w/amoswap.d+, optionally suffixed with
+  +.aq+, +.rl+, or +.aqrl+. Atomic address operands require zero offset,
+  written as +(register)+ or +0(register)+. Other atomic mnemonics are not
+  yet supported by this assembler, even where the CPU implements them.
 * Named forward/backward labels; branch/jump numbers are byte displacements
   from the instruction PC. Instructions and direct branch/jump targets must
   be four-byte aligned; compressed instructions are not supported.
@@ -345,6 +349,8 @@ cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_globals.c C:\path\globals
 cargo run --bin kiuas16-run -- --rom C:\path\globals-rom.bin --steps 10000 --deny-traps
 cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_cursors.c C:\path\cursors-rom.bin
 cargo run --bin kiuas16-run -- --rom C:\path\cursors-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_text.c C:\path\text-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\text-rom.bin --steps 10000 --deny-traps
 cargo test --test kiuas16_compiler -j 1 -- --test-threads=1
 ----
 
@@ -357,6 +363,31 @@ bytes in sector 1, its exact binary UART output is
 +43 00 52 01 00 01 03 00+ for read-only media. Adding +--root-writable+
 changes the fourth byte to zero and persists +W+ as the first byte of sector 1.
 The host neither initializes queues nor performs guest operations on its behalf.
+Descriptor flags/next links, available entries/index, and the used index use
+typed volatile +unsigned short+ accesses with two-byte strides. The guest
+explicitly publishes each ring entry before its index. Poisoned descriptor
+and available-ring tests check exact fields and untouched neighboring bytes,
+plus trap-free execution, restored registers, and persisted disk contents.
+After reading, a generic +void *+ byte-copy helper transfers 16 sector bytes
+into an automatic buffer, changes its first byte to +W+, and copies the prefix
+back before writing. Two doublewords at +0x80000700+ report the snapshot and
+DMA destination addresses; tests inspect both buffers and the complete sector.
+The helper is compiled guest code, not a host memory-copy service.
+File-scope +u8/u16/u32/u64+ and +buffer+ typedefs express the guest's field
+widths and copy interface; their resolved types use the same code generation
+as the underlying declarations.
+Anonymous file-scope enums name driver states, descriptor flags, request
+types, queue/sector sizes, and the MMIO base. Constants use RV64 LP64 evaluation
+and do not allocate RAM objects.
+The guest's +request+ helper uses +switch+ to select read/write/flush descriptor
+updates; unknown requests return without touching the request header or queue.
+The same source retains the exact UART, descriptor/ring bytes, and disk results.
+Private MMIO and request helpers now use file-scope +static+ linkage.
+An initialized-by-startup RAM lock protects request submission with acquire
+exchange and release store, including unlocking on unknown requests.
+An acquire load checks the lock is released after the read/write/flush sequence.
+Successful and unknown requests jump to shared +unlock+ cleanup; lock
+contention returns before taking ownership and does not unlock another caller.
 
 The memory fixture initializes 256 bytes, copies them through pointer parameters
 and a one-past-end loop, and computes checksum 32640. Its exact binary UART
@@ -413,12 +444,19 @@ Tests poison RAM before startup and assert the exact initialized/updated
 64-bit pointer bytes, buffer, and counter, then run the same source through
 the production compiler/runner within 10000 steps without traps.
 
+The text fixture prints +Kiuas16: ROM ready+ followed by newline and bytes
++80 ff 0a+, returns 19 in +a0+, and restores the stack/frame registers within
+10000 steps without traps. It combines a global character buffer, a persistent
+literal cursor, an automatic zero-padded buffer, adjacent literal concatenation,
+and signed-byte output. Tests poison RAM before guest startup, inspect exact
+reported buffer/literal bytes, and execute the production compiler/runner.
+
 The initial language/backend subset is deliberately bounded:
 
-* Signed/unsigned 32-bit +int+, signed/unsigned 64-bit +long+,
-  +unsigned char+, +void+ returns, and pointers to those integer types,
+* Signed/unsigned 16-bit +short+, 32-bit +int+, and 64-bit +long+,
+  distinct +char/signed char/unsigned char+, +void+ returns, and pointers to those integer types,
   either unqualified or volatile-qualified.
-  Dereferences use byte, word, or doubleword accesses respectively.
+  Dereferences use byte, halfword, word, or doubleword accesses respectively.
   Decimal, octal, and hexadecimal literals cover the full unsigned 64-bit
   range, with optional +U+, +L+, +UL+, or +LU+ suffixes (case insensitive).
   LP64 C90 candidate types determine the first representable type:
@@ -428,7 +466,30 @@ The initial language/backend subset is deliberately bounded:
   +unsigned long+. Literal typing is target-specific; the legacy SC-16
   literal parser and its limits are unchanged. Unary minus supplies negative
   expressions. Overflow, invalid digits/suffixes, +long long+,
-  character/string literals, other scalar types, and floating point diagnose.
+  other scalar types, and floating point diagnose.
+  Plain +char+ is unsigned, matching the shared Kiuas16 ABI contract;
+  +signed char+ narrows/sign-extends at eight bits. All character types promote
+  to +int+ and remain distinct for pointer compatibility.
+  Both +short+ types also promote to +int+; unsigned halfwords therefore
+  participate in signed 32-bit arithmetic until wider conversions apply.
+  Short conversions retain the low 16 bits; signed halfwords sign-extend and
+  unsigned halfwords zero-extend in values and integer register/stack calls.
+  Matching halfword pointer arithmetic scales by two bytes. Qualified pointees
+  are supported, but standalone volatile-qualified scalar declarations remain
+  outside this subset.
+* Ordinary character constants and narrow string literals reuse shared lexer
+  escape decoding and adjacent literal concatenation. Strings decay to +char *+
+  and have static lifetime; +sizeof("text")+ includes the trailing zero, including
+  embedded-zero bytes. Identical decoded strings share storage in this bounded
+  backend. Literal bytes are copied from the ROM data payload to RAM by guest
+  startup, not retained in a separately protected read-only section. Modifying
+  string literals has undefined C behavior and is not runtime-checked.
+  Every distinct source literal, including array initializers and unevaluated
+  uses, consumes eight-byte-aligned/padded space in the existing 65536-byte
+  global budget and contributes to ROM capacity. Oversized storage or ROM output
+  diagnoses without overwriting an existing output. Wide literals, +const+,
+  and pointers to whole literal arrays remain
+  unsupported.
 * Integer promotions, LP64 signed/unsigned mixed arithmetic, scalar conversions,
   explicit integer/pointer casts, assignment expressions, direct
   calls, unary +plus/minus/bitwise-not/logical-not+, binary +add/subtract/
@@ -442,9 +503,9 @@ The initial language/backend subset is deliberately bounded:
   Logical +&&/||+ evaluate the left operand first, skip the right when
   appropriate, and produce +int+ zero or one. Conditional +?:+ evaluates
   its condition once and exactly one result arm. Integer arms use the LP64
-  common type; matching pointer arms and pairs of void expressions are
+  common type; compatible object/void-pointer arms and pairs of void expressions are
   supported. Both arms are semantically checked even when an arm cannot
-  execute. Implicit null-pointer arm conversions remain unsupported.
+  execute. Null-pointer constant arms retain the other pointer arm's type.
 * Compound assignments `+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`,
   `&=`, `^=`, and `|=` support integer
   objects using the same promotions and operation types as binary arithmetic,
@@ -458,7 +519,7 @@ The initial language/backend subset is deliberately bounded:
   no synchronization or ordering beyond ordinary guest accesses.
 * The supported scalar pointers allow pointer-plus-integer,
   integer-plus-pointer, and pointer-minus-integer with element strides of
-  1, 4, or 8 bytes. Subscripts (including negative indices and +i[p]+) lower
+  1, 2, 4, or 8 bytes. Subscripts (including negative indices and +i[p]+) lower
   through the same address rules and load/store widths. Pointer subtraction
   requires matching pointee integer types and returns a signed 64-bit element count.
   Matching pointee types support equality and unsigned address ordering;
@@ -471,25 +532,62 @@ The initial language/backend subset is deliberately bounded:
   implicitly; removing it requires an explicit cast. Comparisons, subtraction,
   and conditional expressions accept matching pointee types with either
   qualification; conditional results retain volatile if either arm has it.
-  Casts between different pointee integer types and implicit integer/null-pointer conversions
-  remain unsupported; write a typed pointer cast for zero. This is not
+  Casts between different pointee integer types and implicit nonzero/runtime integer-pointer conversions
+  remain unsupported. This is not
   complete C pointer support.
-* Address-of supports automatic integer locals and parameters, dereferences,
+* Ordinary +void *+ and +volatile void *+ are eight-byte scalar object pointers.
+  They convert implicitly to/from pointers to supported integer objects while
+  retaining volatile qualification; removing qualification requires an explicit
+  cast. Locals, parameters/results, globals, static object-address initializers,
+  explicit integer-address casts, conditions, equality/inequality, and +sizeof+
+  reuse existing scalar-pointer lowering. Mixed object/void-pointer conditional
+  arms yield +void *+ with volatile qualification if either arm has it.
+  Void-pointer arithmetic, subtraction, updates, subscripting, dereference,
+  and ordered comparisons diagnose because void has no complete object size.
+  Different integer-pointer types still require an explicit intermediate
+  +void *+ cast; const-qualified and function-pointer types remain
+  unsupported, as do implicit nonzero/runtime integer-pointer conversions. Converting an
+  address does not establish valid alignment, bounds, lifetime, or aliasing.
+* File-scope typedefs name supported unqualified integer types, +void+, or
+  ordinary pointers to supported integer types/void. Alias chains, function
+  signatures, global/automatic objects, array elements/bounds, casts, and
+  +sizeof+ reuse the shared parser's resolved types; aliases do not create
+  distinct types. Volatile-qualified pointee uses of integer aliases such as
+  +(volatile u16 *)+ are supported. Unsupported alias targets diagnose even
+  when unused. Block-scope/array/function/qualified-pointer typedefs,
+  qualified uses of pointer aliases, duplicate typedef names, and typedef
+  names reused by objects, functions, locals, or parameters diagnose.
+  Typedef names are reserved across this source unit; inner-scope shadowing
+  is not implemented. Preprocessing and target header inclusion remain open.
+* Anonymous file-scope +enum { NAME = expression, NEXT };+ declarations provide
+  signed 32-bit +int+ constants. Explicit values use the RV64 LP64 integer
+  evaluator, including prior enumerators, casts, +sizeof+, unsigned wrapping,
+  and short-circuit expressions; undefined arithmetic or values outside
+  +-2147483648..2147483647+ diagnose. Implicit values start at zero or increment
+  the preceding value; trailing commas are accepted. Constants retain +int+
+  type in runtime expressions and allocate no object storage. They are visible
+  only after declaration, including to later enum values, array bounds, globals,
+  and functions. Duplicate names and collisions with typedefs/objects/functions/
+  parameters/locals diagnose; enumerator shadowing is not implemented.
+  Tagged enum types, enum objects, enum typedefs, block enums, and nonconstant
+  initializers remain unsupported. Legacy SC-16 enum evaluation is unchanged.
+* Address-of supports automatic integer/pointer locals and parameters, dereferences,
   and indexed lvalues. Integer objects keep stable eight-byte private stack
-  slots, but aliased loads/stores use their declared byte/word/doubleword width.
+  slots, but aliased loads/stores use their declared byte/halfword/word/doubleword width.
   Address-of a dereference or subscript computes the address without reading
-  the object; pointer/index side effects still execute once. Pointer-to-pointer
-  types, address-of pointer objects, and address-of non-lvalues diagnose.
+  the object; pointer/index side effects still execute once. Address-of a
+  supported one-level pointer object produces a two-level pointer; deeper
+  pointer types and address-of non-lvalues diagnose.
   Guest code remains responsible for object lifetime and valid bounds.
 * +sizeof(type)+ and +sizeof expression+ return +unsigned long+ constants:
-  byte 1, integer word 4, long/pointer 8. Expressions are semantically checked
+  byte 1, halfword 2, integer word 4, long/pointer 8. Expressions are semantically checked
   without emitting calls, updates, or volatile reads. Void and unsupported
   types diagnose. An array name (including parentheses) retains its full
   byte size under +sizeof+; elsewhere it decays to an element pointer.
   Array parameters are adjusted to pointers, so their +sizeof+ is 8.
   Array type names, variable-length types, and aggregate sizes are not implemented.
-* One-dimensional automatic arrays of supported unqualified integer elements
-  occupy contiguous byte/word/doubleword storage. Each object starts on an
+* One-dimensional automatic arrays of supported unqualified integer or one-level pointer elements
+  occupy contiguous byte/halfword/word/doubleword storage. Each object starts on an
   eight-byte boundary. Nonempty initializer lists convert each element,
   evaluate explicit initializers left-to-right, and zero-fill omitted elements;
   omitted bounds are inferred from the list length. Scalar braces around
@@ -500,10 +598,13 @@ The initial language/backend subset is deliberately bounded:
   Undefined constant arithmetic, nonpositive lengths, and oversized storage
   diagnose. Names and +sizeof(local)+ in bounds remain unsupported.
   Array elements reuse pointer indexing, assignment, and update lowering.
-  Arrays cannot be assigned or incremented. Multidimensional arrays, arrays
-  of pointers, pointers to whole arrays (+&array+), string/designated/empty-list
+  Arrays cannot be assigned or incremented. Multidimensional arrays,
+  pointers to whole arrays (+&array+), designated/empty-list
   initialization, and aggregate elements remain unsupported.
-* File-scope unqualified integer scalars, scalar pointers to the supported
+  Character arrays accept string initializers, optionally surrounded by scalar
+  braces: omitted bounds include the terminator, larger arrays zero-fill, and
+  an exact byte-length bound may omit the trailing zero. A smaller bound diagnoses.
+* File-scope unqualified integer scalars, scalar pointers to void or the supported
   integer types (including volatile-qualified pointees), and one-dimensional integer arrays
   have persistent RAM storage. Supported integer constant initializers use
   LP64 typing, conversions, optional scalar braces, and the same array-list
@@ -514,9 +615,26 @@ The initial language/backend subset is deliberately bounded:
   accompany compatible tentative declarations. Conflicting types/lengths,
   multiple initialized definitions, and object/function name collisions
   diagnose. Objects must be declared before use and local scopes may shadow
-  them. Volatile-qualified integer objects, pointer-to-pointer/record globals,
-  dynamic initializers, +static/extern+, and separate-unit linkage remain
+  them. Volatile-qualified integer objects and record globals,
+  dynamic initializers and separate-unit linkage remain
   unsupported.
+* File-scope +static+ objects/functions have internal linkage; +extern+
+  declarations inherit prior linkage or introduce external linkage. Function
+  declarations without a storage class also inherit earlier linkage, while
+  object declarations without one have external linkage. Conflicting linkage,
+  incompatible types/lengths, duplicate definitions, and internal +main+
+  diagnose. Static function definitions and direct/recursive calls use private
+  assembly labels; external function names retain their existing ABI symbols.
+  Extern object declarations without initializers do not define or duplicate
+  storage, but remain visible for later expressions and symbolic address
+  initializers. An initialized extern object is a definition; compatible
+  tentative definitions still share one object. Every declared object/function
+  must have a definition in the source unit, even if unused. This raw-ROM path
+  has no external symbol resolution, ELF visibility, or separate-unit linker.
+  Extern array bounds must be complete. Block-scope +static/extern+, incomplete
+  tentative arrays, and other unsupported storage classes still diagnose.
+  The text fixture executes private initialized arrays, its persistent pointer
+  cursor, inherited extern object declarations, and a private UART helper.
 * Scalar pointer globals accept addresses of previously declared integer
   objects, array decay, indexed element addresses, and constant element
   offsets through the existing typed pointer rules. Symbolic object addresses
@@ -524,24 +642,104 @@ The initial language/backend subset is deliberately bounded:
   definition moves a previously tentative object into the data region.
   Qualification conversions and conditional selection with an integer
   constant condition are supported. Explicit integer constant casts support
-  null, full-width addresses, and MMIO; implicit integer/null conversions
+  null, full-width addresses, and MMIO; implicit nonzero/runtime integer conversions
   remain unsupported. Loading another pointer global is not a constant
   initializer. Pointer-to-integer address initializers, integer-to-pointer
-  casts through symbolic integer expressions, addresses of pointer objects,
-  pointer arrays, and references before declaration diagnose.
+  casts through symbolic integer expressions and references before declaration diagnose.
   Runtime pointer-global assignment, dereference, indexing, and updates use
   the same scalar rules as locals. No bounds/provenance checks are added.
+* Automatic/global one-dimensional arrays of one-level integer/void pointers
+  use contiguous eight-byte elements, including pointers to volatile integer
+  pointees. Initializer lists accept compatible scalar addresses and literals;
+  omitted entries and explicit null-pointer constants are null.
+  Global symbolic entries resolve individually after final RAM
+  layout; initialized tables are copied from ROM and tentative tables are
+  cleared by guest startup. Two-level pointers (such as +char **+ or
+  +volatile int **+) support decay, indexing, dereference, address-of pointer
+  objects/elements, scaled arithmetic/differences, comparisons, assignments,
+  updates, globals, aliases, and scalar parameter/return conventions.
+  Nested pointee qualification must match: +int **+ does not convert implicitly
+  to +volatile int **+ or +void **+. Outer pointer-object qualification, three
+  or more pointer levels, arrays of two-level pointers, function pointers,
+  designated initializers, and pointer-to-array types remain unsupported.
+  Tables count eight bytes per element against existing RAM/frame budgets.
+  The text fixture traverses an inferred-bound string/address table terminated
+  by an explicit fourth zero entry, rather than a fixed entry count. It
+  reports its address at +0x80000018+; tests inspect each entry and
+  its exact pointed-to text while preserving established UART output.
+* Null-pointer constants include supported integer constant expressions with
+  value zero and those expressions cast to ordinary +void *+. They convert to
+  every supported pointer type in initialization, assignment, parameters,
+  returns, equality/inequality, and conditional arms. A pointer paired with a
+  null constant in +?:+ retains the pointer type and its qualification, rather
+  than becoming a void pointer. Constant evaluation uses LP64 rules; runtime
+  integers (even if zero) and nonzero integer constants do not convert
+  implicitly. Relational pointer/integer comparisons still diagnose.
+  Recognition is deliberately bounded to integer literals, enumerators,
+  integer casts, +sizeof+, unary/binary integer operations, and logical/
+  conditional expressions whose operands are all integer constants. Runtime
+  operands in skipped branches are not accepted as null constants.
+  Floating constant casts and preprocessor +NULL+ macros remain unsupported;
+  this is not blanket C constant-expression support.
 * Automatic scalar locals, nested scopes, compound/expression/return
   statements, +if/else+, +while+, +do-while+, and +for+ (including omitted
-  clauses and scoped C99 declaration initializers). +break/continue+ target
-  the innermost supported loop; +continue+ reaches a +for+ update or
+  clauses and scoped C99 declaration initializers). +break+ targets the
+  innermost loop or switch; +continue+ targets the innermost loop, including
+  from inside a switch, and reaches a +for+ update or
   +do-while+ condition before the next iteration. These jumps are statements,
   not expression-level nonlocal exits. Each function has at most 120
   eight-byte parameter/local storage slots (960 bytes): scalars consume one,
   arrays consume their byte size rounded up to eight, and nested scopes share
-  this budget without slot reuse. Records, enums, typedefs, storage
-  class specifiers, +const+, +switch+, +goto+, labels, and other statements
+  this budget without slot reuse. Records, unsupported enum/typedef forms, storage
+  class specifiers on block declarations, +const+, and other unsupported constructs
   diagnose. C99-style +for+ declarations are not a C90 conformance claim.
+* +goto name;+ and named statement labels are function-scoped, including
+  forward/backward targets in nested compounds, loops, and switch case bodies.
+  Each label emits a private function-unique assembly target. Duplicate labels
+  and missing targets diagnose even in unreachable statements; labels in
+  another function cannot satisfy a jump. Labels have a separate namespace
+  from objects, functions, typedefs, and enumerators, but cannot use keywords.
+  Jumps preserve the function's fixed frame and ordinary lexical name lookup.
+  Entering a scope can bypass initialization; callers must not read objects
+  whose initialization was skipped. Reentering a declaration executes its
+  initializer again. Variable-length arrays remain unsupported, so no dynamic
+  scope storage or VLA cleanup is implemented. A label must precede a statement
+  (use an empty statement before a declaration). Computed goto, label-address
+  expressions, cross-function jumps, and nonlocal jump library calls remain
+  unsupported. These are C control-flow statements, not GNU computed jumps.
+* +switch+ evaluates its integer selector once and applies integer promotions.
+  Case expressions use the existing LP64 constant evaluator and convert to
+  the promoted selector type before comparison and duplicate detection.
+  Signed/unsigned 32/64-bit cases and narrow selectors execute through a
+  linear comparison dispatch, not a jump table. Empty switches, grouped
+  labels, fallthrough, defaults at any position, recursive returns, and nested
+  loop/switch exits are supported. Cases share one switch scope; nested
+  compounds retain their own scopes. Noninteger selectors/cases, nonconstant
+  or undefined case arithmetic, converted duplicates, duplicate defaults, and
+  misplaced exits diagnose. The shared parser requires a braced switch body
+  with case/default labels at its top level; statements before the first label
+  and labels buried in other statements (including Duff's device) remain
+  unsupported.
+* GNU +__atomic_load_n+, +__atomic_store_n+, and +__atomic_exchange_n+
+  accept ordinary or volatile-pointee pointers to signed/unsigned +int/long+.
+  Load and exchange return the normalized pointee type; store returns void.
+  Pointer and value operands execute once, in source argument order, including
+  across nested calls. The memory order must be an integer constant:
+  0 relaxed, 1 consume (implemented as acquire), 2 acquire, 3 release,
+  4 acquire-release, or 5 sequentially consistent. Loads reject release and
+  acquire-release; stores reject consume, acquire, and acquire-release.
+  Loads emit +lr.w/d+ and stores/exchanges emit +amoswap.w/d+, using +aq/rl+
+  bits appropriate to the order. Sequentially consistent operations add full
+  +fence+ instructions before and after the atomic instruction; this is a
+  conservative implementation, not an optimized lowering.
+  The existing one-hart CPU executes atomics synchronously against aligned RAM
+  and traps on misaligned or non-RAM addresses; loads leave an LR reservation,
+  without exposing it as a C value. Exact instruction ordering bits, fences,
+  object bytes, lock contention, and acquire/release publication execute in
+  tests. This does not certify a multi-hart memory model.
+  Byte/halfword, pointer-valued and aggregate atomics, runtime memory orders,
+  compare-exchange, arithmetic atomic builtins, and +_Atomic+ remain unsupported.
+  The three supported builtin names are reserved, not callable user symbols.
 * Prototyped functions with at most 32 scalar arguments. The first eight
   arguments use +a0..a7+; subsequent arguments occupy consecutive eight-byte
   stack slots, starting at offset zero from the callee's entry +sp+.

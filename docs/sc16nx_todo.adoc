@@ -645,8 +645,9 @@ short-circuit +&&/||+, typed conditional +?:+, +for+ with scoped declaration
 initializers, +do-while+, and loop-owned +break/continue+. The shared parser
 is reused; integer promotions, pointer compatibility, and source diagnostics
 come from the existing typed lowering. C99-style +for+ declarations are
-identified as such, not counted as C90 conformance. +switch/goto+ and the
-remaining pinned-source requirements are still unsupported.
+identified as such, not counted as C90 conformance. Bounded +switch+ dispatch
+and function-scoped +goto+ are recorded below; the remaining pinned-source
+requirements are still unsupported.
 
 ** [ ] [[nx-rv64-codegen]] *P0 / Emit correct RV64 code and calls.*
    Implement instruction selection, registers/spills, addresses, stack
@@ -830,13 +831,274 @@ and zero pointer storage. Pointer arrays, pointer-to-pointer types,
 symbolic pointer-to-integer initializers, ELF relocations/linking, and full
 firmware/xv6 acceptance remain open.
 +
-*Validation checkpoint:* Working tree based on +e3d2c26+; one hart, M-mode
+*Compiled text/character slice:* The shared lexer already decoded narrow
+strings, but the RV64 backend could not lower them for firmware UART text.
+The failing +tests/fixtures/kiuas16_text.c+ acceptance now compiles through
+the same Rust-native ROM pipeline. Distinct character types follow the shared
+ABI: plain +char+ is unsigned; +signed char+ uses byte narrowing/sign extension.
+Typed integer promotions, pointer/lvalue operations, array strides, and scalar
+register/stack calls reuse existing lowering. Character arrays accept escaped
+string initializers with inferred size, embedded zeros, exact-length terminator
+omission, and trailing zero-fill. Shared parser inference also handles braced
+string initializers.
+Literal addresses have static lifetime and resolve through existing data
+layout/startup copying; identical decoded literals share padded RAM storage.
+Every distinct literal counts against the existing global/ROM capacity, even
+when used only by an initializer or +sizeof+. This is not ELF +.rodata+,
+read-only literal enforcement, preprocessing, separate-unit linkage, or
+complete firmware/xv6 acceptance.
+Production compiler/runner execution within 10000 steps prints
++Kiuas16: ROM ready+ followed by newline and +80 ff 0a+, returns 19,
+restores stack/frame registers, and takes no traps. Poisoned-RAM tests inspect
+exact character buffers and literal bytes. Independent assembly checks signed
+and unsigned character register/stack argument extension and results.
+Regressions cover recursion/literal lifetime, escape concatenation, unevaluated
+literal size, qualification/type diagnostics, and RAM/ROM overflow without
+output overwrite. All P0 completion gates remain open.
++
+*Exact-width Virtio/halfword slice:* The compiled storage guest previously
+packed adjacent 16-bit descriptor/ring fields into 32-bit writes because
+the RV64 backend lacked +short+. A failing production CLI acceptance now
+executes with signed/unsigned short scalars, globals, arrays, and ordinary
+or volatile-pointee pointers. Halfword loads/stores use +lh/lhu/sh+;
+conversions narrow to 16 bits, both short types promote to +int+, and
+pointer offsets/array strides use two bytes. Existing typed constant,
+lvalue, update, static-address, startup, and scalar-call paths are reused.
+The storage guest publishes explicit descriptor flags/next links and
+available-ring entries/index, then reads the used index at its real width.
+It still owns modern Virtio negotiation, DMA, read/write/flush, IRQ
+acknowledgement, and reset. Poisoned descriptor/ring execution checks all
+48 descriptor bytes, preserved neighboring bytes, three ring submissions,
+and used index 3. Read-only and writable media preserve the established
+UART/disk results within 20000 steps, with return zero, no traps, and
+restored stack/frame registers; the same source runs through production
+compiler/runner CLIs.
+Regressions independently inspect halfword object bytes, signedness,
+promotions, narrowing, aliasing, nested/recursive updates, qualification,
+static addresses, +sizeof+, bounds, and invalid input. Handwritten assembly
+partners validate sign/zero extension in register/stack calls and results.
+This does not implement records, ELF linking, atomics, full LP64D,
+or the complete pinned xv6 corpus; all remaining P0 gates stay open.
++
+*Generic object-pointer/sector-copy slice:* A failing compiled storage
+acceptance identified missing +void *+ conversions as the next obstacle to
+guest-owned generic memory helpers. Ordinary and volatile-pointee void
+pointers now reuse scalar locals/globals, static-address initialization,
+integer address casts, and register/stack call lowering. Implicit conversions
+between supported object pointers and void pointers preserve volatile
+qualification; mixed conditional arms select qualified void-pointer types.
+Equality, conditions, and pointer size execute without inventing a void
+element size. Arithmetic, subtraction, updates, indexing, dereferencing,
+ordering, and implicit qualifier removal diagnose explicitly.
+The storage guest copies 16 bytes from the read sector into a stack buffer,
+changes byte zero to +W+, and copies them back through a generic helper
+before its write/flush sequence. Exact snapshot/DMA bytes, returned addresses,
+full disk contents, and established UART are checked on read-only and
+writable media, with no traps and restored stack/frame registers within
+20000 steps. Production Rust compiler/runner CLIs execute the same source.
+Regressions cover round trips for every supported integer-pointer category,
+qualification-preserving conditional selection and skipped calls, finalized
+global address bytes after tentative declarations, poisoned RAM startup,
+full-width generic pointer register/stack interoperability with independent
+assembly, and invalid incomplete-type operations. Const/function/nested
+pointers, ELF linking, complete firmware/xv6 compilation, and P0 gates
+remain open.
++
+*Target-width alias slice:* The RV64 token gate rejected all typedefs even
+though the shared translation-unit parser already resolves scalar aliases.
+The compiled storage guest now declares +u8/u16/u32/u64+ and a generic
++buffer+ alias for descriptor/ring fields and the copy helper. File-scope
+integer/void/ordinary-pointer aliases and chains use existing typed lowering
+for globals, automatic arrays, signatures, casts, bounds, and +sizeof+.
+A narrow shared type-name parser fix handles qualifiers before scalar aliases
+in casts such as +(volatile u16 *)+ without changing ordinary type parsing.
+Unused unsupported targets diagnose rather than disappearing during parsing;
+duplicate/namespace conflicts and unsupported qualified pointer aliases
+are explicitly rejected. Block typedefs, typedef shadowing, arrays/functions
+as alias targets, preprocessing/headers, and separate-unit linkage remain open.
+Acceptance retains exact descriptor/ring/copy bytes, UART, return zero,
+restored registers, no traps, and read-only/writable disk results within
+20000 steps through the production Rust compiler/runner. Regressions execute
+LP64 widths/promotions/narrowing, alias chains, recursive calls, compatible
+underlying-type redeclarations, static pointer addresses, and qualified scalar
+alias casts. Invalid aliases preserve existing ROM output. No P0 gate is closed.
++
+*Protocol enum-constant slice:* A failing storage fixture identified missing
+named enum constants as a barrier to declarative guest protocol values.
+Anonymous file-scope enums now use a target-specific shared-parser callback
+into the RV64 LP64 constant evaluator, rather than legacy SC-16 range/arithmetic
+rules. Explicit values must fit signed 32-bit +int+; implicit increments,
+previous enumerators, casts, +sizeof+, unsigned wrapping, and short-circuit
+constant selection are supported. Source-order expression resolution preserves
+the constant's +int+ type without allocating a RAM object. Existing typed
+lowering handles runtime use, array bounds, global initialization, and
+static pointer offsets.
+The compiled storage guest names MMIO, status, descriptor flags, request types,
+and queue/sector sizes. Exact descriptor/ring/snapshot/DMA bytes, UART, no traps,
+restored stack/frame registers, return zero, and read-only/writable disk results
+remain verified through Rust compiler/runner execution within 20000 steps.
+Regressions execute signed-int endpoints, LP64 expressions, enum type sizes,
+mixed arithmetic, bounds, static data bytes, and constant storage layout.
+Invalid arithmetic, ranges, forward references, name collisions, lvalue uses,
+and unsupported enum forms diagnose without overwriting existing ROM output.
+Tagged enum/object types, block enums, shadowing, records, preprocessing,
+ELF linking, and complete firmware/xv6 acceptance remain open.
++
+*Protocol switch-dispatch slice:* Converting storage read/write/flush
+selection to a +switch+ reproduced an unsupported-statement failure in the
+production compiler. Typed RV64 lowering now evaluates integer selectors
+once, promotes narrow types, converts LP64 constant cases to the selector
+type, and rejects duplicates after conversion. A linear comparison dispatch
+preserves grouped labels, default position, and source-order fallthrough.
+Separate break/continue target stacks preserve the nearest loop/switch exit
+and the nearest loop's update/condition, including nested switches and loops.
+Switch cases share one scope; nested compounds keep independent locals.
+The storage guest dispatches descriptor changes through named request constants
+and rejects an unknown request before writing the header or submitting a queue.
+Read-only/writable production execution retains exact UART, descriptor/ring/
+snapshot/DMA bytes, return zero, restored stack/frame registers, no traps,
+and complete disk results within 20000 steps. Regressions execute narrow
+promotions, full-width signed/unsigned case conversion, constant expressions,
+selector call/update side effects, a UART selector read exactly once, grouped
+labels/fallthrough/defaults, empty/missing cases, scopes, recursive returns,
+and nested loop/switch control targets. Invalid cases, converted duplicates,
+scope escapes, and misplaced exits diagnose without overwriting existing ROM.
+The shared parser still requires top-level case/default labels in a braced
+switch body; buried labels and Duff's device are not supported.
+Records, linkage, preprocessing, ELF objects/linking, complete firmware/xv6
+compilation, and all incomplete P0 gates remain open.
++
+*File-scope linkage slice:* Making real text and storage helpers/data private
+reproduced the RV64 token gate's rejection of +static/extern+. The shared
+parser now optionally retains file-scope storage metadata and extern object
+declarations for RV64; its legacy default still discards uninitialized extern
+objects as before. RV64 validates internal/external linkage in source order:
++extern+ and unqualified function redeclarations inherit earlier linkage,
+while unqualified object declarations have external linkage. Static functions
+and their direct/recursive calls use private assembly labels.
+Extern objects remain visible without becoming definitions or adding duplicate
+RAM storage. Initialized extern objects are definitions; compatible tentative
+definitions and final symbolic addresses reuse the established global layout.
+The text fixture executes private arrays, a persistent cursor, inherited extern
+object declarations, and a private UART helper. The storage fixture uses private
+MMIO/request helpers. Both retain production CLI results, no traps, and restored
+stack/frame registers; exact UART, buffers, descriptor/ring bytes, and read-only/
+writable disk results remain verified at their established step budgets.
+Regressions poison initialized/BSS RAM, execute private forward/recursive calls,
+check object/pointer bytes and untouched padding, test multi-declarator aliases
+and tentative definitions, and fill the entire 65536-byte global budget despite
+repeated extern declarations. Linkage/type/namespace conflicts, duplicate
+definitions, unresolved declarations, internal +main+, invalid storage classes,
+and references before declaration diagnose without overwriting an existing ROM.
+All declared objects/functions still require definitions in the same unit;
+complete bounds are required for extern arrays. Block storage classes, ELF
+objects, separate-unit linking, preprocessing, records, full firmware/xv6
+acceptance, and incomplete P0 gates remain open.
++
+*Atomic request-lock slice:* A RAM lock around the storage guest's request
+submission reproduced missing builtin call diagnostics. RV64 typed lowering
+now supports GNU +__atomic_load_n+, +__atomic_store_n+, and
++__atomic_exchange_n+ for signed/unsigned 32/64-bit integer pointers.
+Constant memory orders are validated per operation; consume is acquire,
+acquire/release map to instruction ordering bits, and sequentially consistent
+operations receive full fences before and after. Pointer/value operands
+execute once through existing aligned expression temporaries and scalar
+conversions. The Rust assembler emits +lr.w/d+ and +amoswap.w/d+ with checked
+zero-offset addresses and +aq/rl/aqrl+ suffixes; independent expected bytes
+and invalid-operand tests cover the added instruction surface.
+The storage guest uses acquire exchange, release unlock (also on unknown
+requests), and an acquire completion check. Exact UART, descriptor/ring/
+snapshot/DMA bytes, return zero, restored registers, no traps, and read-only/
+writable media results remain verified through production Rust tools within
+20000 steps. Regressions execute all valid memory orders, inspect exact encoded
+ordering bits/fences, poison neighboring RAM, check sign extension/narrowing,
+stack/global objects, nested calls, lock contention and payload publication.
+Misaligned/non-RAM atomic addresses trap in guest execution; invalid types,
+orders, arguments, void-result uses, and reserved builtin names diagnose
+without overwriting an existing ROM.
+This is one-hart synchronous RAM execution, not multi-hart memory-model
+certification. Narrow/pointer/aggregate atomics, runtime orders, compare-exchange,
+other atomic operations, records, preprocessing, ELF linking, complete firmware/
+xv6 execution, and all incomplete P0 gates remain open.
++
+*Object-pointer table slice:* Replacing individual text-output calls with
+an initialized fragment table reproduced the compiler's integer-only array
+restriction. The existing array path now accepts one-level object pointers;
+two-level pointer types represent table decay and address-of pointer objects.
+Each entry occupies eight bytes and reuses scalar load/store, conversion,
+arithmetic, update, and fixed-prototype register/stack call lowering.
+Global pointer initializers retain all entries for individual final-layout
+address resolution rather than only one scalar; omitted list entries are
+null and tentative tables use guest-owned BSS clearing. Deeper pointers and
+arrays of two-level pointers explicitly diagnose.
+The production text guest traverses three string/object pointers with an
+incrementing +char **+ cursor, retaining UART +Kiuas16: ROM ready\n+ followed
+by +80 ff 0a+, result 19, no traps, and restored registers within 10000 steps.
+Tests inspect table entries and exact pointed-to text. Regressions poison
+data/BSS, verify final pointer/object bytes and untouched neighboring RAM,
+exercise every integer pointer width and volatile pointees, generic void-pointer
+tables, local/global pointer-object addresses, recursive table initializers,
+element updates, aliases, and ninth-argument table cursors.
+The 120-entry frame and 8192-entry global table boundaries execute; overflow,
+incompatible nested qualifications/types, nonconstant global entries, invalid
+initializers, unsupported nesting, and array updates diagnose without replacing
+an existing ROM. Established storage UART/memory/media acceptance still passes.
+This is object-pointer table support, not function-pointer dispatch, aggregate
+layout, separate-unit linking, preprocessing, complete firmware/xv6 compilation,
+or completion of any unchecked P0 gate.
++
+*Shared error-cleanup label slice:* Routing successful and unknown storage
+requests through one +unlock+ label reproduced unsupported +goto+ lowering.
+Named labels and jumps now reuse the shared statement AST and fixed RV64
+function frame. Typed lowering records all labels/references per function,
+rejects duplicates and missing targets, and emits function-unique private
+assembly labels. A narrow RV64 parser path gives labels their separate C
+namespace (including typedef/enumerator names) while rejecting keywords;
+legacy parser behavior remains unchanged.
+The storage guest releases its acquire/release RAM lock through shared cleanup,
+retaining exact UART, descriptor/ring/snapshot/DMA bytes, zero result, no traps,
+restored stack/frame registers, and read-only/writable disk results through
+production Rust compilation/execution within 20000 steps.
+Regressions execute forward/backward jumps, skipped calls/MMIO writes, nested
+loop/switch exits, scope entry/reentry and initialization, recursive cleanup,
+same-spelling labels in multiple functions, and ten-argument stack calls.
+Duplicate/undefined targets (even in unreachable paths), cross-function labels,
+scope escapes, invalid label syntax/keywords, and misplaced loop exits diagnose
+without replacing an existing ROM. Labels must precede statements rather than
+declarations; computed jumps, label addresses, VLAs/dynamic-scope cleanup,
+and nonlocal jump libraries remain unsupported. Function pointers, records,
+preprocessing, ELF linking, full firmware/xv6 execution, and all incomplete P0
+gates remain open.
++
+*Null sentinel/conversion slice:* Replacing the text table's fixed iteration
+count with an explicit zero sentinel reproduced incompatible pointer
+initialization. Shared RV64 conversion now recognizes supported integer
+constant zero expressions and ordinary void-pointer casts of them.
+Initialization, assignment, calls/returns, equality in either operand order,
+and conditional arms use the same null-constant predicate; conditional results
+retain the other pointer's type and qualification. Nonzero and runtime integers
+remain explicit-cast-only, and relational pointer/integer comparisons diagnose.
+Recognition uses LP64 evaluation and a structural integer-constant check,
+without treating a skipped runtime call/name as a null constant.
+The production text guest traverses its zero-terminated table and preserves
+UART, result 19, no traps, and restored registers within 10000 steps.
+Tests inspect the fourth entry's eight zero bytes and all pointed-to text.
+Regressions execute literal/cast/sizeof/enum zero forms for ordinary/volatile,
+void, and two-level pointers; test return/argument conversion, conditional
+type preservation, skipped calls, and poisoned data/BSS with exact null entries.
+Invalid nonzero/runtime forms, undefined arithmetic, incompatible nested
+qualifications, and ordering comparisons preserve an existing ROM.
+Floating casts and preprocessor NULL macros remain unsupported. Records,
+function pointers, preprocessing, ELF/separate-unit linking, complete firmware/
+xv6 compilation, and incomplete P0 gates remain open.
++
+*Validation checkpoint:* Working tree based on +dee5081+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 57
++cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 110
 compiler integration tests, including independently assembled call partners
 and compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
-+cargo test --workspace -j 1 -- --test-threads=1+ passes the full serial workspace suite.
++cargo test --workspace -j 1 -- --test-threads=1+ passes all 864 tests in the serial workspace suite.
 +cargo check --lib --bin kiuas16-cc --bin kiuas16-asm --bin kiuas16-run -j 1+,
 +cargo fmt --check+, and +git diff --check+ pass. Remaining P0 completion
 gates are unchanged.

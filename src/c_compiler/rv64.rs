@@ -1,46 +1,140 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
     CCompilerError, Declaration, Expression, ExpressionKind, ExternalDeclaration,
-    FunctionDeclaration, Statement, StatementKind, TranslationUnitParser, error, lex_unexpanded,
-    scalar_initializer,
+    FunctionDeclaration, Statement, StatementKind, TranslationUnitParser, decode_string_token,
+    error, lex_unexpanded, scalar_initializer,
 };
-use crate::kiuas16_abi::STACK_ALIGNMENT;
+use crate::kiuas16_abi::{PLAIN_CHAR_IS_UNSIGNED, STACK_ALIGNMENT};
 
 const GLOBAL_BASE: u64 = 0x80010000;
 const GLOBAL_BYTES: usize = 0x10000;
+
+#[derive(Clone, Copy)]
+enum AtomicOperation {
+    Load,
+    Store,
+    Exchange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerBase {
+    Char,
+    SignedChar,
+    Byte,
+    Short,
+    UShort,
+    Int,
+    UInt,
+    Long,
+    ULong,
+    Void,
+}
+
+impl PointerBase {
+    fn from_type(ty: Type) -> Option<Self> {
+        Some(match ty {
+            Type::Char => Self::Char,
+            Type::SignedChar => Self::SignedChar,
+            Type::Byte => Self::Byte,
+            Type::Short => Self::Short,
+            Type::UShort => Self::UShort,
+            Type::Int => Self::Int,
+            Type::UInt => Self::UInt,
+            Type::Long => Self::Long,
+            Type::ULong => Self::ULong,
+            Type::Void => Self::Void,
+            _ => return None,
+        })
+    }
+
+    fn scalar(self) -> Type {
+        match self {
+            Self::Char => Type::Char,
+            Self::SignedChar => Type::SignedChar,
+            Self::Byte => Type::Byte,
+            Self::Short => Type::Short,
+            Self::UShort => Type::UShort,
+            Self::Int => Type::Int,
+            Self::UInt => Type::UInt,
+            Self::Long => Type::Long,
+            Self::ULong => Type::ULong,
+            Self::Void => Type::Void,
+        }
+    }
+}
+
+fn atomic_operation(name: &str) -> Option<AtomicOperation> {
+    match name {
+        "__atomic_load_n" => Some(AtomicOperation::Load),
+        "__atomic_store_n" => Some(AtomicOperation::Store),
+        "__atomic_exchange_n" => Some(AtomicOperation::Exchange),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Type {
     Int,
     UInt,
+    Short,
+    UShort,
     Long,
     ULong,
+    Char,
+    SignedChar,
     Byte,
+    PlainCharPointer,
+    PlainSignedCharPointer,
     PlainBytePointer,
     PlainIntPointer,
     PlainUIntPointer,
+    PlainShortPointer,
+    PlainUShortPointer,
     PlainLongPointer,
     PlainULongPointer,
+    PlainVoidPointer,
+    CharPointer,
+    SignedCharPointer,
     BytePointer,
     IntPointer,
     UIntPointer,
+    ShortPointer,
+    UShortPointer,
     LongPointer,
     ULongPointer,
+    VoidPointer,
+    PointerPointer { base: PointerBase, volatile: bool },
     Void,
 }
 
 impl Type {
     fn parse(text: &str) -> Option<Self> {
-        Some(match text.split_whitespace().collect::<String>().as_str() {
+        let compact = text.split_whitespace().collect::<String>();
+        if compact.ends_with("**") {
+            return Self::parse(compact.strip_suffix('*')?)?.pointer();
+        }
+        Some(match compact.as_str() {
             "int" | "signed" | "signedint" => Self::Int,
             "unsigned" | "unsignedint" => Self::UInt,
+            "short" | "shortint" | "signedshort" | "signedshortint" => Self::Short,
+            "unsignedshort" | "unsignedshortint" | "shortunsigned" | "shortunsignedint" => {
+                Self::UShort
+            }
             "long" | "longint" | "signedlong" | "signedlongint" => Self::Long,
             "unsignedlong" | "unsignedlongint" | "longunsigned" | "longunsignedint" => Self::ULong,
+            "char" => Self::Char,
+            "signedchar" => Self::SignedChar,
             "unsignedchar" => Self::Byte,
+            "char*" => Self::PlainCharPointer,
+            "signedchar*" => Self::PlainSignedCharPointer,
             "unsignedchar*" => Self::PlainBytePointer,
             "int*" | "signed*" | "signedint*" => Self::PlainIntPointer,
             "unsigned*" | "unsignedint*" => Self::PlainUIntPointer,
+            "short*" | "shortint*" | "signedshort*" | "signedshortint*" => Self::PlainShortPointer,
+            "unsignedshort*" | "unsignedshortint*" | "shortunsigned*" | "shortunsignedint*" => {
+                Self::PlainUShortPointer
+            }
             "long*" | "longint*" | "signedlong*" | "signedlongint*" => Self::PlainLongPointer,
             "unsignedlong*" | "unsignedlongint*" | "longunsigned*" | "longunsignedint*" => {
                 Self::PlainULongPointer
@@ -48,11 +142,29 @@ impl Type {
             "volatileunsignedchar*" | "unsignedvolatilechar*" | "unsignedcharvolatile*" => {
                 Self::BytePointer
             }
+            "volatilechar*" | "charvolatile*" => Self::CharPointer,
+            "volatilesignedchar*" | "signedvolatilechar*" | "signedcharvolatile*" => {
+                Self::SignedCharPointer
+            }
             "volatileint*" | "intvolatile*" => Self::IntPointer,
             "volatileunsigned*"
             | "volatileunsignedint*"
             | "unsignedvolatileint*"
             | "unsignedintvolatile*" => Self::UIntPointer,
+            "volatileshort*"
+            | "shortvolatile*"
+            | "volatileshortint*"
+            | "shortintvolatile*"
+            | "volatilesignedshort*"
+            | "signedvolatileshort*"
+            | "signedshortvolatile*"
+            | "volatilesignedshortint*"
+            | "signedshortintvolatile*" => Self::ShortPointer,
+            "volatileunsignedshort*"
+            | "unsignedvolatileshort*"
+            | "unsignedshortvolatile*"
+            | "volatileunsignedshortint*"
+            | "unsignedshortintvolatile*" => Self::UShortPointer,
             "volatilelong*" | "longvolatile*" | "volatilelongint*" | "longintvolatile*" => {
                 Self::LongPointer
             }
@@ -62,6 +174,8 @@ impl Type {
             | "volatileunsignedlongint*"
             | "unsignedlongintvolatile*" => Self::ULongPointer,
             "void" => Self::Void,
+            "void*" => Self::PlainVoidPointer,
+            "volatilevoid*" | "voidvolatile*" => Self::VoidPointer,
             _ => return None,
         })
     }
@@ -69,12 +183,22 @@ impl Type {
     fn integer(self) -> bool {
         matches!(
             self,
-            Self::Int | Self::UInt | Self::Long | Self::ULong | Self::Byte
+            Self::Int
+                | Self::UInt
+                | Self::Short
+                | Self::UShort
+                | Self::Long
+                | Self::ULong
+                | Self::Char
+                | Self::SignedChar
+                | Self::Byte
         )
     }
 
     fn unsigned(self) -> bool {
-        matches!(self, Self::UInt | Self::ULong | Self::Byte) || self.pointee().is_some()
+        matches!(self, Self::UInt | Self::UShort | Self::ULong | Self::Byte)
+            || self == Self::Char && PLAIN_CHAR_IS_UNSIGNED
+            || self.pointee().is_some()
     }
 
     fn scalar(self) -> bool {
@@ -83,7 +207,8 @@ impl Type {
 
     fn size(self) -> Option<u64> {
         match self {
-            Self::Byte => Some(1),
+            Self::Char | Self::SignedChar | Self::Byte => Some(1),
+            Self::Short | Self::UShort => Some(2),
             Self::Int | Self::UInt => Some(4),
             Self::Long | Self::ULong => Some(8),
             _ if self.pointee().is_some() => Some(8),
@@ -92,7 +217,14 @@ impl Type {
     }
 
     fn promote(self) -> Self {
-        if self == Self::Byte { Self::Int } else { self }
+        if matches!(
+            self,
+            Self::Char | Self::SignedChar | Self::Byte | Self::Short | Self::UShort
+        ) {
+            Self::Int
+        } else {
+            self
+        }
     }
 
     fn common(self, other: Self) -> Self {
@@ -112,30 +244,85 @@ impl Type {
     fn compatible(self, other: Self) -> bool {
         self == other
             || self.integer() && other.integer()
-            || other
-                .pointee()
-                .and_then(Self::pointer)
-                .is_some_and(|plain| other == plain && self.pointee() == other.pointee())
+            || self.pointee().is_some()
+                && other.pointee().is_some()
+                && (self.pointee() == other.pointee()
+                    || self.pointee() == Some(Self::Void)
+                    || other.pointee() == Some(Self::Void))
+                && (self.volatile_pointee() || !other.volatile_pointee())
+    }
+
+    fn volatile_pointee(self) -> bool {
+        self.pointee()
+            .and_then(Self::pointer)
+            .is_some_and(|plain| self != plain)
+    }
+
+    fn qualified_pointer(self, volatile: bool) -> Option<Self> {
+        if !volatile {
+            return self.pointer();
+        }
+        Some(match self {
+            Self::Char => Self::CharPointer,
+            Self::SignedChar => Self::SignedCharPointer,
+            Self::Byte => Self::BytePointer,
+            Self::Int => Self::IntPointer,
+            Self::UInt => Self::UIntPointer,
+            Self::Short => Self::ShortPointer,
+            Self::UShort => Self::UShortPointer,
+            Self::Long => Self::LongPointer,
+            Self::ULong => Self::ULongPointer,
+            Self::Void => Self::VoidPointer,
+            _ => return None,
+        })
+    }
+
+    fn common_pointer(self, other: Self) -> Option<Self> {
+        let left = self.pointee()?;
+        let right = other.pointee()?;
+        let pointee = if left == Self::Void || right == Self::Void {
+            Self::Void
+        } else if left == right {
+            left
+        } else {
+            return None;
+        };
+        pointee.qualified_pointer(self.volatile_pointee() || other.volatile_pointee())
     }
 
     fn pointer(self) -> Option<Self> {
         Some(match self {
+            Self::Char => Self::PlainCharPointer,
+            Self::SignedChar => Self::PlainSignedCharPointer,
             Self::Byte => Self::PlainBytePointer,
             Self::Int => Self::PlainIntPointer,
             Self::UInt => Self::PlainUIntPointer,
+            Self::Short => Self::PlainShortPointer,
+            Self::UShort => Self::PlainUShortPointer,
             Self::Long => Self::PlainLongPointer,
             Self::ULong => Self::PlainULongPointer,
+            Self::Void => Self::PlainVoidPointer,
+            _ if self.pointee().is_some() => Self::PointerPointer {
+                base: PointerBase::from_type(self.pointee()?)?,
+                volatile: self.volatile_pointee(),
+            },
             _ => return None,
         })
     }
 
     fn pointee(self) -> Option<Self> {
         match self {
+            Self::PointerPointer { base, volatile } => base.scalar().qualified_pointer(volatile),
+            Self::PlainCharPointer | Self::CharPointer => Some(Self::Char),
+            Self::PlainSignedCharPointer | Self::SignedCharPointer => Some(Self::SignedChar),
             Self::PlainBytePointer | Self::BytePointer => Some(Self::Byte),
             Self::PlainIntPointer | Self::IntPointer => Some(Self::Int),
             Self::PlainUIntPointer | Self::UIntPointer => Some(Self::UInt),
+            Self::PlainShortPointer | Self::ShortPointer => Some(Self::Short),
+            Self::PlainUShortPointer | Self::UShortPointer => Some(Self::UShort),
             Self::PlainLongPointer | Self::LongPointer => Some(Self::Long),
             Self::PlainULongPointer | Self::ULongPointer => Some(Self::ULong),
+            Self::PlainVoidPointer | Self::VoidPointer => Some(Self::Void),
             _ => None,
         }
     }
@@ -189,6 +376,36 @@ struct Value {
 }
 
 impl Value {
+    fn integer_constant_expression(&self) -> bool {
+        if !self.ty.integer() {
+            return false;
+        }
+        match &self.kind {
+            ValueKind::Constant(_) => true,
+            ValueKind::Convert(inner) | ValueKind::Unary(_, inner) => {
+                inner.integer_constant_expression()
+            }
+            ValueKind::Binary(_, left, right) | ValueKind::Logical(_, left, right) => {
+                left.integer_constant_expression() && right.integer_constant_expression()
+            }
+            ValueKind::Conditional(condition, when_true, when_false) => {
+                condition.integer_constant_expression()
+                    && when_true.integer_constant_expression()
+                    && when_false.integer_constant_expression()
+            }
+            _ => false,
+        }
+    }
+
+    fn null_pointer_constant(&self) -> bool {
+        if self.integer_constant_expression() {
+            return self.constant_integer() == Some(0);
+        }
+        self.ty == Type::PlainVoidPointer
+            && matches!(&self.kind, ValueKind::Convert(inner)
+                if inner.integer_constant_expression() && inner.constant_integer() == Some(0))
+    }
+
     fn static_pointer(&self, globals: &BTreeMap<String, Global>) -> Option<u64> {
         if self.ty.pointee().is_none() {
             return None;
@@ -322,6 +539,10 @@ impl Value {
         Some(match self.ty {
             Type::Int => number as i32 as i64 as u64,
             Type::UInt => number as u32 as u64,
+            Type::Short => number as i16 as i64 as u64,
+            Type::UShort => number as u16 as u64,
+            Type::Char if PLAIN_CHAR_IS_UNSIGNED => number as u8 as u64,
+            Type::Char | Type::SignedChar => number as i8 as i64 as u64,
             Type::Byte => number as u8 as u64,
             _ => number,
         })
@@ -341,6 +562,12 @@ enum ValueKind {
     Logical(String, Box<Value>, Box<Value>),
     Conditional(Box<Value>, Box<Value>, Box<Value>),
     Call(String, Vec<Value>),
+    Atomic {
+        operation: AtomicOperation,
+        pointer: Box<Value>,
+        operand: Option<Box<Value>>,
+        order: u64,
+    },
     Load(Box<Value>),
     Assign(Box<Value>, Box<Value>),
     Update {
@@ -368,8 +595,14 @@ enum Action {
         update: Option<Value>,
         post_test: bool,
     },
+    Switch {
+        selector: Value,
+        cases: Vec<(Option<u64>, Vec<Action>)>,
+    },
     Break,
     Continue,
+    Goto(String),
+    Label(String, Box<Action>),
 }
 
 struct Local {
@@ -385,7 +618,7 @@ struct Global {
     address: u64,
     bytes: usize,
     initializer: Option<Vec<u8>>,
-    pointer_initializer: Option<(usize, Value)>,
+    pointer_initializer: Option<(usize, Vec<Value>)>,
 }
 
 impl Global {
@@ -398,10 +631,15 @@ struct Lower<'a> {
     filename: &'a str,
     signatures: &'a BTreeMap<String, Signature>,
     globals: &'a BTreeMap<String, Global>,
+    typedefs: Option<&'a HashMap<String, String>>,
+    enumerators: Option<&'a HashMap<String, i64>>,
     scopes: Vec<BTreeMap<String, Local>>,
     slots: usize,
     result: Type,
     loop_depth: usize,
+    break_depth: usize,
+    labels: BTreeSet<String>,
+    jumps: Vec<(String, usize)>,
 }
 
 impl Lower<'_> {
@@ -414,6 +652,9 @@ impl Lower<'_> {
     }
 
     fn array_size(&self, name: &str) -> Option<u64> {
+        if let Some(bytes) = decode_string_token(name) {
+            return Some(bytes.len() as u64 + 1);
+        }
         let (ty, length) = if let Some(local) = self.lookup(name) {
             (local.ty, local.array_length?)
         } else {
@@ -430,11 +671,26 @@ impl Lower<'_> {
         array_length: Option<usize>,
         line: usize,
     ) -> Result<usize, CCompilerError> {
+        if atomic_operation(name).is_some() {
+            return Err(self.fail(line, "atomic builtin name is reserved"));
+        }
+        if self
+            .typedefs
+            .is_some_and(|aliases| aliases.contains_key(name))
+        {
+            return Err(self.fail(line, "local or parameter name conflicts with a typedef"));
+        }
+        if self
+            .enumerators
+            .is_some_and(|names| names.contains_key(name))
+        {
+            return Err(self.fail(line, "local or parameter name conflicts with an enumerator"));
+        }
         let slots = if let Some(length) = array_length {
-            if length == 0 || !ty.integer() {
+            if length == 0 || !ty.scalar() || ty.pointer().is_none() {
                 return Err(self.fail(
                     line,
-                    "arrays require a positive length and integer elements",
+                    "arrays require a positive length and supported scalar elements",
                 ));
             }
             length
@@ -468,7 +724,10 @@ impl Lower<'_> {
     }
 
     fn convert(&self, value: Value, ty: Type, line: usize) -> Result<Value, CCompilerError> {
-        if value.ty == Type::Void || ty == Type::Void || !ty.compatible(value.ty) {
+        if value.ty == Type::Void
+            || ty == Type::Void
+            || !(ty.compatible(value.ty) || ty.pointee().is_some() && value.null_pointer_constant())
+        {
             return Err(self.fail(line, "incompatible RV64 subset types"));
         }
         Ok(if value.ty == ty {
@@ -491,7 +750,7 @@ impl Lower<'_> {
         let size = pointer
             .pointee()
             .and_then(Type::size)
-            .expect("scalar pointee");
+            .ok_or_else(|| self.fail(line, "pointer arithmetic requires a complete object type"))?;
         Ok(Value::binary(
             Type::Long,
             "*",
@@ -512,6 +771,16 @@ impl Lower<'_> {
     ) -> Result<Value, CCompilerError> {
         let comparison = matches!(operator, "==" | "!=" | "<" | "<=" | ">" | ">=");
         if left.ty.pointee().is_some() || right.ty.pointee().is_some() {
+            if matches!(operator, "==" | "!=") {
+                if left.ty.pointee().is_some() && right.null_pointer_constant() {
+                    let right = self.convert(right, left.ty, line)?;
+                    return Ok(Value::binary(Type::Int, operator, left, right));
+                }
+                if right.ty.pointee().is_some() && left.null_pointer_constant() {
+                    let left = self.convert(left, right.ty, line)?;
+                    return Ok(Value::binary(Type::Int, operator, left, right));
+                }
+            }
             if left.ty.pointee().is_some() && right.ty.integer() && matches!(operator, "+" | "-") {
                 let ty = left.ty;
                 let offset = self.pointer_offset(right, ty, line)?;
@@ -524,15 +793,16 @@ impl Lower<'_> {
             }
             let matching_pointees =
                 left.ty.pointee().is_some() && left.ty.pointee() == right.ty.pointee();
-            if matching_pointees && comparison {
+            if matches!(operator, "==" | "!=") && left.ty.common_pointer(right.ty).is_some() {
+                return Ok(Value::binary(Type::Int, operator, left, right));
+            }
+            if matching_pointees && left.ty.pointee() != Some(Type::Void) && comparison {
                 return Ok(Value::binary(Type::Int, operator, left, right));
             }
             if matching_pointees && operator == "-" {
-                let size = left
-                    .ty
-                    .pointee()
-                    .and_then(Type::size)
-                    .expect("scalar pointee");
+                let size = left.ty.pointee().and_then(Type::size).ok_or_else(|| {
+                    self.fail(line, "pointer subtraction requires a complete object type")
+                })?;
                 return Ok(Value::binary(
                     Type::Long,
                     "/",
@@ -616,7 +886,7 @@ impl Lower<'_> {
                 let value = self.value(expression)?;
                 if ty.pointee().is_some() && value.ty.integer()
                     || ty.integer() && value.ty.pointee().is_some()
-                    || ty.pointee().is_some() && ty.pointee() == value.ty.pointee()
+                    || ty.common_pointer(value.ty).is_some()
                 {
                     Value {
                         ty,
@@ -632,17 +902,17 @@ impl Lower<'_> {
                     match value.kind {
                         ValueKind::Local(slot) => Value {
                             ty: value.ty.pointer().ok_or_else(|| {
-                                self.fail(line, "address-of requires a supported integer object")
+                                self.fail(line, "address-of requires a supported scalar object")
                             })?,
                             kind: ValueKind::Address(slot),
                         },
                         ValueKind::Global(name, address) => Value {
                             ty: value.ty.pointer().ok_or_else(|| {
-                                self.fail(line, "address-of pointer objects is not supported")
+                                self.fail(line, "address-of requires a supported scalar object")
                             })?,
                             kind: ValueKind::GlobalAddress(name, address),
                         },
-                        ValueKind::Load(pointer) if value.ty.integer() => *pointer,
+                        ValueKind::Load(pointer) if value.ty.scalar() => *pointer,
                         _ => return Err(self.fail(line, "address-of requires an lvalue")),
                     }
                 } else if matches!(operator.as_str(), "++" | "--") {
@@ -657,6 +927,9 @@ impl Lower<'_> {
                         line,
                     )?
                 } else if operator == "*" && value.ty.pointee().is_some() {
+                    if value.ty.pointee() == Some(Type::Void) {
+                        return Err(self.fail(line, "dereference requires a complete object type"));
+                    }
                     Value {
                         ty: value.ty.pointee().expect("checked pointer"),
                         kind: ValueKind::Load(Box::new(value)),
@@ -699,16 +972,14 @@ impl Lower<'_> {
                 let when_false = self.value(when_false)?;
                 let ty = if when_true.ty.integer() && when_false.ty.integer() {
                     when_true.ty.common(when_false.ty)
+                } else if when_true.ty.pointee().is_some() && when_false.null_pointer_constant() {
+                    when_true.ty
+                } else if when_false.ty.pointee().is_some() && when_true.null_pointer_constant() {
+                    when_false.ty
                 } else if when_true.ty == when_false.ty {
                     when_true.ty
-                } else if when_true.ty.pointee().is_some()
-                    && when_true.ty.pointee() == when_false.ty.pointee()
-                {
-                    if when_true.ty.compatible(when_false.ty) {
-                        when_true.ty
-                    } else {
-                        when_false.ty
-                    }
+                } else if let Some(ty) = when_true.ty.common_pointer(when_false.ty) {
+                    ty
                 } else {
                     return Err(self.fail(line, "incompatible RV64 conditional expression types"));
                 };
@@ -780,6 +1051,9 @@ impl Lower<'_> {
                         "indirect calls are not supported by initial RV64 subset",
                     ));
                 };
+                if let Some(operation) = atomic_operation(name) {
+                    return self.atomic(operation, arguments, line);
+                }
                 if self
                     .scopes
                     .iter()
@@ -892,6 +1166,63 @@ impl Lower<'_> {
         })
     }
 
+    fn atomic(
+        &mut self,
+        operation: AtomicOperation,
+        arguments: &[Expression],
+        line: usize,
+    ) -> Result<Value, CCompilerError> {
+        let load = matches!(operation, AtomicOperation::Load);
+        if arguments.len() != if load { 2 } else { 3 } {
+            return Err(self.fail(line, "atomic builtin argument count mismatch"));
+        }
+        let pointer = self.value(&arguments[0])?;
+        let ty = pointer
+            .ty
+            .pointee()
+            .filter(|ty| matches!(ty, Type::Int | Type::UInt | Type::Long | Type::ULong))
+            .ok_or_else(|| {
+                self.fail(
+                    line,
+                    "atomic builtin requires a pointer to a 32/64-bit integer",
+                )
+            })?;
+        let order = self.value(arguments.last().expect("checked arguments"))?;
+        let order = order
+            .constant_integer()
+            .filter(|order| *order <= 5)
+            .ok_or_else(|| {
+                self.fail(
+                    line,
+                    "atomic memory order must be an integer constant from 0 through 5",
+                )
+            })?;
+        if load && matches!(order, 3 | 4)
+            || matches!(operation, AtomicOperation::Store) && matches!(order, 1 | 2 | 4)
+        {
+            return Err(self.fail(line, "invalid memory order for atomic load/store"));
+        }
+        let operand = if load {
+            None
+        } else {
+            let value = self.value(&arguments[1])?;
+            Some(Box::new(self.convert(value, ty, line)?))
+        };
+        Ok(Value {
+            ty: if matches!(operation, AtomicOperation::Store) {
+                Type::Void
+            } else {
+                ty
+            },
+            kind: ValueKind::Atomic {
+                operation,
+                pointer: Box::new(pointer),
+                operand,
+                order,
+            },
+        })
+    }
+
     fn array_initializers(
         &mut self,
         initializer: &Expression,
@@ -899,6 +1230,36 @@ impl Lower<'_> {
         length: usize,
     ) -> Result<Vec<Value>, CCompilerError> {
         let line = initializer.line;
+        if let Some(Expression {
+            kind: ExpressionKind::Atom(token),
+            ..
+        }) = scalar_initializer(initializer)
+            && let Some(bytes) = decode_string_token(token)
+        {
+            if !matches!(ty, Type::Char | Type::SignedChar | Type::Byte) {
+                return Err(self.fail(line, "string initializer requires a character array"));
+            }
+            if bytes.len() > length {
+                return Err(self.fail(
+                    line,
+                    "string initializer is too long for the character array",
+                ));
+            }
+            return (0..length)
+                .map(|index| {
+                    self.convert(
+                        Value {
+                            ty: Type::Int,
+                            kind: ValueKind::Constant(u64::from(
+                                bytes.get(index).copied().unwrap_or(0),
+                            )),
+                        },
+                        ty,
+                        line,
+                    )
+                })
+                .collect();
+        }
         let ExpressionKind::InitializerList(initializers) = &initializer.kind else {
             return Err(self.fail(line, "array initialization requires an initializer list"));
         };
@@ -921,7 +1282,14 @@ impl Lower<'_> {
         }
         values.resize_with(length, || Value {
             ty,
-            kind: ValueKind::Constant(0),
+            kind: if ty.pointee().is_some() {
+                ValueKind::Convert(Box::new(Value {
+                    ty: Type::Int,
+                    kind: ValueKind::Constant(0),
+                }))
+            } else {
+                ValueKind::Constant(0)
+            },
         });
         Ok(values)
     }
@@ -1113,19 +1481,83 @@ impl Lower<'_> {
                 });
                 Action::Block(actions)
             }
-            StatementKind::Break if self.loop_depth != 0 => Action::Break,
-            StatementKind::Continue if self.loop_depth != 0 => Action::Continue,
-            StatementKind::Break | StatementKind::Continue => {
-                return Err(self.fail(line, "break/continue requires an enclosing supported loop"));
+            StatementKind::Switch { expression, cases } => {
+                let selector = self.value(expression)?;
+                if !selector.ty.integer() {
+                    return Err(self.fail(line, "switch requires an integer selector"));
+                }
+                let ty = selector.ty.promote();
+                let selector = self.convert(selector, ty, line)?;
+                let mut seen = BTreeSet::new();
+                let mut lowered = Vec::with_capacity(cases.len());
+                self.scopes.push(BTreeMap::new());
+                self.break_depth += 1;
+                for (case, statements) in cases {
+                    let number = if let Some(case) = case {
+                        let value = self.value(case)?;
+                        if !value.ty.integer() {
+                            return Err(self.fail(case.line, "case requires an integer constant"));
+                        }
+                        let value = self.convert(value, ty, case.line)?;
+                        let number = value.constant_integer().ok_or_else(|| {
+                            self.fail(
+                                case.line,
+                                "case requires an LP64 integer constant without undefined arithmetic",
+                            )
+                        })?;
+                        if !seen.insert(number) {
+                            return Err(self.fail(
+                                case.line,
+                                "duplicate case value after selector type conversion",
+                            ));
+                        }
+                        Some(number)
+                    } else {
+                        None
+                    };
+                    let actions = statements
+                        .iter()
+                        .map(|statement| self.action(statement))
+                        .collect::<Result<_, _>>()?;
+                    lowered.push((number, actions));
+                }
+                self.break_depth -= 1;
+                self.scopes.pop();
+                Action::Switch {
+                    selector,
+                    cases: lowered,
+                }
             }
-            _ => return Err(self.fail(line, "unsupported statement in initial RV64 subset")),
+            StatementKind::Break if self.break_depth != 0 => Action::Break,
+            StatementKind::Continue if self.loop_depth != 0 => Action::Continue,
+            StatementKind::Goto(name) => {
+                self.jumps.push((name.clone(), line));
+                Action::Goto(name.clone())
+            }
+            StatementKind::Label { name, statement } => {
+                if !self.labels.insert(name.clone()) {
+                    return Err(self.fail(line, "duplicate label in function"));
+                }
+                if matches!(statement.kind, StatementKind::Declaration(_)) {
+                    return Err(self.fail(line, "label requires a statement, not a declaration"));
+                }
+                Action::Label(name.clone(), Box::new(self.action(statement)?))
+            }
+            StatementKind::Break | StatementKind::Continue => {
+                return Err(self.fail(
+                    line,
+                    "break requires an enclosing loop/switch; continue requires an enclosing loop",
+                ));
+            }
         })
     }
 
     fn loop_body(&mut self, body: &Statement) -> Result<Action, CCompilerError> {
         self.loop_depth += 1;
+        self.break_depth += 1;
         let body = self.action(body);
         self.loop_depth -= 1;
+        self.break_depth -= 1;
         body
     }
 }
@@ -1134,10 +1566,20 @@ struct Emit {
     assembly: String,
     next_label: usize,
     return_label: String,
-    loops: Vec<(String, String)>,
+    continues: Vec<String>,
+    breaks: Vec<String>,
+    internal_functions: BTreeSet<String>,
 }
 
 impl Emit {
+    fn function_symbol(&self, name: &str) -> String {
+        if self.internal_functions.contains(name) {
+            format!(".Lrv64_internal_{name}")
+        } else {
+            name.to_owned()
+        }
+    }
+
     fn line(&mut self, text: impl AsRef<str>) {
         self.assembly.push_str(text.as_ref());
         self.assembly.push('\n');
@@ -1161,6 +1603,10 @@ impl Emit {
         match ty {
             Type::Int => self.line("addiw a0, a0, 0"),
             Type::UInt => self.line("slli a0, a0, 32\nsrli a0, a0, 32"),
+            Type::Short => self.line("slli a0, a0, 48\nsrai a0, a0, 48"),
+            Type::UShort => self.line("slli a0, a0, 48\nsrli a0, a0, 48"),
+            Type::Char if PLAIN_CHAR_IS_UNSIGNED => self.line("andi a0, a0, 255"),
+            Type::Char | Type::SignedChar => self.line("slli a0, a0, 56\nsrai a0, a0, 56"),
             Type::Byte => self.line("andi a0, a0, 255"),
             _ => {}
         }
@@ -1210,9 +1656,13 @@ impl Emit {
 
     fn load(&mut self, ty: Type) {
         self.line(match ty {
+            Type::Char if PLAIN_CHAR_IS_UNSIGNED => "lbu a0, 0(a0)",
+            Type::Char | Type::SignedChar => "lb a0, 0(a0)",
             Type::Byte => "lbu a0, 0(a0)",
             Type::Int => "lw a0, 0(a0)",
             Type::UInt => "lwu a0, 0(a0)",
+            Type::Short => "lh a0, 0(a0)",
+            Type::UShort => "lhu a0, 0(a0)",
             Type::Long | Type::ULong => "ld a0, 0(a0)",
             _ if ty.pointee().is_some() => "ld a0, 0(a0)",
             _ => unreachable!("checked scalar load"),
@@ -1221,8 +1671,9 @@ impl Emit {
 
     fn store(&mut self, ty: Type) {
         self.line(match ty {
-            Type::Byte => "sb a0, 0(t0)",
+            Type::Char | Type::SignedChar | Type::Byte => "sb a0, 0(t0)",
             Type::Int | Type::UInt => "sw a0, 0(t0)",
+            Type::Short | Type::UShort => "sh a0, 0(t0)",
             Type::Long | Type::ULong => "sd a0, 0(t0)",
             _ if ty.pointee().is_some() => "sd a0, 0(t0)",
             _ => unreachable!("checked scalar store"),
@@ -1310,7 +1761,7 @@ impl Emit {
                     }
                     self.line(format!("addi sp, sp, {temporary_bytes}"));
                 }
-                self.line(format!("call {name}"));
+                self.line(format!("call {}", self.function_symbol(name)));
                 if stack_bytes != 0 {
                     self.line(format!("addi sp, sp, {stack_bytes}"));
                 }
@@ -1318,6 +1769,46 @@ impl Emit {
             ValueKind::Load(pointer) => {
                 self.value(pointer);
                 self.load(value.ty);
+            }
+            ValueKind::Atomic {
+                operation,
+                pointer,
+                operand,
+                order,
+            } => {
+                let ty = pointer.ty.pointee().expect("checked atomic pointer");
+                self.value(pointer);
+                if let Some(operand) = operand {
+                    self.push();
+                    self.value(operand);
+                    self.pop("t0");
+                } else {
+                    self.line("mv t0, a0");
+                }
+                if *order == 5 {
+                    self.line("fence");
+                }
+                let suffix = match order {
+                    1 | 2 => ".aq",
+                    3 => ".rl",
+                    4 | 5 => ".aqrl",
+                    _ => "",
+                };
+                let width = if ty.size() == Some(4) { "w" } else { "d" };
+                if matches!(operation, AtomicOperation::Load) {
+                    let suffix = if *order == 5 { ".aq" } else { suffix };
+                    self.line(format!("lr.{width}{suffix} a0, (t0)"));
+                } else {
+                    let destination = if matches!(operation, AtomicOperation::Store) {
+                        "zero"
+                    } else {
+                        "a0"
+                    };
+                    self.line(format!("amoswap.{width}{suffix} {destination}, a0, (t0)"));
+                }
+                if *order == 5 {
+                    self.line("fence");
+                }
             }
             ValueKind::Assign(target, value) => match &target.kind {
                 ValueKind::Global(_, address) => {
@@ -1425,7 +1916,8 @@ impl Emit {
                 let start = self.label();
                 let next = self.label();
                 let done = self.label();
-                self.loops.push((next.clone(), done.clone()));
+                self.continues.push(next.clone());
+                self.breaks.push(done.clone());
                 self.line(format!("{start}:"));
                 if !post_test {
                     self.value(condition);
@@ -1443,11 +1935,47 @@ impl Emit {
                     self.line(format!("j {start}"));
                 }
                 self.line(format!("{done}:"));
-                self.loops.pop();
+                self.continues.pop();
+                self.breaks.pop();
             }
-            Action::Break => self.line(format!("j {}", self.loops.last().expect("checked loop").1)),
-            Action::Continue => {
-                self.line(format!("j {}", self.loops.last().expect("checked loop").0))
+            Action::Switch { selector, cases } => {
+                let done = self.label();
+                let labels: Vec<_> = cases.iter().map(|_| self.label()).collect();
+                let default = cases
+                    .iter()
+                    .position(|(number, _)| number.is_none())
+                    .map(|index| labels[index].as_str())
+                    .unwrap_or(&done);
+                self.value(selector);
+                self.line("mv t0, a0");
+                for ((number, _), label) in cases.iter().zip(&labels) {
+                    if let Some(number) = number {
+                        self.constant(*number);
+                        self.line(format!("beq t0, a0, {label}"));
+                    }
+                }
+                self.line(format!("j {default}"));
+                self.breaks.push(done.clone());
+                for ((_, actions), label) in cases.iter().zip(&labels) {
+                    self.line(format!("{label}:"));
+                    for action in actions {
+                        self.action(action);
+                    }
+                }
+                self.line(format!("{done}:"));
+                self.breaks.pop();
+            }
+            Action::Break => self.line(format!("j {}", self.breaks.last().expect("checked break"))),
+            Action::Continue => self.line(format!(
+                "j {}",
+                self.continues.last().expect("checked loop")
+            )),
+            Action::Goto(name) => {
+                self.line(format!("j {}_named_{name}", self.return_label));
+            }
+            Action::Label(name, statement) => {
+                self.line(format!("{}_named_{name}:", self.return_label));
+                self.action(statement);
             }
         }
     }
@@ -1475,16 +2003,64 @@ fn array_length(expression: &Expression) -> Result<usize, CCompilerError> {
         filename,
         signatures: &signatures,
         globals: &globals,
+        typedefs: None,
+        enumerators: None,
         scopes: vec![BTreeMap::new()],
         slots: 0,
         result: Type::Void,
         loop_depth: 0,
+        break_depth: 0,
+        labels: BTreeSet::new(),
+        jumps: Vec::new(),
     };
     let value = lower.value(expression)?;
     value.constant_integer()
         .filter(|number| *number > 0 && (value.ty.unsigned() || (*number as i64) > 0))
         .and_then(|number| usize::try_from(number).ok())
         .ok_or_else(|| error(filename, expression.line, "array length requires a positive LP64 integer constant without undefined arithmetic"))
+}
+
+fn enumerator(expression: &Expression) -> Result<i64, CCompilerError> {
+    let filename = expression.filename.as_deref().unwrap_or("<source>");
+    let signatures = BTreeMap::new();
+    let globals = BTreeMap::new();
+    let mut lower = Lower {
+        filename,
+        signatures: &signatures,
+        globals: &globals,
+        typedefs: None,
+        enumerators: None,
+        scopes: vec![BTreeMap::new()],
+        slots: 0,
+        result: Type::Void,
+        loop_depth: 0,
+        break_depth: 0,
+        labels: BTreeSet::new(),
+        jumps: Vec::new(),
+    };
+    let value = lower.value(expression)?;
+    let number = value.constant_integer().ok_or_else(|| {
+        error(
+            filename,
+            expression.line,
+            "enumerator requires an LP64 integer constant without undefined arithmetic",
+        )
+    })?;
+    let signed = if value.ty.unsigned() {
+        i64::try_from(number).ok()
+    } else {
+        Some(number as i64)
+    };
+    signed
+        .and_then(|number| i32::try_from(number).ok())
+        .map(i64::from)
+        .ok_or_else(|| {
+            error(
+                filename,
+                expression.line,
+                "enumerator value is outside the RV64 signed int range",
+            )
+        })
 }
 
 fn global(
@@ -1512,11 +2088,11 @@ fn global(
             "multidimensional global arrays are not supported",
         ));
     }
-    if declaration.array_length.is_some() && !ty.integer() {
+    if declaration.array_length.is_some() && ty.pointer().is_none() {
         return Err(error(
             filename,
             line,
-            "global arrays require integer elements",
+            "global arrays require supported scalar elements",
         ));
     }
     let length = declaration.array_length.unwrap_or(1);
@@ -1546,10 +2122,15 @@ fn global(
             filename,
             signatures: &signatures,
             globals: &visible,
+            typedefs: None,
+            enumerators: None,
             scopes: vec![BTreeMap::new()],
             slots: 0,
             result: Type::Void,
             loop_depth: 0,
+            break_depth: 0,
+            labels: BTreeSet::new(),
+            jumps: Vec::new(),
         };
         let values = if declaration.array_length.is_some() {
             lower.array_initializers(initializer, ty, length)?
@@ -1560,8 +2141,7 @@ fn global(
             vec![lower.convert(value, ty, line)?]
         };
         if ty.pointee().is_some() {
-            object.pointer_initializer =
-                Some((line, values.into_iter().next().expect("scalar initializer")));
+            object.pointer_initializer = Some((line, values));
             return Ok(object);
         }
         let mut image = Vec::with_capacity(object.bytes);
@@ -1584,36 +2164,166 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
     for token in &tokens {
         if matches!(
             token.value.as_str(),
-            "static"
-                | "extern"
-                | "typedef"
-                | "const"
-                | "enum"
-                | "struct"
-                | "union"
-                | "register"
-                | "auto"
-                | "restrict"
-                | "#"
+            "const" | "struct" | "union" | "register" | "auto" | "restrict" | "#"
         ) {
             return Err(error(
                 filename,
                 token.line,
-                "preprocessing, storage classes, typedefs, records, enums and const are not supported by initial RV64 subset",
+                "preprocessing, automatic storage classes, records and const are not supported by initial RV64 subset",
             ));
         }
     }
-    let mut parser = TranslationUnitParser::new(tokens);
-    parser.statements.array_length_evaluator = Some(array_length);
-    let unit = parser.parse()?;
     let mut signatures = BTreeMap::new();
     let mut definitions = BTreeSet::new();
     let mut globals: BTreeMap<String, Global> = BTreeMap::new();
+    for token in &tokens {
+        if let Some(mut bytes) = decode_string_token(&token.value) {
+            bytes.push(0);
+            let length = bytes.len();
+            if length > GLOBAL_BYTES {
+                return Err(error(
+                    filename,
+                    token.line,
+                    "string storage exceeds the 65536-byte RAM budget",
+                ));
+            }
+            bytes.resize(length.div_ceil(8) * 8, 0);
+            globals.entry(token.value.clone()).or_insert(Global {
+                ty: Type::Char,
+                array_length: Some(length),
+                address: 0,
+                bytes: bytes.len(),
+                initializer: Some(bytes),
+                pointer_initializer: None,
+            });
+        }
+    }
+    let mut parser = TranslationUnitParser::new(tokens.clone());
+    parser.statements.array_length_evaluator = Some(array_length);
+    parser.enumerator_evaluator = Some(enumerator);
+    parser.statements.expressions.resolved_enumerators = Some(HashMap::new());
+    parser.file_scope_storage = Some(Vec::new());
+    let unit = parser.parse()?;
+    if unit
+        .enumerators
+        .keys()
+        .any(|name| atomic_operation(name).is_some())
+        || parser
+            .statements
+            .expressions
+            .typedefs
+            .keys()
+            .any(|name| atomic_operation(name).is_some())
+    {
+        return Err(error(filename, 1, "atomic builtin name is reserved"));
+    }
+    let storage = parser
+        .file_scope_storage
+        .as_ref()
+        .expect("RV64 storage metadata");
+    let mut internal_linkage = BTreeMap::new();
+    let mut object_definitions = BTreeSet::new();
+    for (declaration, storage) in unit.declarations.iter().zip(storage) {
+        let (name, function) = match declaration {
+            ExternalDeclaration::Global(object) => (object.name.as_str(), false),
+            ExternalDeclaration::FunctionPrototype(function) => (function.name.as_str(), true),
+            ExternalDeclaration::FunctionDefinition(function) => {
+                (function.declaration.name.as_str(), true)
+            }
+        };
+        let previous = internal_linkage.get(name).copied();
+        if atomic_operation(name).is_some() {
+            return Err(error(
+                filename,
+                storage.line,
+                "atomic builtin name is reserved",
+            ));
+        }
+        let internal = match storage.class.as_deref() {
+            Some("static") => true,
+            Some("extern") => previous.unwrap_or(false),
+            None if function => previous.unwrap_or(false),
+            None => false,
+            _ => {
+                return Err(error(
+                    filename,
+                    storage.line,
+                    "unsupported file-scope storage class",
+                ));
+            }
+        };
+        if previous.is_some_and(|previous| previous != internal) {
+            return Err(error(
+                filename,
+                storage.line,
+                "conflicting internal and external linkage",
+            ));
+        }
+        if name == "main" && internal {
+            return Err(error(
+                filename,
+                storage.line,
+                "RV64 ROM requires external int main(void)",
+            ));
+        }
+        internal_linkage.insert(name.to_owned(), internal);
+        if !function && !storage.declaration_only {
+            object_definitions.insert(name.to_owned());
+        }
+    }
+    for (name, target) in &parser.statements.expressions.typedefs {
+        if unit.enumerators.contains_key(name) {
+            return Err(error(
+                filename,
+                1,
+                "typedef name conflicts with an enumerator",
+            ));
+        }
+        if Type::parse(target).is_none_or(|ty| ty.volatile_pointee()) {
+            return Err(error(
+                filename,
+                1,
+                &format!("unsupported RV64 typedef target for {name:?}: {target}"),
+            ));
+        }
+    }
+    for pair in tokens.windows(2) {
+        if matches!(pair[0].value.as_str(), "volatile" | "const" | "restrict")
+            && parser
+                .statements
+                .expressions
+                .typedefs
+                .get(&pair[1].value)
+                .and_then(|target| Type::parse(target))
+                .is_some_and(|ty| ty.pointee().is_some())
+        {
+            return Err(error(
+                filename,
+                pair[0].line,
+                "qualified pointer typedef uses are not supported by RV64 subset",
+            ));
+        }
+    }
     for declaration in &unit.declarations {
         let (function, line, definition) = match declaration {
             ExternalDeclaration::FunctionDefinition(f) => (&f.declaration, f.body.line, true),
             ExternalDeclaration::FunctionPrototype(f) => (f, 1, false),
             ExternalDeclaration::Global(declaration) => {
+                if unit.enumerators.contains_key(&declaration.name) {
+                    return Err(error(
+                        filename,
+                        1,
+                        "object name conflicts with an enumerator",
+                    ));
+                }
+                if parser
+                    .statements
+                    .expressions
+                    .typedefs
+                    .contains_key(&declaration.name)
+                {
+                    return Err(error(filename, 1, "object name conflicts with a typedef"));
+                }
                 if declaration.name == "_start" || declaration.name.starts_with(".Lrv64_") {
                     return Err(error(filename, 1, "reserved RV64 startup symbol"));
                 }
@@ -1642,6 +2352,25 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         if function.name.starts_with(".Lrv64_") || function.name == "_start" {
             return Err(error(filename, line, "reserved RV64 startup symbol"));
         }
+        if unit.enumerators.contains_key(&function.name) {
+            return Err(error(
+                filename,
+                line,
+                "function name conflicts with an enumerator",
+            ));
+        }
+        if parser
+            .statements
+            .expressions
+            .typedefs
+            .contains_key(&function.name)
+        {
+            return Err(error(
+                filename,
+                line,
+                "function name conflicts with a typedef",
+            ));
+        }
         let signature = signature(function)
             .ok_or_else(|| error(filename, line, "unsupported RV64 function signature; use prototypes and at most 32 scalar parameters"))?;
         if let Some(previous) = signatures.insert(function.name.clone(), signature.clone()) {
@@ -1658,6 +2387,16 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
             filename,
             1,
             "name declared as both object and function",
+        ));
+    }
+    if globals
+        .keys()
+        .any(|name| !name.starts_with("<string:") && !object_definitions.contains(name))
+    {
+        return Err(error(
+            filename,
+            1,
+            "every declared object must be defined in the source unit",
         ));
     }
     let mut image = Vec::new();
@@ -1681,11 +2420,13 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
     for object in globals.values().filter(|object| object.initialized()) {
         if let Some(bytes) = &object.initializer {
             image.extend_from_slice(bytes);
-        } else if let Some((line, value)) = &object.pointer_initializer {
-            let address = value.static_pointer(&globals).ok_or_else(|| {
-                error(filename, *line, "pointer initializer requires a static object address or an explicit integer constant cast")
-            })?;
-            image.extend_from_slice(&address.to_le_bytes());
+        } else if let Some((line, values)) = &object.pointer_initializer {
+            for value in values {
+                let address = value.static_pointer(&globals).ok_or_else(|| {
+                    error(filename, *line, "pointer initializer requires a static object address or an explicit integer constant cast")
+                })?;
+                image.extend_from_slice(&address.to_le_bytes());
+            }
         }
     }
     if signatures.keys().any(|name| !definitions.contains(name)) {
@@ -1707,7 +2448,13 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         assembly: ".text\n.globl _start\n_start:\nli sp, 1\nslli sp, sp, 31\nli t0, 65536\nadd sp, sp, t0\n".to_owned(),
         next_label: 0,
         return_label: String::new(),
-        loops: Vec::new(),
+        continues: Vec::new(),
+        breaks: Vec::new(),
+        internal_functions: internal_linkage
+            .iter()
+            .filter(|(name, internal)| **internal && signatures.contains_key(*name))
+            .map(|(name, _)| name.clone())
+            .collect(),
     };
     if !image.is_empty() {
         emit.line("la t0, .Lrv64_data");
@@ -1724,7 +2471,11 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
     }
     emit.line("call main\n.Lrv64_halt:\nwfi\nj .Lrv64_halt");
     let mut visible = BTreeMap::new();
-    let mut visible_globals = BTreeMap::new();
+    let mut visible_globals: BTreeMap<_, _> = globals
+        .iter()
+        .filter(|(name, _)| name.starts_with("<string:"))
+        .map(|(name, object)| (name.clone(), object.clone()))
+        .collect();
     for declaration in &unit.declarations {
         let function = match declaration {
             ExternalDeclaration::FunctionDefinition(function) => function,
@@ -1744,10 +2495,15 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
             filename,
             signatures: &visible,
             globals: &visible_globals,
+            typedefs: Some(&parser.statements.expressions.typedefs),
+            enumerators: Some(&unit.enumerators),
             scopes: vec![BTreeMap::new()],
             slots: 0,
             result: sig.result,
             loop_depth: 0,
+            break_depth: 0,
+            labels: BTreeSet::new(),
+            jumps: Vec::new(),
         };
         for (parameter, ty) in function.declaration.parameters.iter().zip(&sig.parameters) {
             let name = parameter.name.as_ref().ok_or_else(|| {
@@ -1769,10 +2525,15 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
                 .collect::<Result<_, _>>()?,
         );
         let frame = (16 + lower.slots * 8).div_ceil(STACK_ALIGNMENT) * STACK_ALIGNMENT;
+        for (name, line) in &lower.jumps {
+            if !lower.labels.contains(name) {
+                return Err(lower.fail(*line, &format!("undefined label {name:?} in function")));
+            }
+        }
         emit.return_label = emit.label();
         emit.line(format!(
             "{}:\naddi sp, sp, -{frame}\nsd ra, {}(sp)\nsd s0, {}(sp)\naddi s0, sp, {frame}",
-            function.declaration.name,
+            emit.function_symbol(&function.declaration.name),
             frame - 8,
             frame - 16,
         ));
