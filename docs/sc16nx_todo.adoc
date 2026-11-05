@@ -671,9 +671,10 @@ rearming behave correctly. Host wall-clock changes cannot reverse monotonic time
 CSR with +menvcfg.STCE+ access control. The supervisor timer-pending bit tracks
 the compare condition, supports source-line injection, and clears on compare
 rearming or counter rollover. Focused tests cover permissions, compare
-delivery state, and wraparound. Machine-wide clock integration, non-UART
-external-device interrupt sources, and guest acceptance scenarios remain
-incomplete; keep this task unchecked.
+delivery state, and wraparound. +Kiuas16Machine+ now advances and exposes
+this clock through headless stepping. Timed-device integration, non-UART
+external interrupt sources, and guest acceptance scenarios remain incomplete;
+keep this task unchecked.
 +
 *Vihta PLIC progress (2026-11-05):* The Kiuas16 physical bus now models 31
 external sources and the hart-0 machine/supervisor contexts. It implements
@@ -681,8 +682,19 @@ external sources and the hart-0 machine/supervisor contexts. It implements
 priority selection, level-triggered reassertion after completion, and external
 interrupt-line delivery into trap-delivering core steps are covered by focused
 tests. Höyry now drives source 10; other device source wiring, complete
-platform register conformance, virtual machine integration, and guest
+platform register conformance, complete runtime integration, and guest
 interrupt acceptance remain outstanding; keep this task unchecked.
++
+*Headless machine integration (2026-11-05):* Added +Kiuas16Machine+ to own a
+cold-reset RV64 core and physical bus, use the trap-delivering step path, and
+expose deterministic virtual-time observation plus UART input/output. A
+guest-execution regression reads host-provided UART input and transmits it
+back through MMIO while checking one timebase tick per step. This integrates
+the current timer/PLIC state into the same stepping path. Another
+machine-level regression verifies UART PLIC source delivery to a vectored
+supervisor trap without retiring an instruction. Guest interrupt handlers,
+timer acceptance, other device IRQ sources, baud timing, and a host runtime
+remain incomplete; keep the task unchecked.
 
 ** [ ] [[nx-uart]] *P0 / Implement Höyry's 16550 behavior.*
    Support register aliases, divisor latch, FIFO, status, RX/TX interrupt
@@ -702,6 +714,12 @@ Vihta source 10; focused tests cover the supervisor interrupt path and
 FIFO/register behavior. Baud timing, complete 16550 semantics, a
 machine-runtime/windowed serial adapter, and pinned xv6-driver acceptance are
 still missing; keep this task unchecked.
++
+*Headless guest-I/O integration (2026-11-05):* +Kiuas16Machine+ now routes
+host serial input to the bus and exposes captured output while executing guest
+instructions through MMIO. The regression verifies an RX-to-guest-to-TX
+round trip. Runtime/windowed adapters, baud timing, complete UART semantics,
+and pinned-driver acceptance remain open.
 
 === Phase 4: sector storage and PC-like BIOS
 

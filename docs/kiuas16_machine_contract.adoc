@@ -5,9 +5,11 @@
 == Status
 
 This document defines the selected Kiuas16 machine contract for the planned
-RV64 target. It is a design specification, not evidence of an implemented
-processor, bus, ROM, BIOS, memory system, or device. The existing emulator
-continues to implement the separate SC-16 contract in
+RV64 target and records implementation status for partial components. The
+Rust module has initial integer/privileged execution, translation, ROM/RAM
+bus, PLIC, and UART slices, but does not yet satisfy the full RV64GC, BIOS, or
+xv6 compatibility requirements. The existing emulator continues to implement
+the separate SC-16 contract in
 link:sc16_architecture.adoc[SC-16 Machine Architecture].
 
 The initial configuration is fixed for xv6 bring-up: one hart, 128 MiB of
@@ -173,6 +175,13 @@ interrupt increments +mcycle+ but not +minstret+. Machine integration must use
 the trap-delivering path; device-driven pending lines and the virtual timer
 remain separate requirements.
 
++Kiuas16Machine+ now owns a cold-reset core and physical bus and exposes
+deterministic single-step execution through that trap-delivering path. Each
+step polls the bus PLIC, advances the core's virtual time, and executes or
+delivers the pending trap/interrupt. The machine also exposes the core and bus
+for observation or device setup, plus headless UART input/output methods.
+This is a headless integration surface, not a complete host runtime or BIOS.
+
 CPU and device accesses are coherent and ordered according to the RISC-V
 memory model and explicit fence instructions. Device DMA may read or write
 RAM only, must validate the complete physical range without integer overflow,
@@ -193,8 +202,8 @@ RTC civil time is not the +time+ CSR and does not change this monotonic timer
 contract. Any later wall-clock device has a separate interface and cannot
 replace Sstc or alter the timebase frequency.
 
-The standalone Kiuas16 core currently advances +time+ by one tick for each
-attempted or idle core cycle, exposes the read-only CSR with the specified
+The Kiuas16 core currently advances +time+ by one tick for each attempted or
+idle core cycle, exposes the read-only CSR with the specified
 S/U counter-enable checks, and derives the supervisor timer-pending bit from
 +stimecmp+. S-mode access to +stimecmp+ requires +menvcfg.STCE+; M-mode retains
 access. The physical bus also contains an initial Vihta PLIC slice with 31
@@ -202,8 +211,9 @@ external sources, machine/supervisor contexts, 32-bit priority/pending/enable/
 threshold/claim/complete registers, and level reassertion after completion.
 Its context outputs feed the core's external interrupt pending state. Höyry
 drives source 10; the other board-device sources are not wired yet. The
-PLIC and timer are not integrated into a complete machine runtime or shared
-device clock.
+headless +Kiuas16Machine+ single-step interface now connects this core and bus,
+so timer and PLIC behavior use one deterministic execution loop. Timed device
+peripherals and a host runtime remain unimplemented.
 
 == Höyry UART
 
@@ -216,8 +226,8 @@ thresholds and can clear the receive FIFO. +LSR+ reports data-ready, overrun,
 and transmitter-empty status; +IIR+ reports line-status, receive, THRE, and
 modem-status interrupt causes. MCR loopback connects modem outputs and routes
 transmit bytes back to the receive FIFO. A device reset clears volatile UART
-state and deasserts its interrupt line. Host-injected input is available
-through the bus API, and transmitted bytes are collected for headless tests.
+state and deasserts its interrupt line. Host-injected input and captured
+transmit bytes are available through both the bus and headless machine APIs.
 
 The UART interrupt output drives Vihta source 10. TX completes immediately;
 divisor-based baud timing, full modem/line behavior, windowed/runtime adapter

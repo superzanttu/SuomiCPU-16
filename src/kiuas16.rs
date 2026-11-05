@@ -892,6 +892,55 @@ pub struct Rv64Core {
     reservation: Option<(u64, u8, u64)>,
 }
 
+pub struct Kiuas16Machine {
+    core: Rv64Core,
+    bus: Kiuas16Bus,
+}
+
+impl Kiuas16Machine {
+    pub fn new(boot_rom: Vec<u8>) -> Result<Self, PhysicalAccessError> {
+        Self::new_with_ram_size(boot_rom, XV6_RAM_BYTES as usize)
+    }
+
+    pub fn new_with_ram_size(
+        boot_rom: Vec<u8>,
+        ram_bytes: usize,
+    ) -> Result<Self, PhysicalAccessError> {
+        Ok(Self {
+            core: Rv64Core::cold_reset(),
+            bus: Kiuas16Bus::new_with_ram_size(boot_rom, ram_bytes)?,
+        })
+    }
+
+    pub fn core(&self) -> &Rv64Core {
+        &self.core
+    }
+
+    pub fn bus(&self) -> &Kiuas16Bus {
+        &self.bus
+    }
+
+    pub fn bus_mut(&mut self) -> &mut Kiuas16Bus {
+        &mut self.bus
+    }
+
+    pub fn virtual_time(&self) -> u64 {
+        self.core.virtual_time()
+    }
+
+    pub fn step(&mut self) -> Result<StepOutcome, CoreTrap> {
+        self.core.step_with_trap_delivery(&mut self.bus)
+    }
+
+    pub fn receive_uart_input(&mut self, input: &[u8]) -> Result<usize, PhysicalAccessError> {
+        self.bus.receive_uart_input(input)
+    }
+
+    pub fn take_uart_output(&mut self) -> Vec<u8> {
+        self.bus.take_uart_output()
+    }
+}
+
 const MSTATUS_SIE: u64 = 1 << 1;
 const MSTATUS_MIE: u64 = 1 << 3;
 const MSTATUS_SPIE: u64 = 1 << 5;
@@ -1311,6 +1360,10 @@ impl Rv64Core {
 
     pub fn privilege(&self) -> PrivilegeMode {
         self.privilege
+    }
+
+    pub fn virtual_time(&self) -> u64 {
+        self.time
     }
 
     pub fn register(&self, index: usize) -> Option<u64> {
@@ -3295,6 +3348,74 @@ mod tests {
         assert_ne!(core.mstatus & MSTATUS_MPIE, 0);
         assert_eq!(core.mcycle, 2);
         assert_eq!(core.minstret, 1);
+    }
+
+    #[test]
+    fn kiuas16_machine_executes_guest_uart_io_and_advances_virtual_time() {
+        let instructions = [
+            (0x1_0000u32 << 12) | (1 << 7) | 0x37,
+            (1 << 15) | (0b100 << 12) | (2 << 7) | 0x03,
+            (2 << 20) | (1 << 15) | 0x23,
+        ];
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        for (index, instruction) in instructions.iter().enumerate() {
+            let start = index * 4;
+            rom[start..start + 4].copy_from_slice(&instruction.to_le_bytes());
+        }
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 16).unwrap();
+
+        assert_eq!(machine.virtual_time(), 0);
+        assert_eq!(machine.receive_uart_input(b"x").unwrap(), 1);
+        for tick in 1..=3 {
+            assert_eq!(machine.step().unwrap(), StepOutcome::Retired);
+            assert_eq!(machine.virtual_time(), tick);
+        }
+        assert_eq!(machine.core().register(2), Some(u64::from(b'x')));
+        assert_eq!(machine.take_uart_output(), b"x");
+        assert!(machine.take_uart_output().is_empty());
+    }
+
+    #[test]
+    fn kiuas16_machine_delivers_plic_interrupts_to_guest_trap_state() {
+        let mut machine = Kiuas16Machine::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 16).unwrap();
+        machine.core.privilege = PrivilegeMode::User;
+        machine.core.mideleg = 1 << 9;
+        machine.core.mie = 1 << 9;
+        machine.core.mstatus = MSTATUS_SIE;
+        machine.core.stvec = BOOT_ROM.start + 0x100 | 1;
+        machine
+            .bus
+            .write(
+                PLIC.start + u64::from(UART_PLIC_SOURCE) * 4,
+                &1u32.to_le_bytes(),
+            )
+            .unwrap();
+        machine
+            .bus
+            .write(
+                PLIC.start + 0x2080,
+                &(1u32 << UART_PLIC_SOURCE).to_le_bytes(),
+            )
+            .unwrap();
+        machine
+            .bus
+            .write(PLIC.start + 0x20_1000, &0u32.to_le_bytes())
+            .unwrap();
+        machine
+            .bus
+            .set_plic_source_level(UART_PLIC_SOURCE, true)
+            .unwrap();
+
+        assert_eq!(
+            machine.step().unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorExternal)
+        );
+        assert_eq!(machine.core.privilege(), PrivilegeMode::Supervisor);
+        assert_eq!(machine.core.pc, BOOT_ROM.start + 0x100 + 9 * 4);
+        assert_eq!(machine.core.scause, (1 << 63) | 9);
+        assert_eq!(machine.core.mcycle, 1);
+        assert_eq!(machine.core.minstret, 0);
+        assert_eq!(machine.virtual_time(), 1);
     }
 
     #[test]
