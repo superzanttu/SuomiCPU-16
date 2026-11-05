@@ -594,12 +594,20 @@ privilege transitions and interrupt masking do not bypass protection.
 M/S/U privilege state, a bounded machine/supervisor CSR set, CSR privilege
 and read-only checks, selected WARL masks, synchronous exception delegation
 and CSR capture through an explicit trap-delivery call, and MRET/SRET
-transitions. The tests cover return-state restoration and privilege/counter
-access gates. The time CSR remains unavailable until virtual time is wired to
-the machine clock. Trap delivery is not yet wired automatically into every
-execution fault; interrupt delivery, full CSR semantics, PMP beyond the
+transitions. The time CSR remains unavailable until virtual time is wired to
+the machine clock. Interrupt delivery, full CSR semantics, PMP beyond the
 single-entry slice, WFI wakeup, and architectural acceptance fixtures remain
 incomplete. Keep this task unchecked.
++
+*Trap execution progress (2026-11-05):* Added
++step_with_trap_delivery()+, which executes one instruction and routes any
+synchronous +CoreTrap+ through architectural delegation and trap-state
+capture, returning whether an instruction retired or a trap was delivered.
+The existing +step()+ API remains available for callers that need the raw
+diagnostic trap. A regression verifies user ECALL delegation, handler
+execution, SRET recovery, and that trapped instructions increment +mcycle+
+but not +minstret+. Asynchronous interrupts and machine integration remain
+unimplemented; this does not complete the privilege task.
 +
 *PMP progress (2026-11-04):* Added the first PMP entry's +pmpcfg0+ and
 +pmpaddr0+ CSR state and OFF/TOR/NA4/NAPOT matching for instruction fetches,

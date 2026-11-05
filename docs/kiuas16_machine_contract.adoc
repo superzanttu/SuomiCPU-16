@@ -162,6 +162,13 @@ alignment, side-effect, and interrupt behavior is specified per device.
 Invalid device accesses must not be completed as zero-valued reads or ignored
 writes.
 
+The core exposes a diagnostic single-step operation that returns synchronous
+traps to its caller, and a trap-delivering single-step operation that captures
+the architectural state and enters the selected handler. A faulting
+instruction increments +mcycle+ but not +minstret+. Machine integration must
+use the trap-delivering path; asynchronous interrupt delivery is a separate
+requirement.
+
 CPU and device accesses are coherent and ordered according to the RISC-V
 memory model and explicit fence instructions. Device DMA may read or write
 RAM only, must validate the complete physical range without integer overflow,

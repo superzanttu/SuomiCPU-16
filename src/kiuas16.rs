@@ -405,6 +405,12 @@ pub struct CoreTrap {
     pub value: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StepOutcome {
+    Retired,
+    TrapDelivered(CoreTrap),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rv64Core {
     pub pc: u64,
@@ -889,6 +895,19 @@ impl Rv64Core {
             self.minstret = self.minstret.wrapping_add(1);
         }
         result
+    }
+
+    pub fn step_with_trap_delivery(
+        &mut self,
+        bus: &mut Kiuas16Bus,
+    ) -> Result<StepOutcome, CoreTrap> {
+        match self.step(bus) {
+            Ok(()) => Ok(StepOutcome::Retired),
+            Err(trap) => {
+                self.deliver_trap(trap)?;
+                Ok(StepOutcome::TrapDelivered(trap))
+            }
+        }
     }
 
     fn step_inner(&mut self, bus: &mut Kiuas16Bus) -> Result<(), CoreTrap> {
@@ -2505,6 +2524,57 @@ mod tests {
         assert_eq!(core.pc, RAM.start + 0x20);
         assert_ne!(core.mstatus & MSTATUS_SIE, 0);
         assert_eq!(core.mstatus & MSTATUS_SPP, 0);
+    }
+
+    #[test]
+    fn rv64_step_with_trap_delivery_enters_handler_and_does_not_retire_faulting_instruction() {
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        rom[0..4].copy_from_slice(&0x0000_0073u32.to_le_bytes());
+        rom[4..8].copy_from_slice(&0x0020_0593u32.to_le_bytes());
+        rom[0x100..0x104].copy_from_slice(&0x0010_0513u32.to_le_bytes());
+        rom[0x104..0x108].copy_from_slice(&0x1020_0073u32.to_le_bytes());
+        let mut bus = Kiuas16Bus::new_with_ram_size(rom, 16).unwrap();
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::User;
+        core.pc = BOOT_ROM.start;
+        core.medeleg = 1 << 8;
+        core.stvec = BOOT_ROM.start + 0x100;
+
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::TrapDelivered(CoreTrap {
+                pc: BOOT_ROM.start,
+                cause: CoreTrapCause::EnvironmentCallFromUser,
+                value: 0,
+            })
+        );
+        assert_eq!(core.privilege(), PrivilegeMode::Supervisor);
+        assert_eq!(core.pc, BOOT_ROM.start + 0x100);
+        assert_eq!(core.sepc, BOOT_ROM.start);
+        assert_eq!(core.scause, 8);
+        assert_eq!(core.mcycle, 1);
+        assert_eq!(core.minstret, 0);
+
+        core.sepc = BOOT_ROM.start + 4;
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::Retired
+        );
+        assert_eq!(core.register(10), Some(1));
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::Retired
+        );
+        assert_eq!(core.privilege(), PrivilegeMode::User);
+        assert_eq!(core.pc, BOOT_ROM.start + 4);
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::Retired
+        );
+        assert_eq!(core.register(11), Some(2));
+        assert_eq!(core.mcycle, 4);
+        assert_eq!(core.minstret, 3);
     }
 
     #[test]
