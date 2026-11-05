@@ -599,6 +599,15 @@ the machine clock. Trap delivery is not yet wired automatically into every
 execution fault; interrupt delivery, full CSR semantics, PMP enforcement,
 memory privilege checks, WFI wakeup, and architectural acceptance fixtures
 remain incomplete. Keep this task unchecked.
++
+*PMP progress (2026-11-04):* Added the first PMP entry's +pmpcfg0+ and
++pmpaddr0+ CSR state and OFF/TOR/NA4/NAPOT matching for instruction fetches,
+loads, stores, LR/SC, and AMOs. M-mode bypasses unlocked matches; S/U accesses
+require an in-range match with the requested permissions, partial matches
+fault, and locked entries retain their configuration. Tests exercise the
+specified TOR setup, read/write/execute restrictions, partial-match checks,
+and locked-entry behavior. This is only one entry and does not complete the
+PMP acceptance or the privilege task.
 
 ** [ ] [[nx-sv39]] *P0 / Implement Sv39 translation.*
    Add three-level 64-bit PTEs, canonical addresses, permission/status

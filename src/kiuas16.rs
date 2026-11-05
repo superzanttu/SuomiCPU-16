@@ -417,6 +417,8 @@ pub struct Rv64Core {
     mip: u64,
     mcounteren: u64,
     menvcfg: u64,
+    pmpcfg0: u64,
+    pmpaddr0: u64,
     stvec: u64,
     sscratch: u64,
     sepc: u64,
@@ -445,6 +447,11 @@ const MIDELEG_MASK: u64 = (1 << 1) | (1 << 5) | (1 << 9);
 const MEDELEG_MASK: u64 = (1 << 16) - 1;
 const SCOUNTEREN_MASK: u64 = 0b111;
 const MENVCFG_MASK: u64 = (1 << 61) | (1 << 63);
+const PMP_R: u8 = 1 << 0;
+const PMP_W: u8 = 1 << 1;
+const PMP_X: u8 = 1 << 2;
+const PMP_A_MASK: u8 = 0b11 << 3;
+const PMP_L: u8 = 1 << 7;
 
 impl Rv64Core {
     fn read_csr(&self, csr: u16) -> Result<u64, ()> {
@@ -470,11 +477,13 @@ impl Rv64Core {
             0x305 => self.mtvec,
             0x306 => self.mcounteren,
             0x30a => self.menvcfg,
+            0x3a0 => self.pmpcfg0,
             0x340 => self.mscratch,
             0x341 => self.mepc,
             0x342 => self.mcause,
             0x343 => self.mtval,
             0x344 => self.mip,
+            0x3b0 => self.pmpaddr0,
             0xb00 | 0xc00 => self.mcycle,
             0xb02 | 0xc02 => self.minstret,
             0xf14 => 0,
@@ -519,6 +528,20 @@ impl Rv64Core {
             0x305 => self.mtvec = normalize_tvec(value),
             0x306 => self.mcounteren = value & SCOUNTEREN_MASK,
             0x30a => self.menvcfg = value & MENVCFG_MASK,
+            0x3a0 => {
+                let old = self.pmpcfg0 as u8;
+                let requested = value as u8;
+                let mut config = requested & (PMP_R | PMP_W | PMP_X | PMP_A_MASK | PMP_L);
+                if config & PMP_W != 0 && config & PMP_R == 0 {
+                    config &= !PMP_W;
+                }
+                self.pmpcfg0 = u64::from(if old & PMP_L != 0 { old } else { config });
+            }
+            0x3b0 => {
+                if self.pmpcfg0 as u8 & PMP_L == 0 {
+                    self.pmpaddr0 = value & ((1u64 << (PHYSICAL_ADDRESS_BITS - 2)) - 1);
+                }
+            }
             0x340 => self.mscratch = value,
             0x341 => self.mepc = value & !1,
             0x342 => self.mcause = value,
@@ -543,11 +566,60 @@ impl Rv64Core {
                 0xc00 if self.privilege == PrivilegeMode::User => {
                     self.mcounteren & 1 != 0 && self.scounteren & 1 != 0
                 }
+
                 0xc02 if self.privilege == PrivilegeMode::User => {
                     self.mcounteren & 4 != 0 && self.scounteren & 4 != 0
                 }
                 _ => true,
             }
+    }
+
+    fn pmp_allows(&self, address: u64, length: u64, access: PhysicalAccess) -> bool {
+        let config = self.pmpcfg0 as u8;
+        let address_mode = (config & PMP_A_MASK) >> 3;
+        let end = match address.checked_add(length) {
+            Some(end) if length != 0 => end as u128,
+            _ => return false,
+        };
+        let start = address as u128;
+        let (region_start, region_end) = match address_mode {
+            0 => return self.privilege == PrivilegeMode::Machine,
+            1 => {
+                let top = (self.pmpaddr0 as u128) << 2;
+                (0, top)
+            }
+            2 => {
+                let base = (self.pmpaddr0 as u128) << 2;
+                (base, base + 4)
+            }
+            3 => {
+                let trailing_ones = self.pmpaddr0.trailing_ones();
+                let size = 1u128 << (trailing_ones + 3);
+                let mask = if trailing_ones == 0 {
+                    0
+                } else {
+                    (1u64 << trailing_ones) - 1
+                };
+                let base = ((self.pmpaddr0 & !mask) as u128) << 2;
+                (base, base + size)
+            }
+            _ => return false,
+        };
+        if end <= region_start || start >= region_end {
+            return self.privilege == PrivilegeMode::Machine && config & PMP_L == 0;
+        }
+        if start < region_start || end > region_end {
+            return false;
+        }
+        if self.privilege == PrivilegeMode::Machine && config & PMP_L == 0 {
+            return true;
+        }
+        let required = match access {
+            PhysicalAccess::Read => PMP_R,
+            PhysicalAccess::Write => PMP_W,
+            PhysicalAccess::Execute => PMP_X,
+        };
+        config & required != 0
     }
 
     pub const fn cold_reset() -> Self {
@@ -568,6 +640,8 @@ impl Rv64Core {
             mip: COLD_RESET_STATE.mip,
             mcounteren: COLD_RESET_STATE.mcounteren,
             menvcfg: COLD_RESET_STATE.menvcfg,
+            pmpcfg0: COLD_RESET_STATE.pmpcfg0,
+            pmpaddr0: COLD_RESET_STATE.pmpaddr0,
             stvec: COLD_RESET_STATE.stvec,
             sscratch: 0,
             sepc: COLD_RESET_STATE.sepc,
@@ -650,6 +724,13 @@ impl Rv64Core {
         }
 
         let mut halfword = [0; 2];
+        if !self.pmp_allows(pc, 2, PhysicalAccess::Execute) {
+            return Err(CoreTrap {
+                pc,
+                cause: CoreTrapCause::InstructionAccessFault,
+                value: pc,
+            });
+        }
         bus.fetch(pc, &mut halfword).map_err(|_| CoreTrap {
             pc,
             cause: CoreTrapCause::InstructionAccessFault,
@@ -657,6 +738,13 @@ impl Rv64Core {
         })?;
         let halfword = u16::from_le_bytes(halfword);
         let (instruction, instruction_length) = if halfword & 0b11 == 0b11 {
+            if !self.pmp_allows(pc, 4, PhysicalAccess::Execute) {
+                return Err(CoreTrap {
+                    pc,
+                    cause: CoreTrapCause::InstructionAccessFault,
+                    value: pc,
+                });
+            }
             let mut bytes = [0; 4];
             bus.fetch(pc, &mut bytes).map_err(|_| CoreTrap {
                 pc,
@@ -790,6 +878,13 @@ impl Rv64Core {
                         value: address,
                     });
                 }
+                if !self.pmp_allows(address, length, PhysicalAccess::Read) {
+                    return Err(CoreTrap {
+                        pc,
+                        cause: CoreTrapCause::LoadAccessFault,
+                        value: address,
+                    });
+                }
                 let mut data = [0; 8];
                 bus.read(address, &mut data[..length as usize])
                     .map_err(|_| CoreTrap {
@@ -825,6 +920,13 @@ impl Rv64Core {
                         value: address,
                     });
                 }
+                if !self.pmp_allows(address, length, PhysicalAccess::Write) {
+                    return Err(CoreTrap {
+                        pc,
+                        cause: CoreTrapCause::StoreAccessFault,
+                        value: address,
+                    });
+                }
                 bus.write(address, &right.to_le_bytes()[..length as usize])
                     .map_err(|_| CoreTrap {
                         pc,
@@ -853,6 +955,26 @@ impl Rv64Core {
                 }
 
                 let operation = (instruction >> 27) & 0x1f;
+                let access = if operation == 0b00010 && rs2 == 0 {
+                    PhysicalAccess::Read
+                } else {
+                    PhysicalAccess::Write
+                };
+                if !self.pmp_allows(address, length, access)
+                    || (access == PhysicalAccess::Write
+                        && operation != 0b00011
+                        && !self.pmp_allows(address, length, PhysicalAccess::Read))
+                {
+                    return Err(CoreTrap {
+                        pc,
+                        cause: if access == PhysicalAccess::Read {
+                            CoreTrapCause::LoadAccessFault
+                        } else {
+                            CoreTrapCause::StoreAccessFault
+                        },
+                        value: address,
+                    });
+                }
                 let mut data = [0; 8];
                 match operation {
                     0b00010 if rs2 == 0 => {
@@ -1468,6 +1590,11 @@ mod tests {
         (csr << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x73
     }
 
+    fn allow_full_physical_range(core: &mut Rv64Core) {
+        core.pmpaddr0 = (1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1;
+        core.pmpcfg0 = 0x1f;
+    }
+
     #[test]
     fn rv64_core_executes_integer_word_and_memory_operations() {
         let mut bus = bus_with_program(&[
@@ -1724,6 +1851,7 @@ mod tests {
         let instruction = encode_csr(0x300, 1, 1, 2);
         let mut bus = bus_with_program(&[instruction]);
         let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
         core.privilege = PrivilegeMode::Supervisor;
         let trap = core.step(&mut bus).unwrap_err();
         assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
@@ -1732,6 +1860,7 @@ mod tests {
         let instruction = encode_csr(0x301, 1, 1, 2);
         let mut bus = bus_with_program(&[instruction]);
         let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
         let trap = core.step(&mut bus).unwrap_err();
         assert_eq!(trap.cause, CoreTrapCause::IllegalInstruction);
         assert_eq!(trap.value, instruction as u64);
@@ -1755,6 +1884,7 @@ mod tests {
         assert_eq!(core.mcycle, 3);
         assert_eq!(core.minstret, 3);
 
+        allow_full_physical_range(&mut core);
         core.privilege = PrivilegeMode::Supervisor;
         core.pc = BOOT_ROM.start;
         let mut bus = bus_with_program(&[encode_csr(0xc02, 0, 2, 4)]);
@@ -1787,6 +1917,7 @@ mod tests {
         assert_eq!(core.mtvec, BOOT_ROM.start + 0x200);
 
         let mut bus = bus_with_program(&[encode_csr(0xc00, 0, 2, 7)]);
+        allow_full_physical_range(&mut core);
         core.privilege = PrivilegeMode::User;
         core.pc = BOOT_ROM.start;
         core.mcounteren = 1;
@@ -1797,6 +1928,97 @@ mod tests {
         core.pc = BOOT_ROM.start;
         core.step(&mut bus).unwrap();
         assert_eq!(core.register(7), Some(core.mcycle));
+    }
+
+    #[test]
+    fn rv64_pmp_csr_programming_allows_contract_tor_range_for_supervisor() {
+        let instructions = [
+            encode_csr(0x3b0, 1, 1, 0),
+            encode_csr(0x3a0, 2, 1, 0),
+            0x0002_a303,
+            0x0062_a023,
+        ];
+        let mut bus = bus_with_program(&instructions);
+        bus.write(RAM.start, &0x1234_5678u32.to_le_bytes()).unwrap();
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = (1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1;
+        core.integer_registers[2] = 0x0f;
+        core.integer_registers[5] = RAM.start;
+
+        core.step(&mut bus).unwrap();
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pmpaddr0, (1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1);
+        assert_eq!(core.pmpcfg0, 0x0f);
+
+        core.privilege = PrivilegeMode::Supervisor;
+        core.step(&mut bus).unwrap();
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.register(6), Some(0x1234_5678));
+        let mut stored = [0; 4];
+        bus.read(RAM.start, &mut stored).unwrap();
+        assert_eq!(u32::from_le_bytes(stored), 0x1234_5678);
+    }
+
+    #[test]
+    fn rv64_pmp_enforces_permissions_and_rejects_partial_matches() {
+        let instructions = [
+            encode_csr(0x3b0, 1, 1, 0),
+            encode_csr(0x3a0, 2, 1, 0),
+            0x0002_a303,
+        ];
+        let mut bus = bus_with_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = (1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1;
+        core.integer_registers[2] = 0x0c;
+        core.integer_registers[5] = RAM.start;
+        core.step(&mut bus).unwrap();
+        core.step(&mut bus).unwrap();
+        core.privilege = PrivilegeMode::Supervisor;
+        core.pc = BOOT_ROM.start + 8;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::LoadAccessFault);
+        assert_eq!(trap.value, RAM.start);
+
+        core.pmpcfg0 = 0x1f;
+        core.pmpaddr0 = 0x2000_0000 >> 2;
+        core.pc = BOOT_ROM.start;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::InstructionAccessFault);
+        assert_eq!(trap.value, BOOT_ROM.start);
+
+        core.pmpcfg0 = 0x13;
+        core.pmpaddr0 = RAM.start >> 2;
+        assert!(core.pmp_allows(RAM.start, 4, PhysicalAccess::Read));
+        assert!(!core.pmp_allows(RAM.start, 8, PhysicalAccess::Read));
+    }
+
+    #[test]
+    fn rv64_pmp_locks_entries_and_preserves_locked_configuration() {
+        let instructions = [
+            encode_csr(0x3b0, 1, 1, 0),
+            encode_csr(0x3a0, 2, 1, 0),
+            encode_csr(0x3b0, 3, 1, 0),
+            encode_csr(0x3a0, 4, 1, 0),
+            encode_csr(0x3b0, 0, 2, 5),
+            encode_csr(0x3a0, 0, 2, 6),
+        ];
+        let mut bus = bus_with_program(&instructions);
+        let mut core = Rv64Core::cold_reset();
+        core.integer_registers[1] = (1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1;
+        core.integer_registers[2] = 0x8f;
+        core.integer_registers[3] = 1;
+        core.integer_registers[4] = 0;
+        for _ in 0..instructions.len() {
+            core.step(&mut bus).unwrap();
+        }
+
+        assert_eq!(core.pmpaddr0, (1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1);
+        assert_eq!(core.pmpcfg0, 0x8f);
+        assert_eq!(
+            core.register(5),
+            Some((1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1)
+        );
+        assert_eq!(core.register(6), Some(0x8f));
     }
 
     #[test]
@@ -1835,6 +2057,7 @@ mod tests {
     fn rv64_core_delegates_supervisor_traps_and_executes_sret_to_user() {
         let mut bus = bus_with_program(&[0x1020_0073]);
         let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
         core.privilege = PrivilegeMode::User;
         core.pc = RAM.start + 0x20;
         core.medeleg = 1 << 2;
@@ -1868,6 +2091,7 @@ mod tests {
     fn rv64_core_ecall_reports_current_privilege_and_wfi_is_a_nop() {
         let mut bus = bus_with_program(&[0x0000_0073, 0x1050_0073]);
         let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
         core.privilege = PrivilegeMode::Supervisor;
         let trap = core.step(&mut bus).unwrap_err();
         assert_eq!(trap.cause, CoreTrapCause::EnvironmentCallFromSupervisor);
