@@ -11825,6 +11825,7 @@ fn emit_native_update(
 pub struct StatementParser {
     expressions: ExpressionParser,
     enum_values: HashMap<String, i64>,
+    array_length_evaluator: Option<fn(&Expression) -> Result<usize, CCompilerError>>,
 }
 
 pub struct TranslationUnitParser {
@@ -12354,6 +12355,7 @@ impl StatementParser {
         Self {
             expressions: ExpressionParser::new(tokens),
             enum_values: HashMap::new(),
+            array_length_evaluator: None,
         }
     }
 
@@ -12773,16 +12775,27 @@ impl StatementParser {
             }
             let expression = self.expressions.parse_expression(0)?;
             self.expect("]")?;
-            let value = evaluate_integer_constant_with_names(&expression, &self.enum_values)?;
-            dimensions.push(usize::try_from(value).map_err(|_| {
-                error(
-                    expression.filename.as_deref().unwrap_or("<source>"),
-                    expression.line,
-                    "array length must be a non-negative integer constant",
-                )
-            })?);
+            dimensions.push(self.array_length(&expression, &self.enum_values)?);
         }
         Ok(dimensions)
+    }
+
+    fn array_length(
+        &self,
+        expression: &Expression,
+        names: &HashMap<String, i64>,
+    ) -> Result<usize, CCompilerError> {
+        if let Some(evaluate) = self.array_length_evaluator {
+            return evaluate(expression);
+        }
+        let value = evaluate_integer_constant_with_names(expression, names)?;
+        usize::try_from(value).map_err(|_| {
+            error(
+                expression.filename.as_deref().unwrap_or("<source>"),
+                expression.line,
+                "array length must be a non-negative integer constant",
+            )
+        })
     }
 }
 
@@ -13555,14 +13568,10 @@ impl TranslationUnitParser {
             }
             let expression = self.statements.expressions.parse_expression(0)?;
             self.statements.expect("]")?;
-            let length = evaluate_integer_constant_with_names(&expression, &self.enumerators)?;
-            dimensions.push(usize::try_from(length).map_err(|_| {
-                error(
-                    expression.filename.as_deref().unwrap_or("<source>"),
-                    expression.line,
-                    "array length must be a non-negative integer constant",
-                )
-            })?);
+            dimensions.push(
+                self.statements
+                    .array_length(&expression, &self.enumerators)?,
+            );
         }
         Ok(dimensions)
     }

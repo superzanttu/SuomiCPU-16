@@ -30,7 +30,15 @@ The separate +kiuas16-cc+ command now compiles a small freestanding C subset
 through typed RV64 lowering and that ROM assembler. Its
 link:docs/kiuas16_machine_contract.adoc#rom-c-compiler[compiled guest fixtures]
 execute UART and guest-owned storage operations, including LP64 signed/unsigned
-integer arithmetic, full-width literals, shifts, and volatile MMIO. This is initial bring-up,
+integer arithmetic, full-width literals, shifts, volatile MMIO, and typed
+pointer buffer operations, short-circuit conditions, structured loops, and
+scalar register/stack calls, single-evaluation scalar update expressions,
+addressable scalar stack objects, automatic integer arrays and initializer
+lists, ordinary scalar pointers, LP64 +sizeof+, and single-unit integer globals
+with guest-owned ROM data copying and zero-storage initialization.
+Persistent scalar pointer globals support layout-resolved object-address
+initializers and constant MMIO address casts.
+This is initial bring-up,
 not the complete xv6 compiler or ELF build pipeline.
 
 == Current SC-16 features

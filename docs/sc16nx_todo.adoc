@@ -639,6 +639,14 @@ through the emulator crate, so keep this task unchecked.
 *Acceptance:* Every required construct has positive, invalid-input, and
 behavioral fixtures; kernel/user source inventories identify remaining
 unsupported input. GNU extensions are not mislabeled C90 language features.
++
+*Structured control-flow subset:* The Rust RV64 backend now executes
+short-circuit +&&/||+, typed conditional +?:+, +for+ with scoped declaration
+initializers, +do-while+, and loop-owned +break/continue+. The shared parser
+is reused; integer promotions, pointer compatibility, and source diagnostics
+come from the existing typed lowering. C99-style +for+ declarations are
+identified as such, not counted as C90 conformance. +switch/goto+ and the
+remaining pinned-source requirements are still unsupported.
 
 ** [ ] [[nx-rv64-codegen]] *P0 / Emit correct RV64 code and calls.*
    Implement instruction selection, registers/spills, addresses, stack
@@ -678,9 +686,153 @@ workarounds. Unsupported scalar types, malformed/overflowing literals, and
 unsupported operators still diagnose. This does not certify full LP64D,
 the entire C90/C99 language, or any unchecked parent.
 +
-*Validation checkpoint:* Working tree based on +0ea0237+; one hart, M-mode
+*Pointer buffer slice:* Matching volatile scalar pointers now support scaled
+addition/subtraction, signed 64-bit element differences, byte/word/doubleword
+indexing, comparisons, conditions, logical-not, and explicit integer/pointer
+casts. Shared typed lowering handles both subscripts and explicit address
+arithmetic; tests check negative indices, single evaluation of side-effecting
+operands, exact RAM bytes, and source-located rejection of invalid combinations.
++tests/fixtures/kiuas16_memory.c+ copies all 256 byte values through pointer
+parameters and reports checksum 32640 as UART +50 80 7f 0a+, with return value
+256 and exact buffer/checksum assertions. The same source executes through
+the production compiler and runner CLIs within 100000 steps without traps.
+An independent assembly caller checks 64-bit pointer parameters/results,
+eight-byte scaling, negative differences, restored stack, and saved frame
+register. Array declarations, address-of, implicit null-pointer conversions,
+other pointer categories, and object/provenance checks remain outside this
+bounded slice; complete code-generation acceptance is still open.
++
+*Control-flow execution slice:* +tests/fixtures/kiuas16_control.c+ performs
+bounded polling through a short-circuit pointer guard, then nested
++for/do-while+ loops with conditional output and loop exits. Compilation,
+assembly, and production runner execution yield UART +4c 12 0a+, result 18,
+status RAM word one, no traps, and a restored stack within 10000 steps.
+Regressions verify skipped calls/volatile loads, evaluation order, typed
+conditional results, omitted loop clauses, declaration scopes, and innermost
+continuation/exit targets. Invalid constructs diagnose even in unevaluated
+expression arms and unreachable loop bodies. This expands the tested
+freestanding subset, not full xv6 or Phase 0 acceptance.
++
+*Scalar stack-call slice:* Fixed-prototype functions accept up to 32 scalar
+parameters: eight in integer argument registers, the rest in contiguous
+eight-byte stack slots starting at the callee's entry stack pointer. Callers
+reserve aligned outgoing space separately from expression temporaries,
+preserve earlier evaluated arguments across nested calls, and reclaim both.
+Generated callees normalize incoming stack parameters using the same scalar
+type rules as register parameters. Handwritten caller/callee execution checks
+mixed signed/unsigned/byte/pointer inputs, unsigned 32-bit extension, stack
+offsets/alignment, and preserved stack/frame registers. Counts 9, 10, 11, 12,
+31, and 32 execute; a 33-parameter signature diagnoses.
++tests/fixtures/kiuas16_stack.c+ combines nested ten-argument calls and recursive
+stack-parameter calls through the production compiler/runner; UART is +8b+,
+result is 139, no traps occur, and the startup stack is restored within 10000
+steps. Aggregates, floating-point/variadic/indirect calls, and complete LP64D
+interoperability remain open; this does not close the ABI or codegen task.
++
+*Scalar update slice:* Typed compound assignments implement integer
+arithmetic/bitwise/shift updates and pointer element ++=/-=+. Prefix/postfix
+increment/decrement preserve old/new result semantics and destination-width
+conversions. Shared binary instruction selection and scalar load/store rules
+are reused; destination addresses and old values survive nested calls in
+aligned temporaries. Tests assert single evaluation of side-effecting
+subscripts and destination calls, mixed signed/unsigned arithmetic, byte
+narrowing, pointer strides, and nested updates. A UART receive-FIFO fixture
+proves that a volatile update reads once (input/output +XY+).
++tests/fixtures/kiuas16_updates.c+ executes through the compiler/runner CLI,
+emits +8a+, returns 138, and leaves the exact expected buffer bytes within
+10000 steps without traps. Updates are ordinary non-atomic guest accesses;
+atomic builtins and the broader ABI/toolchain requirements remain open.
++
+*Addressable stack-object slice:* Ordinary pointers to the supported integer
+types, address-of scalar locals/parameters and dereferenced/indexed lvalues,
+and unevaluated LP64 +sizeof+ now execute in the Rust ROM pipeline. Implicit
+pointer conversions can add volatile qualification, but cannot discard it;
+matching qualified/unqualified pointees work in comparisons, subtraction,
+and conditional expressions. Local loads and read-modify-write expressions
+use declared widths so aliased byte/word writes cannot leave stale upper
+slot bits in subsequent values. Tests cover signed/unsigned widths, addresses
+of register and stack parameters, recursive lifetimes, single-evaluation
+subscripts, address computation without a volatile read, and invalid input
+inside unevaluated operands.
++tests/fixtures/kiuas16_objects.c+ passes automatic byte/doubleword output
+objects through recursive calls and a volatile-qualified UART reporter.
+Production compiler/runner execution yields UART +53 0a ff 0a+, result 14,
+RAM doubleword 10 followed by byte +ff+, no traps, and a restored stack within
+10000 steps. Array/record objects, pointer-to-pointer types, globals, ELF
+linking, and the broader xv6 language/ABI requirements remain open.
++
+*Automatic-array slice:* The existing parser now feeds one-dimensional
+automatic integer arrays and inferred/nonempty list initializers into RV64
+lowering. Arrays use contiguous, eight-byte-aligned stack storage with
+declared element widths, element-pointer decay, full-array +sizeof+, and
+pointer-adjusted parameters. Explicit initializers execute left-to-right;
+omitted elements are zero-filled. Scalar and array allocations share the
+existing 120 eight-byte slot budget (960 bytes), with overflow diagnostics
+before allocation. A target-specific parser callback evaluates bounds using
+the same typed LP64 values as runtime expressions, including unsigned
+wrapping, shifts, casts, type +sizeof+, and short-circuit selection, without
+changing legacy SC-16 constant rules. Bounds referencing local names remain
+unsupported.
++tests/fixtures/kiuas16_arrays.c+ copies all 256 byte values between automatic
+buffers and reports checksum 32640 through the production compiler/runner.
+UART is +41 80 7f 0a+, result is 256, and exact stack-buffer bytes and header
+size 12 are asserted within 100000 steps without traps. Regression execution
+covers mixed-width initializer bytes/zero-fill, nested calls, recursion,
+scope shadowing, parameter adjustment, repeated initialization, and maximum
+frame capacity. Multidimensional/pointer/record arrays, whole-array pointers,
+globals, ELF linking, and complete xv6/ABI acceptance remain open.
++
+*Persistent global-storage slice:* The Rust RV64 backend now compiles
+single-unit unqualified integer scalars and one-dimensional arrays with
+LP64 constant initializers, zero-initialized definitions, and compatible
+tentative redeclarations. Globals reuse typed pointer/lvalue operations,
+array decay/size rules, and initializer conversion checks; functions retain
+source-order visibility and local shadowing. Conflicting or duplicate
+definitions, object/function collisions, unsupported initializers, and
+capacity overflow diagnose explicitly.
++kiuas16-cc+ emits a protected-ROM data payload plus guest startup loops
+that copy initialized bytes and clear uninitialized storage before +main+.
+The bounded bring-up layout reserves at most 65536 bytes starting at
++0x80010000+, above the stack, with eight-byte object alignment/padding.
+This is not ELF output, a general linker, address relocations, or
++static/extern+ support.
++tests/fixtures/kiuas16_globals.c+ maintains a persistent total, counter,
+seed array, and history across calls. Production compiler/runner execution
+yields UART +47 94 04 11 0a+, result 148, exact addresses/object bytes,
+no traps, and a restored stack within 10000 steps. Tests poison global RAM
+with +a5+ before execution to prove copying/zeroing is performed by guest
+instructions, check untouched memory beyond allocation, independently
+expected mixed-width initial bytes, recursive updates, and maximum 65536-byte
+BSS initialization. An oversized ROM data payload fails without overwriting
+the previous output. Pointer/qualified/record globals, linkage, ELF sections,
+and full firmware/xv6 acceptance remain open.
++
+*Persistent pointer/address-initializer slice:* Scalar pointer globals now
+support typed persistent cursor/MMIO state, zero-initialized storage, and
+compatible tentative declarations. Object-address initializers retain
+symbolic identities until final data/BSS RAM layout; address-of integer
+objects, array decay/indexing, constant element offsets, qualification
+conversions, and constant conditional selection share existing typed
+lowering. Explicit integer constant casts preserve full-width and null/MMIO
+addresses. No pointer loads or runtime calls are executed to manufacture
+static initializer values. Invalid initializers and incompatible types
+diagnose, including attempts to address pointer objects or refer to an
+undeclared object.
++tests/fixtures/kiuas16_cursors.c+ initializes cursor/limit/counter/UART
+pointers, advances the persistent cursor across calls, and leaves buffer
++00 0a 0b 0c 0d 0e 0f 00+. Production compiler/runner execution yields
+UART +52 06 0f 0a+, result 13, no traps, and a restored stack within
+10000 steps. Poisoned-RAM execution checks independently expected 64-bit
+pointer bytes and exact object data. Regressions cover finalized data/BSS
+addresses after tentative redeclarations, pointer updates across nested
+calls, qualification, element widths, explicit full-width address casts,
+and zero pointer storage. Pointer arrays, pointer-to-pointer types,
+symbolic pointer-to-integer initializers, ELF relocations/linking, and full
+firmware/xv6 acceptance remain open.
++
+*Validation checkpoint:* Working tree based on +e3d2c26+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 14
++cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 57
 compiler integration tests, including independently assembled call partners
 and compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).

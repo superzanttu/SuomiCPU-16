@@ -329,6 +329,22 @@ cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_uart.c C:\path\uart-rom.b
 cargo run --bin kiuas16-run -- --rom C:\path\uart-rom.bin --steps 10000 --deny-traps
 cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_storage.c C:\path\storage-c-rom.bin
 cargo run --bin kiuas16-run -- --rom C:\path\storage-c-rom.bin --root C:\path\disposable.raw --steps 20000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_memory.c C:\path\memory-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\memory-rom.bin --steps 100000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_control.c C:\path\control-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\control-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_stack.c C:\path\stack-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\stack-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_updates.c C:\path\updates-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\updates-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_objects.c C:\path\objects-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\objects-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_arrays.c C:\path\arrays-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\arrays-rom.bin --steps 100000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_globals.c C:\path\globals-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\globals-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_cursors.c C:\path\cursors-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\cursors-rom.bin --steps 10000 --deny-traps
 cargo test --test kiuas16_compiler -j 1 -- --test-threads=1
 ----
 
@@ -342,10 +358,66 @@ bytes in sector 1, its exact binary UART output is
 changes the fourth byte to zero and persists +W+ as the first byte of sector 1.
 The host neither initializes queues nor performs guest operations on its behalf.
 
+The memory fixture initializes 256 bytes, copies them through pointer parameters
+and a one-past-end loop, and computes checksum 32640. Its exact binary UART
+output is +50 80 7f 0a+; it returns 256 in +a0+. Tests compare both buffers
+against the independently expected byte sequence +00..ff+ and inspect the
+little-endian checksum and copied-length words in RAM.
+
+The control-flow fixture performs bounded status polling (including a guarded
+null pointer), then nested +for/do-while+ loops with +break/continue+.
+It prints exact UART bytes +4c 12 0a+, returns 18 in +a0+, and leaves
+the status word at +0x80000000+ equal to one. The tests execute both this
+source and its production CLI-built ROM without traps.
+
+The stack-call fixture combines nested ten-argument calls with recursive
+calls using stack parameters. It emits the single UART byte +8b+, returns
+139 in +a0+, and restores the startup stack. Independent assembly partners
+check incoming/outgoing stack slots, signed/unsigned/byte/pointer parameters,
+odd argument counts, and the 32-argument maximum.
+
+The update fixture uses compound bit operations on a RAM status word, a
+prefix-increment loop, postfix pointer traversal, and byte compound
+multiplication. UART emits +8a+ and +a0+ is 138; tests assert the exact
+16-byte buffer, including the updated byte at index 3.
+
+The stack-object fixture passes addresses of automatic byte/doubleword objects
+through recursive calls, then adds volatile qualification when passing them
+to its UART reporter. A call inside +sizeof+ is checked but never executed.
+UART emits +53 0a ff 0a+, +a0+ is 14, and RAM at +0x80000000+ contains
+the eight-byte little-endian value 10 followed by byte +ff+. The production
+compiler/runner executes it within 10000 steps without traps.
+
+The automatic-array fixture constructs two 256-byte stack buffers and an
+inferred-length integer header, then passes the buffers to a copy/checksum
+routine using array parameters. UART emits +41 80 7f 0a+, +a0+ is 256, and
+the checksum is 32640. Four doublewords at +0x80000000+ report the source
+address, destination address, checksum, and header byte size (12). Tests
+inspect both stack buffers and assert the exact sequence +00..ff+.
+The production compiler/runner executes it within 100000 steps without traps.
+
+The global-state fixture starts with a ROM-initialized total and seed array,
+plus zero-initialized counter/history objects. Calls update persistent state.
+UART emits +47 94 04 11 0a+, +a0+ is 148, and four doublewords at
++0x80000000+ report the total, counter, seed, and history addresses.
+Tests prefill global RAM with +a5+ before reset execution, then inspect exact
+object bytes and untouched storage beyond the allocated region. The same
+source executes through the production compiler/runner within 10000 steps
+without traps. Startup initialization is guest code, not host setup.
+
+The cursor fixture initializes persistent pointer globals to a buffer,
+its element offsets, a counter, and UART MMIO. Calls advance the cursor
+and update the counter through its stored pointer. UART emits +52 06 0f 0a+,
++a0+ is 13, and the buffer contains +00 0a 0b 0c 0d 0e 0f 00+.
+Tests poison RAM before startup and assert the exact initialized/updated
+64-bit pointer bytes, buffer, and counter, then run the same source through
+the production compiler/runner within 10000 steps without traps.
+
 The initial language/backend subset is deliberately bounded:
 
 * Signed/unsigned 32-bit +int+, signed/unsigned 64-bit +long+,
-  +unsigned char+, +void+ returns, and pointers to their volatile integer types.
+  +unsigned char+, +void+ returns, and pointers to those integer types,
+  either unqualified or volatile-qualified.
   Dereferences use byte, word, or doubleword accesses respectively.
   Decimal, octal, and hexadecimal literals cover the full unsigned 64-bit
   range, with optional +U+, +L+, +UL+, or +LU+ suffixes (case insensitive).
@@ -358,7 +430,7 @@ The initial language/backend subset is deliberately bounded:
   expressions. Overflow, invalid digits/suffixes, +long long+,
   character/string literals, other scalar types, and floating point diagnose.
 * Integer promotions, LP64 signed/unsigned mixed arithmetic, scalar conversions,
-  explicit integer-to-volatile-pointer casts, assignment expressions, direct
+  explicit integer/pointer casts, assignment expressions, direct
   calls, unary +plus/minus/bitwise-not/logical-not+, binary +add/subtract/
   multiply/divide/remainder/bitwise-and/or/xor+, shifts, and signed/unsigned
   comparisons. Shifts promote each operand independently and retain the
@@ -367,28 +439,149 @@ The initial language/backend subset is deliberately bounded:
   Signed narrowing retains low bits and interprets the result as two's
   complement. Division by zero, signed arithmetic overflow, and negative or
   out-of-width shift counts have no defined C result and are not runtime-checked.
-  Pointer arithmetic/comparisons, pointer-to-integer casts, short-circuit
-  operators, and increment operators are not yet supported.
+  Logical +&&/||+ evaluate the left operand first, skip the right when
+  appropriate, and produce +int+ zero or one. Conditional +?:+ evaluates
+  its condition once and exactly one result arm. Integer arms use the LP64
+  common type; matching pointer arms and pairs of void expressions are
+  supported. Both arms are semantically checked even when an arm cannot
+  execute. Implicit null-pointer arm conversions remain unsupported.
+* Compound assignments `+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`,
+  `&=`, `^=`, and `|=` support integer
+  objects using the same promotions and operation types as binary arithmetic,
+  followed by conversion to the destination type. Pointer objects support
+  `+=` and `-=` with integer element offsets. Prefix/postfix `++` and `--` support the
+  same scalar locals and dereferenced objects. Each operation evaluates its
+  destination address once, reads the old value once, and writes once;
+  aligned temporaries preserve the address and old value across nested calls.
+  Prefix/compound expressions return the converted new value; postfix
+  expressions return the old value. These operations are not atomic and add
+  no synchronization or ordering beyond ordinary guest accesses.
+* The supported scalar pointers allow pointer-plus-integer,
+  integer-plus-pointer, and pointer-minus-integer with element strides of
+  1, 4, or 8 bytes. Subscripts (including negative indices and +i[p]+) lower
+  through the same address rules and load/store widths. Pointer subtraction
+  requires matching pointee integer types and returns a signed 64-bit element count.
+  Matching pointee types support equality and unsigned address ordering;
+  pointer conditions and logical-not test against zero. Explicit pointer-to-
+  integer casts preserve the address bits before destination-width conversion.
+  Integer-to-pointer casts preserve the integer's extended address bits.
+  These operations do not check object bounds or pointer provenance; valid
+  C array bounds and representable pointer differences remain the guest's
+  responsibility. Pointer conversions may add volatile qualification
+  implicitly; removing it requires an explicit cast. Comparisons, subtraction,
+  and conditional expressions accept matching pointee types with either
+  qualification; conditional results retain volatile if either arm has it.
+  Casts between different pointee integer types and implicit integer/null-pointer conversions
+  remain unsupported; write a typed pointer cast for zero. This is not
+  complete C pointer support.
+* Address-of supports automatic integer locals and parameters, dereferences,
+  and indexed lvalues. Integer objects keep stable eight-byte private stack
+  slots, but aliased loads/stores use their declared byte/word/doubleword width.
+  Address-of a dereference or subscript computes the address without reading
+  the object; pointer/index side effects still execute once. Pointer-to-pointer
+  types, address-of pointer objects, and address-of non-lvalues diagnose.
+  Guest code remains responsible for object lifetime and valid bounds.
+* +sizeof(type)+ and +sizeof expression+ return +unsigned long+ constants:
+  byte 1, integer word 4, long/pointer 8. Expressions are semantically checked
+  without emitting calls, updates, or volatile reads. Void and unsupported
+  types diagnose. An array name (including parentheses) retains its full
+  byte size under +sizeof+; elsewhere it decays to an element pointer.
+  Array parameters are adjusted to pointers, so their +sizeof+ is 8.
+  Array type names, variable-length types, and aggregate sizes are not implemented.
+* One-dimensional automatic arrays of supported unqualified integer elements
+  occupy contiguous byte/word/doubleword storage. Each object starts on an
+  eight-byte boundary. Nonempty initializer lists convert each element,
+  evaluate explicit initializers left-to-right, and zero-fill omitted elements;
+  omitted bounds are inferred from the list length. Scalar braces around
+  individual elements are accepted. Uninitialized arrays are not zero-filled.
+  Bounds use scope-independent LP64 integer constant expressions, including
+  casts, type +sizeof+, arithmetic, comparisons, and short-circuit expressions;
+  unsigned wrapping and signedness match the RV64 expression types.
+  Undefined constant arithmetic, nonpositive lengths, and oversized storage
+  diagnose. Names and +sizeof(local)+ in bounds remain unsupported.
+  Array elements reuse pointer indexing, assignment, and update lowering.
+  Arrays cannot be assigned or incremented. Multidimensional arrays, arrays
+  of pointers, pointers to whole arrays (+&array+), string/designated/empty-list
+  initialization, and aggregate elements remain unsupported.
+* File-scope unqualified integer scalars, scalar pointers to the supported
+  integer types (including volatile-qualified pointees), and one-dimensional integer arrays
+  have persistent RAM storage. Supported integer constant initializers use
+  LP64 typing, conversions, optional scalar braces, and the same array-list
+  rules as automatic arrays; omitted array elements are zero-filled.
+  +sizeof+ may reference the declared object itself or earlier objects.
+  Uninitialized definitions (including repeated compatible tentative
+  declarations) are zeroed before +main+. One initialized definition may
+  accompany compatible tentative declarations. Conflicting types/lengths,
+  multiple initialized definitions, and object/function name collisions
+  diagnose. Objects must be declared before use and local scopes may shadow
+  them. Volatile-qualified integer objects, pointer-to-pointer/record globals,
+  dynamic initializers, +static/extern+, and separate-unit linkage remain
+  unsupported.
+* Scalar pointer globals accept addresses of previously declared integer
+  objects, array decay, indexed element addresses, and constant element
+  offsets through the existing typed pointer rules. Symbolic object addresses
+  are resolved after final RAM placement, including when a later initialized
+  definition moves a previously tentative object into the data region.
+  Qualification conversions and conditional selection with an integer
+  constant condition are supported. Explicit integer constant casts support
+  null, full-width addresses, and MMIO; implicit integer/null conversions
+  remain unsupported. Loading another pointer global is not a constant
+  initializer. Pointer-to-integer address initializers, integer-to-pointer
+  casts through symbolic integer expressions, addresses of pointer objects,
+  pointer arrays, and references before declaration diagnose.
+  Runtime pointer-global assignment, dereference, indexing, and updates use
+  the same scalar rules as locals. No bounds/provenance checks are added.
 * Automatic scalar locals, nested scopes, compound/expression/return
-  statements, +if/else+, and +while+. Each function has at most 120
-  parameter/local slots; arrays, globals, records, enums, typedefs, storage
-  class specifiers, +const+, and other statements diagnose.
-* Prototyped functions with at most eight scalar register arguments.
+  statements, +if/else+, +while+, +do-while+, and +for+ (including omitted
+  clauses and scoped C99 declaration initializers). +break/continue+ target
+  the innermost supported loop; +continue+ reaches a +for+ update or
+  +do-while+ condition before the next iteration. These jumps are statements,
+  not expression-level nonlocal exits. Each function has at most 120
+  eight-byte parameter/local storage slots (960 bytes): scalars consume one,
+  arrays consume their byte size rounded up to eight, and nested scopes share
+  this budget without slot reuse. Records, enums, typedefs, storage
+  class specifiers, +const+, +switch+, +goto+, labels, and other statements
+  diagnose. C99-style +for+ declarations are not a C90 conformance claim.
+* Prototyped functions with at most 32 scalar arguments. The first eight
+  arguments use +a0..a7+; subsequent arguments occupy consecutive eight-byte
+  stack slots, starting at offset zero from the callee's entry +sp+.
+  Outgoing stack space is rounded up to 16-byte alignment, and callers
+  reclaim it after return. Argument values are evaluated left-to-right into
+  private aligned temporaries before the final register/stack placement;
+  nested calls cannot overwrite earlier evaluated arguments. The 32-argument
+  limit keeps this backend's fixed-size stack addressing within instruction
+  immediate bounds; larger signatures diagnose rather than truncate.
   Every declared function must be defined in the same source unit; a call
   needs an earlier declaration or definition. Recursive calls are supported.
   Parameter/return conversions and typed expression temporaries preserve
   values across nested calls. Stack frames and temporary argument slots
   retain 16-byte alignment, with saved +ra/s0+ restored on return.
   Unsigned 32-bit values are zero-extended internally but sign-extended from
-  bit 31 to XLEN at register argument/return boundaries, as required by the
-  RISC-V integer calling convention; callees normalize incoming parameters.
-  Stack arguments, indirect calls, aggregates, and varargs remain unsupported.
+  bit 31 to XLEN at argument/return boundaries (including stack arguments),
+  as required by the RISC-V integer calling convention; callees normalize
+  incoming register and stack parameters.
+  Indirect calls, aggregates, floating-point arguments, and varargs remain
+  unsupported. This is a fixed-prototype scalar convention, not full LP64D.
 * Preprocessor directives, including includes and macros, are rejected
   before parsing. No legacy header search or legacy target macros are
   used for this RV64 path.
 
 Startup begins at the ROM reset vector in M-mode, sets +sp+ to +0x80010000+,
-and calls +int main(void)+. Returning from +main+ leaves its result in +a0+
+copies initialized global bytes from protected ROM to RAM, clears
+uninitialized global storage, and calls +int main(void)+.
+Global storage occupies at most 65536 bytes in
++[0x80010000, 0x80020000)+, above the downward-growing stack. Objects are
+eight-byte aligned and padded to eight bytes; initialized objects precede
+uninitialized objects, with names sorted within each group. Padding is also
+initialized. Guest DMA buffers and other fixed-address accesses must avoid
+allocated global storage. Explicitly initialized zeros currently occupy ROM
+data rather than BSS. BSS uses only guest clearing code and no ROM payload;
+initialized bytes and code must still fit the 61440-byte ROM or assembly
+fails without replacing an existing output file.
+Pointer initializer bytes are resolved against that final layout before
+ROM assembly. This is a fixed single-unit bring-up layout, not ELF sections,
+object-file relocation records, or a cross-unit linker.
+Returning from +main+ leaves its result in +a0+
 and enters WFI; it is not host process exit or firmware boot acceptance.
 The fixed bring-up stack has no allocator or overflow guard. Falling through
 +main+ returns zero; reaching the end of another non-void function executes
@@ -402,7 +595,10 @@ callees also check integer register arguments, signed/byte conversions,
 unsigned 32-bit ABI extension, stack alignment, and saved registers against
 generated functions. Wide literal materialization is checked against
 independently expected host values; unsigned memory stores are checked as
-little-endian RAM bytes. The storage guest uses unsigned MMIO words, direct
+little-endian RAM bytes. Pointer tests check scaled byte/word/doubleword
+addresses, signed differences, single evaluation of side-effecting subscript
+operands, and independent assembly-call interoperability above 32-bit addresses.
+The storage guest uses unsigned MMIO words, direct
 RAM address literals, and a queue-index shift rather than signed-address
 construction workarounds.
 These are initial integer-call fixtures, not complete LP64D certification.
