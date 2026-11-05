@@ -86,6 +86,84 @@ not implemented must fail explicitly. Never silently truncate addresses,
 invent successful device responses, substitute a host OS service, or hide a
 failure behind an external compiler.
 
+=== P0 execution priorities
+
+Prioritize working, reproducible guest milestones rather than the number of
+checked tasks. The immediate critical path is the Rust-native compiler,
+assembler/linker, and executable guest pipeline. Existing fixed-encoding ROM
+fixtures establish useful hardware behavior, but cannot replace compiled
+firmware or kernel consumers.
+
+The order below schedules implementation slices within the existing tasks;
+it does not introduce another checklist, change P0/P1/P2 classifications, or
+relax any task's final acceptance criteria. Phase numbers are not a required
+implementation sequence.
+
+. *First: identify and test the smallest missing compiled-guest capability.*
+  Inventory the path from a small C source and assembly startup through
+  RV64 output, assembly, linking, ROM packaging, and +kiuas16-run+ execution.
+  Map each missing capability to <<nx-compiler-boundaries>>,
+  <<nx-rv64-codegen>>, <<nx-rv64-assembler>>, <<nx-elf-linker>>, or
+  <<nx-rust-build-driver>>. Define a failing execution fixture before
+  implementing the next gap; do not begin with the entire xv6 language
+  corpus or a broad compiler rewrite.
+. *Bring up one compiled ROM guest.*
+  Implement only the coherent frontend, typed lowering, ABI, instruction,
+  relocation, and startup subset needed by that fixture, extending existing
+  shared stages rather than creating a second compiler. Start with integer
+  expressions, calls, stack setup, address construction, and volatile MMIO
+  access as required by the source. Rust tools must compile, assemble, link,
+  and package it for protected-ROM startup; verify exact guest UART output
+  and observable call results within an explicit step budget. Unsupported
+  constructs and invalid operands must diagnose. Direct ELF loading may
+  help isolate failures, but is not ROM-boot acceptance.
+. *Extend that guest through storage.*
+  Replace the fixed-encoding storage scenario with compiled guest code that
+  owns modern Virtio negotiation, queue construction, DMA buffers, completion,
+  and reset. Read a known sector from disposable explicitly attached media
+  and assert its bytes through UART; extend to write/flush and read-only
+  failure with image-content assertions. Keep stdout, traps, backend errors,
+  and budget exhaustion observable; do not initialize queues or substitute
+  disk operations in the host.
+. *Use the working pipeline to complete Phase 0 evidence.*
+  Add independently expected LP64D layout/call/ELF execution fixtures for
+  <<nx-abi-contract>> and compile real firmware and pinned-kernel consumers
+  of the shared definitions for <<nx-device-contract>>. Extend the pipeline
+  only as their requirements demand. The small ROM guest is an intermediate
+  milestone, not completion of either contract, full Sytyke, or xv6 boot.
+. *Grow the same path toward firmware and xv6.*
+  Expand <<nx-c-xv6>>, <<nx-rv64-codegen>>, <<nx-rv64-assembler>>,
+  <<nx-elf-linker>>, and <<nx-rust-build-driver>> against the pinned source
+  inventory. Implement <<nx-boot-images>> and the firmware-owned load/handoff
+  path as those consumers become buildable. Complete the remaining CPU and
+  device behavior exercised by these guests without concealing unimplemented
+  architectural requirements behind a successful boot.
+
+*Dependency interpretation:* Full ABI acceptance needs a compiler/linker,
+while compiler tasks depend on the ABI contract. Use the specified ABI and
+shared definitions as inputs to incremental implementation; then produce the
+independent execution evidence required to close the contract. Apply the same
+distinction to device specifications and their compiled consumers. This
+permits prerequisite slices across open tasks, not acceptance by assumption.
+Do not wait for Phase 0 parent closure before building its missing toolchain
+prerequisites.
+
+*Execution and validation discipline:*
+
+* Define each batch's source fixture, expected output/object bytes, failure
+  cases, and completion criterion before coding. Finish with guest execution,
+  not only parsing, assembly text, or successful object emission.
+* Parallelize only independent work with agreed interfaces and separate file
+  ownership: CPU conformance, toolchain development, and firmware/device
+  integration. Shared ABI, object/relocation, and device-definition changes
+  must be coordinated before dependent work proceeds.
+* Run focused tests during iteration; run the full serial suite and build/
+  format checks at coherent integration checkpoints. Keep changes in small,
+  verified commits rather than accumulating disconnected features.
+* Record remaining blockers and reproducible evidence under the owning tasks.
+  Recount completed children only after acceptance-backed closures; never
+  optimize the count by weakening a parent or child gate.
+
 == Static project audit
 
 The source audit used repository revision
