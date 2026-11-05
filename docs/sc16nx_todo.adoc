@@ -593,7 +593,9 @@ Extraction preserves supported behavior before RV64-specific changes are applied
 existing lexer/parser and lowers its supported syntax to explicitly typed
 values/actions before emitting RV64 assembly. Call signatures, local scopes,
 integer promotions/conversions, memory widths, and diagnostics share these
-typed rules. The legacy backend remains unchanged. This bounded bring-up
+typed rules. LP64 literal candidate selection, signed/unsigned common types,
+independent shift promotions, and register-boundary extension are now explicit
+RV64 rules; legacy literal limits and code generation remain unchanged. This bounded bring-up
 does not complete shared semantic-stage extraction, aggregate layout
 integration, preprocessing/header selection, or the xv6 language corpus.
 
@@ -653,8 +655,8 @@ cleanup, and preserved registers rather than assembly substrings alone.
 +
 *Initial executable subset:* +kiuas16-cc+ now compiles freestanding C to
 raw protected ROM through typed RV64 lowering and the Rust assembler.
-Signed +int/long+, +unsigned char+, scalar register calls/returns, recursion,
-locals/scopes, +if/while+, and explicit volatile byte/word/doubleword accesses
+Signed/unsigned +int/long+, +unsigned char+, scalar register calls/returns,
+recursion, locals/scopes, +if/while+, and explicit volatile byte/word/doubleword accesses
 execute in +tests/kiuas16_compiler.rs+. Independent handwritten caller/callee
 fixtures check integer call interoperability rather than relying solely on
 compiler-generated callers and callees. The C storage fixture drives the
@@ -664,13 +666,25 @@ link:kiuas16_machine_contract.adoc#rom-c-compiler[commands and subset limits].
 This is not ELF output, full LP64D, or pinned xv6 compilation. Unsupported
 input diagnoses and the complete code-generation acceptance remains open.
 +
-*Validation checkpoint:* Working tree based on +39146da+; one hart, M-mode
+*Unsigned arithmetic slice:* LP64 C90 integer literal typing through
++18446744073709551615UL+, full-width constant materialization, unsigned
+wrapping arithmetic, mixed signed/unsigned conversions/comparisons, division,
+remainder, and shifts execute in the same Rust-native ROM pipeline.
+Unsigned volatile word/doubleword access is checked as exact RAM bytes.
+Independent assembly validates unsigned 32-bit parameter/result sign extension
+to XLEN and nested-call stack alignment. The compiled storage consumer now
+uses unsigned MMIO and direct RAM address constants instead of signed-address
+workarounds. Unsupported scalar types, malformed/overflowing literals, and
+unsupported operators still diagnose. This does not certify full LP64D,
+the entire C90/C99 language, or any unchecked parent.
++
+*Validation checkpoint:* Working tree based on +0ea0237+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all nine
++cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 14
 compiler integration tests, including independently assembled call partners
 and compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
-+cargo test -j 1 -- --test-threads=1+ passes the full serial workspace suite.
++cargo test --workspace -j 1 -- --test-threads=1+ passes the full serial workspace suite.
 +cargo check --lib --bin kiuas16-cc --bin kiuas16-asm --bin kiuas16-run -j 1+,
 +cargo fmt --check+, and +git diff --check+ pass. Remaining P0 completion
 gates are unchanged.

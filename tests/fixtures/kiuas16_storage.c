@@ -3,52 +3,52 @@ void put(unsigned char value)
     *(volatile unsigned char *)0x10000000 = value;
 }
 
-void mmio(long offset, int value)
+void mmio(unsigned long offset, unsigned int value)
 {
-    *(volatile int *)(0x10001000L + offset) = value;
+    *(volatile unsigned int *)(0x10001000UL + offset) = value;
 }
 
-int mmio_read(long offset)
+unsigned int mmio_read(unsigned long offset)
 {
-    return *(volatile int *)(0x10001000L + offset);
+    return *(volatile unsigned int *)(0x10001000UL + offset);
 }
 
-long ram(void)
+unsigned long ram(void)
 {
-    return 2147483647L + 1L;
+    return 0x80000000UL;
 }
 
-void ram_word(long offset, int value)
+void ram_word(unsigned long offset, unsigned int value)
 {
-    *(volatile int *)(ram() + offset) = value;
+    *(volatile unsigned int *)(ram() + offset) = value;
 }
 
-void ram_long(long offset, long value)
+void ram_long(unsigned long offset, unsigned long value)
 {
-    *(volatile long *)(ram() + offset) = value;
+    *(volatile unsigned long *)(ram() + offset) = value;
 }
 
-void ram_byte(long offset, unsigned char value)
+void ram_byte(unsigned long offset, unsigned char value)
 {
     *(volatile unsigned char *)(ram() + offset) = value;
 }
 
-unsigned char ram_read_byte(long offset)
+unsigned char ram_read_byte(unsigned long offset)
 {
     return *(volatile unsigned char *)(ram() + offset);
 }
 
-void descriptor(long offset, long address, int length, int flags)
+void descriptor(unsigned long offset, unsigned long address, unsigned int length, unsigned int flags)
 {
     ram_long(offset, address);
     ram_word(offset + 8L, length);
     ram_word(offset + 12L, flags);
 }
 
-void submit(int index)
+void submit(unsigned int index)
 {
     ram_byte(0x600L, 255);
-    ram_word(0x100L, index * 65536);
+    ram_word(0x100UL, index << 16);
     mmio(0x50L, 0);
     put(ram_read_byte(0x600L));
 }
@@ -63,9 +63,9 @@ int main(void)
     mmio(0x20L, 512);
     mmio(0x70L, 11);
     mmio(0x38L, 8);
-    mmio(0x80L, (int)ram());
-    mmio(0x90L, (int)(ram() + 0x100L));
-    mmio(0xa0L, (int)(ram() + 0x200L));
+    mmio(0x80L, (unsigned int)ram());
+    mmio(0x90L, (unsigned int)(ram() + 0x100UL));
+    mmio(0xa0L, (unsigned int)(ram() + 0x200UL));
     mmio(0x44L, 1);
     mmio(0x70L, 15);
     descriptor(0L, ram() + 0x300L, 16, 0x10001);

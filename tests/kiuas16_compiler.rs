@@ -65,15 +65,15 @@ fn invalid_and_unsupported_c_is_not_silently_compiled() {
         "#include <limits.h>\nint main(void) { return 0; }",
         "#define VALUE 1\nint main(void) { return VALUE; }",
         "int main() { return 0; }",
-        "int main(void) { unsigned long a; return 0; }",
+        "int main(void) { unsigned short a; return 0; }",
         "int main(void) { static int a; return 0; }",
         "int main(void) { const int a = 1; return 0; }",
         "int main(void) { return unknown; }",
         "int main(void) { int a; int a; return 0; }",
         "int main(void) { int a[2]; return 0; }",
-        "int main(void) { return 1 / 2; }",
-        "int main(void) { return 1U; }",
-        "int main(void) { return 2147483648; }",
+        "int main(void) { return 1 && 2; }",
+        "int main(void) { return 1ULL; }",
+        "int main(void) { return 18446744073709551616UL; }",
         "int main(void) { return sizeof(long); }",
         "int main(void) { return; }",
         "void f(void) { return 1; } int main(void) { f(); return 0; }",
@@ -97,6 +97,197 @@ fn invalid_and_unsupported_c_is_not_silently_compiled() {
             .unwrap_err()
             .to_string();
         assert!(error.contains("invalid.c"), "{source}: {error}");
+    }
+}
+
+#[test]
+fn lp64_unsigned_literals_conversions_and_arithmetic_execute() {
+    let cases = [
+        ("return 2147483648 > 0;", 1),
+        ("return 4294967295 == 4294967295L;", 1),
+        ("return 4294967295U > 2147483647;", 1),
+        ("return 0xffffffff == -1;", 1),
+        ("return 037777777777 == 4294967295U;", 1),
+        ("return 0x8000000000000000 > 0;", 1),
+        ("return 18446744073709551615UL > 0L;", 1),
+        ("return 18446744073709551615U == -1L;", 1),
+        ("return 18446744073709551615 == -1L;", 1),
+        ("return 0xffffffffffffffffL == -1L;", 1),
+        ("return 0XfEdCbA9876543210uL == 18364758544493064720UL;", 1),
+        ("return (unsigned int)-1L == 4294967295U;", 1),
+        ("return (unsigned long)-1 == 18446744073709551615UL;", 1),
+        ("return (long)4294967295U == 4294967295L;", 1),
+        ("return -1L < 1U;", 1),
+        ("return -1 < 1U;", 0),
+        ("return -1L < 1UL;", 0),
+        ("return 4294967295U + 1U == 0U;", 1),
+        ("return 0UL - 1UL == 18446744073709551615UL;", 1),
+        ("return -4294967295U == 1U;", 1),
+        ("return ~0U == 4294967295U;", 1),
+        ("return ~0UL == 18446744073709551615UL;", 1),
+        ("return 0x80000000U * 2U == 0;", 1),
+        ("return (unsigned char)0xffffffffffffffffUL;", 255),
+        ("return (int)0xffffffffUL;", -1),
+        (
+            "return 0x8000000000000000UL / 2UL == 0x4000000000000000UL;",
+            1,
+        ),
+        ("return 0xffffffffffffffffUL % 16UL;", 15),
+        ("return 4294967295U / 2U == 2147483647;", 1),
+        ("return 4294967295U % 2U;", 1),
+        ("return -17 / 5;", -3),
+        ("return -17 % 5;", -2),
+        ("return -17L / 5U;", -3),
+        ("return -17L % 5U;", -2),
+        ("return 1U << 31 == 0x80000000U;", 1),
+        ("return 0x80000000U >> 31;", 1),
+        ("return -4 >> 1;", -2),
+        ("return -4L >> 1;", -2),
+        ("return 0xffffffffffffffffUL >> 63;", 1),
+        ("return 1UL << 63 == 0x8000000000000000UL;", 1),
+        ("return 1U << 31UL == 0x80000000U;", 1),
+        ("unsigned char a = 255; return a << 1;", 510),
+        ("return -1 < 4294967295U;", 0),
+        ("return -1 <= 4294967295U;", 1),
+        ("return 0xffffffffffffffffUL >= 1;", 1),
+        ("return 0xffffffffffffffffUL != 0;", 1),
+    ];
+    for (body, expected) in cases {
+        let (machine, _) = execute(&format!("int main(void) {{ {body} }}"));
+        assert_eq!(
+            machine.core().register(10),
+            Some(expected as i64 as u64),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn unsigned_volatile_words_doublewords_and_nested_calls_execute() {
+    let (mut machine, output) = execute(
+        "unsigned long combine(unsigned int low, unsigned long high) {
+                 return high | low;
+             }
+             unsigned int narrow(unsigned long value) { return value; }
+             int main(void) {
+                 volatile unsigned int *word = (volatile unsigned int *)0x80000000UL;
+                 volatile unsigned long *wide = (volatile unsigned long *)0x80000008UL;
+                 *word = 0xffffffffU;
+                 *wide = combine(narrow(0x12345678ffffffffUL), 0xabcdef0100000000UL);
+                 if (*word != 4294967295L) return 1;
+                 if (*wide != 0xabcdef01ffffffffUL) return 2;
+                 *(volatile unsigned char *)0x10000000 = (*wide >> 32) & 255U;
+                 return *word / 0x10000000U;
+             }",
+    );
+    assert_eq!(output, [1]);
+    assert_eq!(machine.core().register(10), Some(15));
+    let mut bytes = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    assert_eq!(&bytes[..4], &u32::MAX.to_le_bytes());
+    assert_eq!(&bytes[4..8], &[0; 4]);
+    assert_eq!(&bytes[8..], &0xabcdef01ffffffff_u64.to_le_bytes());
+}
+
+#[test]
+fn wide_literal_materialization_matches_independent_host_values() {
+    let cases = [
+        ("0UL", 0),
+        ("2147483647L", 0x7fffffff),
+        ("2147483648", 0x80000000),
+        ("0xffffffffU", 0xffffffff),
+        ("0x100000000UL", 0x100000000),
+        ("0x1234567887654321UL", 0x1234567887654321),
+        ("0x7ffffffffffff7ffUL", 0x7ffffffffffff7ff),
+        ("0x7ffffffffffff800UL", 0x7ffffffffffff800),
+        ("9223372036854775807L", 0x7fffffffffffffff),
+        ("9223372036854775808", 0x8000000000000000),
+        ("0x8000000000000800UL", 0x8000000000000800),
+        ("0xaaaaaaaaaaaaaaaaUL", 0xaaaaaaaaaaaaaaaa),
+        ("0xffffffff7fffffffUL", 0xffffffff7fffffff),
+        ("0xffffffff80000000UL", 0xffffffff80000000),
+        ("0xffffffffffffffffUL", u64::MAX),
+    ];
+    for (literal, expected) in cases {
+        let source = format!(
+            "unsigned long wide(void) {{ return {literal}; }}
+             int main(void) {{ return 0; }}"
+        );
+        let assembly = compile_to_assembly(&source, "literal.c").unwrap().replacen(
+            "call main\n",
+            "call wide\n",
+            1,
+        );
+        let rom = assemble_boot_rom(&assembly).unwrap();
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+        let report = run_headless(&mut machine, 1000, &[], &mut Vec::new()).unwrap();
+        assert_eq!(report.traps, 0, "{literal}");
+        assert!(report.waiting > 0, "{literal}");
+        assert_eq!(machine.core().register(10), Some(expected), "{literal}");
+    }
+}
+
+#[test]
+fn unsigned_integer_abi_interoperates_with_independent_assembly() {
+    let source = "
+            unsigned int echo(unsigned int value) { return value; }
+            unsigned int probe(unsigned int a, unsigned int b) { return 0; }
+            unsigned int call_probe(void) { return probe(0x80000000U, echo(0xffffffffU)); }
+            int main(void) { return 0; }";
+    let mut assembly = compile_to_assembly(source, "unsigned-abi.c")
+        .unwrap()
+        .replacen("call main\n", "call .Lunsigned_entry\n", 1)
+        .replacen("\nprobe:\n", "\n.Lunused_probe:\n", 1);
+    assembly.push_str(
+        ".Lunsigned_entry:
+             addi sp, sp, -16
+             sd ra, 0(sp)
+             li a0, -1
+             call echo
+             mv s2, a0
+             call call_probe
+             mv s3, a0
+             ld ra, 0(sp)
+             addi sp, sp, 16
+             ret
+             probe:
+             andi t0, sp, 15
+             bne t0, zero, .Lunsigned_bad
+             li t0, -2147483648
+             bne a0, t0, .Lunsigned_bad
+             li t0, -1
+             bne a1, t0, .Lunsigned_bad
+             li a0, -2
+             ret
+             .Lunsigned_bad:
+             li a0, 7
+             ret",
+    );
+    let rom = assemble_boot_rom(&assembly).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(18), Some(u64::MAX));
+    assert_eq!(machine.core().register(19), Some(u64::MAX - 1));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+}
+
+#[test]
+fn invalid_lp64_integer_literals_diagnose_without_truncation() {
+    for literal in [
+        "18446744073709551616UL",
+        "0x10000000000000000",
+        "1ULL",
+        "1UU",
+        "1LL",
+        "09",
+    ] {
+        let source = format!("int main(void) {{ return {literal}; }}");
+        let error = compile_to_assembly(&source, "literal.c")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("literal.c"), "{literal}: {error}");
     }
 }
 #[test]

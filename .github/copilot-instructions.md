@@ -1,22 +1,29 @@
-Don't include long explanations in replies.
-Don't add comments to code unless the user asks for them.
+# SuomiCPU-16 Project Guidelines
+
+## Project direction
+
+- Keep user-facing replies concise. Avoid code comments unless they clarify non-obvious behavior or are requested.
+- The working product is still the legacy SC-16 emulator and toolchain. The successor target is Kiuas16, an RV64-compatible machine intended to boot xv6 built with this repository's Rust-native toolchain. Do not describe planned firmware, full xv6 support, or other roadmap goals as implemented.
+- `docs/sc16nx_todo.adoc` is the sole development checklist. Keep parent milestones unchecked until every child requirement and its acceptance tests pass. Record verified progress, exact commands, target configuration, and observable results there; do not create a competing checklist.
+- Preserve SisuOS/SaunaShell as a frozen historical example. Do not extend or port it to Kiuas16.
 
 ## Architecture
 
-- The SC-16 emulator, assembler, C compiler, and host runtime are implemented in Rust. `src/c_compiler/mod.rs` emits SC-16 assembly; `src/assembler/mod.rs` assembles it; `src/emulator/cpu.rs` executes the machine code. `src/emulator/image.rs` connects source/image loading, while `src/emulator/runtime.rs` handles BIOS selection and the interactive host runtime.
-- C programs under `programs/<slug>/src/` are guest workloads, with their own tools and manifests. Shared guest headers and runtime sources live under `toolchain/`; BIOS firmware and fonts live under `firmware/`. When a program exposes a bug, trace it through generated assembly and CPU execution before changing guest code to work around it.
+- The legacy SC-16 emulator, compiler, and assembler are Rust code under `src/emulator/`, `src/c_compiler/`, and `src/assembler/`. Kiuas16 CPU, machine, and devices are under `src/kiuas16/`; the incremental RV64 compiler and assembler paths are `src/c_compiler/rv64.rs` and `src/assembler/rv64.rs`. Rust command-line tools live in `src/tools/`.
+- Guest programs live under `programs/`; shared guest headers and runtime sources live under `toolchain/`; firmware assets live under `firmware/`. Follow the owning package's manifest and existing patterns.
+- Keep production compilation, assembly, linking, and image construction Rust-native. External compilers, assemblers, linkers, Python, or Perl must not become production fallbacks. QEMU and other external tools may be optional independent verification only.
+- When a guest exposes a bug, trace it through compiler output, assembly or machine code, CPU execution, and device behavior before changing guest code to work around it. Preserve guest ownership of device protocols and host/device error reporting.
 
-## Build and Test
+## Implementation and testing
 
-- Format check: `cargo fmt --check`
-- Library type/build check: `cargo check --lib`
-- Run a focused compiler unit test: `cargo test --lib c_compiler::tests::<test_name>`
-- Run C90 end-to-end conformance tests: `cargo test --test c90_conformance`
-- Run the full suite serially: `cargo test -- --test-threads=1`
-- Compiler validation must cover execution, not only parsing or assembly generation. Follow `tests/c90_conformance.rs`: compile C to assembly, assemble it, load it into `Cpu`, run it, and assert observable results. Add focused behavioral regressions for affected compiler, ISA, or runtime behavior; use a real program scenario when it reproduces the reported bug.
-
-## Compiler and Roadmap Conventions
-
-- Keep compiler and emulator implementation paths Rust-native. Unsupported C input should be rejected by the Rust compiler with a diagnostic; do not restore or add a Python compiler/runtime fallback.
-- Treat C90 support as a tested subset, not a blanket compatibility claim. Keep documentation aligned with verified behavior and list unsupported requirements explicitly.
-- In `docs/sc16nx_todo.adoc`, leave a parent task unchecked until every child task is complete and its acceptance tests pass. Update task status only after validating the corresponding behavior.
+- Make focused changes, preserve existing behavior, and add regression tests for behavior changes. Reject unsupported input explicitly; do not silently truncate values, invent successful results, or hide failures.
+- Treat C90 support as a tested subset, not blanket conformance. Keep supported behavior and known limitations aligned with tests and documentation.
+- Validate compiler and machine changes by executing guests and asserting observable results such as UART bytes, registers, memory or disk contents, traps, and step budgets—not just parsing, generated text, or successful assembly.
+- Use focused tests while iterating. Relevant integration targets include `kiuas16_compiler`, `kiuas16_assembler`, `kiuas16_runtime`, and `c90_conformance`.
+- Before completing a coherent change, run the applicable checks:
+  - `cargo fmt --check`
+  - `cargo check --lib`
+  - Focused integration tests for affected behavior
+  - `cargo test --workspace -- --test-threads=1` at integration checkpoints
+  - `git diff --check`
+- Update directly related documentation and roadmap evidence to match tested behavior. Keep claims of language, ABI, ISA, firmware, and OS support bounded by verified acceptance coverage.

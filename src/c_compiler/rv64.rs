@@ -2,18 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     CCompilerError, Expression, ExpressionKind, ExternalDeclaration, FunctionDeclaration,
-    Statement, StatementKind, TranslationUnitParser, error, lex_unexpanded, parse_integer_constant,
+    Statement, StatementKind, TranslationUnitParser, error, lex_unexpanded,
 };
 use crate::kiuas16_abi::STACK_ALIGNMENT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Type {
     Int,
+    UInt,
     Long,
+    ULong,
     Byte,
     BytePointer,
     IntPointer,
+    UIntPointer,
     LongPointer,
+    ULongPointer,
     Void,
 }
 
@@ -21,22 +25,58 @@ impl Type {
     fn parse(text: &str) -> Option<Self> {
         Some(match text.split_whitespace().collect::<String>().as_str() {
             "int" | "signed" | "signedint" => Self::Int,
+            "unsigned" | "unsignedint" => Self::UInt,
             "long" | "longint" | "signedlong" | "signedlongint" => Self::Long,
+            "unsignedlong" | "unsignedlongint" | "longunsigned" | "longunsignedint" => Self::ULong,
             "unsignedchar" => Self::Byte,
             "volatileunsignedchar*" | "unsignedvolatilechar*" | "unsignedcharvolatile*" => {
                 Self::BytePointer
             }
             "volatileint*" | "intvolatile*" => Self::IntPointer,
+            "volatileunsigned*"
+            | "volatileunsignedint*"
+            | "unsignedvolatileint*"
+            | "unsignedintvolatile*" => Self::UIntPointer,
             "volatilelong*" | "longvolatile*" | "volatilelongint*" | "longintvolatile*" => {
                 Self::LongPointer
             }
+            "volatileunsignedlong*"
+            | "unsignedvolatilelong*"
+            | "unsignedlongvolatile*"
+            | "volatileunsignedlongint*"
+            | "unsignedlongintvolatile*" => Self::ULongPointer,
             "void" => Self::Void,
             _ => return None,
         })
     }
 
     fn integer(self) -> bool {
-        matches!(self, Self::Int | Self::Long | Self::Byte)
+        matches!(
+            self,
+            Self::Int | Self::UInt | Self::Long | Self::ULong | Self::Byte
+        )
+    }
+
+    fn unsigned(self) -> bool {
+        matches!(self, Self::UInt | Self::ULong | Self::Byte)
+    }
+
+    fn promote(self) -> Self {
+        if self == Self::Byte { Self::Int } else { self }
+    }
+
+    fn common(self, other: Self) -> Self {
+        let left = self.promote();
+        let right = other.promote();
+        if left == Self::ULong || right == Self::ULong {
+            Self::ULong
+        } else if left == Self::Long || right == Self::Long {
+            Self::Long
+        } else if left == Self::UInt || right == Self::UInt {
+            Self::UInt
+        } else {
+            Self::Int
+        }
     }
 
     fn compatible(self, other: Self) -> bool {
@@ -47,10 +87,47 @@ impl Type {
         match self {
             Self::BytePointer => Some(Self::Byte),
             Self::IntPointer => Some(Self::Int),
+            Self::UIntPointer => Some(Self::UInt),
             Self::LongPointer => Some(Self::Long),
+            Self::ULongPointer => Some(Self::ULong),
             _ => None,
         }
     }
+}
+
+fn integer_literal(token: &str) -> Option<(u64, Type)> {
+    let suffix_start = token.find(['u', 'U', 'l', 'L']).unwrap_or(token.len());
+    let (digits, suffix) = token.split_at(suffix_start);
+    let suffix = suffix.to_ascii_lowercase();
+    if !matches!(suffix.as_str(), "" | "u" | "l" | "ul" | "lu") {
+        return None;
+    }
+    let (radix, digits) = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, hex)
+    } else if digits.starts_with('0') {
+        (8, digits)
+    } else {
+        (10, digits)
+    };
+    let number = u64::from_str_radix(digits, radix).ok()?;
+    let candidates: &[Type] = match suffix.as_str() {
+        "ul" | "lu" => &[Type::ULong],
+        "u" => &[Type::UInt, Type::ULong],
+        "l" => &[Type::Long, Type::ULong],
+        _ if radix == 10 => &[Type::Int, Type::Long, Type::ULong],
+        _ => &[Type::Int, Type::UInt, Type::Long, Type::ULong],
+    };
+    let ty = candidates.iter().copied().find(|ty| match ty {
+        Type::Int => number <= i32::MAX as u64,
+        Type::UInt => number <= u32::MAX as u64,
+        Type::Long => number <= i64::MAX as u64,
+        Type::ULong => true,
+        _ => unreachable!("integer literal candidates"),
+    })?;
+    Some((number, ty))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -65,7 +142,7 @@ struct Value {
 }
 
 enum ValueKind {
-    Constant(i64),
+    Constant(u64),
     Local(usize),
     Convert(Box<Value>),
     Unary(String, Box<Value>),
@@ -136,21 +213,16 @@ impl Lower<'_> {
                         ty: *ty,
                         kind: ValueKind::Local(*slot),
                     }
-                } else if let Some(number) = parse_integer_constant(token) {
-                    if token.contains(['u', 'U']) || i32::try_from(number).is_err() {
-                        return Err(self.fail(
-                            line,
-                            "integer literal requires signed 32-bit value in initial RV64 subset",
-                        ));
-                    }
+                } else if let Some((number, ty)) = integer_literal(token) {
                     Value {
-                        ty: if token.contains(['l', 'L']) {
-                            Type::Long
-                        } else {
-                            Type::Int
-                        },
+                        ty,
                         kind: ValueKind::Constant(number),
                     }
+                } else if token.starts_with(|c: char| c.is_ascii_digit()) {
+                    return Err(self.fail(
+                        line,
+                        "invalid or out-of-range LP64 integer literal; supported suffixes are U, L, UL and LU",
+                    ));
                 } else {
                     return Err(
                         self.fail(line, &format!("undefined or unsupported value {token:?}"))
@@ -178,11 +250,7 @@ impl Lower<'_> {
                         kind: ValueKind::Load(Box::new(value)),
                     }
                 } else if matches!(operator.as_str(), "+" | "-" | "~" | "!") && value.ty.integer() {
-                    let ty = if value.ty == Type::Long {
-                        Type::Long
-                    } else {
-                        Type::Int
-                    };
+                    let ty = value.ty.promote();
                     let value = self.convert(value, ty, line)?;
                     Value {
                         ty: if operator == "!" { Type::Int } else { ty },
@@ -199,7 +267,21 @@ impl Lower<'_> {
             } => {
                 if !matches!(
                     operator.as_str(),
-                    "+" | "-" | "*" | "&" | "|" | "^" | "==" | "!=" | "<" | "<=" | ">" | ">="
+                    "+" | "-"
+                        | "*"
+                        | "/"
+                        | "%"
+                        | "<<"
+                        | ">>"
+                        | "&"
+                        | "|"
+                        | "^"
+                        | "=="
+                        | "!="
+                        | "<"
+                        | "<="
+                        | ">"
+                        | ">="
                 ) {
                     return Err(self.fail(line, "unsupported RV64 binary operation"));
                 }
@@ -208,13 +290,15 @@ impl Lower<'_> {
                 if !left.ty.integer() || !right.ty.integer() {
                     return Err(self.fail(line, "RV64 arithmetic requires integer operands"));
                 }
-                let ty = if left.ty == Type::Long || right.ty == Type::Long {
-                    Type::Long
+                let shift = matches!(operator.as_str(), "<<" | ">>");
+                let ty = if shift {
+                    left.ty.promote()
                 } else {
-                    Type::Int
+                    left.ty.common(right.ty)
                 };
+                let right_ty = if shift { right.ty.promote() } else { ty };
                 let left = self.convert(left, ty, line)?;
-                let right = self.convert(right, ty, line)?;
+                let right = self.convert(right, right_ty, line)?;
                 Value {
                     ty: if matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") {
                         Type::Int
@@ -399,14 +483,28 @@ impl Emit {
     fn normalize(&mut self, ty: Type) {
         match ty {
             Type::Int => self.line("addiw a0, a0, 0"),
+            Type::UInt => self.line("slli a0, a0, 32\nsrli a0, a0, 32"),
             Type::Byte => self.line("andi a0, a0, 255"),
             _ => {}
         }
     }
 
+    fn constant(&mut self, number: u64) {
+        if let Ok(value) = i32::try_from(number as i64) {
+            self.line(format!("li a0, {value}"));
+        } else {
+            let low = ((number as i64) << 52) >> 52;
+            self.constant(number.wrapping_sub(low as u64) >> 12);
+            self.line("slli a0, a0, 12");
+            if low != 0 {
+                self.line(format!("addi a0, a0, {low}"));
+            }
+        }
+    }
+
     fn value(&mut self, value: &Value) {
         match &value.kind {
-            ValueKind::Constant(number) => self.line(format!("li a0, {number}")),
+            ValueKind::Constant(number) => self.constant(*number),
             ValueKind::Local(slot) => self.line(format!("ld a0, -{}(s0)", 24 + slot * 8)),
             ValueKind::Convert(inner) => self.value(inner),
             ValueKind::Unary(operator, inner) => {
@@ -427,12 +525,23 @@ impl Emit {
                     "+" => "add a0, t0, a0",
                     "-" => "sub a0, t0, a0",
                     "*" => "mul a0, t0, a0",
+                    "/" if left.ty.unsigned() => "divu a0, t0, a0",
+                    "/" => "div a0, t0, a0",
+                    "%" if left.ty.unsigned() => "remu a0, t0, a0",
+                    "%" => "rem a0, t0, a0",
+                    "<<" => "sll a0, t0, a0",
+                    ">>" if left.ty.unsigned() => "srl a0, t0, a0",
+                    ">>" => "sra a0, t0, a0",
                     "&" => "and a0, t0, a0",
                     "|" => "or a0, t0, a0",
                     "^" => "xor a0, t0, a0",
+                    "<" if left.ty.unsigned() => "sltu a0, t0, a0",
                     "<" => "slt a0, t0, a0",
+                    ">" if left.ty.unsigned() => "sltu a0, a0, t0",
                     ">" => "slt a0, a0, t0",
+                    "<=" if left.ty.unsigned() => "sltu a0, a0, t0\nxori a0, a0, 1",
                     "<=" => "slt a0, a0, t0\nxori a0, a0, 1",
+                    ">=" if left.ty.unsigned() => "sltu a0, t0, a0\nxori a0, a0, 1",
                     ">=" => "slt a0, t0, a0\nxori a0, a0, 1",
                     "==" => "xor a0, t0, a0\nsltiu a0, a0, 1",
                     "!=" => "xor a0, t0, a0\nsltu a0, zero, a0",
@@ -442,6 +551,9 @@ impl Emit {
             ValueKind::Call(name, arguments) => {
                 for argument in arguments {
                     self.value(argument);
+                    if argument.ty == Type::UInt {
+                        self.line("addiw a0, a0, 0");
+                    }
                     self.push();
                 }
                 for index in (0..arguments.len()).rev() {
@@ -454,7 +566,8 @@ impl Emit {
                 self.line(match value.ty {
                     Type::Byte => "lbu a0, 0(a0)",
                     Type::Int => "lw a0, 0(a0)",
-                    Type::Long => "ld a0, 0(a0)",
+                    Type::UInt => "lwu a0, 0(a0)",
+                    Type::Long | Type::ULong => "ld a0, 0(a0)",
                     _ => unreachable!("checked pointee"),
                 });
             }
@@ -470,8 +583,8 @@ impl Emit {
                     self.pop("t0");
                     self.line(match target.ty {
                         Type::Byte => "sb a0, 0(t0)",
-                        Type::Int => "sw a0, 0(t0)",
-                        Type::Long => "sd a0, 0(t0)",
+                        Type::Int | Type::UInt => "sw a0, 0(t0)",
+                        Type::Long | Type::ULong => "sd a0, 0(t0)",
                         _ => unreachable!("checked pointee"),
                     });
                 }
@@ -664,10 +777,11 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         } else if sig.result != Type::Void {
             emit.line("ebreak");
         }
-        emit.line(format!(
-            "{}:\nld ra, -8(s0)\nld t0, -16(s0)\nmv sp, s0\nmv s0, t0\nret",
-            emit.return_label
-        ));
+        emit.line(format!("{}:", emit.return_label));
+        if sig.result == Type::UInt {
+            emit.line("addiw a0, a0, 0");
+        }
+        emit.line("ld ra, -8(s0)\nld t0, -16(s0)\nmv sp, s0\nmv s0, t0\nret");
     }
     Ok(emit.assembly)
 }

@@ -344,20 +344,31 @@ The host neither initializes queues nor performs guest operations on its behalf.
 
 The initial language/backend subset is deliberately bounded:
 
-* Signed 32-bit +int+, signed 64-bit +long+, +unsigned char+, +void+ returns,
-  and pointers to +volatile unsigned char+, +volatile int+, or +volatile long+.
+* Signed/unsigned 32-bit +int+, signed/unsigned 64-bit +long+,
+  +unsigned char+, +void+ returns, and pointers to their volatile integer types.
   Dereferences use byte, word, or doubleword accesses respectively.
-  Integer literals must fit a positive signed 32-bit value, optionally with
-  an +L+ suffix; unary minus supplies negative expressions. Larger +long+
-  values can be formed by supported arithmetic. Unsigned integer suffixes,
+  Decimal, octal, and hexadecimal literals cover the full unsigned 64-bit
+  range, with optional +U+, +L+, +UL+, or +LU+ suffixes (case insensitive).
+  LP64 C90 candidate types determine the first representable type:
+  unsuffixed decimal uses +int/long/unsigned long+; octal/hexadecimal also
+  try +unsigned int+ before +long+. The +U+ suffix tries +unsigned int+ then
+  +unsigned long+, +L+ tries +long+ then +unsigned long+, and +UL/LU+ selects
+  +unsigned long+. Literal typing is target-specific; the legacy SC-16
+  literal parser and its limits are unchanged. Unary minus supplies negative
+  expressions. Overflow, invalid digits/suffixes, +long long+,
   character/string literals, other scalar types, and floating point diagnose.
-* Integer promotions, signed mixed +int/long+ arithmetic, scalar conversions,
+* Integer promotions, LP64 signed/unsigned mixed arithmetic, scalar conversions,
   explicit integer-to-volatile-pointer casts, assignment expressions, direct
   calls, unary +plus/minus/bitwise-not/logical-not+, binary +add/subtract/
-  multiply/bitwise-and/or/xor+, and signed/equality comparisons.
-  Pointer arithmetic/comparisons, pointer-to-integer casts, division,
-  remainder, shifts, short-circuit operators, and increment operators
-  are not yet supported.
+  multiply/divide/remainder/bitwise-and/or/xor+, shifts, and signed/unsigned
+  comparisons. Shifts promote each operand independently and retain the
+  promoted left operand's type; right shift of negative signed values is
+  arithmetic. Unsigned arithmetic wraps at its type's width.
+  Signed narrowing retains low bits and interprets the result as two's
+  complement. Division by zero, signed arithmetic overflow, and negative or
+  out-of-width shift counts have no defined C result and are not runtime-checked.
+  Pointer arithmetic/comparisons, pointer-to-integer casts, short-circuit
+  operators, and increment operators are not yet supported.
 * Automatic scalar locals, nested scopes, compound/expression/return
   statements, +if/else+, and +while+. Each function has at most 120
   parameter/local slots; arrays, globals, records, enums, typedefs, storage
@@ -368,6 +379,9 @@ The initial language/backend subset is deliberately bounded:
   Parameter/return conversions and typed expression temporaries preserve
   values across nested calls. Stack frames and temporary argument slots
   retain 16-byte alignment, with saved +ra/s0+ restored on return.
+  Unsigned 32-bit values are zero-extended internally but sign-extended from
+  bit 31 to XLEN at register argument/return boundaries, as required by the
+  RISC-V integer calling convention; callees normalize incoming parameters.
   Stack arguments, indirect calls, aggregates, and varargs remain unsupported.
 * Preprocessor directives, including includes and macros, are rejected
   before parsing. No legacy header search or legacy target macros are
@@ -385,7 +399,12 @@ an explicit breakpoint instead of inventing a return value. Use the runner's
 checks observable UART/disk bytes and restored registers, and tests invalid
 inputs and CLI output preservation. Independent handwritten RV64 callers and
 callees also check integer register arguments, signed/byte conversions,
-stack alignment, and saved registers against generated functions.
+unsigned 32-bit ABI extension, stack alignment, and saved registers against
+generated functions. Wide literal materialization is checked against
+independently expected host values; unsigned memory stores are checked as
+little-endian RAM bytes. The storage guest uses unsigned MMIO words, direct
+RAM address literals, and a queue-index shift rather than signed-address
+construction workarounds.
 These are initial integer-call fixtures, not complete LP64D certification.
 The backend does not yet consume the aggregate ABI layout model. C source
 diagnostics identify the input file/line; assembly range/ROM overflow errors
