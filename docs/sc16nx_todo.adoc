@@ -574,10 +574,11 @@ compressed control flow and memory, M-extension edge cases, atomic
 operations/reservations, breakpoint, and faults. A privileged slice now
 provides M/S/U state, a bounded Zicsr set with privilege/read-only checks and
 WARL handling, exception delegation/state capture through explicit trap
-delivery, MRET/SRET, ECALL, WFI, and cycle/retirement counters. This does not
-yet route every execution fault automatically, deliver interrupts, protect
-memory with PMP, or implement Sv39, floating point, and the remaining
-architectural behavior. It is not RV64GC and the task remains unchecked.
+delivery, MRET/SRET, ECALL, WFI, and cycle/retirement counters. At this
+checkpoint, execution faults were not yet routed automatically, interrupts
+were not delivered, and PMP and Sv39 were not implemented. Floating point and
+the remaining architectural behavior are still incomplete. It is not RV64GC
+and the task remains unchecked.
 
 ** [ ] [[nx-privilege]] *P0 / Implement M/S/U traps, control state, and PMP.*
    Define exception/interrupt delegation, status/counter access, trap
@@ -596,9 +597,9 @@ and CSR capture through an explicit trap-delivery call, and MRET/SRET
 transitions. The tests cover return-state restoration and privilege/counter
 access gates. The time CSR remains unavailable until virtual time is wired to
 the machine clock. Trap delivery is not yet wired automatically into every
-execution fault; interrupt delivery, full CSR semantics, PMP enforcement,
-memory privilege checks, WFI wakeup, and architectural acceptance fixtures
-remain incomplete. Keep this task unchecked.
+execution fault; interrupt delivery, full CSR semantics, PMP beyond the
+single-entry slice, WFI wakeup, and architectural acceptance fixtures remain
+incomplete. Keep this task unchecked.
 +
 *PMP progress (2026-11-04):* Added the first PMP entry's +pmpcfg0+ and
 +pmpaddr0+ CSR state and OFF/TOR/NA4/NAPOT matching for instruction fetches,
@@ -608,6 +609,19 @@ fault, and locked entries retain their configuration. Tests exercise the
 specified TOR setup, read/write/execute restrictions, partial-match checks,
 and locked-entry behavior. This is only one entry and does not complete the
 PMP acceptance or the privilege task.
+
+*Sv39 progress (2026-11-05):* Added a three-level page-table walker for Sv39
+with canonical-address checks, leaf permission and U/S checks (including SUM
+and MXR), aligned 1 GiB/2 MiB superpages, page-fault causes, and hardware
+accessed/dirty updates when +menvcfg.ADUE+ is enabled. Instruction fetches,
+loads, stores, LR/SC, and AMOs now translate virtual addresses before PMP and
+physical-bus checks; 32-bit instruction fetches translate each halfword
+separately across page boundaries. +sfence.vma+ is accepted as a no-op because
+this implementation has no TLB. Tests cover translated execution, A/D updates,
+invalid and noncanonical addresses, superpages, and privilege permissions.
+MPRV data accesses use the effective MPP privilege. Full privileged-state
+interactions and broader guest-owned address-space tests remain open. Keep the
+task unchecked.
 
 ** [ ] [[nx-sv39]] *P0 / Implement Sv39 translation.*
    Add three-level 64-bit PTEs, canonical addresses, permission/status

@@ -270,14 +270,17 @@ pub const SUPPORTED_EXTENSIONS: &[Extension] = &[
     Extension::I,
     Extension::M,
     Extension::A,
-    Extension::F,
-    Extension::D,
     Extension::C,
     Extension::Zicsr,
     Extension::Zifencei,
 ];
 
-pub const UNSUPPORTED_EXTENSIONS: &[Extension] = &[Extension::Hypervisor, Extension::Vector];
+pub const UNSUPPORTED_EXTENSIONS: &[Extension] = &[
+    Extension::F,
+    Extension::D,
+    Extension::Hypervisor,
+    Extension::Vector,
+];
 
 pub const REQUIRED_PRIVILEGED_FEATURES: &[PrivilegedFeature] = &[
     PrivilegedFeature::Sv39,
@@ -381,6 +384,7 @@ pub const COLD_RESET_STATE: ColdResetState = ColdResetState {
 pub enum CoreTrapCause {
     InstructionAddressMisaligned,
     InstructionAccessFault,
+    InstructionPageFault,
     IllegalInstruction,
     Breakpoint,
     EnvironmentCallFromUser,
@@ -388,8 +392,10 @@ pub enum CoreTrapCause {
     EnvironmentCallFromMachine,
     LoadAddressMisaligned,
     LoadAccessFault,
+    LoadPageFault,
     StoreAddressMisaligned,
     StoreAccessFault,
+    StorePageFault,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -436,11 +442,15 @@ const MSTATUS_SPIE: u64 = 1 << 5;
 const MSTATUS_MPIE: u64 = 1 << 7;
 const MSTATUS_SPP: u64 = 1 << 8;
 const MSTATUS_MPP_MASK: u64 = 0b11 << 11;
+const MSTATUS_MPRV: u64 = 1 << 17;
 const MSTATUS_TVM: u64 = 1 << 20;
-const MSTATUS_SSTATUS_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP;
+const MSTATUS_SUM: u64 = 1 << 18;
+const MSTATUS_MXR: u64 = 1 << 19;
+const MSTATUS_SSTATUS_MASK: u64 =
+    MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR;
 const SSTATUS_MASK: u64 = MSTATUS_SSTATUS_MASK;
 const MSTATUS_WRITABLE_MASK: u64 =
-    MSTATUS_SSTATUS_MASK | MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK;
+    MSTATUS_SSTATUS_MASK | MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_MASK | MSTATUS_MPRV;
 const MIE_MASK: u64 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11);
 const MIP_SOFTWARE: u64 = 1 << 1;
 const MIDELEG_MASK: u64 = (1 << 1) | (1 << 5) | (1 << 9);
@@ -575,6 +585,31 @@ impl Rv64Core {
     }
 
     fn pmp_allows(&self, address: u64, length: u64, access: PhysicalAccess) -> bool {
+        self.pmp_allows_as(self.effective_privilege(access), address, length, access)
+    }
+
+    fn effective_privilege(&self, access: PhysicalAccess) -> PrivilegeMode {
+        if access != PhysicalAccess::Execute
+            && self.privilege == PrivilegeMode::Machine
+            && self.mstatus & MSTATUS_MPRV != 0
+        {
+            match (self.mstatus & MSTATUS_MPP_MASK) >> 11 {
+                0 => PrivilegeMode::User,
+                1 => PrivilegeMode::Supervisor,
+                _ => PrivilegeMode::Machine,
+            }
+        } else {
+            self.privilege
+        }
+    }
+
+    fn pmp_allows_as(
+        &self,
+        privilege: PrivilegeMode,
+        address: u64,
+        length: u64,
+        access: PhysicalAccess,
+    ) -> bool {
         let config = self.pmpcfg0 as u8;
         let address_mode = (config & PMP_A_MASK) >> 3;
         let end = match address.checked_add(length) {
@@ -583,7 +618,7 @@ impl Rv64Core {
         };
         let start = address as u128;
         let (region_start, region_end) = match address_mode {
-            0 => return self.privilege == PrivilegeMode::Machine,
+            0 => return privilege == PrivilegeMode::Machine,
             1 => {
                 let top = (self.pmpaddr0 as u128) << 2;
                 (0, top)
@@ -606,12 +641,12 @@ impl Rv64Core {
             _ => return false,
         };
         if end <= region_start || start >= region_end {
-            return self.privilege == PrivilegeMode::Machine && config & PMP_L == 0;
+            return privilege == PrivilegeMode::Machine && config & PMP_L == 0;
         }
         if start < region_start || end > region_end {
             return false;
         }
-        if self.privilege == PrivilegeMode::Machine && config & PMP_L == 0 {
+        if privilege == PrivilegeMode::Machine && config & PMP_L == 0 {
             return true;
         }
         let required = match access {
@@ -620,6 +655,149 @@ impl Rv64Core {
             PhysicalAccess::Execute => PMP_X,
         };
         config & required != 0
+    }
+
+    fn translate_address(
+        &self,
+        bus: &mut Kiuas16Bus,
+        pc: u64,
+        virtual_address: u64,
+        access: PhysicalAccess,
+    ) -> Result<u64, CoreTrap> {
+        let privilege = self.effective_privilege(access);
+        let page_fault = match access {
+            PhysicalAccess::Execute => CoreTrapCause::InstructionPageFault,
+            PhysicalAccess::Read => CoreTrapCause::LoadPageFault,
+            PhysicalAccess::Write => CoreTrapCause::StorePageFault,
+        };
+        let fault = || CoreTrap {
+            pc,
+            cause: page_fault,
+            value: virtual_address,
+        };
+        if privilege == PrivilegeMode::Machine || self.satp >> 60 == 0 {
+            return Ok(virtual_address);
+        }
+        if self.satp >> 60 != 8
+            || (((virtual_address << 25) as i64 >> 25) as u64) != virtual_address
+        {
+            return Err(fault());
+        }
+
+        let vpn = [
+            (virtual_address >> 12) & 0x1ff,
+            (virtual_address >> 21) & 0x1ff,
+            (virtual_address >> 30) & 0x1ff,
+        ];
+        let mut table = (self.satp & ((1u64 << 44) - 1)) << 12;
+        for level in (0..=2).rev() {
+            let pte_address = table + vpn[level] * 8;
+            if !self.pmp_allows_as(privilege, pte_address, 8, PhysicalAccess::Read) {
+                return Err(CoreTrap {
+                    pc,
+                    cause: match access {
+                        PhysicalAccess::Execute => CoreTrapCause::InstructionAccessFault,
+                        PhysicalAccess::Read => CoreTrapCause::LoadAccessFault,
+                        PhysicalAccess::Write => CoreTrapCause::StoreAccessFault,
+                    },
+                    value: virtual_address,
+                });
+            }
+            let mut pte_bytes = [0; 8];
+            bus.read(pte_address, &mut pte_bytes)
+                .map_err(|_| CoreTrap {
+                    pc,
+                    cause: match access {
+                        PhysicalAccess::Execute => CoreTrapCause::InstructionAccessFault,
+                        PhysicalAccess::Read => CoreTrapCause::LoadAccessFault,
+                        PhysicalAccess::Write => CoreTrapCause::StoreAccessFault,
+                    },
+                    value: virtual_address,
+                })?;
+            let mut pte = u64::from_le_bytes(pte_bytes);
+            let valid = pte & 1 != 0;
+            let readable = pte & 2 != 0;
+            let writable = pte & 4 != 0;
+            let executable = pte & 8 != 0;
+            if !valid || (writable && !readable) || pte >> 54 != 0 {
+                return Err(fault());
+            }
+            if readable || executable {
+                let user_page = pte & (1 << 4) != 0;
+                let permitted = match (privilege, user_page, access) {
+                    (PrivilegeMode::User, true, PhysicalAccess::Read) => {
+                        readable || (self.mstatus & MSTATUS_MXR != 0 && executable)
+                    }
+                    (PrivilegeMode::User, true, PhysicalAccess::Write) => writable,
+                    (PrivilegeMode::User, true, PhysicalAccess::Execute) => executable,
+                    (PrivilegeMode::Supervisor, false, PhysicalAccess::Read) => {
+                        readable || (self.mstatus & MSTATUS_MXR != 0 && executable)
+                    }
+                    (PrivilegeMode::Supervisor, false, PhysicalAccess::Write) => writable,
+                    (PrivilegeMode::Supervisor, false, PhysicalAccess::Execute) => executable,
+                    (PrivilegeMode::Supervisor, true, PhysicalAccess::Read) => {
+                        self.mstatus & MSTATUS_SUM != 0
+                            && (readable || (self.mstatus & MSTATUS_MXR != 0 && executable))
+                    }
+                    (PrivilegeMode::Supervisor, true, PhysicalAccess::Write) => {
+                        self.mstatus & MSTATUS_SUM != 0 && writable
+                    }
+                    _ => false,
+                };
+                let lower_ppn_bits = level * 9;
+                let ppn = (pte >> 10) & ((1u64 << 44) - 1);
+                if !permitted || (lower_ppn_bits != 0 && ppn & ((1u64 << lower_ppn_bits) - 1) != 0)
+                {
+                    return Err(fault());
+                }
+                let required_ad = (1 << 6)
+                    | if access == PhysicalAccess::Write {
+                        1 << 7
+                    } else {
+                        0
+                    };
+                if pte & required_ad != required_ad {
+                    if self.menvcfg & (1 << 61) == 0 {
+                        return Err(fault());
+                    }
+                    pte |= required_ad;
+                    if !self.pmp_allows_as(privilege, pte_address, 8, PhysicalAccess::Write) {
+                        return Err(CoreTrap {
+                            pc,
+                            cause: match access {
+                                PhysicalAccess::Execute => CoreTrapCause::InstructionAccessFault,
+                                PhysicalAccess::Read => CoreTrapCause::LoadAccessFault,
+                                PhysicalAccess::Write => CoreTrapCause::StoreAccessFault,
+                            },
+                            value: virtual_address,
+                        });
+                    }
+                    bus.write(pte_address, &pte.to_le_bytes())
+                        .map_err(|_| CoreTrap {
+                            pc,
+                            cause: match access {
+                                PhysicalAccess::Execute => CoreTrapCause::InstructionAccessFault,
+                                PhysicalAccess::Read => CoreTrapCause::LoadAccessFault,
+                                PhysicalAccess::Write => CoreTrapCause::StoreAccessFault,
+                            },
+                            value: virtual_address,
+                        })?;
+                }
+                let page_offset = virtual_address & 0xfff;
+                let vpn_mask = if lower_ppn_bits == 0 {
+                    0
+                } else {
+                    (1u64 << lower_ppn_bits) - 1
+                };
+                let physical_ppn = (ppn & !vpn_mask) | ((virtual_address >> 12) & vpn_mask);
+                return Ok((physical_ppn << 12) | page_offset);
+            }
+            if level == 0 || pte & ((1 << 4) | (1 << 6) | (1 << 7)) != 0 {
+                return Err(fault());
+            }
+            table = ((pte >> 10) & ((1u64 << 44) - 1)) << 12;
+        }
+        Err(fault())
     }
 
     pub const fn cold_reset() -> Self {
@@ -723,35 +901,53 @@ impl Rv64Core {
             });
         }
 
+        let physical_pc = self.translate_address(bus, pc, pc, PhysicalAccess::Execute)?;
         let mut halfword = [0; 2];
-        if !self.pmp_allows(pc, 2, PhysicalAccess::Execute) {
+        if !self.pmp_allows(physical_pc, 2, PhysicalAccess::Execute) {
             return Err(CoreTrap {
                 pc,
                 cause: CoreTrapCause::InstructionAccessFault,
                 value: pc,
             });
         }
-        bus.fetch(pc, &mut halfword).map_err(|_| CoreTrap {
-            pc,
-            cause: CoreTrapCause::InstructionAccessFault,
-            value: pc,
-        })?;
-        let halfword = u16::from_le_bytes(halfword);
-        let (instruction, instruction_length) = if halfword & 0b11 == 0b11 {
-            if !self.pmp_allows(pc, 4, PhysicalAccess::Execute) {
-                return Err(CoreTrap {
-                    pc,
-                    cause: CoreTrapCause::InstructionAccessFault,
-                    value: pc,
-                });
-            }
-            let mut bytes = [0; 4];
-            bus.fetch(pc, &mut bytes).map_err(|_| CoreTrap {
+        bus.fetch(physical_pc, &mut halfword)
+            .map_err(|_| CoreTrap {
                 pc,
                 cause: CoreTrapCause::InstructionAccessFault,
                 value: pc,
             })?;
-            (u32::from_le_bytes(bytes), 4)
+        let halfword = u16::from_le_bytes(halfword);
+        let (instruction, instruction_length) = if halfword & 0b11 == 0b11 {
+            let second_pc = pc.checked_add(2).ok_or(CoreTrap {
+                pc,
+                cause: CoreTrapCause::InstructionAccessFault,
+                value: pc,
+            })?;
+            let physical_second_pc =
+                self.translate_address(bus, pc, second_pc, PhysicalAccess::Execute)?;
+            if !self.pmp_allows(physical_second_pc, 2, PhysicalAccess::Execute) {
+                return Err(CoreTrap {
+                    pc,
+                    cause: CoreTrapCause::InstructionAccessFault,
+                    value: second_pc,
+                });
+            }
+            let mut second_halfword = [0; 2];
+            bus.fetch(physical_second_pc, &mut second_halfword)
+                .map_err(|_| CoreTrap {
+                    pc,
+                    cause: CoreTrapCause::InstructionAccessFault,
+                    value: second_pc,
+                })?;
+            (
+                u32::from_le_bytes([
+                    halfword as u8,
+                    (halfword >> 8) as u8,
+                    second_halfword[0],
+                    second_halfword[1],
+                ]),
+                4,
+            )
         } else {
             let instruction = decompress_rv64c(halfword).ok_or(CoreTrap {
                 pc,
@@ -816,6 +1012,9 @@ impl Rv64Core {
                         0
                     }
                     | MSTATUS_MPIE;
+                if target_privilege != PrivilegeMode::Machine {
+                    self.mstatus &= !MSTATUS_MPRV;
+                }
                 self.privilege = target_privilege;
                 next_pc = self.mepc;
             }
@@ -837,6 +1036,14 @@ impl Rv64Core {
                     | MSTATUS_SPIE;
                 self.privilege = target_privilege;
                 next_pc = self.sepc;
+            }
+            0x73 if instruction & 0xfe00_7fff == 0x1200_0073 => {
+                if self.privilege == PrivilegeMode::User
+                    || (self.privilege == PrivilegeMode::Supervisor
+                        && self.mstatus & MSTATUS_TVM != 0)
+                {
+                    return Err(illegal_instruction(pc, instruction));
+                }
             }
             0x73 if instruction == 0x1050_0073 => {}
             0x73 if funct3 != 0 => {
@@ -878,7 +1085,9 @@ impl Rv64Core {
                         value: address,
                     });
                 }
-                if !self.pmp_allows(address, length, PhysicalAccess::Read) {
+                let physical_address =
+                    self.translate_address(bus, pc, address, PhysicalAccess::Read)?;
+                if !self.pmp_allows(physical_address, length, PhysicalAccess::Read) {
                     return Err(CoreTrap {
                         pc,
                         cause: CoreTrapCause::LoadAccessFault,
@@ -886,7 +1095,7 @@ impl Rv64Core {
                     });
                 }
                 let mut data = [0; 8];
-                bus.read(address, &mut data[..length as usize])
+                bus.read(physical_address, &mut data[..length as usize])
                     .map_err(|_| CoreTrap {
                         pc,
                         cause: CoreTrapCause::LoadAccessFault,
@@ -920,14 +1129,16 @@ impl Rv64Core {
                         value: address,
                     });
                 }
-                if !self.pmp_allows(address, length, PhysicalAccess::Write) {
+                let physical_address =
+                    self.translate_address(bus, pc, address, PhysicalAccess::Write)?;
+                if !self.pmp_allows(physical_address, length, PhysicalAccess::Write) {
                     return Err(CoreTrap {
                         pc,
                         cause: CoreTrapCause::StoreAccessFault,
                         value: address,
                     });
                 }
-                bus.write(address, &right.to_le_bytes()[..length as usize])
+                bus.write(physical_address, &right.to_le_bytes()[..length as usize])
                     .map_err(|_| CoreTrap {
                         pc,
                         cause: CoreTrapCause::StoreAccessFault,
@@ -960,10 +1171,11 @@ impl Rv64Core {
                 } else {
                     PhysicalAccess::Write
                 };
-                if !self.pmp_allows(address, length, access)
+                let physical_address = self.translate_address(bus, pc, address, access)?;
+                if !self.pmp_allows(physical_address, length, access)
                     || (access == PhysicalAccess::Write
                         && operation != 0b00011
-                        && !self.pmp_allows(address, length, PhysicalAccess::Read))
+                        && !self.pmp_allows(physical_address, length, PhysicalAccess::Read))
                 {
                     return Err(CoreTrap {
                         pc,
@@ -979,7 +1191,7 @@ impl Rv64Core {
                 match operation {
                     0b00010 if rs2 == 0 => {
                         let region = bus
-                            .check_access(address, length, PhysicalAccess::Read)
+                            .check_access(physical_address, length, PhysicalAccess::Read)
                             .map_err(|_| CoreTrap {
                                 pc,
                                 cause: CoreTrapCause::LoadAccessFault,
@@ -992,13 +1204,13 @@ impl Rv64Core {
                                 value: address,
                             });
                         }
-                        bus.read(address, &mut data[..length as usize])
+                        bus.read(physical_address, &mut data[..length as usize])
                             .map_err(|_| CoreTrap {
                                 pc,
                                 cause: CoreTrapCause::LoadAccessFault,
                                 value: address,
                             })?;
-                        self.reservation = Some((address, length as u8, bus.write_epoch));
+                        self.reservation = Some((physical_address, length as u8, bus.write_epoch));
                         let old = u64::from_le_bytes(data);
                         result = Some(if length == 4 {
                             old as u32 as i32 as i64 as u64
@@ -1008,7 +1220,7 @@ impl Rv64Core {
                     }
                     0b00011 => {
                         let region = bus
-                            .check_access(address, length, PhysicalAccess::Write)
+                            .check_access(physical_address, length, PhysicalAccess::Write)
                             .map_err(|_| CoreTrap {
                                 pc,
                                 cause: CoreTrapCause::StoreAccessFault,
@@ -1022,9 +1234,10 @@ impl Rv64Core {
                             });
                         }
                         let reserved = self.reservation.take();
-                        let succeeded = reserved == Some((address, length as u8, bus.write_epoch));
+                        let succeeded =
+                            reserved == Some((physical_address, length as u8, bus.write_epoch));
                         if succeeded {
-                            bus.write(address, &right.to_le_bytes()[..length as usize])
+                            bus.write(physical_address, &right.to_le_bytes()[..length as usize])
                                 .map_err(|_| CoreTrap {
                                     pc,
                                     cause: CoreTrapCause::StoreAccessFault,
@@ -1036,7 +1249,7 @@ impl Rv64Core {
                     0b00001 | 0b00000 | 0b00100 | 0b01100 | 0b01000 | 0b10000 | 0b10100
                     | 0b11000 | 0b11100 => {
                         let region = bus
-                            .check_access(address, length, PhysicalAccess::Write)
+                            .check_access(physical_address, length, PhysicalAccess::Write)
                             .map_err(|_| CoreTrap {
                                 pc,
                                 cause: CoreTrapCause::StoreAccessFault,
@@ -1049,7 +1262,7 @@ impl Rv64Core {
                                 value: address,
                             });
                         }
-                        bus.read(address, &mut data[..length as usize])
+                        bus.read(physical_address, &mut data[..length as usize])
                             .map_err(|_| CoreTrap {
                                 pc,
                                 cause: CoreTrapCause::LoadAccessFault,
@@ -1101,7 +1314,7 @@ impl Rv64Core {
                             0b11100 => old_width.max(operand),
                             _ => return Err(illegal_instruction(pc, instruction)),
                         };
-                        bus.write(address, &new.to_le_bytes()[..length as usize])
+                        bus.write(physical_address, &new.to_le_bytes()[..length as usize])
                             .map_err(|_| CoreTrap {
                                 pc,
                                 cause: CoreTrapCause::StoreAccessFault,
@@ -1490,12 +1703,15 @@ fn exception_code(cause: CoreTrapCause) -> Option<u64> {
     Some(match cause {
         CoreTrapCause::InstructionAddressMisaligned => 0,
         CoreTrapCause::InstructionAccessFault => 1,
+        CoreTrapCause::InstructionPageFault => 12,
         CoreTrapCause::IllegalInstruction => 2,
         CoreTrapCause::Breakpoint => 3,
         CoreTrapCause::LoadAddressMisaligned => 4,
         CoreTrapCause::LoadAccessFault => 5,
+        CoreTrapCause::LoadPageFault => 13,
         CoreTrapCause::StoreAddressMisaligned => 6,
         CoreTrapCause::StoreAccessFault => 7,
+        CoreTrapCause::StorePageFault => 15,
         CoreTrapCause::EnvironmentCallFromUser => 8,
         CoreTrapCause::EnvironmentCallFromSupervisor => 9,
         CoreTrapCause::EnvironmentCallFromMachine => 11,
@@ -1533,8 +1749,6 @@ mod tests {
             Extension::I,
             Extension::M,
             Extension::A,
-            Extension::F,
-            Extension::D,
             Extension::C,
             Extension::Zicsr,
             Extension::Zifencei,
@@ -1543,7 +1757,12 @@ mod tests {
         }
         assert_eq!(
             XV6_PROFILE.unsupported_extensions,
-            &[Extension::Hypervisor, Extension::Vector]
+            &[
+                Extension::F,
+                Extension::D,
+                Extension::Hypervisor,
+                Extension::Vector
+            ]
         );
         assert_eq!(
             XV6_PROFILE.required_privileged_features,
@@ -1593,6 +1812,35 @@ mod tests {
     fn allow_full_physical_range(core: &mut Rv64Core) {
         core.pmpaddr0 = (1 << (PHYSICAL_ADDRESS_BITS - 2)) - 1;
         core.pmpcfg0 = 0x1f;
+    }
+
+    fn install_sv39_mapping(
+        bus: &mut Kiuas16Bus,
+        root: u64,
+        virtual_address: u64,
+        physical_address: u64,
+        flags: u64,
+    ) {
+        let vpn = [
+            (virtual_address >> 12) & 0x1ff,
+            (virtual_address >> 21) & 0x1ff,
+            (virtual_address >> 30) & 0x1ff,
+        ];
+        let level1 = root + 0x1000;
+        let level0 = root + 0x2000;
+        for (address, ppn) in [
+            (root + vpn[2] * 8, level1 >> 12),
+            (level1 + vpn[1] * 8, level0 >> 12),
+            (level0 + vpn[0] * 8, physical_address >> 12),
+        ] {
+            let pte = (ppn << 10)
+                | if address == level0 + vpn[0] * 8 {
+                    flags
+                } else {
+                    1
+                };
+            bus.write(address, &pte.to_le_bytes()).unwrap();
+        }
     }
 
     #[test]
@@ -2022,6 +2270,172 @@ mod tests {
     }
 
     #[test]
+    fn rv64_sv39_executes_mapped_code_and_updates_accessed_dirty_bits() {
+        let mut bus = bus_with_program_and_ram_size(&[], 0x5000);
+        let root = RAM.start;
+        let code = RAM.start + 0x3000;
+        let va = 0x4000;
+        let instructions = [0x1002_b303u32, 0x1062_b423];
+        bus.write(code, &instructions[0].to_le_bytes()).unwrap();
+        bus.write(code + 4, &instructions[1].to_le_bytes()).unwrap();
+        bus.write(code + 0x100, &0x1234_5678_9abc_def0u64.to_le_bytes())
+            .unwrap();
+        install_sv39_mapping(&mut bus, root, va, code, 0b1_1111);
+
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::User;
+        core.pc = va;
+        core.integer_registers[5] = va;
+        core.satp = (8 << 60) | (root >> 12);
+        core.menvcfg = 1 << 61;
+
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.register(6), Some(0x1234_5678_9abc_def0));
+        core.step(&mut bus).unwrap();
+        let pte_address = root + 0x2000 + ((va >> 12) & 0x1ff) * 8;
+        let mut pte = [0; 8];
+        bus.read(pte_address, &mut pte).unwrap();
+        assert_eq!(u64::from_le_bytes(pte) & (1 << 6), 1 << 6);
+        assert_eq!(u64::from_le_bytes(pte) & (1 << 7), 1 << 7);
+        let mut stored = [0; 8];
+        bus.read(code + 0x108, &mut stored).unwrap();
+        assert_eq!(u64::from_le_bytes(stored), 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn rv64_sv39_reports_invalid_and_noncanonical_addresses_as_page_faults() {
+        let mut bus = bus_with_program_and_ram_size(&[], 0x4000);
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::User;
+        core.satp = (8 << 60) | (RAM.start >> 12);
+        core.pc = 0x4000;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::InstructionPageFault);
+        assert_eq!(trap.value, 0x4000);
+
+        let noncanonical = 1 << 39;
+        assert_eq!(
+            core.translate_address(&mut bus, core.pc, noncanonical, PhysicalAccess::Read)
+                .unwrap_err()
+                .cause,
+            CoreTrapCause::LoadPageFault
+        );
+    }
+
+    #[test]
+    fn rv64_sv39_enforces_store_permissions_and_supervisor_user_access_rules() {
+        let mut bus = bus_with_program_and_ram_size(&[], 0x5000);
+        let root = RAM.start;
+        let va = 0x4000;
+        let pa = RAM.start + 0x3000;
+        install_sv39_mapping(&mut bus, root, va, pa, 0b1_1011);
+
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::Supervisor;
+        core.satp = (8 << 60) | (root >> 12);
+        core.menvcfg = 1 << 61;
+        assert_eq!(
+            core.translate_address(&mut bus, 0, va, PhysicalAccess::Read)
+                .unwrap_err()
+                .cause,
+            CoreTrapCause::LoadPageFault
+        );
+        core.mstatus |= MSTATUS_SUM;
+        assert_eq!(
+            core.translate_address(&mut bus, 0, va, PhysicalAccess::Read)
+                .unwrap(),
+            pa
+        );
+        assert_eq!(
+            core.translate_address(&mut bus, 0, va, PhysicalAccess::Write)
+                .unwrap_err()
+                .cause,
+            CoreTrapCause::StorePageFault
+        );
+        core.privilege = PrivilegeMode::Machine;
+        core.mstatus = MSTATUS_MPRV | MSTATUS_SUM | (1 << 11);
+        assert_eq!(
+            core.translate_address(&mut bus, 0, va, PhysicalAccess::Read)
+                .unwrap(),
+            pa
+        );
+        core.mstatus = 0;
+        assert_eq!(
+            core.translate_address(&mut bus, 0, va, PhysicalAccess::Read)
+                .unwrap(),
+            va
+        );
+    }
+
+    #[test]
+    fn rv64_sv39_supports_aligned_superpages_and_rejects_misaligned_ones() {
+        let mut bus = bus_with_program_and_ram_size(&[], 0x5000);
+        let root = RAM.start;
+        let level1 = root + 0x1000;
+        let va = 0x4000;
+        let root_pte = ((level1 >> 12) << 10) | 1;
+        let superpage_pte = ((RAM.start >> 12) << 10) | 0b1100_1011;
+        bus.write(root, &root_pte.to_le_bytes()).unwrap();
+        bus.write(level1, &superpage_pte.to_le_bytes()).unwrap();
+
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::Supervisor;
+        core.satp = (8 << 60) | (root >> 12);
+        core.menvcfg = 1 << 61;
+        assert_eq!(
+            core.translate_address(&mut bus, 0, va, PhysicalAccess::Read)
+                .unwrap(),
+            RAM.start + va
+        );
+
+        let misaligned_superpage_pte = superpage_pte | (1 << 10);
+        bus.write(level1, &misaligned_superpage_pte.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            core.translate_address(&mut bus, 0, va, PhysicalAccess::Read)
+                .unwrap_err()
+                .cause,
+            CoreTrapCause::LoadPageFault
+        );
+    }
+
+    #[test]
+    fn rv64_sv39_fetches_across_pages_and_faults_on_an_unmapped_second_half() {
+        let mut bus = bus_with_program_and_ram_size(&[], 0x6000);
+        let root = RAM.start;
+        let first_page = RAM.start + 0x3000;
+        let second_page = RAM.start + 0x4000;
+        let first_va = 0x4000;
+        let second_va = 0x5000;
+        let crossing_pc = second_va - 2;
+        install_sv39_mapping(&mut bus, root, first_va, first_page, 0b1_1001);
+        install_sv39_mapping(&mut bus, root, second_va, second_page, 0b1_1001);
+        bus.write(first_page + 0xffe, &0x0013u16.to_le_bytes())
+            .unwrap();
+        bus.write(second_page, &0u16.to_le_bytes()).unwrap();
+
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::User;
+        core.pc = crossing_pc;
+        core.satp = (8 << 60) | (root >> 12);
+        core.menvcfg = 1 << 61;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.pc, crossing_pc + 4);
+
+        let second_leaf = root + 0x2000 + ((second_va >> 12) & 0x1ff) * 8;
+        bus.write(second_leaf, &0u64.to_le_bytes()).unwrap();
+        core.pc = crossing_pc;
+        let trap = core.step(&mut bus).unwrap_err();
+        assert_eq!(trap.cause, CoreTrapCause::InstructionPageFault);
+        assert_eq!(trap.value, second_va);
+    }
+
+    #[test]
     fn rv64_core_delivers_machine_traps_and_executes_mret() {
         let mut bus = bus_with_program(&[0x3020_0073]);
         let mut core = Rv64Core::cold_reset();
@@ -2051,6 +2465,12 @@ mod tests {
         assert_ne!(core.mstatus & MSTATUS_MIE, 0);
         assert_ne!(core.mstatus & MSTATUS_MPIE, 0);
         assert_eq!(core.mstatus & MSTATUS_MPP_MASK, 0);
+
+        core.mstatus = (core.mstatus & !MSTATUS_MPP_MASK) | (1 << 11) | MSTATUS_MPRV;
+        core.pc = BOOT_ROM.start;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.privilege(), PrivilegeMode::Supervisor);
+        assert_eq!(core.mstatus & MSTATUS_MPRV, 0);
     }
 
     #[test]
