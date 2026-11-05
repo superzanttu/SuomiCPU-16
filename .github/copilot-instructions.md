@@ -27,3 +27,12 @@
   - `cargo test --workspace -- --test-threads=1` at integration checkpoints
   - `git diff --check`
 - Update directly related documentation and roadmap evidence to match tested behavior. Keep claims of language, ABI, ISA, firmware, and OS support bounded by verified acceptance coverage.
+
+## Efficient Copilot use
+
+- Reduce unnecessary context and repeated work, not correctness or required validation. These practices cannot guarantee a particular credit cost.
+- Search narrowly, read relevant file ranges, and reuse findings already established in the current task. Avoid dumping large files, logs, or diffs; retrieve only the details needed for the next decision.
+- Handle small tasks directly. Use subagents only for substantial independent work that benefits from separate context; give bounded objectives and avoid duplicated investigation or review.
+- Batch independent reads and related test selectors. Start with the smallest tests covering the change; run broader suites at integration checkpoints or when targeted failures require them. Documentation-only edits need no build unless documentation tooling requires it.
+- Prefer existing helpers and a complete, focused implementation over speculative abstractions, unrelated cleanup, or repeated planning. Keep progress updates and final summaries brief.
+- Do not assume a model is cheaper or change models automatically. Respect the user's selected model and configured subagent defaults; discuss model trade-offs only when requested.
