@@ -200,9 +200,28 @@ S/U counter-enable checks, and derives the supervisor timer-pending bit from
 access. The physical bus also contains an initial Vihta PLIC slice with 31
 external sources, machine/supervisor contexts, 32-bit priority/pending/enable/
 threshold/claim/complete registers, and level reassertion after completion.
-Its context outputs feed the core's external interrupt pending state. Board
-devices do not yet drive these sources, and the PLIC and timer are not
-integrated into a complete machine runtime or shared device clock.
+Its context outputs feed the core's external interrupt pending state. Höyry
+drives source 10; the other board-device sources are not wired yet. The
+PLIC and timer are not integrated into a complete machine runtime or shared
+device clock.
+
+== Höyry UART
+
+Höyry occupies +0x10000000..0x10001000+, with byte accesses to registers
+0 through 7; other widths and offsets fault. Register 0/1 use the divisor
+latch when +LCR.DLAB+ is set, otherwise they are receive/transmit data and
+interrupt enable. RX uses a bounded 16-byte FIFO when enabled and a one-byte
+holding register otherwise. +FCR+ configures 1/4/8/14-byte receive interrupt
+thresholds and can clear the receive FIFO. +LSR+ reports data-ready, overrun,
+and transmitter-empty status; +IIR+ reports line-status, receive, THRE, and
+modem-status interrupt causes. MCR loopback connects modem outputs and routes
+transmit bytes back to the receive FIFO. A device reset clears volatile UART
+state and deasserts its interrupt line. Host-injected input is available
+through the bus API, and transmitted bytes are collected for headless tests.
+
+The UART interrupt output drives Vihta source 10. TX completes immediately;
+divisor-based baud timing, full modem/line behavior, windowed/runtime adapter
+integration, and pinned xv6-driver acceptance are not implemented yet.
 
 == Limits and conformance
 

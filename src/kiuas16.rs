@@ -292,6 +292,7 @@ struct Uart16550 {
     fifo_control: u8,
     line_control: u8,
     modem_control: u8,
+    modem_status: u8,
     scratch: u8,
     divisor_latch: u16,
     line_status_errors: u8,
@@ -309,6 +310,7 @@ impl Uart16550 {
             fifo_control: 0,
             line_control: 0,
             modem_control: 0,
+            modem_status: 0,
             scratch: 0,
             divisor_latch: 0,
             line_status_errors: 0,
@@ -336,7 +338,11 @@ impl Uart16550 {
                 self.line_status_errors = 0;
                 status
             }
-            6 => 0,
+            6 => {
+                let status = self.modem_status;
+                self.modem_status &= 0xf0;
+                status
+            }
             7 => self.scratch,
             _ => return Err(PhysicalAccessError::InvalidDeviceAccess),
         };
@@ -349,12 +355,15 @@ impl Uart16550 {
                 self.divisor_latch = (self.divisor_latch & 0xff00) | u16::from(value);
             }
             0 => {
-                self.transmit_output.push(value);
                 self.thre_interrupt_pending = true;
+                if self.modem_control & 0x10 != 0 {
+                    self.receive(&[value]);
+                } else {
+                    self.transmit_output.push(value);
+                }
             }
             1 if self.line_control & 0x80 != 0 => {
-                self.divisor_latch =
-                    (self.divisor_latch & 0x00ff) | (u16::from(value) << 8);
+                self.divisor_latch = (self.divisor_latch & 0x00ff) | (u16::from(value) << 8);
             }
             1 => {
                 let previous = self.interrupt_enable;
@@ -374,7 +383,10 @@ impl Uart16550 {
                 }
             }
             3 => self.line_control = value,
-            4 => self.modem_control = value & 0x1f,
+            4 => {
+                self.modem_control = value & 0x1f;
+                self.update_loopback_modem_status();
+            }
             7 => self.scratch = value,
             _ => return Err(PhysicalAccessError::InvalidDeviceAccess),
         }
@@ -389,7 +401,7 @@ impl Uart16550 {
         };
         let mut accepted = 0;
         for &byte in input {
-            if self.receive_fifo.len() == capacity {
+            if self.receive_fifo.len() >= capacity {
                 self.line_status_errors |= 0x02;
             } else {
                 self.receive_fifo.push_back(byte);
@@ -401,6 +413,40 @@ impl Uart16550 {
 
     fn take_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.transmit_output)
+    }
+
+    fn reset(&mut self) {
+        let output = self.take_output();
+        *self = Self::new();
+        self.transmit_output = output;
+    }
+
+    fn update_loopback_modem_status(&mut self) {
+        let previous = (self.modem_status >> 4) & 0x0f;
+        let current = if self.modem_control & 0x10 != 0 {
+            ((self.modem_control & 0x02) << 3)
+                | ((self.modem_control & 0x01) << 5)
+                | ((self.modem_control & 0x04) << 4)
+                | ((self.modem_control & 0x08) << 4)
+        } else {
+            0
+        };
+        let current = (current >> 4) & 0x0f;
+        let changed = previous ^ current;
+        let mut delta = self.modem_status & 0x0f;
+        if changed & 0x01 != 0 {
+            delta |= 0x01;
+        }
+        if changed & 0x02 != 0 {
+            delta |= 0x02;
+        }
+        if previous & 0x04 != 0 && current & 0x04 == 0 {
+            delta |= 0x04;
+        }
+        if changed & 0x08 != 0 {
+            delta |= 0x08;
+        }
+        self.modem_status = (current << 4) | delta;
     }
 
     fn line_status(&self) -> u8 {
@@ -421,12 +467,12 @@ impl Uart16550 {
         };
         let cause = if self.interrupt_enable & 0x04 != 0 && self.line_status_errors != 0 {
             0x06
-        } else if self.interrupt_enable & 0x01 != 0
-            && self.receive_fifo.len() >= receive_trigger
-        {
+        } else if self.interrupt_enable & 0x01 != 0 && self.receive_fifo.len() >= receive_trigger {
             0x04
         } else if self.interrupt_enable & 0x02 != 0 && self.thre_interrupt_pending {
             0x02
+        } else if self.interrupt_enable & 0x08 != 0 && self.modem_status & 0x0f != 0 {
+            0x00
         } else {
             0x01
         };
@@ -515,12 +561,10 @@ impl Kiuas16Bus {
             if length != 1 {
                 return Err(PhysicalAccessError::InvalidDeviceAccess);
             }
-            self.uart
-                .write_register(address - UART.start, data[0])?;
-            return self.plic.set_source_level(
-                UART_PLIC_SOURCE,
-                self.uart.interrupt_asserted(),
-            );
+            self.uart.write_register(address - UART.start, data[0])?;
+            return self
+                .plic
+                .set_source_level(UART_PLIC_SOURCE, self.uart.interrupt_asserted());
         }
         if region != PhysicalRegion::Ram {
             return Err(PhysicalAccessError::DeviceNotImplemented);
@@ -557,10 +601,9 @@ impl Kiuas16Bus {
                 return Err(PhysicalAccessError::InvalidDeviceAccess);
             }
             output[0] = self.uart.read_register(address - UART.start)?;
-            return self.plic.set_source_level(
-                UART_PLIC_SOURCE,
-                self.uart.interrupt_asserted(),
-            );
+            return self
+                .plic
+                .set_source_level(UART_PLIC_SOURCE, self.uart.interrupt_asserted());
         }
         self.transfer_backed(address, output, region)
     }
@@ -600,10 +643,7 @@ impl Kiuas16Bus {
         self.plic.interrupt_pending(context)
     }
 
-    pub fn receive_uart_input(
-        &mut self,
-        input: &[u8],
-    ) -> Result<usize, PhysicalAccessError> {
+    pub fn receive_uart_input(&mut self, input: &[u8]) -> Result<usize, PhysicalAccessError> {
         let accepted = self.uart.receive(input);
         self.plic
             .set_source_level(UART_PLIC_SOURCE, self.uart.interrupt_asserted())?;
@@ -612,6 +652,11 @@ impl Kiuas16Bus {
 
     pub fn take_uart_output(&mut self) -> Vec<u8> {
         self.uart.take_output()
+    }
+
+    pub fn reset_uart(&mut self) -> Result<(), PhysicalAccessError> {
+        self.uart.reset();
+        self.plic.set_source_level(UART_PLIC_SOURCE, false)
     }
 
     fn check_access(
@@ -3266,7 +3311,16 @@ mod tests {
         assert_eq!(value[0], 0x12);
 
         bus.write(register(3), &[0x03]).unwrap();
+        bus.write(register(1), &[0x02]).unwrap();
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0] & 0x0f, 0x02);
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0] & 0x0f, 0x01);
         bus.write(register(0), b"X").unwrap();
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0] & 0x0f, 0x02);
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0] & 0x0f, 0x01);
         assert_eq!(bus.take_uart_output(), b"X");
         bus.read(register(5), &mut value).unwrap();
         assert_eq!(value[0] & 0x60, 0x60);
@@ -3315,16 +3369,61 @@ mod tests {
         assert_eq!(bus.receive_uart_input(&[0; 17]).unwrap(), 16);
         bus.read(register(5), &mut value).unwrap();
         assert_ne!(value[0] & 0x02, 0);
+        bus.write(register(2), &[0]).unwrap();
+        assert_eq!(bus.receive_uart_input(b"z").unwrap(), 0);
+        bus.read(register(5), &mut value).unwrap();
+        assert_ne!(value[0] & 0x02, 0);
+    }
+
+    #[test]
+    fn hoyry_uart_loopback_modem_interrupts_and_device_reset_work() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let register = |offset| UART.start + offset;
+        let mut value = [0];
+        bus.write(register(1), &[0x08]).unwrap();
+        bus.write(register(4), &[0x17]).unwrap();
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0] & 0x0f, 0x00);
+        bus.read(register(6), &mut value).unwrap();
+        assert_eq!(value[0], 0x73);
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0] & 0x0f, 0x01);
+
+        bus.write(register(1), &[0x01]).unwrap();
+        bus.write(register(0), b"L").unwrap();
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0] & 0x0f, 0x04);
+        bus.read(register(0), &mut value).unwrap();
+        assert_eq!(value[0], b'L');
+        assert!(bus.take_uart_output().is_empty());
+
+        let priority = PLIC.start + u64::from(UART_PLIC_SOURCE) * 4;
+        let enable = PLIC.start + VihtaPlic::ENABLE_BASE;
+        bus.write(priority, &1u32.to_le_bytes()).unwrap();
+        bus.write(enable, &(1u32 << UART_PLIC_SOURCE).to_le_bytes())
+            .unwrap();
+        bus.receive_uart_input(b"r").unwrap();
+        assert!(bus.plic_interrupt_pending(0));
+        bus.reset_uart().unwrap();
+        assert!(bus.plic_interrupt_pending(0));
+        let claim = PLIC.start + VihtaPlic::CONTEXT_BASE + 4;
+        let mut claimed = [0; 4];
+        bus.read(claim, &mut claimed).unwrap();
+        assert_eq!(u32::from_le_bytes(claimed), UART_PLIC_SOURCE);
+        bus.write(claim, &UART_PLIC_SOURCE.to_le_bytes()).unwrap();
+        assert!(!bus.plic_interrupt_pending(0));
+        bus.read(register(1), &mut value).unwrap();
+        assert_eq!(value[0], 0);
+        bus.read(register(5), &mut value).unwrap();
+        assert_eq!(value[0] & 0x03, 0);
     }
 
     #[test]
     fn hoyry_uart_rx_interrupt_reaches_supervisor_through_vihta() {
         let mut bus = bus_with_program(&[0x0010_0513]);
         let plic_priority = PLIC.start + u64::from(UART_PLIC_SOURCE) * 4;
-        let plic_enable =
-            PLIC.start + VihtaPlic::ENABLE_BASE + VihtaPlic::ENABLE_STRIDE;
-        let plic_claim =
-            PLIC.start + VihtaPlic::CONTEXT_BASE + VihtaPlic::CONTEXT_STRIDE + 4;
+        let plic_enable = PLIC.start + VihtaPlic::ENABLE_BASE + VihtaPlic::ENABLE_STRIDE;
+        let plic_claim = PLIC.start + VihtaPlic::CONTEXT_BASE + VihtaPlic::CONTEXT_STRIDE + 4;
         bus.write(plic_priority, &1u32.to_le_bytes()).unwrap();
         bus.write(plic_enable, &(1u32 << UART_PLIC_SOURCE).to_le_bytes())
             .unwrap();
@@ -3908,10 +4007,13 @@ mod tests {
     }
 
     #[test]
-    fn bus_does_not_fake_unimplemented_mmio() {
+    fn bus_exposes_uart_without_faking_unimplemented_mmio() {
         let mut bus = Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 8).unwrap();
+        let mut line_status = [0];
+        assert_eq!(bus.read(UART.start + 5, &mut line_status), Ok(()));
+        assert_eq!(line_status[0] & 0x60, 0x60);
         assert_eq!(
-            bus.read(UART.start, &mut [0]),
+            bus.read(ROOT_BLOCK.start, &mut [0]),
             Err(PhysicalAccessError::DeviceNotImplemented)
         );
     }
