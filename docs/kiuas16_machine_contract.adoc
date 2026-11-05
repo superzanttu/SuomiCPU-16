@@ -197,8 +197,12 @@ The standalone Kiuas16 core currently advances +time+ by one tick for each
 attempted or idle core cycle, exposes the read-only CSR with the specified
 S/U counter-enable checks, and derives the supervisor timer-pending bit from
 +stimecmp+. S-mode access to +stimecmp+ requires +menvcfg.STCE+; M-mode retains
-access. This is core-local behavior only: the machine runtime, virtual clock
-shared with devices, and PLIC are not yet integrated.
+access. The physical bus also contains an initial Vihta PLIC slice with 31
+external sources, machine/supervisor contexts, 32-bit priority/pending/enable/
+threshold/claim/complete registers, and level reassertion after completion.
+Its context outputs feed the core's external interrupt pending state. Board
+devices do not yet drive these sources, and the PLIC and timer are not
+integrated into a complete machine runtime or shared device clock.
 
 == Limits and conformance
 

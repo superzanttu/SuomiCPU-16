@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 pub const PHYSICAL_ADDRESS_BITS: u32 = 56;
 pub const PHYSICAL_ADDRESS_LIMIT: u64 = 1 << PHYSICAL_ADDRESS_BITS;
 
@@ -13,6 +15,9 @@ pub const XV6_HART_COUNT: u32 = 1;
 pub const XV6_RAM_BYTES: u64 = RAM.end - RAM.start;
 pub const TIMEBASE_FREQUENCY: u64 = 10_000_000;
 pub const RESET_STIMECMP: u64 = u64::MAX;
+pub const PLIC_SOURCE_COUNT: u32 = 31;
+pub const PLIC_CONTEXT_COUNT: usize = 2;
+pub const UART_PLIC_SOURCE: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AddressRange {
@@ -88,6 +93,7 @@ pub enum PhysicalAccessError {
     PermissionDenied,
     DmaOutsideRam,
     InvalidConfiguration,
+    InvalidDeviceAccess,
     DeviceNotImplemented,
 }
 
@@ -132,6 +138,306 @@ pub fn check_dma_range(address: u64, length: u64) -> Result<(), PhysicalAccessEr
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VihtaPlic {
+    priority: [u8; PLIC_SOURCE_COUNT as usize + 1],
+    pending: u32,
+    enabled: [u32; PLIC_CONTEXT_COUNT],
+    threshold: [u8; PLIC_CONTEXT_COUNT],
+    source_levels: u32,
+    in_service: [u32; PLIC_CONTEXT_COUNT],
+}
+
+impl VihtaPlic {
+    const PENDING_BASE: u64 = 0x1000;
+    const ENABLE_BASE: u64 = 0x2000;
+    const CONTEXT_BASE: u64 = 0x20_0000;
+    const ENABLE_STRIDE: u64 = 0x80;
+    const CONTEXT_STRIDE: u64 = 0x1000;
+    const MAX_PRIORITY: u8 = 7;
+
+    fn new() -> Self {
+        Self {
+            priority: [0; PLIC_SOURCE_COUNT as usize + 1],
+            pending: 0,
+            enabled: [0; PLIC_CONTEXT_COUNT],
+            threshold: [0; PLIC_CONTEXT_COUNT],
+            source_levels: 0,
+            in_service: [0; PLIC_CONTEXT_COUNT],
+        }
+    }
+
+    fn read_word(&mut self, offset: u64) -> Result<u32, PhysicalAccessError> {
+        if offset < Self::PENDING_BASE {
+            let source = offset / 4;
+            if offset % 4 != 0 || source > u64::from(PLIC_SOURCE_COUNT) {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            return Ok(u32::from(self.priority[source as usize]));
+        }
+        if (Self::PENDING_BASE..Self::ENABLE_BASE).contains(&offset) {
+            if offset != Self::PENDING_BASE {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            return Ok(self.pending);
+        }
+        if (Self::ENABLE_BASE..Self::CONTEXT_BASE).contains(&offset) {
+            let relative = offset - Self::ENABLE_BASE;
+            let context = (relative / Self::ENABLE_STRIDE) as usize;
+            if context >= PLIC_CONTEXT_COUNT || relative % Self::ENABLE_STRIDE != 0 {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            return Ok(self.enabled[context]);
+        }
+        let relative = offset
+            .checked_sub(Self::CONTEXT_BASE)
+            .ok_or(PhysicalAccessError::InvalidDeviceAccess)?;
+        let context = (relative / Self::CONTEXT_STRIDE) as usize;
+        let register = relative % Self::CONTEXT_STRIDE;
+        if context >= PLIC_CONTEXT_COUNT || !matches!(register, 0 | 4) {
+            return Err(PhysicalAccessError::InvalidDeviceAccess);
+        }
+        if register == 0 {
+            return Ok(u32::from(self.threshold[context]));
+        }
+        let claim = self.best_interrupt(context);
+        if claim != 0 {
+            let bit = 1u32 << claim;
+            self.pending &= !bit;
+            self.in_service[context] |= bit;
+        }
+        Ok(claim)
+    }
+
+    fn write_word(&mut self, offset: u64, value: u32) -> Result<(), PhysicalAccessError> {
+        if offset < Self::PENDING_BASE {
+            let source = offset / 4;
+            if offset % 4 != 0 || source > u64::from(PLIC_SOURCE_COUNT) {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            if source != 0 {
+                self.priority[source as usize] = (value as u8).min(Self::MAX_PRIORITY);
+            }
+            return Ok(());
+        }
+        if (Self::ENABLE_BASE..Self::CONTEXT_BASE).contains(&offset) {
+            let relative = offset - Self::ENABLE_BASE;
+            let context = (relative / Self::ENABLE_STRIDE) as usize;
+            if context >= PLIC_CONTEXT_COUNT || relative % Self::ENABLE_STRIDE != 0 {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            self.enabled[context] = value & !1;
+            return Ok(());
+        }
+        let relative = offset
+            .checked_sub(Self::CONTEXT_BASE)
+            .ok_or(PhysicalAccessError::InvalidDeviceAccess)?;
+        let context = (relative / Self::CONTEXT_STRIDE) as usize;
+        let register = relative % Self::CONTEXT_STRIDE;
+        if context >= PLIC_CONTEXT_COUNT || !matches!(register, 0 | 4) {
+            return Err(PhysicalAccessError::InvalidDeviceAccess);
+        }
+        if register == 0 {
+            self.threshold[context] = (value as u8).min(Self::MAX_PRIORITY);
+        } else if value != 0 && value <= PLIC_SOURCE_COUNT {
+            let bit = 1u32 << value;
+            if self.in_service[context] & bit != 0 {
+                self.in_service[context] &= !bit;
+                if self.source_levels & bit != 0 {
+                    self.pending |= bit;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_source_level(&mut self, source: u32, asserted: bool) -> Result<(), PhysicalAccessError> {
+        if source == 0 || source > PLIC_SOURCE_COUNT {
+            return Err(PhysicalAccessError::InvalidDeviceAccess);
+        }
+        let bit = 1u32 << source;
+        if asserted {
+            self.source_levels |= bit;
+            if self.in_service.iter().all(|claimed| claimed & bit == 0) {
+                self.pending |= bit;
+            }
+        } else {
+            self.source_levels &= !bit;
+        }
+        Ok(())
+    }
+
+    fn interrupt_pending(&self, context: usize) -> bool {
+        context < PLIC_CONTEXT_COUNT && self.best_interrupt(context) != 0
+    }
+
+    fn best_interrupt(&self, context: usize) -> u32 {
+        if context >= PLIC_CONTEXT_COUNT {
+            return 0;
+        }
+        let eligible = self.pending & self.enabled[context];
+        (1..=PLIC_SOURCE_COUNT)
+            .filter(|source| eligible & (1u32 << source) != 0)
+            .filter(|source| self.priority[*source as usize] > self.threshold[context])
+            .max_by_key(|source| (self.priority[*source as usize], std::cmp::Reverse(*source)))
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Uart16550 {
+    receive_fifo: VecDeque<u8>,
+    transmit_output: Vec<u8>,
+    interrupt_enable: u8,
+    fifo_control: u8,
+    line_control: u8,
+    modem_control: u8,
+    scratch: u8,
+    divisor_latch: u16,
+    line_status_errors: u8,
+    thre_interrupt_pending: bool,
+}
+
+impl Uart16550 {
+    const FIFO_CAPACITY: usize = 16;
+
+    fn new() -> Self {
+        Self {
+            receive_fifo: VecDeque::new(),
+            transmit_output: Vec::new(),
+            interrupt_enable: 0,
+            fifo_control: 0,
+            line_control: 0,
+            modem_control: 0,
+            scratch: 0,
+            divisor_latch: 0,
+            line_status_errors: 0,
+            thre_interrupt_pending: true,
+        }
+    }
+
+    fn read_register(&mut self, offset: u64) -> Result<u8, PhysicalAccessError> {
+        let value = match offset {
+            0 if self.line_control & 0x80 != 0 => self.divisor_latch as u8,
+            0 => self.receive_fifo.pop_front().unwrap_or(0),
+            1 if self.line_control & 0x80 != 0 => (self.divisor_latch >> 8) as u8,
+            1 => self.interrupt_enable,
+            2 => {
+                let iir = self.interrupt_identification();
+                if iir & 0x0f == 0x02 {
+                    self.thre_interrupt_pending = false;
+                }
+                iir
+            }
+            3 => self.line_control,
+            4 => self.modem_control,
+            5 => {
+                let status = self.line_status();
+                self.line_status_errors = 0;
+                status
+            }
+            6 => 0,
+            7 => self.scratch,
+            _ => return Err(PhysicalAccessError::InvalidDeviceAccess),
+        };
+        Ok(value)
+    }
+
+    fn write_register(&mut self, offset: u64, value: u8) -> Result<(), PhysicalAccessError> {
+        match offset {
+            0 if self.line_control & 0x80 != 0 => {
+                self.divisor_latch = (self.divisor_latch & 0xff00) | u16::from(value);
+            }
+            0 => {
+                self.transmit_output.push(value);
+                self.thre_interrupt_pending = true;
+            }
+            1 if self.line_control & 0x80 != 0 => {
+                self.divisor_latch =
+                    (self.divisor_latch & 0x00ff) | (u16::from(value) << 8);
+            }
+            1 => {
+                let previous = self.interrupt_enable;
+                self.interrupt_enable = value & 0x0f;
+                if previous & 0x02 == 0 && self.interrupt_enable & 0x02 != 0 {
+                    self.thre_interrupt_pending = true;
+                }
+            }
+            2 => {
+                self.fifo_control = value & 0xc1;
+                if value & 0x02 != 0 {
+                    self.receive_fifo.clear();
+                    self.line_status_errors &= !0x02;
+                }
+                if value & 0x04 != 0 {
+                    self.thre_interrupt_pending = true;
+                }
+            }
+            3 => self.line_control = value,
+            4 => self.modem_control = value & 0x1f,
+            7 => self.scratch = value,
+            _ => return Err(PhysicalAccessError::InvalidDeviceAccess),
+        }
+        Ok(())
+    }
+
+    fn receive(&mut self, input: &[u8]) -> usize {
+        let capacity = if self.fifo_control & 1 != 0 {
+            Self::FIFO_CAPACITY
+        } else {
+            1
+        };
+        let mut accepted = 0;
+        for &byte in input {
+            if self.receive_fifo.len() == capacity {
+                self.line_status_errors |= 0x02;
+            } else {
+                self.receive_fifo.push_back(byte);
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
+    fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.transmit_output)
+    }
+
+    fn line_status(&self) -> u8 {
+        let receive_ready = u8::from(!self.receive_fifo.is_empty());
+        receive_ready | self.line_status_errors | 0x60
+    }
+
+    fn interrupt_identification(&self) -> u8 {
+        let receive_trigger = if self.fifo_control & 1 == 0 {
+            1
+        } else {
+            match (self.fifo_control >> 6) & 3 {
+                0 => 1,
+                1 => 4,
+                2 => 8,
+                _ => 14,
+            }
+        };
+        let cause = if self.interrupt_enable & 0x04 != 0 && self.line_status_errors != 0 {
+            0x06
+        } else if self.interrupt_enable & 0x01 != 0
+            && self.receive_fifo.len() >= receive_trigger
+        {
+            0x04
+        } else if self.interrupt_enable & 0x02 != 0 && self.thre_interrupt_pending {
+            0x02
+        } else {
+            0x01
+        };
+        cause | if self.fifo_control & 1 != 0 { 0xc0 } else { 0 }
+    }
+
+    fn interrupt_asserted(&self) -> bool {
+        self.interrupt_identification() & 1 == 0
+    }
+}
+
 fn checked_end(address: u64, length: u64) -> Result<u64, PhysicalAccessError> {
     if length == 0 {
         return Err(PhysicalAccessError::EmptyAccess);
@@ -150,6 +456,8 @@ pub struct Kiuas16Bus {
     ram: Vec<u8>,
     ram_end: u64,
     write_epoch: u64,
+    plic: VihtaPlic,
+    uart: Uart16550,
 }
 
 impl Kiuas16Bus {
@@ -173,21 +481,47 @@ impl Kiuas16Bus {
             ram: vec![0; ram_bytes],
             ram_end,
             write_epoch: 0,
+            plic: VihtaPlic::new(),
+            uart: Uart16550::new(),
         })
     }
 
-    pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), PhysicalAccessError> {
+    pub fn read(&mut self, address: u64, output: &mut [u8]) -> Result<(), PhysicalAccessError> {
         self.transfer(address, output, PhysicalAccess::Read)
     }
 
     pub fn fetch(&self, address: u64, output: &mut [u8]) -> Result<(), PhysicalAccessError> {
-        self.transfer(address, output, PhysicalAccess::Execute)
+        let length =
+            u64::try_from(output.len()).map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
+        let region = self.check_access(address, length, PhysicalAccess::Execute)?;
+        self.transfer_backed(address, output, region)
     }
 
     pub fn write(&mut self, address: u64, data: &[u8]) -> Result<(), PhysicalAccessError> {
         let length =
             u64::try_from(data.len()).map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
         let region = self.check_access(address, length, PhysicalAccess::Write)?;
+        if region == PhysicalRegion::Plic {
+            if length != 4 || address & 3 != 0 {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            let value = u32::from_le_bytes(
+                data.try_into()
+                    .map_err(|_| PhysicalAccessError::InvalidDeviceAccess)?,
+            );
+            return self.plic.write_word(address - PLIC.start, value);
+        }
+        if region == PhysicalRegion::Uart {
+            if length != 1 {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            self.uart
+                .write_register(address - UART.start, data[0])?;
+            return self.plic.set_source_level(
+                UART_PLIC_SOURCE,
+                self.uart.interrupt_asserted(),
+            );
+        }
         if region != PhysicalRegion::Ram {
             return Err(PhysicalAccessError::DeviceNotImplemented);
         }
@@ -202,7 +536,7 @@ impl Kiuas16Bus {
     }
 
     fn transfer(
-        &self,
+        &mut self,
         address: u64,
         output: &mut [u8],
         access: PhysicalAccess,
@@ -210,6 +544,33 @@ impl Kiuas16Bus {
         let length =
             u64::try_from(output.len()).map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
         let region = self.check_access(address, length, access)?;
+        if region == PhysicalRegion::Plic {
+            if length != 4 || address & 3 != 0 {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            let value = self.plic.read_word(address - PLIC.start)?;
+            output.copy_from_slice(&value.to_le_bytes());
+            return Ok(());
+        }
+        if region == PhysicalRegion::Uart {
+            if length != 1 {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            output[0] = self.uart.read_register(address - UART.start)?;
+            return self.plic.set_source_level(
+                UART_PLIC_SOURCE,
+                self.uart.interrupt_asserted(),
+            );
+        }
+        self.transfer_backed(address, output, region)
+    }
+
+    fn transfer_backed(
+        &self,
+        address: u64,
+        output: &mut [u8],
+        region: PhysicalRegion,
+    ) -> Result<(), PhysicalAccessError> {
         let region_range = region.address_range();
         let start = usize::try_from(address - region_range.start)
             .map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
@@ -225,6 +586,32 @@ impl Kiuas16Bus {
         };
         output.copy_from_slice(&backing[start..end]);
         Ok(())
+    }
+
+    pub fn set_plic_source_level(
+        &mut self,
+        source: u32,
+        asserted: bool,
+    ) -> Result<(), PhysicalAccessError> {
+        self.plic.set_source_level(source, asserted)
+    }
+
+    pub fn plic_interrupt_pending(&self, context: usize) -> bool {
+        self.plic.interrupt_pending(context)
+    }
+
+    pub fn receive_uart_input(
+        &mut self,
+        input: &[u8],
+    ) -> Result<usize, PhysicalAccessError> {
+        let accepted = self.uart.receive(input);
+        self.plic
+            .set_source_level(UART_PLIC_SOURCE, self.uart.interrupt_asserted())?;
+        Ok(accepted)
+    }
+
+    pub fn take_uart_output(&mut self) -> Vec<u8> {
+        self.uart.take_output()
     }
 
     fn check_access(
@@ -444,6 +831,8 @@ pub struct Rv64Core {
     stimecmp: u64,
     time: u64,
     supervisor_timer_source_pending: bool,
+    injected_external_interrupts: u64,
+    plic_external_interrupts: u64,
     pmpcfg0: u64,
     pmpaddr0: u64,
     stvec: u64,
@@ -858,6 +1247,8 @@ impl Rv64Core {
             stimecmp: COLD_RESET_STATE.stimecmp,
             time: COLD_RESET_STATE.time,
             supervisor_timer_source_pending: false,
+            injected_external_interrupts: 0,
+            plic_external_interrupts: 0,
             pmpcfg0: COLD_RESET_STATE.pmpcfg0,
             pmpaddr0: COLD_RESET_STATE.pmpaddr0,
             stvec: COLD_RESET_STATE.stvec,
@@ -886,6 +1277,18 @@ impl Rv64Core {
         if cause == CoreInterruptCause::SupervisorTimer {
             self.supervisor_timer_source_pending = pending;
             self.update_supervisor_timer_pending();
+            return;
+        }
+        if matches!(
+            cause,
+            CoreInterruptCause::MachineExternal | CoreInterruptCause::SupervisorExternal
+        ) {
+            if pending {
+                self.injected_external_interrupts |= bit;
+            } else {
+                self.injected_external_interrupts &= !bit;
+            }
+            self.update_external_interrupt_pending();
             return;
         }
         if pending {
@@ -950,6 +1353,16 @@ impl Rv64Core {
         &mut self,
         bus: &mut Kiuas16Bus,
     ) -> Result<StepOutcome, CoreTrap> {
+        self.plic_external_interrupts = (if bus.plic_interrupt_pending(0) {
+            interrupt_bit(CoreInterruptCause::MachineExternal)
+        } else {
+            0
+        }) | (if bus.plic_interrupt_pending(1) {
+            interrupt_bit(CoreInterruptCause::SupervisorExternal)
+        } else {
+            0
+        });
+        self.update_external_interrupt_pending();
         self.update_supervisor_timer_pending();
         if let Some(cause) = self.pending_interrupt() {
             self.advance_cycle();
@@ -985,6 +1398,13 @@ impl Rv64Core {
         } else {
             self.mip &= !bit;
         }
+    }
+
+    fn update_external_interrupt_pending(&mut self) {
+        let mask = interrupt_bit(CoreInterruptCause::MachineExternal)
+            | interrupt_bit(CoreInterruptCause::SupervisorExternal);
+        self.mip = (self.mip & !mask)
+            | ((self.injected_external_interrupts | self.plic_external_interrupts) & mask);
     }
 
     fn pending_interrupt(&self) -> Option<CoreInterruptCause> {
@@ -2833,6 +3253,205 @@ mod tests {
     }
 
     #[test]
+    fn hoyry_uart_implements_divisor_aliases_transmit_and_byte_access_rules() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let register = |offset| UART.start + offset;
+        bus.write(register(3), &[0x80]).unwrap();
+        bus.write(register(0), &[0x34]).unwrap();
+        bus.write(register(1), &[0x12]).unwrap();
+        let mut value = [0];
+        bus.read(register(0), &mut value).unwrap();
+        assert_eq!(value[0], 0x34);
+        bus.read(register(1), &mut value).unwrap();
+        assert_eq!(value[0], 0x12);
+
+        bus.write(register(3), &[0x03]).unwrap();
+        bus.write(register(0), b"X").unwrap();
+        assert_eq!(bus.take_uart_output(), b"X");
+        bus.read(register(5), &mut value).unwrap();
+        assert_eq!(value[0] & 0x60, 0x60);
+
+        assert_eq!(
+            bus.read(register(0), &mut [0; 2]),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.write(register(0), b"xy"),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.read(register(8), &mut value),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+    }
+
+    #[test]
+    fn hoyry_uart_bounds_receive_fifos_and_reports_status_and_interrupt_causes() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let register = |offset| UART.start + offset;
+        let mut value = [0];
+        assert_eq!(bus.receive_uart_input(b"ab").unwrap(), 1);
+        bus.write(register(1), &[0x01]).unwrap();
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0], 0x04);
+        bus.read(register(5), &mut value).unwrap();
+        assert_eq!(value[0] & 0x03, 0x03);
+        bus.read(register(0), &mut value).unwrap();
+        assert_eq!(value[0], b'a');
+        bus.read(register(5), &mut value).unwrap();
+        assert_eq!(value[0] & 0x03, 0);
+
+        bus.write(register(2), &[0x41]).unwrap();
+        assert_eq!(bus.receive_uart_input(&[1, 2, 3]).unwrap(), 3);
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0], 0xc1);
+        assert_eq!(bus.receive_uart_input(&[4]).unwrap(), 1);
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0], 0xc4);
+
+        bus.write(register(2), &[0x43]).unwrap();
+        bus.read(register(2), &mut value).unwrap();
+        assert_eq!(value[0], 0xc1);
+        assert_eq!(bus.receive_uart_input(&[0; 17]).unwrap(), 16);
+        bus.read(register(5), &mut value).unwrap();
+        assert_ne!(value[0] & 0x02, 0);
+    }
+
+    #[test]
+    fn hoyry_uart_rx_interrupt_reaches_supervisor_through_vihta() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let plic_priority = PLIC.start + u64::from(UART_PLIC_SOURCE) * 4;
+        let plic_enable =
+            PLIC.start + VihtaPlic::ENABLE_BASE + VihtaPlic::ENABLE_STRIDE;
+        let plic_claim =
+            PLIC.start + VihtaPlic::CONTEXT_BASE + VihtaPlic::CONTEXT_STRIDE + 4;
+        bus.write(plic_priority, &1u32.to_le_bytes()).unwrap();
+        bus.write(plic_enable, &(1u32 << UART_PLIC_SOURCE).to_le_bytes())
+            .unwrap();
+        bus.write(UART.start + 1, &[0x01]).unwrap();
+        assert_eq!(bus.receive_uart_input(b"x").unwrap(), 1);
+        assert!(bus.plic_interrupt_pending(1));
+
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::Supervisor;
+        core.mideleg = 1 << 9;
+        core.mie = 1 << 9;
+        core.mstatus = MSTATUS_SIE;
+        core.stvec = BOOT_ROM.start + 0x100;
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorExternal)
+        );
+
+        let mut claimed = [0; 4];
+        bus.read(plic_claim, &mut claimed).unwrap();
+        assert_eq!(u32::from_le_bytes(claimed), UART_PLIC_SOURCE);
+        let mut received = [0];
+        bus.read(UART.start, &mut received).unwrap();
+        assert_eq!(received[0], b'x');
+        bus.write(plic_claim, &UART_PLIC_SOURCE.to_le_bytes())
+            .unwrap();
+        assert!(!bus.plic_interrupt_pending(1));
+    }
+
+    #[test]
+    fn vihta_plic_prioritizes_enabled_sources_and_claims_pending_interrupts() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let priority = |source: u64| PLIC.start + source * 4;
+        let enable = PLIC.start + VihtaPlic::ENABLE_BASE + VihtaPlic::ENABLE_STRIDE;
+        let threshold = PLIC.start + VihtaPlic::CONTEXT_BASE + VihtaPlic::CONTEXT_STRIDE;
+        let claim = threshold + 4;
+        bus.write(priority(1), &3u32.to_le_bytes()).unwrap();
+        bus.write(priority(2), &6u32.to_le_bytes()).unwrap();
+        bus.write(enable, &((1u32 << 1) | (1u32 << 2)).to_le_bytes())
+            .unwrap();
+        bus.write(threshold, &2u32.to_le_bytes()).unwrap();
+        bus.set_plic_source_level(1, true).unwrap();
+        bus.set_plic_source_level(2, true).unwrap();
+        assert!(bus.plic_interrupt_pending(1));
+        bus.write(threshold, &6u32.to_le_bytes()).unwrap();
+        assert!(!bus.plic_interrupt_pending(1));
+        bus.write(threshold, &2u32.to_le_bytes()).unwrap();
+
+        let mut claimed = [0; 4];
+        bus.read(claim, &mut claimed).unwrap();
+        assert_eq!(u32::from_le_bytes(claimed), 2);
+        assert!(bus.plic_interrupt_pending(1));
+        bus.set_plic_source_level(2, false).unwrap();
+        bus.write(claim, &2u32.to_le_bytes()).unwrap();
+        assert!(bus.plic_interrupt_pending(1));
+        bus.read(claim, &mut claimed).unwrap();
+        assert_eq!(u32::from_le_bytes(claimed), 1);
+        bus.set_plic_source_level(1, false).unwrap();
+        bus.write(claim, &1u32.to_le_bytes()).unwrap();
+        assert!(!bus.plic_interrupt_pending(1));
+    }
+
+    #[test]
+    fn vihta_plic_reasserts_level_sources_after_completion_and_rejects_bad_accesses() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let priority = PLIC.start + 4 * 3;
+        let enable = PLIC.start + VihtaPlic::ENABLE_BASE;
+        let claim = PLIC.start + VihtaPlic::CONTEXT_BASE + 4;
+        bus.write(priority, &1u32.to_le_bytes()).unwrap();
+        bus.write(enable, &(1u32 << 3).to_le_bytes()).unwrap();
+        bus.set_plic_source_level(3, true).unwrap();
+        let mut claimed = [0; 4];
+        bus.read(claim, &mut claimed).unwrap();
+        assert_eq!(u32::from_le_bytes(claimed), 3);
+        bus.set_plic_source_level(3, true).unwrap();
+        assert!(!bus.plic_interrupt_pending(0));
+        bus.write(claim, &3u32.to_le_bytes()).unwrap();
+        assert!(bus.plic_interrupt_pending(0));
+        bus.set_plic_source_level(3, false).unwrap();
+        bus.read(claim, &mut claimed).unwrap();
+        assert_eq!(u32::from_le_bytes(claimed), 3);
+        bus.write(claim, &3u32.to_le_bytes()).unwrap();
+        assert!(!bus.plic_interrupt_pending(0));
+
+        assert_eq!(
+            bus.read(PLIC.start, &mut [0; 2]),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.read(PLIC.start + 1, &mut [0; 4]),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.write(PLIC.start + VihtaPlic::PENDING_BASE, &1u32.to_le_bytes()),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.set_plic_source_level(PLIC_SOURCE_COUNT + 1, true),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+    }
+
+    #[test]
+    fn vihta_plic_drives_the_supervisor_external_interrupt_line() {
+        let mut bus = bus_with_program(&[0x0010_0513]);
+        let priority = PLIC.start + 4 * 5;
+        let enable = PLIC.start + VihtaPlic::ENABLE_BASE + VihtaPlic::ENABLE_STRIDE;
+        bus.write(priority, &1u32.to_le_bytes()).unwrap();
+        bus.write(enable, &(1u32 << 5).to_le_bytes()).unwrap();
+        bus.set_plic_source_level(5, true).unwrap();
+
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.privilege = PrivilegeMode::Supervisor;
+        core.mideleg = 1 << 9;
+        core.mie = 1 << 9;
+        core.mstatus = MSTATUS_SIE;
+        core.stvec = BOOT_ROM.start + 0x100;
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorExternal)
+        );
+        assert_eq!(core.scause, (1 << 63) | 9);
+    }
+
+    #[test]
     fn rv64_time_csr_permissions_and_sstc_compare_access_follow_controls() {
         let mut core = Rv64Core::cold_reset();
         assert_eq!(core.read_csr(0xc01), Ok(0));
@@ -3290,7 +3909,7 @@ mod tests {
 
     #[test]
     fn bus_does_not_fake_unimplemented_mmio() {
-        let bus = Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 8).unwrap();
+        let mut bus = Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 8).unwrap();
         assert_eq!(
             bus.read(UART.start, &mut [0]),
             Err(PhysicalAccessError::DeviceNotImplemented)
