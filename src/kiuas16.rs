@@ -25,6 +25,11 @@ pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
 pub const VIRTIO_MMIO_VENDOR_ID: u32 = 0x554d_4551;
 pub const VIRTIO_SECTOR_BYTES: u32 = 512;
 pub const XV6_FILESYSTEM_BLOCK_BYTES: u32 = 1024;
+const VIRTQ_DESCRIPTOR_BYTES: usize = 16;
+const VIRTQ_MAX_SIZE: u16 = 32_768;
+const VIRTQ_DESC_F_NEXT: u16 = 1;
+const VIRTQ_DESC_F_WRITE: u16 = 2;
+const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AddressRange {
@@ -102,6 +107,14 @@ pub enum PhysicalAccessError {
     InvalidConfiguration,
     InvalidDeviceAccess,
     DeviceNotImplemented,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedVirtqDescriptor {
+    pub index: u16,
+    pub address: u64,
+    pub length: u32,
+    pub device_writable: bool,
 }
 
 pub fn check_physical_access(
@@ -667,6 +680,98 @@ impl Kiuas16Bus {
             return Err(PhysicalAccessError::DmaOutsideRam);
         }
         Ok(())
+    }
+
+    pub fn validate_virtqueue_chain(
+        &self,
+        descriptor_table: u64,
+        queue_size: u16,
+        head: u16,
+    ) -> Result<Vec<ValidatedVirtqDescriptor>, PhysicalAccessError> {
+        if queue_size == 0
+            || queue_size > VIRTQ_MAX_SIZE
+            || !queue_size.is_power_of_two()
+            || head >= queue_size
+            || descriptor_table & (VIRTQ_DESCRIPTOR_BYTES as u64 - 1) != 0
+        {
+            return Err(PhysicalAccessError::InvalidDeviceAccess);
+        }
+
+        let table_bytes = usize::from(queue_size)
+            .checked_mul(VIRTQ_DESCRIPTOR_BYTES)
+            .ok_or(PhysicalAccessError::AddressOverflow)?;
+        self.validate_dma_range(
+            descriptor_table,
+            u64::try_from(table_bytes).map_err(|_| PhysicalAccessError::AddressOverflow)?,
+        )?;
+        let table_start = usize::try_from(descriptor_table - RAM.start)
+            .map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
+
+        let mut visited = vec![false; usize::from(queue_size)];
+        let mut chain = Vec::new();
+        let mut index = head;
+        loop {
+            let slot = usize::from(index);
+            if visited[slot] {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            visited[slot] = true;
+
+            let descriptor_offset = slot
+                .checked_mul(VIRTQ_DESCRIPTOR_BYTES)
+                .and_then(|offset| table_start.checked_add(offset))
+                .ok_or(PhysicalAccessError::AddressOverflow)?;
+            let descriptor_end = descriptor_offset
+                .checked_add(VIRTQ_DESCRIPTOR_BYTES)
+                .ok_or(PhysicalAccessError::AddressOverflow)?;
+            let bytes = self
+                .ram
+                .get(descriptor_offset..descriptor_end)
+                .ok_or(PhysicalAccessError::DmaOutsideRam)?;
+            let address = u64::from_le_bytes(
+                bytes[0..8]
+                    .try_into()
+                    .map_err(|_| PhysicalAccessError::InvalidDeviceAccess)?,
+            );
+            let length = u32::from_le_bytes(
+                bytes[8..12]
+                    .try_into()
+                    .map_err(|_| PhysicalAccessError::InvalidDeviceAccess)?,
+            );
+            let flags = u16::from_le_bytes(
+                bytes[12..14]
+                    .try_into()
+                    .map_err(|_| PhysicalAccessError::InvalidDeviceAccess)?,
+            );
+            let next = u16::from_le_bytes(
+                bytes[14..16]
+                    .try_into()
+                    .map_err(|_| PhysicalAccessError::InvalidDeviceAccess)?,
+            );
+
+            if flags & !(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_INDIRECT) != 0
+                || flags & VIRTQ_DESC_F_INDIRECT != 0
+            {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            if length != 0 {
+                self.validate_dma_range(address, u64::from(length))?;
+            }
+            chain.push(ValidatedVirtqDescriptor {
+                index,
+                address,
+                length,
+                device_writable: flags & VIRTQ_DESC_F_WRITE != 0,
+            });
+
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
+                return Ok(chain);
+            }
+            if next >= queue_size {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            index = next;
+        }
     }
 
     pub fn reset_uart(&mut self) -> Result<(), PhysicalAccessError> {
@@ -2559,6 +2664,27 @@ mod tests {
         Kiuas16Bus::new_with_ram_size(rom, ram_bytes).unwrap()
     }
 
+    fn write_virtq_descriptor(
+        bus: &mut Kiuas16Bus,
+        table: u64,
+        index: u16,
+        address: u64,
+        length: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let mut bytes = [0; VIRTQ_DESCRIPTOR_BYTES];
+        bytes[0..8].copy_from_slice(&address.to_le_bytes());
+        bytes[8..12].copy_from_slice(&length.to_le_bytes());
+        bytes[12..14].copy_from_slice(&flags.to_le_bytes());
+        bytes[14..16].copy_from_slice(&next.to_le_bytes());
+        bus.write(
+            table + u64::from(index) * VIRTQ_DESCRIPTOR_BYTES as u64,
+            &bytes,
+        )
+        .unwrap();
+    }
+
     fn bus_with_compressed_program(instructions: &[u16]) -> Kiuas16Bus {
         let mut rom = vec![0; BOOT_ROM_BYTES];
         for (index, instruction) in instructions.iter().enumerate() {
@@ -4391,6 +4517,97 @@ mod tests {
         assert_eq!(
             bus.validate_dma_range(u64::MAX, 2),
             Err(PhysicalAccessError::AddressOverflow)
+        );
+    }
+
+    #[test]
+    fn virtqueue_chain_validates_all_descriptors_and_data_ranges() {
+        let mut bus = bus_with_program_and_ram_size(&[], 1024);
+        let table = RAM.start + 0x100;
+        let readable = RAM.start + 0x300;
+        let writable = RAM.start + 0x380;
+        write_virtq_descriptor(&mut bus, table, 0, readable, 8, VIRTQ_DESC_F_NEXT, 2);
+        write_virtq_descriptor(&mut bus, table, 2, writable, 16, VIRTQ_DESC_F_WRITE, 0);
+
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Ok(vec![
+                ValidatedVirtqDescriptor {
+                    index: 0,
+                    address: readable,
+                    length: 8,
+                    device_writable: false,
+                },
+                ValidatedVirtqDescriptor {
+                    index: 2,
+                    address: writable,
+                    length: 16,
+                    device_writable: true,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn virtqueue_chain_rejects_malformed_metadata_and_dma_before_returning() {
+        let mut bus = bus_with_program_and_ram_size(&[], 1024);
+        let table = RAM.start + 0x100;
+        let payload = RAM.start + 0x300;
+        write_virtq_descriptor(&mut bus, table, 0, payload, 8, VIRTQ_DESC_F_NEXT, 4);
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 3, 0),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 4),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.validate_virtqueue_chain(table + 1, 4, 0),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        assert_eq!(
+            bus.validate_virtqueue_chain(RAM.start + 1008, 4, 0),
+            Err(PhysicalAccessError::DmaOutsideRam)
+        );
+
+        write_virtq_descriptor(&mut bus, table, 0, payload, 8, VIRTQ_DESC_F_NEXT, 1);
+        write_virtq_descriptor(&mut bus, table, 1, payload, 8, VIRTQ_DESC_F_NEXT, 0);
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+
+        write_virtq_descriptor(&mut bus, table, 0, payload, 8, VIRTQ_DESC_F_INDIRECT, 0);
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+
+        write_virtq_descriptor(&mut bus, table, 0, payload, 8, 8, 0);
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Err(PhysicalAccessError::InvalidDeviceAccess)
+        );
+        write_virtq_descriptor(&mut bus, table, 0, UART.start, 8, 0, 0);
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Err(PhysicalAccessError::DmaOutsideRam)
+        );
+        write_virtq_descriptor(&mut bus, table, 0, u64::MAX, 8, 0, 0);
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Err(PhysicalAccessError::AddressOverflow)
+        );
+
+        write_virtq_descriptor(&mut bus, table, 0, RAM.start + 1016, 16, 0, 0);
+        assert_eq!(
+            bus.validate_virtqueue_chain(table, 4, 0),
+            Err(PhysicalAccessError::DmaOutsideRam)
         );
     }
 

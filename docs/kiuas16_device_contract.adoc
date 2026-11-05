@@ -83,12 +83,17 @@ a one-byte holding register otherwise. Captured TX is immediate; baud timing
 and full modem/line behavior remain unimplemented.
 
 Kiulu's address and expected Virtio identity are reserved for compatibility,
-but no device model, queues, descriptors, media, or interrupt generation is
-implemented. Reads and writes return +DeviceNotImplemented+ rather than a
-success-shaped value. No queue descriptor is currently accepted. Future
-queue validation must validate the complete descriptor and data ranges,
-reject overflow and non-RAM DMA, and prevent partial effects on invalid
-requests.
+but no device model, queue execution, payload processing, media, or interrupt
+generation is implemented. Reads and writes return +DeviceNotImplemented+
+rather than a success-shaped value. The host bus provides a validation-only
+split-queue descriptor-chain helper: it checks power-of-two queue sizes up to
+32768, 16-byte descriptor-table alignment, the whole table range, descriptor
+flags and indices, cycles, and each nonempty data range against configured
+RAM.
+Indirect descriptors are explicitly rejected until implemented. The helper
+returns a chain only after the entire chain validates; it performs no device
+or memory writes. This is not a queue engine and does not implement Kiulu
+register semantics, media, interrupts, or descriptor execution.
 
 == Faults, DMA, reset, and discovery
 
@@ -103,8 +108,12 @@ DMA is RAM-only. +Kiuas16Bus::validate_dma_range()+ checks for overflow and
 ensures the entire requested range fits in the bus instance's configured RAM;
 the board-level +check_dma_range()+ additionally defines the fixed 128 MiB
 xv6 range. A device must validate before reading or writing any descriptor or
-payload. There is no implicit host-file, host-memory, or filesystem service.
-No DMA-capable device is implemented yet.
+payload. +Kiuas16Bus::validate_virtqueue_chain()+ validates split-ring
+descriptor metadata and all nonempty payload ranges without causing side
+effects; malformed metadata and unsupported indirect descriptors return
++InvalidDeviceAccess+, while out-of-RAM ranges return +DmaOutsideRam+.
+There is no implicit host-file, host-memory, or filesystem service. No
+DMA-capable device is implemented yet.
 
 Cold reset preserves ROM and guest RAM, resets the core, clears UART and PLIC
 volatile state, and reinitializes device interrupt state. Reset behavior for

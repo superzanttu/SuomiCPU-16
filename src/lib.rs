@@ -26,6 +26,7 @@ pub mod interrupts;
 #[path = "emulator/isa.rs"]
 pub mod isa;
 pub mod kiuas16;
+pub mod kiuas16_abi;
 #[path = "emulator/machine.rs"]
 pub mod machine;
 #[path = "emulator/mmu.rs"]

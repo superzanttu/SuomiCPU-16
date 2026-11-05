@@ -62,6 +62,13 @@ packed/aligned attributes, and any implementation-defined layout extensions
 must match the pinned psABI/compiler behavior and require independent byte
 fixtures before support is advertised.
 
+The host-side +kiuas16_abi+ module models scalar, array, structure, and union
+sizes, alignments, member offsets, and tail padding for this data model. Its
+regressions compare representative nested layouts with fixed expected
+offsets and reject invalid or overflowing object sizes. This model is
+preparatory infrastructure only: the Kiuas16 compiler does not yet consume
+it, and these tests do not independently execute guest layout or ABI code.
+
 The qualifiers +const+, +volatile+, and C99 +restrict+ do not change object
 size, alignment, or calling convention. +const+ and +volatile+ retain their
 language access semantics; +restrict+ is a C99 aliasing contract. Unsupported
