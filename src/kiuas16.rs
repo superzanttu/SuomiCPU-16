@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
 
+pub mod kiulu;
+pub use kiulu::{FileSectorMedia, SectorMedia};
+
 pub const PHYSICAL_ADDRESS_BITS: u32 = 56;
 pub const PHYSICAL_ADDRESS_LIMIT: u64 = 1 << PHYSICAL_ADDRESS_BITS;
 
@@ -524,6 +527,7 @@ pub struct Kiuas16Bus {
     write_epoch: u64,
     plic: VihtaPlic,
     uart: Uart16550,
+    root_block: Option<kiulu::Kiulu>,
 }
 
 impl Kiuas16Bus {
@@ -549,6 +553,7 @@ impl Kiuas16Bus {
             write_epoch: 0,
             plic: VihtaPlic::new(),
             uart: Uart16550::new(),
+            root_block: None,
         })
     }
 
@@ -567,6 +572,23 @@ impl Kiuas16Bus {
         let length =
             u64::try_from(data.len()).map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
         let region = self.check_access(address, length, PhysicalAccess::Write)?;
+        if region == PhysicalRegion::RootBlock {
+            let mut device = self
+                .root_block
+                .take()
+                .ok_or(PhysicalAccessError::DeviceNotImplemented)?;
+            let result = if length == 4 && address & 3 == 0 {
+                let value = u32::from_le_bytes(data.try_into().unwrap());
+                device.write_word(address - ROOT_BLOCK.start, value, self)
+            } else {
+                Err(PhysicalAccessError::InvalidDeviceAccess)
+            };
+            let asserted = device.interrupt_asserted();
+            self.root_block = Some(device);
+            self.plic
+                .set_source_level(ROOT_BLOCK_PLIC_SOURCE, asserted)?;
+            return result;
+        }
         if region == PhysicalRegion::Plic {
             if length != 4 || address & 3 != 0 {
                 return Err(PhysicalAccessError::InvalidDeviceAccess);
@@ -608,6 +630,18 @@ impl Kiuas16Bus {
         let length =
             u64::try_from(output.len()).map_err(|_| PhysicalAccessError::AddressOutOfRange)?;
         let region = self.check_access(address, length, access)?;
+        if region == PhysicalRegion::RootBlock {
+            let device = self
+                .root_block
+                .as_ref()
+                .ok_or(PhysicalAccessError::DeviceNotImplemented)?;
+            if length != 4 || address & 3 != 0 {
+                return Err(PhysicalAccessError::InvalidDeviceAccess);
+            }
+            let value = device.read_word(address - ROOT_BLOCK.start)?;
+            output.copy_from_slice(&value.to_le_bytes());
+            return Ok(());
+        }
         if region == PhysicalRegion::Plic {
             if length != 4 || address & 3 != 0 {
                 return Err(PhysicalAccessError::InvalidDeviceAccess);
@@ -672,6 +706,23 @@ impl Kiuas16Bus {
 
     pub fn take_uart_output(&mut self) -> Vec<u8> {
         self.uart.take_output()
+    }
+
+    pub fn attach_root_block(
+        &mut self,
+        media: Box<dyn SectorMedia>,
+    ) -> Result<(), PhysicalAccessError> {
+        if self.root_block.is_some() {
+            return Err(PhysicalAccessError::InvalidConfiguration);
+        }
+        self.root_block = Some(kiulu::Kiulu::new(media)?);
+        Ok(())
+    }
+
+    pub fn take_root_block_io_error(&mut self) -> Option<std::io::Error> {
+        self.root_block
+            .as_mut()
+            .and_then(kiulu::Kiulu::take_io_error)
     }
 
     pub fn validate_dma_range(&self, address: u64, length: u64) -> Result<(), PhysicalAccessError> {
@@ -782,6 +833,9 @@ impl Kiuas16Bus {
     fn reset_volatile_devices(&mut self) {
         self.plic = VihtaPlic::new();
         self.uart = Uart16550::new();
+        if let Some(device) = &mut self.root_block {
+            device.reset();
+        }
     }
 
     fn check_access(
@@ -2589,7 +2643,7 @@ fn multiply_high_signed_unsigned(left: u64, right: u64) -> u64 {
 mod tests {
     use super::*;
 
-    fn assert_header_values_match(header: &str, expected: &[(&str, u64)]) {
+    pub(super) fn assert_header_values_match(header: &str, expected: &[(&str, u64)]) {
         for (name, value) in expected {
             let definition = header
                 .lines()

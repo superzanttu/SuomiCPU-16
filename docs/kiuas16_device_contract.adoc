@@ -6,7 +6,8 @@
 
 This document is the behavioral contract for Kiuas16 physical devices. The
 host address map and implemented register paths are in
-link:../src/kiuas16.rs[+src/kiuas16.rs+]; guest-facing constants mirror them
+link:../src/kiuas16.rs[+src/kiuas16.rs+] and
+link:../src/kiuas16/kiulu.rs[+src/kiuas16/kiulu.rs+]; guest-facing constants mirror them
 in link:../toolchain/include/kiuas16_machine.h[+kiuas16_machine.h+]. A Rust
 test checks the numeric host/header values. Firmware and xv6 device sources
 are not yet present, so agreement with those consumers is not claimed.
@@ -47,7 +48,8 @@ an aperture does not imply that a register exists.
 |+0x10001000..0x10002000+
 |Virtio-MMIO v2; PLIC source 1
 |Expected identity: magic +0x74726976+, version 2, block device 2, vendor +0x554d4551+.
-|Reserved aperture only; every bus access returns +DeviceNotImplemented+.
+|Initial block device implemented when sector media is explicitly attached;
+without attached media, accesses return +DeviceNotImplemented+.
 |Löyly RAM
 |+0x80000000..0x88000000+
 |RAM
@@ -67,8 +69,8 @@ Source zero is reserved. Priority values are limited to 0–7; pending sources
 are claimed according to enabled state, priority, and context threshold.
 Claim removes the selected pending bit and records it in service; completion
 clears the in-service state. A still-asserted level source can pend again.
-Only Höyry currently drives a board source. Root Kiulu source 1 is reserved
-for the planned virtio device and does not currently signal interrupts.
+Höyry drives source 10. An attached root Kiulu drives source 1 while its
+Virtio interrupt status is nonzero.
 
 PLIC accesses require aligned 32-bit transfers to implemented registers.
 Höyry accesses require one-byte transfers to offsets 0–7. Unsupported widths,
@@ -82,18 +84,94 @@ modem-control, and scratch registers. RX uses a bounded FIFO when enabled and
 a one-byte holding register otherwise. Captured TX is immediate; baud timing
 and full modem/line behavior remain unimplemented.
 
-Kiulu's address and expected Virtio identity are reserved for compatibility,
-but no device model, queue execution, payload processing, media, or interrupt
-generation is implemented. Reads and writes return +DeviceNotImplemented+
-rather than a success-shaped value. The host bus provides a validation-only
-split-queue descriptor-chain helper: it checks power-of-two queue sizes up to
-32768, 16-byte descriptor-table alignment, the whole table range, descriptor
-flags and indices, cycles, and each nonempty data range against configured
-RAM.
-Indirect descriptors are explicitly rejected until implemented. The helper
-returns a chain only after the entire chain validates; it performs no device
-or memory writes. This is not a queue engine and does not implement Kiulu
-register semantics, media, interrupts, or descriptor execution.
+=== Kiulu transport and Saavi media
+
++Kiuas16Bus::attach_root_block()+ attaches one explicit +SectorMedia+ backend;
+a second attachment fails with +InvalidConfiguration+. No image path comes
+from the guest. +FileSectorMedia::open()+ opens an existing regular, nonempty,
+512-byte-aligned raw image in read-only or read/write mode. It neither creates
+an image nor exposes folders or host filesystem services. Capacity is fixed
+at attachment; out-of-image or non-sector-aligned transfers fail.
+
+The transport implements little-endian, aligned 32-bit MMIO accesses.
+Undefined registers, unsupported widths, and writes to read-only registers
+return +InvalidDeviceAccess+. The following register offsets are mirrored in
+the guest header and checked by a Rust regression:
+
+[cols="1,2,1",options="header"]
+|===
+|Offset |Register |Access
+|+0x000..0x00c+ |Magic, version, device ID, vendor ID |Read
+|+0x010+, +0x014+ |Device features, device-feature selector |Read, write
+|+0x020+, +0x024+ |Driver features, driver-feature selector |Write
+|+0x030+ |Queue selector |Write
+|+0x034+, +0x038+ |Queue maximum, queue size |Read, write
+|+0x044+ |Queue ready |Read/write
+|+0x050+ |Queue notification |Write
+|+0x060+, +0x064+ |Interrupt status, interrupt acknowledgement |Read, write
+|+0x070+ |Device status |Read/write
+|+0x080+, +0x084+ |Descriptor address low/high |Write
+|+0x090+, +0x094+ |Available-ring address low/high |Write
+|+0x0a0+, +0x0a4+ |Used-ring address low/high |Write
+|+0x0fc+ |Configuration generation (fixed zero) |Read
+|+0x100+, +0x104+ |Capacity in 512-byte sectors, low/high |Read
+|===
+
+Only queue zero exists, with power-of-two sizes from 1 through 256.
+The offered features are +VIRTIO_F_VERSION_1+ (bit 32), +VIRTIO_BLK_F_FLUSH+
+(bit 9), and +VIRTIO_BLK_F_RO+ (bit 5) for read-only media. Unsupported
+features or omission of bit 32 clear +FEATURES_OK+ rather than accepting an
+invalid configuration. Drivers must negotiate before configuring the queue,
+set +QueueReady+ before notifying, and set +DRIVER_OK+ before requests execute.
+Queue addresses and size cannot change while ready; disabling/reconfiguring
+the queue requires device reset. Indirect descriptors, event-index features,
+multiqueue, dynamic capacity, and hot removal are not implemented or offered.
+
+The pinned xv6 revision's +kernel/virtio_disk.c+ negotiates only the low
+feature page. Its unmodified initialization therefore fails the required
+modern-version negotiation. A regression records this rejection. The future
+versioned xv6 integration must explicitly negotiate the upper-page
++VIRTIO_F_VERSION_1+ bit; no unmodified-driver or xv6 boot acceptance is
+claimed here.
+
+Descriptor, available, and used rings must be aligned to 16, 2, and 4 bytes,
+respectively, entirely inside configured RAM, and mutually non-overlapping.
+The descriptor-chain helper checks the full table, flags, indices, cycles,
+and every nonempty payload range before execution. Indirect descriptors fail
+explicitly. Available-index advances larger than the queue size fail.
+Both ring slots and 16-bit available/used indices wrap. Request staging is
+bounded by the configured RAM size, including repeated/overlapping buffers.
+
+Kiulu executes notifications synchronously, draining the published available
+entries. It supports read (type 0), write (type 1), and negotiated flush
+(type 4), including scatter/gather data buffers. A readable 16-byte request
+header and a final writable status byte are required. Read payloads must be
+device-writable; write payloads must be device-readable. Total data lengths
+must be sector-aligned. Read results are staged before DMA, so failed reads
+leave guest payload buffers unchanged. All DMA writes use the bus write path,
+including its write epoch for atomic-reservation invalidation.
+
+Successful requests write status 0; invalid sector ranges, read-only writes,
+and backend I/O errors write +IOERR+ (1); unsupported operations write
++UNSUPP+ (2). Used lengths count only bytes written by the device: successful
+read data plus one status byte, otherwise one byte. Malformed queue/descriptor
+metadata returns an explicit bus error, sets +DEVICE_NEEDS_RESET+, raises the
+configuration interrupt bit, and blocks further notifications until reset.
+Previously completed requests in the same notification are not rolled back.
+
+Used-ring completions raise interrupt bit 0 unless +VIRTQ_AVAIL_F_NO_INTERRUPT+
+is set. Acknowledgement clears the selected interrupt bits; the PLIC source
+is deasserted when no bits remain. PLIC claim/complete remains the driver's
+responsibility.
+
+When flush is negotiated, successful writes reach the backend but persistence
+requires a successful flush. Without flush negotiation, writes operate in
+writethrough mode: backend flush must succeed before status 0 is returned.
+File flush uses +File::sync_all()+; durability remains subject to host storage
+guarantees. A failed write or sync can leave partial/uncertain media changes;
+there is no transactional rollback. Guest errors are not disguised as success.
+The latest backend error is also available to host diagnostics via
++Kiuas16Bus::take_root_block_io_error()+.
 
 == Faults, DMA, reset, and discovery
 
@@ -112,12 +190,18 @@ payload. +Kiuas16Bus::validate_virtqueue_chain()+ validates split-ring
 descriptor metadata and all nonempty payload ranges without causing side
 effects; malformed metadata and unsupported indirect descriptors return
 +InvalidDeviceAccess+, while out-of-RAM ranges return +DmaOutsideRam+.
-There is no implicit host-file, host-memory, or filesystem service. No
-DMA-capable device is implemented yet.
+There is no implicit host-file, host-memory, or filesystem service. Kiulu
+uses the validated RAM-only DMA path above.
 
 Cold reset preserves ROM and guest RAM, resets the core, clears UART and PLIC
-volatile state, and reinitializes device interrupt state. Reset behavior for
-the unimplemented Kiulu and future devices is not claimed. A machine/device
+volatile state, and reinitializes device interrupt state. Kiulu reset clears
+negotiated features, queue addresses/indices/readiness, device status, and
+interrupts, while preserving attached media and guest RAM. Published requests
+not yet notified do not execute during reset. Execution is synchronous, so no
+backend request remains in flight between bus operations; completed writes
+are not undone. The latest host I/O diagnostic survives reset until consumed.
+Reset does not imply a media flush. Reset behavior for future devices is not
+claimed. A machine/device
 inventory interface and interface-version discovery are not implemented;
 software must not infer device presence merely from an aperture.
 
@@ -161,11 +245,11 @@ The names in the roadmap catalog have these physical-device dispositions:
 |Implemented initial UART
 |UART range above; source 10
 |Kiulu
-|Not implemented; root-controller aperture reserved
-|Root block range above; source 1 reserved
+|Initial Virtio-MMIO block transport, explicitly attached media only
+|Root block range above; source 1
 |Saavi
-|No media attached
-|Owned by a future block-controller instance
+|Bounded raw sector media adapter implemented
+|Owned by its Kiulu controller; no default media attached
 |AinoGPU
 |Not implemented
 |No address or IRQ assigned
@@ -184,3 +268,15 @@ The reserved root-block range must not be reclaimed by another device. Future
 device assignments, interfaces, and reset behavior require updates here,
 their host enforcement, the guest header, and header-consistency tests before
 firmware or kernel consumers are added.
+
+== Reproducible implementation checks
+
+The Kiulu regressions run with
++cargo test --lib kiuas16::kiulu::tests -j 1 -- --test-threads=1+.
+They cover identities and header agreement, negotiation rejection, queue
+bounds, scatter/gather reads/writes, flush and writethrough errors, status and
+used lengths, multiple requests per notification, 65536-index wrap,
+malformed/DMA rejection, IRQ acknowledgement/suppression, host I/O failures,
+device/cold reset, and raw-file persistence after reopen. An RV64 store
+instruction notifies the device and a subsequent load observes read DMA.
+These are device/core fixtures, not Rust-compiled firmware or xv6 execution.

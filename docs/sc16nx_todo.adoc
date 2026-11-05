@@ -415,7 +415,7 @@ Kiuas16 compiler and linker exist. Keep this child unchecked.
    Generate or check guest definitions against Rust device definitions.
 +
 *Components:* link:kiuas16_device_contract.adoc[device contract],
-+src/kiuas16.rs+, and
++src/kiuas16.rs+, +src/kiuas16/kiulu.rs+, and
 link:../toolchain/include/kiuas16_machine.h[guest machine header]. +
 *Dependencies:* <<nx-machine-contract>>. +
 *Acceptance:* All named devices and all retired banks have a disposition;
@@ -431,9 +431,12 @@ test. The bus also provides validation-only split-queue descriptor-chain
 checks for table alignment/extent, queue limits, descriptor flags/indices,
 cycles, and complete payload DMA ranges; malformed and unsupported indirect
 descriptors fail before a chain is returned. Focused valid/malformed-chain
-regressions pass. Firmware and xv6 consumers do not exist yet, and the Kiulu
-queue engine remains unimplemented, so cross-consumer and end-to-end queue
-acceptance criteria remain open. Keep this child unchecked.
+regressions pass. An initial Kiulu queue engine now executes explicitly
+attached sector media, with checked MMIO negotiation, split rings, DMA,
+completion IRQs, and reset. Guest-header checks cover its register offsets
+and queue limit as well as board constants. Firmware and xv6 consumers do not
+exist yet, so cross-consumer and firmware/kernel execution acceptance remain
+open. Keep this child unchecked.
 
 === Phase 1: focused Rust refactoring
 
@@ -792,6 +795,35 @@ and pinned-driver acceptance remain open.
 exercise reads/writes, ring wrap, invalid chains/addresses, out-of-range
 sectors, failed host I/O, reset during requests, and persistence. No guest
 request can escape its media image or access arbitrary host files.
++
+*Implementation evidence:* The initial +src/kiuas16/kiulu.rs+ transport and
++FileSectorMedia+ backend provide one explicitly attached root device,
+512-byte raw sectors, fixed capacity/read-only state, modern feature-page
+negotiation, bounded scatter/gather DMA, available/used rings, IRQ source 1,
+reset, and flush-backed persistence. Flush-negotiated writes require a later
+flush for durability; without that feature, writes are synchronously flushed
+before successful completion. The focused command
++cargo test --lib kiuas16::kiulu::tests -j 1 -- --test-threads=1+
+exercises device/core and temporary-file fixtures, including index wrap,
+malformed metadata/DMA, media limits, injected read/write/sync errors, reset,
+and file reopen. Execution is synchronous; reset discards unnotified work
+and preserves completed media writes, with no outstanding backend operation.
+An RV64 store notifies the device and a load observes DMA results.
++
+The pinned xv6 driver only negotiates low feature bits; an explicit future
+driver change must accept upper-page +VIRTIO_F_VERSION_1+. The regression
++pinned_xv6_low_feature_page_alone_is_not_modern_negotiation+ records this
+remaining integration gap rather than silently accepting invalid features.
+Runtime image attachment, firmware/kernel consumers, and their production
+execution tests remain open. Keep this child unchecked.
++
+*Validation:* On the Windows native host with the current working tree,
++cargo test --lib kiuas16:: -j 1 -- --test-threads=1+ passes all 83
+machine/device tests, including 19 new Kiulu regressions.
++cargo test -j 1 -- --test-threads=1+ passes all 582 library tests and all
+other workspace targets. +cargo check --lib -j 1+, +cargo fmt --check+,
+and +git diff --check+ also pass. No P0 checkbox is closed by this slice:
+27 child tasks and 6 parent milestones remain unchecked.
 
 ** [ ] [[nx-boot-images]] *P0 / Define separate boot and root volumes.*
    Specify versioned boot metadata containing the kernel ELF and validated
