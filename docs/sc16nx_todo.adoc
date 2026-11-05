@@ -664,6 +664,16 @@ isolation. The guest owns physical-page allocation and address-space policy.
 *Acceptance:* Guest timer and external-interrupt handlers make progress
 headlessly; simultaneous sources, masking, completion, rollover, and
 rearming behave correctly. Host wall-clock changes cannot reverse monotonic time.
++
+*Core-local timer progress (2026-11-05):* Kiuas16 now advances a deterministic
+64-bit +time+ CSR once per attempted or idle core cycle, gates S/U reads with
++mcounteren.TIME+ and +scounteren.TIME+, and implements the Sstc +stimecmp+
+CSR with +menvcfg.STCE+ access control. The supervisor timer-pending bit tracks
+the compare condition, supports source-line injection, and clears on compare
+rearming or counter rollover. Focused tests cover permissions, compare
+delivery state, and wraparound. Machine-wide clock integration, the Vihta
+PLIC, external-device interrupt sources, and guest acceptance scenarios remain
+incomplete; keep this task unchecked.
 
 ** [ ] [[nx-uart]] *P0 / Implement Höyry's 16550 behavior.*
    Support register aliases, divisor latch, FIFO, status, RX/TX interrupt

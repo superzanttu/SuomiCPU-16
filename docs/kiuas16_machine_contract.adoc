@@ -193,6 +193,13 @@ RTC civil time is not the +time+ CSR and does not change this monotonic timer
 contract. Any later wall-clock device has a separate interface and cannot
 replace Sstc or alter the timebase frequency.
 
+The standalone Kiuas16 core currently advances +time+ by one tick for each
+attempted or idle core cycle, exposes the read-only CSR with the specified
+S/U counter-enable checks, and derives the supervisor timer-pending bit from
++stimecmp+. S-mode access to +stimecmp+ requires +menvcfg.STCE+; M-mode retains
+access. This is core-local behavior only: the machine runtime, virtual clock
+shared with devices, and PLIC are not yet integrated.
+
 == Limits and conformance
 
 The initial configuration has exactly one hart and 128 MiB of RAM. Multicore,

@@ -441,6 +441,9 @@ pub struct Rv64Core {
     mip: u64,
     mcounteren: u64,
     menvcfg: u64,
+    stimecmp: u64,
+    time: u64,
+    supervisor_timer_source_pending: bool,
     pmpcfg0: u64,
     pmpaddr0: u64,
     stvec: u64,
@@ -507,6 +510,7 @@ impl Rv64Core {
             0x305 => self.mtvec,
             0x306 => self.mcounteren,
             0x30a => self.menvcfg,
+            0x14d => self.stimecmp,
             0x3a0 => self.pmpcfg0,
             0x340 => self.mscratch,
             0x341 => self.mepc,
@@ -516,6 +520,7 @@ impl Rv64Core {
             0x3b0 => self.pmpaddr0,
             0xb00 | 0xc00 => self.mcycle,
             0xb02 | 0xc02 => self.minstret,
+            0xc01 => self.time,
             0xf14 => 0,
             _ => return Err(()),
         };
@@ -558,6 +563,10 @@ impl Rv64Core {
             0x305 => self.mtvec = normalize_tvec(value),
             0x306 => self.mcounteren = value & SCOUNTEREN_MASK,
             0x30a => self.menvcfg = value & MENVCFG_MASK,
+            0x14d => {
+                self.stimecmp = value;
+                self.update_supervisor_timer_pending();
+            }
             0x3a0 => {
                 let old = self.pmpcfg0 as u8;
                 let requested = value as u8;
@@ -592,13 +601,21 @@ impl Rv64Core {
                 && self.mstatus & MSTATUS_TVM != 0)
             && match csr {
                 0xc00 if self.privilege == PrivilegeMode::Supervisor => self.mcounteren & 1 != 0,
+                0xc01 if self.privilege == PrivilegeMode::Supervisor => {
+                    self.mcounteren & (1 << 1) != 0
+                }
                 0xc02 if self.privilege == PrivilegeMode::Supervisor => self.mcounteren & 4 != 0,
                 0xc00 if self.privilege == PrivilegeMode::User => {
                     self.mcounteren & 1 != 0 && self.scounteren & 1 != 0
                 }
-
+                0xc01 if self.privilege == PrivilegeMode::User => {
+                    self.mcounteren & (1 << 1) != 0 && self.scounteren & (1 << 1) != 0
+                }
                 0xc02 if self.privilege == PrivilegeMode::User => {
                     self.mcounteren & 4 != 0 && self.scounteren & 4 != 0
+                }
+                0x14d if self.privilege == PrivilegeMode::Supervisor => {
+                    self.menvcfg & (1 << 63) != 0
                 }
                 _ => true,
             }
@@ -838,6 +855,9 @@ impl Rv64Core {
             mip: COLD_RESET_STATE.mip,
             mcounteren: COLD_RESET_STATE.mcounteren,
             menvcfg: COLD_RESET_STATE.menvcfg,
+            stimecmp: COLD_RESET_STATE.stimecmp,
+            time: COLD_RESET_STATE.time,
+            supervisor_timer_source_pending: false,
             pmpcfg0: COLD_RESET_STATE.pmpcfg0,
             pmpaddr0: COLD_RESET_STATE.pmpaddr0,
             stvec: COLD_RESET_STATE.stvec,
@@ -863,6 +883,11 @@ impl Rv64Core {
 
     pub fn set_interrupt_pending(&mut self, cause: CoreInterruptCause, pending: bool) {
         let bit = interrupt_bit(cause);
+        if cause == CoreInterruptCause::SupervisorTimer {
+            self.supervisor_timer_source_pending = pending;
+            self.update_supervisor_timer_pending();
+            return;
+        }
         if pending {
             self.mip |= bit;
         } else {
@@ -913,7 +938,7 @@ impl Rv64Core {
     }
 
     pub fn step(&mut self, bus: &mut Kiuas16Bus) -> Result<(), CoreTrap> {
-        self.mcycle = self.mcycle.wrapping_add(1);
+        self.advance_cycle();
         let result = self.step_inner(bus);
         if result.is_ok() {
             self.minstret = self.minstret.wrapping_add(1);
@@ -925,14 +950,15 @@ impl Rv64Core {
         &mut self,
         bus: &mut Kiuas16Bus,
     ) -> Result<StepOutcome, CoreTrap> {
+        self.update_supervisor_timer_pending();
         if let Some(cause) = self.pending_interrupt() {
-            self.mcycle = self.mcycle.wrapping_add(1);
+            self.advance_cycle();
             self.deliver_interrupt(cause);
             return Ok(StepOutcome::InterruptDelivered(cause));
         }
         if self.waiting_for_interrupt {
             if self.mip & MIP_MASK == 0 {
-                self.mcycle = self.mcycle.wrapping_add(1);
+                self.advance_cycle();
                 return Ok(StepOutcome::WaitingForInterrupt);
             }
             self.waiting_for_interrupt = false;
@@ -943,6 +969,21 @@ impl Rv64Core {
                 self.deliver_trap(trap)?;
                 Ok(StepOutcome::TrapDelivered(trap))
             }
+        }
+    }
+
+    fn advance_cycle(&mut self) {
+        self.mcycle = self.mcycle.wrapping_add(1);
+        self.time = self.time.wrapping_add(1);
+        self.update_supervisor_timer_pending();
+    }
+
+    fn update_supervisor_timer_pending(&mut self) {
+        let bit = interrupt_bit(CoreInterruptCause::SupervisorTimer);
+        if self.supervisor_timer_source_pending || self.time >= self.stimecmp {
+            self.mip |= bit;
+        } else {
+            self.mip &= !bit;
         }
     }
 
@@ -2789,6 +2830,69 @@ mod tests {
         assert_ne!(core.mstatus & MSTATUS_MPIE, 0);
         assert_eq!(core.mcycle, 2);
         assert_eq!(core.minstret, 1);
+    }
+
+    #[test]
+    fn rv64_time_csr_permissions_and_sstc_compare_access_follow_controls() {
+        let mut core = Rv64Core::cold_reset();
+        assert_eq!(core.read_csr(0xc01), Ok(0));
+        assert_eq!(core.read_csr(0x14d), Ok(u64::MAX));
+        assert_eq!(core.write_csr(0x14d, 7), Ok(()));
+        assert_eq!(core.write_csr(0xc01, 7), Err(()));
+
+        core.privilege = PrivilegeMode::Supervisor;
+        assert_eq!(core.read_csr(0xc01), Err(()));
+        assert_eq!(core.read_csr(0x14d), Err(()));
+        core.mcounteren = 1 << 1;
+        assert_eq!(core.read_csr(0xc01), Ok(0));
+        core.menvcfg |= 1 << 63;
+        assert_eq!(core.read_csr(0x14d), Ok(7));
+        assert_eq!(core.write_csr(0x14d, 9), Ok(()));
+
+        core.privilege = PrivilegeMode::User;
+        assert_eq!(core.read_csr(0xc01), Err(()));
+        core.scounteren = 1 << 1;
+        assert_eq!(core.read_csr(0xc01), Ok(0));
+        assert_eq!(core.read_csr(0x14d), Err(()));
+    }
+
+    #[test]
+    fn rv64_virtual_time_drives_stimer_and_wraps_monotonically() {
+        let mut bus = bus_with_program(&[0x0010_0513; 4]);
+        let mut core = Rv64Core::cold_reset();
+        allow_full_physical_range(&mut core);
+        core.stimecmp = 2;
+
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.time, 1);
+        assert_eq!(core.mip & (1 << 5), 0);
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.time, 2);
+        assert_ne!(core.mip & (1 << 5), 0);
+
+        core.time = u64::MAX - 1;
+        core.stimecmp = u64::MAX;
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.time, u64::MAX);
+        assert_ne!(core.mip & (1 << 5), 0);
+        core.step(&mut bus).unwrap();
+        assert_eq!(core.time, 0);
+        assert_eq!(core.mip & (1 << 5), 0);
+        assert_eq!(core.mcycle, 4);
+
+        core.privilege = PrivilegeMode::Supervisor;
+        core.mideleg = 1 << 5;
+        core.mie = 1 << 5;
+        core.mstatus = MSTATUS_SIE;
+        core.stvec = BOOT_ROM.start + 0x100;
+        core.stimecmp = 0;
+        assert_eq!(
+            core.step_with_trap_delivery(&mut bus).unwrap(),
+            StepOutcome::InterruptDelivered(CoreInterruptCause::SupervisorTimer)
+        );
+        assert_eq!(core.scause, (1 << 63) | 5);
+        assert_eq!(core.mcycle, 5);
+        assert_eq!(core.minstret, 4);
     }
 
     #[test]
