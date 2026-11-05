@@ -17,7 +17,14 @@ pub const TIMEBASE_FREQUENCY: u64 = 10_000_000;
 pub const RESET_STIMECMP: u64 = u64::MAX;
 pub const PLIC_SOURCE_COUNT: u32 = 31;
 pub const PLIC_CONTEXT_COUNT: usize = 2;
+pub const ROOT_BLOCK_PLIC_SOURCE: u32 = 1;
 pub const UART_PLIC_SOURCE: u32 = 10;
+pub const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+pub const VIRTIO_MMIO_VERSION: u32 = 2;
+pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
+pub const VIRTIO_MMIO_VENDOR_ID: u32 = 0x554d_4551;
+pub const VIRTIO_SECTOR_BYTES: u32 = 512;
+pub const XV6_FILESYSTEM_BLOCK_BYTES: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AddressRange {
@@ -652,6 +659,14 @@ impl Kiuas16Bus {
 
     pub fn take_uart_output(&mut self) -> Vec<u8> {
         self.uart.take_output()
+    }
+
+    pub fn validate_dma_range(&self, address: u64, length: u64) -> Result<(), PhysicalAccessError> {
+        let end = checked_end(address, length)?;
+        if !RAM.contains_range(address, end) || end > self.ram_end {
+            return Err(PhysicalAccessError::DmaOutsideRam);
+        }
+        Ok(())
     }
 
     pub fn reset_uart(&mut self) -> Result<(), PhysicalAccessError> {
@@ -2469,6 +2484,28 @@ fn multiply_high_signed_unsigned(left: u64, right: u64) -> u64 {
 mod tests {
     use super::*;
 
+    fn assert_header_values_match(header: &str, expected: &[(&str, u64)]) {
+        for (name, value) in expected {
+            let definition = header
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    (fields.next() == Some("#define") && fields.next() == Some(name))
+                        .then(|| fields.next())
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("missing {name} in header"));
+            let actual = u64::from_str_radix(
+                definition
+                    .strip_prefix("0x")
+                    .unwrap_or_else(|| panic!("{name} must use a hexadecimal literal")),
+                16,
+            )
+            .unwrap_or_else(|_| panic!("invalid hexadecimal value for {name}"));
+            assert_eq!(actual, *value, "{name}");
+        }
+    }
+
     #[test]
     fn xv6_profile_reports_initial_board_and_extensions() {
         assert_eq!(XV6_PROFILE.hart_count, 1);
@@ -4226,6 +4263,76 @@ mod tests {
     }
 
     #[test]
+    fn board_constants_match_guest_header() {
+        let header = include_str!("../toolchain/include/kiuas16_machine.h");
+        let expected = [
+            (
+                "KIUAS16_PHYSICAL_ADDRESS_BITS",
+                PHYSICAL_ADDRESS_BITS as u64,
+            ),
+            ("KIUAS16_BOOT_ROM_BASE", BOOT_ROM.start),
+            ("KIUAS16_BOOT_ROM_BYTES", BOOT_ROM_BYTES as u64),
+            ("KIUAS16_PLIC_BASE", PLIC.start),
+            ("KIUAS16_PLIC_BYTES", PLIC.end - PLIC.start),
+            ("KIUAS16_UART_BASE", UART.start),
+            ("KIUAS16_UART_BYTES", UART.end - UART.start),
+            ("KIUAS16_ROOT_BLOCK_BASE", ROOT_BLOCK.start),
+            (
+                "KIUAS16_ROOT_BLOCK_BYTES",
+                ROOT_BLOCK.end - ROOT_BLOCK.start,
+            ),
+            ("KIUAS16_RAM_BASE", RAM.start),
+            ("KIUAS16_RAM_BYTES", XV6_RAM_BYTES),
+            ("KIUAS16_HART_COUNT", u64::from(XV6_HART_COUNT)),
+            ("KIUAS16_TIMEBASE_FREQUENCY", TIMEBASE_FREQUENCY),
+            ("KIUAS16_PLIC_SOURCE_COUNT", u64::from(PLIC_SOURCE_COUNT)),
+            ("KIUAS16_ROOT_BLOCK_IRQ", u64::from(ROOT_BLOCK_PLIC_SOURCE)),
+            ("KIUAS16_UART_IRQ", u64::from(UART_PLIC_SOURCE)),
+            ("KIUAS16_VIRTIO_MMIO_MAGIC", u64::from(VIRTIO_MMIO_MAGIC)),
+            (
+                "KIUAS16_VIRTIO_MMIO_VERSION",
+                u64::from(VIRTIO_MMIO_VERSION),
+            ),
+            (
+                "KIUAS16_VIRTIO_BLOCK_DEVICE_ID",
+                u64::from(VIRTIO_BLOCK_DEVICE_ID),
+            ),
+            (
+                "KIUAS16_VIRTIO_MMIO_VENDOR_ID",
+                u64::from(VIRTIO_MMIO_VENDOR_ID),
+            ),
+            (
+                "KIUAS16_VIRTIO_SECTOR_BYTES",
+                u64::from(VIRTIO_SECTOR_BYTES),
+            ),
+            (
+                "KIUAS16_XV6_FILESYSTEM_BLOCK_BYTES",
+                u64::from(XV6_FILESYSTEM_BLOCK_BYTES),
+            ),
+        ];
+        assert_header_values_match(header, &expected);
+    }
+
+    #[test]
+    fn guest_abi_constants_match_the_lp64d_contract() {
+        let header = include_str!("../toolchain/include/kiuas16_abi.h");
+        let expected = [
+            ("KIUAS16_ABI_CHAR_BITS", 8),
+            ("KIUAS16_ABI_CHAR_UNSIGNED", 1),
+            ("KIUAS16_ABI_INT_BYTES", 4),
+            ("KIUAS16_ABI_LONG_BYTES", 8),
+            ("KIUAS16_ABI_POINTER_BYTES", 8),
+            ("KIUAS16_ABI_LITTLE_ENDIAN", 1),
+            ("KIUAS16_ABI_STACK_ALIGNMENT", 16),
+            ("KIUAS16_ABI_FLOAT_BYTES", 4),
+            ("KIUAS16_ABI_DOUBLE_BYTES", 8),
+            ("KIUAS16_ABI_LONG_DOUBLE_BYTES", 16),
+            ("KIUAS16_ABI_LONG_DOUBLE_ALIGNMENT", 16),
+        ];
+        assert_header_values_match(header, &expected);
+    }
+
+    #[test]
     fn physical_access_rejects_holes_permission_violations_and_partial_crossings() {
         for address in [0, BOOT_ROM.end, ROOT_BLOCK.end, RAM.end] {
             assert_eq!(
@@ -4269,6 +4376,20 @@ mod tests {
         );
         assert_eq!(
             check_dma_range(u64::MAX, 2),
+            Err(PhysicalAccessError::AddressOverflow)
+        );
+    }
+
+    #[test]
+    fn configured_bus_dma_range_cannot_escape_test_ram() {
+        let bus = Kiuas16Bus::new_with_ram_size(vec![0; BOOT_ROM_BYTES], 8).unwrap();
+        assert_eq!(bus.validate_dma_range(RAM.start, 8), Ok(()));
+        assert_eq!(
+            bus.validate_dma_range(RAM.start + 7, 2),
+            Err(PhysicalAccessError::DmaOutsideRam)
+        );
+        assert_eq!(
+            bus.validate_dma_range(u64::MAX, 2),
             Err(PhysicalAccessError::AddressOverflow)
         );
     }
@@ -4320,6 +4441,10 @@ mod tests {
         assert_eq!(line_status[0] & 0x60, 0x60);
         assert_eq!(
             bus.read(ROOT_BLOCK.start, &mut [0]),
+            Err(PhysicalAccessError::DeviceNotImplemented)
+        );
+        assert_eq!(
+            bus.write(ROOT_BLOCK.start, &[0]),
             Err(PhysicalAccessError::DeviceNotImplemented)
         );
     }

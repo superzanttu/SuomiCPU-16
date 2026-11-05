@@ -1,0 +1,146 @@
+= Kiuas16 Guest ABI and Language Profiles
+:toc: left
+:toclevels: 2
+
+== Status and authority
+
+This document defines the planned Kiuas16 application binary interface. It
+does not describe the existing SC-16 compiler ABI in
+link:c90_target_abi.adoc[SC-16 C90 Target ABI], and it does not claim that a
+Kiuas16 C compiler, assembler, linker, or startup runtime exists. The
+implementation remains gated on independent layout, call, and execution
+fixtures in the P0 roadmap.
+
+The normative procedure and ELF conventions are the RISC-V ELF psABI for
+RV64 LP64D. Kiuas16 uses the little-endian variant, RV64GC, and the medany
+code model required by the pinned xv6-riscv build. The project must pin the
+exact psABI source revision with the toolchain before claiming reproducible
+binary compatibility.
+
+== Data model
+
+The xv6 and Kiuas16 C target uses LP64D. Bytes are 8 bits; integers and
+floating values use little-endian object representations.
+
+[cols="1,1,1",options="header"]
+|===
+|C type
+|Size
+|Alignment
+|+char+, +signed char+, +unsigned char+, +_Bool+
+|1 byte
+|1 byte
+|+short+, +unsigned short+
+|2 bytes
+|2 bytes
+|+int+, +unsigned int+, +enum+
+|4 bytes
+|4 bytes
+|+long+, +unsigned long+, +long long+, +unsigned long long+
+|8 bytes
+|8 bytes
+|object and function pointers, +size_t+, +ptrdiff_t+
+|8 bytes
+|8 bytes
+|+float+
+|IEEE-754 binary32, 4 bytes
+|4 bytes
+|+double+
+|IEEE-754 binary64, 8 bytes
+|8 bytes
+|+long double+
+|IEEE-754 binary128, 16 bytes
+|16 bytes
+|===
+
+Plain +char+ is unsigned. Signed integer ranges use two's-complement
+representations. A structure's members appear in declaration order, each
+member is aligned as required by its type, and the structure's size includes
+tail padding to a multiple of its alignment. Structure and union alignment is
+the maximum alignment of its members. Bit-field allocation, zero-width fields,
+packed/aligned attributes, and any implementation-defined layout extensions
+must match the pinned psABI/compiler behavior and require independent byte
+fixtures before support is advertised.
+
+The qualifiers +const+, +volatile+, and C99 +restrict+ do not change object
+size, alignment, or calling convention. +const+ and +volatile+ retain their
+language access semantics; +restrict+ is a C99 aliasing contract. Unsupported
+qualifier or attribute semantics must diagnose rather than silently change
+layout.
+
+== Procedure calls
+
+The integer convention uses +a0–a7+ for arguments, with +a0–a1+ also used
+for integer results. Values up to XLEN use one argument register when
+available. A 2×XLEN scalar uses a register pair or stack storage; values
+larger than 2×XLEN are passed by reference. Small aggregates are classified
+and split according to their in-memory layout and the psABI rules. A result
+that would be passed indirectly uses caller-allocated storage and an implicit
+first address argument.
+
+The LP64D hardware floating-point convention additionally uses +fa0–fa7+ for
+eligible named floating arguments and +fa0–fa1+ for corresponding results.
+The ABI floating-point width is 64 bits. Wider floating scalars, including
+binary128 +long double+, use the integer convention. Variadic arguments use
+the integer convention after the C default argument promotions; in particular
+binary32 variadic arguments are promoted to binary64. The psABI's aligned
+register-pair and stack rules apply to wide variadic values.
+
+The stack grows toward lower addresses and is 16-byte aligned at procedure
+entry and throughout standard-ABI execution. The first stack-passed argument
+is at offset zero from the callee's entry +sp+. +s0–s11+ are callee-saved;
++sp+ is restored by the callee. +ra+, +a0–a7+, +t0–t6+, +fa0–fa7+, and
++ft0–ft11+ are caller-saved. Floating callee-saved registers are +fs0–fs11+
+when used for values no wider than ABI_FLEN. The exact aggregate,
+floating-register, variadic, and return classification follows the pinned
+LP64D psABI and is an acceptance-test requirement, not a compiler feature
+claim.
+
+== ELF and startup
+
+Kiuas16 objects and executables use ELF64, little-endian, +EM_RISCV+, and the
+LP64D floating-point ABI flag. They target RV64GC with compressed instructions
+permitted and use medany relocations. Kernel and user ELF layouts, load
+permissions, BSS zeroing, relocation handling, and entry validation are
+defined by the Rust linker/loader tasks; unsupported or malformed ELF must
+fail explicitly.
+
+Firmware enters the pinned xv6 kernel at its ELF entry in M-mode with the
+hart identity preserved. The xv6 entry code establishes its own stack and
+performs the M-to-S handoff. This machine-level contract is specified in
+link:kiuas16_machine_contract.adoc[Kiuas16 RV64 Machine Contract]; it is not a
+hosted C call and does not synthesize +argc+, +argv+, environment, or a return
+address. User-process startup and syscall behavior belong to the pinned xv6
+runtime.
+
+== Language profiles
+
+The profiles share the LP64D data model and procedure ABI but are separate
+language/runtime contracts:
+
+* *xv6 GNU C99 subset:* the C99 features and explicit GNU extensions used by
+  the pinned xv6 source, with the Rust toolchain and xv6-specific headers and
+  runtime. It does not include the existing SC-16 C library.
+* *Kiuas16 project applications:* a separately selected C dialect and
+  project-owned APIs on the same LP64D ABI. No legacy SC-16 language,
+  pointer, header, or runtime extension is inherited implicitly.
+* *Eventual C90 conformance:* a distinct language conformance profile. It
+  uses the Kiuas16 ABI, including 64-bit pointers and binary128
+  +long double+; C90 source rules do not change object layout or procedure
+  calls. Unsupported binary128 operations require diagnostics until
+  implemented.
+
+Language selection and standard headers are explicit build inputs. A program
+must not be compiled with one profile and linked against another merely
+because both use ELF64.
+
+== Acceptance fixtures still required
+
+Independent layout fixtures must inspect sizes, alignments, member offsets,
+padding, little-endian bytes, unsigned plain +char+, and binary128
++long double+. Executing call fixtures must cover mixed integer/floating
+arguments, register exhaustion, aggregates, returns, recursion, variadic
+promotions and +va_arg+, 16-byte stack alignment, and callee-saved registers.
+ELF fixtures must verify class, endianness, machine, ABI flags, entry, segment
+permissions, and zero-filled BSS. These fixtures cannot pass until a Kiuas16
+compiler, assembler, linker, and executable test path exist.

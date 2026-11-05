@@ -11,6 +11,8 @@ bus, PLIC, and UART slices, but does not yet satisfy the full RV64GC, BIOS, or
 xv6 compatibility requirements. The existing emulator continues to implement
 the separate SC-16 contract in
 link:sc16_architecture.adoc[SC-16 Machine Architecture].
+The guest language profiles, object layout, and procedure ABI are defined in
+link:kiuas16_guest_abi.adoc[Kiuas16 Guest ABI and Language Profiles].
 
 The initial configuration is fixed for xv6 bring-up: one hart, 128 MiB of
 RAM, and the pinned xv6-riscv revision
@@ -81,8 +83,9 @@ unmapped space into RAM, or uses host allocation size as a substitute for the
 guest map.
 
 The following half-open ranges define the initial board. Undefined portions
-of each device's register interface remain governed by the device contract;
-an address inside an aperture is not by itself a valid register access.
+of each device's register interface remain governed by the
+link:kiuas16_device_contract.adoc[device contract]; an address inside an
+aperture is not by itself a valid register access.
 
 [cols="1,1,2,2",options="header"]
 |===
@@ -90,9 +93,9 @@ an address inside an aperture is not by itself a valid register access.
 |+0x00000000..0x00001000+ |4 KiB |Lauteet |Unmapped; access fault
 |+0x00001000..0x00010000+ |60 KiB |Sytyke |Read/execute boot ROM; writes fault
 |+0x00010000..0x0c000000+ |Reserved |Lauteet |Unmapped; access fault
-|+0x0c000000..0x10000000+ |64 MiB |Vihta |PLIC aperture; register behavior defined by device contract
-|+0x10000000..0x10001000+ |4 KiB |Höyry |16550-compatible UART aperture
-|+0x10001000..0x10002000+ |4 KiB |Kiulu |Virtio-MMIO v2 root block controller
+|+0x0c000000..0x10000000+ |64 MiB |Vihta |PLIC aperture; see device contract
+|+0x10000000..0x10001000+ |4 KiB |Höyry |16550-compatible UART; see device contract
+|+0x10001000..0x10002000+ |4 KiB |Kiulu |Reserved Virtio-MMIO v2 root block aperture; model not implemented
 |+0x10002000..0x80000000+ |Reserved |Lauteet |Unmapped; access fault
 |+0x80000000..0x88000000+ |128 MiB |Löyly |RAM; usable and DMA-addressable
 |+0x88000000..0x0100000000000000+ |Reserved |Lauteet |Unmapped; access fault
@@ -100,11 +103,11 @@ an address inside an aperture is not by itself a valid register access.
 
 The PLIC aperture follows the pinned +qemu -machine virt+ physical layout.
 Only implemented registers and contexts are accessible; the full aperture is
-not backing RAM. The root disk controller remains at +0x10001000+ with the
-identity expected by upstream xv6, regardless of Finnish presentation names.
-This map does not allocate an address for an additional boot-volume controller;
-that choice belongs to the boot-image/device design and must not displace the
-xv6 root controller.
+not backing RAM. Register access, IRQ assignments, protocol identities,
+reset, and unimplemented-device outcomes are defined in
+link:kiuas16_device_contract.adoc[the device contract]. The root controller
+remains at +0x10001000+ with the identity expected by upstream xv6; no
+additional boot-volume controller may displace it.
 
 RAM is contiguous from +0x80000000+ through +0x87ffffff+. The initial firmware
 loads the kernel ELF into that RAM; kernel allocation and all DMA are bounded
@@ -231,21 +234,13 @@ advances exactly once per machine step; no host wall clock is consulted.
 
 == Höyry UART
 
-Höyry occupies +0x10000000..0x10001000+, with byte accesses to registers
-0 through 7; other widths and offsets fault. Register 0/1 use the divisor
-latch when +LCR.DLAB+ is set, otherwise they are receive/transmit data and
-interrupt enable. RX uses a bounded 16-byte FIFO when enabled and a one-byte
-holding register otherwise. +FCR+ configures 1/4/8/14-byte receive interrupt
-thresholds and can clear the receive FIFO. +LSR+ reports data-ready, overrun,
-and transmitter-empty status; +IIR+ reports line-status, receive, THRE, and
-modem-status interrupt causes. MCR loopback connects modem outputs and routes
-transmit bytes back to the receive FIFO. A device reset clears volatile UART
-state and deasserts its interrupt line. Host-injected input and captured
-transmit bytes are available through both the bus and headless machine APIs.
-
-The UART interrupt output drives Vihta source 10. TX completes immediately;
-divisor-based baud timing, full modem/line behavior, windowed/runtime adapter
-integration, and pinned xv6-driver acceptance are not implemented yet.
+Höyry occupies +0x10000000..0x10001000+ and has an initial
+16550-compatible register/FIFO/interrupt implementation with headless input
+and output methods. The normative register behavior, source assignment,
+unsupported accesses, and implementation gaps are defined in
+link:kiuas16_device_contract.adoc[the device contract]. Timed transmission,
+full modem/line behavior, runtime adapters, and pinned xv6-driver acceptance
+remain open.
 
 == Limits and conformance
 

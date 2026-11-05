@@ -1,0 +1,177 @@
+= Kiuas16 Device Contract
+:toc: left
+:toclevels: 2
+
+== Status and source of truth
+
+This document is the behavioral contract for Kiuas16 physical devices. The
+host address map and implemented register paths are in
+link:../src/kiuas16.rs[+src/kiuas16.rs+]; guest-facing constants mirror them
+in link:../toolchain/include/kiuas16_machine.h[+kiuas16_machine.h+]. A Rust
+test checks the numeric host/header values. Firmware and xv6 device sources
+are not yet present, so agreement with those consumers is not claimed.
+
+The complete Finnish hardware catalog and dispositions of all 13 retired
+SC-16 high-address banks are listed in
+link:sc16nx_todo.adoc[the development roadmap]. Those old banks are not
+mapped into the Kiuas16 physical space and must not be used as aliases.
+
+== Board resource contract
+
+All ranges are half-open. Undefined address space faults; an address inside
+an aperture does not imply that a register exists.
+
+[cols="1,1,1,2,2",options="header"]
+|===
+|Resource
+|Physical range
+|Interface / IRQ
+|Access, reset, and ownership
+|Implementation status
+|Sytyke boot ROM
+|+0x00001000..0x00010000+
+|Read/execute
+|Immutable bytes owned by firmware; cold reset starts at +0x1000+.
+|ROM bus implemented; BIOS image and handoff remain open.
+|Vihta PLIC
+|+0x0c000000..0x10000000+
+|PLIC source IDs 1–31
+|Little-endian aligned 32-bit registers; two contexts, machine and supervisor.
+|Initial priority/pending/enable/threshold/claim/complete implementation.
+|Höyry UART
+|+0x10000000..0x10001000+
+|16550-compatible; PLIC source 10
+|Byte registers at offsets 0–7; reset clears UART and deasserts its line.
+|Initial register/FIFO/interrupt implementation; runtime adapters and baud timing open.
+|Kiulu root block
+|+0x10001000..0x10002000+
+|Virtio-MMIO v2; PLIC source 1
+|Expected identity: magic +0x74726976+, version 2, block device 2, vendor +0x554d4551+.
+|Reserved aperture only; every bus access returns +DeviceNotImplemented+.
+|Löyly RAM
+|+0x80000000..0x88000000+
+|RAM
+|Read/write/execute; cold reset preserves contents; DMA must remain inside configured RAM.
+|Implemented, with reduced sizes allowed only by isolated tests.
+|===
+
+Sector size is 512 bytes; the xv6 filesystem block size is 1024 bytes. They
+are different units and must remain distinct in future queue, DMA, driver, and
+image code. The physical map and cold-reset behavior are further specified in
+link:kiuas16_machine_contract.adoc[the machine contract].
+
+== Implemented device semantics
+
+Vihta exposes 31 external interrupt sources and machine/supervisor contexts.
+Source zero is reserved. Priority values are limited to 0–7; pending sources
+are claimed according to enabled state, priority, and context threshold.
+Claim removes the selected pending bit and records it in service; completion
+clears the in-service state. A still-asserted level source can pend again.
+Only Höyry currently drives a board source. Root Kiulu source 1 is reserved
+for the planned virtio device and does not currently signal interrupts.
+
+PLIC accesses require aligned 32-bit transfers to implemented registers.
+Höyry accesses require one-byte transfers to offsets 0–7. Unsupported widths,
+misalignment, reserved offsets, and invalid source IDs return
++InvalidDeviceAccess+; they are not zero-filled reads or ignored writes.
+Multi-byte cross-region accesses are rejected before side effects.
+
+Höyry implements the documented 16550-compatible divisor-latch, RX/TX,
+interrupt-enable, FIFO-control, line-status, interrupt-identification,
+modem-control, and scratch registers. RX uses a bounded FIFO when enabled and
+a one-byte holding register otherwise. Captured TX is immediate; baud timing
+and full modem/line behavior remain unimplemented.
+
+Kiulu's address and expected Virtio identity are reserved for compatibility,
+but no device model, queues, descriptors, media, or interrupt generation is
+implemented. Reads and writes return +DeviceNotImplemented+ rather than a
+success-shaped value. No queue descriptor is currently accepted. Future
+queue validation must validate the complete descriptor and data ranges,
+reject overflow and non-RAM DMA, and prevent partial effects on invalid
+requests.
+
+== Faults, DMA, reset, and discovery
+
+The bus validates complete access ranges before applying side effects.
+Address arithmetic overflow returns +AddressOverflow+; unmapped space returns
++Unmapped+; crossing an aperture returns +RegionBoundary+; writes to ROM
+return +PermissionDenied+; and zero-length accesses return +EmptyAccess+.
+Guest accesses become architectural access faults. Invalid device widths,
+alignments, or register locations return +InvalidDeviceAccess+.
+
+DMA is RAM-only. +Kiuas16Bus::validate_dma_range()+ checks for overflow and
+ensures the entire requested range fits in the bus instance's configured RAM;
+the board-level +check_dma_range()+ additionally defines the fixed 128 MiB
+xv6 range. A device must validate before reading or writing any descriptor or
+payload. There is no implicit host-file, host-memory, or filesystem service.
+No DMA-capable device is implemented yet.
+
+Cold reset preserves ROM and guest RAM, resets the core, clears UART and PLIC
+volatile state, and reinitializes device interrupt state. Reset behavior for
+the unimplemented Kiulu and future devices is not claimed. A machine/device
+inventory interface and interface-version discovery are not implemented;
+software must not infer device presence merely from an aperture.
+
+== Catalog dispositions
+
+The names in the roadmap catalog have these physical-device dispositions:
+
+[cols="1,2,2",options="header"]
+|===
+|Device
+|Disposition
+|Address / interface
+|Kiuas16
+|Integrated processor; no MMIO aperture
+|Architectural registers and traps
+|Kiuaskivet
+|Integrated translation/protection; no MMIO aperture
+|Sv39 and PMP
+|Löyly
+|Main memory
+|Configured RAM range above
+|Lauteet
+|Physical interconnect
+|Unmapped accesses fault
+|Saunamestari
+|Not implemented
+|No inventory aperture or version yet
+|Sytyke
+|ROM hardware is present; BIOS is not implemented
+|Boot ROM range above
+|Vihta
+|Implemented initial PLIC
+|PLIC range above
+|Tiimalasi
+|Integrated timers and counters; partial implementation
+|CSRs; no MMIO aperture
+|Saunakello
+|Not implemented
+|No address or IRQ assigned
+|Höyry
+|Implemented initial UART
+|UART range above; source 10
+|Kiulu
+|Not implemented; root-controller aperture reserved
+|Root block range above; source 1 reserved
+|Saavi
+|No media attached
+|Owned by a future block-controller instance
+|AinoGPU
+|Not implemented
+|No address or IRQ assigned
+|Vasta, Laudeliina
+|Not implemented
+|No address or IRQ assigned
+|Sihinä, Saunapolku
+|Not implemented
+|No address or IRQ assigned
+|Kipinä, Löylymuisti, Hiillos
+|Not implemented
+|No address or IRQ assigned
+|===
+
+The reserved root-block range must not be reclaimed by another device. Future
+device assignments, interfaces, and reset behavior require updates here,
+their host enforcement, the guest header, and header-consistency tests before
+firmware or kernel consumers are added.

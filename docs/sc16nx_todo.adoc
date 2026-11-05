@@ -389,24 +389,44 @@ the containing P0 milestone or claim full RV64GC implementation.
    Separate the xv6-required GNU C99 subset, project application extensions,
    and eventual C90 conformance.
 +
-*Components:* target ABI documentation, compiler type/layout and call rules. +
+*Components:* link:kiuas16_guest_abi.adoc[guest ABI contract],
+link:../toolchain/include/kiuas16_abi.h[guest ABI constants],
+and future compiler type/layout and call rules. +
 *Dependencies:* <<nx-machine-contract>>. +
 *Acceptance:* Independent layout/call fixtures cover LP64D, unsigned plain
 +char+, 16-byte stack alignment, and target-specific constant/header values.
 Binary128 +long double+ requirements or unsupported-operation diagnostics
 are explicit. Legacy SC-16 ABI results are not relabeled RV64 results.
++
+*Implementation evidence:* The new guest ABI contract defines the LP64D
+data model, little-endian layout, call/return/varargs rules, ELF/startup
+conventions, and separate xv6 GNU C99, application, and future C90 profiles.
+The guest ABI header is checked against its required constants by a focused
+Rust test. This is specification/header validation only: independent layout
+and executable call fixtures cannot run until the Kiuas16 compiler and
+linker exist. Keep this child unchecked.
 
 ** [ ] [[nx-device-contract]] *P0 / Establish one device contract source of truth.*
    Define addresses, access widths, IRQs, protocol identities, discovery,
    reset, side effects, DMA bounds, ownership, and interface versions.
    Generate or check guest definitions against Rust device definitions.
 +
-*Components:* +src/emulator/machine.rs+, guest headers, firmware/device docs. +
+*Components:* link:kiuas16_device_contract.adoc[device contract],
++src/kiuas16.rs+, and
+link:../toolchain/include/kiuas16_machine.h[guest machine header]. +
 *Dependencies:* <<nx-machine-contract>>. +
 *Acceptance:* All named devices and all retired banks have a disposition;
 register/IRQ definitions agree across host, firmware, and kernel. Invalid
 widths, addresses, queue descriptors, and unmapped DMA have explicit outcomes.
 The additional boot controller cannot displace the upstream root controller.
++
+*Implementation evidence:* The device contract records board ranges, IRQ and
+Virtio identities, reset/access/error behavior, and every named device's
+current disposition. A Rust regression checks guest-header values against
+the host constants; configured-RAM DMA validation now has a focused boundary
+test. Firmware and xv6 consumers do not exist yet, and Kiulu queue validation
+is unimplemented, so the cross-consumer and queue acceptance criteria remain
+open. Keep this child unchecked.
 
 === Phase 1: focused Rust refactoring
 
