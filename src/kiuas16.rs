@@ -659,6 +659,11 @@ impl Kiuas16Bus {
         self.plic.set_source_level(UART_PLIC_SOURCE, false)
     }
 
+    fn reset_volatile_devices(&mut self) {
+        self.plic = VihtaPlic::new();
+        self.uart = Uart16550::new();
+    }
+
     fn check_access(
         &self,
         address: u64,
@@ -924,8 +929,20 @@ impl Kiuas16Machine {
         &mut self.bus
     }
 
+    pub fn profile(&self) -> MachineProfile {
+        MachineProfile {
+            ram: AddressRange::new(RAM.start, self.bus.ram_end),
+            ..XV6_PROFILE
+        }
+    }
+
     pub fn virtual_time(&self) -> u64 {
         self.core.virtual_time()
+    }
+
+    pub fn reset(&mut self) {
+        self.core = Rv64Core::cold_reset();
+        self.bus.reset_volatile_devices();
     }
 
     pub fn step(&mut self) -> Result<StepOutcome, CoreTrap> {
@@ -3416,6 +3433,65 @@ mod tests {
         assert_eq!(machine.core.mcycle, 1);
         assert_eq!(machine.core.minstret, 0);
         assert_eq!(machine.virtual_time(), 1);
+    }
+
+    #[test]
+    fn kiuas16_machine_reset_preserves_memory_and_clears_volatile_state() {
+        let mut rom = vec![0; BOOT_ROM_BYTES];
+        rom[..4].copy_from_slice(&0x0070_0093u32.to_le_bytes());
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 32).unwrap();
+        machine
+            .bus
+            .write(RAM.start, &[0x12, 0x34, 0x56, 0x78])
+            .unwrap();
+        machine.step().unwrap();
+        assert_eq!(machine.core.register(1), Some(7));
+        assert_eq!(machine.virtual_time(), 1);
+
+        machine.bus.write(UART.start + 1, &[1]).unwrap();
+        machine.receive_uart_input(b"r").unwrap();
+        machine.bus.write(UART.start, b"t").unwrap();
+        machine
+            .bus
+            .write(
+                PLIC.start + u64::from(UART_PLIC_SOURCE) * 4,
+                &1u32.to_le_bytes(),
+            )
+            .unwrap();
+        machine
+            .bus
+            .write(
+                PLIC.start + 0x2080,
+                &(1u32 << UART_PLIC_SOURCE).to_le_bytes(),
+            )
+            .unwrap();
+        assert!(machine.bus.plic_interrupt_pending(1));
+        assert_eq!(machine.take_uart_output(), b"t");
+        machine.bus.write(UART.start, b"q").unwrap();
+
+        let profile = machine.profile();
+        assert_eq!(profile.ram, AddressRange::new(RAM.start, RAM.start + 32));
+        assert_eq!(profile.hart_count, 1);
+        assert!(profile.supported_extensions.contains(&Extension::I));
+        assert!(profile.unsupported_extensions.contains(&Extension::F));
+
+        machine.reset();
+
+        assert_eq!(machine.core.pc, RESET_PC);
+        assert_eq!(machine.core.privilege(), PrivilegeMode::Machine);
+        assert_eq!(machine.core.register(1), Some(0));
+        assert_eq!(machine.virtual_time(), 0);
+        assert!(!machine.bus.plic_interrupt_pending(1));
+        assert!(machine.take_uart_output().is_empty());
+        let mut line_status = [0];
+        machine.bus.read(UART.start + 5, &mut line_status).unwrap();
+        assert_eq!(line_status[0] & 0x03, 0);
+        let mut ram = [0; 4];
+        machine.bus.read(RAM.start, &mut ram).unwrap();
+        assert_eq!(ram, [0x12, 0x34, 0x56, 0x78]);
+        let mut instruction = [0; 4];
+        machine.bus.fetch(BOOT_ROM.start, &mut instruction).unwrap();
+        assert_eq!(instruction, 0x0070_0093u32.to_le_bytes());
     }
 
     #[test]

@@ -20,19 +20,24 @@ silently.
 
 == Processor and execution environment
 
-Kiuas16 implements RV64GC: RV64I, M, A, F, D, C, Zicsr, and Zifencei, with
-XLEN 64. Instructions and data are little-endian. Instruction alignment is
-two bytes. The base integer register file has x0 through x31; x0 always reads
-zero and discards writes. F and D registers and their architectural status
-state are present. All arithmetic wraps as specified by RISC-V; address
-arithmetic does not wrap at a narrower legacy SC-16 width.
+The target contract requires RV64GC: RV64I, M, A, F, D, C, Zicsr, and
+Zifencei, with XLEN 64. Instructions and data are little-endian. Instruction
+alignment is two bytes. The base integer register file has x0 through x31; x0
+always reads zero and discards writes. F and D registers and their
+architectural status state are required. All arithmetic wraps as specified by
+RISC-V; address arithmetic does not wrap at a narrower legacy SC-16 width.
 
-The privileged execution environment has Machine, Supervisor, and User modes.
-It implements the CSR, trap, interrupt, delegation, counter, and return
-behavior required by xv6 and the privileged architecture. At minimum it
-supports PMP, Sv39, supervisor timer compare (Sstc), and the hardware page-table
+The target privileged execution environment has Machine, Supervisor, and User
+modes. It must implement the CSR, trap, interrupt, delegation, counter, and
+return behavior required by xv6 and the privileged architecture. At minimum it
+requires PMP, Sv39, supervisor timer compare (Sstc), and hardware page-table
 accessed/dirty-bit updates enabled by +menvcfg.ADUE+. Hypervisor and vector
-extensions are not implemented or advertised.
+extensions are not part of this target.
+
+The current implementation is a subset, not RV64GC: its capability profile
+reports I/M/A/C, Zicsr, and Zifencei, and explicitly lists F and D as
+unsupported. Required privileged features in that profile describe the
+xv6-target requirement and do not claim complete architectural conformance.
 
 Unsupported instruction encodings, privilege operations, CSR accesses, and
 translation modes trap or read back architecturally defined WARL values; they
@@ -127,9 +132,14 @@ A cold machine reset has the following defined state:
 * +fcsr+ is zero and floating-point status is Off.
 * +menvcfg+ and +mcounteren+ are zero. Firmware must explicitly enable ADUE,
   Sstc, and the +time+ counter before relying on them from S-mode.
-* +mcycle+, +minstret+, and the virtual +time+ counter start at zero. Device
-  reset state is defined by each device contract; reset does not initialize
-  guest RAM to a promised value.
+* +mcycle+, +minstret+, and the virtual +time+ counter start at zero.
+* A machine reset reinitializes the core and volatile device/controller state,
+  including the UART and PLIC. Boot ROM and guest RAM contents are preserved;
+  reset does not initialize guest RAM.
+
++Kiuas16Machine::reset()+ implements this reset policy. Its
++profile()+ reports the fixed board capabilities and the instance's configured
+RAM range, which may be smaller than the xv6 profile only for isolated tests.
 
 The Sytyke ROM is immutable to guest stores and executable at reset. Fetches
 from unmapped physical addresses and stores to ROM fault. BIOS implementation,

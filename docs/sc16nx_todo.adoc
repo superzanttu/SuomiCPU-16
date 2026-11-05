@@ -344,7 +344,7 @@ disk image were not changed. +
 +cargo test -- --test-threads=1+ suite passed (646 tests); +cargo fmt --check+,
 +cargo check --lib+, and the direct CLI refusal check passed.
 
-** [ ] [[nx-machine-contract]] *P0 / Specify Kiuas16 and the physical machine.*
+** [x] [[nx-machine-contract]] *P0 / Specify Kiuas16 and the physical machine.*
    Define RV64GC and required privileged facilities, reset state, hart
    identity, sparse RAM/ROM/MMIO map, clocks, access/fault rules, and limits.
    Include Sstc and the pinned startup's +menvcfg.ADUE+ behavior.
@@ -371,8 +371,17 @@ validators, and a ROM/RAM physical bus. Ten focused +kiuas16::tests+ pass.
 The bus rejects MMIO until device implementations exist, and rejects ROM
 writes and out-of-range RAM access. This does not implement instruction
 execution, applying reset state to a CPU, device register semantics,
-translation, interrupts, or runtime capability reporting. Keep this item
-unchecked.
+translation, interrupts, or runtime capability reporting at that checkpoint.
++
+*Acceptance evidence (2026-11-05):* The contract now distinguishes the
+required RV64GC target from the current reported I/M/A/C/Zicsr/Zifencei
+subset and documents machine reset semantics. Existing focused fixtures cover
+full-width physical addresses, RAM limits, unmapped ranges, and the explicit
+machine profile. A new constructed-machine test verifies reset PC/privilege/
+registers/time, RAM and ROM retention, volatile UART/PLIC clearing, and
+instance-specific RAM capability reporting. The relevant tests pass; the
+machine-contract child acceptance criteria are complete. This does not close
+the containing P0 milestone or claim full RV64GC implementation.
 
 ** [ ] [[nx-abi-contract]] *P0 / Define the RV64 guest ABI and language profiles.*
    Specify scalar/aggregate layout, alignment, endianness, qualifiers,
