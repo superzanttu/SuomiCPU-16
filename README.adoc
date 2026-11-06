@@ -122,6 +122,49 @@ The assembler now exposes all RV64M instructions, including signed/mixed/
 unsigned high-half products and word multiply/divide/remainder. A compiled
 arithmetic guest executes through production tools; this does not add
 128-bit C types or change compiler arithmetic lowering.
+Register word shifts +sllw/srlw/sraw+ now use the same checked assembler
+encoder. A compiled bit-field guest verifies low-five-bit shift counts,
+32-bit input truncation, and sign-extended results through production tools;
+CPU semantics and C operator lowering are unchanged.
+Scalar register pseudos +not/neg/negw/sext.w/seqz/snez/sltz/sgtz+ now
+emit checked single instructions. A compiled register-helper guest verifies
+full-width predicates and signed word results through production tools;
+this adds no new CPU instructions or C language features.
+Explicit +fence pred,succ+ accepts checked +i/o/r/w+ subsets and zero masks,
+while bare +fence+ retains its full-mask encoding. A compiled publication/
+MMIO guest executes through production tools; single-hart execution is not
+evidence of multi-hart ordering, and +fence.tso+ remains unsupported.
+The +li+ pseudo now materializes signed 64-bit constants, including the
+minimum value, without scratch registers or literal pools. Existing signed
+32-bit encodings remain unchanged. A compiled wide-constant guest executes
+through production tools; unsigned literals above the signed 64-bit maximum
+and constant expressions remain unsupported.
+Standard +jal target+, +jalr rs+, +jr rs+, and +jalr rd,rs,offset+
+now reuse checked jump encodings. A compiled direct/indirect call guest
+executes through production tools and preserves its caller state; this adds
+no long-call relaxation, relocations, or new inline-assembly clobber support.
+Halfword data directives +.half/.short/.2byte+ now emit checked little-endian
+16-bit tables with local label operands. A compiled table guest verifies
+signed/unsigned loads through production tools; directives do not implicitly
+align data or add relocatable object support.
+Exponent alignment +.p2align/.align+ now accepts exponents 0 through 15.
+Alignment directives use mapped ROM addresses, correcting +.balign+ above
+4 KiB. A compiled aligned-table guest executes through production tools;
+padding remains zero-filled, without optional fill/max-skip operands.
+The assembler now accepts +sfence.vma+ with zero, one, or two register
+operands. Executed tests cover supervisor Sv39 page remapping and privilege
+checks; guest-written +mstatus.TVM+ now reaches the existing SATP/fence gates.
+A compiled fence guest executes through production tools. This adds no TLB,
+multi-hart shootdown, or full xv6 acceptance claim.
+Counter-read pseudos +rdcycle/rdtime/rdinstret rd+ now emit checked read-only
+CSR accesses. A compiled sampling guest verifies exact virtual counter deltas
+through production tools; privilege tests exercise +mcounteren/scounteren+.
+These are machine counters, not host wall-clock measurements; RV32 high-half
+forms remain unsupported.
+Local +tail target+ now emits a checked +auipc t1/jalr zero+ pair, preserving
+the caller's return link and documenting its +t1+ scratch clobber. A compiled
+tail-call chain executes through production tools; this adds no compiler
+tail-call optimization, external symbols, relocations, or relaxation.
 GNU +aligned(n)+ attributes now give supported global objects power-of-two
 RAM alignment up to 65536 bytes, including initialized/BSS buffers and static
 pointer/callback tables. The aligned descriptor/page-table guest verifies

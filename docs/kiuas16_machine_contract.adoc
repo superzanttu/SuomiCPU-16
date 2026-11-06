@@ -286,8 +286,13 @@ Supported syntax is intentionally limited:
   including +fp+; comma-separated operands and +offset(register)+ memory.
 * +lui+, +auipc+, integer immediate arithmetic/logical/comparison/shift
   instructions, base register arithmetic/logical/comparison/shift instructions,
-  +addw/subw+, integer loads/stores, all six base
+  +addw/subw/sllw/srlw/sraw+, integer loads/stores, all six base
   conditional branches, +jal rd,target+, and +jalr rd,offset(base)+.
+  Register word shifts use the low 32 source bits and low five shift-count
+  bits. Logical right shift fills with zeros; arithmetic right shift
+  replicates bit 31. Every word result is sign-extended to XLEN, including
+  zero-count and logical shifts. Each emits one instruction without changing
+  CPU semantics or C operator lowering.
 * All RV64M operations: +mul/mulh/mulhsu/mulhu/div/divu/rem/remu+ and
   +mulw/divw/divuw/remw/remuw+, each with three integer register operands.
   High products select bits 127:64 of signed/signed, signed/unsigned,
@@ -297,9 +302,43 @@ Supported syntax is intentionally limited:
   overflow results do not trap. This exposes existing CPU semantics without
   adding C 128-bit types or new compiler operator lowering.
 * +nop+, +mv+, +ret+, +j+, +call+, +li+, and +la+.
-  +li+ accepts signed 32-bit constants and emits +lui/addiw+.
+  +li+ accepts signed 64-bit constants. Signed 32-bit values retain their
+  two-instruction +lui/addiw+ encoding; wider values append checked signed
+  12-bit chunks with +slli/addi+, using at most eight instructions and no
+  scratch register or literal pool. Sizing and emission share the same
+  deterministic expansion so labels, alignment, and ROM limits reflect its
+  actual width. Numeric syntax retains the signed 64-bit range, including
+  -9223372036854775808 and -0x8000000000000000; positive literals above
+  9223372036854775807 and constant expressions still diagnose.
   +la+ emits checked local PC-relative +auipc/addi+.
   +call+ is a checked local +jal+, not a long-call relocation.
+  +tail target+ emits an eight-byte +auipc t1/jalr zero,offset(t1)+ pair,
+  preserving +ra+ and clobbering +t1+. It accepts named/numeric local labels
+  or a byte displacement from the AUIPC PC. Targets must be four-byte aligned;
+  the checked signed upper-20/lower-12 split permits displacements from
+  -2147483648 through 2147481596 in four-byte steps. This shares +la+'s
+  displacement splitting and always reserves eight bytes, without relaxation.
+  There is no external-symbol relocation, alternate scratch-register form,
+  or automatic C tail-call optimization. Inline assembly must preserve any
+  live +t1+ value and its own caller state explicitly.
+* +jal target+ defaults the link destination to +ra+, sharing label resolution,
+  signed 21-bit displacement, and four-byte alignment checks with +jal rd,target+.
+  +jalr rs+ expands to +jalr ra,0(rs)+, and +jr rs+ to +jalr zero,0(rs)+.
+  +jalr rd,rs,offset+ shares the signed 12-bit offset checks and exact encoding
+  of +jalr rd,offset(rs)+. Each form emits one instruction without scratch
+  registers. Indirect jumps read the old base before writing a possibly
+  aliased destination, clear target bit zero, and link to PC+4; +jr+ writes
+  no link. Target accessibility/alignment remain CPU execution checks.
+  No long-call relaxation, relocation, or new compiler clobber support is added;
+  inline assembly that calls helpers must preserve its caller state explicitly.
+* Scalar pseudos +not/neg/negw/sext.w/seqz/snez/sltz/sgtz rd,rs+ each
+  emit one four-byte instruction without a scratch register.
+  +not+ is +xori rd,rs,-1+; +neg/negw+ are +sub/subw rd,zero,rs+;
+  +sext.w+ is +addiw rd,rs,0+. Word results sign-extend to XLEN and
+  negation wraps without trapping. +seqz+ is +sltiu rd,rs,1+;
+  +snez+ is +sltu rd,zero,rs+; +sltz/sgtz+ use signed +slt+ with
+  zero as the right/left operand respectively. Predicates compare the
+  full XLEN input and produce exactly zero or one.
 * Zero-test branch aliases +beqz/bnez/blez/bgez/bltz/bgtz rs,target+ and
   reversed-comparison aliases +bgt/ble/bgtu/bleu rs,rt,target+. Each emits
   one four-byte base branch with zero or swapped register operands.
@@ -309,7 +348,27 @@ Supported syntax is intentionally limited:
   Existing four-byte alignment and signed 13-bit displacement checks apply;
   no long-branch relaxation, extra scratch register, or compressed form is added.
 * +wfi+, +ecall+, +ebreak+, +mret+, +sret+, +fence+, and +fence.i+
-  with no operands. Explicit fence predecessor/successor lists are unsupported.
+  with no operands. Bare +fence+ remains +fence iorw,iorw+.
+  Explicit +fence pred,succ+ also accepts nonempty sets of unique lowercase
+  +i/o/r/w+ flags in any order, or +0+ for an empty mask. Input/output/read/write
+  bits are 8/4/2/1 respectively; predecessor and successor occupy bits 27:24
+  and 23:20, with zero mode/register fields. Duplicate/unknown flags and
+  missing/extra operands diagnose. +fence.i+ still takes no operands;
+  +fence.tso+ and other nonzero fence modes remain unsupported.
+  The existing sequential single-hart machine executes these fences without
+  register, RAM, or UART side effects. This is not a multi-hart ordering claim.
+* +sfence.vma+, +sfence.vma rs1+, and +sfence.vma rs1,rs2+ use integer
+  address/ASID registers, with omitted operands encoded as +zero+. Every
+  form emits one instruction with no destination register or implicit writes.
+  Immediate and memory operands are rejected. Existing CPU privilege rules
+  allow M-mode regardless of TVM and S-mode when +mstatus.TVM+ is clear;
+  U-mode traps.
+  TVM is writable from M-mode, hidden from +sstatus+, and also gates
+  supervisor SATP reads/writes. The current walker has no translation cache;
+  guest page-table updates are visible after the fence without selective
+  invalidation machinery. Executed coverage builds Sv39 tables in guest code,
+  remaps an alias in S-mode, and checks old/new values and privilege traps.
+  This adds neither a TLB implementation nor multi-hart shootdown support.
 * +csrrw/csrrs/csrrc+ and +csrrwi/csrrsi/csrrci+, plus
   +csrr/csrw/csrs/csrc/csrwi/csrsi/csrci+ pseudos. CSR addresses accept
   unsigned 12-bit numbers or the architectural names implemented by the
@@ -319,6 +378,15 @@ Supported syntax is intentionally limited:
   integer registers. The assembler encodes numeric CSR addresses even if the
   machine does not implement them; privilege, read-only, and implemented-CSR
   checks remain CPU execution semantics.
+* +rdcycle/rdtime/rdinstret rd+ each emit +csrrs rd,cycle/time/instret,zero+.
+  One integer destination is required; all are full-width RV64 reads, with no
+  counter writes even for +rd = zero+. Machine mode may read regardless of
+  enable bits; S-mode requires the corresponding +mcounteren+ bit and U-mode
+  requires both +mcounteren+ and +scounteren+. Disabled accesses trap without
+  writing the destination. Cycle/time progression uses the machine's virtual
+  step model, not host wall-clock time; retired counts track completed guest
+  instructions. No CPU counter semantics change. RV32 +rdcycleh/rdtimeh/rdinstreth+
+  forms are unsupported on this target.
 * +lr.w/lr.d+, +sc.w/sc.d+, +amoswap.w/amoswap.d+, +amoadd.w/amoadd.d+,
   +amoand.w/amoand.d+, +amoor.w/amoor.d+, +amoxor.w/amoxor.d+,
   +amomin.w/amomin.d+, +amomax.w/amomax.d+, +amominu.w/amominu.d+, and
@@ -342,11 +410,25 @@ Supported syntax is intentionally limited:
   Branch/jump numbers are byte displacements
   from the instruction PC. Instructions and direct branch/jump targets must
   be four-byte aligned; compressed instructions are not supported.
-* +.text+, +.globl/.global+, +.byte+, +.word+ (32 bits), +.dword+ (64 bits),
-  +.zero+, and power-of-two +.balign+. Data is little-endian; label data
+* +.text+, +.globl/.global+, +.byte+, +.half/.short/.2byte+ (16 bits),
+  +.word+ (32 bits), +.dword+ (64 bits),
+  +.zero+, power-of-two +.balign+, and +.p2align/.align+. Data is little-endian; label data
   operands resolve to absolute ROM addresses. Global declarations require a
   definition, but do not select an entry point or export an object symbol.
   Numeric operands reuse the shared assembler's integer-literal parser.
+  Halfword directives accept one or more comma-separated values from
+  -32768 through 65535, or resolved absolute local ROM addresses in that
+  range. All three spellings emit identical bytes without implicit alignment;
+  use +.balign+ where required by loads or following instructions. Missing
+  values, overflow, and unresolved labels diagnose rather than truncate.
+  +.p2align n+ and RISC-V +.align n+ align to +2^n+ bytes for exponents
+  0 through 15; zero means one-byte alignment, not an omitted directive.
+  All alignment forms round the mapped ROM address (base +0x1000+) upward,
+  not the file offset. This corrects +.balign+ for alignments above 4096
+  bytes; smaller alignments retain their layout. Padding is zero-filled,
+  not executable NOPs: guests must jump over it when necessary.
+  Directives accept exactly one operand; fill/max-skip operands, larger
+  alignments, and expressions diagnose. ROM bounds still apply to padding.
 * +#+ comments. Preprocessor directives, expressions (including label arithmetic),
   other sections/directives, F/D/C instructions, external
   symbols, relocatable objects, and ELF output are not supported.
@@ -422,6 +504,26 @@ cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_branch_aliases.c C:\path\
 cargo run --bin kiuas16-run -- --rom C:\path\branch-aliases-rom.bin --steps 10000 --deny-traps
 cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_multiply.c C:\path\multiply-rom.bin
 cargo run --bin kiuas16-run -- --rom C:\path\multiply-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_word_shifts.c C:\path\word-shifts-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\word-shifts-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_scalar_pseudos.c C:\path\scalar-pseudos-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\scalar-pseudos-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_fences.c C:\path\fences-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\fences-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_wide_immediates.c C:\path\wide-immediates-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\wide-immediates-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_jump_forms.c C:\path\jump-forms-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\jump-forms-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_halfwords.c C:\path\halfwords-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\halfwords-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_asm_alignment.c C:\path\asm-alignment-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\asm-alignment-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_sfence.c C:\path\sfence-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\sfence-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_counters.c C:\path\counters-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\counters-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_tail.c C:\path\tail-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\tail-rom.bin --steps 10000 --deny-traps
 cargo test --test kiuas16_compiler -j 1 -- --test-threads=1
 ----
 

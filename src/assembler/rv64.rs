@@ -150,6 +150,55 @@ fn immediate(opcode: u32, rd: u32, rs: u32, function: u32, value: u32) -> u32 {
     value << 20 | rs << 15 | function << 12 | rd << 7 | opcode
 }
 
+fn load_immediate(operands: &[&str], line: usize) -> Result<Vec<u32>, AssemblyError> {
+    let [destination, literal] = operands else {
+        return Err(error(line, "li expects 2 operands"));
+    };
+    let rd = register(destination, line)?;
+    let mut value = parse_number(literal, line)?;
+    let mut tails = Vec::new();
+    while i32::try_from(value).is_err() {
+        let low = (value << 52) >> 52;
+        tails.push(low);
+        value = ((i128::from(value) - i128::from(low)) >> 12) as i64;
+    }
+    let low = (value << 52) >> 52;
+    let upper = ((value - low) as u32) & 0xfffff000;
+    let mut words = vec![
+        upper | rd << 7 | 0x37,
+        immediate(0x1b, rd, rd, 0, signed(low, 12, line)?),
+    ];
+    for low in tails.into_iter().rev() {
+        words.push(immediate(0x13, rd, rd, 1, 12));
+        words.push(immediate(0x13, rd, rd, 0, signed(low, 12, line)?));
+    }
+    Ok(words)
+}
+
+fn fence_set(text: &str, line: usize) -> Result<u32, AssemblyError> {
+    if text == "0" {
+        return Ok(0);
+    }
+    let mut mask = 0;
+    for flag in text.chars() {
+        let bit = match flag {
+            'i' => 8,
+            'o' => 4,
+            'r' => 2,
+            'w' => 1,
+            _ => return Err(error(line, "fence set requires unique i/o/r/w flags or 0")),
+        };
+        if mask & bit != 0 {
+            return Err(error(line, "duplicate fence flag"));
+        }
+        mask |= bit;
+    }
+    if mask == 0 {
+        return Err(error(line, "empty fence set; use 0 for an empty mask"));
+    }
+    Ok(mask)
+}
+
 fn memory(text: &str, line: usize) -> Result<(u32, u32), AssemblyError> {
     let (offset, base) = text
         .split_once('(')
@@ -193,6 +242,15 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
         }
     };
     let word = match op {
+        "rdcycle" | "rdtime" | "rdinstret" => {
+            count(1)?;
+            let address = match op {
+                "rdcycle" => 0xc00,
+                "rdtime" => 0xc01,
+                _ => 0xc02,
+            };
+            immediate(0x73, reg(0)?, 0, 2, address)
+        }
         "csrrw" | "csrrs" | "csrrc" | "csrrwi" | "csrrsi" | "csrrci" | "csrr" | "csrw" | "csrs"
         | "csrc" | "csrwi" | "csrsi" | "csrci" => {
             let full = op.starts_with("csrr") && op != "csrr";
@@ -273,7 +331,24 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
                 | reg(0)? << 7
                 | 0x2f
         }
-        "nop" | "ret" | "wfi" | "ecall" | "ebreak" | "mret" | "sret" | "fence" | "fence.i" => {
+        "sfence.vma" => {
+            if args.len() > 2 {
+                return Err(error(line, "sfence.vma expects 0, 1, or 2 operands"));
+            }
+            let address = if args.is_empty() { 0 } else { reg(0)? };
+            let asid = if args.len() < 2 { 0 } else { reg(1)? };
+            0x12000073 | address << 15 | asid << 20
+        }
+        "fence" => {
+            let (predecessor, successor) = if args.is_empty() {
+                (15, 15)
+            } else {
+                count(2)?;
+                (fence_set(args[0], line)?, fence_set(args[1], line)?)
+            };
+            immediate(0x0f, 0, 0, 0, predecessor << 4 | successor)
+        }
+        "nop" | "ret" | "wfi" | "ecall" | "ebreak" | "mret" | "sret" | "fence.i" => {
             count(0)?;
             match op {
                 "nop" => 0x00000013,
@@ -283,7 +358,6 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
                 "ebreak" => 0x00100073,
                 "mret" => 0x30200073,
                 "sret" => 0x10200073,
-                "fence" => 0x0ff0000f,
                 _ => 0x0000100f,
             }
         }
@@ -291,37 +365,69 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
             count(2)?;
             immediate(0x13, reg(0)?, reg(1)?, 0, 0)
         }
-        "li" => {
+        "not" | "sext.w" | "seqz" => {
             count(2)?;
-            let value = number(1)?;
-            if i32::try_from(value).is_err() {
-                return Err(error(
-                    line,
-                    "li currently requires a signed 32-bit constant",
-                ));
-            }
-            let low = (value << 52) >> 52;
-            let upper = ((value - low) as u32) & 0xfffff000;
-            return Ok(vec![
-                upper | reg(0)? << 7 | 0x37,
-                immediate(0x1b, reg(0)?, reg(0)?, 0, signed(low, 12, line)?),
-            ]);
+            let (opcode, function, value) = match op {
+                "not" => (0x13, 4, 0xfff),
+                "sext.w" => (0x1b, 0, 0),
+                _ => (0x13, 3, 1),
+            };
+            immediate(opcode, reg(0)?, reg(1)?, function, value)
         }
-        "la" => {
+        "neg" | "negw" | "snez" | "sltz" | "sgtz" => {
             count(2)?;
-            let delta = relative(args[1])?;
+            let source = reg(1)?;
+            let (left, right) = if op == "sltz" {
+                (source, 0)
+            } else {
+                (0, source)
+            };
+            let function = match op {
+                "snez" => 3,
+                "sltz" | "sgtz" => 2,
+                _ => 0,
+            };
+            let upper = if matches!(op, "neg" | "negw") {
+                0x20
+            } else {
+                0
+            };
+            upper << 25
+                | right << 20
+                | left << 15
+                | function << 12
+                | reg(0)? << 7
+                | if op == "negw" { 0x3b } else { 0x33 }
+        }
+        "li" => {
+            return load_immediate(args, line);
+        }
+        "la" | "tail" => {
+            let tail = op == "tail";
+            count(if tail { 1 } else { 2 })?;
+            let delta = relative(args[if tail { 0 } else { 1 }])?;
+            if tail && delta % 4 != 0 {
+                return Err(error(line, "tail target must be four-byte aligned"));
+            }
             if i32::try_from(delta).is_err() {
                 return Err(error(
                     line,
-                    "la currently requires a signed 32-bit displacement",
+                    format!("{op} currently requires a signed 32-bit displacement"),
                 ));
             }
             let low = (delta << 52) >> 52;
             let high = (delta - low) >> 12;
             let upper = signed(high, 20, line)?;
+            let base = if tail { 6 } else { reg(0)? };
             return Ok(vec![
-                upper << 12 | reg(0)? << 7 | 0x17,
-                immediate(0x13, reg(0)?, reg(0)?, 0, signed(low, 12, line)?),
+                upper << 12 | base << 7 | 0x17,
+                immediate(
+                    if tail { 0x67 } else { 0x13 },
+                    if tail { 0 } else { base },
+                    base,
+                    0,
+                    signed(low, 12, line)?,
+                ),
             ]);
         }
         "lui" | "auipc" => {
@@ -367,16 +473,16 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
         }
         "add" | "sub" | "sll" | "slt" | "sltu" | "xor" | "srl" | "sra" | "or" | "and" | "mul"
         | "div" | "divu" | "rem" | "remu" | "addw" | "subw" | "mulh" | "mulhsu" | "mulhu"
-        | "mulw" | "divw" | "divuw" | "remw" | "remuw" => {
+        | "mulw" | "divw" | "divuw" | "remw" | "remuw" | "sllw" | "srlw" | "sraw" => {
             count(3)?;
             let (function, upper) = match op {
                 "sub" | "subw" => (0, 0x20),
-                "sll" => (1, 0),
+                "sll" | "sllw" => (1, 0),
                 "slt" => (2, 0),
                 "sltu" => (3, 0),
                 "xor" => (4, 0),
-                "srl" => (5, 0),
-                "sra" => (5, 0x20),
+                "srl" | "srlw" => (5, 0),
+                "sra" | "sraw" => (5, 0x20),
                 "or" => (6, 0),
                 "and" => (7, 0),
                 "mul" | "mulw" => (0, 1),
@@ -460,7 +566,13 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
                 | 0x63
         }
         "j" | "call" | "jal" => {
-            count(if op == "jal" { 2 } else { 1 })?;
+            if op == "jal" {
+                if !matches!(args.len(), 1 | 2) {
+                    return Err(error(line, "jal expects 1 or 2 operands"));
+                }
+            } else {
+                count(1)?;
+            }
             let delta = relative(args[args.len() - 1])?;
             if delta % 4 != 0 {
                 return Err(error(line, "jump target must be four-byte aligned"));
@@ -469,6 +581,7 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
             let rd = match op {
                 "j" => 0,
                 "call" => 1,
+                "jal" if args.len() == 1 => 1,
                 _ => reg(0)?,
             };
             (value >> 20) << 31
@@ -478,10 +591,22 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
                 | rd << 7
                 | 0x6f
         }
-        "jalr" => {
-            count(2)?;
-            let (base, offset) = memory(args[1], line)?;
-            immediate(0x67, reg(0)?, base, 0, offset)
+        "jr" | "jalr" => {
+            let (rd, base, offset) = if op == "jr" {
+                count(1)?;
+                (0, reg(0)?, 0)
+            } else {
+                match args.len() {
+                    1 => (1, reg(0)?, 0),
+                    2 => {
+                        let (base, offset) = memory(args[1], line)?;
+                        (reg(0)?, base, offset)
+                    }
+                    3 => (reg(0)?, reg(1)?, signed(number(2)?, 12, line)?),
+                    _ => return Err(error(line, "jalr expects 1, 2, or 3 operands")),
+                }
+            };
+            immediate(0x67, rd, base, 0, offset)
         }
         _ => return Err(error(line, format!("unsupported RV64 instruction {op:?}"))),
     };
@@ -553,36 +678,46 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
                 }
                 0
             }
-            ".byte" | ".word" | ".dword" => {
+            ".byte" | ".half" | ".short" | ".2byte" | ".word" | ".dword" => {
                 if operands.is_empty() {
                     return Err(error(line, "data directive requires at least one value"));
                 }
                 operands.len()
                     * match operation {
                         ".byte" => 1,
+                        ".half" | ".short" | ".2byte" => 2,
                         ".word" => 4,
                         _ => 8,
                     }
             }
-            ".zero" | ".balign" => {
+            ".zero" | ".balign" | ".p2align" | ".align" => {
                 if operands.len() != 1 {
                     return Err(error(line, "expected one size operand"));
                 }
                 let value = parse_number(operands[0], line)?;
+                let value = if matches!(operation, ".p2align" | ".align") {
+                    if !(0..=15).contains(&value) {
+                        return Err(error(line, "alignment exponent must be between 0 and 15"));
+                    }
+                    1_i64 << value
+                } else {
+                    value
+                };
                 let value = usize::try_from(value)
                     .ok()
                     .filter(|value| *value <= BOOT_ROM_BYTES)
                     .ok_or_else(|| error(line, "size outside ROM bounds"))?;
-                if operation == ".balign" {
+                if operation != ".zero" {
                     if !value.is_power_of_two() {
                         return Err(error(line, "alignment must be a positive power of two"));
                     }
-                    (value - offset % value) % value
+                    (value - (BOOT_ROM.start as usize + offset) % value) % value
                 } else {
                     value
                 }
             }
-            "li" | "la" => 8,
+            "li" => load_immediate(&operands, line)?.len() * 4,
+            "la" | "tail" => 8,
             _ => 4,
         };
         if !operation.starts_with('.') && offset % 4 != 0 {
@@ -622,10 +757,11 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
             ..
         } = statement;
         match operation {
-            ".text" | ".globl" | ".global" | ".zero" | ".balign" => {}
-            ".byte" | ".word" | ".dword" => {
+            ".text" | ".globl" | ".global" | ".zero" | ".balign" | ".p2align" | ".align" => {}
+            ".byte" | ".half" | ".short" | ".2byte" | ".word" | ".dword" => {
                 let width = match operation {
                     ".byte" => 1,
+                    ".half" | ".short" | ".2byte" => 2,
                     ".word" => 4,
                     _ => 8,
                 };

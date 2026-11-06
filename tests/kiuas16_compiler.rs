@@ -24,6 +24,329 @@ fn execute_with_budget(source: &str, steps: u64) -> (Kiuas16Machine, Vec<u8>) {
 }
 
 #[test]
+fn tail_calls_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_tail.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"Q*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn counter_reads_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_counters.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"T*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    for bytes in report.chunks_exact(8) {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 1);
+    }
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn translation_fence_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_sfence.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"V*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report[..8].try_into().unwrap()), 42);
+    assert_eq!(u64::from_le_bytes(report[8..].try_into().unwrap()), 0);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn exponent_alignment_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_asm_alignment.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"E*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report[..8].try_into().unwrap()), 42);
+    let table = u64::from_le_bytes(report[8..16].try_into().unwrap());
+    let entry = u64::from_le_bytes(report[16..].try_into().unwrap());
+    assert_eq!(table & 7, 0);
+    assert_eq!(entry & 15, 0);
+    assert!(table >= 0x1000 && entry > table && entry < 0x10000);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn halfword_data_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_halfwords.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"H*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    for (bytes, expected) in report.chunks_exact(8).zip([42i64, -1, 32768]) {
+        assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn jump_forms_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_jump_forms.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"J*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn wide_immediates_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_wide_immediates.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"L*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    for (bytes, expected) in report
+        .chunks_exact(8)
+        .zip([i64::MAX, i64::MIN, 0x123456789abcdef])
+    {
+        assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn explicit_fences_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_fences.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"F*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report[..8].try_into().unwrap()), 42);
+    assert_eq!(u64::from_le_bytes(report[8..].try_into().unwrap()), 1);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn scalar_pseudos_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_scalar_pseudos.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"P*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    for (bytes, expected) in report.chunks_exact(8).zip([42i64, -2147483606, 4]) {
+        assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn word_shifts_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_word_shifts.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"W*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 32];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    for (bytes, expected) in report
+        .chunks_exact(8)
+        .zip([42i64, 42, -1073741782, -2147483564])
+    {
+        assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
 fn rv64m_guest_executes_through_production_cli() {
     let source = include_str!("fixtures/kiuas16_multiply.c");
     let (mut machine, output) = execute(source);

@@ -135,9 +135,10 @@ fn parse_number(text: &str, line: usize) -> Result<i64, AssemblyError> {
             format!("expected a numeric value, got {text:?}"),
         ));
     }
-    let parsed = i64::from_str_radix(&normalized, base)
+    let parsed = i128::from_str_radix(&normalized, base)
         .map_err(|_| error(line, format!("expected a numeric value, got {text:?}")))?;
-    Ok(if negative { -parsed } else { parsed })
+    i64::try_from(if negative { -parsed } else { parsed })
+        .map_err(|_| error(line, format!("expected a numeric value, got {text:?}")))
 }
 
 fn register(text: &str, line: usize) -> Result<u16, AssemblyError> {

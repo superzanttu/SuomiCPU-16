@@ -1597,10 +1597,10 @@ their exact sequence is not ABI. Other modifiers, +asm goto+, file-scope
 assembly, records, separate units/ELF, full LP64D, firmware/xv6, and the
 parent P0 milestones remain open.
 +
-*Validation checkpoint:* Working tree based on +d9071d9+; one hart, M-mode
+*Validation checkpoint:* Working tree based on +bf77f08+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --workspace -j 1 -- --test-threads=1+ passes all 1001 tests,
-including all 222 compiler and 29 assembler integration tests.
++cargo test --workspace -j 1 -- --test-threads=1+ passes all 1045 tests,
+including all 232 compiler and 63 assembler integration tests.
 Compiler coverage includes independently assembled call partners and
 compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
@@ -1721,9 +1721,280 @@ destinations and zero destinations preserve the architectural inputs/results.
 Malformed register/count operands diagnose without replacing a prior ROM.
 +cargo test --test kiuas16_assembler --test kiuas16_compiler rv64m -j 1 -- --test-threads=1+
 passes all five focused tests. The workspace/build/format/whitespace checkpoint
-above includes this slice. This is not 128-bit C support, remaining RV64I word
-shift syntax, preprocessing, compressed assembly, relocation/ELF, full upstream
+above includes this slice. This is not 128-bit C support, preprocessing,
+compressed assembly, relocation/ELF, full upstream
 source coverage, or parent P0 completion.
++
+*Implemented slice / register word shifts:* A compiled bit-field consumer
+reproduced +unsupported RV64 instruction "sllw"+ even though the CPU already
+executes all three register word shifts. The existing checked register encoder
+now accepts +sllw/srlw/sraw+ with the RV64 word opcode and matching function
+bits. No CPU semantics, C operator lowering, scratch registers, or production
+fallbacks changed.
++tests/fixtures/kiuas16_word_shifts.c+ executes all three operations through
+the Rust compiler, assembler, machine, and production CLI. Within 10000 steps
+it emits UART +57 2a 0a+, returns 42, reports doublewords 42, 42,
+-1073741782, and -2147483564 starting at +0x80000000+, restores +sp/s0+,
+and traps zero times. Independent instruction words check ABI and numeric
+register spellings. Execution matrices check source truncation, low-five-bit
+count masking across zero/31/32/63/64 and full-width values, signed versus
+logical right shifts, and mandatory sign extension, including zero-count
+logical shifts. Destination/source aliasing, all-three-register aliasing, and
+zero destinations retain architectural results and unaffected inputs.
+Invalid counts/register operands diagnose with source lines without replacing
+a prior ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler word_shifts -j 1 -- --test-threads=1+
+passes all four focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. Preprocessing, compressed assembly,
+relocations/ELF, full upstream source coverage, and parent P0 milestones
+remain open.
++
+*Implemented slice / scalar register pseudos:* A compiled register-helper
+consumer reached assembly and reproduced +unsupported RV64 instruction "not"+.
+The checked encoder now accepts +not/neg/negw/sext.w/seqz/snez/sltz/sgtz+
+as standard single-instruction expansions. Arithmetic/word conversion uses
++xori/sub/subw/addiw+; predicates use +sltiu/sltu/slt+ with the appropriate
+zero operand. No scratch registers, CPU semantics, C operator lowering,
+external tools, or new language features are introduced.
++tests/fixtures/kiuas16_scalar_pseudos.c+ executes all eight operations through
+the Rust compiler, assembler, machine, and production CLI. Within 10000 steps
+it emits UART +50 2a 0a+, returns 42, reports doublewords 42, -2147483606,
+and four at +0x80000000/+0x80000008/+0x80000010+, restores +sp/s0+,
+and traps zero times. Independent instruction words and canonical expansions
+check each mnemonic with ABI/numeric register spellings. Execution matrices
+cover zero, negative, sign-boundary, upper-bits-only, and full-width inputs,
+wrapping negation including signed minima, word truncation/sign extension,
+full-XLEN signed/zero predicates, source/destination aliases, and zero
+sources/destinations. Invalid operand counts/registers diagnose with source
+lines without replacing an old ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler scalar_pseudos -j 1 -- --test-threads=1+
+passes all four focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. Preprocessing, compressed assembly, relocations/ELF,
+full upstream source coverage, and parent P0 milestones remain open.
++
+*Implemented slice / explicit fence sets:* A compiled publication/MMIO guest
+reproduced +fence expects 0 operands+ at +fence w,w+. The Rust assembler now
+encodes +fence pred,succ+ using unique lowercase +i/o/r/w+ sets in any order
+or +0+ for an empty mask. Mode and register fields remain zero; bare +fence+
+retains its full-mask encoding, and +fence.i+ remains operand-free.
+No CPU behavior, C builtin lowering, host synchronization service, or external
+fallback changed.
++tests/fixtures/kiuas16_fences.c+ publishes a RAM payload/ready flag and
+executes read/write/I/O fences through the Rust compiler, assembler, machine,
+and production CLI. Within 10000 steps it emits UART +46 2a 0a+, returns 42,
+reports payload 42 and ready one at +0x80000000/+0x80000008+, restores
++sp/s0+, and traps zero times. Independent instruction words check common
+fences, empty masks, bare +fence+, and unchanged +fence.i+. All 24 full-set
+permutations encode identically. Execution covers all 256 predecessor/
+successor mask pairs with exact bytes, all integer registers, RAM sentinels,
+empty UART, and zero traps. Malformed sets/counts, duplicate flags, register
+operands, +fence.i+ operands, and unsupported +fence.tso+ diagnose with source
+lines without replacing an old ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler explicit_fences -j 1 -- --test-threads=1+
+passes all four focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. This verifies encoding and sequential single-hart
+execution, not multi-hart memory ordering. Nonzero fence modes, preprocessing,
+compressed assembly, relocations/ELF, full upstream source coverage, and parent
+P0 milestones remain open.
++
+*Implemented slice / signed 64-bit immediate materialization:* A compiled
+wide-constant consumer reproduced +li currently requires a signed 32-bit
+constant+. The assembler now expands +li+ over the signed 64-bit range using
+the original +lui/addiw+ base followed by signed 12-bit +slli/addi+ chunks,
+with at most eight instructions and no scratch register or literal pool.
+Sizing and emission invoke the same expansion, preserving source-label
+positions, alignment, range checks, and exact ROM bounds. Existing signed
+32-bit encodings remain byte-identical.
+The shared numeric parser now applies the sign before checking the signed
+64-bit range, fixing rejection of the minimum value without admitting
+out-of-range values or changing the accepted bases/separator rules.
++tests/fixtures/kiuas16_wide_immediates.c+ executes wide address, maximum,
+minimum, and patterned constants through the Rust compiler, assembler,
+machine, and production CLI. Within 10000 steps it emits UART +4c 2a 0a+,
+returns 42, reports doublewords +0x7fffffffffffffff+, +0x8000000000000000+,
+and +0x0123456789abcdef+ starting at +0x80000000+, restores +sp/s0+,
+and traps zero times. Independent expansions and words check signed extrema,
+the unsigned-32 boundary, and unchanged old encodings. Execution checks each
+power-of-two boundary and its neighbors plus 128 deterministic bit patterns,
+ABI/numeric destinations, zero destinations, and all unaffected registers.
+Forward/backward numeric labels, +la+, jumps, data addresses, alignment, and
+exact-fit/overflow ROM cases check layout. Decimal/hexadecimal minimum data
+values work; invalid registers/counts, overflow, malformed constants, and
+unsupported expressions diagnose without replacing a prior ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler wide_immediates -j 1 -- --test-threads=1+
+passes all five focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. Positive literals above the signed 64-bit maximum,
+expressions, preprocessing, compressed assembly, relocations/ELF, full upstream
+source coverage, and parent P0 milestones remain open.
++
+*Implemented slice / standard call and jump forms:* A compiled direct/indirect
+call consumer reproduced +jal expects 2 operands+ at +jal target+.
+The assembler now accepts +jal target+ with implicit +ra+, +jalr rs+ with
+implicit +ra+ and zero offset, +jr rs+ without a link, and
++jalr rd,rs,offset+ alongside the existing +jalr rd,offset(rs)+.
+All forms share the existing checked JAL/JALR encodings and emit one
+instruction without a scratch register. No CPU semantics, compiler call ABI,
+inline-assembly clobber support, external tool, or production fallback changed.
++tests/fixtures/kiuas16_jump_forms.c+ saves its caller link on a 16-byte-aligned
+stack, calls a local helper directly, calls another indirectly, returns with
++jr ra+, and restores its caller state before continuing compiled C.
+The Rust compiler, assembler, machine, and production CLI produce UART
++4a 2a 0a+, return/report 42 at +0x80000000+, restored +sp/s0+, and zero
+traps within 10000 steps. Independent instruction words and canonical
+comparisons check implicit links, no-link returns, ABI/numeric registers,
+offset extrema, and aliased base/destination. Direct jumps retain named/numeric
+label resolution and range/alignment limits. Indirect execution checks exact
+PC+4 links, all unaffected registers, both target low-bit values, positive/
+negative offset boundaries, and source/destination aliases including +ra+
+and zero destinations. Malformed counts/registers, undefined labels,
+misaligned/out-of-range direct targets, and invalid indirect offsets diagnose
+with source lines without replacing an old ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler jump_forms -j 1 -- --test-threads=1+
+passes all four focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. Long-call relaxation, relocations/ELF, preprocessing,
+compressed assembly, full upstream source coverage, and parent P0 milestones
+remain open.
++
+*Implemented slice / halfword data tables:* A compiled signed/unsigned table
+consumer reproduced +unsupported directive ".half"+. The existing checked
+data sizing/emission path now accepts +.half/.short/.2byte+ as equivalent
+two-byte directives. Values use the existing numeric/local-label resolver,
+little-endian output, and signed-or-unsigned width bounds: -32768 through
+65535. No implicit alignment, CPU changes, C lowering changes, external
+fallback, or relocatable object semantics are added.
++tests/fixtures/kiuas16_halfwords.c+ embeds all three spellings, skips its data,
+and reads it with +lh/lhu+ through the Rust compiler, assembler, machine,
+and production CLI. Within 10000 steps it emits UART +48 2a 0a+, returns 42,
+reports doublewords 42, -1, and 32768 starting at +0x80000000+, restores
++sp/s0+, and traps zero times. Independent bytes cover signed/unsigned
+boundaries, multiple operands, odd-address data, and untouched neighboring
+bytes. Executed tables check signed extension, unsigned loads, forward/backward
+numeric label addresses, and following instruction alignment. Exact-fit ROM
+data, a near-limit encodable local address, ROM overflow, and a label at
++0x10000+ check layout and prevent address truncation. Invalid values,
+missing/empty operands, unresolved labels, and misaligned following
+instructions diagnose; CLI failures preserve an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler halfword_data -j 1 -- --test-threads=1+
+passes all four focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. Preprocessing, other directives, compressed
+assembly, relocations/ELF, full upstream source coverage, and parent P0
+milestones remain open.
++
+*Implemented slice / exponent alignment:* A compiled aligned-table consumer
+reproduced a following-instruction alignment failure because +.p2align/.align+
+were not recognized. Both directives now share checked sizing and zero-filled
+emission with +.balign+, accepting exponents 0 through 15 (one through 32768
+bytes). Alignment rounds mapped ROM addresses, fixing the old +.balign+
+file-offset calculation above 4096-byte alignment while preserving smaller
+layouts. Optional fill/max-skip operands and larger alignments diagnose.
+No CPU semantics, C object alignment rules, external tools, or fallback changed.
++tests/fixtures/kiuas16_asm_alignment.c+ skips padding and an aligned ROM table,
+loads the table value, and checks table/instruction addresses through the Rust
+compiler, assembler, machine, and production CLI. Within 10000 steps it emits
+UART +45 2a 0a+, returns/reports 42, reports table/entry addresses at
++0x80000008/+0x80000010+ aligned to eight/16 bytes, restores +sp/s0+,
+and traps zero times. Independent layout checks cover every exponent,
+equivalent +.balign+ values, aligned/unaligned offsets, and offsets crossing
+the ROM base-alignment boundary. Execution checks mapped addresses +0x2000+
+and +0x2010+, forward/backward numeric labels, zero-length alignment, exact
+data bytes, and zero-filled padding. Exact-fit ROM padding succeeds; added
+data beyond the end, invalid/oversized exponents, extra operands, unresolved
+values, and misaligned following instructions diagnose. CLI failures
+preserve an old ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler exponent_alignment -j 1 -- --test-threads=1+
+passes all four focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. Executable NOP padding, optional alignment operands,
+preprocessing, other directives, compressed assembly, relocations/ELF, full
+upstream source coverage, and parent P0 milestones remain open.
++
+*Implemented slice / translation-fence assembly and TVM:* A compiled fence
+consumer reproduced +unsupported RV64 instruction "sfence.vma"+. The checked
+encoder now accepts zero, one, or two integer register operands, filling
+omitted address/ASID fields with zero. Each emits one instruction without
+register writes. Privilege execution exposed a coupled CPU bug: guest writes
+to +mstatus.TVM+ were masked out, leaving existing supervisor SATP/fence
+checks unreachable. The writable mask now includes TVM while +sstatus+
+continues to hide and preserve it.
++tests/fixtures/kiuas16_sfence.c+ executes all three forms through the Rust
+compiler, assembler, machine, and production CLI. Within 10000 steps it emits
+UART +56 2a 0a+, returns/reports 42 at +0x80000000+, reports unchanged
+bare SATP at +0x80000008+, restores +sp/s0+, and traps zero times.
+Independent instruction words and all 1024 address/ASID register pairs check
+encoding. Executed privilege cases allow M-mode (including TVM) and S-mode
+without TVM, reject U-mode and S-mode with TVM, and assert exact fault PC/
+instruction, untouched operand registers/RAM, and no UART writes.
+Guest CSR set/clear and +sstatus+ isolation tests verify writable TVM and
+supervisor SATP read/write rejection without unintended continuation.
+A separate assembled guest builds three-level Sv39 tables and physical
+payloads, configures PMP/SATP, enters S-mode, reads 19 through a virtual
+alias, updates its leaf PTE, executes a register-scoped fence, then reads 42.
+It preserves both physical payloads, reports the updated PTE and unchanged
+SATP, and waits in S-mode without traps within 160 steps. No host page-table
+construction or external tool supplies the behavior.
+Invalid registers, immediate/memory operands, and extra/empty operands
+diagnose with source lines without replacing an old ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler translation_fence -j 1 -- --test-threads=1+
+passes all six focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. The existing walker has no TLB; selective cache
+invalidation, multi-hart shootdowns, preprocessing, compressed assembly,
+relocations/ELF, full upstream source coverage, and parent P0 milestones remain
+open.
++
+*Implemented slice / counter-read pseudos:* A compiled counter-sampling
+consumer reproduced +unsupported RV64 instruction "rdcycle"+. The assembler
+now accepts +rdcycle/rdtime/rdinstret rd+, encoding read-only CSRRS accesses
+to +cycle/time/instret+ with zero source. Each emits one instruction and
+requires one checked integer destination. No CPU counter behavior, compiler
+language support, host timing service, or external fallback changed.
++tests/fixtures/kiuas16_counters.c+ samples adjacent reads and verifies exact
+one-step deltas for each counter through the Rust compiler, assembler,
+machine, and production CLI. Within 10000 steps it emits UART +54 2a 0a+,
+returns 42, reports three doublewords equal to one starting at +0x80000000+,
+restores +sp/s0+, and traps zero times. Independent words and all destination
+registers agree with canonical CSRRS forms. Executed tests seed cycle/retired
+counters with zero, a 32-bit boundary, a wide pattern, signed maximum, and
+unsigned maximum, checking exact full-width results, wrapping progression,
+zero destinations, and all unaffected registers. Time reads check exact
+virtual-step progression. Privilege matrices use guest-written
++mcounteren/scounteren+ for every counter in M/S/U mode, enabling the selected
+bit independently while setting unrelated bits when it is disabled. Allowed
+reads continue; denied reads trap with exact instruction/PC and retain the old
+destination. Invalid operands diagnose without replacing a prior ROM, and
+RV32 high-half pseudos remain rejected.
++cargo test --test kiuas16_assembler --test kiuas16_compiler counter_reads -j 1 -- --test-threads=1+
+passes all five focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. This is not host wall-clock timing, RV32 support,
+preprocessing, compressed assembly, relocations/ELF, full upstream source
+coverage, or parent P0 completion.
++
+*Implemented slice / local tail-call assembly:* A compiled local call chain
+reproduced +unsupported RV64 instruction "tail"+. The assembler now emits
+the standard +auipc t1/jalr zero+ pair for +tail target+, preserving +ra+
+and explicitly clobbering +t1+. The shared +la/tail+ address split checks
+signed upper-20/lower-12 fields, while tail also requires a four-byte-aligned
+target. Named/numeric labels and byte displacements resolve from the AUIPC
+PC; first-pass sizing reserves the complete eight-byte sequence. No CPU
+semantics, C call lowering, automatic tail optimization, external tools, or
+production fallback changed.
++tests/fixtures/kiuas16_tail.c+ saves its caller link and a live scratch value,
+calls a helper which tail-calls another, restores the live value, and returns
+directly to the original continuation. Through the Rust compiler, assembler,
+machine, and production CLI it emits UART +51 2a 0a+, returns/reports 42
+at +0x80000000+, restores +sp/s0+, and traps zero times within 10000 steps.
+Independent instruction words check zero/positive/negative offsets,
+low-immediate rounding, a displacement beyond JAL range, and both checked
+pair limits. Executed forward/backward calls and chained numeric-label tails
+verify exact scratch values, preserved links, unaffected registers, skipped
+continuations, data-label addresses, and alignment. Exact-fit ROM output
+succeeds; an overflowing pair diagnoses. Missing/extra operands, undefined
+labels, misaligned targets, and unencodable displacements diagnose with source
+lines without replacing an old ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler tail_calls -j 1 -- --test-threads=1+
+passes all four focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. Alternate scratch-register syntax, compiler
+tail-call optimization, external-symbol relocations/ELF, relaxation,
+preprocessing, compressed assembly, full upstream source coverage, and parent
+P0 milestones remain open.
 +
 *Execution evidence:* +cargo test --test kiuas16_assembler --test kiuas16_runtime
 --bin kiuas16-asm -j 1 -- --test-threads=1+ checks independent instruction
