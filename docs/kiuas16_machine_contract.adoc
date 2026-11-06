@@ -319,7 +319,13 @@ Supported syntax is intentionally limited:
   unsigned maximum diagnose. Other instructions/directives and the legacy
   assembler retain their existing numeric ranges; unsigned masks are not
   reinterpreted as negative signed immediate operands. C suffixes remain
-  unsupported; additive expressions are accepted only in integer data operands.
+  unsupported; additive expressions are accepted in integer data operands and
+  as one numeric addition or subtraction on a local PC-relative target.
+  Branches, jumps/calls, +la+, and +tail+ accept named or directional numeric
+  local labels with one addend; +.+ denotes the current instruction for these
+  targets. Direct numeric displacements retain their existing meaning.
+  Unsupported expressions, undefined labels, overflow, misalignment, and
+  out-of-range displacements diagnose.
   +la+ emits checked local PC-relative +auipc/addi+.
   +call+ is a checked local +jal+, not a long-call relocation.
   +tail target+ emits an eight-byte +auipc t1/jalr zero,offset(t1)+ pair,

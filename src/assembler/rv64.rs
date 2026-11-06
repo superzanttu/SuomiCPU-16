@@ -458,6 +458,54 @@ fn memory(text: &str, line: usize) -> Result<(u32, u32), AssemblyError> {
     Ok((register(base.trim(), line)?, signed(offset, 12, line)?))
 }
 
+fn local_target_delta(
+    text: &str,
+    labels: &Labels<'_>,
+    statement: &Statement<'_>,
+) -> Result<Option<i64>, AssemblyError> {
+    let text = text.trim();
+    if text == "." {
+        return Ok(Some(0));
+    }
+    let mut operators = text
+        .char_indices()
+        .filter(|(index, character)| *index > 0 && matches!(character, '+' | '-'));
+    let Some((index, operation)) = operators.next() else {
+        return Ok(None);
+    };
+    if operators.next().is_some() {
+        return Err(error(
+            statement.line,
+            "address addend accepts one label and one numeric offset",
+        ));
+    }
+    let base_text = text[..index].trim();
+    let addend_text = text[index + 1..].trim();
+    let base = if base_text == "." {
+        statement.offset as i64
+    } else if let Some(target) = labels.resolve(base_text, statement)? {
+        target as i64
+    } else if symbol(base_text) {
+        return Err(error(
+            statement.line,
+            format!("undefined label {base_text:?}"),
+        ));
+    } else {
+        return Ok(None);
+    };
+    let addend = parse_number(addend_text, statement.line)?;
+    let target = if operation == '+' {
+        base.checked_add(addend)
+    } else {
+        base.checked_sub(addend)
+    }
+    .ok_or_else(|| error(statement.line, "address addend overflow"))?;
+    target
+        .checked_sub(statement.offset as i64)
+        .map(Some)
+        .ok_or_else(|| error(statement.line, "address displacement overflow"))
+}
+
 fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, AssemblyError> {
     let Statement {
         line,
@@ -481,6 +529,8 @@ fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, As
     let relative = |text: &str| -> Result<i64, AssemblyError> {
         if let Some(target) = labels.resolve(text, statement)? {
             Ok(target as i64 - *offset as i64)
+        } else if let Some(delta) = local_target_delta(text, labels, statement)? {
+            Ok(delta)
         } else if symbol(text) {
             Err(error(line, format!("undefined label {text:?}")))
         } else {

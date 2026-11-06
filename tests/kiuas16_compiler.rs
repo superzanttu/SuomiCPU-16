@@ -24,6 +24,47 @@ fn execute_with_budget(source: &str, steps: u64) -> (Kiuas16Machine, Vec<u8>) {
 }
 
 #[test]
+fn address_addends_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_address_addends.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"E*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    for (bytes, expected) in report[8..].chunks_exact(8).zip([23u64, 42]) {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    let address = u64::from_le_bytes(report[..8].try_into().unwrap());
+    assert!((0x1010..0x10000).contains(&address));
+    assert_eq!(address % 8, 0);
+    let table_address = address - 16;
+    let mut table = [0; 24];
+    machine.bus_mut().read(table_address, &mut table).unwrap();
+    for (bytes, expected) in table.chunks_exact(8).zip([19u64, 23, 42]) {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
 fn rom_origin_guest_executes_through_production_cli() {
     let source = include_str!("fixtures/kiuas16_asm_org.c");
     let (mut machine, output) = execute(source);

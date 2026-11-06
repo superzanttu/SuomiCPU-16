@@ -1597,13 +1597,15 @@ their exact sequence is not ABI. Other modifiers, +asm goto+, file-scope
 assembly, records, separate units/ELF, full LP64D, firmware/xv6, and the
 parent P0 milestones remain open.
 +
-*Validation checkpoint:* Working tree based on +49e1bd35+; one hart, M-mode
+*Validation checkpoint:* Working tree based on +b4a19bd+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --workspace -j 1 -- --test-threads=1+ passes all 1087 tests,
-including all 240 compiler and 96 assembler integration tests.
++cargo test --workspace -- --test-threads=1+ passes all 1091 tests,
+including all 241 compiler and 99 assembler integration tests.
 Compiler coverage includes independently assembled call partners and
 compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
+The local PC-relative target-addend guest also executes through the production
+compiler/assembler/runner and CLI with UART +45 2a 0a+ and zero traps.
 +cargo check --lib --bin kiuas16-cc --bin kiuas16-asm --bin kiuas16-run -j 1+,
 +cargo fmt --check+, and +git diff --check+ pass. Remaining P0 completion
 gates are unchanged.
@@ -2244,11 +2246,41 @@ sections, preprocessing, relocatable objects/ELF, full upstream source
 coverage, and parent P0 completion remain open. The workspace/build/format/
 whitespace checkpoint above includes this slice.
 +
+*Implemented slice / local PC-relative target addends:* A compiled inline-
+assembly guest reproduced rejection of a symbolic address addend. Branch,
+jump/call, +la+, and +tail+ targets now accept +.+ or a named/directional
+numeric local label, optionally followed by one numeric addend. Resolution is
+checked against the instruction's PC and reuses the existing range,
+alignment, and PC-relative encodings; other instruction operands, multiple
+addends, external relocations, CPU behavior, and legacy assembly are
+unchanged.
++tests/fixtures/kiuas16_address_addends.c+ uses +j label + 4+, +la label + 16+,
+and +ld -8(register)+ to reach an aligned embedded table. Through the
+production Rust compiler/assembler/runner it emits UART +45 2a 0a+, returns
+42, and traps zero times within 10000 steps. The execution harness verifies
+the reported address, loaded value, table bytes, waiting state, and restored
++sp/s0+; the production CLI independently executes the same guest.
+Assembler tests compare encoded bytes against equivalent direct displacements
+for named/numeric labels, +.+, branches, jumps, calls, +la+, and +tail+.
+An assembled guest executes branch/call/jump addends and verifies the
+register result and return link. Undefined labels, malformed/multiple
+addends, overflow, misalignment, out-of-range values, and addends in
+non-target operands diagnose with source lines; CLI failure preserves
+source and an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler address_addends -j 1 -- --test-threads=1+
+passes all four focused tests. General instruction expressions, external
+relocations, preprocessing, relocatable objects/ELF, full upstream source
+coverage, and parent P0 completion remain open. The workspace/build/format/
+whitespace checkpoint above includes this slice.
++
 *Execution evidence:* +cargo test --test kiuas16_assembler --test kiuas16_runtime
---bin kiuas16-asm -j 1 -- --test-threads=1+ checks independent instruction
+--test kiuas16_compiler --bin kiuas16-asm -j 1 -- --test-threads=1+ checks
+independent instruction
 bytes and branch/jump bounds, signed constant edges, label/data layout,
 line-numbered invalid-input diagnostics, source/output preservation, and
-production CLI execution. +tests/fixtures/kiuas16_storage.S+ performs nested
+production CLI execution. Compiled guests now exercise tested assembler
+behavior through the Rust-native production pipeline; broader compiler-
+generated source coverage remains open. +tests/fixtures/kiuas16_storage.S+ performs nested
 stack calls and UART output, then guest-owned modern Virtio negotiation,
 RAM queue construction, read/write/flush, completion/IRQ observation,
 acknowledgement, and reset. Disposable read-only and writable images have

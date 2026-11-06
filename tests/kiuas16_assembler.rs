@@ -7,6 +7,83 @@ use suomicpu16::kiuas16::runtime::run_headless;
 use suomicpu16::kiuas16::{BOOT_ROM_BYTES, Kiuas16Machine};
 
 #[test]
+fn local_address_addends_match_independent_pcrel_encodings() {
+    for (with_label, direct) in [
+        ("la a0, target + 4\nnop\ntarget: nop", "la a0, 16\nnop\nnop"),
+        ("la a0, . + 8\nnop", "la a0, 8\nnop"),
+        ("la a0, 1f - 4\nnop\n1: nop", "la a0, 8\nnop\nnop"),
+        ("j target+4\nnop\ntarget: nop", "j 12\nnop\nnop"),
+        ("j .+8\nnop", "j 8\nnop"),
+        ("j 1f+4\nnop\n1: nop\nnop", "j 12\nnop\nnop\nnop"),
+        (
+            "beqz a0, target+4\nnop\ntarget: nop",
+            "beqz a0, 12\nnop\nnop",
+        ),
+        ("call target - 4\ntarget: nop", "call 0\nnop"),
+        ("tail target+4\ntarget: nop", "tail 12\nnop"),
+    ] {
+        assert_eq!(
+            assemble_boot_rom(with_label).unwrap(),
+            assemble_boot_rom(direct).unwrap(),
+            "{with_label}"
+        );
+    }
+    let rom = assemble_boot_rom("la a0, .").unwrap();
+    assert_eq!(&rom[..4], &0x00000517u32.to_le_bytes());
+    assert_eq!(&rom[4..8], &0x00050513u32.to_le_bytes());
+}
+
+#[test]
+fn local_address_addends_execute_calls_branches_and_jump_skips() {
+    let rom = assemble_boot_rom(
+        "li a0, 19\nbeqz zero, 1f+4\n\
+         1: addi a0, a0, -100\naddi a0, a0, 23\ncall 2f+4\nj 3f+4\n\
+         2: addi a0, a0, -99\naddi a0, a0, 0\nret\n\
+         3: addi a0, a0, -98\nwfi",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let report = run_headless(&mut machine, 40, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(42));
+    assert_eq!(machine.core().register(1), Some(0x1018));
+}
+
+#[test]
+fn local_address_addends_reject_invalid_targets_without_changing_other_operands() {
+    for source in [
+        "j missing+4",
+        "la a0, missing-4",
+        "beqz a0, missing + 4",
+        "j target+4+8\ntarget: nop",
+        "la a0, target-4-8\ntarget: nop",
+        "j target+",
+        "la a0, .-",
+        "j target+9223372036854775807\ntarget: nop",
+        "j target--9223372036854775808\ntarget: nop",
+        "j target+1\ntarget: nop",
+        "beqz a0, target-1\ntarget: nop",
+        "tail target+2\ntarget: nop",
+        "addi a0, zero, target+4",
+        "ld a0, target+4(t0)",
+    ] {
+        let diagnostic = assemble_boot_rom(source).unwrap_err().to_string();
+        assert!(diagnostic.starts_with("line "), "{source}: {diagnostic}");
+        let files = Files::new();
+        std::fs::write(files.0.join("guest.S"), source).unwrap();
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.assemble();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
 fn rom_origin_matches_offsets_and_every_checked_fill_byte() {
     for fill in -128i64..=255 {
         let rom = assemble_boot_rom(&format!(".byte 19\n.org 8, {fill}\n.byte 23")).unwrap();
@@ -248,8 +325,6 @@ fn data_location_invalid_inputs_preserve_outputs_and_nondata_rejections() {
         ".: .word 19",
         ".globl .\n.word 19",
         "li a0, .",
-        "la a0, .",
-        "j .",
         ".space .",
         ".balign .",
         ".zero 1, .",
@@ -393,7 +468,6 @@ fn data_expressions_invalid_inputs_preserve_outputs_and_other_operand_limits() {
         ".word 01 + 1",
         ".word 0x__ff + 1",
         "li a0, 19 + 23",
-        "la a0, target + 4\ntarget: wfi",
         ".space 1+1",
         ".balign 4+4",
         ".zero 1, 19+23",
