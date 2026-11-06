@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{AssemblyError, error, parse_number};
+use super::{AssemblyError, error, parse_integer, parse_number};
 use crate::kiuas16::{BOOT_ROM, BOOT_ROM_BYTES};
 
 struct Statement<'a> {
@@ -65,11 +65,101 @@ impl Labels<'_> {
 }
 
 fn symbol(text: &str) -> bool {
+    if text == "." {
+        return false;
+    }
     let mut chars = text.chars();
     chars
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '.')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+fn unquoted(text: &str, delimiter: char) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if !quoted && character == delimiter {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn string_data(operands: &[&str], terminated: bool, line: usize) -> Result<Vec<u8>, AssemblyError> {
+    if operands.is_empty() {
+        return Err(error(line, "string directive requires at least one string"));
+    }
+    let mut data = Vec::new();
+    for operand in operands {
+        let body = operand
+            .strip_prefix('"')
+            .ok_or_else(|| error(line, "expected a double-quoted string"))?;
+        let mut bytes = body.bytes().peekable();
+        loop {
+            let byte = bytes
+                .next()
+                .ok_or_else(|| error(line, "unterminated assembly string"))?;
+            if byte == b'"' {
+                if bytes.next().is_some() {
+                    return Err(error(line, "unexpected text after assembly string"));
+                }
+                break;
+            }
+            let value = if byte != b'\\' {
+                byte
+            } else {
+                let escape = bytes
+                    .next()
+                    .ok_or_else(|| error(line, "unterminated assembly string escape"))?;
+                match escape {
+                    b'a' => 7,
+                    b'b' => 8,
+                    b'f' => 12,
+                    b'n' => 10,
+                    b'r' => 13,
+                    b't' => 9,
+                    b'v' => 11,
+                    b'\\' | b'"' | b'\'' => escape,
+                    b'0'..=b'7' | b'x' => {
+                        let radix = if escape == b'x' { 16 } else { 8 };
+                        let mut value = if radix == 8 { escape - b'0' } else { 0 };
+                        let mut count = if radix == 8 { 1 } else { 0 };
+                        while let Some(digit) = bytes
+                            .peek()
+                            .and_then(|byte| char::from(*byte).to_digit(radix))
+                        {
+                            if radix == 8 && count == 3 {
+                                break;
+                            }
+                            value = value
+                                .checked_mul(radix as u8)
+                                .and_then(|value| value.checked_add(digit as u8))
+                                .ok_or_else(|| error(line, "string byte escape out of range"))?;
+                            count += 1;
+                            bytes.next();
+                        }
+                        if count == 0 {
+                            return Err(error(line, "hex string escape requires a digit"));
+                        }
+                        value
+                    }
+                    _ => return Err(error(line, "unsupported assembly string escape")),
+                }
+            };
+            data.push(value);
+        }
+        if terminated {
+            data.push(0);
+        }
+    }
+    Ok(data)
 }
 
 fn register(text: &str, line: usize) -> Result<u32, AssemblyError> {
@@ -150,12 +240,168 @@ fn immediate(opcode: u32, rd: u32, rs: u32, function: u32, value: u32) -> u32 {
     value << 20 | rs << 15 | function << 12 | rd << 7 | opcode
 }
 
+fn full_width_literal(text: &str, line: usize) -> Result<i64, AssemblyError> {
+    let value = parse_integer(text, line)?;
+    if let Ok(value) = i64::try_from(value) {
+        return Ok(value);
+    }
+    u64::try_from(value)
+        .map(|value| i64::from_le_bytes(value.to_le_bytes()))
+        .map_err(|_| error(line, "64-bit literal out of range"))
+}
+
+fn data_width(operation: &str) -> Option<usize> {
+    match operation {
+        ".byte" => Some(1),
+        ".half" | ".short" | ".2byte" => Some(2),
+        ".word" | ".long" | ".int" | ".4byte" => Some(4),
+        ".dword" | ".quad" | ".8byte" => Some(8),
+        _ => None,
+    }
+}
+
+fn data_expression(
+    text: &str,
+    labels: &Labels<'_>,
+    statement: &Statement<'_>,
+    location: usize,
+) -> Result<i128, AssemblyError> {
+    let mut rest = text.trim();
+    let mut result = 0i128;
+    let mut subtract = false;
+    loop {
+        let negative = rest.starts_with('-');
+        if negative || rest.starts_with('+') {
+            rest = rest[1..].trim_start();
+        }
+        let end = rest.find(['+', '-']).unwrap_or(rest.len());
+        let term = rest[..end].trim();
+        if term.is_empty() {
+            return Err(error(statement.line, "expected a data expression term"));
+        }
+        let value = if term == "." {
+            i128::from(BOOT_ROM.start) + location as i128
+        } else if let Some(target) = labels.resolve(term, statement)? {
+            i128::from(BOOT_ROM.start) + target as i128
+        } else if symbol(term) {
+            return Err(error(statement.line, format!("undefined label {term:?}")));
+        } else {
+            let value = parse_integer(term, statement.line)?;
+            u64::try_from(value)
+                .map(i128::from)
+                .map_err(|_| error(statement.line, "64-bit literal out of range"))?
+        };
+        result = if subtract ^ negative {
+            result.checked_sub(value)
+        } else {
+            result.checked_add(value)
+        }
+        .ok_or_else(|| error(statement.line, "data expression overflow"))?;
+        if end == rest.len() {
+            return Ok(result);
+        }
+        subtract = rest.as_bytes()[end] == b'-';
+        rest = rest[end + 1..].trim_start();
+    }
+}
+
+fn check_data_value(value: i128, width: usize, line: usize) -> Result<(), AssemblyError> {
+    let bits = width * 8;
+    if !(-(1_i128 << (bits - 1))..(1_i128 << bits)).contains(&value) {
+        return Err(error(line, "data value out of range"));
+    }
+    Ok(())
+}
+
+fn fill_byte(text: &str, line: usize) -> Result<u8, AssemblyError> {
+    let value = parse_number(text, line)?;
+    check_data_value(i128::from(value), 1, line)?;
+    Ok(value.to_le_bytes()[0])
+}
+
+fn filled_space(operands: &[&str], line: usize) -> Result<(usize, u8), AssemblyError> {
+    if !(1..=2).contains(&operands.len()) {
+        return Err(error(line, "expected a size and optional fill byte"));
+    }
+    let size = usize::try_from(parse_number(operands[0], line)?)
+        .ok()
+        .filter(|size| *size <= BOOT_ROM_BYTES)
+        .ok_or_else(|| error(line, "size outside ROM bounds"))?;
+    let fill = if operands.len() == 2 {
+        fill_byte(operands[1], line)?
+    } else {
+        0
+    };
+    Ok((size, fill))
+}
+
+fn origin_padding(
+    operands: &[&str],
+    offset: usize,
+    line: usize,
+) -> Result<(usize, u8), AssemblyError> {
+    let (target, fill) = filled_space(operands, line)?;
+    let size = target
+        .checked_sub(offset)
+        .ok_or_else(|| error(line, ".org cannot move backwards"))?;
+    Ok((size, fill))
+}
+
+fn alignment_padding(
+    operation: &str,
+    operands: &[&str],
+    offset: usize,
+    line: usize,
+) -> Result<(usize, u8), AssemblyError> {
+    if !(1..=3).contains(&operands.len()) {
+        return Err(error(
+            line,
+            "expected alignment, optional fill, and optional maximum skip",
+        ));
+    }
+    let value = parse_number(operands[0], line)?;
+    let value = if matches!(operation, ".p2align" | ".align") {
+        if !(0..=15).contains(&value) {
+            return Err(error(line, "alignment exponent must be between 0 and 15"));
+        }
+        1_i64 << value
+    } else {
+        value
+    };
+    let alignment = usize::try_from(value)
+        .ok()
+        .filter(|value| *value <= BOOT_ROM_BYTES)
+        .ok_or_else(|| error(line, "size outside ROM bounds"))?;
+    if !alignment.is_power_of_two() {
+        return Err(error(line, "alignment must be a positive power of two"));
+    }
+    let fill = match operands.get(1) {
+        None => 0,
+        Some(&"") if operands.len() == 3 => 0,
+        Some(text) => fill_byte(text, line)?,
+    };
+    let maximum = operands
+        .get(2)
+        .map(|text| {
+            let value = parse_number(text, line)?;
+            usize::try_from(value).map_err(|_| error(line, "maximum skip must be nonnegative"))
+        })
+        .transpose()?;
+    let padding = (alignment - (BOOT_ROM.start as usize + offset) % alignment) % alignment;
+    let padding = if maximum.is_some_and(|maximum| maximum != 0 && padding > maximum) {
+        0
+    } else {
+        padding
+    };
+    Ok((padding, fill))
+}
+
 fn load_immediate(operands: &[&str], line: usize) -> Result<Vec<u32>, AssemblyError> {
     let [destination, literal] = operands else {
         return Err(error(line, "li expects 2 operands"));
     };
     let rd = register(destination, line)?;
-    let mut value = parse_number(literal, line)?;
+    let mut value = full_width_literal(literal, line)?;
     let mut tails = Vec::new();
     while i32::try_from(value).is_err() {
         let low = (value << 52) >> 52;
@@ -640,9 +886,9 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
                 return Err(error(line, "preprocessor directives are not supported"));
             }
         }
-        let mut text = raw.split('#').next().unwrap_or("").trim();
-        while let Some((name, rest)) = text.split_once(':') {
-            let name = name.trim();
+        let mut text = raw[..unquoted(raw, '#').unwrap_or(raw.len())].trim();
+        while let Some(colon) = unquoted(text, ':') {
+            let name = text[..colon].trim();
             if let Some(number) = numeric_label(name) {
                 labels
                     .numeric
@@ -654,71 +900,52 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
             } else if labels.named.insert(name, offset).is_some() {
                 return Err(error(line, format!("duplicate label {name:?}")));
             }
-            text = rest.trim();
+            text = text[colon + 1..].trim();
         }
         if text.is_empty() {
             continue;
         }
         let (operation, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        let operands: Vec<_> = if rest.trim().is_empty() {
-            Vec::new()
+        let mut operands = Vec::new();
+        let mut rest = rest.trim();
+        if !rest.is_empty() {
+            while let Some(comma) = unquoted(rest, ',') {
+                operands.push(rest[..comma].trim());
+                rest = rest[comma + 1..].trim();
+            }
+            operands.push(rest);
+        }
+        let size = if let Some(width) = data_width(operation) {
+            if operands.is_empty() {
+                return Err(error(line, "data directive requires at least one value"));
+            }
+            operands.len() * width
         } else {
-            rest.split(',').map(str::trim).collect()
-        };
-        let size = match operation {
-            ".text" => {
-                if !operands.is_empty() {
-                    return Err(error(line, ".text expects no operands"));
+            match operation {
+                ".ascii" | ".asciz" | ".string" => {
+                    string_data(&operands, operation != ".ascii", line)?.len()
                 }
-                0
-            }
-            ".globl" | ".global" => {
-                if operands.len() != 1 || !symbol(operands[0]) {
-                    return Err(error(line, "expected one global symbol"));
-                }
-                0
-            }
-            ".byte" | ".half" | ".short" | ".2byte" | ".word" | ".dword" => {
-                if operands.is_empty() {
-                    return Err(error(line, "data directive requires at least one value"));
-                }
-                operands.len()
-                    * match operation {
-                        ".byte" => 1,
-                        ".half" | ".short" | ".2byte" => 2,
-                        ".word" => 4,
-                        _ => 8,
+                ".text" => {
+                    if !operands.is_empty() {
+                        return Err(error(line, ".text expects no operands"));
                     }
-            }
-            ".zero" | ".balign" | ".p2align" | ".align" => {
-                if operands.len() != 1 {
-                    return Err(error(line, "expected one size operand"));
+                    0
                 }
-                let value = parse_number(operands[0], line)?;
-                let value = if matches!(operation, ".p2align" | ".align") {
-                    if !(0..=15).contains(&value) {
-                        return Err(error(line, "alignment exponent must be between 0 and 15"));
+                ".globl" | ".global" => {
+                    if operands.len() != 1 || !symbol(operands[0]) {
+                        return Err(error(line, "expected one global symbol"));
                     }
-                    1_i64 << value
-                } else {
-                    value
-                };
-                let value = usize::try_from(value)
-                    .ok()
-                    .filter(|value| *value <= BOOT_ROM_BYTES)
-                    .ok_or_else(|| error(line, "size outside ROM bounds"))?;
-                if operation != ".zero" {
-                    if !value.is_power_of_two() {
-                        return Err(error(line, "alignment must be a positive power of two"));
-                    }
-                    (value - (BOOT_ROM.start as usize + offset) % value) % value
-                } else {
-                    value
+                    0
                 }
+                ".zero" | ".space" | ".skip" => filled_space(&operands, line)?.0,
+                ".org" => origin_padding(&operands, offset, line)?.0,
+                ".balign" | ".p2align" | ".align" => {
+                    alignment_padding(operation, &operands, offset, line)?.0
+                }
+                "li" => load_immediate(&operands, line)?.len() * 4,
+                "la" | "tail" => 8,
+                _ => 4,
             }
-            "li" => load_immediate(&operands, line)?.len() * 4,
-            "la" | "tail" => 8,
-            _ => 4,
         };
         if !operation.starts_with('.') && offset % 4 != 0 {
             return Err(error(line, "instruction must be four-byte aligned"));
@@ -756,28 +983,32 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
             size,
             ..
         } = statement;
+        if let Some(width) = data_width(operation) {
+            for (index, operand) in operands.iter().enumerate() {
+                let start = offset + index * width;
+                let value = data_expression(operand, &labels, &statement, start)?;
+                check_data_value(value, width, line)?;
+                rom[start..start + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            }
+            continue;
+        }
         match operation {
-            ".text" | ".globl" | ".global" | ".zero" | ".balign" | ".p2align" | ".align" => {}
-            ".byte" | ".half" | ".short" | ".2byte" | ".word" | ".dword" => {
-                let width = match operation {
-                    ".byte" => 1,
-                    ".half" | ".short" | ".2byte" => 2,
-                    ".word" => 4,
-                    _ => 8,
-                };
-                for (index, operand) in operands.iter().enumerate() {
-                    let value = if let Some(target) = labels.resolve(operand, &statement)? {
-                        BOOT_ROM.start as i64 + target as i64
-                    } else {
-                        parse_number(operand, line)?
-                    };
-                    let bits = width * 8;
-                    if width < 8 && !(-(1_i64 << (bits - 1))..(1_i64 << bits)).contains(&value) {
-                        return Err(error(line, "data value out of range"));
-                    }
-                    let start = offset + index * width;
-                    rom[start..start + width].copy_from_slice(&value.to_le_bytes()[..width]);
-                }
+            ".text" | ".globl" | ".global" => {}
+            ".org" => {
+                let (_, fill) = origin_padding(operands, offset, line)?;
+                rom[offset..offset + size].fill(fill);
+            }
+            ".balign" | ".p2align" | ".align" => {
+                let (_, fill) = alignment_padding(operation, operands, offset, line)?;
+                rom[offset..offset + size].fill(fill);
+            }
+            ".zero" | ".space" | ".skip" => {
+                let (_, fill) = filled_space(operands, line)?;
+                rom[offset..offset + size].fill(fill);
+            }
+            ".ascii" | ".asciz" | ".string" => {
+                let data = string_data(operands, operation != ".ascii", line)?;
+                rom[offset..offset + size].copy_from_slice(&data);
             }
             _ if operation.starts_with('.') => {
                 return Err(error(line, format!("unsupported directive {operation:?}")));

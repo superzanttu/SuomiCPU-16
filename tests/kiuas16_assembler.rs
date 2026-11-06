@@ -7,6 +7,1169 @@ use suomicpu16::kiuas16::runtime::run_headless;
 use suomicpu16::kiuas16::{BOOT_ROM_BYTES, Kiuas16Machine};
 
 #[test]
+fn rom_origin_matches_offsets_and_every_checked_fill_byte() {
+    for fill in -128i64..=255 {
+        let rom = assemble_boot_rom(&format!(".byte 19\n.org 8, {fill}\n.byte 23")).unwrap();
+        assert_eq!(rom[0], 19);
+        assert!(rom[1..8].iter().all(|byte| *byte == fill as u8));
+        assert_eq!(rom[8], 23);
+        assert!(rom[9..].iter().all(|byte| *byte == 0));
+    }
+    for target in [0usize, 1, 7, 4095, 4096, 4097, 61439] {
+        for literal in [
+            target.to_string(),
+            format!("0x{target:x}"),
+            format!("0o{target:o}"),
+            format!("0b{target:b}"),
+        ] {
+            let rom = assemble_boot_rom(&format!(".org {literal}\n.byte 42")).unwrap();
+            assert!(rom[..target].iter().all(|byte| *byte == 0));
+            assert_eq!(rom[target], 42);
+            assert!(rom[target + 1..].iter().all(|byte| *byte == 0));
+        }
+    }
+    let default = assemble_boot_rom(".byte 19\n.org 8\n.byte 23").unwrap();
+    assert!(default == assemble_boot_rom(".byte 19\n.org 8, 0\n.byte 23").unwrap());
+    assert!(default == assemble_boot_rom(".byte 19\n.zero 7\n.byte 23").unwrap());
+}
+
+#[test]
+fn rom_origin_preserves_labels_locations_alignment_and_rom_limits() {
+    let rom = assemble_boot_rom(
+        "first: .org 7, 42\n1: .byte 19\n.org 8, -1\n\
+         .org 8, 128\n.org 16, 23\n2: .quad first, 1b, 2b, ., 2b - 1b\nwfi",
+    )
+    .unwrap();
+    assert_eq!(&rom[..7], &[42; 7]);
+    assert_eq!(rom[7], 19);
+    assert_eq!(&rom[8..16], &[23; 8]);
+    for (bytes, expected) in rom[16..56]
+        .chunks_exact(8)
+        .zip([0x1000u64, 0x1007, 0x1010, 0x1028, 9])
+    {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), expected);
+    }
+    assert_eq!(&rom[56..60], &0x10500073u32.to_le_bytes());
+    let rom = assemble_boot_rom(".org 61439, 42\n.byte 23\n.org 61440, 255").unwrap();
+    assert!(rom[..61439].iter().all(|byte| *byte == 42));
+    assert_eq!(rom[61439], 23);
+    assert!(
+        assemble_boot_rom(".org 61440\n.byte 1")
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds")
+    );
+    let rom = assemble_boot_rom(".org 61440, -1").unwrap();
+    assert_eq!(rom.len(), BOOT_ROM_BYTES);
+    assert!(rom.iter().all(|byte| *byte == 255));
+    let rom = assemble_boot_rom(".org 4097\n.balign 8, 42\n.quad .").unwrap();
+    assert_eq!(&rom[4097..4104], &[42; 7]);
+    assert_eq!(&rom[4104..4112], &0x2008u64.to_le_bytes());
+}
+
+#[test]
+fn rom_origin_executes_fixed_entry_and_returning_helpers() {
+    let rom = assemble_boot_rom(
+        "j entry\n.org 256, 42\n\
+         helper: addi a0, a0, 23\nret\n\
+         .org 4096, 128\nentry: li a0, 19\ncall helper\n\
+         la t0, entry\nlbu a1, -1(t0)\nwfi",
+    )
+    .unwrap();
+    assert_eq!(&rom[256..260], &0x01750513u32.to_le_bytes());
+    assert!(rom[264..4096].iter().all(|byte| *byte == 128));
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 24, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert!(output.is_empty());
+    assert_eq!(machine.core().register(10), Some(42));
+    assert_eq!(machine.core().register(11), Some(128));
+    assert_eq!(machine.core().register(1), Some(0x200c));
+}
+
+#[test]
+fn rom_origin_invalid_operands_preserve_existing_rom() {
+    for source in [
+        ".org",
+        ".org -1",
+        ".org 61441",
+        ".org 18446744073709551615",
+        ".org missing",
+        ".org 1+1",
+        ".org .",
+        ".org 1,",
+        ".org ,42",
+        ".org 8, 256",
+        ".org 0, 256",
+        ".org 0, -129",
+        ".org 8, missing",
+        ".org 8, 0xffffffffffffffff",
+        ".org 8, 1, 2",
+        ".org 0x__ff",
+        ".org 4\n.org 3",
+        ".byte 42\n.org 0",
+        ".org 1\nwfi",
+        ".org 8\n.org 4\n.byte 42",
+    ] {
+        let source = format!("# first line\n{source}");
+        let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+        assert!(
+            diagnostic.starts_with("line 2:") || diagnostic.starts_with("line 3:"),
+            "{diagnostic}"
+        );
+        let files = Files::new();
+        std::fs::write(files.0.join("guest.S"), &source).unwrap();
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.assemble();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("guest.S")).unwrap(),
+            source.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn data_location_matches_each_value_address_for_every_integer_width() {
+    for (directive, width) in [
+        (".byte", 1),
+        (".half", 2),
+        (".short", 2),
+        (".2byte", 2),
+        (".word", 4),
+        (".long", 4),
+        (".int", 4),
+        (".4byte", 4),
+        (".dword", 8),
+        (".quad", 8),
+        (".8byte", 8),
+    ] {
+        for offset in [0usize, 1, 7, 4095, 4096, 4097] {
+            let rom = assemble_boot_rom(&format!(
+                ".zero {offset}\nbase: {directive} . - base, .-base, .-base, .-base"
+            ))
+            .unwrap();
+            for index in 0..4 {
+                let expected = (index * width) as u64;
+                let start = offset + index * width;
+                assert_eq!(
+                    &rom[start..start + width],
+                    &expected.to_le_bytes()[..width],
+                    "{directive} at {offset}, value {index}"
+                );
+            }
+        }
+    }
+    let rom = assemble_boot_rom(".word ., .\n.quad ., .").unwrap();
+    assert_eq!(&rom[..4], &0x1000u32.to_le_bytes());
+    assert_eq!(&rom[4..8], &0x1004u32.to_le_bytes());
+    assert_eq!(&rom[8..16], &0x1008u64.to_le_bytes());
+    assert_eq!(&rom[16..24], &0x1010u64.to_le_bytes());
+}
+
+#[test]
+fn data_location_preserves_numeric_labels_alignment_and_rom_limits() {
+    let rom = assemble_boot_rom(
+        "1: .byte 19\n.balign 8, 42\n\
+         .half 2f - ., . - 1b\n\
+         .word . - 1b, 2f - .\n2: .quad ., . + 8, - . + 1b\nwfi",
+    )
+    .unwrap();
+    assert_eq!(&rom[8..12], &[12, 0, 10, 0]);
+    assert_eq!(&rom[12..16], &12u32.to_le_bytes());
+    assert_eq!(&rom[16..20], &4u32.to_le_bytes());
+    assert_eq!(&rom[20..28], &0x1014u64.to_le_bytes());
+    assert_eq!(&rom[28..36], &0x1024u64.to_le_bytes());
+    assert_eq!(&rom[36..44], &(-36i64).to_le_bytes());
+    assert_eq!(&rom[44..48], &0x10500073u32.to_le_bytes());
+    for (directive, width) in [(".byte", 1), (".half", 2), (".word", 4), (".quad", 8)] {
+        let padding = BOOT_ROM_BYTES - width;
+        let rom =
+            assemble_boot_rom(&format!(".zero {padding}\n{directive} end - .\nend:")).unwrap();
+        assert_eq!(&rom[padding..], &(width as u64).to_le_bytes()[..width]);
+        assert!(
+            assemble_boot_rom(&format!(".zero {}\n{directive} . - .", padding + 1))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+    let rom = assemble_boot_rom(".zero 61432\n.half ., .\n.word .").unwrap();
+    assert_eq!(&rom[61432..61434], &0xfff8u16.to_le_bytes());
+    assert_eq!(&rom[61434..61436], &0xfffau16.to_le_bytes());
+    assert_eq!(&rom[61436..], &0xfffcu32.to_le_bytes());
+    assert!(assemble_boot_rom(".zero 61440\n.byte .").is_err());
+}
+
+#[test]
+fn data_location_executes_self_relative_dispatch_and_pointer_entries() {
+    let rom = assemble_boot_rom(
+        "la t0, table\nlw t1, 0(t0)\nadd t1, t0, t1\n\
+         jalr ra, 0(t1)\nla t0, table\nld t2, 8(t0)\n\
+         lbu a1, 0(t2)\nwfi\n\
+         target: li a0, 42\nret\n.balign 8\n\
+         table: .word target - ., payload - .\n\
+         .quad . + 8\npayload: .byte 19, 23",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 32, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert!(output.is_empty());
+    assert_eq!(machine.core().register(10), Some(42));
+    assert_eq!(machine.core().register(11), Some(19));
+}
+
+#[test]
+fn data_location_invalid_inputs_preserve_outputs_and_nondata_rejections() {
+    for source in [
+        ".byte .",
+        ".half . + 65536",
+        ".word . - 2147487745",
+        ".quad . + 18446744073709551615",
+        ".byte . - . - 129",
+        ".word . + missing",
+        ".word . + 1f",
+        ".word . + 1b",
+        ".word . +",
+        ".word . * 2",
+        ".word (.)",
+        ".word ..",
+        ".word . = 42",
+        ".: .word 19",
+        ".globl .\n.word 19",
+        "li a0, .",
+        "la a0, .",
+        "j .",
+        ".space .",
+        ".balign .",
+        ".zero 1, .",
+        ".align 2, .",
+    ] {
+        let source = format!("# first line\n{source}");
+        let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+        assert!(diagnostic.starts_with("line 2:"), "{diagnostic}");
+        let files = Files::new();
+        std::fs::write(files.0.join("guest.S"), &source).unwrap();
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.assemble();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("guest.S")).unwrap(),
+            source.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    let rom = assemble_boot_rom(".Ldot: .word .Ldot - ., . - .Ldot").unwrap();
+    assert_eq!(&rom[..8], &[0, 0, 0, 0, 4, 0, 0, 0]);
+}
+
+#[test]
+fn data_expressions_match_independent_bytes_and_checked_final_ranges() {
+    let rom = assemble_boot_rom(
+        ".byte 19 + 23, 0xff - 1, -128 + 0, 1 - -2, + 7, 9 + -2\n\
+         .half 0x8000 - 1, -32768, 65535 - 1\n\
+         .word 0x100000000 - 1, -2147483648, 0xffffffff + 1 - 2\n\
+         .quad 18446744073709551615, 0xffffffffffffffff + 1 - 1",
+    )
+    .unwrap();
+    let expected = [
+        42, 254, 128, 3, 7, 7, 255, 127, 0, 128, 254, 255, 255, 255, 255, 255, 0, 0, 0, 128, 254,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255,
+    ];
+    assert_eq!(&rom[..expected.len()], &expected);
+    for (aliases, expression, expected) in [
+        (&[".byte"][..], "256-1", vec![255]),
+        (
+            &[".half", ".short", ".2byte"][..],
+            "65536 - 1",
+            vec![255; 2],
+        ),
+        (
+            &[".word", ".long", ".int", ".4byte"][..],
+            "4294967296-1",
+            vec![255; 4],
+        ),
+        (
+            &[".dword", ".quad", ".8byte"][..],
+            "0xffffffffffffffff + 1 - 1",
+            vec![255; 8],
+        ),
+    ] {
+        for alias in aliases {
+            let rom = assemble_boot_rom(&format!("{alias} {expression}")).unwrap();
+            assert_eq!(&rom[..expected.len()], &expected, "{alias}");
+            assert!(rom[expected.len()..].iter().all(|byte| *byte == 0));
+        }
+    }
+}
+
+#[test]
+fn data_expressions_resolve_forward_backward_labels_and_fixed_layout() {
+    let rom = assemble_boot_rom(
+        "1: base: .byte 2f - 1b, end - base\n\
+         .half 1b + 2, -base + end\n\
+         2: .word end-base, base-end\n\
+         .balign 8\nend: .quad base + 8, 2b - 1b + 19 + 23 - 6\n\
+         .dword 0xffffffffffffffff - base + base\nwfi",
+    )
+    .unwrap();
+    assert_eq!(&rom[..6], &[6, 16, 2, 16, 16, 0]);
+    assert_eq!(&rom[6..10], &16i32.to_le_bytes());
+    assert_eq!(&rom[10..14], &(-16i32).to_le_bytes());
+    assert_eq!(&rom[16..24], &0x1008u64.to_le_bytes());
+    assert_eq!(&rom[24..32], &42u64.to_le_bytes());
+    assert_eq!(&rom[32..40], &u64::MAX.to_le_bytes());
+    assert_eq!(&rom[40..44], &0x10500073u32.to_le_bytes());
+    let rom = assemble_boot_rom(".zero 61432\n.quad 65536 - 1\nend:").unwrap();
+    assert_eq!(&rom[61432..], &65535u64.to_le_bytes());
+    assert!(
+        assemble_boot_rom(".zero 61436\n.quad 1 + 1")
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds")
+    );
+    let rom = assemble_boot_rom("base: .half end - base\n.zero 61438\nend:").unwrap();
+    assert_eq!(&rom[..2], &61440u16.to_le_bytes());
+}
+
+#[test]
+fn data_expressions_execute_relative_pointer_table_dispatch() {
+    let rom = assemble_boot_rom(
+        "la t0, table\nlw t1, 0(t0)\nadd t1, t0, t1\n\
+         jalr ra, 0(t1)\nla t0, table\nld t2, 8(t0)\n\
+         lbu a1, 0(t2)\nwfi\n\
+         target: li a0, 42\nret\n.balign 8\n\
+         table: .word target - table, table - target\n\
+         .quad payload + 1\npayload: .byte 19, 23",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 32, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert!(output.is_empty());
+    assert_eq!(machine.core().register(10), Some(42));
+    assert_eq!(machine.core().register(11), Some(23));
+}
+
+#[test]
+fn data_expressions_invalid_inputs_preserve_outputs_and_other_operand_limits() {
+    for source in [
+        ".byte 255 + 1",
+        ".byte -128 - 1",
+        ".half 65535 + 1",
+        ".short -32768 - 1",
+        ".word 4294967295 + 1",
+        ".long -2147483648-1",
+        ".quad 18446744073709551615 + 1",
+        ".dword -9223372036854775808 - 1",
+        ".quad 18446744073709551616 - 1",
+        ".word missing+4",
+        ".word 1f-1b",
+        ".byte 1+",
+        ".byte +",
+        ".byte 1--",
+        ".byte 1+++2",
+        ".word (19 + 23)",
+        ".word 6*7",
+        ".word 1 << 2",
+        ".word 42UL",
+        ".word 01 + 1",
+        ".word 0x__ff + 1",
+        "li a0, 19 + 23",
+        "la a0, target + 4\ntarget: wfi",
+        ".space 1+1",
+        ".balign 4+4",
+        ".zero 1, 19+23",
+    ] {
+        let source = format!("# first line\n{source}");
+        let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+        assert!(diagnostic.starts_with("line 2:"), "{diagnostic}");
+        let files = Files::new();
+        std::fs::write(files.0.join("guest.S"), &source).unwrap();
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.assemble();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("guest.S")).unwrap(),
+            source.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn bounded_alignment_matches_thresholds_and_mapped_addresses() {
+    for exponent in 0..=15 {
+        let alignment = 1usize << exponent;
+        for offset in [0, 1, 3, 4, 17, 4095, 4096, 4097] {
+            let padding = (alignment - (0x1000 + offset) % alignment) % alignment;
+            for maximum in [0, padding.saturating_sub(1), padding, padding + 1] {
+                let expected = if maximum != 0 && padding > maximum {
+                    0
+                } else {
+                    padding
+                };
+                for (directive, operand) in [
+                    (".balign", alignment),
+                    (".p2align", exponent),
+                    (".align", exponent),
+                ] {
+                    let rom = assemble_boot_rom(&format!(
+                        ".zero {offset}\n{directive} {operand}, 42, {maximum}\n.byte 19"
+                    ))
+                    .unwrap();
+                    assert!(rom[..offset].iter().all(|byte| *byte == 0));
+                    assert!(
+                        rom[offset..offset + expected]
+                            .iter()
+                            .all(|byte| *byte == 42)
+                    );
+                    assert_eq!(
+                        rom[offset + expected],
+                        19,
+                        "{directive} {operand} at {offset}, max {maximum}"
+                    );
+                    assert!(rom[offset + expected + 1..].iter().all(|byte| *byte == 0));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bounded_alignment_fills_all_byte_patterns_and_keeps_default_zeros() {
+    for directive in [".balign 8", ".p2align 3", ".align 3"] {
+        for fill in -128i64..=255 {
+            let rom =
+                assemble_boot_rom(&format!(".byte 19\n{directive}, {fill}\n.byte 23")).unwrap();
+            assert_eq!(rom[0], 19);
+            assert!(rom[1..8].iter().all(|byte| *byte == fill as u8));
+            assert_eq!(rom[8], 23);
+        }
+        let original = assemble_boot_rom(&format!(".byte 19\n{directive}\n.byte 23")).unwrap();
+        for suffix in [", 0", ",,7", ",,0", ", 0, 7", ", 0, 9223372036854775807"] {
+            assert!(
+                original
+                    == assemble_boot_rom(&format!(".byte 19\n{directive}{suffix}\n.byte 23"))
+                        .unwrap()
+            );
+        }
+        let suppressed =
+            assemble_boot_rom(&format!(".byte 19\n{directive}, -1, 6\n.byte 23")).unwrap();
+        assert_eq!(&suppressed[..3], &[19, 23, 0]);
+        let signed = assemble_boot_rom(&format!(".byte 19\n{directive}, -1, 7\n.byte 23")).unwrap();
+        let hex =
+            assemble_boot_rom(&format!(".byte 19\n{directive}, 0xff, 0b111\n.byte 23")).unwrap();
+        assert!(signed == hex);
+    }
+}
+
+#[test]
+fn bounded_alignment_preserves_labels_rom_limits_and_instruction_checks() {
+    let rom = assemble_boot_rom(
+        ".byte 19\n.balign 8, 42, 7\n1: aligned: .byte 23\n\
+         .p2align 4, 255, 6\n2: skipped: .byte 5\n.align 2,,2\n\
+         entry: wfi\n.dword 1b, 2b, aligned, skipped, entry",
+    )
+    .unwrap();
+    assert_eq!(&rom[..12], &[19, 42, 42, 42, 42, 42, 42, 42, 23, 5, 0, 0]);
+    assert_eq!(&rom[12..16], &0x10500073u32.to_le_bytes());
+    for (bytes, value) in rom[16..56]
+        .chunks_exact(8)
+        .zip([0x1008u64, 0x1009, 0x1008, 0x1009, 0x100c])
+    {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), value);
+    }
+    for directive in [".balign 4", ".p2align 2", ".align 2"] {
+        assert!(
+            assemble_boot_rom(&format!(".byte 19\n{directive}, 42, 2\nwfi"))
+                .unwrap_err()
+                .to_string()
+                .contains("aligned")
+        );
+        let rom = assemble_boot_rom(&format!(".zero 61437\n{directive}, 42, 3")).unwrap();
+        assert_eq!(&rom[61437..], &[42; 3]);
+        assert!(
+            assemble_boot_rom(&format!(".zero 61437\n{directive}, 42, 3\n.byte 1"))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+        let rom =
+            assemble_boot_rom(&format!(".zero 61437\n{directive}, 42, 2\n.byte 19,23,5")).unwrap();
+        assert_eq!(&rom[61437..], &[19, 23, 5]);
+        assert!(assemble_boot_rom(&format!(".zero 61440\n{directive}, 255, 1")).is_ok());
+    }
+}
+
+#[test]
+fn bounded_alignment_executes_skipped_padding_and_reads_fill_bytes() {
+    let rom = assemble_boot_rom(
+        "j entry\n.byte 19\n.balign 8, 42, 3\n1: .byte 23\n\
+         .p2align 4, 255, 6\n2: .byte 5\n.align 2,,2\n\
+         entry: la t0, 1b\nlbu a0, -1(t0)\nla t1, 2b\n\
+         lbu a1, 0(t1)\nsub a2, t1, t0\nwfi",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 24, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert!(output.is_empty());
+    assert_eq!(machine.core().register(10), Some(42));
+    assert_eq!(machine.core().register(11), Some(5));
+    assert_eq!(machine.core().register(12), Some(1));
+}
+
+#[test]
+fn bounded_alignment_invalid_operands_preserve_existing_rom() {
+    for directive in [".balign 8", ".p2align 3", ".align 3"] {
+        for suffix in [
+            ",",
+            ", 256",
+            ", -129",
+            ", missing",
+            ", 0xffffffffffffffff",
+            ", 42,",
+            ",,missing",
+            ", 42, -1",
+            ", 42, 18446744073709551615",
+            ", 42, 2, 1",
+            ", 42, 1 << 2",
+            ",,",
+        ] {
+            for prefix in ["", ".byte 19\n"] {
+                let source = format!("{prefix}{directive}{suffix}");
+                let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+                let line = if prefix.is_empty() { 1 } else { 2 };
+                assert!(
+                    diagnostic.starts_with(&format!("line {line}:")),
+                    "{diagnostic}"
+                );
+                let files = Files::new();
+                std::fs::write(files.0.join("guest.S"), &source).unwrap();
+                std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+                let build = files.assemble();
+                assert!(!build.status.success(), "{source}");
+                assert!(!build.stderr.is_empty());
+                assert_eq!(
+                    std::fs::read(files.0.join("guest.S")).unwrap(),
+                    source.as_bytes()
+                );
+                assert_eq!(
+                    std::fs::read(files.0.join("rom.bin")).unwrap(),
+                    b"previous ROM"
+                );
+            }
+        }
+    }
+    assert!(assemble_boot_rom(".balign 8, 256, 1").is_err());
+    assert!(assemble_boot_rom(".byte 1\n.balign 8, 256, 1").is_err());
+}
+
+#[test]
+fn data_aliases_match_independent_bytes_and_canonical_directives() {
+    for (aliases, canonical, values, expected) in [
+        (
+            &[".long", ".int", ".4byte"][..],
+            ".word",
+            "-2147483648, 2147483647, 4294967295, 0x12345678",
+            &[
+                0, 0, 0, 128, 255, 255, 255, 127, 255, 255, 255, 255, 120, 86, 52, 18,
+            ][..],
+        ),
+        (
+            &[".quad", ".8byte"][..],
+            ".dword",
+            "-9223372036854775808, 18446744073709551615, 0x0123456789abcdef",
+            &[
+                0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 255, 255, 239, 205, 171,
+                137, 103, 69, 35, 1,
+            ][..],
+        ),
+    ] {
+        let canonical = assemble_boot_rom(&format!("{canonical} {values}")).unwrap();
+        for alias in aliases {
+            let rom = assemble_boot_rom(&format!("{alias} {values}")).unwrap();
+            assert_eq!(&rom[..expected.len()], expected, "{alias}");
+            assert!(rom == canonical, "{alias}");
+        }
+    }
+}
+
+#[test]
+fn data_aliases_preserve_unaligned_labels_widths_and_rom_limits() {
+    for (alias, width) in [
+        (".long", 4),
+        (".int", 4),
+        (".4byte", 4),
+        (".quad", 8),
+        (".8byte", 8),
+    ] {
+        let rom = assemble_boot_rom(&format!(
+            ".byte 42\n1: first: {alias} 1f, 1b, first\n1: .byte 19\n\
+             .balign 4\nentry: wfi\n.dword entry"
+        ))
+        .unwrap();
+        let end = 1 + width * 3;
+        assert_eq!(rom[0], 42);
+        for (index, address) in [0x1000u64 + end as u64, 0x1001, 0x1001]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = 1 + index * width;
+            assert_eq!(
+                &rom[offset..offset + width],
+                &address.to_le_bytes()[..width],
+                "{alias}"
+            );
+        }
+        assert_eq!(rom[end], 19);
+        let entry = (end + 4) & !3;
+        assert_eq!(&rom[entry..entry + 4], &0x10500073u32.to_le_bytes());
+        assert_eq!(
+            &rom[entry + 4..entry + 12],
+            &(0x1000 + entry as u64).to_le_bytes()
+        );
+        let padding = BOOT_ROM_BYTES - width;
+        let rom = assemble_boot_rom(&format!(".zero {padding}\n{alias} 42")).unwrap();
+        assert_eq!(rom[padding], 42);
+        assert!(
+            assemble_boot_rom(&format!(".zero {}\n{alias} 42", padding + 1))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+        assert!(
+            assemble_boot_rom(&format!(".byte 1\n{alias} 42\nwfi"))
+                .unwrap_err()
+                .to_string()
+                .contains("aligned")
+        );
+    }
+}
+
+#[test]
+fn data_aliases_execute_signed_unsigned_and_pointer_table_loads() {
+    let rom = assemble_boot_rom(
+        "la t0, 1f\nlw a0, 0(t0)\nlwu t1, 4(t0)\nadd a0, a0, t1\n\
+         lw a1, 8(t0)\nlwu a2, 12(t0)\nld a3, 16(t0)\nld a4, 24(t0)\nwfi\n\
+         .balign 8\n1: .long 19\n.int 23\n.4byte -2147483648, 4294967295\n\
+         .quad 18446744073709551615\n.8byte 1b",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 24, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert!(output.is_empty());
+    for (register, value) in [
+        (10, 42),
+        (11, (-2147483648i64) as u64),
+        (12, 4294967295),
+        (13, u64::MAX),
+        (14, 0x1028),
+    ] {
+        assert_eq!(machine.core().register(register), Some(value));
+    }
+}
+
+#[test]
+fn data_aliases_invalid_values_preserve_source_and_existing_rom() {
+    for (alias, overflow, underflow) in [
+        (".long", "4294967296", "-2147483649"),
+        (".int", "4294967296", "-2147483649"),
+        (".4byte", "4294967296", "-2147483649"),
+        (".quad", "18446744073709551616", "-9223372036854775809"),
+        (".8byte", "18446744073709551616", "-9223372036854775809"),
+    ] {
+        for operand in [
+            "",
+            overflow,
+            underflow,
+            "missing",
+            "1f",
+            "1b",
+            "1,",
+            ",1",
+            "1,,2",
+            "0x__ff",
+            "42UL",
+            "label + 4",
+        ] {
+            let source = format!("# first line\n{alias} {operand}");
+            let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+            assert!(diagnostic.starts_with("line 2:"), "{diagnostic}");
+            let files = Files::new();
+            std::fs::write(files.0.join("guest.S"), &source).unwrap();
+            std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+            let build = files.assemble();
+            assert!(!build.status.success(), "{source}");
+            assert!(!build.stderr.is_empty());
+            assert_eq!(
+                std::fs::read(files.0.join("guest.S")).unwrap(),
+                source.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(files.0.join("rom.bin")).unwrap(),
+                b"previous ROM"
+            );
+        }
+    }
+}
+
+#[test]
+fn filled_space_matches_every_byte_and_preserves_implicit_zero_fills() {
+    for operation in [".zero", ".space", ".skip"] {
+        for fill in -128i64..=255 {
+            let rom =
+                assemble_boot_rom(&format!(".byte 19\n{operation} 3, {fill}\n.byte 23")).unwrap();
+            assert_eq!(&rom[..5], &[19, fill as u8, fill as u8, fill as u8, 23]);
+            assert!(rom[5..].iter().all(|byte| *byte == 0));
+        }
+        let rom = assemble_boot_rom(&format!(".byte 19\n{operation} 3\n.byte 23")).unwrap();
+        assert_eq!(&rom[..5], &[19, 0, 0, 0, 23]);
+        let explicit = assemble_boot_rom(&format!(".byte 19\n{operation} 3, 0\n.byte 23")).unwrap();
+        assert!(rom == explicit);
+        for fill in ["0x_FF", "0o377", "0B1111_1111", "-0x80", "+42"] {
+            let rom = assemble_boot_rom(&format!("{operation} 2, {fill}")).unwrap();
+            let expected = if fill == "-0x80" {
+                128
+            } else if fill == "+42" {
+                42
+            } else {
+                255
+            };
+            assert_eq!(&rom[..2], &[expected, expected]);
+        }
+    }
+}
+
+#[test]
+fn filled_space_preserves_labels_alignment_and_exact_rom_limits() {
+    let rom = assemble_boot_rom(
+        "first: .space 0, -1\n1: .skip 3, 42\n\
+         second: .zero 0, 128\n.zero 2, 255\n.balign 4\n\
+         entry: wfi\n.dword first, 1b, second, entry",
+    )
+    .unwrap();
+    assert_eq!(&rom[..8], &[42, 42, 42, 255, 255, 0, 0, 0]);
+    assert_eq!(&rom[8..12], &0x10500073u32.to_le_bytes());
+    for (bytes, address) in rom[12..44]
+        .chunks_exact(8)
+        .zip([0x1000u64, 0x1000, 0x1003, 0x1008])
+    {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), address);
+    }
+    for operation in [".zero", ".space", ".skip"] {
+        let rom = assemble_boot_rom(&format!("{operation} 61440, 42\n{operation} 0, 255")).unwrap();
+        assert_eq!(rom.len(), BOOT_ROM_BYTES);
+        assert!(rom.iter().all(|byte| *byte == 42));
+        assert!(assemble_boot_rom(&format!(".byte 1\n{operation} 61439, -1")).is_ok());
+        assert!(
+            assemble_boot_rom(&format!(".byte 1\n{operation} 61440, -1"))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+        assert!(
+            assemble_boot_rom(&format!("{operation} 1, 0\nwfi"))
+                .unwrap_err()
+                .to_string()
+                .contains("aligned")
+        );
+    }
+}
+
+#[test]
+fn filled_space_executes_guest_owned_table_scan() {
+    let rom = assemble_boot_rom(
+        "la t0, 1f\nli t1, 4\nli a0, 0\n\
+         2: lbu t2, 0(t0)\nadd a0, a0, t2\naddi t0, t0, 1\n\
+         addi t1, t1, -1\nbnez t1, 2b\nwfi\n\
+         1: .space 2, 19\n.skip 1, 4\n.zero 1, 0",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 40, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert!(output.is_empty());
+    assert_eq!(machine.core().register(10), Some(42));
+}
+
+#[test]
+fn filled_space_invalid_operands_preserve_existing_rom() {
+    for operation in [".zero", ".space", ".skip"] {
+        for operands in [
+            "",
+            "1, 2, 3",
+            "-1",
+            "61441",
+            "18446744073709551615",
+            "1,",
+            ",1",
+            "1, -129",
+            "1, 256",
+            "0, 256",
+            "0, missing",
+            "1, 0xffffffffffffffff",
+            "1, 1 << 2",
+            "1, 0x__ff",
+            "missing, 42",
+        ] {
+            let source = format!("# first line\n{operation} {operands}");
+            let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+            assert!(diagnostic.starts_with("line 2:"), "{diagnostic}");
+            let files = Files::new();
+            std::fs::write(files.0.join("guest.S"), &source).unwrap();
+            std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+            let build = files.assemble();
+            assert!(!build.status.success(), "{source}");
+            assert!(!build.stderr.is_empty());
+            assert_eq!(
+                std::fs::read(files.0.join("guest.S")).unwrap(),
+                source.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(files.0.join("rom.bin")).unwrap(),
+                b"previous ROM"
+            );
+        }
+    }
+}
+
+#[test]
+fn unsigned_literals_match_signed_encodings_and_independent_data_bytes() {
+    for (literal, value) in [
+        ("18446744073709551615", u64::MAX),
+        ("+0X_FFFF_FFFF_FFFF_FFFF", u64::MAX),
+        ("0o1777777777777777777777", u64::MAX),
+        (
+            "0B1111111111111111111111111111111111111111111111111111111111111111",
+            u64::MAX,
+        ),
+        ("9223372036854775808", 1u64 << 63),
+        ("0x8000_0000_0000_0001", (1u64 << 63) + 1),
+        ("0xfedcba9876543210", 0xfedcba9876543210),
+        ("0xffff_ffff_8000_0000", (-2147483648i64) as u64),
+    ] {
+        let signed = i64::from_le_bytes(value.to_le_bytes());
+        let unsigned_rom = assemble_boot_rom(&format!("li a0, {literal}")).unwrap();
+        let signed_rom = assemble_boot_rom(&format!("li a0, {signed}")).unwrap();
+        assert_eq!(
+            unsigned_rom
+                .iter()
+                .zip(signed_rom)
+                .position(|(a, b)| *a != b),
+            None,
+            "{literal}"
+        );
+        let data = assemble_boot_rom(&format!(".dword {literal}, {signed}")).unwrap();
+        assert_eq!(&data[..8], &value.to_le_bytes());
+        assert_eq!(&data[8..16], &value.to_le_bytes());
+    }
+    let rom = assemble_boot_rom("li a0, 0xffffffffffffffff").unwrap();
+    assert_eq!(&rom[..4], &0x00000537u32.to_le_bytes());
+    assert_eq!(&rom[4..8], &0xfff5051bu32.to_le_bytes());
+    assert!(rom[8..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn unsigned_literals_execute_all_bases_boundaries_and_register_destinations() {
+    let mut values = vec![u64::MAX, 1u64 << 63, (1u64 << 63) + 1, 0xfedcba9876543210];
+    for bit in 0..64 {
+        values.push(1u64 << bit);
+        values.push(!(1u64 << bit));
+    }
+    let mut pattern = 0xfedcba9876543210u64;
+    for _ in 0..64 {
+        pattern ^= pattern << 13;
+        pattern ^= pattern >> 7;
+        pattern ^= pattern << 17;
+        values.push(pattern);
+    }
+    for value in values {
+        for literal in [
+            value.to_string(),
+            format!("0x{value:x}"),
+            format!("0o{value:o}"),
+            format!("0b{value:b}"),
+        ] {
+            for destination in ["a0", "zero"] {
+                let rom = assemble_boot_rom(&format!("li {destination}, {literal}\nwfi")).unwrap();
+                let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+                let mut output = Vec::new();
+                let report = run_headless(&mut machine, 12, &[], &mut output).unwrap();
+                assert_eq!(report.traps, 0, "{literal}");
+                assert!(report.waiting > 0, "{literal}");
+                assert!(output.is_empty());
+                for register in 0..32 {
+                    let expected = if destination == "a0" && register == 10 {
+                        value
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        machine.core().register(register),
+                        Some(expected),
+                        "{literal}: x{register}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unsigned_literals_preserve_layout_and_exact_rom_limits() {
+    let rom = assemble_boot_rom(
+        "li a0, 0xffffffffffffffff\nli a1, 0x8000000000000000\n\
+         la a2, 1f\nld a3, 0(a2)\nwfi\n.balign 8\n\
+         1: .dword 0xffffffffffffffff, 1b",
+    )
+    .unwrap();
+    assert_eq!(&rom[56..64], &u64::MAX.to_le_bytes());
+    assert_eq!(&rom[64..72], &0x1038u64.to_le_bytes());
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let report = run_headless(&mut machine, 24, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(u64::MAX));
+    assert_eq!(machine.core().register(11), Some(1u64 << 63));
+    assert_eq!(machine.core().register(12), Some(0x1038));
+    assert_eq!(machine.core().register(13), Some(u64::MAX));
+    for (padding, operation) in [
+        (61432, "li a0, 0xffffffffffffffff"),
+        (61408, "li a0, 0x8000000000000000"),
+        (61432, ".dword 18446744073709551615"),
+    ] {
+        assert_eq!(
+            assemble_boot_rom(&format!(".zero {padding}\n{operation}"))
+                .unwrap()
+                .len(),
+            BOOT_ROM_BYTES
+        );
+        assert!(
+            assemble_boot_rom(&format!(".zero {}\n{operation}", padding + 4))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+}
+
+#[test]
+fn unsigned_literals_invalid_inputs_preserve_outputs_and_signed_immediate_rules() {
+    let literals = [
+        "18446744073709551616",
+        "0x10000000000000000",
+        "-9223372036854775809",
+        "-0xffffffffffffffff",
+        "+0x",
+        "0x__ff",
+        "0xffff_",
+        "1__0",
+        "018446744073709551615",
+        "18446744073709551615UL",
+        "0xffffffffffffffff + 1",
+        "170141183460469231731687303715884105728",
+    ];
+    let mut sources = Vec::new();
+    for literal in literals {
+        sources.push(format!("li a0, {literal}"));
+        sources.push(format!(".dword {literal}"));
+    }
+    for source in [
+        "addi a0, zero, 0xffffffffffffffff",
+        "ld a0, 0xffffffffffffffff(zero)",
+        "csrr a0, 0xffffffffffffffff",
+        "slli a0, a0, 0xffffffffffffffff",
+        "j 0xffffffffffffffff",
+        "la a0, 0xffffffffffffffff",
+        ".byte 0xffffffffffffffff",
+        ".half 0xffffffffffffffff",
+        ".word 0xffffffffffffffff",
+        ".zero 0xffffffffffffffff",
+        ".balign 0xffffffffffffffff",
+    ] {
+        sources.push(source.to_string());
+    }
+    for source in sources {
+        let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+        assert!(diagnostic.starts_with("line 1:"), "{diagnostic}");
+        let files = Files::new();
+        std::fs::write(files.0.join("guest.S"), &source).unwrap();
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.assemble();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("guest.S")).unwrap(),
+            source.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn string_data_preserves_quoted_delimiters_and_checked_byte_escapes() {
+    let rom = assemble_boot_rom(
+        r##"first: .ascii "a#,:", "", "\"\\", "z" # ignored ":,
+           .asciz "", "b#,:"
+           .string "c", ""
+           .ascii "\a\b\f\n\r\t\v\'", "\0\07\101\377", "\x0\x7f\x80\xff"
+           .ascii "\0007", "\x00002a", "\1234"
+           .ascii "end\\", "#include: x,y"
+           .ascii "" # empty data
+        "##,
+    )
+    .unwrap();
+    let expected = b"a#,:\"\\z\0b#,:\0c\0\0\x07\x08\x0c\n\r\t\x0b'\0\x07A\xff\0\x7f\x80\xff\07*S4end\\#include: x,y";
+    assert_eq!(&rom[..expected.len()], expected);
+    assert!(rom[expected.len()..].iter().all(|byte| *byte == 0));
+    let utf8 = assemble_boot_rom(".ascii \"\u{e4}\u{1f600}\"").unwrap();
+    assert_eq!(&utf8[..6], "\u{e4}\u{1f600}".as_bytes());
+    for value in 0..=255u8 {
+        for escape in [format!("\\{value:03o}"), format!("\\x{value:02x}")] {
+            let rom = assemble_boot_rom(&format!(".ascii \"{escape}\"")).unwrap();
+            assert_eq!(rom[0], value, "{escape}");
+            assert!(rom[1..].iter().all(|byte| *byte == 0));
+        }
+    }
+}
+
+#[test]
+fn string_data_sizes_labels_alignment_and_rom_limits_exactly() {
+    let rom = assemble_boot_rom(
+        "1: .ascii \"\"\nfirst: .ascii \"a,b:#\"\n\
+         2: .asciz \"\", \"x\"\n.string \"yz\"\n.ascii \"\"\n\
+         .balign 4\nentry: wfi\n.dword first, 1b, 2b, entry",
+    )
+    .unwrap();
+    assert_eq!(&rom[..12], b"a,b:#\0x\0yz\0\0");
+    assert_eq!(&rom[12..16], &0x10500073u32.to_le_bytes());
+    for (bytes, address) in rom[16..48]
+        .chunks_exact(8)
+        .zip([0x1000u64, 0x1000, 0x1005, 0x100c])
+    {
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), address);
+    }
+    for directive in [".ascii", ".asciz", ".string"] {
+        let padding = if directive == ".ascii" { 61439 } else { 61438 };
+        let rom = assemble_boot_rom(&format!(".zero {padding}\n{directive} \"x\"")).unwrap();
+        assert_eq!(rom[padding], b'x');
+        assert_eq!(rom.len(), BOOT_ROM_BYTES);
+        assert!(
+            assemble_boot_rom(&format!(".zero {}\n{directive} \"x\"", padding + 1))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+    assert!(assemble_boot_rom(".zero 61440\n.ascii \"\"").is_ok());
+    assert!(assemble_boot_rom(".zero 61440\n.asciz \"\"").is_err());
+    assert!(
+        assemble_boot_rom(".ascii \"x\"\nwfi")
+            .unwrap_err()
+            .to_string()
+            .contains("aligned")
+    );
+}
+
+#[test]
+fn string_data_guest_executes_bytes_and_numeric_label_addresses() {
+    let rom = assemble_boot_rom(
+        "li t0, 0x10000000\nla t1, 1f\nli a0, 0\n\
+         2: lbu t2, 0(t1)\nbeqz t2, 3f\nsb t2, 0(t0)\n\
+         addi a0, a0, 1\naddi t1, t1, 1\nj 2b\n\
+         3: wfi\n1: .string \"S#,:*\\n\"",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 100, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"S#,:*\n");
+    assert_eq!(machine.core().register(10), Some(6));
+}
+
+#[test]
+fn string_data_invalid_operands_preserve_existing_rom() {
+    for source in [
+        ".ascii",
+        ".asciz",
+        ".string",
+        ".ascii 42",
+        ".ascii 'x'",
+        ".ascii \"x\",",
+        ".ascii ,\"x\"",
+        ".ascii \"x\",,\"y\"",
+        ".ascii \"x\" \"y\"",
+        ".ascii \"x",
+        ".ascii \"x\\",
+        ".ascii \"\\q\"",
+        ".ascii \"\\u0041\"",
+        ".ascii \"\\x\"",
+        ".ascii \"\\x100\"",
+        ".ascii \"\\400\"",
+        ".ascii \"\\777\"",
+        ".ascii \"\\8\"",
+        ".ascii \"x\"junk",
+        ".ascii \"x\"#\nwfi",
+    ] {
+        let source = format!("# first line\n{source}");
+        let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
+        assert!(
+            diagnostic.starts_with("line 2:") || diagnostic.starts_with("line 3:"),
+            "{diagnostic}"
+        );
+        let files = Files::new();
+        std::fs::write(files.0.join("guest.S"), &source).unwrap();
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.assemble();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("guest.S")).unwrap(),
+            source.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
 fn tail_calls_match_independent_words_and_displacement_boundaries() {
     for (delta, upper, lower) in [
         (0, 0x00000317u32, 0x00030067u32),
@@ -641,8 +1804,8 @@ fn exponent_alignment_invalid_operands_preserve_existing_rom() {
             "64",
             "9223372036854775807",
             "missing",
-            "2, 0",
-            "2, 0, 3",
+            "2, 256",
+            "2, 0, -1",
         ] {
             let source = format!("{directive} {operand}");
             let diagnostic = assemble_boot_rom(&source).unwrap_err().to_string();
@@ -1030,10 +2193,10 @@ fn wide_immediates_invalid_operands_preserve_existing_rom() {
         "a0, 1, 2",
         "x32, 1",
         "a0, missing",
-        "a0, 9223372036854775808",
+        "a0, 18446744073709551616",
         "a0, -9223372036854775809",
         "a0, 0x10000000000000000",
-        "a0, 0xffffffffffffffff",
+        "a0, 0x1ffffffffffffffff",
         "a0, 1 << 40",
         "a0, 0x1__0000",
     ] {
@@ -2478,7 +3641,7 @@ fn malformed_sources_diagnose_with_line_numbers() {
         ("beq a0, a1, 4096", "out of range"),
         ("jal ra, 1048576", "out of range"),
         ("la a0, 9223372036854775807", "displacement"),
-        ("li a0, 9223372036854775808", "numeric"),
+        ("li a0, 18446744073709551616", "out of range"),
         ("a: nop\na: nop", "duplicate label"),
         ("1a: nop", "invalid label"),
         (".byte 256", "out of range"),

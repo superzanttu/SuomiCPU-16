@@ -60,6 +60,11 @@ fn strip_comment(line: &str) -> &str {
 }
 
 fn parse_number(text: &str, line: usize) -> Result<i64, AssemblyError> {
+    i64::try_from(parse_integer(text, line)?)
+        .map_err(|_| error(line, format!("expected a numeric value, got {text:?}")))
+}
+
+fn parse_integer(text: &str, line: usize) -> Result<i128, AssemblyError> {
     let value = text.trim();
     let (negative, unsigned) = if let Some(rest) = value.strip_prefix('-') {
         (true, rest)
@@ -137,8 +142,7 @@ fn parse_number(text: &str, line: usize) -> Result<i64, AssemblyError> {
     }
     let parsed = i128::from_str_radix(&normalized, base)
         .map_err(|_| error(line, format!("expected a numeric value, got {text:?}")))?;
-    i64::try_from(if negative { -parsed } else { parsed })
-        .map_err(|_| error(line, format!("expected a numeric value, got {text:?}")))
+    Ok(if negative { -parsed } else { parsed })
 }
 
 fn register(text: &str, line: usize) -> Result<u16, AssemblyError> {
@@ -1238,6 +1242,25 @@ pub fn assemble_file(path: &Path, origin: u32) -> Result<ProgramImage, AssemblyE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_numeric_consumers_keep_their_original_range() {
+        assert_eq!(parse_number("-0x8000000000000000", 1).unwrap(), i64::MIN);
+        assert_eq!(parse_number("+9223372036854775807", 1).unwrap(), i64::MAX);
+        assert_eq!(
+            parse_integer("0x_FFFF_FFFF_FFFF_FFFF", 1).unwrap(),
+            i128::from(u64::MAX)
+        );
+        for literal in [
+            "9223372036854775808",
+            "18446744073709551615",
+            "0xffffffffffffffff",
+            "-9223372036854775809",
+        ] {
+            assert!(parse_number(literal, 1).is_err(), "{literal}");
+            assert!(assemble(&format!("LDI R0, {literal}"), 0).is_err());
+        }
+    }
 
     #[test]
     fn assembles_forward_labels_and_wide_load_immediates() {

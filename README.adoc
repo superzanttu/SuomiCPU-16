@@ -106,7 +106,7 @@ unsupported constraints, clobbers, and templates diagnose.
 Reusable decimal assembly labels (+1:+, +1b+, +1f+) now resolve the nearest
 definition in source order for branches, jumps, addresses, and data. A compiled
 countdown guest executes repeated inline-assembly loops through production
-tools; label expressions remain unsupported.
+tools; integer data operands also support checked label sums/differences.
 Extended assembly now expands +%=+ into a statement-unique decimal ID,
 allowing macro-generated named labels without collisions across functions.
 The repeated countdown guest executes through production tools; basic strings
@@ -134,11 +134,13 @@ Explicit +fence pred,succ+ accepts checked +i/o/r/w+ subsets and zero masks,
 while bare +fence+ retains its full-mask encoding. A compiled publication/
 MMIO guest executes through production tools; single-hart execution is not
 evidence of multi-hart ordering, and +fence.tso+ remains unsupported.
-The +li+ pseudo now materializes signed 64-bit constants, including the
-minimum value, without scratch registers or literal pools. Existing signed
-32-bit encodings remain unchanged. A compiled wide-constant guest executes
-through production tools; unsigned literals above the signed 64-bit maximum
-and constant expressions remain unsupported.
+The +li+ pseudo now materializes signed 64-bit constants and full unsigned
+64-bit patterns without scratch registers or literal pools. +.dword+ accepts
+the same range, from -9223372036854775808 through 18446744073709551615,
+with checked overflow and exact bit preservation. Existing signed encodings
+remain unchanged. Compiled constant/mask guests execute through production
+tools; other immediate operands retain their previous limits and reject
+expressions.
 Standard +jal target+, +jalr rs+, +jr rs+, and +jalr rd,rs,offset+
 now reuse checked jump encodings. A compiled direct/indirect call guest
 executes through production tools and preserves its caller state; this adds
@@ -149,8 +151,10 @@ signed/unsigned loads through production tools; directives do not implicitly
 align data or add relocatable object support.
 Exponent alignment +.p2align/.align+ now accepts exponents 0 through 15.
 Alignment directives use mapped ROM addresses, correcting +.balign+ above
-4 KiB. A compiled aligned-table guest executes through production tools;
-padding remains zero-filled, without optional fill/max-skip operands.
+4 KiB. Optional fill bytes and maximum-skip operands now support bounded
+padding; an omitted fill retains zero bytes, not executable NOPs.
+Compiled aligned-table guests verify filled and suppressed padding through
+production tools.
 The assembler now accepts +sfence.vma+ with zero, one, or two register
 operands. Executed tests cover supervisor Sv39 page remapping and privilege
 checks; guest-written +mstatus.TVM+ now reaches the existing SATP/fence gates.
@@ -165,6 +169,31 @@ Local +tail target+ now emits a checked +auipc t1/jalr zero+ pair, preserving
 the caller's return link and documenting its +t1+ scratch clobber. A compiled
 tail-call chain executes through production tools; this adds no compiler
 tail-call optimization, external symbols, relocations, or relaxation.
+Assembly string directives +.ascii+, +.asciz+, and +.string+ now emit checked
+byte data, preserving quoted commas, colons, and comment markers. A compiled
+guest verifies terminators, byte escapes, ROM reads, and exact UART output
+through production tools. Strings add no implicit alignment; preprocessing,
+object files, and ELF linking remain unsupported.
+Byte reservations +.zero/.space/.skip count[,fill]+ now share checked sizing
+and optional fill bytes, with zero as the default. A compiled guest verifies
+zero and nonzero ROM fills, signed byte patterns, checksum, and UART output
+through production tools. Reservations do not imply alignment or RAM BSS.
+Standard data aliases +.long/.int/.4byte+ (32 bits) and +.quad/.8byte+
+(64 bits) now share the existing checked +.word/.dword+ pipeline.
+A compiled table guest verifies signed/unsigned loads, full-width masks,
+and absolute ROM pointers through production tools, without implicit alignment.
+Integer data operands now accept checked additive expressions using local
+labels and numeric literals. A compiled relative-table guest verifies signed
+offsets, pointer addends, and table lengths through production tools.
+Instruction/layout expressions and external relocations remain unsupported.
+The location term +.+ now denotes each emitted integer data value's mapped
+ROM address, including separate operands on the same line. A compiled guest
+verifies self-relative tables and embedded addresses through production tools;
+assigning the location counter and using it in instructions remain unsupported.
+Forward-only +.org offset[,fill]+ now places tables or code at a fixed
+ROM-relative byte offset with checked padding. A compiled guest verifies a
+table at mapped address +0x2000+ through production tools. This does not
+change the ROM base, reset entry, or provide sections/ELF linking.
 GNU +aligned(n)+ attributes now give supported global objects power-of-two
 RAM alignment up to 65536 bytes, including initialized/BSS buffers and static
 pointer/callback tables. The aligned descriptor/page-table guest verifies

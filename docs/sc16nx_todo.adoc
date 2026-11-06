@@ -1597,10 +1597,10 @@ their exact sequence is not ABI. Other modifiers, +asm goto+, file-scope
 assembly, records, separate units/ELF, full LP64D, firmware/xv6, and the
 parent P0 milestones remain open.
 +
-*Validation checkpoint:* Working tree based on +bf77f08+; one hart, M-mode
+*Validation checkpoint:* Working tree based on +49e1bd35+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --workspace -j 1 -- --test-threads=1+ passes all 1045 tests,
-including all 232 compiler and 63 assembler integration tests.
++cargo test --workspace -j 1 -- --test-threads=1+ passes all 1087 tests,
+including all 240 compiler and 96 assembler integration tests.
 Compiler coverage includes independently assembled call partners and
 compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
@@ -1995,6 +1995,254 @@ above includes this slice. Alternate scratch-register syntax, compiler
 tail-call optimization, external-symbol relocations/ELF, relaxation,
 preprocessing, compressed assembly, full upstream source coverage, and parent
 P0 milestones remain open.
++
+*Implemented slice / assembly byte strings:* A compiled guest reproduced
++unsupported directive ".ascii"+. The raw-ROM assembler now accepts
++.ascii+, +.asciz+, and +.string+ with comma-separated double-quoted
+operands. Shared quote-aware delimiter handling keeps commas, colons, and
+comment markers inside strings intact. A checked byte decoder supplies both
+sizing and emission, with standard control/quote/backslash escapes, up to
+three octal digits, and hexadecimal byte escapes. Out-of-byte-range values
+diagnose rather than truncate or expand into Unicode; literal UTF-8 bytes
+remain intact. Terminated directives append one zero per operand, including
+empty strings. No implicit alignment, CPU changes, external tools, or
+production fallback were added.
++tests/fixtures/kiuas16_asm_strings.c+ reads all 15 expected ROM bytes,
+including embedded zeros and high-bit bytes, reports its data address and 42
+at +0x80000000+, returns 42, and emits exact UART +53 23 2c 3a 2a 0a+.
+Both the compiled execution harness and production CLI reach waiting state
+without traps within 10000 steps; the harness checks restored +sp/s0+.
+Independent byte expectations cover punctuation, escaped quotes/backslashes,
+all 256 byte values through octal and hex escapes, literal UTF-8, numeric/named
+label addresses, explicit alignment, empty strings, exact ROM fits, and
+overflow rejection. Malformed strings, separators, escapes, and following
+unaligned instructions diagnose with source lines; failed CLI assembly
+preserves source and an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler string_data -j 1 -- --test-threads=1+
+passes all five focused tests. Unicode escapes, multiline strings,
+preprocessing, sections, relocatable objects/ELF, full upstream source
+coverage, and parent P0 completion remain open. The workspace/build/format/
+whitespace checkpoint above includes this slice.
++
+*Implemented slice / full-width unsigned assembly literals:* A compiled mask
+guest reproduced numeric rejection of +li rd,0xffffffffffffffff+.
+The shared numeric syntax is now decoded once into a wider checked integer;
+existing signed consumers still explicitly require +i64+. Only RV64 +li+
+and +.dword+ additionally accept the full unsigned 64-bit range, preserving
+each pattern exactly. The accepted combined range is -9223372036854775808
+through 18446744073709551615, with decimal and explicit hexadecimal/octal/
+binary bases, signs, uppercase prefixes, and existing underscore rules.
++li+ uses the existing signed expansion of the same bits, including its
+shared sizing/emission logic; no new CPU semantics, scratch registers,
+literal pools, or external tools were added. Signed instruction immediates,
+addresses, shifts, CSR operands, smaller data directives, sizes/alignment,
+and legacy SC-16 assembly retain their previous numeric ranges.
++tests/fixtures/kiuas16_unsigned_literals.c+ loads all-ones, high-bit-only,
+and mixed high-bit patterns, compares them with compiled C expressions and
+three +.dword+ table entries, reports exact bits at +0x80000000+, returns 42,
+and emits UART +55 2a 0a+. Both the execution harness and production CLI
+complete without traps within 10000 steps; the harness checks waiting
+and restored +sp/s0+. Independent encodings/data bytes, all four bases,
+every one-bit/complement pattern, deterministic mixed patterns, zero
+destinations, unaffected registers, labels, alignment, exact ROM fits,
+overflow, and malformed literals are covered. CLI rejection preserves
+source and an existing ROM. A shared-parser unit regression explicitly
+checks unchanged legacy signed limits.
++cargo test --test kiuas16_assembler --test kiuas16_compiler unsigned_literals -j 1 -- --test-threads=1+
+passes all six selected tests (including existing C unsigned arithmetic).
++cargo test --lib assembler::tests::signed_numeric_consumers_keep_their_original_range -j 1 -- --test-threads=1+
+passes. The workspace/build/format/whitespace checkpoint above includes
+this slice. Assembly expressions/C suffixes, preprocessing, relocatable
+objects/ELF, full upstream source coverage, and parent P0 completion remain
+open.
++
+*Implemented slice / filled byte reservations:* A compiled table guest
+reproduced rejection of its filled reservations (+expected one size operand+).
+The assembler now shares checked +count[,fill]+ handling for
++.zero/.space/.skip+. It reserves exactly the requested ROM bytes, defaults
+to zero, and repeats a fill byte from the same -128 through 255 range as
++.byte+. Signed patterns are preserved without unchecked truncation.
+Shared data-range validation also retains the existing numeric and
+label-data rules. Sizing and emission use the same reservation decoder;
+zero-length reservations still validate their fill. Existing alignment,
+signed numeric limits, CPU behavior, and single-operand +.zero+ output
+remain unchanged. No RAM/BSS allocation or implicit alignment is added.
++tests/fixtures/kiuas16_asm_space.c+ reads all 12 reserved bytes across the
+three spellings, including signed/high-bit fills and default zero fills.
+It reports the table address and checksum 1189 at +0x80000000+, returns 42,
+and emits UART +42 2a 0a+ through the Rust-native production pipeline.
+The execution harness and CLI run without traps within 10000 steps;
+the harness verifies waiting state and restored +sp/s0+.
+Independent byte expectations cover every accepted fill value for each
+directive, numeric bases, explicit/default zeros, named/numeric labels,
+zero lengths, explicit alignment, exact ROM fits, cumulative overflow,
+and instruction misalignment. An assembled table scan independently
+returns 42. Invalid counts, fills, expressions, and operand lists diagnose
+with source lines while CLI failure preserves source and an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler filled_space -j 1 -- --test-threads=1+
+passes all five focused tests. Preprocessing, sections/BSS, relocatable
+objects/ELF, full upstream source coverage, and parent P0 completion remain
+open. The workspace/build/format/whitespace checkpoint above includes this
+slice.
++
+*Implemented slice / standard integer data aliases:* A compiled table guest
+reproduced +unsupported directive ".4byte"+. The assembler now supports
++.long/.int/.4byte+ as four-byte aliases of +.word+ and +.quad/.8byte+
+as eight-byte aliases of +.dword+. One shared width lookup drives first-pass
+sizing and emission for all integer data directives, retaining checked
+numeric ranges, full-width patterns, absolute local-label addresses, and
+little-endian bytes. Directives add no implicit alignment, and four-byte
+aliases remain four bytes on RV64. No CPU/compiler lowering, external
+tool, or production fallback changed.
++tests/fixtures/kiuas16_data_aliases.c+ reads a mixed-width ROM table,
+computes 19+23, verifies sign extension of +0x80000000+, zero extension
+of +0xffffffff+, the all-ones 64-bit pattern, and a self-referencing ROM
+pointer. The Rust compiler/assembler/machine and production CLI emit UART
++44 2a 0a+, return 42, and trap zero times within 10000 steps. RAM reports
+at +0x80000000+ preserve all four exact results; the execution harness
+also checks waiting state and restored +sp/s0+.
+Independent byte expectations and canonical-directive comparisons cover
+signed/unsigned limits and distinct byte order. Tests verify odd-address
+data without padding, forward/backward numeric and named labels, exact
+following instruction addresses, explicit alignment, exact ROM fits,
+cumulative overflow, and misaligned instruction rejection. An assembled
+guest independently checks LW/LWU/LD results and the exact table pointer.
+Missing/empty operands, undefined labels, expressions, suffixes, malformed
+literals, and overflow diagnose with source lines; failed CLI assembly
+preserves source and an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler data_aliases -j 1 -- --test-threads=1+
+passes all five focused tests. Floating/128-bit data, expressions,
+preprocessing, sections, relocatable objects/ELF, full upstream source
+coverage, and parent P0 completion remain open. The workspace/build/format/
+whitespace checkpoint above includes this slice.
++
+*Implemented slice / bounded alignment padding:* A compiled table guest
+reproduced +expected one size operand+ for filled/bounded alignment.
+The assembler now accepts +alignment[,fill[,maximum]]+ for
++.balign/.p2align/.align+, including omitted fill in the three-operand form.
+Fill shares the checked byte decoder with reservations (-128 through 255).
+A positive maximum suppresses the entire padding when the required size
+exceeds the cap; equality permits padding. Zero or omitted maximum means
+no cap. Both passes share the mapped-address calculation, fill validation,
+and cap decision. Invalid operands still diagnose for already aligned or
+suppressed padding. Existing one-operand layouts and zero-filled defaults
+remain unchanged; no executable NOP synthesis, CPU changes, external tools,
+or production fallback were added.
++tests/fixtures/kiuas16_bounded_alignment.c+ observes seven 42-valued padding
+bytes, a suppressed seven-byte alignment, two default-zero bytes, and three
+128-valued padding bytes. It verifies exact aligned/skipped label addresses,
+all 16 table bytes, and checksum 732. Through the Rust-native production
+pipeline it emits UART +41 2a 0a+, returns 42, and traps zero times within
+10000 steps. RAM reports the three addresses and checksum at +0x80000000+;
+the execution harness also checks waiting state and restored +sp/s0+.
+Threshold matrices cover every supported exponent, all three directive
+forms, offsets below/above 4 KiB, and caps below/equal/above required padding.
+Tests check every accepted fill value, explicit/default zeros, unlimited
+zero cap, large caps, signed/numeric-base fills, named/numeric labels,
+exact ROM fits, cumulative overflow, and misaligned following instructions.
+An assembled guest independently skips the padding and reads exact results.
+Malformed/empty/extra operands and out-of-range fills/caps diagnose with
+source lines; CLI failure preserves source and an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler bounded_alignment -j 1 -- --test-threads=1+
+passes all six focused tests. Expressions, executable NOP padding,
+preprocessing, sections, relocatable objects/ELF, full upstream source
+coverage, and parent P0 completion remain open. The workspace/build/format/
+whitespace checkpoint above includes this slice.
++
+*Implemented slice / additive integer data expressions:* A compiled relative
+table guest reproduced numeric rejection of a local label difference.
+All integer data directives now accept left-associative addition/subtraction
+of numeric literals and named/directional local labels, with an optional unary
+sign per term. Labels resolve to mapped ROM addresses after sizing, preserving
+fixed layout and forward references. Numeric magnitudes retain shared syntax
+and unsigned-64-bit bounds; checked signed-128-bit evaluation is followed by
+the existing destination-width range check. Intermediate values may exceed
+the destination range, but final overflow diagnoses rather than truncates.
+No CPU behavior, instruction/layout expression syntax, legacy grammar,
+external tools, or production fallback changed.
++tests/fixtures/kiuas16_data_expressions.c+ reads forward/backward relative
+offsets, a pointer addend, and a table length, then uses the resulting addresses
+to load 19 and 23. Through the production Rust compiler/assembler/runner it
+emits UART +52 2a 0a+, returns 42, and traps zero times within 10000 steps.
+RAM reports 42, -16, 24, and 32 at +0x80000000+; the execution harness checks
+waiting state and restored +sp/s0+. A separate assembled guest dispatches
+through a negative relative table offset and reads a pointer-plus-one payload.
+Independent bytes check unary signs, left-associative arithmetic, numeric
+bases, all data-width aliases, final range limits, and wider intermediates.
+Forward/backward numeric and named labels, fixed instruction addresses,
+explicit alignment, and exact ROM limits are covered. Missing terms,
+undefined labels, unsupported operators, overflow, and expressions in
+instruction/layout operands diagnose with source lines; CLI failure
+preserves source and an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler data_expressions -j 1 -- --test-threads=1+
+passes all five focused tests. Parentheses, multiplication/shifts,
+location-counter syntax, symbol definitions, preprocessing, relocatable
+objects/ELF, full upstream source coverage, and parent P0 completion remain
+open. The workspace/build/format/whitespace checkpoint above includes this
+slice.
++
+*Implemented slice / per-value data location terms:* A compiled self-relative
+table guest reproduced +undefined label "."+. Integer data expressions now
+resolve +.+ to the absolute mapped ROM address of each emitted value.
+The location advances by the directive's fixed width between comma-separated
+operands; repeated occurrences within one operand share its location.
+The existing additive evaluator and final width checks are reused, with no
+layout changes, instruction expression support, CPU changes, external tools,
+or production fallback. Bare +.+ is reserved rather than accepted as an
+ambiguous label/export; ordinary dot-prefixed labels are unchanged.
++tests/fixtures/kiuas16_data_location.c+ consumes backward and forward
+self-relative offsets from consecutive word entries to read 19 and 23.
+It also verifies consecutive quad entries containing their own address
+and an address addend. Through the production Rust compiler/assembler/runner
+it emits UART +4f 2a 0a+, returns 42, and traps zero times within 10000 steps.
+The execution harness checks exact -8/+20 offsets and embedded pointers,
+RAM result/table/self-address reports at +0x80000000+, waiting state,
+and restored +sp/s0+. A separate assembled guest dispatches through a
+negative self-relative offset and reads an embedded pointer's payload.
+Independent bytes cover every integer data alias, multiple operands,
+odd addresses, locations below/above 4 KiB, named/numeric labels, unary
+signs, explicit filled alignment, following instruction addresses, final
+ROM bytes, exact fits, and overflow. Invalid uses of dot, out-of-width
+results, undefined labels, malformed expressions, attempted definitions/
+exports, and non-data operand uses diagnose with source lines; CLI failure
+preserves source and an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler data_location -j 1 -- --test-threads=1+
+passes all five focused tests. Location assignment, instruction/layout
+expressions, preprocessing, relocatable objects/ELF, full upstream source
+coverage, and parent P0 completion remain open. The workspace/build/format/
+whitespace checkpoint above includes this slice.
++
+*Implemented slice / forward fixed ROM origins:* A compiled fixed-table
+guest reproduced +unsupported directive ".org"+. The raw-ROM assembler now
+supports +.org offset[,fill]+ with a numeric ROM-relative target offset.
+It reuses reservation size/fill validation, rejects backward movement,
+and supplies the same padding decision in sizing and emission. The
+optional fill defaults to zero and accepts -128 through 255; even an
+unchanged origin validates fill. ROM base, reset entry, implicit instruction
+alignment, CPU behavior, and previous directive behavior are unchanged.
+No sections, external tools, or production fallback were added.
++tests/fixtures/kiuas16_asm_org.c+ places a table at ROM offset 4096
+(mapped address +0x2000+), skips the padding, adds its 19 and 23 entries,
+checks the preceding fill byte and an embedded per-value address, then
+emits UART +47 2a 0a+ and returns 42 through the Rust-native production
+pipeline. RAM reports +0x2000+, 42, and 42 at +0x80000000+.
+The execution harness and CLI trap zero times within 10000 steps;
+the harness also checks exact table bytes, waiting state, and restored
++sp/s0+. A separate assembled guest jumps to a fixed entry at +0x2000+,
+calls a helper at +0x1100+, returns 42, and verifies fill and return-link
+addresses.
+Independent expectations cover every fill byte, all numeric bases, default
+zero padding, equal/zero origins, offsets below/above 4 KiB, named/numeric
+labels, per-value locations, explicit alignment, exact ROM fits, and
+end-of-ROM origins. Backward targets, malformed/extra operands, negative/
+out-of-ROM offsets, invalid fills, overflow, and misaligned following
+instructions diagnose with source lines; CLI failure preserves source and
+an existing ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler rom_origin -j 1 -- --test-threads=1+
+passes all five focused tests. Symbolic/expression origins, base relocation,
+sections, preprocessing, relocatable objects/ELF, full upstream source
+coverage, and parent P0 completion remain open. The workspace/build/format/
+whitespace checkpoint above includes this slice.
 +
 *Execution evidence:* +cargo test --test kiuas16_assembler --test kiuas16_runtime
 --bin kiuas16-asm -j 1 -- --test-threads=1+ checks independent instruction
