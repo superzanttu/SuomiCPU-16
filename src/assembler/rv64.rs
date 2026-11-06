@@ -5,10 +5,63 @@ use crate::kiuas16::{BOOT_ROM, BOOT_ROM_BYTES};
 
 struct Statement<'a> {
     line: usize,
+    position: usize,
     offset: usize,
     operation: &'a str,
     operands: Vec<&'a str>,
     size: usize,
+}
+
+#[derive(Default)]
+struct Labels<'a> {
+    named: BTreeMap<&'a str, usize>,
+    numeric: BTreeMap<&'a str, Vec<(usize, usize)>>,
+}
+
+fn numeric_label(text: &str) -> Option<&str> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number = text.trim_start_matches('0');
+    Some(if number.is_empty() { "0" } else { number })
+}
+
+impl Labels<'_> {
+    fn resolve(
+        &self,
+        text: &str,
+        statement: &Statement<'_>,
+    ) -> Result<Option<usize>, AssemblyError> {
+        if let Some(offset) = self.named.get(text) {
+            return Ok(Some(*offset));
+        }
+        let Some((number, backward)) = text
+            .strip_suffix('b')
+            .map(|number| (number, true))
+            .or_else(|| text.strip_suffix('f').map(|number| (number, false)))
+            .and_then(|(number, backward)| numeric_label(number).map(|n| (n, backward)))
+        else {
+            return Ok(None);
+        };
+        let target = self.numeric.get(number).and_then(|definitions| {
+            if backward {
+                definitions
+                    .iter()
+                    .rev()
+                    .find(|(position, _)| *position <= statement.position)
+            } else {
+                definitions
+                    .iter()
+                    .find(|(position, _)| *position > statement.position)
+            }
+        });
+        target.map(|(_, offset)| Some(*offset)).ok_or_else(|| {
+            error(
+                statement.line,
+                format!("undefined numeric local label {text:?}"),
+            )
+        })
+    }
 }
 
 fn symbol(text: &str) -> bool {
@@ -110,10 +163,7 @@ fn memory(text: &str, line: usize) -> Result<(u32, u32), AssemblyError> {
     Ok((register(base.trim(), line)?, signed(offset, 12, line)?))
 }
 
-fn encode(
-    statement: &Statement<'_>,
-    labels: &BTreeMap<&str, usize>,
-) -> Result<Vec<u32>, AssemblyError> {
+fn encode(statement: &Statement<'_>, labels: &Labels<'_>) -> Result<Vec<u32>, AssemblyError> {
     let Statement {
         line,
         offset,
@@ -134,8 +184,8 @@ fn encode(
     let reg = |i: usize| register(args[i], line);
     let number = |i: usize| parse_number(args[i], line);
     let relative = |text: &str| -> Result<i64, AssemblyError> {
-        if let Some(target) = labels.get(text) {
-            Ok(*target as i64 - *offset as i64)
+        if let Some(target) = labels.resolve(text, statement)? {
+            Ok(target as i64 - *offset as i64)
         } else if symbol(text) {
             Err(error(line, format!("undefined label {text:?}")))
         } else {
@@ -175,9 +225,12 @@ fn encode(
             } | if immediate_source { 4 } else { 0 };
             immediate(0x73, rd, source, function, address)
         }
-        op if ["amoswap.", "amoadd.", "amoand.", "amoor.", "amoxor.", "lr."]
-            .iter()
-            .any(|prefix| op.starts_with(prefix)) =>
+        op if [
+            "amoswap.", "amoadd.", "amoand.", "amoor.", "amoxor.", "amomin.", "amomax.",
+            "amominu.", "amomaxu.", "lr.", "sc.",
+        ]
+        .iter()
+        .any(|prefix| op.starts_with(prefix)) =>
         {
             let parts: Vec<_> = op.split('.').collect();
             let width = match parts.get(1).copied() {
@@ -201,11 +254,16 @@ fn encode(
             let source = if load { 0 } else { reg(1)? };
             (match parts[0] {
                 "lr" => 2,
+                "sc" => 3,
                 "amoswap" => 1,
                 "amoadd" => 0,
                 "amoxor" => 4,
                 "amoor" => 8,
                 "amoand" => 12,
+                "amomin" => 16,
+                "amomax" => 20,
+                "amominu" => 24,
+                "amomaxu" => 28,
                 _ => return Err(error(line, "unsupported atomic instruction")),
             }) << 27
                 | ordering << 25
@@ -308,7 +366,8 @@ fn encode(
             )
         }
         "add" | "sub" | "sll" | "slt" | "sltu" | "xor" | "srl" | "sra" | "or" | "and" | "mul"
-        | "div" | "divu" | "rem" | "remu" | "addw" | "subw" => {
+        | "div" | "divu" | "rem" | "remu" | "addw" | "subw" | "mulh" | "mulhsu" | "mulhu"
+        | "mulw" | "divw" | "divuw" | "remw" | "remuw" => {
             count(3)?;
             let (function, upper) = match op {
                 "sub" | "subw" => (0, 0x20),
@@ -320,11 +379,14 @@ fn encode(
                 "sra" => (5, 0x20),
                 "or" => (6, 0),
                 "and" => (7, 0),
-                "mul" => (0, 1),
-                "div" => (4, 1),
-                "divu" => (5, 1),
-                "rem" => (6, 1),
-                "remu" => (7, 1),
+                "mul" | "mulw" => (0, 1),
+                "mulh" => (1, 1),
+                "mulhsu" => (2, 1),
+                "mulhu" => (3, 1),
+                "div" | "divw" => (4, 1),
+                "divu" | "divuw" => (5, 1),
+                "rem" | "remw" => (6, 1),
+                "remu" | "remuw" => (7, 1),
                 _ => (0, 0),
             };
             upper << 25
@@ -364,25 +426,34 @@ fn encode(
                 | (offset & 31) << 7
                 | 0x23
         }
-        "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu" => {
-            count(3)?;
-            let delta = relative(args[2])?;
+        "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu" | "beqz" | "bnez" | "blez" | "bgez"
+        | "bltz" | "bgtz" | "bgt" | "ble" | "bgtu" | "bleu" => {
+            let zero_test = matches!(op, "beqz" | "bnez" | "blez" | "bgez" | "bltz" | "bgtz");
+            count(if zero_test { 2 } else { 3 })?;
+            let left = reg(0)?;
+            let right = if zero_test { 0 } else { reg(1)? };
+            let (left, right) = if matches!(op, "blez" | "bgtz" | "bgt" | "ble" | "bgtu" | "bleu") {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            let delta = relative(args[args.len() - 1])?;
             if delta % 4 != 0 {
                 return Err(error(line, "branch target must be four-byte aligned"));
             }
             let value = signed(delta, 13, line)?;
             let function = match op {
-                "beq" => 0,
-                "bne" => 1,
-                "blt" => 4,
-                "bge" => 5,
-                "bltu" => 6,
+                "beq" | "beqz" => 0,
+                "bne" | "bnez" => 1,
+                "blt" | "bltz" | "bgtz" | "bgt" => 4,
+                "bge" | "bgez" | "blez" | "ble" => 5,
+                "bltu" | "bgtu" => 6,
                 _ => 7,
             };
             (value >> 12) << 31
                 | ((value >> 5) & 63) << 25
-                | reg(1)? << 20
-                | reg(0)? << 15
+                | right << 20
+                | left << 15
                 | function << 12
                 | ((value >> 1) & 15) << 8
                 | ((value >> 11) & 1) << 7
@@ -418,7 +489,7 @@ fn encode(
 }
 
 pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
-    let mut labels = BTreeMap::new();
+    let mut labels = Labels::default();
     let mut statements = Vec::new();
     let mut offset = 0_usize;
     for (index, raw) in source.lines().enumerate() {
@@ -447,10 +518,15 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
         let mut text = raw.split('#').next().unwrap_or("").trim();
         while let Some((name, rest)) = text.split_once(':') {
             let name = name.trim();
-            if !symbol(name) {
+            if let Some(number) = numeric_label(name) {
+                labels
+                    .numeric
+                    .entry(number)
+                    .or_default()
+                    .push((statements.len(), offset));
+            } else if !symbol(name) {
                 return Err(error(line, format!("invalid label {name:?}")));
-            }
-            if labels.insert(name, offset).is_some() {
+            } else if labels.named.insert(name, offset).is_some() {
                 return Err(error(line, format!("duplicate label {name:?}")));
             }
             text = rest.trim();
@@ -520,6 +596,7 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
         }
         statements.push(Statement {
             line,
+            position: statements.len(),
             offset,
             operation,
             operands,
@@ -529,7 +606,7 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
     }
     for statement in &statements {
         if matches!(statement.operation, ".globl" | ".global")
-            && !labels.contains_key(statement.operands[0])
+            && !labels.named.contains_key(statement.operands[0])
         {
             return Err(error(statement.line, "global symbol is undefined"));
         }
@@ -542,6 +619,7 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
             operation,
             ref operands,
             size,
+            ..
         } = statement;
         match operation {
             ".text" | ".globl" | ".global" | ".zero" | ".balign" => {}
@@ -552,8 +630,8 @@ pub fn assemble_boot_rom(source: &str) -> Result<Vec<u8>, AssemblyError> {
                     _ => 8,
                 };
                 for (index, operand) in operands.iter().enumerate() {
-                    let value = if let Some(target) = labels.get(operand) {
-                        BOOT_ROM.start as i64 + *target as i64
+                    let value = if let Some(target) = labels.resolve(operand, &statement)? {
+                        BOOT_ROM.start as i64 + target as i64
                     } else {
                         parse_number(operand, line)?
                     };

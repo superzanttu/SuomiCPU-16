@@ -815,7 +815,7 @@ enum ValueKind {
 
 enum Action {
     Assembly {
-        template: String,
+        template_parts: Vec<String>,
         outputs: Vec<(Value, bool, &'static str)>,
         inputs: Vec<(Value, &'static str)>,
     },
@@ -2231,7 +2231,7 @@ impl Lower<'_> {
     ) -> Result<Action, CCompilerError> {
         if !assembly.extended {
             return Ok(Action::Assembly {
-                template: assembly.template.clone(),
+                template_parts: vec![assembly.template.clone()],
                 outputs: Vec::new(),
                 inputs: Vec::new(),
             });
@@ -2289,6 +2289,7 @@ impl Lower<'_> {
             }
         }
         let mut template = String::new();
+        let mut template_parts = Vec::new();
         let mut chars = assembly.template.chars().peekable();
         while let Some(c) = chars.next() {
             if c != '%' {
@@ -2298,6 +2299,11 @@ impl Lower<'_> {
             if chars.peek() == Some(&'%') {
                 chars.next();
                 template.push('%');
+                continue;
+            }
+            if chars.peek() == Some(&'=') {
+                chars.next();
+                template_parts.push(std::mem::take(&mut template));
                 continue;
             }
             let index = if chars.peek() == Some(&'[') {
@@ -2327,8 +2333,9 @@ impl Lower<'_> {
                     .ok_or_else(|| self.fail(line, "inline assembly operand index out of range"))?,
             );
         }
+        template_parts.push(template);
         Ok(Action::Assembly {
-            template,
+            template_parts,
             outputs,
             inputs,
         })
@@ -2359,9 +2366,13 @@ impl Emit {
     }
 
     fn label(&mut self) -> String {
-        let label = format!(".Lrv64_{}", self.next_label);
+        format!(".Lrv64_{}", self.unique_id())
+    }
+
+    fn unique_id(&mut self) -> usize {
+        let id = self.next_label;
         self.next_label += 1;
-        label
+        id
     }
 
     fn push(&mut self) {
@@ -2685,7 +2696,7 @@ impl Emit {
     fn action(&mut self, action: &Action) {
         match action {
             Action::Assembly {
-                template,
+                template_parts,
                 outputs,
                 inputs,
             } => {
@@ -2717,7 +2728,12 @@ impl Emit {
                         (outputs.len() + index) * 16
                     ));
                 }
-                self.line(template);
+                if template_parts.len() == 1 {
+                    self.line(&template_parts[0]);
+                } else {
+                    let id = self.unique_id().to_string();
+                    self.line(template_parts.join(&id));
+                }
                 for (index, (_, _, register)) in outputs.iter().enumerate() {
                     self.line(format!("sd {register}, {}(sp)", index * 16 + 8));
                 }

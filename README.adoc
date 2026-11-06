@@ -103,6 +103,25 @@ constant operands, and compiler +"memory"+ clobbers. CSR read/write/set/clear
 instructions and their pseudos accept checked names/numbers in the Rust
 assembler. The scratch-CSR guest executes through the production tools;
 unsupported constraints, clobbers, and templates diagnose.
+Reusable decimal assembly labels (+1:+, +1b+, +1f+) now resolve the nearest
+definition in source order for branches, jumps, addresses, and data. A compiled
+countdown guest executes repeated inline-assembly loops through production
+tools; label expressions remain unsupported.
+Extended assembly now expands +%=+ into a statement-unique decimal ID,
+allowing macro-generated named labels without collisions across functions.
+The repeated countdown guest executes through production tools; basic strings
+remain verbatim and +%%=+ escapes to literal +%=+ in extended strings.
+The assembler now exposes all RV64A word/doubleword operations, including
+store-conditional and signed/unsigned atomic min/max with acquire/release
+suffixes. A compiled LR/SC retry-loop and extrema guest executes through
+production tools; this does not add new C atomic builtins or multi-hart support.
+Standard zero-test and reversed-comparison branch aliases now reuse checked
+RV64 branch encoding. A compiled countdown/unsigned-comparison guest executes
+through production tools; branch relaxation and compressed forms remain unsupported.
+The assembler now exposes all RV64M instructions, including signed/mixed/
+unsigned high-half products and word multiply/divide/remainder. A compiled
+arithmetic guest executes through production tools; this does not add
+128-bit C types or change compiler arithmetic lowering.
 GNU +aligned(n)+ attributes now give supported global objects power-of-two
 RAM alignment up to 65536 bytes, including initialized/BSS buffers and static
 pointer/callback tables. The aligned descriptor/page-table guest verifies

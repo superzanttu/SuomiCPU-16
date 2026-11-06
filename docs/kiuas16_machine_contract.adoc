@@ -286,12 +286,28 @@ Supported syntax is intentionally limited:
   including +fp+; comma-separated operands and +offset(register)+ memory.
 * +lui+, +auipc+, integer immediate arithmetic/logical/comparison/shift
   instructions, base register arithmetic/logical/comparison/shift instructions,
-  +addw/subw+, +mul/div/divu/rem/remu+, integer loads/stores, all six base
+  +addw/subw+, integer loads/stores, all six base
   conditional branches, +jal rd,target+, and +jalr rd,offset(base)+.
+* All RV64M operations: +mul/mulh/mulhsu/mulhu/div/divu/rem/remu+ and
+  +mulw/divw/divuw/remw/remuw+, each with three integer register operands.
+  High products select bits 127:64 of signed/signed, signed/unsigned,
+  or unsigned/unsigned products respectively. Word operations use the low
+  32 input bits and sign-extend their 32-bit result to XLEN, including
+  unsigned division/remainder. Architectural zero-divisor and signed
+  overflow results do not trap. This exposes existing CPU semantics without
+  adding C 128-bit types or new compiler operator lowering.
 * +nop+, +mv+, +ret+, +j+, +call+, +li+, and +la+.
   +li+ accepts signed 32-bit constants and emits +lui/addiw+.
   +la+ emits checked local PC-relative +auipc/addi+.
   +call+ is a checked local +jal+, not a long-call relocation.
+* Zero-test branch aliases +beqz/bnez/blez/bgez/bltz/bgtz rs,target+ and
+  reversed-comparison aliases +bgt/ble/bgtu/bleu rs,rt,target+. Each emits
+  one four-byte base branch with zero or swapped register operands.
+  Signed +blez/bgez/bltz/bgtz/bgt/ble+ comparisons use XLEN, not a word
+  truncation; +bgtu/bleu+ compare unsigned XLEN values. Targets accept the
+  same named/numeric local labels or byte displacements as base branches.
+  Existing four-byte alignment and signed 13-bit displacement checks apply;
+  no long-branch relaxation, extra scratch register, or compressed form is added.
 * +wfi+, +ecall+, +ebreak+, +mret+, +sret+, +fence+, and +fence.i+
   with no operands. Explicit fence predecessor/successor lists are unsupported.
 * +csrrw/csrrs/csrrc+ and +csrrwi/csrrsi/csrrci+, plus
@@ -303,12 +319,27 @@ Supported syntax is intentionally limited:
   integer registers. The assembler encodes numeric CSR addresses even if the
   machine does not implement them; privilege, read-only, and implemented-CSR
   checks remain CPU execution semantics.
-* +lr.w/lr.d+, +amoswap.w/amoswap.d+, +amoadd.w/amoadd.d+,
-  +amoand.w/amoand.d+, +amoor.w/amoor.d+, and +amoxor.w/amoxor.d+, optionally suffixed with
+* +lr.w/lr.d+, +sc.w/sc.d+, +amoswap.w/amoswap.d+, +amoadd.w/amoadd.d+,
+  +amoand.w/amoand.d+, +amoor.w/amoor.d+, +amoxor.w/amoxor.d+,
+  +amomin.w/amomin.d+, +amomax.w/amomax.d+, +amominu.w/amominu.d+, and
+  +amomaxu.w/amomaxu.d+, optionally suffixed with
   +.aq+, +.rl+, or +.aqrl+. Atomic address operands require zero offset,
-  written as +(register)+ or +0(register)+. Other atomic mnemonics are not
-  yet supported by this assembler, even where the CPU implements them.
-* Named forward/backward labels; branch/jump numbers are byte displacements
+  written as +(register)+ or +0(register)+. LR takes a destination and address;
+  SC/AMOs take a destination, source register, and address. SC returns zero
+  on success and nonzero on reservation failure; either attempt consumes the
+  reservation. Word LR/AMO results sign-extend to XLEN; SC returns status,
+  not the old value. Min/max compare signed or unsigned values at the selected
+  width. This covers the RV64A instruction set, not newer atomic extensions.
+  RAM-only access, reservation invalidation, and address/permission faults
+  remain CPU/machine semantics; suffix encoding does not add multi-hart support.
+* Named labels and reusable decimal numeric local labels (+1:+, +12:+).
+  Directional references (+1b+, +1f+) select the nearest preceding/following
+  definition in source order, including a preceding label on the same line.
+  Leading zeros do not change the decimal label number. Numeric labels have
+  source-unit scope, may repeat, and cannot be exported with +.globl/.global+.
+  Branches, jumps/calls, +la+, and label data operands accept these references;
+  bare numbers remain constants/displacements, not numeric-label references.
+  Branch/jump numbers are byte displacements
   from the instruction PC. Instructions and direct branch/jump targets must
   be four-byte aligned; compressed instructions are not supported.
 * +.text+, +.globl/.global+, +.byte+, +.word+ (32 bits), +.dword+ (64 bits),
@@ -316,8 +347,8 @@ Supported syntax is intentionally limited:
   operands resolve to absolute ROM addresses. Global declarations require a
   definition, but do not select an entry point or export an object symbol.
   Numeric operands reuse the shared assembler's integer-literal parser.
-* +#+ comments. Preprocessor directives, expressions, numeric local labels,
-  other sections/directives, F/D/C and remaining A instructions, external
+* +#+ comments. Preprocessor directives, expressions (including label arithmetic),
+  other sections/directives, F/D/C instructions, external
   symbols, relocatable objects, and ELF output are not supported.
 
 Malformed input, unknown operations, unresolved/duplicate labels, immediate
@@ -381,6 +412,16 @@ cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_nonstring.c C:\path\nonst
 cargo run --bin kiuas16-run -- --rom C:\path\nonstring-rom.bin --steps 10000 --deny-traps
 cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_inline.c C:\path\inline-rom.bin
 cargo run --bin kiuas16-run -- --rom C:\path\inline-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_numeric_labels.c C:\path\numeric-labels-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\numeric-labels-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_lrsc.c C:\path\lrsc-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\lrsc-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_unique_asm.c C:\path\unique-asm-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\unique-asm-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_branch_aliases.c C:\path\branch-aliases-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\branch-aliases-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_multiply.c C:\path\multiply-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\multiply-rom.bin --steps 10000 --deny-traps
 cargo test --test kiuas16_compiler -j 1 -- --test-threads=1
 ----
 
@@ -1130,6 +1171,13 @@ The initial language/backend subset is deliberately bounded:
   accepts supported integer/object-pointer/callback scalar values, and +"i"+
   requires an evaluable integer constant expression. Numeric +%0+ and named
   +%[name]+ substitutions and escaped +%%+ are supported in extended templates.
+  +%=+ expands to one decimal ID shared by all its occurrences in an emitted
+  extended statement and distinct from other statements across the translation
+  unit. IDs use the emitter's shared label counter, including compiler-generated
+  control-flow labels. Repeated runtime execution of a statement reuses its
+  emitted ID; the starting value and sequence are not guest ABI guarantees.
+  Zero-operand extended statements also support it. +%%=+ produces literal
+  +%=+ without a second substitution pass; basic assembly remains verbatim.
   Register operands use distinct caller-saved +t1..t6+ registers, including
   early-clobber outputs. Output addresses and input expressions evaluate once
   into aligned temporary storage before loading operand registers, so nested/
@@ -1145,9 +1193,45 @@ The initial language/backend subset is deliberately bounded:
   modified values through supported output operands; undeclared register
   clobbers or invalid guest addresses are not checked at runtime.
   Alternative/matching constraints, memory operands, explicit register
-  variables/clobbers, modifiers, +asm goto+, unique/numeric local labels,
+  variables/clobbers, other template modifiers, +asm goto+,
   file-scope assembly, and semicolon-separated instructions remain unsupported.
   Templates use newline-separated instructions accepted by the Rust assembler.
+  Reusable decimal local labels (+1:+ with +1b/1f+ references) work in basic
+  and extended templates, including repeated templates in different functions.
+  References resolve across the complete emitted assembly source, not a
+  compiler-created per-template namespace. Missing directional definitions
+  diagnose during assembly before the CLI replaces a prior ROM.
+  +tests/fixtures/kiuas16_numeric_labels.c+ executes backward countdown loops
+  and forward skips through library and production CLI paths. Within 10000
+  steps it emits +4e 2a 0a+, returns/reports 42 at +0x80000000+, restores
+  +sp/s0+, and traps zero times.
+  +tests/fixtures/kiuas16_lrsc.c+ combines an acquire-LR/release-SC retry loop
+  with signed/unsigned atomic min/max. It uses early-clobber outputs and a
+  compiler memory barrier, not a host atomic helper. Library and production
+  CLI execution emit +41 2a 0a+, return/report 42 at +0x80000000+, restore
+  +sp/s0+, and trap zero times within 10000 steps. This adds assembly
+  instruction coverage, not C compare-exchange/min/max builtins.
+  +tests/fixtures/kiuas16_unique_asm.c+ expands one macro's named loop/exit
+  labels with +%=+ in two private helpers. Library and production CLI execution
+  emit +55 2a 0a+, return/report 42 at +0x80000000+, restore +sp/s0+, and
+  trap zero times within 10000 steps. Regressions check consistent numeric
+  IDs, repeated templates, recursion, nested operand calls, deterministic
+  compilation, zero-operand statements, escapes, and invalid-template ROM
+  preservation. This does not add call-site inlining or +asm goto+.
+  +tests/fixtures/kiuas16_branch_aliases.c+ combines a signed nonpositive
+  guard, a backward nonzero countdown, and unsigned full-width ordering
+  through +blez/bnez/bgtu+. Library and production CLI execution emit
+  +42 2a 0a+, return/report 42 at +0x80000000+, restore +sp/s0+, and
+  trap zero times within 10000 steps. Independent instruction bytes and
+  executed truth tables cover all ten aliases at zero, equality, negative
+  values, and signed/unsigned XLEN boundaries.
+  +tests/fixtures/kiuas16_multiply.c+ uses high-half products and word
+  multiplication/division/remainder through extended assembly. Library and
+  production CLI execution emit +4d 2a 0a+, return 42, report doublewords
+  42 and one at +0x80000000/+0x80000008+, restore +sp/s0+, and trap zero
+  times within 10000 steps. Independent instruction words and execution
+  matrices check signed/mixed/unsigned high halves, truncation/sign extension,
+  division overflow/zero divisors, aliased registers, and zero destinations.
   These are GNU extensions, not C90/C99 language conformance.
   +tests/fixtures/kiuas16_csr.c+ exercises full-XLEN scratch read/write/exchange,
   a five-bit immediate set, read/write operands, and a compiler memory barrier.

@@ -1391,7 +1391,7 @@ Invalid constraints/clobbers, const/nonobject outputs, nonconstant immediate
 values, malformed templates, excessive operands, and invalid CSR operands
 diagnose without replacing an existing ROM; legacy GNU-asm rejection remains.
 Matching/alternative/memory constraints, explicit register variables/clobbers,
-template modifiers, +asm goto+, unique/numeric local labels, file-scope
+other template modifiers, +asm goto+, file-scope
 assembly, preprocessed assembler input, remaining ISA/relocation work,
 records, varargs, ELF/separate-unit linking, full LP64D, firmware/xv6, and
 P0 completion remain open. This is a bounded GNU extension, not C90 support.
@@ -1574,10 +1574,33 @@ No actual inline optimization, external-inline/separate-unit semantics,
 records, ELF, floating/aggregate ABI, full LP64D, firmware/xv6, or parent P0
 completion is claimed.
 +
-*Validation checkpoint:* Working tree based on +2882334+; one hart, M-mode
+*Implemented slice / unique extended-assembly labels:* A repeated
+macro-generated countdown helper reproduced rejection of GNU +%=+ as an
+unsupported template modifier. Extended-template lowering now preserves
+segments around +%=+ instead of eagerly allocating an ID or searching
+already-substituted text. Emission joins those segments with one decimal
+ID from the shared control-flow label counter. All occurrences in a statement
+agree; different emitted statements/functions cannot reuse the ID.
+Basic assembly remains verbatim, +%%=+ stays literal +%=+, and zero-operand
+extended forms work. This changes neither operand staging nor the scalar ABI.
++tests/fixtures/kiuas16_unique_asm.c+ executes two expansions of identical
+loop/exit label templates through the compiler, assembler, machine, and
+production CLI: UART +55 2a 0a+, return/report 42 at +0x80000000+, restored
++sp/s0+, and zero traps within 10000 steps. Behavioral regressions compare
+the IDs from twelve statements and repeated occurrences, mix them with
+compiler control-flow labels, exercise recursive and nested operand calls,
+and verify escape/basic-string behavior and deterministic output. Invalid
+templates retain source-line diagnostics and preserve an existing ROM.
++cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all
+220 tests. IDs identify emitted statements, not dynamic executions, and
+their exact sequence is not ABI. Other modifiers, +asm goto+, file-scope
+assembly, records, separate units/ELF, full LP64D, firmware/xv6, and the
+parent P0 milestones remain open.
++
+*Validation checkpoint:* Working tree based on +d9071d9+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --workspace -j 1 -- --test-threads=1+ passes all 975 tests,
-including all 213 compiler and 12 assembler integration tests.
++cargo test --workspace -j 1 -- --test-threads=1+ passes all 1001 tests,
+including all 222 compiler and 29 assembler integration tests.
 Compiler coverage includes independently assembled call partners and
 compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
@@ -1603,6 +1626,104 @@ loads/stores, local labels and PC-relative addresses, stack calls, alignment,
 and little-endian data directives. No external build tool is invoked and the
 legacy SC-16 assembler remains unchanged. See
 link:kiuas16_machine_contract.adoc#rom-assembler[supported syntax and limits].
++
+*Implemented slice / directional numeric local labels:* A compiled
+inline-assembly countdown reproduced +invalid label "1"+ in the Rust
+assembler. Decimal definitions such as +1:+ and +12:+ now permit repetition;
++Nb/Nf+ operands select the nearest preceding/following definition in source
+order. Leading zeros retain decimal identity, and labels on an instruction's
+own line count as preceding it. Branches, jumps/calls, +la+, and data
+directives share resolution while retaining existing alignment, range,
+little-endian absolute-address, and ROM checks. Named labels still require
+unique definitions; numeric locals cannot be global exports. Missing
+directional targets diagnose with source lines without replacing an old ROM.
++tests/fixtures/kiuas16_numeric_labels.c+ executes backward loops and forward
+skips through the Rust compiler, assembler, machine, and production CLI:
+UART +4e 2a 0a+, return/report 42 at +0x80000000+, restored +sp/s0+,
+and zero traps within 10000 steps. Additional execution reuses identical
+templates in separate private functions. Independent instruction bytes and
+named-label comparisons check all six branch forms, jump/call/address
+resolution, repeated and same-address definitions, and data addresses;
+a source-assembled CLI guest emits +2a+ within 100 steps without traps.
+This supersedes earlier numeric-local-label rejection, not unique-template
+modifiers, label arithmetic, preprocessing, compressed instructions,
+relocatable objects, ELF, or parent P0 completion.
++cargo test --test kiuas16_assembler --test kiuas16_compiler -j 1 -- --test-threads=1+
+passes all 231 tests. The workspace/build/format/whitespace checkpoint above
+includes this slice.
++
+*Implemented slice / remaining RV64A assembly:* The CPU already executed
+store-conditional and atomic extrema, but the compiled retry-loop guest
+reproduced +unsupported RV64 instruction "sc.d.rl"+. The existing checked
+atomic encoder now accepts +sc.w/d+ and +amomin/amomax/amominu/amomaxu.w/d+
+with no suffix or +aq/rl/aqrl+. Width, operand count, registers, zero-offset
+addresses, and ordering syntax use the same validation as existing atomics.
+No CPU semantics or compiler atomic builtin lowering changed.
++tests/fixtures/kiuas16_lrsc.c+ executes an acquire-LR/release-SC update
+from 19 to 42 and signed/unsigned extrema through the compiler, assembler,
+machine, and production CLI. Within 10000 steps it emits UART +41 2a 0a+,
+returns/reports 42 at +0x80000000+, restores +sp/s0+, and traps zero times.
+Independent encodings cover all new operations, both widths, four ordering
+forms, and zero/ordinary destinations. Execution checks sign extension,
+signed/unsigned boundary comparisons, old values, exact writes and untouched
+neighbors, successful/failed/repeated SC, absent/invalidated/address/width
+reservations, zero destinations, and aliased SC source/status registers.
+Misaligned, MMIO, and protected-ROM addresses trap without RAM/UART writes;
+malformed source diagnoses without replacing an old ROM.
+The Rust assembler now exposes all RV64A operations; newer atomic extensions,
+new C atomic builtins, multi-hart guarantees, preprocessing, compressed
+instructions, relocatable objects, ELF, and parent P0 completion remain out
+of scope. +cargo test --test kiuas16_assembler --test kiuas16_compiler -j 1 -- --test-threads=1+
+passes all 238 tests.
+The workspace/build/format/whitespace checkpoint above includes this slice.
++
+*Implemented slice / conditional branch aliases:* A compiled guarded
+countdown reproduced +unsupported RV64 instruction "blez"+. The Rust
+assembler now accepts +beqz/bnez/blez/bgez/bltz/bgtz+ and
++bgt/ble/bgtu/bleu+. They select a zero operand or reverse operands in the
+existing B-type encoder, retaining label resolution, alignment, range,
+operand-count, register, and ROM checks. Every alias emits one instruction;
+no CPU behavior, scratch-register clobber, or branch relaxation is added.
++tests/fixtures/kiuas16_branch_aliases.c+ combines a signed nonpositive
+guard, nonzero countdown, and unsigned full-width ordering. Library and
+production compiler/runner paths emit exact UART +42 2a 0a+,
+return/report 42 at +0x80000000+, restore +sp/s0+, and trap zero times
+within 10000 steps. Independent words verify all ten aliases. Named and
+numeric forward/backward targets and displacement edges -4096/4092 match
+canonical branches. Executed truth tables cover zero, equality, -1,
+signed minimum/maximum, and unsigned high-bit ordering without truncation
+or operand mutation. Invalid ranges, alignment, registers/counts, and
+unresolved targets diagnose; CLI failures preserve a prior ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler branch_alias -j 1 -- --test-threads=1+
+passes all four focused tests; the workspace/build/format/whitespace
+checkpoint above includes this slice. Preprocessing, other pseudos,
+compressed forms, relocations/ELF, full upstream source coverage, and the
+parent P0 milestones remain open.
++
+*Implemented slice / remaining RV64M assembly:* The CPU implemented high-half
+products and word arithmetic, but a compiled arithmetic consumer reproduced
++unsupported RV64 instruction "mulhu"+. The existing register encoder now
+accepts +mulh/mulhsu/mulhu/mulw/divw/divuw/remw/remuw+, completing RV64M
+assembly syntax. Each emits one checked three-register instruction with no
+CPU changes, host arithmetic service, or new C operator lowering.
++tests/fixtures/kiuas16_multiply.c+ executes signed/mixed/unsigned high
+products and word multiply/divide/remainder through the compiler, assembler,
+machine, and production CLI. Within 10000 steps it emits +4d 2a 0a+,
+returns 42, reports doublewords 42 and one at
++0x80000000/+0x80000008+, restores +sp/s0+, and traps zero times.
+Independent instruction words cover every added mnemonic and numeric/ABI
+register spellings. Execution matrices compare high products with widened
+host arithmetic across zero, negative, sign-boundary, and full-width values.
+Word matrices check upper input-bit truncation, signed/unsigned division and
+remainder, zero divisors, signed minimum divided by -1, wrapping multiplication,
+and mandatory sign extension, including unsigned-word results. Aliased
+destinations and zero destinations preserve the architectural inputs/results.
+Malformed register/count operands diagnose without replacing a prior ROM.
++cargo test --test kiuas16_assembler --test kiuas16_compiler rv64m -j 1 -- --test-threads=1+
+passes all five focused tests. The workspace/build/format/whitespace checkpoint
+above includes this slice. This is not 128-bit C support, remaining RV64I word
+shift syntax, preprocessing, compressed assembly, relocation/ELF, full upstream
+source coverage, or parent P0 completion.
 +
 *Execution evidence:* +cargo test --test kiuas16_assembler --test kiuas16_runtime
 --bin kiuas16-asm -j 1 -- --test-threads=1+ checks independent instruction

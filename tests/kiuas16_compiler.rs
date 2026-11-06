@@ -24,6 +24,263 @@ fn execute_with_budget(source: &str, steps: u64) -> (Kiuas16Machine, Vec<u8>) {
 }
 
 #[test]
+fn rv64m_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_multiply.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"M*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report[..8].try_into().unwrap()), 42);
+    assert_eq!(u64::from_le_bytes(report[8..].try_into().unwrap()), 1);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn branch_aliases_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_branch_aliases.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"B*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn unique_assembly_labels_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_unique_asm.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"U*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn unique_assembly_labels_ids_are_consistent_distinct_and_deterministic() {
+    let mut source = String::from("int main(void) { long ids[12]; long same;");
+    for index in 0..12 {
+        source.push_str(&format!(
+            "asm volatile(\"j .Lrv64_%=\\n.Lrv64_%=: addi %0, zero, %=\\naddi %[same], zero, %=\"
+                : \"=r\"(ids[{index}]), [same] \"=r\"(same));
+             if (ids[{index}] != same) return -1;"
+        ));
+    }
+    source.push_str(
+        "for (int i=0;i<12;i++) {
+             if (ids[i]<0) return -2;
+             for (int j=0;j<i;j++) if (ids[i]==ids[j]) return -3;
+         }
+         return ids[11]>9 ? 42 : -4; }",
+    );
+    let assembly = compile_to_assembly(&source, "unique-ids.c").unwrap();
+    assert_eq!(
+        assembly,
+        compile_to_assembly(&source, "unique-ids.c").unwrap()
+    );
+    assert!(!assembly.contains("%="));
+    assert_eq!(execute(&source).0.core().register(10), Some(42));
+}
+
+#[test]
+fn unique_assembly_labels_preserve_escapes_basic_strings_and_zero_operand_forms() {
+    let source = "static int nested(int n) {
+            long value=n;
+            asm volatile(\".Lnested_%=: addi %0, %0, 1\\nj .Lend_%=\\naddi %0, zero, -99\\n.Lend_%=:\"
+                : \"+r\"(value));
+            if(n) return value+nested(n-1);
+            return value;
+        }
+        int main(void) {
+            asm(\"nop # basic %= %%= %0 %[name]\");
+            asm volatile(\".Lempty_%=: nop # escaped %%= %%0 %%[name]\" :);
+            asm volatile(\"j .Lempty_%=\\n.Lempty_%=: nop\" : : : \"memory\");
+            long value;
+            asm(\"addi %0, %1, %= # literal %%= and id %=\\naddi %0, %0, -%=\" : \"=r\"(value) : \"r\"(nested(5)));
+            return value==21 ? 42 : -1;
+        }";
+    let assembly = compile_to_assembly(source, "unique-escapes.c").unwrap();
+    assert!(assembly.contains("nop # basic %= %%= %0 %[name]\n"));
+    assert!(assembly.contains("nop # escaped %= %0 %[name]\n"));
+    assert!(assembly.contains("# literal %= and id "));
+    assert_eq!(execute(source).0.core().register(10), Some(42));
+}
+
+#[test]
+fn unique_assembly_labels_invalid_templates_retain_source_lines_and_rom() {
+    for template in [
+        ".Lbad_%=: nop\\n%",
+        ".Lbad_%=: nop\\n%z0",
+        ".Lbad_%=: nop\\n%99",
+        ".Lbad_%=: nop\\n%[missing]",
+        ".Lbad_%=: nop\\n%[broken",
+    ] {
+        let source = format!(
+            "#line 73 \"unique-header.h\"\nint main(void) {{ long value; asm(\"{template}\" : \"=r\"(value)); return 0; }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "guest.c")
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.starts_with("guest.c:73:"), "{diagnostic}");
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success());
+        assert!(String::from_utf8_lossy(&build.stderr).contains(":73:"));
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn lrsc_atomic_extrema_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_lrsc.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"A*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn numeric_local_labels_inline_assembly_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_numeric_labels.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"N*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn numeric_local_labels_reused_templates_keep_independent_targets() {
+    let helper = "static inline long first(long value) {
+        __asm__ volatile(
+            \"1: addi %0, %0, -1\\nbne %0, zero, 1b\\nj 1f\\naddi %0, zero, -99\\n1: addi %0, %0, 21\"
+            : \"+r\"(value));
+        return value;
+    }";
+    let source = format!(
+        "{helper}\n{}\nint main(void) {{ return first(4)+second(7); }}",
+        helper.replace("first", "second")
+    );
+    assert_eq!(execute(&source).0.core().register(10), Some(42));
+    for template in ["j 1f", "j 1b"] {
+        let files = Files::new(&format!(
+            "int main(void) {{ __asm__ volatile(\"{template}\"); return 0; }}"
+        ));
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success());
+        assert!(String::from_utf8_lossy(&build.stderr).contains("undefined numeric local label"));
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
 fn static_inline_csr_guest_executes_through_production_cli() {
     let source = include_str!("fixtures/kiuas16_inline.c");
     let (mut machine, output) = execute(source);
