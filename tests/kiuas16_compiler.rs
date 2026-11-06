@@ -24,6 +24,3055 @@ fn execute_with_budget(source: &str, steps: u64) -> (Kiuas16Machine, Vec<u8>) {
 }
 
 #[test]
+fn static_inline_csr_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_inline.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"I*\n");
+    assert_eq!(machine.core().register(10), Some(42));
+    let mut report = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(report[..8].try_into().unwrap()),
+        0x1234567887654321
+    );
+    assert_eq!(u64::from_le_bytes(report[8..].try_into().unwrap()), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn static_inline_spellings_specifier_order_and_redeclarations_execute() {
+    for specifiers in [
+        "static inline int",
+        "inline static int",
+        "static int inline",
+        "int static inline",
+        "inline int static",
+        "int inline static",
+        "static __inline int",
+        "__inline__ static int",
+        "static int __inline__",
+        "static inline inline int",
+    ] {
+        let source = format!(
+            "{specifiers} plus(int n);
+             static int plus(int n) {{ return n+1; }}
+             int main(void) {{ return plus(41); }}"
+        );
+        assert_eq!(
+            execute(&source).0.core().register(10),
+            Some(42),
+            "{specifiers}"
+        );
+    }
+    for declaration in [
+        "inline int f(int n);",
+        "extern inline int f(int n);",
+        "int inline f(int n);",
+    ] {
+        let source = format!(
+            "static int f(int n); {declaration}
+            static int f(int n) {{ return n+2; }}
+            int main(void) {{ return f(40); }}"
+        );
+        assert_eq!(execute(&source).0.core().register(10), Some(42));
+    }
+    let source = "typedef unsigned long word;
+        static word inline plus(word value) { return value+1; }
+        static inline word inspect(word value) { return plus(value); }
+        int main(void) { return inspect(41UL); }";
+    assert_eq!(execute(source).0.core().register(10), Some(42));
+    let files = Files::new("#include \"helpers.h\"\nint main(void) { return plus(41); }");
+    std::fs::write(files.0.join("helpers.h"),
+        "#ifndef HELPERS_H\n#define HELPERS_H\n#define PRIVATE static __inline__\nPRIVATE int plus(int n) { return n+1; }\n#endif\n").unwrap();
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let rom = std::fs::read(files.0.join("rom.bin")).unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+    let run = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(run.traps, 0);
+    assert!(run.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(42));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+}
+
+#[test]
+fn static_inline_callback_identity_recursion_and_stack_arguments_execute() {
+    let source = "typedef long (*operation)(long,long,long,long,long,long,long,long,long);
+        static inline long sum(long a,long b,long c,long d,long e,long f,long g,long h,long i) {
+            if(a) return sum(a-1,b,c,d,e,f,g,h,i)+1;
+            return b+c+d+e+f+g+h+i;
+        }
+        static operation table[2]={sum,sum};
+        int calls;
+        static inline long next(void) { return ++calls; }
+        int main(void) {
+            operation callback=sum;
+            if(callback!=&sum || table[0]!=table[1]) return -1;
+            long result=callback(next(),next(),next(),next(),next(),next(),next(),next(),next());
+            return result==45 && calls==9 && callback==table[1] ? 77 : -2;
+        }";
+    assert_eq!(execute(source).0.core().register(10), Some(77));
+}
+
+#[test]
+fn static_inline_variadic_format_and_noreturn_attributes_keep_existing_semantics() {
+    let source = "#include <stdarg.h>
+        static inline long collect(const char *text,...) __attribute__((format(printf,1,2))) {
+            va_list list; va_start(list,text);
+            long result=va_arg(list,long)+va_arg(list,long);
+            va_end(list); return result;
+        }
+        int main(void) { return collect(\"%ld %ld\",19L,23L); }";
+    assert_eq!(execute(source).0.core().register(10), Some(42));
+    let invalid = source.replace("19L,23L", "19,23L");
+    assert!(
+        compile_to_assembly(&invalid, "inline-format.c")
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible type")
+    );
+    let source = "static inline void stop(void) __attribute__((noreturn)) {
+            *(volatile unsigned char *)0x10000000UL='S';
+            for(;;) __asm__ volatile(\"wfi\");
+        }
+        int main(void) { stop(); *(volatile unsigned char *)0x10000000UL='X'; return 0; }";
+    let assembly = compile_to_assembly(source, "inline-noreturn.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let mut output = Vec::new();
+    let run = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(run.traps, 0);
+    assert!(run.waiting > 0);
+    assert_eq!(output, b"S");
+    assert!(machine.core().register(2).unwrap() < 0x80010000);
+    assert_eq!(machine.core().register(2).unwrap() % 16, 0);
+}
+
+#[test]
+fn static_inline_independent_caller_observes_normal_scalar_abi() {
+    let source="static inline long helper(long a,long b,long c,long d,long e,long f,long g,long h,long i) {
+            return a+b+c+d+e+f+g+h+i;
+        }
+        int main(void) { return 0; }";
+    let mut assembly = compile_to_assembly(source, "inline-abi.c")
+        .unwrap()
+        .replacen("call main\n", "call .Linline_entry\n", 1);
+    assembly.push_str(
+        "\n.Linline_entry:
+        addi sp, sp, -32
+        sd ra, 24(sp)
+        li a0, 1
+        li a1, 2
+        li a2, 3
+        li a3, 4
+        li a4, 5
+        li a5, 6
+        li a6, 7
+        li a7, 8
+        li t0, 9
+        sd t0, 0(sp)
+        li s1, 123
+        call .Lrv64_internal_helper
+        li t0, 123
+        bne s1, t0, .Linline_bad
+        ld ra, 24(sp)
+        addi sp, sp, 32
+        ret
+        .Linline_bad:
+        ebreak\n",
+    );
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let run = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(run.traps, 0, "{:?}", run.last_trap);
+    assert!(run.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(45));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+}
+
+#[test]
+fn static_inline_invalid_linkage_and_placements_preserve_rom() {
+    for declaration in [
+        "inline int f(void) { return 0; }",
+        "extern inline int f(void) { return 0; }",
+        "inline int f(void); static int f(void) { return 0; }",
+        "static inline int object;",
+        "static int inline object[4];",
+        "typedef inline int number;",
+        "static inline int;",
+        "static int f(inline int n) { return n; }",
+        "static int f(int inline n) { return n; }",
+        "static int f(void) { inline int n=0; return n; }",
+        "static inline int f(void);",
+        "static inline int f(void) { return 0; } extern int f(void) { return 1; }",
+    ] {
+        let source = format!("{declaration} int main(void) {{ return 0; }}");
+        assert!(
+            compile_to_assembly(&source, "inline-invalid.c").is_err(),
+            "{declaration}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let result = files.compile();
+        assert!(!result.status.success(), "{declaration}");
+        assert!(!result.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    let source = "#line 137 \"inline-header.h\"\ninline int f(void) { return 0; }\nint main(void) { return 0; }";
+    let diagnostic = compile_to_assembly(source, "inline.c")
+        .unwrap_err()
+        .to_string();
+    assert!(diagnostic.contains("inline-header.h:137:"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("external inline semantics"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn nonstring_byte_buffer_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_nonstring.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"NODE\n");
+    assert_eq!(machine.core().register(10), Some(262));
+    let mut report = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    assert_eq!(u64::from_le_bytes(report[..8].try_into().unwrap()), 262);
+    assert_eq!(u64::from_le_bytes(report[8..16].try_into().unwrap()), 4);
+    let address = u64::from_le_bytes(report[16..].try_into().unwrap());
+    assert_eq!(address % 32, 0);
+    let mut buffer = [0; 8];
+    machine.bus_mut().read(address, &mut buffer).unwrap();
+    assert_eq!(&buffer, b"NODE\0\0\0\0");
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn nonstring_arrays_and_pointers_preserve_qualified_bytes_and_poisoned_startup() {
+    let source = "#include <stdint.h>
+        static const signed char signed_bytes[3] __attribute__((nonstring))={-1,0,127};
+        __attribute__((nonstring)) unsigned char bytes[4]={0,255,1,128};
+        static char empty[4] __attribute__((aligned(64),nonstring));
+        static const signed char *pointer __attribute__((nonstring))=signed_bytes;
+        volatile unsigned char *view __attribute__((__nonstring__))=bytes;
+        int main(void) {
+            volatile uint64_t *report=(volatile uint64_t *)0x80000000UL;
+            report[0]=(uint64_t)signed_bytes; report[1]=(uint64_t)bytes;
+            report[2]=(uint64_t)empty; report[3]=(uint64_t)pointer;
+            report[4]=sizeof(signed_bytes); report[5]=sizeof(bytes);
+            if(pointer[0]!=-1 || pointer[1]!=0 || pointer[2]!=127) return -1;
+            if(empty[0] || empty[1] || empty[2] || empty[3]) return -2;
+            view[2]=42; empty[3]='X';
+            return bytes[2]+empty[3];
+        }";
+    let assembly = compile_to_assembly(source, "nonstring-bytes.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    machine
+        .bus_mut()
+        .write(0x80010000, &vec![0xa5; 65536])
+        .unwrap();
+    let mut output = Vec::new();
+    let run = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(run.traps, 0, "{:?}", run.last_trap);
+    assert!(run.waiting > 0);
+    assert!(output.is_empty());
+    assert_eq!(machine.core().register(10), Some(130));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut report = [0; 48];
+    machine.bus_mut().read(0x80000000, &mut report).unwrap();
+    let words = report
+        .chunks_exact(8)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(words[0], words[3]);
+    assert_eq!(words[2] % 64, 0);
+    assert_eq!(&words[4..], &[3, 4]);
+    for (address, expected) in [
+        (words[0], [255, 0, 127, 0, 0, 0, 0, 0]),
+        (words[1], [0, 255, 42, 128, 0, 0, 0, 0]),
+        (words[2], [0, 0, 0, b'X', 0, 0, 0, 0]),
+    ] {
+        let mut bytes = [0; 8];
+        machine.bus_mut().read(address, &mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+    }
+    let mut trailing = [0; 8];
+    machine.bus_mut().read(words[2] + 8, &mut trailing).unwrap();
+    assert_eq!(trailing, [0xa5; 8]);
+}
+
+#[test]
+fn nonstring_attributes_merge_per_object_without_changing_ordinary_calls() {
+    for declaration in [
+        "extern char raw[4] __attribute__((nonstring));",
+        "__attribute__((nonstring)) extern char raw[4];",
+        "extern __attribute__((__nonstring__)) char raw[4];",
+        "extern char __attribute__((nonstring,nonstring)) raw[4];",
+    ] {
+        let source = format!(
+            "{declaration}
+             char raw[4]=\"ABCD\";
+             char ordinary[4]=\"ok\";
+             int f(const char *s,...) __attribute__((format(printf,1,2))) {{ return 42; }}
+             int main(void) {{ return raw[3]=='D' ? f(\"%s %p %c\",ordinary,(void *)raw,raw[0]) : -1; }}"
+        );
+        assert_eq!(execute(&source).0.core().register(10), Some(42));
+    }
+    let source = "char raw[4]=\"ABCD\", ordinary[4]=\"ok\";
+        int f(const char *s,...) __attribute__((format(printf,1,2))) { return 7; }
+        int main(void) { return f(\"%s\",ordinary); }
+        extern char raw[4] __attribute__((nonstring));";
+    assert_eq!(execute(source).0.core().register(10), Some(7));
+    let source = source.replace("f(\"%s\",ordinary)", "f(\"%s\",raw)");
+    assert!(
+        compile_to_assembly(&source, "late-nonstring.c")
+            .unwrap_err()
+            .to_string()
+            .contains("not a nonstring object")
+    );
+    let source = "char raw[4] __attribute__((nonstring)),ordinary[4]=\"ok\";
+        int f(const char *s,...) __attribute__((format(printf,1,2))) { return 7; }
+        int main(void) { return f(\"%s\",ordinary); }";
+    assert_eq!(execute(source).0.core().register(10), Some(7));
+}
+
+#[test]
+fn nonstring_known_string_uses_diagnose_without_overwriting_rom() {
+    for expression in [
+        "raw",
+        "raw+1",
+        "1+raw",
+        "&raw[0]",
+        "&raw[2]-1",
+        "(const char *)raw",
+        "flag ? raw : \"ok\"",
+        "flag ? \"ok\" : raw",
+        "pointer",
+        "pointer+1",
+        "(const char *)(const void *)signed_raw",
+        "(const char *)(const void *)unsigned_raw",
+        "volatile_pointer",
+        "pointer++",
+        "(pointer=raw)",
+    ] {
+        let source = format!(
+            "char raw[4] __attribute__((nonstring))=\"ABCD\";
+             signed char signed_raw[4] __attribute__((nonstring));
+             unsigned char unsigned_raw[4] __attribute__((nonstring));
+             const char *pointer __attribute__((nonstring))=raw;
+             volatile char *volatile_pointer __attribute__((nonstring))=raw;
+             int flag;
+             int f(const char *s,...) __attribute__((format(printf,1,2))) {{ return 0; }}
+             int main(void) {{ return f(\"%s\",{expression}); }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "nonstring-use.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("not a nonstring object"),
+            "{expression}: {diagnostic}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let result = files.compile();
+        assert!(!result.status.success(), "{expression}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("not a nonstring object"),
+            "{expression}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    for call in [
+        "f(raw)",
+        "f(pointer)",
+        "f(\"%.2s\",raw)",
+        "f(\"%*s\",4,raw)",
+    ] {
+        let source = format!(
+            "char raw[4] __attribute__((nonstring))=\"ABCD\";
+             const char *pointer __attribute__((nonstring))=raw;
+             int f(const char *s,...) __attribute__((format(printf,1,2))) {{ return 0; }}
+             int main(void) {{ return {call}; }}"
+        );
+        assert!(
+            compile_to_assembly(&source, "nonstring-format.c")
+                .unwrap_err()
+                .to_string()
+                .contains("not a nonstring object")
+        );
+    }
+}
+
+#[test]
+fn nonstring_invalid_types_arguments_and_placements_preserve_rom() {
+    for declaration in [
+        "int object __attribute__((nonstring));",
+        "char object __attribute__((nonstring));",
+        "int object[4] __attribute__((nonstring));",
+        "int *object __attribute__((nonstring));",
+        "char **object __attribute__((nonstring));",
+        "char *object[4] __attribute__((nonstring));",
+        "typedef char object __attribute__((nonstring));",
+        "typedef char *object __attribute__((nonstring));",
+        "int f(void) __attribute__((nonstring)) { return 0; }",
+        "__attribute__((nonstring)) int;",
+        "char object[4] __attribute__((nonstring(1)));",
+        "int f(char *p __attribute__((nonstring))) { return 0; }",
+        "int f(__attribute__((nonstring)) char *p) { return 0; }",
+        "int f(void) { char object[4] __attribute__((nonstring)); return 0; }",
+    ] {
+        let source = format!("{declaration} int main(void) {{ return 0; }}");
+        assert!(
+            compile_to_assembly(&source, "nonstring-invalid.c").is_err(),
+            "{declaration}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        assert!(!files.compile().status.success(), "{declaration}");
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn nonstring_diagnostics_keep_mapped_locations_and_documented_unchecked_boundaries() {
+    for (source, location) in [
+        (
+            "#line 137 \"bytes-header.h\"\nint wrong[4] __attribute__((nonstring));\nint main(void) { return 0; }",
+            "bytes-header.h:137:",
+        ),
+        (
+            "char raw[4] __attribute__((nonstring));\nint f(const char *s,...) __attribute__((format(printf,1,2))) { return 0; }\nint main(void) {\n#line 207 \"bytes-user.h\"\nreturn f(\"%s\",raw);\n}",
+            "bytes-user.h:207:",
+        ),
+    ] {
+        let diagnostic = compile_to_assembly(source, "nonstring.c")
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.contains(location), "{diagnostic}");
+    }
+    let source = "char raw[4] __attribute__((nonstring))=\"ABCD\";
+        typedef int (*logger)(const char *s,...);
+        int f(const char *s,...) __attribute__((format(printf,1,2))) { return 7; }
+        int main(void) {
+            const char *alias=raw; const char *format=\"%s\"; logger callback=f;
+            return f(\"%s\",alias)+f(format,raw)+callback(\"%s\",raw)
+                +f(\"%s\",1 ? \"ok\" : raw);
+        }";
+    assert_eq!(execute(source).0.core().register(10), Some(28));
+}
+
+#[test]
+fn printf_format_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_format.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(output, b"F:7/9!%\n");
+    assert_eq!(machine.core().register(10), Some(8));
+    let mut bytes = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes), 8);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn printf_format_scalar_conversions_execute_after_default_promotions() {
+    for (format, argument, ty, expected) in [
+        ("%d", "(signed char)-7", "int", -7i64),
+        ("%i", "(short)-8", "int", -8),
+        ("%hhd", "(signed char)-9", "int", -9),
+        ("%hd", "(short)-10", "int", -10),
+        ("%hhu", "(unsigned char)250", "int", 250),
+        ("%hu", "(unsigned short)65535", "int", 65535),
+        ("%u", "4000000000U", "unsigned int", 4000000000),
+        ("%o", "17U", "unsigned int", 17),
+        ("%x", "19U", "unsigned int", 19),
+        ("%X", "21U", "unsigned int", 21),
+        ("%ld", "-4294967297L", "long", -4294967297),
+        ("%li", "4294967297L", "long", 4294967297),
+        ("%lu", "4294967298UL", "unsigned long", 4294967298),
+        ("%lo", "4294967299UL", "unsigned long", 4294967299),
+        ("%lx", "4294967300UL", "unsigned long", 4294967300),
+        ("%lX", "4294967301UL", "unsigned long", 4294967301),
+        ("%jd", "(intmax_t)-13", "intmax_t", -13),
+        ("%ju", "(uintmax_t)23", "uintmax_t", 23),
+        ("%zd", "(ptrdiff_t)-14", "ptrdiff_t", -14),
+        ("%zu", "(size_t)24", "size_t", 24),
+        ("%td", "(ptrdiff_t)-15", "ptrdiff_t", -15),
+        ("%tu", "25UL", "unsigned long", 25),
+        ("%c", "(_Bool)1", "int", 1),
+    ] {
+        let source = format!(
+            "#include <stdarg.h>
+             #include <stdint.h>
+             #include <stddef.h>
+             long collect(const char *text, ...) __attribute__((format(printf,1,2))) {{
+                 va_list list; va_start(list,text);
+                 long result=(long)va_arg(list,{ty}); va_end(list); return result;
+             }}
+             int main(void) {{
+                 long value=collect(\"{format}\",{argument});
+                 return value=={expected}L ? 77 : -1;
+             }}"
+        );
+        let (machine, _) = execute(&source);
+        assert_eq!(machine.core().register(10), Some(77), "{format}");
+    }
+}
+
+#[test]
+fn printf_format_stars_strings_pointers_and_escaped_percent_execute_once() {
+    let (machine, _) = execute(
+        "#include <stdarg.h>
+         int calls;
+         int next(void) { calls++; return calls; }
+         long collect(const char *text, ...) __attribute__((format(printf,1,2))) {
+             va_list list; va_start(list,text);
+             int width=va_arg(list,int),precision=va_arg(list,int);
+             unsigned long value=va_arg(list,unsigned long);
+             const char *string=va_arg(list,const char *);
+             const void *pointer=va_arg(list,const void *);
+             int result=width==1 && precision==2 && value==4294967297UL
+                 && string[0]=='A' && pointer==(const void *)string && calls==2;
+             va_end(list); return result;
+         }
+         int main(void) {
+             const char *text=\"A\";
+             return collect(\"%% %-#0*.*lx %.1s %p\",next(),next(),4294967297UL,text,(const void *)text);
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(1));
+    for literal in ["%%", "%05d", "%+ d", "%10.3i", "%.d", "%d\\0%q"] {
+        let args = if literal == "%%" { "" } else { ",7" };
+        let source = format!(
+            "int f(const char *s,...) __attribute__((format(printf,1,2))) {{ return 42; }}
+             int main(void) {{ return f(\"{literal}\"{args}); }}"
+        );
+        assert_eq!(execute(&source).0.core().register(10), Some(42));
+    }
+}
+
+#[test]
+fn printf_format_attributes_merge_and_check_calls_before_late_redeclarations() {
+    for declaration in [
+        "__attribute__((format(printf,2,3))) static int f(int n,const char *s,...);",
+        "static __attribute__((__format__(__printf__,2,3))) int f(int n,const char *s,...);",
+        "static int __attribute__((format(printf,1+1,3))) f(int n,const char *s,...);",
+        "static int f(int n,const char *s,...) __attribute__((format(printf,2,3),format(__printf__,2,3)));",
+    ] {
+        let source = format!(
+            "{declaration}
+             static int f(int n,const char *s,...) {{ return n; }}
+             int main(void) {{ return (&f)(42,\"%ld\",7L); }}"
+        );
+        assert_eq!(execute(&source).0.core().register(10), Some(42));
+    }
+    let parameters = (0..31)
+        .map(|index| format!("int p{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let arguments = (0..31).map(|_| "42").collect::<Vec<_>>().join(",");
+    let source = format!(
+        "int f({parameters},const char *s,...) __attribute__((format(printf,32,33))) {{ return p0; }}
+         int main(void) {{ return f({arguments},\"\"); }}"
+    );
+    assert_eq!(execute(&source).0.core().register(10), Some(42));
+    let invalid = source.replace(",\"\")", ",\"%d\")");
+    assert!(
+        compile_to_assembly(&invalid, "format-boundary.c")
+            .unwrap_err()
+            .to_string()
+            .contains("more arguments")
+    );
+    let source = "int f(const char *s,...) { return 0; }
+        int main(void) { return f(\"%ld\",1); }
+        int f(const char *s,...) __attribute__((format(printf,1,2)));";
+    assert!(
+        compile_to_assembly(source, "late-format.c")
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible type")
+    );
+}
+
+#[test]
+fn printf_format_va_list_wrappers_check_syntax_without_reading_argument_types() {
+    let source = "#include <stdarg.h>
+        long render(const char *s,va_list args) __attribute__((format(printf,1,0))) {
+            return va_arg(args,long);
+        }
+        int wrapper(const char *s,...) __attribute__((format(printf,1,2))) {
+            va_list list; va_start(list,s);
+            long value=render(\"%ld %s %*.*u\",list);
+            va_end(list); return value;
+        }
+        int main(void) { return wrapper(\"%ld\",42L); }";
+    assert_eq!(execute(source).0.core().register(10), Some(42));
+    let invalid = source.replace("%ld %s %*.*u", "%n");
+    assert!(
+        compile_to_assembly(&invalid, "vformat.c")
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported printf")
+    );
+}
+
+#[test]
+fn printf_format_nonliteral_and_dynamic_callback_calls_remain_unchecked() {
+    let (machine, _) = execute(
+        "typedef int (*logger)(const char *s,...);
+         int f(const char *s,...) __attribute__((format(printf,1,2))) { return 7; }
+         int main(void) {
+             const char *format=\"%n\"; logger callback=f;
+             return f(format,1L)+callback(\"%q\",2L);
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(14));
+}
+
+#[test]
+fn printf_format_invalid_literals_and_types_preserve_existing_rom() {
+    for (arguments, message) in [
+        ("\"%d\"", "more arguments"),
+        ("\"\",1", "unused arguments"),
+        ("\"%%\",1", "unused arguments"),
+        ("\"%d\",1L", "incompatible type"),
+        ("\"%u\",1", "incompatible type"),
+        ("\"%ld\",1", "incompatible type"),
+        ("\"%lu\",1L", "incompatible type"),
+        ("\"%d\",(void *)0", "incompatible type"),
+        ("\"%s\",1", "incompatible type"),
+        ("\"%s\",(int *)0", "incompatible type"),
+        ("\"%p\",(char *)0", "incompatible type"),
+        ("\"%*d\",1L,2", "incompatible type"),
+        ("\"%.*d\",1U,2", "incompatible type"),
+        ("\"%*.*d\",1,2", "more arguments"),
+        ("\"%\"", "unterminated printf"),
+        ("\"%0.\"", "unterminated printf"),
+        ("\"%n\",(int *)0", "unsupported printf"),
+        ("\"%f\",1", "unsupported printf"),
+        ("\"%lc\",1", "unsupported printf"),
+        ("\"%ls\",\"a\"", "unsupported printf"),
+        ("\"%lld\",1L", "unsupported printf"),
+        ("\"%llu\",1UL", "unsupported printf"),
+        ("\"%Ld\",1L", "unsupported printf"),
+        ("\"%1$d\",1", "unsupported printf"),
+        ("\"%*1$d\",1,2", "unsupported printf"),
+        ("\"%q\",1", "unsupported printf"),
+        ("\"%+s\",\"text\"", "unsupported printf flags"),
+        ("\"%#d\",1", "unsupported printf flags"),
+        ("\"%.2c\",1", "unsupported printf flags"),
+        ("\"%.1p\",(void *)0", "unsupported printf flags"),
+    ] {
+        let source = format!(
+            "int f(const char *s,...) __attribute__((format(printf,1,2))) {{ return 0; }}
+             int main(void) {{ return f({arguments}); }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "format-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.contains(message), "{arguments}: {diagnostic}");
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let result = files.compile();
+        assert!(!result.status.success(), "{arguments}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains(message));
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn printf_format_invalid_attributes_redeclarations_and_placements_are_diagnosed() {
+    for attribute in [
+        "format(scanf,1,2)",
+        "format(printf,0,2)",
+        "format(printf,2,2)",
+        "format(printf,1,1)",
+        "format(printf,1,3)",
+        "format(printf,-1,2)",
+        "format(printf,1,1/0)",
+        "format(printf,1,65536)",
+        "format(printf,1,0),format(printf,1,2)",
+        "format(printf,1)",
+    ] {
+        let source = format!(
+            "int f(const char *s,...) __attribute__(({attribute})) {{ return 0; }}
+             int main(void) {{ return 0; }}"
+        );
+        assert!(
+            compile_to_assembly(&source, "format-attribute.c").is_err(),
+            "{attribute}"
+        );
+    }
+    for source in [
+        "int f(int s,...) __attribute__((format(printf,1,2))) { return 0; }",
+        "int f(const char **s,...) __attribute__((format(printf,1,2))) { return 0; }",
+        "int f(const char *s) __attribute__((format(printf,1,2))) { return 0; }",
+        "int f(const char *s,...) __attribute__((format(printf,1,2))); int f(const char *s,...) __attribute__((format(printf,1,0))) { return 0; }",
+        "int object __attribute__((format(printf,1,2)));",
+        "typedef int object __attribute__((format(printf,1,2)));",
+        "__attribute__((format(printf,1,2))) int;",
+        "int f(const char *s __attribute__((format(printf,1,2))),...) { return 0; }",
+        "int f(void) { int local __attribute__((format(printf,1,2))); return 0; }",
+    ] {
+        let source = format!("{source} int main(void) {{ return 0; }}");
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        assert!(!files.compile().status.success(), "{source}");
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
+fn printf_format_diagnostics_keep_mapped_call_and_declaration_locations() {
+    for (source, location) in [
+        (
+            "int f(const char *s,...) __attribute__((format(printf,1,2))) { return 0; }\nint main(void) {\n#line 207 \"logger-user.h\"\nreturn f(\"%ld\",1);\n}",
+            "logger-user.h:207:",
+        ),
+        (
+            "#line 123 \"logger-header.h\"\nint f(int s,...) __attribute__((format(printf,1,2))) { return 0; }\nint main(void) { return 0; }",
+            "logger-header.h:123:",
+        ),
+        (
+            "int f(const char *s,...) __attribute__((format(printf,1,2))) { return 0; }\n#line 92 \"logger-header.h\"\nint f(const char *s,...) __attribute__((format(printf,1,0)));\nint main(void) { return 0; }",
+            "logger-header.h:92:",
+        ),
+        (
+            "#line 87 \"logger-header.h\"\nint f(const char *s,...) __attribute__((format(scanf,1,2))) { return 0; }\nint main(void) { return 0; }",
+            "logger-header.h:87:",
+        ),
+    ] {
+        let diagnostic = compile_to_assembly(source, "format.c")
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.contains(location), "{diagnostic}");
+    }
+}
+
+#[test]
+fn scalar_varargs_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_varargs.c");
+    let (mut machine, output) = execute(source);
+    assert_eq!(machine.core().register(10), Some(132));
+    assert_eq!(output, b"V\x84\n");
+    let mut bytes = [0; 8];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes), 132);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn scalar_varargs_cross_every_named_register_and_stack_boundary() {
+    for named in [1usize, 2, 6, 7, 8, 9, 10, 31, 32] {
+        for extra in [0, 1, 2, 7, 9, 23, 31] {
+            if named + extra > 32 {
+                continue;
+            }
+            let parameters = (0..named)
+                .map(|i| format!("long p{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let arguments = (0..named + extra)
+                .map(|i| format!("{}L", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let checks = (0..named)
+                .map(|i| format!("if(p{i}!={}L) return -1;", i + 1))
+                .collect::<String>();
+            let expected = (named + 1..=named + extra).sum::<usize>();
+            let source = format!(
+                "#include <stdarg.h>
+                 long collect({parameters},...) {{
+                     {checks}
+                     va_list args;
+                     va_start(args,p{last});
+                     long sum=0;
+                     for(int i=0;i<{extra};i++) sum += va_arg(args,long);
+                     va_end(args);
+                     return sum;
+                 }}
+                 int main(void) {{ return collect({arguments}); }}",
+                last = named - 1
+            );
+            let (machine, output) = execute(&source);
+            assert_eq!(
+                machine.core().register(10),
+                Some(expected as u64),
+                "named={named} extra={extra}"
+            );
+            assert!(output.is_empty());
+        }
+    }
+}
+
+#[test]
+fn scalar_varargs_promote_narrow_arguments_preserve_pointer_types_and_copy_cursors() {
+    let (mut machine, _) = execute(
+        "#include <stdarg.h>
+         #include <stdint.h>
+         typedef long (*callback)(long);
+         long plus(long n) { return n+3; }
+         long inspect(int last, ...) {
+             va_list args,copy;
+             va_start(args,last);
+             va_copy(copy,args);
+             volatile uint64_t *report=(volatile uint64_t *)0x80000000UL;
+             report[0]=va_arg(args,int);
+             report[1]=va_arg(args,int);
+             report[2]=va_arg(args,int);
+             report[3]=va_arg(args,int);
+             report[4]=va_arg(args,int);
+             report[5]=va_arg(args,int);
+             report[6]=va_arg(args,unsigned int);
+             report[7]=va_arg(args,long);
+             report[8]=va_arg(args,unsigned long);
+             const int *pointer=va_arg(args,const int *);
+             callback operation=va_arg(args,callback);
+             void *null=va_arg(args,void *);
+             report[9]=*pointer;
+             report[10]=operation(39);
+             report[11]=null==0;
+             report[12]=va_arg(copy,int);
+             va_end(args); va_end(copy);
+             return 77;
+         }
+         int main(void) {
+             _Bool flag=1;
+             char plain=255;
+             signed char byte=-7;
+             unsigned char octet=254;
+             short small=-1234;
+             unsigned short half=65535;
+             const int object=37;
+             return inspect(0,flag,plain,byte,octet,small,half,0xfedcba98U,
+                 -0x123456788765432L,0xfedcba9876543210UL,&object,plus,(void *)0);
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(77));
+    let mut bytes = [0; 104];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    let expected = [
+        1u64,
+        255,
+        (-7i64) as u64,
+        254,
+        (-1234i64) as u64,
+        65535,
+        0xfedcba98,
+        (-0x123456788765432i64) as u64,
+        0xfedcba9876543210,
+        37,
+        42,
+        1,
+        1,
+    ]
+    .iter()
+    .flat_map(|value| value.to_le_bytes())
+    .collect::<Vec<_>>();
+    assert_eq!(bytes.as_slice(), expected);
+}
+
+#[test]
+fn scalar_varargs_recursive_indirect_dispatch_and_argument_side_effects_execute_once() {
+    let (machine,output)=execute(
+        "#include <stdarg.h>
+         typedef long (*collector)(int,...);
+         int calls;
+         long next(void) { calls++; return calls; }
+         long consume(int count,va_list args) {
+             long result=0;
+             while(count--) result+=va_arg(args,long);
+             return result;
+         }
+         long recursive(int depth,...) {
+             va_list args,copy;
+             va_start(args,depth);
+             long first=va_arg(args,long);
+             va_copy(copy,args);
+             long rest=consume(9,copy);
+             if (depth) rest+=recursive(depth-1,first,1L,2L,3L,4L,5L,6L,7L,8L,9L);
+             va_end(args); va_end(copy);
+             return first+rest;
+         }
+         collector table[2]={recursive,0};
+         int targets;
+         collector choose(void) { targets++; return table[0]; }
+         int main(void) {
+             long result=choose()(2,next(),next(),next(),next(),next(),next(),next(),next(),next(),next());
+             if(calls!=10 || targets!=1 || result!=147) return 1;
+             return 77;
+         }");
+    assert_eq!(machine.core().register(10), Some(77));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn scalar_varargs_list_operands_evaluate_once_and_restart_uses_original_arguments() {
+    let (machine, output) = execute(
+        "#include <stdarg.h>
+         va_list cursors[3];
+         int addresses;
+         va_list *where(void) { addresses++; return cursors+1; }
+         int inspect(int last,...) {
+             int i=0;
+             va_start(cursors[i++],last);
+             va_copy(*where(),cursors[0]);
+             long first=va_arg(*where(),long);
+             long again=va_arg(cursors[0],long);
+             va_end(*where());
+             va_start(cursors[2],last);
+             long restart=va_arg(cursors[2],long);
+             if(i!=1 || addresses!=3 || first!=17 || again!=17 || restart!=17) return 1;
+             last=999;
+             va_start(cursors[0],last);
+             if(va_arg(cursors[0],long)!=17) return 2;
+             return 77;
+         }
+         int main(void) { return inspect(0,17L); }",
+    );
+    assert_eq!(machine.core().register(10), Some(77));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn scalar_varargs_independent_caller_checks_save_area_stack_slots_and_preserved_registers() {
+    let source = "#include <stdarg.h>
+         unsigned long inspect(unsigned long last,...) {
+             va_list args;
+             va_start(args,last);
+             unsigned long total=last;
+             for(int i=0;i<10;i++) total+=va_arg(args,unsigned long);
+             va_end(args);
+             return total;
+         }
+         int main(void) { return 0; }";
+    let mut assembly = compile_to_assembly(source, "varargs-caller.c")
+        .unwrap()
+        .replacen("call main\n", "call .Lva_entry\n", 1);
+    assembly.push_str(
+        "\n.Lva_entry:
+         addi sp, sp, -48
+         sd ra, 40(sp)
+         li s0, 88
+         li s1, 99
+         li a0, 1
+         li a1, 2
+         li a2, 3
+         li a3, 4
+         li a4, 5
+         li a5, 6
+         li a6, 7
+         li a7, 8
+         li t0, 9
+         sd t0, 0(sp)
+         li t0, 10
+         sd t0, 8(sp)
+         li t0, 11
+         sd t0, 16(sp)
+         li t0, 123
+         sd t0, 24(sp)
+         call inspect
+         ld t0, 24(sp)
+         ld ra, 40(sp)
+         addi sp, sp, 48
+         ret\n",
+    );
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    for (register, value) in [(2, 0x80010000), (8, 88), (9, 99), (10, 66), (5, 123)] {
+        assert_eq!(machine.core().register(register), Some(value));
+    }
+}
+
+#[test]
+fn scalar_varargs_independent_callee_checks_default_promotions_and_outgoing_stack() {
+    let source = "long foreign(int last,...) { return 0; }
+         int main(void) {
+             signed char byte=-7;
+             unsigned short half=65535;
+             _Bool flag=1;
+             return foreign(1,byte,half,flag,0xfedcba98U,5L,6UL,7L,8UL,9L);
+         }";
+    let mut assembly = compile_to_assembly(source, "varargs-callee.c")
+        .unwrap()
+        .replacen("\nforeign:\n", "\n.Lunused_va_foreign:\n", 1);
+    assembly.push_str(
+        "\nforeign:
+         andi t0, sp, 15
+         bne t0, zero, .Lbad_va
+         li t0, 1
+         bne a0, t0, .Lbad_va
+         li t0, -7
+         bne a1, t0, .Lbad_va
+         li t0, 65535
+         bne a2, t0, .Lbad_va
+         li t0, 1
+         bne a3, t0, .Lbad_va
+         li t0, -19088744
+         bne a4, t0, .Lbad_va
+         li t0, 5
+         bne a5, t0, .Lbad_va
+         li t0, 6
+         bne a6, t0, .Lbad_va
+         li t0, 7
+         bne a7, t0, .Lbad_va
+         ld t0, 0(sp)
+         li t1, 8
+         bne t0, t1, .Lbad_va
+         ld t0, 8(sp)
+         li t1, 9
+         bne t0, t1, .Lbad_va
+         li a0, 77
+         ret
+         .Lbad_va:
+         li a0, -1
+         ret\n",
+    );
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(77));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+}
+
+#[test]
+fn scalar_varargs_cursor_matches_independent_register_save_and_incoming_stack_layout() {
+    for named in [1usize, 7, 8, 9, 10, 30] {
+        let parameters = (0..named)
+            .map(|i| format!("long p{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            "#include <stdarg.h>
+             long foreign(va_list list) {{ return 0; }}
+             long collect({parameters},...) {{
+                 va_list list;
+                 va_start(list,p{});
+                 return foreign(list);
+             }}
+             int main(void) {{ return 0; }}",
+            named - 1
+        );
+        let mut assembly = compile_to_assembly(&source, "va-layout.c")
+            .unwrap()
+            .replacen("call main\n", "call .Lva_layout_entry\n", 1)
+            .replacen("\nforeign:\n", "\n.Lunused_va_layout_foreign:\n", 1);
+        let extra = 2;
+        let outgoing = ((named + extra).saturating_sub(8) * 8).next_multiple_of(16);
+        let allocation = outgoing + 16;
+        assembly.push_str(&format!(
+            "\n.Lva_layout_entry:\naddi sp, sp, -{allocation}\nsd ra, {outgoing}(sp)\nmv s1, sp\n"
+        ));
+        for index in 0..named + extra {
+            if index < 8 {
+                assembly.push_str(&format!("li a{index}, {}\n", index + 1));
+            } else {
+                assembly.push_str(&format!(
+                    "li t0, {}\nsd t0, {}(sp)\n",
+                    index + 1,
+                    (index - 8) * 8
+                ));
+            }
+        }
+        assembly.push_str(&format!(
+            "call collect\nld ra, {outgoing}(sp)\naddi sp, sp, {allocation}\nret
+             foreign:
+             addi t0, s1, {}
+             bne a0, t0, .Lbad_va_layout
+             ld t0, 0(a0)
+             li t1, {}
+             bne t0, t1, .Lbad_va_layout
+             ld t0, 8(a0)
+             li t1, {}
+             bne t0, t1, .Lbad_va_layout
+             li a0, 77
+             ret
+             .Lbad_va_layout:
+             li a0, -1
+             ret\n",
+            (named as isize - 8) * 8,
+            named + 1,
+            named + 2
+        ));
+        let mut machine =
+            Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000)
+                .unwrap();
+        let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+        assert_eq!(report.traps, 0, "named={named}: {:?}", report.last_trap);
+        assert!(report.waiting > 0);
+        assert_eq!(machine.core().register(10), Some(77), "named={named}");
+        assert_eq!(machine.core().register(2), Some(0x80010000));
+        assert_eq!(machine.core().register(8), Some(0));
+    }
+}
+
+#[test]
+fn scalar_varargs_skipped_and_sizeof_operands_do_not_advance_the_cursor() {
+    let (machine, output) = execute(
+        "#include <stdarg.h>
+         int collect(int last,...) {
+             va_list args;
+             va_start(args,last);
+             if(sizeof(va_arg(args,long))!=8) return 1;
+             if(0 && va_arg(args,long)) return 2;
+             long a=1 ? va_arg(args,long) : va_arg(args,long);
+             if(a!=17 || va_arg(args,long)!=25) return 3;
+             va_end(args);
+             return a+25;
+         }
+         int main(void) { return collect(0,17L,25L); }",
+    );
+    assert_eq!(machine.core().register(10), Some(42));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn scalar_varargs_pointer_to_pointer_and_callback_object_arguments_remain_typed_rvalues() {
+    let (machine, output) = execute(
+        "#include <stdarg.h>
+         typedef long (*callback)(long);
+         long plus(long n) { return n+3; }
+         int collect(int last,...) {
+             va_list args;
+             va_start(args,last);
+             int **object=va_arg(args,int **);
+             const unsigned char *text=va_arg(args,const unsigned char *);
+             callback *operation=va_arg(args,callback *);
+             va_end(args);
+             return **object+*text+(*operation)(4);
+         }
+         int main(void) {
+             int object=17;
+             int *pointer=&object;
+             const unsigned char bytes[2]={18,0};
+             callback operation=plus;
+             return collect(0,&pointer,bytes,&operation);
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(42));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn scalar_varargs_invalid_builtin_types_arguments_and_declarations_preserve_rom() {
+    for body in [
+        "va_start(args,first);",
+        "va_start(args,last+0);",
+        "va_start(args,0);",
+        "{ int last=1; va_start(args,last); }",
+        "va_start((va_list)args,last);",
+        "va_start(0,last);",
+        "int not_list=0; va_start(not_list,last);",
+        "va_arg(args,char);",
+        "va_arg(args,signed char);",
+        "va_arg(args,unsigned char);",
+        "va_arg(args,_Bool);",
+        "va_arg(args,short);",
+        "va_arg(args,unsigned short);",
+        "va_arg(args,void);",
+        "va_arg(args,double);",
+        "va_arg(args,float);",
+        "va_arg(args,long long);",
+        "va_arg(args,missing);",
+        "va_arg((va_list)args,long);",
+        "va_arg(0,long);",
+        "va_arg(args,int)=1;",
+        "++va_arg(args,int);",
+        "&va_arg(args,long);",
+        "va_copy(args,1);",
+        "va_copy(0,args);",
+        "va_end(0);",
+        "__builtin_va_start(args);",
+        "__builtin_va_start(args,last,1);",
+        "__builtin_va_copy(args);",
+        "__builtin_va_end(args,args);",
+        "int __builtin_va_start=1;",
+        "if(0) va_arg(args,char);",
+    ] {
+        let source = format!(
+            "#include <stdarg.h>\nint inspect(int first,int last,...) {{ va_list args; {body} return 0; }} int main(void) {{ return 0; }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "varargs-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("varargs-invalid.c:"),
+            "{body}: {diagnostic}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let result = files.compile();
+        assert!(!result.status.success(), "{body}");
+        assert!(!result.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    for source in [
+        "#include <stdarg.h>\nint f(int last) { va_list args; va_start(args,last); return 0; } int main(void) { return 0; }",
+        "int f(...) { return 0; } int main(void) { return 0; }",
+        "int f(int x,...) { return x; } int f(int); int main(void) { return 0; }",
+        "typedef int (*fn)(int); int f(int x,...) { return x; } fn object=f; int main(void) { return 0; }",
+        "typedef int (*fn)(int,...); int f(int x) { return x; } fn object=f; int main(void) { return 0; }",
+        "int f(int a,int b,...) { return a+b; } int main(void) { return f(1); }",
+        "int f(int a,...) { return a; } void nothing(void) {} int main(void) { return f(1,nothing()); }",
+        "int __builtin_va_arg; int main(void) { return 0; }",
+        "typedef int __builtin_va_end; int main(void) { return 0; }",
+        "enum { __builtin_va_copy=1 }; int main(void) { return 0; }",
+        "int main(int x,...) { return x; }",
+    ] {
+        assert!(
+            compile_to_assembly(source, "varargs-invalid.c").is_err(),
+            "{source}"
+        );
+    }
+    let extra = (0..33).map(|_| "1").collect::<Vec<_>>().join(",");
+    let source =
+        format!("int f(int n,...) {{ return n; }} int main(void) {{ return f({extra}); }}");
+    assert!(compile_to_assembly(&source, "too-many-varargs.c").is_err());
+}
+
+#[test]
+fn noreturn_panic_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_noreturn.c");
+    let assembly = compile_to_assembly(source, "panic.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"P\x2a\n");
+    let stack = machine.core().register(2).unwrap();
+    assert!(stack < 0x80010000);
+    assert_eq!(stack & 15, 0);
+    assert!(machine.core().register(8).unwrap() > stack);
+    let mut bytes = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 7);
+    assert_eq!(u64::from_le_bytes(bytes[8..].try_into().unwrap()), 42);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn noreturn_function_attributes_merge_across_declarations_without_changing_call_types() {
+    for (before, definition, after) in [
+        (
+            "void stop(int);",
+            "__attribute__((noreturn)) void stop(int code)",
+            "void stop(int);",
+        ),
+        (
+            "void stop(int) __attribute__((noreturn));",
+            "void stop(int code)",
+            "",
+        ),
+        ("", "void stop(int code) __attribute__((__noreturn__))", ""),
+        (
+            "",
+            "void stop(int code)",
+            "__attribute__((noreturn)) void stop(int);",
+        ),
+        (
+            "static void stop(int) __attribute__((noreturn));",
+            "static void stop(int code)",
+            "extern void stop(int);",
+        ),
+        (
+            "",
+            "void __attribute((noreturn, __noreturn__)) stop(int code)",
+            "",
+        ),
+        (
+            "__attribute__((noreturn)) extern void stop(int);",
+            "void stop(int code)",
+            "extern void stop(int);",
+        ),
+        (
+            "",
+            "__attribute__((noreturn)) void __attribute__((noreturn)) stop(int code) __attribute__((noreturn))",
+            "",
+        ),
+    ] {
+        let source = format!(
+            "{before}
+             {definition} {{
+                 *(volatile unsigned char *)0x10000000UL = code;
+                 for (;;) asm volatile(\"wfi\");
+             }}
+             {after}
+             typedef void (*exit_fn)(int);
+             exit_fn handler=stop;
+             int main(void) {{
+                 if (0) stop(1);
+                 handler(75);
+                 *(volatile unsigned char *)0x10000000UL='X';
+                 return 1;
+             }}"
+        );
+        let assembly = compile_to_assembly(&source, "noreturn-decl.c").unwrap();
+        let mut machine =
+            Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000)
+                .unwrap();
+        let mut output = Vec::new();
+        let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+        assert_eq!(
+            report.traps, 0,
+            "{before} {definition} {after}: {:?}",
+            report.last_trap
+        );
+        assert!(report.waiting > 0);
+        assert_eq!(output, b"K");
+        assert_eq!(machine.core().register(2).unwrap() & 15, 0);
+    }
+}
+
+#[test]
+fn noreturn_recursive_stack_calls_preserve_exact_arguments_and_ordinary_function_behavior() {
+    let source = "long sum9(long a,long b,long c,long d,long e,long f,long g,long h,long i) {
+             return a+b+c+d+e+f+g+h+i;
+         }
+         void ordinary(volatile long *value) { *value=3; return; }
+         __attribute__((noreturn)) long stop(int depth, signed char byte, unsigned int word,
+             long d,long e,long f,long g,long h,unsigned long ninth) {
+             long local=2;
+             ordinary(&local);
+             if (depth) stop(depth-1,byte,word,d,e,f,g,h,ninth);
+             volatile unsigned long *report=(volatile unsigned long *)0x80000000UL;
+             report[0]=byte; report[1]=word; report[2]=ninth;
+             report[3]=sum9(local,2,3,4,5,6,7,8,9);
+             report[4]=d+e+f+g+h;
+             for (;;) asm volatile(\"wfi\" : : : \"memory\");
+         }
+         int main(void) { stop(2,-7,0xfedcba98U,4,5,6,7,8,0x1234567887654321UL); return 1; }";
+    let assembly = compile_to_assembly(source, "noreturn-stack.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert!(output.is_empty());
+    let mut bytes = [0; 40];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    let expected = [(-7i64) as u64, 0xfedcba98, 0x1234567887654321, 47, 30]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(bytes.as_slice(), expected);
+    assert_eq!(machine.core().register(2).unwrap() & 15, 0);
+}
+
+#[test]
+fn noreturn_fallthrough_traps_instead_of_returning_even_when_traps_resume() {
+    use suomicpu16::kiuas16::CoreTrapCause;
+    for (result, before, after, body, indirect) in [
+        ("void", "", "", "", false),
+        ("int", "", "", "", false),
+        (
+            "void",
+            "void stop(void);",
+            "",
+            "if (0) for (;;) asm(\"wfi\");",
+            true,
+        ),
+        (
+            "void",
+            "",
+            "void stop(void) __attribute__((noreturn));",
+            "",
+            false,
+        ),
+        (
+            "void",
+            "",
+            "",
+            "goto end; for (;;) asm(\"wfi\"); end: ;",
+            true,
+        ),
+        ("void", "", "", "ordinary();", false),
+    ] {
+        let source = format!(
+            "void ordinary(void) {{ return; }}
+             {before}
+             {result} stop(void) {} {{
+                 *(volatile unsigned char *)0x10000000UL = 'N';
+                 {body}
+             }}
+             {after}
+             typedef {result} (*exit_fn)(void);
+             int main(void) {{
+                 asm volatile(\"la t0, .Lresume_noreturn\\ncsrw mtvec, t0\");
+                 exit_fn handler=stop;
+                 {};
+                 *(volatile unsigned char *)0x10000000UL = 'X';
+                 return 99;
+             }}",
+            if after.is_empty() {
+                "__attribute__((noreturn))"
+            } else {
+                ""
+            },
+            if indirect { "handler()" } else { "stop()" },
+        );
+        let mut assembly = compile_to_assembly(&source, "noreturn-fallthrough.c").unwrap();
+        assembly.push_str(
+            "\n.Lresume_noreturn:
+             csrr t0, mepc
+             addi t0, t0, 4
+             csrw mepc, t0
+             mret\n",
+        );
+        let rom = assemble_boot_rom(&assembly).unwrap();
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom.clone(), 0x20000).unwrap();
+        let mut output = Vec::new();
+        let report = run_headless(&mut machine, 1000, &[], &mut output).unwrap();
+        assert!(report.traps > 2, "{source}");
+        assert_eq!(report.waiting, 0);
+        let trap = report.last_trap.unwrap();
+        assert_eq!(trap.cause, CoreTrapCause::Breakpoint);
+        assert_eq!(
+            &rom[(trap.pc - 0x1000) as usize..(trap.pc - 0x1000) as usize + 4],
+            &0x00100073u32.to_le_bytes()
+        );
+        assert_eq!(output, b"N");
+        assert!(machine.core().register(2).unwrap() < 0x80010000);
+        assert_eq!(machine.core().register(2).unwrap() & 15, 0);
+    }
+    let source = "void stop(void) __attribute__((noreturn)) {}
+         int main(void) { stop(); return 99; }";
+    let files = Files::new(source);
+    assert!(files.compile().status.success());
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "1000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    let diagnostic = String::from_utf8_lossy(&run.stderr);
+    assert!(diagnostic.contains("synchronous trap(s)"), "{diagnostic}");
+}
+
+#[test]
+fn noreturn_invalid_returns_placements_and_arguments_preserve_existing_rom() {
+    for source in [
+        "void stop(void) __attribute__((noreturn)) { return; } int main(void) { return 0; }",
+        "int stop(void) __attribute__((noreturn)) { return 3; } int main(void) { return 0; }",
+        "void stop(void) { return; } void stop(void) __attribute__((noreturn)); int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)) { if (0) return; for (;;) ; } int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)) { while (0) { return; } } int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)) { do { return; } while (0); } int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)) { for (;;) return; } int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)) { switch (0) { case 0: return; } } int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)) { end: return; } int main(void) { return 0; }",
+        "int main(void) __attribute__((noreturn)) { for (;;) ; }",
+        "__attribute__((noreturn)) int object; int main(void) { return 0; }",
+        "int object __attribute__((noreturn)); int main(void) { return 0; }",
+        "typedef int (*fn)(void) __attribute__((noreturn)); int main(void) { return 0; }",
+        "typedef int (*fn)(void); fn object __attribute__((noreturn)); int main(void) { return 0; }",
+        "__attribute__((noreturn)) typedef int value; int main(void) { return 0; }",
+        "__attribute__((noreturn)) int; int main(void) { return 0; }",
+        "void stop(int __attribute__((noreturn)) value) { for (;;) ; } int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn())); int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn(1))); int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn, aligned(16))) { for (;;) ; } int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn, format(printf,1,2))); int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)); int main(void) { return 0; }",
+        "void stop(void) __attribute__((noreturn)) { for (;;) ; } int stop(void); int main(void) { return 0; }",
+        "int main(void) { int value __attribute__((noreturn)); return 0; }",
+    ] {
+        let diagnostic = compile_to_assembly(source, "noreturn-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("noreturn-invalid.c:"),
+            "{source}: {diagnostic}"
+        );
+        let files = Files::new(source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let result = files.compile();
+        assert!(!result.status.success(), "{source}");
+        assert!(!result.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    let source = "void stop(void) __attribute__((noreturn)) {\n#line 207 \"panic-header.h\"\nreturn;\n}\nint main(void) { return 0; }";
+    let diagnostic = compile_to_assembly(source, "noreturn-source.c")
+        .unwrap_err()
+        .to_string();
+    assert!(diagnostic.contains("panic-header.h:207:"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("noreturn function cannot contain a return"),
+        "{diagnostic}"
+    );
+    let source =
+        "void stop(void) __attribute__((noreturn)) { for (;;) ; } int main(void) { return 0; }";
+    assert!(
+        suomicpu16::c_compiler::compile_minimal_program_to_assembly(source, "legacy-noreturn.c")
+            .is_err()
+    );
+}
+
+#[test]
+fn aligned_global_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_aligned.c");
+    let assembly = compile_to_assembly(source, "aligned.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    machine.bus_mut().write(0x80010000, &[0xa5; 8208]).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 100000, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(42));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    assert_eq!(output, b"A\x07\n");
+    let mut memory = [0; 8208];
+    machine.bus_mut().read(0x80010000, &mut memory).unwrap();
+    let mut expected = [0; 8208];
+    expected[0] = 0x5a;
+    expected[64] = 3;
+    expected[79] = 7;
+    expected[80..88].copy_from_slice(&0x80010040u64.to_le_bytes());
+    expected[88..96].copy_from_slice(&0x80011000u64.to_le_bytes());
+    expected[4096..4104].copy_from_slice(&0x80010040u64.to_le_bytes());
+    expected[8184..8192].copy_from_slice(&0x0123456789abcdefu64.to_le_bytes());
+    expected[8192..].fill(0xa5);
+    assert_eq!(memory, expected);
+    let mut report_bytes = [0; 32];
+    machine
+        .bus_mut()
+        .read(0x80000000, &mut report_bytes)
+        .unwrap();
+    let expected_report = [0x80010040u64, 0x80011000, 0x80010040, 0x0123456789abcdef]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(report_bytes.as_slice(), expected_report);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "100000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn aligned_globals_merge_redeclarations_and_keep_attributes_per_declarator() {
+    let (mut machine, _) = execute(
+        "#define A(n) __attribute__((aligned(n)))
+         typedef unsigned long word;
+         enum { CACHE = 64 };
+         extern word b A(CACHE);
+         extern word b;
+         extern word z A(128);
+         __attribute__((__aligned__(16), aligned(32))) word a = 1, b = 2;
+         word c A(64) = 3, d = 4;
+         static A(32) word e = 5;
+         word __attribute((aligned(sizeof(long) * 8))) f = 6;
+         word g A(16) __attribute__((aligned(64))) = 7;
+         word z;
+         extern word z A(256);
+         extern word b A(16);
+         int main(void) {
+             unsigned long *report = (unsigned long *)0x80000000UL;
+             report[0]=(unsigned long)&a; report[1]=(unsigned long)&b;
+             report[2]=(unsigned long)&c; report[3]=(unsigned long)&d;
+             report[4]=(unsigned long)&e; report[5]=(unsigned long)&f;
+             report[6]=(unsigned long)&g; report[7]=(unsigned long)&z;
+             if (a+b+c+d+e+f+g != 28 || z) return 1;
+             b += 10;
+             return b;
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(12));
+    let mut bytes = [0; 64];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    for (index, offset) in [0u64, 64, 128, 136, 160, 192, 256, 512].iter().enumerate() {
+        assert_eq!(
+            u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap()),
+            0x80010000 + offset,
+            "object {index}"
+        );
+    }
+}
+
+#[test]
+fn aligned_globals_preserve_symbolic_callbacks_and_static_pointer_offsets() {
+    let (mut machine, _) = execute_with_budget(
+        "typedef int (*op)(int);
+         int twice(int n) { return n*2; }
+         int plus(int n) { return n+3; }
+         unsigned char a = 7;
+         op callbacks[3] __attribute__((aligned(256))) = {twice, plus, 0};
+         unsigned short data[4] __attribute__((aligned(64))) = {1,2,3,4};
+         unsigned short *view __attribute__((aligned(128))) = data+2;
+         op *dispatch = callbacks+1;
+         int main(void) {
+             unsigned long *report = (unsigned long *)0x80000000UL;
+             report[0]=(unsigned long)callbacks; report[1]=(unsigned long)data;
+             report[2]=(unsigned long)view; report[3]=(unsigned long)dispatch;
+             if (a != 7 || view[0] != 3 || dispatch[1] != 0) return 1;
+             return callbacks[0](view[1]) + (*dispatch)(view[0]);
+         }",
+        100000,
+    );
+    assert_eq!(machine.core().register(10), Some(14));
+    let mut bytes = [0; 32];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    for (index, address) in [0x80010100u64, 0x80010140, 0x80010144, 0x80010108]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap()),
+            *address
+        );
+    }
+    let mut callbacks = [0; 24];
+    machine.bus_mut().read(0x80010100, &mut callbacks).unwrap();
+    for entry in callbacks[..16].chunks_exact(8) {
+        let address = u64::from_le_bytes(entry.try_into().unwrap());
+        assert!((0x1000..0x10000).contains(&address));
+        assert_eq!(address & 3, 0);
+    }
+    assert_ne!(&callbacks[..8], &callbacks[8..16]);
+    assert_eq!(&callbacks[16..], &[0; 8]);
+}
+
+#[test]
+fn aligned_globals_cover_power_of_two_limits_and_full_ram_budget() {
+    for alignment in (0..=15).map(|shift| 1usize << shift) {
+        let source = format!(
+            "unsigned char a = 7;
+             unsigned char b __attribute__((aligned({alignment})));
+             int main(void) {{
+                 unsigned long address = (unsigned long)&b;
+                 *(unsigned long *)0x80000000UL = address;
+                 return b + a;
+             }}"
+        );
+        let assembly = compile_to_assembly(&source, "alignment-limit.c").unwrap();
+        let mut machine =
+            Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000)
+                .unwrap();
+        machine.bus_mut().write(0x80010000, &[0xa5; 65536]).unwrap();
+        let report = run_headless(&mut machine, 300000, &[], &mut Vec::new()).unwrap();
+        assert_eq!(
+            report.traps, 0,
+            "alignment {alignment}: {:?}",
+            report.last_trap
+        );
+        assert!(report.waiting > 0, "alignment {alignment}");
+        assert_eq!(
+            machine.core().register(10),
+            Some(7),
+            "alignment {alignment}"
+        );
+        let mut bytes = [0; 8];
+        machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+        let offset = 8usize.next_multiple_of(alignment.max(8));
+        assert_eq!(u64::from_le_bytes(bytes), 0x80010000 + offset as u64);
+        let mut after = [0; 8];
+        machine
+            .bus_mut()
+            .read(0x80010000 + offset as u64 + 8, &mut after)
+            .unwrap();
+        assert_eq!(after, [0xa5; 8]);
+        assert_eq!(machine.core().register(2), Some(0x80010000));
+        assert_eq!(machine.core().register(8), Some(0));
+    }
+    let assembly = compile_to_assembly(
+        "unsigned char all[65536] __attribute__((aligned(65536)));
+         int main(void) {
+             if ((unsigned long)all != 0x80010000UL || all[0] || all[65535]) return 1;
+             all[0]=21; all[65535]=42;
+             return all[0]+all[65535];
+         }",
+        "aligned-full.c",
+    )
+    .unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x21000).unwrap();
+    machine
+        .bus_mut()
+        .write(0x80010000, &vec![0xa5; 65544])
+        .unwrap();
+    let report = run_headless(&mut machine, 300000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(63));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut bytes = vec![0; 65544];
+    machine.bus_mut().read(0x80010000, &mut bytes).unwrap();
+    assert_eq!(bytes[0], 21);
+    assert!(bytes[1..65535].iter().all(|byte| *byte == 0));
+    assert_eq!(bytes[65535], 42);
+    assert_eq!(&bytes[65536..], &[0xa5; 8]);
+}
+
+#[test]
+fn aligned_globals_copy_initialized_padding_and_clear_bss_without_touching_following_ram() {
+    for alignment in [1usize, 2, 4, 8, 16, 32, 64, 256, 4096, 32768] {
+        let source = format!(
+            "unsigned char a=1;
+             unsigned char b __attribute__((aligned({alignment})))=2;
+             unsigned char c;
+             int main(void) {{
+                 *(unsigned long *)0x80000000UL = (unsigned long)&b;
+                 return a+b+c;
+             }}"
+        );
+        let assembly = compile_to_assembly(&source, "aligned-data.c").unwrap();
+        let mut machine =
+            Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000)
+                .unwrap();
+        machine.bus_mut().write(0x80010000, &[0xa5; 65536]).unwrap();
+        let report = run_headless(&mut machine, 400000, &[], &mut Vec::new()).unwrap();
+        assert_eq!(
+            report.traps, 0,
+            "alignment {alignment}: {:?}",
+            report.last_trap
+        );
+        assert!(report.waiting > 0);
+        assert_eq!(machine.core().register(10), Some(3));
+        let offset = 8usize.next_multiple_of(alignment.max(8));
+        let end = offset + 16;
+        let mut bytes = vec![0; end + 16];
+        machine.bus_mut().read(0x80010000, &mut bytes).unwrap();
+        let mut expected = vec![0; end + 16];
+        expected[0] = 1;
+        expected[offset] = 2;
+        expected[end..].fill(0xa5);
+        assert_eq!(bytes, expected, "alignment {alignment}");
+        let mut address = [0; 8];
+        machine.bus_mut().read(0x80000000, &mut address).unwrap();
+        assert_eq!(u64::from_le_bytes(address), 0x80010000 + offset as u64);
+        assert_eq!(machine.core().register(2), Some(0x80010000));
+        assert_eq!(machine.core().register(8), Some(0));
+    }
+}
+
+#[test]
+fn aligned_globals_reject_unsupported_attributes_placements_and_capacity_without_overwriting_rom() {
+    for declaration in [
+        "int object __attribute__((aligned));",
+        "int object __attribute__((aligned()));",
+        "int object __attribute__((aligned(0)));",
+        "int object __attribute__((aligned(-8)));",
+        "int object __attribute__((aligned(3)));",
+        "int object __attribute__((aligned(131072)));",
+        "int object __attribute__((aligned(1UL << 63)));",
+        "int object __attribute__((aligned(1 << 32)));",
+        "int object __attribute__((aligned(1 / 0)));",
+        "int size; int object __attribute__((aligned(size)));",
+        "int side(void) { return 16; } int object __attribute__((aligned(1 ? 16 : side())));",
+        "int object __attribute__((aligned(8), packed));",
+        "int object __attribute__((section(\".data\")));",
+        "int object __attribute__((unknown));",
+        "__attribute__((aligned(1))) typedef int object;",
+        "typedef int object __attribute__((aligned(16)));",
+        "__attribute__((aligned(1))) int function(void) { return 0; }",
+        "int function(void) __attribute__((aligned(16)));",
+        "int function(__attribute__((aligned(1))) int value) { return value; }",
+        "int function(int value __attribute__((aligned(16)))) { return value; }",
+        "__attribute__((aligned(1))) int;",
+        "int a = 1; int b __attribute__((aligned(65536)));",
+        "int a; int b[8193] __attribute__((aligned(32768)));",
+        "unsigned char a=1; unsigned char b[32769] __attribute__((aligned(32768))) = {2};",
+        "extern int object __attribute__((aligned(16)));",
+        "int object __attribute__((aligned(16))); long object;",
+    ] {
+        let source = format!("{declaration}\nint main(void) {{ return 0; }}");
+        let diagnostic = compile_to_assembly(&source, "aligned-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("aligned-invalid.c:"),
+            "{declaration}: {diagnostic}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{declaration}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    for source in [
+        "int main(void) { int value __attribute__((aligned(16))); return 0; }",
+        "int main(void) { __attribute__((aligned(16))) int value; return 0; }",
+        "int main(void) { int __attribute__((aligned(16))) value; return 0; }",
+    ] {
+        assert!(
+            compile_to_assembly(source, "aligned-local.c").is_err(),
+            "{source}"
+        );
+    }
+    let source = "int global __attribute__((aligned(16))); int main(void) { return 0; }";
+    assert!(
+        suomicpu16::c_compiler::compile_minimal_program_to_assembly(source, "legacy-aligned.c")
+            .is_err()
+    );
+}
+
+#[test]
+fn aligned_globals_rom_padding_overflow_preserves_existing_output_and_attribute_locations() {
+    let source = "unsigned char a=1;
+         unsigned char b[30000] __attribute__((aligned(32768))) = {2};
+         int main(void) { return b[0]+a; }";
+    let assembly = compile_to_assembly(source, "aligned-rom.c").unwrap();
+    assert!(
+        assemble_boot_rom(&assembly)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds")
+    );
+    let files = Files::new(source);
+    std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+    let build = files.compile();
+    assert!(!build.status.success());
+    assert!(!build.stderr.is_empty());
+    assert_eq!(
+        std::fs::read(files.0.join("rom.bin")).unwrap(),
+        b"previous ROM"
+    );
+    for (attribute, message) in [
+        ("aligned(3)", "power of two"),
+        ("packed", "unsupported RV64 attribute"),
+    ] {
+        let source = format!(
+            "#line 123 \"alignment-header.h\"\nint object __attribute__(({attribute}));\nint main(void) {{ return 0; }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "aligned-locations.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("alignment-header.h:123:"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains(message), "{diagnostic}");
+    }
+}
+
+#[test]
+fn inline_assembly_csr_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_csr.c");
+    let assembly = compile_to_assembly(source, "csr.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"C\x19\n");
+    assert_eq!(machine.core().register(10), Some(25));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut bytes = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    let expected = [0xfedcba9876543210u64, 0xfedcba9876543210, 25]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(bytes.as_slice(), expected);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn inline_assembly_stages_side_effects_nested_calls_and_recursive_operands_once() {
+    let (machine, _) = execute(
+        "long data[2] = {11,22};
+         int addresses; int sums;
+         long *location(void) { addresses++; return data + 1; }
+         long sum9(long a,long b,long c,long d,long e,long f,long g,long h,long i) {
+             sums++; return a+b+c+d+e+f+g+h+i;
+         }
+         long recursive(int n) {
+             long result = n;
+             if (n) asm(\"add %0, %0, %1\" : \"+r\"(result) : \"r\"(recursive(n-1)));
+             return result;
+         }
+         int main(void) {
+             int index = 0;
+             asm volatile(\"add %[first], %[n], %[m]\\n\\tadd %[second], %[second], %[k]\\nadd %[first], %[first], %[last]\"
+                 : [first] \"=&r\"(data[index++]), [second] \"+&r\"(*location())
+                 : [n] \"r\"(sum9(1,2,3,4,5,6,7,8,9)),
+                   [m] \"r\"(sum9(1,1,1,1,1,1,1,1,1)),
+                   [k] \"r\"(recursive(4)), [last] \"r\"(7) : \"memory\");
+             if (data[0] != 61 || data[1] != 32 || addresses != 1 || index != 1 || sums != 2) return 1;
+             return 77;
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(77));
+}
+
+#[test]
+fn inline_assembly_outputs_normalize_all_integer_types_without_overwriting_neighbors() {
+    for (ty, size, expected) in [
+        ("_Bool", 1, 1u64),
+        ("char", 1, 255),
+        ("signed char", 1, u64::MAX),
+        ("unsigned char", 1, 255),
+        ("short", 2, u64::MAX),
+        ("unsigned short", 2, 65535),
+        ("int", 4, u64::MAX),
+        ("unsigned int", 4, u32::MAX as u64),
+        ("long", 8, u64::MAX),
+        ("unsigned long", 8, u64::MAX),
+    ] {
+        let source = format!(
+            "{ty} global;
+             int main(void) {{
+                 {ty} local = 0;
+                 volatile {ty} *target = (volatile {ty} *)0x80000008UL;
+                 asm volatile(\"addi %0, zero, -1\\naddi %1, zero, -1\\naddi %2, zero, -1\"
+                      : \"=r\"(local), \"=r\"(global), \"=r\"(*target) : : \"memory\");
+                 if ((unsigned long)local != {expected}UL || (unsigned long)global != {expected}UL
+                     || (unsigned long)*target != {expected}UL) return 1;
+                 *target = 0;
+                 asm(\"addi %0, zero, -1\" : \"+r\"(*target));
+                 if ((unsigned long)*target != {expected}UL) return 2;
+                 return 77;
+             }}"
+        );
+        let assembly = compile_to_assembly(&source, "asm-width.c").unwrap();
+        let mut machine =
+            Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000)
+                .unwrap();
+        machine.bus_mut().write(0x80000000, &[0xa5; 32]).unwrap();
+        let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+        assert_eq!(report.traps, 0, "{ty}: {:?}", report.last_trap);
+        assert!(report.waiting > 0, "{ty}");
+        assert_eq!(machine.core().register(10), Some(77), "{ty}");
+        assert_eq!(machine.core().register(2), Some(0x80010000));
+        assert_eq!(machine.core().register(8), Some(0));
+        let mut bytes = [0; 32];
+        machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+        assert_eq!(&bytes[..8], &[0xa5; 8], "{ty}");
+        assert_eq!(&bytes[8..8 + size], &expected.to_le_bytes()[..size], "{ty}");
+        assert!(
+            bytes[8 + size..].iter().all(|byte| *byte == 0xa5),
+            "{ty}: {bytes:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_assembly_accepts_constant_expressions_pointer_values_and_zero_operand_forms() {
+    let (machine, _) = execute(
+        "#define READ \"csrr %0, mscratch\"
+         #define MASK (1U << 4)
+         typedef long (*callback)(long);
+         long plus(long n) { return n+3; }
+         int main(void) {
+             long value = 39;
+             long *pointer = 0;
+             callback operation = 0;
+             unsigned long scratch;
+             asm(\"mv %0, %1\" : \"=r\"(pointer) : \"r\"(&value));
+             asm(\"mv %0, %1\" : \"=r\"(operation) : \"r\"(plus));
+             __asm volatile(\"csrwi mscratch, %[value]\" : : [value] \"i\"(MASK | 3));
+             __asm__ __volatile(READ : \"=r\"(scratch));
+             asm(\"addi %0, %0, %1\" : \"+r\"(scratch) : \"i\"(-1));
+             asm(\"fence\");
+             asm volatile(\"\" : : : \"memory\");
+             asm(\"\");
+             if (scratch != 18 || *pointer != 39 || operation(*pointer) != 42) return 1;
+             return operation(*pointer);
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(42));
+}
+
+#[test]
+fn inline_assembly_memory_clobbers_preserve_volatile_load_store_order() {
+    let (machine, output) = execute(
+        "int main(void) {
+             volatile unsigned char *uart = (volatile unsigned char *)0x10000000UL;
+             unsigned char byte;
+             asm volatile(\"lbu %0, 0(%1)\" : \"=r\"(byte) : \"r\"(uart) : \"memory\");
+             asm volatile(\"sb %0, 0(%1)\" : : \"r\"(byte), \"r\"(uart) : \"memory\");
+             asm volatile(\"lbu %0, 0(%1)\" : \"=r\"(byte) : \"r\"(uart) : \"memory\");
+             return byte;
+         }",
+    );
+    assert_eq!(output, b"\0");
+    assert_eq!(machine.core().register(10), Some(0));
+    let assembly = compile_to_assembly(
+        "int main(void) {
+             volatile unsigned char *uart = (volatile unsigned char *)0x10000000UL;
+             unsigned char byte;
+             asm volatile(\"lbu %0, 0(%1)\" : \"=r\"(byte) : \"r\"(uart) : \"memory\");
+             *uart = byte;
+             asm volatile(\"lbu %0, 0(%1)\" : \"=r\"(byte) : \"r\"(uart) : \"memory\");
+             *uart = byte;
+             return byte;
+         }",
+        "asm-uart.c",
+    )
+    .unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, b"QR", &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"QR");
+    assert_eq!(machine.core().register(10), Some(b'R' as u64));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+}
+
+#[test]
+fn inline_assembly_matches_an_independent_register_abi_callee() {
+    let source = "long independent(long a,long b,long c,long d,long e,long f,long g,long h,long i) { return 0; }
+         int main(void) {
+             long result;
+             asm(\"add %0, %1, %2\" : \"=r\"(result) : \"r\"(17L), \"r\"(25L));
+             return independent(result,2,3,4,5,6,7,8,9);
+         }";
+    let mut assembly = compile_to_assembly(source, "asm-abi.c").unwrap().replacen(
+        "\nindependent:\n",
+        "\n.Lunused_independent:\n",
+        1,
+    );
+    assembly.push_str(
+        "\nindependent:
+         andi t0, sp, 15
+         bne t0, zero, bad_asm_abi
+         addi t0, zero, 42
+         bne a0, t0, bad_asm_abi
+         ld t0, 0(sp)
+         add a0, a0, a1
+         add a0, a0, a2
+         add a0, a0, a3
+         add a0, a0, a4
+         add a0, a0, a5
+         add a0, a0, a6
+         add a0, a0, a7
+         add a0, a0, t0
+         ret
+         bad_asm_abi:
+         addi a0, zero, -1
+         ret\n",
+    );
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(86));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+}
+
+#[test]
+fn inline_assembly_six_outputs_preserve_saved_registers_and_template_percent_rules() {
+    let source = "int main(void) {
+             long a=1,b=2,c=3,d=4,e=5,f=6;
+             asm(\"nop # basic % marker %%\");
+             asm volatile(\"add %0, %0, %5\\nadd %1, %1, %5\\nadd %2, %2, %5\\nadd %3, %3, %5\\nadd %4, %4, %5\\naddi %5, %5, 6 # escaped %%\"
+                 : \"+r\"(a), \"+r\"(b), \"+r\"(c), \"+r\"(d), \"+r\"(e), \"+r\"(f));
+             return a+b+c+d+e+f;
+         }";
+    let mut assembly = compile_to_assembly(source, "asm-saved.c").unwrap();
+    assert!(assembly.contains("nop # basic % marker %%\n"));
+    assert!(assembly.contains("addi t6, t6, 6 # escaped %\n"));
+    assembly = assembly.replacen("call main\n", "call .Lasm_saved_entry\n", 1);
+    assembly.push_str("\n.Lasm_saved_entry:\naddi sp, sp, -16\nsd ra, 0(sp)\n");
+    let registers = [8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+    for register in registers {
+        assembly.push_str(&format!("addi x{register}, zero, {}\n", 112 + register));
+    }
+    assembly.push_str("call main\nld ra, 0(sp)\naddi sp, sp, 16\nret\n");
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(57));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    for register in registers {
+        assert_eq!(
+            machine.core().register(register),
+            Some(112 + register as u64),
+            "x{register}"
+        );
+    }
+}
+
+#[test]
+fn inline_assembly_invalid_operands_templates_and_constraints_preserve_existing_rom() {
+    for body in [
+        "asm(\"nop\" : \"r\"(value));",
+        "asm(\"nop\" : \"=m\"(value));",
+        "asm(\"nop\" : \"=r\"(1));",
+        "asm(\"nop\" : \"=r\"(value+1));",
+        "asm(\"nop\" : \"=r\"(fixed));",
+        "asm(\"nop\" : \"=r\"(*readonly));",
+        "asm(\"nop\" : \"=r\"((long)value));",
+        "asm(\"nop\" : \"=r\"(array));",
+        "asm(\"nop\" : : \"m\"(value));",
+        "asm(\"nop\" : : \"ri\"(value));",
+        "asm(\"nop\" : : \"0\"(value));",
+        "asm(\"nop\" : : \"i\"(value));",
+        "asm(\"nop\" : : \"i\"(1 ? 3 : side()));",
+        "asm(\"nop\" : : \"i\"(1 / 0));",
+        "asm(\"nop\" : : \"i\"(1 << 32));",
+        "asm(\"nop\" : : \"i\"(&value));",
+        "asm(\"nop\" : : \"r\"(nothing()));",
+        "asm(\"nop\" : : : \"t0\");",
+        "asm(\"nop\" : : : \"cc\");",
+        "asm(\"mv %1, %0\" : \"=r\"(value));",
+        "asm(\"mv %[missing], %0\" : \"=r\"(value));",
+        "asm(\"mv %[broken, %0\" : \"=r\"(value));",
+        "asm(\"mv %z0, %0\" : \"=r\"(value));",
+        "asm(\"mv %999999999999999999999999999999, %0\" : \"=r\"(value));",
+        "asm(\"%\" : \"=r\"(value));",
+        "asm(\"nop\" : [same] \"=r\"(value) : [same] \"r\"(1));",
+        "asm(\"nop\" : : \"r\"(1),\"r\"(2),\"r\"(3),\"r\"(4),\"r\"(5),\"r\"(6),\"r\"(7));",
+        "asm goto(\"nop\" : : : : label); label: ;",
+        "asm(value);",
+        "asm(\"nop\\0\");",
+        "asm(\"nop\" : \"=r\" value);",
+        "if (0) asm(\"nop\" : : \"m\"(value));",
+    ] {
+        let source = format!(
+            "int side(void) {{ return 1; }} void nothing(void) {{ }}
+             int main(void) {{
+                 int value = 2; const int fixed = 3; const int *readonly = &fixed; int array[2];
+                 {body}
+                 return 0;
+             }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "asm-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("asm-invalid.c:"),
+            "{body}: {diagnostic}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{body}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    for body in [
+        "asm(\"csrwi mscratch, %0\" : : \"i\"(32));",
+        "asm(\"csrr %0, missing\" : \"=r\"(value));",
+        "asm(\"unsupported %0\" : : \"r\"(value));",
+    ] {
+        let source = format!("int main(void) {{ int value = 0; {body} return 0; }}");
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{body}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    assert!(
+        suomicpu16::c_compiler::compile_minimal_program_to_assembly(
+            "int main(void) { asm volatile(\"nop\" : : : \"memory\"); return 0; }",
+            "legacy-asm.c"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn callback_dispatch_guest_executes_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_dispatch.c");
+    let assembly = compile_to_assembly(source, "dispatch.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    machine.bus_mut().write(0x80010000, &[0xa5; 128]).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"DE\x03\n");
+    assert_eq!(machine.core().register(10), Some(69));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut bytes = [0; 16];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    assert_eq!(&bytes[..8], &[69, 0, 0, 0, 3, 0, 0, 0]);
+    let mut table = [0; 32];
+    machine
+        .bus_mut()
+        .read(
+            u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            &mut table,
+        )
+        .unwrap();
+    assert_eq!(&table[..8], &table[8..16]);
+    assert_eq!(&table[24..], &[0; 8]);
+    for address in table[..24].chunks_exact(8) {
+        let address = u64::from_le_bytes(address.try_into().unwrap());
+        assert!((0x1000..0x10000).contains(&address));
+        assert_eq!(address & 3, 0);
+    }
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn callback_values_tables_addresses_returns_and_scalar_results_execute() {
+    let (machine, output) = execute(
+        "typedef int (*unary)(int);
+         typedef unary same;
+         typedef void (*sink)(int);
+         typedef const char *(*reader)(void);
+         typedef _Bool (*predicate)(unsigned long);
+         static int add(int value) { return value + 1; }
+         static int sub(int value) { return value - 1; }
+         static void uart(int value) { *(volatile unsigned char *)0x10000000UL = value; }
+         static const char *text(void) { return \"OK\"; }
+         static _Bool truth(unsigned long value) { return value; }
+         static unary initial = &*add;
+         static unary zero;
+         static unary table[] = { [2] = sub, [0] = 1 ? add : sub };
+         static unary select(int n) { return n ? add : sub; }
+         int main(void) {
+             same local[] = { [2] = add, [0] = sub };
+             unary *p = local;
+             unary *q = &initial;
+             if (sizeof(unary) != 8 || sizeof(local) != 24 || sizeof(*p) != 8) return 1;
+             if (zero != 0 || table[1] || local[1] || p + 2 - p != 2) return 2;
+             if (initial != add || *q != &add || *p != sub || p[2] != add) return 3;
+             *q = sub;
+             p[1] = select(1);
+             unary chosen = 0 ? 0 : *q;
+             unary empty = 1 ? 0 : chosen;
+             if (empty || !chosen || (chosen == 0) || (0 != empty)) return 4;
+             if (chosen(42) != 41 || (*p[1])(42) != 43 || (**p[1])(42) != 43) return 5;
+             if ((&*p[1])(42) != 43 || (&add)(42) != 43) return 6;
+             predicate test = truth;
+             if (!test(0x8000000000000000UL) || test(0)) return 7;
+             _Bool nonnull = chosen;
+             _Bool isnull = empty;
+             if (!nonnull || isnull) return 8;
+             reader read = text;
+             sink write = uart;
+             const char *message = read();
+             write(message[0]); write(message[1]);
+             return p[1](41);
+         }",
+    );
+    assert_eq!(output, b"OK");
+    assert_eq!(machine.core().register(10), Some(42));
+}
+
+#[test]
+fn callback_targets_and_nested_stack_arguments_evaluate_once_and_survive_calls() {
+    let (machine, _) = execute(
+        "typedef long (*wide)(long,long,long,long,long,long,long,long,long,long);
+         typedef int (*unary)(int);
+         int targets;
+         int arguments;
+         static long sum(long a,long b,long c,long d,long e,long f,long g,long h,long i,long j) {
+             return a+b+c+d+e+f+g+h+i+j;
+         }
+         static wide get(void) { ++targets; return sum; }
+         static long next(void) { return ++arguments; }
+         static long clear(wide *p) { *p = 0; return 10; }
+         static long recurse(int n, wide callback) {
+             if (!n) return callback(1,2,3,4,5,6,7,8,9,10);
+             return n + recurse(n - 1, callback);
+         }
+         static int plus(int n) { return n + 1; }
+         int main(void) {
+             wide callback = get();
+             long value = get()(next(), next(), next(), next(), next(), next(), next(), next(),
+                                get()(1,1,1,1,1,1,1,1,1,1), next());
+             if (targets != 3 || arguments != 9 || value != 55) return 1;
+             if (recurse(4, callback) != 65) return 2;
+             unary table[2] = { plus, 0 };
+             int index = 0;
+             if (table[index++](41) != 42 || index != 1) return 3;
+             wide last = callback;
+             long result = callback(1,2,3,4,5,6,7,8,9,clear(&callback));
+             if (result != 55 || callback != 0 || !last) return 4;
+             return 42;
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(42));
+}
+
+#[test]
+fn callback_prototypes_and_abstract_types_use_exact_parameter_and_return_types() {
+    let (machine, _) = execute(
+        "int increment(int value);
+         int (*global)(int) = increment;
+         int call(int (*callback)(int), int value) { return callback(value); }
+         int increment(const int value) { return value + 1; }
+         int main(void) {
+             if (sizeof(long (*)(long)) != 8) return 1;
+             if ((int (*)(int))0 != 0 || global != &increment) return 2;
+             return call(global, 41);
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(42));
+}
+
+#[test]
+fn callback_register_and_stack_abi_matches_independent_assembly() {
+    let mut assembly = compile_to_assembly(
+        "typedef unsigned int (*wide)(signed char,unsigned short,int,int,int,int,int,int,unsigned int);
+         unsigned int foreign(signed char a,unsigned short b,int c,int d,int e,int f,int g,int h,unsigned int i) { return 0; }
+         unsigned int probe(wide callback) { return callback(-1,65535,3,4,5,6,7,8,0x80000001U) + 1U; }
+         int main(void) { return 0; }",
+        "callback-abi.c",
+    ).unwrap()
+        .replacen("call main\n", "call .Lcallback_entry\n", 1)
+        .replacen("foreign:\n", ".Lunused_foreign:\n", 1);
+    assembly.push_str(
+        ".Lcallback_entry:
+         addi sp, sp, -16
+         sd ra, 8(sp)
+         li s0, 123
+         li s1, 456
+         la a0, foreign
+         call probe
+         ld ra, 8(sp)
+         addi sp, sp, 16
+         ret
+         foreign:
+         andi t0, sp, 15
+         bne t0, zero, .Lcallback_bad
+         li t0, -1
+         bne a0, t0, .Lcallback_bad
+         li t0, 65535
+         bne a1, t0, .Lcallback_bad
+         add t0, a2, a3
+         add t0, t0, a4
+         add t0, t0, a5
+         add t0, t0, a6
+         add t0, t0, a7
+         li t1, 33
+         bne t0, t1, .Lcallback_bad
+         ld t0, 0(sp)
+         li t1, -2147483647
+         bne t0, t1, .Lcallback_bad
+         li a0, -2147483647
+         ret
+         .Lcallback_bad:
+         li a0, 99
+         ret",
+    );
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    for (register, value) in [
+        (2, 0x80010000),
+        (8, 123),
+        (9, 456),
+        (10, (-2147483646i64) as u64),
+    ] {
+        assert_eq!(machine.core().register(register), Some(value));
+    }
+}
+
+#[test]
+fn callback_zero_through_thirty_two_arguments_preserve_call_frames() {
+    for count in [0, 1, 8, 9, 10, 11, 12, 31, 32] {
+        let types = if count == 0 {
+            "void".to_owned()
+        } else {
+            vec!["long"; count].join(",")
+        };
+        let parameters = if count == 0 {
+            "void".to_owned()
+        } else {
+            (0..count)
+                .map(|index| format!("long a{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let arguments = (1..=count)
+            .map(|index| format!("nested({index})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sum = if count == 0 {
+            "42".to_owned()
+        } else {
+            (0..count)
+                .map(|index| format!("a{index}"))
+                .collect::<Vec<_>>()
+                .join("+")
+        };
+        let source = format!(
+            "typedef long (*callback)({types});
+             long nested(long n) {{ return n; }}
+             long sum({parameters}) {{ return {sum}; }}
+             int main(void) {{
+                 callback p = sum;
+                 long first = p({arguments});
+                 long second = (*p)({arguments});
+                 if (first != second) return 1;
+                 return first;
+             }}"
+        );
+        let (machine, _) = execute_with_budget(&source, 30000);
+        assert_eq!(
+            machine.core().register(10),
+            Some(if count == 0 {
+                42
+            } else {
+                (count * (count + 1) / 2) as u64
+            }),
+            "{count}"
+        );
+    }
+}
+
+#[test]
+fn callback_result_conversions_match_all_supported_integer_widths() {
+    for (ty, value, expected) in [
+        ("_Bool", "0x100000000UL", 1u64),
+        ("char", "255", 255),
+        ("signed char", "255", u64::MAX),
+        ("unsigned char", "255", 255),
+        ("short", "65535", u64::MAX),
+        ("unsigned short", "65535", 65535),
+        ("int", "0x80000001U", (-2147483647i64) as u64),
+        ("unsigned int", "0x80000001U", 0x80000001),
+        ("long", "-4294967297L", (-4294967297i64) as u64),
+        ("unsigned long", "0xfedcba9876543210UL", 0xfedcba9876543210),
+    ] {
+        let source = format!(
+            "typedef {ty} (*callback)(unsigned long);
+             {ty} convert(unsigned long n) {{ return n; }}
+             int main(void) {{
+                 callback p = convert;
+                 {ty} value = p({value});
+                 *(volatile unsigned long *)0x80000000UL = value;
+                 return 42;
+             }}"
+        );
+        let (mut machine, _) = execute(&source);
+        assert_eq!(machine.core().register(10), Some(42), "{ty}");
+        let mut bytes = [0; 8];
+        machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), expected, "{ty}");
+    }
+}
+
+#[test]
+fn callback_invalid_types_operations_and_initializers_preserve_existing_rom() {
+    for body in [
+        "callback = wrong;",
+        "callback = wide;",
+        "callback = noargs;",
+        "callback = pointer;",
+        "callback = &object;",
+        "callback = 1;",
+        "void *p = callback;",
+        "int *p = callback;",
+        "callback = (void *)1;",
+        "callback(1,2);",
+        "callback();",
+        "callback((int *)0);",
+        "callback++;",
+        "callback += 1;",
+        "callback + 1;",
+        "1 + callback;",
+        "callback - add;",
+        "callback < add;",
+        "callback | 1;",
+        "*callback = add;",
+        "(&*callback) = add;",
+        "(unary)callback = add;",
+        "++*callback;",
+        "add = callback;",
+        "sizeof(add);",
+        "sizeof(*callback);",
+        "int *p = &callback;",
+        "long number = (long)callback;",
+        "callback = (unary)1;",
+        "(void *)callback;",
+        "unary *p = &callback; const int **q = p;",
+        "long (*p)(int) = callback;",
+        "__atomic_load_n(&callback, 0);",
+        "if (0) callback(1,2);",
+    ] {
+        let source = format!(
+            "typedef int (*unary)(int);
+             int add(int n) {{ return n + 1; }}
+             long wrong(int n) {{ return n; }}
+             int wide(long n) {{ return n; }}
+             int noargs(void) {{ return 1; }}
+             int *pointer(int n) {{ return 0; }}
+             int main(void) {{ int object = 0; unary callback = add; {body} return 0; }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "callback-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("callback-invalid.c:"),
+            "{body}: {diagnostic}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{body}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    for source in [
+        "typedef int (*old)(); int main(void) { return 0; }",
+        "typedef int (*varargs)(...); int main(void) { return 0; }",
+        "typedef int (**nested)(int); int main(void) { return 0; }",
+        "typedef int (*fn)(int); int f(int n) { return n; } fn global = f(); int main(void) { return 0; }",
+        "typedef int (*fn)(int); int f(int n) { return n; } fn other = f; fn global = other; int main(void) { return 0; }",
+        "typedef int (*fn)(int); fn global = later; int later(int n) { return n; } int main(void) { return 0; }",
+        "typedef int (*fn)(int); int missing(int); fn global = missing; int main(void) { return 0; }",
+        "typedef int (*fn)(int); const fn global; int main(void) { return 0; }",
+        "typedef int (*fn)(int); int f(void *p) { return 0; } fn global = f; int main(void) { return 0; }",
+    ] {
+        assert!(
+            compile_to_assembly(source, "callback-invalid.c").is_err(),
+            "{source}"
+        );
+    }
+    let parameters = vec!["int"; 33].join(",");
+    assert!(
+        compile_to_assembly(
+            &format!("typedef int (*callback)({parameters}); int main(void) {{ return 0; }}"),
+            "callback-invalid.c"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn target_headers_and_macros_execute_through_production_cli() {
+    let source = include_str!("fixtures/kiuas16_headers.c");
+    let assembly = compile_to_assembly(source, "headers.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    machine.bus_mut().write(0x80010000, &[0xa5; 128]).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, &[], &mut output).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"H\x11\x2a\x08\n");
+    assert_eq!(machine.core().register(10), Some(59));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut bytes = [0; 24];
+    machine.bus_mut().read(0x80000000, &mut bytes).unwrap();
+    let mut expected = [0; 24];
+    expected[..4].copy_from_slice(&17u32.to_le_bytes());
+    expected[12..16].copy_from_slice(&42u32.to_le_bytes());
+    expected[16..].copy_from_slice(&8u64.to_le_bytes());
+    assert_eq!(bytes, expected);
+    let files = Files::new(source);
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let run = Command::new(env!("CARGO_BIN_EXE_kiuas16-run"))
+        .arg("--rom")
+        .arg(files.0.join("rom.bin"))
+        .args(["--steps", "10000", "--deny-traps"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, output);
+}
+
+#[test]
+fn target_integer_headers_match_lp64_sizes_limits_and_promotions() {
+    let (machine, _) = execute(
+        "#include <stdint.h>
+         #include <stddef.h>
+         #include <stdbool.h>
+         #include <limits.h>
+         #define VERIFY(type, bytes, minimum, maximum) \\
+             if (sizeof(type) != bytes || (type)(minimum) != minimum || (type)(maximum) != maximum) return __LINE__;
+         int main(void) {
+             VERIFY(int8_t, 1, INT8_MIN, INT8_MAX)
+             VERIFY(uint8_t, 1, 0, UINT8_MAX)
+             VERIFY(int16_t, 2, INT16_MIN, INT16_MAX)
+             VERIFY(uint16_t, 2, 0, UINT16_MAX)
+             VERIFY(int32_t, 4, INT32_MIN, INT32_MAX)
+             VERIFY(uint32_t, 4, 0, UINT32_MAX)
+             VERIFY(int64_t, 8, INT64_MIN, INT64_MAX)
+             VERIFY(uint64_t, 8, 0, UINT64_MAX)
+             VERIFY(int_least8_t, 1, INT_LEAST8_MIN, INT_LEAST8_MAX)
+             VERIFY(uint_least8_t, 1, 0, UINT_LEAST8_MAX)
+             VERIFY(int_least16_t, 2, INT_LEAST16_MIN, INT_LEAST16_MAX)
+             VERIFY(uint_least16_t, 2, 0, UINT_LEAST16_MAX)
+             VERIFY(int_least32_t, 4, INT_LEAST32_MIN, INT_LEAST32_MAX)
+             VERIFY(uint_least32_t, 4, 0, UINT_LEAST32_MAX)
+             VERIFY(int_least64_t, 8, INT_LEAST64_MIN, INT_LEAST64_MAX)
+             VERIFY(uint_least64_t, 8, 0, UINT_LEAST64_MAX)
+             VERIFY(int_fast8_t, 8, INT_FAST8_MIN, INT_FAST8_MAX)
+             VERIFY(uint_fast8_t, 8, 0, UINT_FAST8_MAX)
+             VERIFY(int_fast16_t, 8, INT_FAST16_MIN, INT_FAST16_MAX)
+             VERIFY(uint_fast16_t, 8, 0, UINT_FAST16_MAX)
+             VERIFY(int_fast32_t, 8, INT_FAST32_MIN, INT_FAST32_MAX)
+             VERIFY(uint_fast32_t, 8, 0, UINT_FAST32_MAX)
+             VERIFY(int_fast64_t, 8, INT_FAST64_MIN, INT_FAST64_MAX)
+             VERIFY(uint_fast64_t, 8, 0, UINT_FAST64_MAX)
+             VERIFY(intptr_t, 8, INTPTR_MIN, INTPTR_MAX)
+             VERIFY(uintptr_t, 8, 0, UINTPTR_MAX)
+             VERIFY(intmax_t, 8, INTMAX_MIN, INTMAX_MAX)
+             VERIFY(uintmax_t, 8, 0, UINTMAX_MAX)
+             VERIFY(size_t, 8, 0, SIZE_MAX)
+             VERIFY(ptrdiff_t, 8, PTRDIFF_MIN, PTRDIFF_MAX)
+             if (sizeof(INT8_C(127)) != 4 || sizeof(UINT8_C(255)) != 4) return 1;
+             if (sizeof(INT16_C(32767)) != 4 || sizeof(UINT16_C(65535)) != 4) return 2;
+             if (sizeof(INT32_C(2147483647)) != 4 || sizeof(UINT32_C(4294967295)) != 4) return 3;
+             if (sizeof(INT64_C(9223372036854775807)) != 8 || sizeof(UINT64_C(18446744073709551615)) != 8) return 4;
+             if (sizeof(INTMAX_C(1)) != 8 || sizeof(UINTMAX_C(1)) != 8) return 5;
+             if (UINT8_C(255) + 1 != 256 || UINT16_C(65535) + 1 != 65536) return 6;
+             if (UINT32_C(4294967295) + 1U != 0 || UINT64_C(18446744073709551615) + 1UL != 0) return 7;
+             if (LONG_MIN != INT64_MIN || ULONG_MAX != UINT64_MAX || SHRT_MIN != INT16_MIN) return 8;
+             if (CHAR_MIN || CHAR_MAX != 255 || CHAR_BIT != 8 || sizeof(bool) != 1) return 9;
+             bool flag = true;
+             void *pointer = NULL;
+             if (!__bool_true_false_are_defined || !flag || false || pointer != 0) return 10;
+             return 42;
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(42));
+}
+
+#[test]
+fn rv64_preprocessor_conditions_use_signed_and_unsigned_intmax_widths() {
+    let conditions = [
+        "0xffffffff > 0",
+        "0xffffffff + 1 == 0x100000000",
+        "0xffffffffU + 1U == 0x100000000UL",
+        "2147483647 + 1 == 2147483648",
+        "(1 < 2) << 40 == 0x10000000000",
+        "(!0) << 40 == 0x10000000000",
+        "(1 && 1) << 40 == 0x10000000000",
+        "~0U == 18446744073709551615UL",
+        "-1 < 0 && !(-1 < 0U)",
+        "(1 ? -1 : 0U) > 0",
+        "(0 ? -1 : 0U) == 0",
+        "0xffffffffffffffff + 1 == 0",
+        "0xffffffffffffffffUL / 0x100000000UL == 0xffffffff",
+        "-9223372036854775807L - 1L < -1",
+        "(-9223372036854775807L - 1L) >> 63 == -1",
+        "1 || 1 / 0",
+        "!(0 && 1 / 0)",
+        "(1 ? 7 : 1 / 0) == 7",
+        "((1 ? 1 : 0) << 40) == 0x10000000000",
+        "'A' == 65 && '\\xff' == 255",
+        "defined(__kiuas16__) && defined __riscv && __riscv_xlen == 64",
+        "!defined(UNKNOWN) && UNKNOWN == 0",
+    ];
+    for condition in conditions {
+        let source = format!(
+            "#if {condition}\n#define RESULT 42\n#else\n#error wrong intmax evaluation\n#endif\n\
+             int main(void) {{ return RESULT; }}"
+        );
+        let (machine, _) = execute(&source);
+        assert_eq!(machine.core().register(10), Some(42), "{condition}");
+    }
+}
+
+#[test]
+fn rv64_preprocessor_macros_rescan_stringify_paste_and_preserve_side_effects() {
+    let (machine, output) = execute(
+        "#define JOIN_RAW(a,b) a##b
+         #define JOIN(a,b) JOIN_RAW(a,b)
+         #define TEXT_RAW(value) #value
+         #define TEXT(value) TEXT_RAW(value)
+         #define PREFIX \"P\"
+         #define SUFFIX \"!\"
+         #define ADD(a,b) ((a) + (b))
+         #define CALL ADD
+         #define WRAP(x) x
+         #define MMIO(address) (*(volatile unsigned char *)(address))
+         #define OUT(x) MMIO(0x10000000UL) = (x)
+         #define VALUE 17
+         static const int early = VALUE;
+         #undef VALUE
+         #define VALUE 42
+         static const int late = VALUE;
+         #define EMPTY()
+         #define BIAS \\
+             3
+         /* macros and comments
+          * retain physical source lines */
+         int calls;
+         int next(void) { return ++calls; }
+         int main(void) {
+             int JOIN(result, _value) = CALL
+                 (next(), WRAP(ADD(next(), BIAS)));
+             EMPTY()
+             const char *text = PREFIX TEXT(VALUE) SUFFIX;
+             const char *raw = TEXT_RAW(VALUE);
+             const char *comment = TEXT_RAW(a /* gap */ b);
+             const char *quoted = TEXT_RAW(\"a\" \"b\");
+             if (result_value != 6 || calls != 2 || early != 17 || late != 42) return 1;
+             if (raw[0] != 'V' || comment[1] != ' ' || quoted[3] != ' ') return 2;
+             if (text[0] != 'P' || text[3] != '!') return 3;
+             OUT(text[1]); OUT(text[2]); OUT('\\n');
+             return result_value;
+         }",
+    );
+    assert_eq!(output, b"42\n");
+    assert_eq!(machine.core().register(10), Some(6));
+}
+
+#[test]
+fn rv64_preprocessor_nested_quoted_headers_guards_and_macro_includes_execute() {
+    let files = Files::new(
+        "#define PICK \"consumer.h\"
+         #include PICK
+         #include \"consumer.h\"
+         #include <stdint.h>
+         #include <stdint.h>
+         #ifndef INCLUDED_BY_PARENT
+         #error nested header macro missing
+         #endif
+         #if 0
+         #include \"missing-inactive.h\"
+         #error inactive
+         #if 1 / 0
+         #error inactive nested
+         #endif
+         #elif defined(INCLUDED_BY_PARENT)
+         #define RESULT 42
+         #else
+         #error wrong branch
+         #endif
+         int main(void) { return helper(RESULT); }",
+    );
+    std::fs::write(
+        files.0.join("consumer.h"),
+        "#ifndef CONSUMER_H\n#define CONSUMER_H\n#include \"nested.h\"\n\
+         static uint32_t helper(uint32_t value) { return value + OFFSET; }\n#endif",
+    )
+    .unwrap();
+    std::fs::write(
+        files.0.join("nested.h"),
+        "#include <stdint.h>\n#define INCLUDED_BY_PARENT 1\n#define OFFSET 17\n",
+    )
+    .unwrap();
+    let source = std::fs::read_to_string(files.0.join("guest.c")).unwrap();
+    let assembly =
+        compile_to_assembly(&source, &files.0.join("guest.c").to_string_lossy()).unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(59));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let build = files.compile();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[test]
+fn rv64_preprocessor_repeated_header_expansion_retains_each_inclusion_state() {
+    let files = Files::new(
+        "#define NAME first\n#define VALUE 17\n#include \"instance.h\"\n\
+         #undef NAME\n#undef VALUE\n#define NAME second\n#define VALUE 42\n#include \"instance.h\"\n\
+         int main(void) { return first + second; }",
+    );
+    std::fs::write(
+        files.0.join("instance.h"),
+        "static const int NAME = VALUE;\n",
+    )
+    .unwrap();
+    let source = std::fs::read_to_string(files.0.join("guest.c")).unwrap();
+    let assembly =
+        compile_to_assembly(&source, &files.0.join("guest.c").to_string_lossy()).unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(machine.core().register(10), Some(59));
+}
+
+#[test]
+fn rv64_preprocessor_line_file_and_header_diagnostics_preserve_locations() {
+    let (machine, output) = execute(
+        "#line 73 \"virtual-rv64.c\"
+         int main(void) {
+             const char *file = __FILE__;
+             *(volatile unsigned char *)0x10000000UL = file[0];
+             return __LINE__;
+         }",
+    );
+    assert_eq!(output, b"v");
+    assert_eq!(machine.core().register(10), Some(76));
+    let diagnostic = compile_to_assembly(
+        "#line 123 \"mapped.h\"\n#if 1 / 0\n#endif\nint main(void) { return 0; }",
+        "original.c",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(diagnostic.contains("mapped.h:123:"), "{diagnostic}");
+    let files = Files::new("#include \"broken.h\"\nint main(void) { return 0; }");
+    std::fs::write(
+        files.0.join("broken.h"),
+        "#line 91 \"broken-virtual.h\"\n#error broken header\n",
+    )
+    .unwrap();
+    let build = files.compile();
+    let diagnostic = String::from_utf8_lossy(&build.stderr);
+    assert!(!build.status.success());
+    assert!(diagnostic.contains("broken-virtual.h:91:"), "{diagnostic}");
+}
+
+#[test]
+fn rv64_preprocessor_invalid_input_and_legacy_headers_preserve_existing_rom() {
+    for source in [
+        "#include <stdio.h>\nint main(void) { return 0; }",
+        "#include <does-not-exist.h>\nint main(void) { return 0; }",
+        "#define BAD(a,a) a\nint main(void) { return 0; }",
+        "#define BAD(...) 0\nint main(void) { return 0; }",
+        "#define VALUE 1\n#define VALUE 2\nint main(void) { return VALUE; }",
+        "#define ADD(a,b) ((a)+(b))\nint main(void) { return ADD(1); }",
+        "#define ADD(a,b) ((a)+(b))\nint main(void) { return ADD(1,2; }",
+        "#define BAD(a,b) a##b\nint main(void) { return BAD(+,*); }",
+        "#pragma pack(1)\nint main(void) { return 0; }",
+        "#error stop here\nint main(void) { return 0; }",
+        "#warning ignored\nint main(void) { return 0; }",
+        "#if 1\nint main(void) { return 0; }",
+        "#else\nint main(void) { return 0; }",
+        "#if 0\n#else\n#else\n#endif\nint main(void) { return 0; }",
+        "#if defined()\n#endif\nint main(void) { return 0; }",
+        "#if 1 / 0\n#endif\nint main(void) { return 0; }",
+        "#if 9223372036854775807L + 1\n#endif\nint main(void) { return 0; }",
+        "#if 1 << 64\n#endif\nint main(void) { return 0; }",
+        "#if 18446744073709551616UL\n#endif\nint main(void) { return 0; }",
+        "#if 1LL\n#endif\nint main(void) { return 0; }",
+        "#if (int)1\n#endif\nint main(void) { return 0; }",
+        "#if sizeof(int)\n#endif\nint main(void) { return 0; }",
+        "#if 1 || (1,2)\n#endif\nint main(void) { return 0; }",
+        "#line 0\nint main(void) { return 0; }",
+        "#define A A\nint main(void) { return A; }",
+    ] {
+        let diagnostic = compile_to_assembly(source, "pp-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("pp-invalid.c:"),
+            "{source}: {diagnostic}"
+        );
+        let files = Files::new(source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{source}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+}
+
+#[test]
 fn compiled_c_recursion_eight_arguments_scopes_and_uart_execute() {
     let (machine, output) = execute(include_str!("fixtures/kiuas16_uart.c"));
     assert_eq!(output, b"KK=\n");
@@ -280,7 +3329,7 @@ fn invalid_character_and_string_uses_diagnose_without_output_overwrite() {
         r#"char *p = &"ABC"; int main(void) { return 0; }"#,
         r#"char full[65536]; char *p = "X"; int main(void) { return 0; }"#,
         "char a; signed char a; int main(void) { return 0; }",
-        "int main(void) { volatile char c; return 0; }",
+        "int main(void) { volatile char c; char *p = &c; return 0; }",
         r#"int main(void) { return L"ABC"[0]; }"#,
     ] {
         let error = compile_to_assembly(source, "text-invalid.c")
@@ -743,7 +3792,7 @@ fn invalid_global_definitions_initializers_visibility_and_capacity_diagnose() {
         "int main; int main(void) { return 0; }",
         "int _start; int main(void) { return 0; }",
         "int ***pointer; int main(void) { return 0; }",
-        "volatile int state; int main(void) { return 0; }",
+        "volatile int state; int main(void) { int *p = &state; return 0; }",
         "int **table[2]; int main(void) { return 0; }",
         "int a[2][3]; int main(void) { return 0; }",
         "int a = 1 / 0; int main(void) { return 0; }",
@@ -2185,8 +5234,8 @@ fn const_writes_qualifier_loss_and_unsupported_objects_preserve_existing_rom() {
         "if (0) *p = 1;",
         "__atomic_store_n(p, 1, 3);",
         "__atomic_exchange_n(p, 1, 2);",
-        "const int value = 1;",
-        "const int a[2] = {1};",
+        "const int value = 1; value = 2;",
+        "const int a[2] = {1}; a[0] = 2;",
         "int *const q = &object;",
         "sizeof(int *const);",
         "(int *const)&object;",
@@ -2225,7 +5274,7 @@ fn const_writes_qualifier_loss_and_unsupported_objects_preserve_existing_rom() {
         "int object; const int *p = &object; int *bad(void) { return p; } int main(void) { return 0; }",
         "int object; const int *p = &object; int *q = p; int main(void) { return 0; }",
         "int object; const int *p = &object; int *a[] = { [0] = p }; int main(void) { return 0; }",
-        "const int object = 1; int main(void) { return 0; }",
+        "const int object = 1; int main(void) { object = 2; return 0; }",
         "typedef int *ip; const ip q; int main(void) { return 0; }",
         "typedef const int *cp; typedef const cp bad; int main(void) { return 0; }",
         "const int *p; extern int *p; int main(void) { return 0; }",
@@ -2233,6 +5282,384 @@ fn const_writes_qualifier_loss_and_unsupported_objects_preserve_existing_rom() {
     ] {
         assert!(
             compile_to_assembly(source, "const-global.c").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn qualified_objects_preserve_widths_sparse_data_bss_and_stack_bytes() {
+    for (ty, value, expected, size) in [
+        ("_Bool", "256", 1u64, 1),
+        ("char", "255", 255, 1),
+        ("signed char", "255", u64::MAX, 1),
+        ("unsigned char", "128", 128, 1),
+        ("short", "65535", u64::MAX, 2),
+        ("unsigned short", "65535", 65535, 2),
+        ("int", "0x80000001U", (-2147483647i64) as u64, 4),
+        ("unsigned int", "0x80000001U", 0x80000001, 4),
+        ("long", "-4294967297L", (-4294967297i64) as u64, 8),
+        (
+            "unsigned long",
+            "0xfedcba9876543210UL",
+            0xfedcba9876543210,
+            8,
+        ),
+    ] {
+        let source = format!(
+            "const {ty} frozen[] = {{ [2] = {value}, [0] = {value} }};
+             extern const {ty} frozen[3];
+             const volatile {ty} zero[2];
+             volatile {ty} state;
+             int main(void) {{
+                 const {ty} local[] = {{ [2] = {value}, [0] = {value} }};
+                 volatile {ty} mutable = {value};
+                 const volatile {ty} scalar = {value};
+                 const volatile {ty} *view = local;
+                 volatile {ty} *write = &mutable;
+                 state = *write;
+                 if (sizeof(frozen) != 3 * sizeof({ty}) || sizeof(local) != sizeof(frozen)) return 1;
+                 if (frozen[0] != scalar || frozen[1] || frozen[2] != state) return 2;
+                 if (view[0] != scalar || view[1] || view[2] != state || zero[0] || zero[1]) return 3;
+                 *(volatile unsigned long *)0x80000000UL = (unsigned long)frozen;
+                 *(volatile unsigned long *)0x80000008UL = (unsigned long)zero;
+                 *(volatile unsigned long *)0x80000010UL = (unsigned long)&state;
+                 *(volatile unsigned long *)0x80000018UL = (unsigned long)local;
+                 *(volatile unsigned long *)0x80000020UL = (unsigned long)write;
+                 *(volatile unsigned long *)0x80000028UL = (unsigned long)&scalar;
+                 *(volatile unsigned long *)0x80000030UL = scalar;
+                 return 42;
+             }}"
+        );
+        let rom = assemble_boot_rom(&compile_to_assembly(&source, "qualified.c").unwrap()).unwrap();
+        let mut machine = Kiuas16Machine::new_with_ram_size(rom, 0x20000).unwrap();
+        machine.bus_mut().write(0x80010000, &[0xa5; 128]).unwrap();
+        machine.bus_mut().write(0x8000fc00, &[0xa5; 1024]).unwrap();
+        let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+        assert_eq!(report.traps, 0, "{ty}: {:?}", report.last_trap);
+        assert!(report.waiting > 0, "{ty}");
+        assert_eq!(machine.core().register(10), Some(42), "{ty}");
+        assert_eq!(machine.core().register(2), Some(0x80010000));
+        assert_eq!(machine.core().register(8), Some(0));
+        let mut report = [0; 56];
+        machine.bus_mut().read(0x80000000, &mut report).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(report[48..].try_into().unwrap()),
+            expected,
+            "{ty}"
+        );
+        let scalar = expected.to_le_bytes()[..size].to_vec();
+        let mut array = scalar.clone();
+        array.extend(vec![0; size]);
+        array.extend(&scalar);
+        for (index, address) in report[..48].chunks_exact(8).enumerate() {
+            let address = u64::from_le_bytes(address.try_into().unwrap());
+            let mut expected = match index {
+                0 | 3 => array.clone(),
+                1 => vec![0; size * 2],
+                _ => scalar.clone(),
+            };
+            if index < 3 {
+                expected.resize(expected.len().div_ceil(8) * 8, 0);
+            } else if index == 3 {
+                expected.resize(expected.len().div_ceil(8) * 8, 0xa5);
+            }
+            let mut actual = vec![0; expected.len()];
+            machine.bus_mut().read(address, &mut actual).unwrap();
+            assert_eq!(actual, expected, "{ty}, object {index}");
+        }
+        let bytes = (3 * size).div_ceil(8) * 8 + (2 * size).div_ceil(8) * 8 + 8;
+        let mut neighbor = [0; 8];
+        machine
+            .bus_mut()
+            .read(0x80010000 + bytes as u64, &mut neighbor)
+            .unwrap();
+        assert_eq!(neighbor, [0xa5; 8], "{ty}");
+    }
+}
+
+#[test]
+fn qualified_objects_aliases_casts_and_character_array_bounds_execute() {
+    let (machine, output) = execute(
+        "typedef const unsigned short word;
+         typedef word same;
+         typedef volatile unsigned int counter;
+         static same value = 65535;
+         static char const text[] = \"Q\";
+         static volatile unsigned char bytes[] = {\"AB\"};
+         static const unsigned short *table[] = { &value, 0 };
+         const unsigned short *read(void) { return &value; }
+         int main(void) {
+             const char local[] = \"C\";
+             char const trailing[] = \"D\";
+             same copy = *read();
+             counter count = 0;
+             unsigned short const volatile *both = &copy;
+             const volatile void *generic = both;
+             const volatile unsigned short *roundtrip = generic;
+             if (*roundtrip != 65535 || *table[0] != copy || table[1]) return 1;
+             if (sizeof(text) != 2 || sizeof(bytes) != 3 || sizeof(trailing) != 2) return 2;
+             if (sizeof(same) != 2 || sizeof(const volatile unsigned int) != 4) return 3;
+             if ((const unsigned char)256 != 0 || (volatile _Bool)256 != 1) return 4;
+             unsigned int *explicit_view = (unsigned int *)&count;
+             *explicit_view = 7;
+             if (count++ != 7 || ++count != 9 || (count += 256) != 265) return 5;
+             bytes[1] += 1;
+             *(volatile unsigned char *)0x10000000UL = text[0];
+             *(volatile unsigned char *)0x10000000UL = local[0];
+             *(volatile unsigned char *)0x10000000UL = trailing[0];
+             *(volatile unsigned char *)0x10000000UL = bytes[1];
+             return count;
+         }",
+    );
+    assert_eq!(output, b"QCDC");
+    assert_eq!(machine.core().register(10), Some(265));
+}
+
+#[test]
+fn qualified_object_parameters_recurse_and_ignore_top_level_signature_qualifiers() {
+    let (machine, _) = execute(
+        "int ninth(int a,int b,int c,int d,int e,int f,int g,int h,unsigned int value);
+         const int ninth(const int a,int b,int c,int d,int e,int f,int g,int h,volatile unsigned int value) {
+             const int *first = &a;
+             volatile unsigned int *last = &value;
+             if (*first != 1 || value != 0x80000001U) return 100;
+             *last += 1;
+             return value == 0x80000002U;
+         }
+         int recurse(const int n, volatile int value) {
+             const int fixed = n;
+             volatile int *p = &value;
+             *p += 2;
+             if (!n) return value;
+             return fixed + recurse(n - 1, value);
+         }
+         int main(void) {
+             return ninth(1,2,3,4,5,6,7,8,0x80000001U) + recurse(3, 10);
+         }",
+    );
+    assert_eq!(machine.core().register(10), Some(25));
+}
+
+#[test]
+fn qualified_object_volatile_aliases_updates_and_unevaluated_reads_execute_once() {
+    let source = "volatile unsigned char received;
+         int calls;
+         unsigned char input(void) { ++calls; return *(volatile unsigned char *)0x10000000UL; }
+         int main(void) {
+             const volatile unsigned char first = input();
+             volatile unsigned char second = input();
+             volatile unsigned char *p = &second;
+             sizeof(first); sizeof(received); sizeof(second++);
+             0 && (second = input());
+             1 || (received = input());
+             received = first;
+             *p += 1;
+             unsigned char old = second++;
+             unsigned char now = ++second;
+             *(volatile unsigned char *)0x10000000UL = received;
+             *(volatile unsigned char *)0x10000000UL = old;
+             *(volatile unsigned char *)0x10000000UL = now;
+             *(volatile unsigned char *)0x10000000UL = second;
+             return calls;
+         }";
+    let assembly = compile_to_assembly(source, "qualified-uart.c").unwrap();
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let mut output = Vec::new();
+    let report = run_headless(&mut machine, 10000, b"ABC", &mut output).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    assert_eq!(output, b"ACEE");
+    assert_eq!(machine.core().register(10), Some(2));
+    assert_eq!(machine.core().register(2), Some(0x80010000));
+    assert_eq!(machine.core().register(8), Some(0));
+    let mut next = [0; 1];
+    machine.bus_mut().read(0x10000000, &mut next).unwrap();
+    assert_eq!(next, *b"C");
+}
+
+#[test]
+fn qualified_object_register_and_stack_parameters_match_independent_assembly() {
+    let mut assembly = compile_to_assembly(
+        "unsigned int probe(const signed char first, volatile short second,
+                            int c,int d,int e,int f,int g,int h,
+                            const volatile unsigned int ninth) {
+             const signed char *a = &first;
+             volatile short *b = &second;
+             const volatile unsigned int *last = &ninth;
+             if (*a != -1 || *b != -128 || *last != 0x80000001U) return 99;
+             if (c + d + e + f + g + h != 33) return 98;
+             *b += 1;
+             if (second != -127) return 97;
+             return ninth + 1U;
+         }
+         int main(void) { return 0; }",
+        "qualified-abi.c",
+    )
+    .unwrap()
+    .replacen("call main\n", "call .Lqualified_entry\n", 1);
+    assembly.push_str(
+        ".Lqualified_entry:
+         addi sp, sp, -32
+         sd ra, 24(sp)
+         li s0, 123
+         li s1, 456
+         li t0, -2147483647
+         sd t0, 0(sp)
+         li a0, -1
+         li a1, -128
+         li a2, 3
+         li a3, 4
+         li a4, 5
+         li a5, 6
+         li a6, 7
+         li a7, 8
+         call probe
+         andi t0, sp, 15
+         bne t0, zero, .Lqualified_fail
+         ld t0, 0(sp)
+         li t1, -2147483647
+         bne t0, t1, .Lqualified_fail
+         j .Lqualified_done
+         .Lqualified_fail:
+         li a0, 96
+         .Lqualified_done:
+         ld ra, 24(sp)
+         addi sp, sp, 32
+         ret",
+    );
+    let mut machine =
+        Kiuas16Machine::new_with_ram_size(assemble_boot_rom(&assembly).unwrap(), 0x20000).unwrap();
+    let report = run_headless(&mut machine, 10000, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0);
+    assert!(report.waiting > 0);
+    for (register, value) in [
+        (2, 0x80010000),
+        (8, 123),
+        (9, 456),
+        (10, (-2147483646i64) as u64),
+    ] {
+        assert_eq!(machine.core().register(register), Some(value));
+    }
+}
+
+#[test]
+fn qualified_object_atomic_addresses_preserve_widths_and_const_loads() {
+    for (ty, value, size) in [
+        ("int", "-17", 4),
+        ("unsigned int", "0x80000001U", 4),
+        ("long", "-4294967297L", 8),
+        ("unsigned long", "0xfedcba9876543210UL", 8),
+    ] {
+        let source = format!(
+            "const volatile {ty} fixed = {value};
+             volatile {ty} shared;
+             int main(void) {{
+                 const {ty} local = {value};
+                 volatile {ty} counter = 0;
+                 {ty} first = __atomic_load_n(&fixed, 2);
+                 if (__atomic_load_n(&local, 5) != first) return 1;
+                 __atomic_store_n(&shared, first, 3);
+                 if (__atomic_exchange_n(&counter, shared, 4) != 0) return 2;
+                 if (__atomic_load_n(&counter, 2) != fixed) return 3;
+                 if (__atomic_fetch_add(&counter, 1, 0) != first) return 4;
+                 *(volatile unsigned long *)0x80000000UL = (unsigned long)&shared;
+                 *(volatile unsigned long *)0x80000008UL = shared;
+                 return 42;
+             }}"
+        );
+        let (mut machine, _) = execute(&source);
+        assert_eq!(machine.core().register(10), Some(42), "{ty}");
+        let mut report = [0; 16];
+        machine.bus_mut().read(0x80000000, &mut report).unwrap();
+        let address = u64::from_le_bytes(report[..8].try_into().unwrap());
+        let mut bytes = [0; 8];
+        machine.bus_mut().read(address, &mut bytes).unwrap();
+        assert_eq!(&bytes[..size], &report[8..8 + size], "{ty}");
+        assert_eq!(&bytes[size..], &vec![0; 8 - size], "{ty}");
+    }
+}
+
+#[test]
+fn qualified_object_const_mutation_and_qualifier_loss_preserve_existing_rom() {
+    for body in [
+        "frozen = 1;",
+        "++frozen;",
+        "frozen--;",
+        "frozen += 1;",
+        "*(&frozen) = 1;",
+        "sizeof(frozen++);",
+        "if (0) frozen = 1;",
+        "local = 1;",
+        "--local;",
+        "local *= 2;",
+        "items[0] = 2;",
+        "++items[0];",
+        "items[0]--;",
+        "*(&items[0]) = 1;",
+        "*items = 1;",
+        "if (0) items[0] += 1;",
+        "int *p = &frozen;",
+        "int *p = &local;",
+        "int *p = items;",
+        "volatile int *p = &frozen;",
+        "const int *p = &state;",
+        "const int *p = &both;",
+        "const int *p = values;",
+        "int *p = &state;",
+        "consume(&frozen);",
+        "consume(&state);",
+        "int *p = 1 ? &local : &state;",
+        "__atomic_store_n(&frozen, 1, 0);",
+        "__atomic_fetch_add(&local, 1, 0);",
+        "__atomic_exchange_n(&both, 1, 0);",
+    ] {
+        let source = format!(
+            "const int frozen = 1;
+             volatile int state;
+             const volatile int both = 2;
+             int consume(int *p) {{ return *p; }}
+             int main(void) {{
+                 const int local = 3;
+                 const int items[2] = {{ 1, 2 }};
+                 volatile int values[2];
+                 {body}
+                 return 0;
+             }}"
+        );
+        let diagnostic = compile_to_assembly(&source, "qualified-invalid.c")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.contains("qualified-invalid.c:"),
+            "{body}: {diagnostic}"
+        );
+        let files = Files::new(&source);
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let build = files.compile();
+        assert!(!build.status.success(), "{body}");
+        assert!(!build.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
+    }
+    for source in [
+        "const int x; extern int x; int main(void) { return 0; }",
+        "volatile int x; extern int x; int main(void) { return 0; }",
+        "const int a[2]; extern const volatile int a[2]; int main(void) { return 0; }",
+        "int f(int n) { const int n = 1; return n; } int main(void) { return f(0); }",
+        "int f(const int n) { return ++n; } int main(void) { return f(0); }",
+        "int f(const int a,int b,int c,int d,int e,int f,int g,int h,const int n) { n = 1; return n; } int main(void) { return 0; }",
+        "typedef const int number; int main(void) { number n = 1; n = 2; return n; }",
+        "const void x; int main(void) { return 0; }",
+        "const int *const p; int main(void) { return 0; }",
+        "typedef int *pointer; const pointer p; int main(void) { return 0; }",
+        "int main(void) { const int a[2][2]; return 0; }",
+    ] {
+        assert!(
+            compile_to_assembly(source, "qualified-invalid.c").is_err(),
             "{source}"
         );
     }
@@ -3301,8 +6728,8 @@ fn boolean_invalid_types_qualifications_and_atomic_widths_preserve_rom() {
         "unsigned _Bool object; int main(void) { return 0; }",
         "signed _Bool object; int main(void) { return 0; }",
         "long _Bool object; int main(void) { return 0; }",
-        "const _Bool object = 1; int main(void) { return 0; }",
-        "volatile _Bool object; int main(void) { return 0; }",
+        "const _Bool object = 1; int main(void) { object = 0; return 0; }",
+        "volatile _Bool object; int main(void) { _Bool *p = &object; return 0; }",
         "int main(void) { _Bool a[2] = \"AB\"; return 0; }",
         "int main(void) { _Bool *p = (int *)0; return 0; }",
         "int main(void) { int *p = (_Bool *)0; return 0; }",
@@ -4171,12 +7598,12 @@ fn invalid_file_linkage_declarations_visibility_and_definitions_preserve_output(
 #[test]
 fn invalid_and_unsupported_c_is_not_silently_compiled() {
     let cases = [
-        "#include <limits.h>\nint main(void) { return 0; }",
-        "#define VALUE 1\nint main(void) { return VALUE; }",
+        "#include <stdio.h>\nint main(void) { return 0; }",
+        "#define VALUE(a) a\nint main(void) { return VALUE(1, 2); }",
         "int main() { return 0; }",
         "int main(void) { unsigned long long a; return 0; }",
         "int main(void) { static int a; return 0; }",
-        "int main(void) { const int a = 1; return 0; }",
+        "int main(void) { const int a = 1; ++a; return 0; }",
         "int main(void) { return unknown; }",
         "int main(void) { int a; int a; return 0; }",
         "int main(void) { int a[2][3]; return 0; }",
@@ -4839,7 +8266,7 @@ fn unsupported_typedef_targets_and_namespace_conflicts_diagnose() {
         "typedef int ***nested; int main(void) { return 0; }",
         "typedef int array[2]; int main(void) { return 0; }",
         "typedef int initialized = 7; int main(void) { return 0; }",
-        "typedef int (*callback)(int); int main(void) { return 0; }",
+        "typedef int (*callback)(void,...); int main(void) { return 0; }",
         "typedef int word; typedef long word; int main(void) { return 0; }",
         "typedef int word; int word; int main(void) { return 0; }",
         "int word; typedef int word; int main(void) { return 0; }",
@@ -4847,7 +8274,7 @@ fn unsupported_typedef_targets_and_namespace_conflicts_diagnose() {
         "typedef int word; int f(int word) { return word; } int main(void) { return 0; }",
         "typedef int word; int word(void) { return 1; } int main(void) { return 0; }",
         "int word(void) { return 1; } typedef int word; int main(void) { return 0; }",
-        "typedef volatile int object; int main(void) { return 0; }",
+        "typedef volatile int object; int main(void) { object n; int *p = &n; return 0; }",
         "typedef int *pointer; int main(void) { volatile pointer p; return 0; }",
         "typedef int *pointer; int main(void) { sizeof(volatile pointer); return 0; }",
         "int main(void) { typedef int word; return 0; }",
@@ -5351,7 +8778,7 @@ fn invalid_halfword_types_initializers_and_qualifications_diagnose() {
         "int main(void) { short a[481]; return 0; }",
         "short a[32769]; int main(void) { return 0; }",
         "short a; unsigned short a; int main(void) { return 0; }",
-        "int main(void) { volatile short a; return 0; }",
+        "int main(void) { volatile short a; short *p = &a; return 0; }",
         "int main(void) { short a[2] = \"AB\"; return 0; }",
     ] {
         let error = compile_to_assembly(source, "halfword-invalid.c")

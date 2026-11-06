@@ -99,11 +99,18 @@ pub struct Declaration {
 const INCOMPLETE_ARRAY_LENGTH: usize = usize::MAX;
 
 fn infer_incomplete_array_length(c_type: &str, initializer: &Expression) -> Option<usize> {
-    if matches!(c_type.trim(), "char" | "signed char" | "unsigned char")
-        && let Some(Expression {
-            kind: ExpressionKind::Atom(value),
-            ..
-        }) = scalar_initializer(initializer)
+    let unqualified = c_type
+        .split_whitespace()
+        .filter(|word| !matches!(*word, "const" | "volatile"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if matches!(
+        unqualified.as_str(),
+        "char" | "signed char" | "unsigned char"
+    ) && let Some(Expression {
+        kind: ExpressionKind::Atom(value),
+        ..
+    }) = scalar_initializer(initializer)
         && let Some(bytes) = decode_string_token(value)
     {
         return bytes.len().checked_add(1);
@@ -246,6 +253,7 @@ pub struct Statement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementKind {
+    Assembly(InlineAssembly),
     Compound(Vec<Statement>),
     Declaration(Vec<Declaration>),
     Expression(Option<Expression>),
@@ -282,8 +290,25 @@ pub enum StatementKind {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssemblyOperand {
+    pub name: Option<String>,
+    pub constraint: String,
+    pub expression: Expression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineAssembly {
+    pub template: String,
+    pub extended: bool,
+    pub outputs: Vec<AssemblyOperand>,
+    pub inputs: Vec<AssemblyOperand>,
+    pub clobbers: Vec<String>,
+}
+
 fn native_statement_kind(statement: &StatementKind) -> &'static str {
     match statement {
+        StatementKind::Assembly(_) => "inline assembly",
         StatementKind::Compound(_) => "compound statement",
         StatementKind::Declaration(_) => "declaration",
         StatementKind::Expression(_) => "expression",
@@ -1107,6 +1132,11 @@ fn collect_string_literals_expression(expression: &Expression, literals: &mut Ha
 
 fn collect_string_literals_statement(statement: &Statement, literals: &mut HashSet<String>) {
     match &statement.kind {
+        StatementKind::Assembly(assembly) => {
+            for operand in assembly.outputs.iter().chain(&assembly.inputs) {
+                collect_string_literals_expression(&operand.expression, literals);
+            }
+        }
         StatementKind::Compound(statements) => {
             for statement in statements {
                 collect_string_literals_statement(statement, literals);
@@ -1262,6 +1292,7 @@ fn native_adjust_array_parameter_type(c_type: &str) -> String {
 
 fn native_statement_has_function_pointer_declaration(statement: &Statement) -> bool {
     match &statement.kind {
+        StatementKind::Assembly(_) => false,
         StatementKind::Compound(statements) => statements
             .iter()
             .any(native_statement_has_function_pointer_declaration),
@@ -1306,6 +1337,7 @@ fn native_statement_has_function_pointer_declaration(statement: &Statement) -> b
 
 fn native_statement_has_pointer_to_array_declaration(statement: &Statement) -> bool {
     match &statement.kind {
+        StatementKind::Assembly(_) => false,
         StatementKind::Compound(statements) => statements
             .iter()
             .any(native_statement_has_pointer_to_array_declaration),
@@ -2520,6 +2552,7 @@ fn statement_calls_are_defined(
         expression_calls_are_defined(expression, defined_functions, false)
     };
     match &statement.kind {
+        StatementKind::Assembly(_) => false,
         StatementKind::Compound(statements) => statements
             .iter()
             .all(|statement| statement_calls_are_defined(statement, defined_functions)),
@@ -2661,6 +2694,7 @@ fn rewrite_native_local_scopes(
     let mut valid = true;
     for statement in statements {
         match &mut statement.kind {
+            StatementKind::Assembly(_) => valid = false,
             StatementKind::Compound(nested) => {
                 valid &= rewrite_native_local_scopes(nested, scopes, next_name, true);
             }
@@ -2890,6 +2924,11 @@ fn native_stack_required_locals(statement: &Statement) -> HashSet<String> {
 
     fn collect_statement(statement: &Statement, names: &mut HashSet<String>) {
         match &statement.kind {
+            StatementKind::Assembly(assembly) => {
+                for operand in assembly.outputs.iter().chain(&assembly.inputs) {
+                    collect_expression(&operand.expression, names);
+                }
+            }
             StatementKind::Compound(statements) => {
                 for statement in statements {
                     collect_statement(statement, names);
@@ -4995,6 +5034,7 @@ fn native_expression_is_const_lvalue(
 
 fn collect_native_object_qualifiers(statement: &Statement, qualifiers: &mut HashMap<String, bool>) {
     match &statement.kind {
+        StatementKind::Assembly(_) => {}
         StatementKind::Compound(statements) => {
             for statement in statements {
                 collect_native_object_qualifiers(statement, qualifiers);
@@ -5259,6 +5299,7 @@ fn native_pointer_qualifier_loss_line_statement(
     function_name: &str,
 ) -> Option<usize> {
     match &statement.kind {
+        StatementKind::Assembly(_) => Some(statement.line),
         StatementKind::Return(Some(expression)) => {
             let drops_const = matches!(
                 locals.get(function_name),
@@ -5408,6 +5449,7 @@ fn native_const_write_line_statement(
     const_objects: &HashSet<String>,
 ) -> Option<usize> {
     match &statement.kind {
+        StatementKind::Assembly(_) => Some(statement.line),
         StatementKind::Compound(statements) => statements.iter().find_map(|statement| {
             native_const_write_line_statement(statement, locals, const_objects)
         }),
@@ -5684,6 +5726,13 @@ fn validate_native_bitfield_statement(
     locals: &HashMap<String, NativeLocation>,
 ) -> Result<(), CCompilerError> {
     match &statement.kind {
+        StatementKind::Assembly(_) => {
+            return Err(error(
+                statement.filename.as_deref().unwrap_or("<source>"),
+                statement.line,
+                "inline assembly is not supported by the legacy C backend",
+            ));
+        }
         StatementKind::Compound(statements) => {
             for statement in statements {
                 validate_native_bitfield_statement(statement, locals)?;
@@ -11883,7 +11932,38 @@ pub struct TranslationUnitParser {
 struct FileScopeStorage {
     class: Option<String>,
     declaration_only: bool,
+    attributes: DeclarationAttributes,
     line: usize,
+    filename: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DeclarationAttributes {
+    alignment: usize,
+    no_return: bool,
+    format: Option<PrintfAttribute>,
+    nonstring: bool,
+    inline: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PrintfAttribute {
+    format_index: usize,
+    first_argument: usize,
+}
+
+impl DeclarationAttributes {
+    fn merge(&mut self, other: Self) -> Result<(), &'static str> {
+        if self.format.is_some() && other.format.is_some() && self.format != other.format {
+            return Err("conflicting printf format attributes");
+        }
+        self.alignment = self.alignment.max(other.alignment);
+        self.no_return |= other.no_return;
+        self.format = self.format.or(other.format);
+        self.nonstring |= other.nonstring;
+        self.inline |= other.inline;
+        Ok(())
+    }
 }
 
 const ASSIGNMENTS: [&str; 11] = [
@@ -12306,7 +12386,8 @@ impl ExpressionParser {
                     },
                 );
             } else if let Some(open) = self.accept("(") {
-                if !Self::is_callable(&expression)
+                if self.resolved_enumerators.is_none()
+                    && !Self::is_callable(&expression)
                     && !matches!(
                         expression.kind,
                         ExpressionKind::Unary { ref operator, .. } if operator == "*"
@@ -12319,7 +12400,15 @@ impl ExpressionParser {
                     ));
                 }
                 let mut arguments = Vec::new();
-                if self.token().value != ")" {
+                if self.resolved_enumerators.is_some()
+                    && matches!(&expression.kind, ExpressionKind::Atom(name) if name == "__builtin_va_arg")
+                {
+                    arguments.push(self.parse_expression(1)?);
+                    self.expect(",")?;
+                    let token = self.token().clone();
+                    let c_type = self.parse_type_name()?;
+                    arguments.push(self.make(&token, ExpressionKind::SizeofType(c_type)));
+                } else if self.token().value != ")" {
                     loop {
                         arguments.push(self.parse_expression(1)?);
                         if self.accept(",").is_none() {
@@ -12502,8 +12591,103 @@ impl StatementParser {
         }
     }
 
+    fn assembly_string(&mut self) -> Result<String, CCompilerError> {
+        let token = self.expressions.advance();
+        let bytes = decode_string_token(&token.value).ok_or_else(|| {
+            self.expressions
+                .fail("inline assembly requires a string literal")
+        })?;
+        if bytes.contains(&0) {
+            return Err(self
+                .expressions
+                .fail("inline assembly strings cannot contain NUL"));
+        }
+        String::from_utf8(bytes).map_err(|_| {
+            self.expressions
+                .fail("inline assembly requires UTF-8 strings")
+        })
+    }
+
+    fn assembly_operands(&mut self) -> Result<Vec<AssemblyOperand>, CCompilerError> {
+        let mut operands = Vec::new();
+        if self.at(":") || self.at(")") {
+            return Ok(operands);
+        }
+        loop {
+            let name = if self.accept("[").is_some() {
+                let name = self
+                    .expect_identifier("expected an assembly operand name")?
+                    .value;
+                self.expect("]")?;
+                Some(name)
+            } else {
+                None
+            };
+            let constraint = self.assembly_string()?;
+            self.expect("(")?;
+            let expression = self.expressions.parse_expression(0)?;
+            self.expect(")")?;
+            operands.push(AssemblyOperand {
+                name,
+                constraint,
+                expression,
+            });
+            if self.accept(",").is_none() {
+                break;
+            }
+        }
+        Ok(operands)
+    }
+
+    fn parse_assembly(&mut self) -> Result<Statement, CCompilerError> {
+        let start = self.expressions.advance();
+        if matches!(
+            self.expressions.token().value.as_str(),
+            "volatile" | "__volatile" | "__volatile__"
+        ) {
+            self.expressions.advance();
+        }
+        self.expect("(")?;
+        let template = self.assembly_string()?;
+        let mut outputs = Vec::new();
+        let mut inputs = Vec::new();
+        let mut clobbers = Vec::new();
+        let extended = self.accept(":").is_some();
+        if extended {
+            outputs = self.assembly_operands()?;
+            if self.accept(":").is_some() {
+                inputs = self.assembly_operands()?;
+                if self.accept(":").is_some() && !self.at(")") {
+                    loop {
+                        clobbers.push(self.assembly_string()?);
+                        if self.accept(",").is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.expect(")")?;
+        self.expect(";")?;
+        Ok(self.statement(
+            &start,
+            StatementKind::Assembly(InlineAssembly {
+                template,
+                extended,
+                outputs,
+                inputs,
+                clobbers,
+            }),
+        ))
+    }
+
     fn parse_statement(&mut self) -> Result<Statement, CCompilerError> {
         let start = self.expressions.token().clone();
+        if self.expressions.resolved_enumerators.is_some()
+            && matches!(start.value.as_str(), "asm" | "__asm" | "__asm__")
+        {
+            return self.parse_assembly();
+        }
         if let Some(open) = self.accept("{") {
             let mut statements = Vec::new();
             while !self.at("}") && !self.expressions.is_at_end() {
@@ -13025,7 +13209,7 @@ impl TranslationUnitParser {
     fn parse_external_declaration(&mut self) -> Result<Vec<ExternalDeclaration>, CCompilerError> {
         let token = self.statements.expressions.token().clone();
         let enumerator_count = self.enumerators.len();
-        let (base_type, storage_class) = self.parse_base_type()?;
+        let (base_type, storage_class, base_attributes) = self.parse_base_type()?;
         if self.enumerator_evaluator.is_some()
             && self.enumerators.len() != enumerator_count
             && (storage_class.is_some() || !self.statements.at(";"))
@@ -13036,6 +13220,17 @@ impl TranslationUnitParser {
                 .fail("RV64 enum declarations must only declare constants"));
         }
         if self.statements.accept(";").is_some() {
+            if base_attributes.alignment > 0
+                || base_attributes.no_return
+                || base_attributes.format.is_some()
+                || base_attributes.nonstring
+                || base_attributes.inline
+            {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("attribute requires a declarator"));
+            }
             if self.file_scope_storage.is_some() && storage_class.is_some() {
                 return Err(error(
                     token.filename.as_deref().unwrap_or("<source>"),
@@ -13060,6 +13255,22 @@ impl TranslationUnitParser {
                     .fail("function typedefs are not supported"));
             }
             let (parameters, variadic, has_prototype) = self.parse_parameters()?;
+            let mut attributes = base_attributes;
+            attributes
+                .merge(self.parse_declaration_attributes()?)
+                .map_err(|message| self.statements.expressions.fail(message))?;
+            if attributes.alignment > 0 {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("aligned functions are not supported"));
+            }
+            if attributes.nonstring {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("nonstring requires a file-scope character array or pointer object"));
+            }
             let declaration = FunctionDeclaration {
                 return_type: declarator_type,
                 name: name.value,
@@ -13071,7 +13282,9 @@ impl TranslationUnitParser {
                 storage.push(FileScopeStorage {
                     class: storage_class.clone(),
                     declaration_only: false,
+                    attributes,
                     line: token.line,
+                    filename: token.filename.clone(),
                 });
             }
             if self.statements.accept(";").is_some() {
@@ -13096,6 +13309,23 @@ impl TranslationUnitParser {
         let mut next = Some((declarator_type, name, declarator_dimensions));
         while let Some((declarator_type, name, mut array_dimensions)) = next.take() {
             array_dimensions.extend(self.parse_array_dimensions()?);
+            let mut attributes = base_attributes;
+            attributes
+                .merge(self.parse_declaration_attributes()?)
+                .map_err(|message| self.statements.expressions.fail(message))?;
+            if attributes.no_return || attributes.format.is_some() {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("noreturn/format requires a function declaration"));
+            }
+            if attributes.inline {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("inline requires a function declaration"));
+            }
+            let alignment = attributes.alignment;
             let initializer = if self.statements.accept("=").is_some() {
                 Some(self.statements.parse_initializer()?)
             } else {
@@ -13155,6 +13385,18 @@ impl TranslationUnitParser {
                 )
             };
             if is_typedef {
+                if attributes.nonstring {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("nonstring typedefs are not supported"));
+                }
+                if alignment > 0 {
+                    return Err(self
+                        .statements
+                        .expressions
+                        .fail("aligned typedefs are not supported"));
+                }
                 if array_length.is_some() || initializer.is_some() {
                     return Err(error(
                         name.filename.as_deref().unwrap_or("<source>"),
@@ -13194,7 +13436,9 @@ impl TranslationUnitParser {
                         class: storage_class.clone(),
                         declaration_only: storage_class.as_deref() == Some("extern")
                             && initializer.is_none(),
+                        attributes,
                         line: name.line,
+                        filename: name.filename.clone(),
                     });
                 }
                 globals.push(ExternalDeclaration::Global(Declaration {
@@ -13215,23 +13459,125 @@ impl TranslationUnitParser {
         Ok(if is_typedef { Vec::new() } else { globals })
     }
 
-    fn parse_base_type(&mut self) -> Result<(String, Option<String>), CCompilerError> {
-        let mut storage_class = None;
-        let mut qualifiers = Vec::new();
+    fn parse_declaration_attributes(&mut self) -> Result<DeclarationAttributes, CCompilerError> {
+        let mut attributes = DeclarationAttributes::default();
+        while self.file_scope_storage.is_some()
+            && matches!(
+                self.statements.expressions.token().value.as_str(),
+                "__attribute" | "__attribute__"
+            )
+        {
+            self.statements.expressions.advance();
+            self.statements.expect("(")?;
+            self.statements.expect("(")?;
+            loop {
+                let attribute = self
+                    .statements
+                    .expect_identifier("expected an attribute name")?;
+                match attribute.value.as_str() {
+                    "nonstring" | "__nonstring__" => attributes.nonstring = true,
+                    "format" | "__format__" => {
+                        self.statements.expect("(")?;
+                        let kind = self
+                            .statements
+                            .expect_identifier("expected a format archetype")?;
+                        if !matches!(kind.value.as_str(), "printf" | "__printf__") {
+                            return Err(error(
+                                kind.filename.as_deref().unwrap_or("<source>"),
+                                kind.line,
+                                "only the printf format archetype is supported",
+                            ));
+                        }
+                        self.statements.expect(",")?;
+                        let index = self.statements.expressions.parse_expression(1)?;
+                        let format_index = rv64::attribute_index(&index)?;
+                        self.statements.expect(",")?;
+                        let first = self.statements.expressions.parse_expression(1)?;
+                        let first_argument = rv64::attribute_index(&first)?;
+                        self.statements.expect(")")?;
+                        attributes
+                            .merge(DeclarationAttributes {
+                                format: Some(PrintfAttribute {
+                                    format_index,
+                                    first_argument,
+                                }),
+                                ..DeclarationAttributes::default()
+                            })
+                            .map_err(|message| self.statements.expressions.fail(message))?;
+                    }
+                    "noreturn" | "__noreturn__" => attributes.no_return = true,
+                    "aligned" | "__aligned__" => {
+                        self.statements.expect("(")?;
+                        let expression = self.statements.expressions.parse_expression(1)?;
+                        self.statements.expect(")")?;
+                        let value = rv64::object_alignment(&expression)?;
+                        if !value.is_power_of_two() || value > 65536 {
+                            return Err(error(
+                                attribute.filename.as_deref().unwrap_or("<source>"),
+                                attribute.line,
+                                "aligned requires a power of two from 1 to 65536",
+                            ));
+                        }
+                        attributes.alignment = attributes.alignment.max(value);
+                    }
+                    _ => {
+                        return Err(error(
+                            attribute.filename.as_deref().unwrap_or("<source>"),
+                            attribute.line,
+                            "unsupported RV64 attribute; expected aligned, noreturn, format or nonstring",
+                        ));
+                    }
+                }
+                if self.statements.accept(",").is_none() {
+                    break;
+                }
+            }
+            self.statements.expect(")")?;
+            self.statements.expect(")")?;
+        }
+        Ok(attributes)
+    }
+
+    fn parse_declaration_specifiers(
+        &mut self,
+        storage_class: &mut Option<String>,
+        qualifiers: &mut Vec<String>,
+        attributes: &mut DeclarationAttributes,
+    ) -> Result<(), CCompilerError> {
         while matches!(
             self.statements.expressions.token().value.as_str(),
             "static" | "extern" | "register" | "auto" | "typedef" | "const" | "volatile"
-        ) {
+        ) || (self.file_scope_storage.is_some()
+            && matches!(
+                self.statements.expressions.token().value.as_str(),
+                "inline" | "__inline" | "__inline__"
+            ))
+        {
             let value = self.statements.expressions.advance().value;
             if matches!(value.as_str(), "const" | "volatile") {
                 qualifiers.push(value);
+            } else if matches!(value.as_str(), "inline" | "__inline" | "__inline__") {
+                attributes.inline = true;
             } else if storage_class.replace(value).is_some() {
                 return Err(self
                     .statements
                     .expressions
                     .fail("multiple storage-class specifiers in declaration"));
             }
+            attributes
+                .merge(self.parse_declaration_attributes()?)
+                .map_err(|message| self.statements.expressions.fail(message))?;
         }
+        Ok(())
+    }
+
+    fn parse_base_type(
+        &mut self,
+    ) -> Result<(String, Option<String>, DeclarationAttributes), CCompilerError> {
+        let mut storage_class = None;
+        let mut qualifiers = Vec::new();
+        let mut attributes = self.parse_declaration_attributes()?;
+        self.parse_declaration_specifiers(&mut storage_class, &mut qualifiers, &mut attributes)?;
         if self.statements.accept("enum").is_some() {
             self.parse_enum_specifier()?;
             let c_type = if qualifiers.is_empty() {
@@ -13239,7 +13585,10 @@ impl TranslationUnitParser {
             } else {
                 format!("{} int", qualifiers.join(" "))
             };
-            return Ok((c_type, storage_class));
+            attributes
+                .merge(self.parse_declaration_attributes()?)
+                .map_err(|message| self.statements.expressions.fail(message))?;
+            return Ok((c_type, storage_class, attributes));
         }
         if matches!(
             self.statements.expressions.token().value.as_str(),
@@ -13277,6 +13626,7 @@ impl TranslationUnitParser {
                     format!("{} {c_type}", qualifiers.join(" "))
                 },
                 storage_class,
+                attributes,
             ));
         }
         if let Some(alias) = self
@@ -13286,6 +13636,17 @@ impl TranslationUnitParser {
             .get(&self.statements.expressions.token().value)
             .cloned()
         {
+            self.statements.expressions.advance();
+            attributes
+                .merge(self.parse_declaration_attributes()?)
+                .map_err(|message| self.statements.expressions.fail(message))?;
+            if self.file_scope_storage.is_some() {
+                self.parse_declaration_specifiers(
+                    &mut storage_class,
+                    &mut qualifiers,
+                    &mut attributes,
+                )?;
+            }
             if self.statements.expressions.resolved_enumerators.is_some()
                 && !qualifiers.is_empty()
                 && alias.contains('*')
@@ -13295,17 +13656,29 @@ impl TranslationUnitParser {
                     .expressions
                     .fail("qualifiers on pointer typedefs are not supported"));
             }
-            self.statements.expressions.advance();
             let c_type = if qualifiers.is_empty() {
                 alias
             } else {
                 format!("{} {alias}", qualifiers.join(" "))
             };
-            return Ok((c_type, storage_class));
+            attributes
+                .merge(self.parse_declaration_attributes()?)
+                .map_err(|message| self.statements.expressions.fail(message))?;
+            return Ok((c_type, storage_class, attributes));
         }
         let mut words = Vec::new();
         while TYPE_WORDS.contains(&self.statements.expressions.token().value.as_str()) {
             words.push(self.statements.expressions.advance().value);
+            attributes
+                .merge(self.parse_declaration_attributes()?)
+                .map_err(|message| self.statements.expressions.fail(message))?;
+            if self.file_scope_storage.is_some() {
+                self.parse_declaration_specifiers(
+                    &mut storage_class,
+                    &mut qualifiers,
+                    &mut attributes,
+                )?;
+            }
         }
         if !words.iter().any(|word| {
             matches!(
@@ -13322,7 +13695,7 @@ impl TranslationUnitParser {
         if !qualifiers.is_empty() {
             c_type = format!("{} {c_type}", qualifiers.join(" "));
         }
-        Ok((c_type, storage_class))
+        Ok((c_type, storage_class, attributes))
     }
 
     fn parse_record_members(&mut self, record_name: &str) -> Result<(), CCompilerError> {
@@ -13860,7 +14233,18 @@ impl TranslationUnitParser {
                 variadic = true;
                 break;
             }
-            let (base_type, storage) = self.parse_base_type()?;
+            let (base_type, storage, attributes) = self.parse_base_type()?;
+            if attributes.inline
+                || attributes.alignment > 0
+                || attributes.no_return
+                || attributes.format.is_some()
+                || attributes.nonstring
+            {
+                return Err(self
+                    .statements
+                    .expressions
+                    .fail("attributes on parameters are not supported"));
+            }
             if storage.is_some() {
                 return Err(self
                     .statements
@@ -13922,6 +14306,15 @@ impl TranslationUnitParser {
             if self.statements.accept(",").is_none() {
                 break;
             }
+        }
+        if variadic
+            && parameters.is_empty()
+            && self.statements.expressions.resolved_enumerators.is_some()
+        {
+            return Err(self
+                .statements
+                .expressions
+                .fail("variadic prototype requires at least one named parameter"));
         }
         self.statements.expect(")")?;
         Ok((parameters, variadic, true))
@@ -14181,12 +14574,50 @@ fn parse_line_directive(
 }
 
 pub fn lex_raw(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerError> {
+    lex_for_target(source, filename, PreprocessorTarget::Sc16)
+}
+
+#[derive(Clone, Copy)]
+enum PreprocessorTarget {
+    Sc16,
+    Kiuas16,
+}
+
+fn lex_for_target(
+    source: &str,
+    filename: &str,
+    target: PreprocessorTarget,
+) -> Result<Vec<Token>, CCompilerError> {
     let mut macros = HashMap::new();
-    let mut macro_snapshots: HashMap<(String, usize), HashMap<String, MacroDefinition>> =
-        HashMap::new();
-    let filtered_source =
-        preprocess_source(source, filename, &mut macros, &mut macro_snapshots, 0)?;
-    let tokens = lex_unexpanded(&filtered_source, filename)?;
+    if matches!(target, PreprocessorTarget::Kiuas16) {
+        for (name, value) in [
+            ("__kiuas16__", "1"),
+            ("__riscv", "1"),
+            ("__riscv_xlen", "64"),
+            ("__SIZEOF_LONG__", "8"),
+            ("__SIZEOF_POINTER__", "8"),
+        ] {
+            let mut replacement = lex_unexpanded(value, filename)?;
+            replacement.pop();
+            macros.insert(
+                name.to_owned(),
+                MacroDefinition {
+                    parameters: None,
+                    replacement,
+                },
+            );
+        }
+    }
+    let mut macro_snapshots = HashMap::new();
+    let filtered_source = preprocess_source(
+        source,
+        filename,
+        &mut macros,
+        &mut macro_snapshots,
+        0,
+        target,
+    )?;
+    let (tokens, contexts) = lex_with_contexts(&filtered_source, filename)?;
     let mut expanded_tokens = Vec::new();
     let mut position = 0;
     while position < tokens.len() {
@@ -14195,24 +14626,10 @@ pub fn lex_raw(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerErro
             expanded_tokens.push(token.clone());
             break;
         }
-        let key = (
-            token
-                .filename
-                .clone()
-                .unwrap_or_else(|| filename.to_owned()),
-            token.line,
-        );
-        let line_macros = macro_snapshots.get(&key);
+        let line_macros = macro_snapshots.get(&contexts[position]);
         let mut end = position + 1;
         while end < tokens.len() && tokens[end].value != "<eof>" {
-            let next_key = (
-                tokens[end]
-                    .filename
-                    .clone()
-                    .unwrap_or_else(|| filename.to_owned()),
-                tokens[end].line,
-            );
-            let next_macros = macro_snapshots.get(&next_key);
+            let next_macros = macro_snapshots.get(&contexts[end]);
             let snapshots_match = match (line_macros, next_macros) {
                 (Some(left), Some(right)) => left == right,
                 (None, None) => true,
@@ -14235,15 +14652,33 @@ pub fn lex_raw(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerErro
         }
         position = end;
     }
-    Ok(expanded_tokens)
+    let mut concatenated: Vec<Token> = Vec::new();
+    for token in expanded_tokens {
+        if token.value.starts_with("<string:")
+            && let Some(previous) = concatenated.last_mut()
+            && previous.value.starts_with("<string:")
+        {
+            previous.value.pop();
+            previous.value.push_str(
+                token
+                    .value
+                    .strip_prefix("<string:")
+                    .expect("checked string token"),
+            );
+        } else {
+            concatenated.push(token);
+        }
+    }
+    Ok(concatenated)
 }
 
 fn preprocess_source(
     source: &str,
     filename: &str,
     macros: &mut HashMap<String, MacroDefinition>,
-    macro_snapshots: &mut HashMap<(String, usize), HashMap<String, MacroDefinition>>,
+    macro_snapshots: &mut HashMap<usize, HashMap<String, MacroDefinition>>,
     depth: usize,
+    target_machine: PreprocessorTarget,
 ) -> Result<String, CCompilerError> {
     if depth > 64 {
         return Err(error(
@@ -14337,6 +14772,7 @@ fn preprocess_source(
                             macros,
                             &logical_filename,
                             logical_line_number,
+                            target_machine,
                         )?
                     } else {
                         false
@@ -14373,6 +14809,7 @@ fn preprocess_source(
                             macros,
                             &logical_filename,
                             logical_line_number,
+                            target_machine,
                         )?
                     } else {
                         false
@@ -14524,14 +14961,15 @@ fn preprocess_source(
                         &logical_filename,
                         logical_line_number,
                     )?;
-                    let included_path = resolve_include_path(&target, quoted, filename)
-                        .ok_or_else(|| {
-                            error(
-                                &logical_filename,
-                                logical_line_number,
-                                &format!("cannot find include file {target:?}"),
-                            )
-                        })?;
+                    let included_path =
+                        resolve_include_path(&target, quoted, filename, target_machine)
+                            .ok_or_else(|| {
+                                error(
+                                    &logical_filename,
+                                    logical_line_number,
+                                    &format!("cannot find include file {target:?}"),
+                                )
+                            })?;
                     let included = fs::read_to_string(&included_path).map_err(|io_error| {
                         error(
                             &logical_filename,
@@ -14550,6 +14988,7 @@ fn preprocess_source(
                         macros,
                         macro_snapshots,
                         depth + 1,
+                        target_machine,
                     )?);
                     filtered_source.push_str(&format!(
                         "\n\0SC16_LINE:{}:{}",
@@ -14600,7 +15039,15 @@ fn preprocess_source(
                     };
                     return Err(error(&logical_filename, logical_line_number, &message));
                 }
-                "pragma" if active => {}
+                "pragma" if active => {
+                    if matches!(target_machine, PreprocessorTarget::Kiuas16) {
+                        return Err(error(
+                            &logical_filename,
+                            logical_line_number,
+                            "#pragma is not supported by the RV64 preprocessor",
+                        ));
+                    }
+                }
                 "define" | "undef" => {}
                 _ if !active => {}
                 _ => {
@@ -14614,10 +15061,9 @@ fn preprocess_source(
             }
         } else {
             if active {
-                macro_snapshots.insert(
-                    (logical_filename.clone(), logical_line_number),
-                    macros.clone(),
-                );
+                let context = macro_snapshots.len();
+                macro_snapshots.insert(context, macros.clone());
+                filtered_source.push_str(&format!("\0SC16_MACROS:{context}\0"));
                 filtered_source.push_str(&logical_line);
             }
             for _ in 0..output_newlines {
@@ -14719,7 +15165,12 @@ fn parse_include_target(
     Err(error(filename, line, "invalid #include"))
 }
 
-fn resolve_include_path(target: &str, quoted: bool, filename: &str) -> Option<PathBuf> {
+fn resolve_include_path(
+    target: &str,
+    quoted: bool,
+    filename: &str,
+    target_machine: PreprocessorTarget,
+) -> Option<PathBuf> {
     let target_path = Path::new(target);
     let mut candidates = Vec::new();
     if target_path.is_absolute() {
@@ -14732,13 +15183,17 @@ fn resolve_include_path(target: &str, quoted: bool, filename: &str) -> Option<Pa
             candidates.push(source_parent.join(target_path));
         }
         let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
-        candidates.push(
-            manifest_directory
+        let include_directory = match target_machine {
+            PreprocessorTarget::Sc16 => manifest_directory.join("toolchain").join("include"),
+            PreprocessorTarget::Kiuas16 => manifest_directory
                 .join("toolchain")
-                .join("include")
-                .join(target_path),
-        );
-        if let Some(repository_directory) = manifest_directory.parent() {
+                .join("kiuas16")
+                .join("include"),
+        };
+        candidates.push(include_directory.join(target_path));
+        if matches!(target_machine, PreprocessorTarget::Sc16)
+            && let Some(repository_directory) = manifest_directory.parent()
+        {
             candidates.push(
                 repository_directory
                     .join("toolchain")
@@ -14764,6 +15219,7 @@ fn evaluate_preprocessor_condition(
     macros: &HashMap<String, MacroDefinition>,
     filename: &str,
     line: usize,
+    target: PreprocessorTarget,
 ) -> Result<bool, CCompilerError> {
     let mut tokens = lex_unexpanded(source, filename)?;
     tokens.pop();
@@ -14836,15 +15292,21 @@ fn evaluate_preprocessor_condition(
             "invalid integer constant expression in preprocessor condition",
         ));
     }
-    let value =
-        evaluate_integer_constant_with_names(&expression, &HashMap::new()).map_err(|_| {
-            error(
-                filename,
-                line,
-                "invalid integer constant expression in preprocessor condition",
-            )
-        })?;
-    Ok(value != 0)
+    let value = match target {
+        PreprocessorTarget::Sc16 => {
+            evaluate_integer_constant_with_names(&expression, &HashMap::new())
+                .map(|value| value != 0)
+        }
+        PreprocessorTarget::Kiuas16 => rv64::preprocessor_condition(&expression),
+    }
+    .map_err(|_| {
+        error(
+            filename,
+            line,
+            "invalid integer constant expression in preprocessor condition",
+        )
+    })?;
+    Ok(value)
 }
 
 fn strip_comments_for_directive(line: &str, in_block_comment: &mut bool) -> String {
@@ -14940,6 +15402,15 @@ fn expand_object_macros(
     macros: &HashMap<String, MacroDefinition>,
     expansion_stack: &mut Vec<String>,
 ) -> Result<Vec<Token>, CCompilerError> {
+    expand_macros_inner(tokens, macros, expansion_stack, 0)
+}
+
+fn expand_macros_inner(
+    tokens: &[Token],
+    macros: &HashMap<String, MacroDefinition>,
+    expansion_stack: &mut Vec<String>,
+    depth: usize,
+) -> Result<Vec<Token>, CCompilerError> {
     let mut expanded = Vec::new();
     let mut position = 0;
     while position < tokens.len() {
@@ -14975,7 +15446,7 @@ fn expand_object_macros(
             position += 1;
             continue;
         }
-        if expansion_stack.len() >= 128 {
+        if expansion_stack.len() >= 128 || depth >= 128 {
             return Err(error(
                 token.filename.as_deref().unwrap_or("<source>"),
                 token.line,
@@ -15079,7 +15550,12 @@ fn expand_object_macros(
                 let mut argument = if paste_adjacent {
                     argument.clone()
                 } else {
-                    expand_object_macros(argument, macros, expansion_stack)?
+                    expand_macros_inner(
+                        argument,
+                        macros,
+                        &mut expansion_stack[..expansion_stack.len() - 1].to_vec(),
+                        depth + 1,
+                    )?
                 };
                 for argument_token in &mut argument {
                     argument_token.line = token.line;
@@ -15096,10 +15572,11 @@ fn expand_object_macros(
             }
             replacement_index += 1;
         }
-        let mut rescanned = expand_object_macros(
+        let mut rescanned = expand_macros_inner(
             &paste_macro_tokens(substituted, token)?,
             macros,
             expansion_stack,
+            depth + 1,
         )?;
         expansion_stack.pop();
         let suffix = &tokens[invocation_end + 1..];
@@ -15112,7 +15589,12 @@ fn expand_object_macros(
         {
             let mut bridge = vec![rescanned.pop().expect("last token exists")];
             bridge.extend_from_slice(suffix);
-            expanded.extend(expand_object_macros(&bridge, macros, expansion_stack)?);
+            expanded.extend(expand_macros_inner(
+                &bridge,
+                macros,
+                expansion_stack,
+                depth + 1,
+            )?);
             return Ok(expanded);
         }
         expanded.extend(rescanned);
@@ -15197,11 +15679,20 @@ fn paste_macro_tokens(
 }
 
 fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerError> {
+    lex_with_contexts(source, filename).map(|(tokens, _)| tokens)
+}
+
+fn lex_with_contexts(
+    source: &str,
+    filename: &str,
+) -> Result<(Vec<Token>, Vec<usize>), CCompilerError> {
     let mut tokens = Vec::new();
     let mut position = 0;
     let mut line = 1;
     let mut token_filename = filename.to_owned();
     let mut leading_space = false;
+    let mut context = 0;
+    let mut contexts = Vec::new();
 
     while position < source.len() {
         let remaining = &source[position..];
@@ -15215,6 +15706,17 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
             }
             leading_space = true;
             position += character.len_utf8();
+            continue;
+        }
+
+        if let Some(marker) = remaining.strip_prefix("\0SC16_MACROS:") {
+            let end = marker
+                .find('\0')
+                .ok_or_else(|| error(&token_filename, line, "invalid macro context marker"))?;
+            context = marker[..end]
+                .parse()
+                .map_err(|_| error(&token_filename, line, "invalid macro context marker"))?;
+            position += "\0SC16_MACROS:".len() + end + 1;
             continue;
         }
 
@@ -15250,6 +15752,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
         }
 
         if let Some(end) = float_end(source, position) {
+            contexts.push(context);
             tokens.push(Token {
                 value: source[position..end].to_owned(),
                 line,
@@ -15322,19 +15825,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                             "character constants must contain one character",
                         ));
                     };
-                    if quote == '"'
-                        && let Some(previous) = tokens.last_mut()
-                        && previous.value.starts_with("<string:")
-                        && previous.value.ends_with('>')
-                    {
-                        previous.value.pop();
-                        previous
-                            .value
-                            .push_str(value.strip_prefix("<string:").unwrap_or_default());
-                        leading_space = false;
-                        closed = true;
-                        break;
-                    }
+                    contexts.push(context);
                     tokens.push(Token {
                         value,
                         line: start_line,
@@ -15374,6 +15865,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 }
                 position += next.len_utf8();
             }
+            contexts.push(context);
             tokens.push(Token {
                 value: source[start..position].to_owned(),
                 line,
@@ -15397,6 +15889,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
                 }
                 position += next.len_utf8();
             }
+            contexts.push(context);
             tokens.push(Token {
                 value: source[start..position].to_owned(),
                 line,
@@ -15411,6 +15904,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
             .iter()
             .find(|operator| remaining.starts_with(**operator))
         {
+            contexts.push(context);
             tokens.push(Token {
                 value: (*operator).to_owned(),
                 line,
@@ -15422,6 +15916,7 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
             continue;
         }
         if "{}();,:.[]=+-*/%<>!~&|^#?".contains(character) {
+            contexts.push(context);
             tokens.push(Token {
                 value: character.to_string(),
                 line,
@@ -15439,13 +15934,14 @@ fn lex_unexpanded(source: &str, filename: &str) -> Result<Vec<Token>, CCompilerE
         ));
     }
 
+    contexts.push(context);
     tokens.push(Token {
         value: "<eof>".to_owned(),
         line,
         filename: Some(token_filename),
         leading_space: false,
     });
-    Ok(tokens)
+    Ok((tokens, contexts))
 }
 
 #[cfg(test)]
@@ -15602,6 +16098,34 @@ int main(void) { return VALUE; }"#
                 "(", "(", "4", ")", "+", "(", "(", "2", "+", "1", ")", ")", ")", "<eof>"
             ]
         );
+        assert_eq!(
+            values("#define ADD(a,b) ((a)+(b))\nADD(1,ADD(2,3))"),
+            [
+                "(", "(", "1", ")", "+", "(", "(", "(", "2", ")", "+", "(", "3", ")", ")", ")",
+                ")", "<eof>"
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_logical_locations_keep_distinct_macro_contexts() {
+        let tokens = lex_raw(
+            "#define VALUE 17\n#line 10 \"repeat.h\"\nint first = VALUE;\n\
+             #undef VALUE\n#define VALUE 42\n#line 10 \"repeat.h\"\nint second = VALUE;\n",
+            "fixture.c",
+        )
+        .unwrap();
+        let numbers = tokens
+            .iter()
+            .filter(|token| matches!(token.value.as_str(), "17" | "42"))
+            .collect::<Vec<_>>();
+        assert_eq!(numbers.len(), 2);
+        assert_eq!(numbers[0].value, "17");
+        assert_eq!(numbers[1].value, "42");
+        for token in numbers {
+            assert_eq!(token.line, 10);
+            assert_eq!(token.filename.as_deref(), Some("repeat.h"));
+        }
     }
 
     #[test]
@@ -15626,17 +16150,34 @@ int main(void) { return VALUE; }"#
             ["<string:68656c6c6f20776f726c64>", "item7", "5U", "<eof>"]
         );
         assert_eq!(
+            values("#define TEXT(x) #x\n#define PREFIX \"P\"\nPREFIX TEXT(\"a\" \"b\") \"!\""),
+            ["<string:502261222022622221>", "<eof>"]
+        );
+        assert_eq!(
             values(
                 "#define TEXT(value) #value\n\
-                 TEXT(a+b) TEXT(a + b) TEXT(a/**/+b) TEXT(  a   +   b  )"
+                 TEXT(a+b), TEXT(a + b), TEXT(a/**/+b), TEXT(  a   +   b  )"
             ),
             [
                 "<string:612b62>",
+                ",",
                 "<string:61202b2062>",
+                ",",
                 "<string:61202b62>",
+                ",",
                 "<string:61202b2062>",
                 "<eof>"
             ]
+        );
+    }
+
+    #[test]
+    fn nested_same_macro_arguments_obey_the_expansion_limit() {
+        let nested = format!("#define ID(x) x\n{}1{}", "ID(".repeat(130), ")".repeat(130));
+        let diagnostic = lex_raw(&nested, "nested.c").unwrap_err().to_string();
+        assert!(
+            diagnostic.contains("macro expansion exceeds"),
+            "{diagnostic}"
         );
     }
 

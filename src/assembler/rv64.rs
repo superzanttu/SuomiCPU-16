@@ -51,6 +51,48 @@ fn signed(value: i64, bits: u32, line: usize) -> Result<u32, AssemblyError> {
     Ok(value as u32 & ((1_u32 << bits) - 1))
 }
 
+fn csr(text: &str, line: usize) -> Result<u32, AssemblyError> {
+    let value = match text {
+        "sstatus" => 0x100,
+        "sie" => 0x104,
+        "stvec" => 0x105,
+        "scounteren" => 0x106,
+        "sscratch" => 0x140,
+        "sepc" => 0x141,
+        "scause" => 0x142,
+        "stval" => 0x143,
+        "sip" => 0x144,
+        "stimecmp" => 0x14d,
+        "satp" => 0x180,
+        "mstatus" => 0x300,
+        "misa" => 0x301,
+        "medeleg" => 0x302,
+        "mideleg" => 0x303,
+        "mie" => 0x304,
+        "mtvec" => 0x305,
+        "mcounteren" => 0x306,
+        "menvcfg" => 0x30a,
+        "mscratch" => 0x340,
+        "mepc" => 0x341,
+        "mcause" => 0x342,
+        "mtval" => 0x343,
+        "mip" => 0x344,
+        "pmpcfg0" => 0x3a0,
+        "pmpaddr0" => 0x3b0,
+        "mcycle" => 0xb00,
+        "minstret" => 0xb02,
+        "cycle" => 0xc00,
+        "time" => 0xc01,
+        "instret" => 0xc02,
+        "mhartid" => 0xf14,
+        _ => parse_number(text, line)?,
+    };
+    if !(0..=0xfff).contains(&value) {
+        return Err(error(line, "CSR address must be an unsigned 12-bit number"));
+    }
+    Ok(value as u32)
+}
+
 fn immediate(opcode: u32, rd: u32, rs: u32, function: u32, value: u32) -> u32 {
     value << 20 | rs << 15 | function << 12 | rd << 7 | opcode
 }
@@ -101,6 +143,38 @@ fn encode(
         }
     };
     let word = match op {
+        "csrrw" | "csrrs" | "csrrc" | "csrrwi" | "csrrsi" | "csrrci" | "csrr" | "csrw" | "csrs"
+        | "csrc" | "csrwi" | "csrsi" | "csrci" => {
+            let full = op.starts_with("csrr") && op != "csrr";
+            let read = op == "csrr";
+            count(if full { 3 } else { 2 })?;
+            let rd = if full || read { reg(0)? } else { 0 };
+            let address = csr(args[if full || read { 1 } else { 0 }], line)?;
+            let immediate_source = op.ends_with('i');
+            let source = if read {
+                0
+            } else {
+                let index = if full { 2 } else { 1 };
+                if immediate_source {
+                    let value = number(index)?;
+                    if !(0..=31).contains(&value) {
+                        return Err(error(
+                            line,
+                            "CSR immediate must be an unsigned 5-bit number",
+                        ));
+                    }
+                    value as u32
+                } else {
+                    reg(index)?
+                }
+            };
+            let function = match op {
+                "csrrw" | "csrw" | "csrrwi" | "csrwi" => 1,
+                "csrrs" | "csrr" | "csrs" | "csrrsi" | "csrsi" => 2,
+                _ => 3,
+            } | if immediate_source { 4 } else { 0 };
+            immediate(0x73, rd, source, function, address)
+        }
         op if ["amoswap.", "amoadd.", "amoand.", "amoor.", "amoxor.", "lr."]
             .iter()
             .any(|prefix| op.starts_with(prefix)) =>

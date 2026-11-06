@@ -1,9 +1,10 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
     CCompilerError, Declaration, Expression, ExpressionKind, ExternalDeclaration,
-    FunctionDeclaration, Statement, StatementKind, TranslationUnitParser, decode_string_token,
-    error, lex_unexpanded, scalar_initializer,
+    FunctionDeclaration, PreprocessorTarget, Statement, StatementKind, TranslationUnitParser,
+    decode_string_token, error, lex_for_target, scalar_initializer,
 };
 use crate::kiuas16_abi::{PLAIN_CHAR_IS_UNSIGNED, STACK_ALIGNMENT};
 
@@ -86,8 +87,18 @@ fn atomic_operation(name: &str) -> Option<AtomicOperation> {
     }
 }
 
+fn reserved_builtin(name: &str) -> bool {
+    atomic_operation(name).is_some()
+        || matches!(
+            name,
+            "__builtin_va_start" | "__builtin_va_arg" | "__builtin_va_copy" | "__builtin_va_end"
+        )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Type {
+    FunctionPointer(usize),
+    FunctionPointerPointer(usize),
     Bool,
     Int,
     UInt,
@@ -237,17 +248,27 @@ impl Type {
     fn unsigned(self) -> bool {
         matches!(
             self,
-            Self::Bool | Self::UInt | Self::UShort | Self::ULong | Self::Byte
+            Self::Bool
+                | Self::UInt
+                | Self::UShort
+                | Self::ULong
+                | Self::Byte
+                | Self::FunctionPointer(_)
         ) || self == Self::Char && PLAIN_CHAR_IS_UNSIGNED
             || self.pointee().is_some()
     }
 
     fn scalar(self) -> bool {
-        self.integer() || self.pointee().is_some()
+        self.integer() || self.pointer_value()
+    }
+
+    fn pointer_value(self) -> bool {
+        self.pointee().is_some() || matches!(self, Self::FunctionPointer(_))
     }
 
     fn size(self) -> Option<u64> {
         match self {
+            Self::FunctionPointer(_) => Some(8),
             Self::Bool | Self::Char | Self::SignedChar | Self::Byte => Some(1),
             Self::Short | Self::UShort => Some(2),
             Self::Int | Self::UInt => Some(4),
@@ -328,6 +349,9 @@ impl Type {
     }
 
     fn common_pointer(self, other: Self) -> Option<Self> {
+        if matches!(self, Self::FunctionPointer(_)) {
+            return (self == other).then_some(self);
+        }
         let left = self.pointee()?;
         let right = other.pointee()?;
         let pointee = if left == Self::Void || right == Self::Void {
@@ -350,6 +374,7 @@ impl Type {
 
     fn pointer(self) -> Option<Self> {
         Some(match self {
+            Self::FunctionPointer(index) => Self::FunctionPointerPointer(index),
             Self::Bool => Self::PlainBoolPointer,
             Self::Char => Self::PlainCharPointer,
             Self::SignedChar => Self::PlainSignedCharPointer,
@@ -372,6 +397,7 @@ impl Type {
 
     fn pointee(self) -> Option<Self> {
         match self {
+            Self::FunctionPointerPointer(index) => Some(Self::FunctionPointer(index)),
             Self::PlainBoolPointer | Self::BoolPointer => Some(Self::Bool),
             Self::ConstPointer { base, .. } => Some(base.scalar()),
             Self::PointerPointer {
@@ -439,6 +465,76 @@ fn integer_literal(token: &str) -> Option<(u64, Type)> {
 struct Signature {
     result: Type,
     parameters: Vec<Type>,
+    variadic: bool,
+}
+
+#[derive(Default)]
+struct FunctionTypes(RefCell<Vec<Signature>>);
+
+impl FunctionTypes {
+    fn pointer(&self, signature: Signature) -> Type {
+        let mut signatures = self.0.borrow_mut();
+        let index = signatures
+            .iter()
+            .position(|existing| *existing == signature)
+            .unwrap_or_else(|| {
+                signatures.push(signature);
+                signatures.len() - 1
+            });
+        Type::FunctionPointer(index)
+    }
+
+    fn signature(&self, index: usize) -> Signature {
+        self.0.borrow()[index].clone()
+    }
+
+    fn declaration(text: &str) -> Option<Signature> {
+        let (result, parameters) = text.split_once(" (*)(")?;
+        let parameters = parameters.strip_suffix(')')?;
+        let variadic = parameters.ends_with(", ...");
+        let parameters = parameters.strip_suffix(", ...").unwrap_or(parameters);
+        if parameters.is_empty() || parameters.contains("...") || (variadic && parameters == "void")
+        {
+            return None;
+        }
+        let result = ObjectType::parse(result)?.ty;
+        let parameters = if parameters == "void" {
+            Vec::new()
+        } else {
+            parameters
+                .split(',')
+                .map(|text| {
+                    ObjectType::parse(text.trim())
+                        .map(|object| object.ty)
+                        .filter(|ty| ty.scalar())
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        (parameters.len() <= 32).then_some(Signature {
+            result,
+            parameters,
+            variadic,
+        })
+    }
+
+    fn parse(&self, text: &str) -> Option<ObjectType> {
+        ObjectType::parse(text).or_else(|| {
+            if let Some(inner) = text.strip_suffix('*') {
+                let ty = self.parse(inner)?.ty.pointer()?;
+                return Some(ObjectType {
+                    ty,
+                    read_only: false,
+                    volatile: false,
+                });
+            }
+            let ty = self.pointer(Self::declaration(text)?);
+            Some(ObjectType {
+                ty,
+                read_only: false,
+                volatile: false,
+            })
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -487,7 +583,7 @@ impl Value {
     }
 
     fn static_pointer(&self, globals: &BTreeMap<String, Global>) -> Option<u64> {
-        if self.ty.pointee().is_none() {
+        if !self.ty.pointer_value() {
             return None;
         }
         match &self.kind {
@@ -513,6 +609,59 @@ impl Value {
                     when_true.static_pointer(globals)
                 } else {
                     when_false.static_pointer(globals)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn nonstring(&self, globals: &BTreeMap<String, Global>) -> bool {
+        if !self.ty.pointer_value() {
+            return false;
+        }
+        match &self.kind {
+            ValueKind::GlobalAddress(name, _) => globals
+                .get(name)
+                .is_some_and(|object| object.nonstring && object.array_length.is_some()),
+            ValueKind::Global(name, _) => globals.get(name).is_some_and(|object| object.nonstring),
+            ValueKind::Load(address) => {
+                if let ValueKind::GlobalAddress(name, _) = &address.kind {
+                    globals
+                        .get(name)
+                        .is_some_and(|object| object.nonstring && object.array_length.is_none())
+                } else {
+                    false
+                }
+            }
+            ValueKind::Convert(inner) => inner.nonstring(globals),
+            ValueKind::Binary(operator, left, right) if matches!(operator.as_str(), "+" | "-") => {
+                left.nonstring(globals) || right.nonstring(globals)
+            }
+            ValueKind::Conditional(condition, when_true, when_false) => {
+                match condition.constant_integer() {
+                    Some(0) => when_false.nonstring(globals),
+                    Some(_) => when_true.nonstring(globals),
+                    None => when_true.nonstring(globals) || when_false.nonstring(globals),
+                }
+            }
+            ValueKind::Assign(_, value) => value.nonstring(globals),
+            ValueKind::Update { target, .. } => target.nonstring(globals),
+            _ => false,
+        }
+    }
+
+    fn static_function(&self) -> Option<&str> {
+        match &self.kind {
+            ValueKind::FunctionAddress(name) => Some(name),
+            ValueKind::FunctionDesignator(inner) => inner.static_function(),
+            ValueKind::Convert(inner) if matches!(self.ty, Type::FunctionPointer(_)) => {
+                inner.static_function()
+            }
+            ValueKind::Conditional(condition, when_true, when_false) => {
+                if condition.constant_integer()? != 0 {
+                    when_true.static_function()
+                } else {
+                    when_false.static_function()
                 }
             }
             _ => None,
@@ -632,6 +781,10 @@ impl Value {
 
 #[derive(Clone)]
 enum ValueKind {
+    VariadicAddress(usize),
+    VariadicArgument(Box<Value>),
+    FunctionAddress(String),
+    FunctionDesignator(Box<Value>),
     Constant(u64),
     GlobalAddress(String, u64),
     Global(String, u64),
@@ -642,7 +795,7 @@ enum ValueKind {
     Binary(String, Box<Value>, Box<Value>),
     Logical(String, Box<Value>, Box<Value>),
     Conditional(Box<Value>, Box<Value>, Box<Value>),
-    Call(String, Vec<Value>),
+    Call(Box<Value>, Vec<Value>),
     Atomic {
         operation: AtomicOperation,
         pointer: Box<Value>,
@@ -661,6 +814,11 @@ enum ValueKind {
 }
 
 enum Action {
+    Assembly {
+        template: String,
+        outputs: Vec<(Value, bool, &'static str)>,
+        inputs: Vec<(Value, &'static str)>,
+    },
     Block(Vec<Action>),
     Evaluate(Value),
     InitializeArray {
@@ -686,18 +844,86 @@ enum Action {
     Label(String, Box<Action>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ObjectType {
+    ty: Type,
+    read_only: bool,
+    volatile: bool,
+}
+
+impl ObjectType {
+    fn parse(text: &str) -> Option<Self> {
+        let mut read_only = false;
+        let mut volatile = false;
+        let ty = if text.contains('*') {
+            Type::parse(text)?
+        } else {
+            let mut words = Vec::new();
+            for word in text.split_whitespace() {
+                match word {
+                    "const" => read_only = true,
+                    "volatile" => volatile = true,
+                    _ => words.push(word),
+                }
+            }
+            let ty = Type::parse(&words.join(" "))?;
+            if (read_only || volatile) && !ty.integer() {
+                return None;
+            }
+            ty
+        };
+        Some(Self {
+            ty,
+            read_only,
+            volatile,
+        })
+    }
+
+    fn pointer(self) -> Option<Type> {
+        if self.read_only {
+            Some(Type::ConstPointer {
+                base: PointerBase::from_type(self.ty)?,
+                volatile: self.volatile,
+            })
+        } else {
+            self.ty.qualified_pointer(self.volatile)
+        }
+    }
+
+    fn value(self, kind: ValueKind, address: ValueKind, array: bool) -> Value {
+        if array || self.read_only || self.volatile {
+            let pointer = Value {
+                ty: self.pointer().expect("supported object address"),
+                kind: address,
+            };
+            if array {
+                pointer
+            } else {
+                Value {
+                    ty: self.ty,
+                    kind: ValueKind::Load(Box::new(pointer)),
+                }
+            }
+        } else {
+            Value { ty: self.ty, kind }
+        }
+    }
+}
+
 struct Local {
     slot: usize,
-    ty: Type,
+    object: ObjectType,
     array_length: Option<usize>,
 }
 
 #[derive(Clone)]
 struct Global {
-    ty: Type,
+    object: ObjectType,
     array_length: Option<usize>,
     address: u64,
     bytes: usize,
+    alignment: usize,
+    nonstring: bool,
     initializer: Option<Vec<u8>>,
     pointer_initializer: Option<(usize, Vec<(usize, Value)>)>,
 }
@@ -711,12 +937,16 @@ impl Global {
 struct Lower<'a> {
     filename: &'a str,
     signatures: &'a BTreeMap<String, Signature>,
+    function_types: &'a FunctionTypes,
     globals: &'a BTreeMap<String, Global>,
     typedefs: Option<&'a HashMap<String, String>>,
     enumerators: Option<&'a HashMap<String, i64>>,
     scopes: Vec<BTreeMap<String, Local>>,
     slots: usize,
     result: Type,
+    no_return: bool,
+    variadic_parameters: Option<usize>,
+    formats: Option<&'a BTreeMap<String, super::PrintfAttribute>>,
     loop_depth: usize,
     break_depth: usize,
     labels: BTreeSet<String>,
@@ -737,10 +967,10 @@ impl Lower<'_> {
             return Some(bytes.len() as u64 + 1);
         }
         let (ty, length) = if let Some(local) = self.lookup(name) {
-            (local.ty, local.array_length?)
+            (local.object.ty, local.array_length?)
         } else {
             let global = self.globals.get(name)?;
-            (global.ty, global.array_length?)
+            (global.object.ty, global.array_length?)
         };
         Some(ty.size().expect("integer element size") * length as u64)
     }
@@ -748,12 +978,12 @@ impl Lower<'_> {
     fn local(
         &mut self,
         name: &str,
-        ty: Type,
+        object: ObjectType,
         array_length: Option<usize>,
         line: usize,
     ) -> Result<usize, CCompilerError> {
-        if atomic_operation(name).is_some() {
-            return Err(self.fail(line, "atomic builtin name is reserved"));
+        if reserved_builtin(name) {
+            return Err(self.fail(line, "compiler builtin name is reserved"));
         }
         if self
             .typedefs
@@ -767,6 +997,7 @@ impl Lower<'_> {
         {
             return Err(self.fail(line, "local or parameter name conflicts with an enumerator"));
         }
+        let ty = object.ty;
         let slots = if let Some(length) = array_length {
             if length == 0 || !ty.scalar() || ty.pointer().is_none() {
                 return Err(self.fail(
@@ -796,7 +1027,7 @@ impl Lower<'_> {
             name.to_owned(),
             Local {
                 slot,
-                ty,
+                object,
                 array_length,
             },
         );
@@ -809,7 +1040,7 @@ impl Lower<'_> {
             || ty == Type::Void
             || !(ty.compatible(value.ty)
                 || ty == Type::Bool && value.ty.scalar()
-                || ty.pointee().is_some() && value.null_pointer_constant())
+                || ty.pointer_value() && value.null_pointer_constant())
         {
             return Err(self.fail(line, "incompatible RV64 subset types"));
         }
@@ -853,6 +1084,35 @@ impl Lower<'_> {
         line: usize,
     ) -> Result<Value, CCompilerError> {
         let comparison = matches!(operator, "==" | "!=" | "<" | "<=" | ">" | ">=");
+        if matches!(left.ty, Type::FunctionPointer(_))
+            || matches!(right.ty, Type::FunctionPointer(_))
+        {
+            if matches!(operator, "==" | "!=") {
+                if left.ty == right.ty {
+                    return Ok(Value::binary(Type::Int, operator, left, right));
+                }
+                if left.null_pointer_constant() {
+                    return Ok(Value::binary(
+                        Type::Int,
+                        operator,
+                        self.convert(left, right.ty, line)?,
+                        right,
+                    ));
+                }
+                if right.null_pointer_constant() {
+                    return Ok(Value::binary(
+                        Type::Int,
+                        operator,
+                        left.clone(),
+                        self.convert(right, left.ty, line)?,
+                    ));
+                }
+            }
+            return Err(self.fail(
+                line,
+                "function pointers only support compatible equality comparisons",
+            ));
+        }
         if left.ty.pointee().is_some() || right.ty.pointee().is_some() {
             if matches!(operator, "==" | "!=") {
                 if left.ty.pointee().is_some() && right.null_pointer_constant() {
@@ -923,29 +1183,21 @@ impl Lower<'_> {
         let value = match &expression.kind {
             ExpressionKind::Atom(token) => {
                 if let Some(local) = self.lookup(token) {
-                    Value {
-                        ty: if local.array_length.is_some() {
-                            local.ty.pointer().expect("integer array")
-                        } else {
-                            local.ty
-                        },
-                        kind: if local.array_length.is_some() {
-                            ValueKind::Address(local.slot)
-                        } else {
-                            ValueKind::Local(local.slot)
-                        },
-                    }
+                    local.object.value(
+                        ValueKind::Local(local.slot),
+                        ValueKind::Address(local.slot),
+                        local.array_length.is_some(),
+                    )
                 } else if let Some(global) = self.globals.get(token) {
-                    if global.array_length.is_some() {
-                        Value {
-                            ty: global.ty.pointer().expect("integer array"),
-                            kind: ValueKind::GlobalAddress(token.clone(), global.address),
-                        }
-                    } else {
-                        Value {
-                            ty: global.ty,
-                            kind: ValueKind::Global(token.clone(), global.address),
-                        }
+                    global.object.value(
+                        ValueKind::Global(token.clone(), global.address),
+                        ValueKind::GlobalAddress(token.clone(), global.address),
+                        global.array_length.is_some(),
+                    )
+                } else if let Some(signature) = self.signatures.get(token) {
+                    Value {
+                        ty: self.function_types.pointer(signature.clone()),
+                        kind: ValueKind::FunctionAddress(token.clone()),
                     }
                 } else if let Some((number, ty)) = integer_literal(token) {
                     Value {
@@ -964,9 +1216,19 @@ impl Lower<'_> {
                 }
             }
             ExpressionKind::Cast { c_type, expression } => {
-                let ty = Type::parse(c_type)
+                let ty = self
+                    .function_types
+                    .parse(c_type)
+                    .map(|object| object.ty)
                     .ok_or_else(|| self.fail(line, "unsupported RV64 cast type"))?;
                 let value = self.value(expression)?;
+                if matches!(ty, Type::FunctionPointer(_)) {
+                    let value = self.convert(value, ty, line)?;
+                    return Ok(Value {
+                        ty,
+                        kind: ValueKind::Convert(Box::new(value)),
+                    });
+                }
                 if ty.pointee().is_some() && value.ty.integer()
                     || ty.integer() && value.ty.pointee().is_some()
                     || ty.common_pointer(value.ty).is_some()
@@ -982,6 +1244,15 @@ impl Lower<'_> {
             ExpressionKind::Unary { operator, operand } => {
                 let value = self.value(operand)?;
                 if operator == "&" {
+                    if matches!(value.kind, ValueKind::FunctionAddress(_)) {
+                        return Ok(value);
+                    }
+                    if let ValueKind::FunctionDesignator(inner) = value.kind {
+                        return Ok(Value {
+                            ty: inner.ty,
+                            kind: ValueKind::Convert(inner),
+                        });
+                    }
                     match value.kind {
                         ValueKind::Local(slot) => Value {
                             ty: value.ty.pointer().ok_or_else(|| {
@@ -998,6 +1269,11 @@ impl Lower<'_> {
                         ValueKind::Load(pointer) if value.ty.scalar() => *pointer,
                         _ => return Err(self.fail(line, "address-of requires an lvalue")),
                     }
+                } else if operator == "*" && matches!(value.ty, Type::FunctionPointer(_)) {
+                    return Ok(Value {
+                        ty: value.ty,
+                        kind: ValueKind::FunctionDesignator(Box::new(value)),
+                    });
                 } else if matches!(operator.as_str(), "++" | "--") {
                     self.update(
                         value,
@@ -1055,9 +1331,9 @@ impl Lower<'_> {
                 let when_false = self.value(when_false)?;
                 let ty = if when_true.ty.integer() && when_false.ty.integer() {
                     when_true.ty.common(when_false.ty)
-                } else if when_true.ty.pointee().is_some() && when_false.null_pointer_constant() {
+                } else if when_true.ty.pointer_value() && when_false.null_pointer_constant() {
                     when_true.ty
-                } else if when_false.ty.pointee().is_some() && when_true.null_pointer_constant() {
+                } else if when_false.ty.pointer_value() && when_true.null_pointer_constant() {
                     when_false.ty
                 } else if when_true.ty == when_false.ty {
                     when_true.ty
@@ -1128,40 +1404,57 @@ impl Lower<'_> {
                 function,
                 arguments,
             } => {
-                let ExpressionKind::Atom(name) = &function.kind else {
-                    return Err(self.fail(
-                        line,
-                        "indirect calls are not supported by initial RV64 subset",
-                    ));
-                };
-                if let Some(operation) = atomic_operation(name) {
+                if let ExpressionKind::Atom(name) = &function.kind
+                    && matches!(
+                        name.as_str(),
+                        "__builtin_va_start"
+                            | "__builtin_va_arg"
+                            | "__builtin_va_copy"
+                            | "__builtin_va_end"
+                    )
+                {
+                    return self.variadic(name, arguments, line);
+                }
+                if let ExpressionKind::Atom(name) = &function.kind
+                    && let Some(operation) = atomic_operation(name)
+                {
                     return self.atomic(operation, arguments, line);
                 }
-                if self
-                    .scopes
-                    .iter()
-                    .rev()
-                    .any(|scope| scope.contains_key(name))
-                    || self.globals.contains_key(name)
+                let target = self.value(function)?;
+                let Type::FunctionPointer(index) = target.ty else {
+                    return Err(self.fail(line, "call requires a prototyped function pointer"));
+                };
+                let signature = self.function_types.signature(index);
+                if arguments.len() > 32
+                    || arguments.len() < signature.parameters.len()
+                    || (!signature.variadic && signature.parameters.len() != arguments.len())
                 {
-                    return Err(self.fail(line, "called name is an object"));
-                }
-                let signature = self
-                    .signatures
-                    .get(name)
-                    .ok_or_else(|| self.fail(line, "call requires a defined prototyped function"))?
-                    .clone();
-                if signature.parameters.len() != arguments.len() {
                     return Err(self.fail(line, "function argument count mismatch"));
                 }
                 let mut values = Vec::new();
-                for (argument, ty) in arguments.iter().zip(&signature.parameters) {
+                for (index, argument) in arguments.iter().enumerate() {
                     let value = self.value(argument)?;
-                    values.push(self.convert(value, *ty, line)?);
+                    let ty = if let Some(ty) = signature.parameters.get(index) {
+                        *ty
+                    } else if value.ty.integer() {
+                        value.ty.promote()
+                    } else if value.ty.pointer_value() {
+                        value.ty
+                    } else {
+                        return Err(
+                            self.fail(line, "variadic arguments require supported scalar values")
+                        );
+                    };
+                    values.push(self.convert(value, ty, line)?);
+                }
+                if let Some(name) = target.static_function()
+                    && let Some(attribute) = self.formats.and_then(|formats| formats.get(name))
+                {
+                    self.check_format(*attribute, arguments, &values, expression)?;
                 }
                 Value {
                     ty: signature.result,
-                    kind: ValueKind::Call(name.clone(), values),
+                    kind: ValueKind::Call(Box::new(target), values),
                 }
             }
             ExpressionKind::Assignment {
@@ -1214,7 +1507,10 @@ impl Lower<'_> {
                 )?
             }
             ExpressionKind::SizeofType(text) => {
-                let ty = Type::parse(text)
+                let ty = self
+                    .function_types
+                    .parse(text)
+                    .map(|object| object.ty)
                     .ok_or_else(|| self.fail(line, "unsupported RV64 sizeof type"))?;
                 self.sizeof(ty, line)?
             }
@@ -1228,6 +1524,12 @@ impl Lower<'_> {
                     }
                 } else {
                     let value = self.value(expression)?;
+                    if matches!(
+                        value.kind,
+                        ValueKind::FunctionAddress(_) | ValueKind::FunctionDesignator(_)
+                    ) {
+                        return Err(self.fail(line, "sizeof requires an object, not a function"));
+                    }
                     self.sizeof(value.ty, line)?
                 }
             }
@@ -1244,6 +1546,250 @@ impl Lower<'_> {
                     .ok_or_else(|| self.fail(line, "sizeof requires a complete object type"))?,
             ),
         })
+    }
+
+    fn check_format(
+        &self,
+        attribute: super::PrintfAttribute,
+        arguments: &[Expression],
+        values: &[Value],
+        expression: &Expression,
+    ) -> Result<(), CCompilerError> {
+        let fail = |message: &str| {
+            error(
+                expression.filename.as_deref().unwrap_or(self.filename),
+                expression.line,
+                message,
+            )
+        };
+        if values[attribute.format_index - 1].nonstring(self.globals) {
+            return Err(fail(
+                "printf format requires a string, not a nonstring object",
+            ));
+        }
+        let format = &arguments[attribute.format_index - 1];
+        let ExpressionKind::Atom(token) = &format.kind else {
+            return Ok(());
+        };
+        let Some(bytes) = decode_string_token(token) else {
+            return Ok(());
+        };
+        let bytes = bytes
+            .split(|byte| *byte == 0)
+            .next()
+            .expect("split has first element");
+        let mut position = 0;
+        let mut argument = attribute.first_argument.saturating_sub(1);
+        let check_arguments = attribute.first_argument != 0;
+        let mut consume = |expected: Type| -> Result<(), CCompilerError> {
+            if !check_arguments {
+                return Ok(());
+            }
+            let value = values
+                .get(argument)
+                .ok_or_else(|| fail("printf format requires more arguments"))?;
+            let compatible = if expected == Type::PlainCharPointer {
+                if value.nonstring(self.globals) {
+                    return Err(fail("printf %s requires a string, not a nonstring object"));
+                }
+                value.ty.pointee() == Some(Type::Char)
+            } else if expected == Type::PlainVoidPointer {
+                matches!(
+                    value.ty,
+                    Type::PlainVoidPointer
+                        | Type::VoidPointer
+                        | Type::ConstPointer {
+                            base: PointerBase::Void,
+                            ..
+                        }
+                )
+            } else {
+                value.ty == expected
+            };
+            if !compatible {
+                return Err(fail(&format!(
+                    "printf format argument {} has incompatible type",
+                    argument + 1
+                )));
+            }
+            argument += 1;
+            Ok(())
+        };
+        while position < bytes.len() {
+            if bytes[position] != b'%' {
+                position += 1;
+                continue;
+            }
+            position += 1;
+            if bytes.get(position) == Some(&b'%') {
+                position += 1;
+                continue;
+            }
+            let flags_start = position;
+            while bytes
+                .get(position)
+                .is_some_and(|byte| b"-+ #0".contains(byte))
+            {
+                position += 1;
+            }
+            let flags = &bytes[flags_start..position];
+            if bytes.get(position) == Some(&b'*') {
+                consume(Type::Int)?;
+                position += 1;
+            } else {
+                while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+                    position += 1;
+                }
+            }
+            let precision = bytes.get(position) == Some(&b'.');
+            if precision {
+                position += 1;
+                if bytes.get(position) == Some(&b'*') {
+                    consume(Type::Int)?;
+                    position += 1;
+                } else {
+                    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+                        position += 1;
+                    }
+                }
+            }
+            let start = position;
+            if bytes
+                .get(position)
+                .is_some_and(|byte| b"hljztL".contains(byte))
+            {
+                position += 1;
+                if matches!(bytes.get(start), Some(b'h' | b'l'))
+                    && bytes.get(position) == bytes.get(start)
+                {
+                    position += 1;
+                }
+            }
+            let length = &bytes[start..position];
+            let conversion = *bytes
+                .get(position)
+                .ok_or_else(|| fail("unterminated printf conversion"))?;
+            position += 1;
+            let expected = match conversion {
+                b'd' | b'i' => match length {
+                    b"" | b"h" | b"hh" => Type::Int,
+                    b"l" | b"j" | b"z" | b"t" => Type::Long,
+                    _ => return Err(fail("unsupported printf integer length")),
+                },
+                b'u' | b'o' | b'x' | b'X' => match length {
+                    b"" => Type::UInt,
+                    b"h" | b"hh" => Type::Int,
+                    b"l" | b"j" | b"z" | b"t" => Type::ULong,
+                    _ => return Err(fail("unsupported printf integer length")),
+                },
+                b'c' if length.is_empty() => Type::Int,
+                b's' if length.is_empty() => Type::PlainCharPointer,
+                b'p' if length.is_empty() => Type::PlainVoidPointer,
+                _ => return Err(fail("unsupported printf format conversion")),
+            };
+            let allowed_flags: &[u8] = match conversion {
+                b'd' | b'i' => b"-+ 0",
+                b'u' => b"-0",
+                b'o' | b'x' | b'X' => b"-#0",
+                _ => b"-",
+            };
+            if flags.iter().any(|flag| !allowed_flags.contains(flag))
+                || (precision && matches!(conversion, b'c' | b'p'))
+            {
+                return Err(fail("unsupported printf flags or precision for conversion"));
+            }
+            consume(expected)?;
+        }
+        if check_arguments && argument != values.len() {
+            return Err(fail("printf format has unused arguments"));
+        }
+        Ok(())
+    }
+
+    fn variadic(
+        &mut self,
+        name: &str,
+        arguments: &[Expression],
+        line: usize,
+    ) -> Result<Value, CCompilerError> {
+        let count = if name == "__builtin_va_end" { 1 } else { 2 };
+        if arguments.len() != count {
+            return Err(self.fail(line, "stdarg builtin argument count mismatch"));
+        }
+        let list = self.value(&arguments[0])?;
+        if list.ty != Type::PlainULongPointer || !list.modifiable() {
+            return Err(self.fail(line, "stdarg requires a modifiable va_list object"));
+        }
+        match name {
+            "__builtin_va_start" => {
+                let count = self
+                    .variadic_parameters
+                    .ok_or_else(|| self.fail(line, "va_start requires a variadic function"))?;
+                let ExpressionKind::Atom(last) = &arguments[1].kind else {
+                    return Err(self.fail(line, "va_start requires the last named parameter"));
+                };
+                if !self
+                    .lookup(last)
+                    .is_some_and(|local| local.slot == count - 1 && local.array_length.is_none())
+                {
+                    return Err(self.fail(line, "va_start requires the last named parameter"));
+                }
+                Ok(Value {
+                    ty: Type::Void,
+                    kind: ValueKind::Assign(
+                        Box::new(list),
+                        Box::new(Value {
+                            ty: Type::PlainULongPointer,
+                            kind: ValueKind::VariadicAddress(count * 8),
+                        }),
+                    ),
+                })
+            }
+            "__builtin_va_copy" => {
+                let source = self.value(&arguments[1])?;
+                if source.ty != Type::PlainULongPointer {
+                    return Err(self.fail(line, "va_copy source requires va_list"));
+                }
+                Ok(Value {
+                    ty: Type::Void,
+                    kind: ValueKind::Assign(Box::new(list), Box::new(source)),
+                })
+            }
+            "__builtin_va_end" => Ok(Value {
+                ty: Type::Void,
+                kind: ValueKind::Convert(Box::new(list)),
+            }),
+            _ => {
+                let ExpressionKind::SizeofType(text) = &arguments[1].kind else {
+                    return Err(self.fail(line, "va_arg requires a type name"));
+                };
+                let ty = self
+                    .function_types
+                    .parse(text)
+                    .map(|object| object.ty)
+                    .filter(|ty| ty.scalar() && (!ty.integer() || ty.promote() == *ty))
+                    .ok_or_else(|| {
+                        self.fail(
+                            line,
+                            "va_arg requires a promoted integer or supported pointer type",
+                        )
+                    })?;
+                let pointer = self.update(
+                    list,
+                    "+",
+                    Value {
+                        ty: Type::Int,
+                        kind: ValueKind::Constant(1),
+                    },
+                    true,
+                    line,
+                )?;
+                Ok(Value {
+                    ty,
+                    kind: ValueKind::VariadicArgument(Box::new(pointer)),
+                })
+            }
+        }
     }
 
     fn atomic(
@@ -1388,7 +1934,7 @@ impl Lower<'_> {
                 index,
                 Value {
                     ty,
-                    kind: if ty.pointee().is_some() {
+                    kind: if ty.pointer_value() {
                         ValueKind::Convert(Box::new(Value {
                             ty: Type::Int,
                             kind: ValueKind::Constant(0),
@@ -1467,7 +2013,15 @@ impl Lower<'_> {
 
     fn action(&mut self, statement: &Statement) -> Result<Action, CCompilerError> {
         let line = statement.line;
+        if self.no_return && matches!(statement.kind, StatementKind::Return(_)) {
+            return Err(error(
+                statement.filename.as_deref().unwrap_or(self.filename),
+                line,
+                "noreturn function cannot contain a return statement",
+            ));
+        }
         Ok(match &statement.kind {
+            StatementKind::Assembly(assembly) => self.assembly(assembly, line)?,
             StatementKind::Compound(statements) => {
                 self.scopes.push(BTreeMap::new());
                 let actions = statements
@@ -1486,10 +2040,14 @@ impl Lower<'_> {
                             "multidimensional arrays are not supported by RV64 subset",
                         ));
                     }
-                    let ty = Type::parse(&declaration.c_type)
-                        .filter(|ty| *ty != Type::Void)
+                    let object = self
+                        .function_types
+                        .parse(&declaration.c_type)
+                        .filter(|object| object.ty != Type::Void)
                         .ok_or_else(|| self.fail(line, "unsupported RV64 local type"))?;
-                    let slot = self.local(&declaration.name, ty, declaration.array_length, line)?;
+                    let ty = object.ty;
+                    let slot =
+                        self.local(&declaration.name, object, declaration.array_length, line)?;
                     if let Some(initializer) = &declaration.initializer {
                         if let Some(length) = declaration.array_length {
                             let values = self.array_initializers(initializer, ty, length)?;
@@ -1665,6 +2223,116 @@ impl Lower<'_> {
         self.break_depth -= 1;
         body
     }
+
+    fn assembly(
+        &mut self,
+        assembly: &super::InlineAssembly,
+        line: usize,
+    ) -> Result<Action, CCompilerError> {
+        if !assembly.extended {
+            return Ok(Action::Assembly {
+                template: assembly.template.clone(),
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+            });
+        }
+        if assembly.clobbers.iter().any(|clobber| clobber != "memory") {
+            return Err(self.fail(line, "inline assembly supports only the memory clobber"));
+        }
+        let registers = ["t1", "t2", "t3", "t4", "t5", "t6"];
+        if assembly.outputs.len() + assembly.inputs.len() > registers.len() {
+            return Err(self.fail(line, "inline assembly supports at most six operands"));
+        }
+        let mut names = BTreeMap::new();
+        let mut substitutions = Vec::new();
+        let mut outputs = Vec::new();
+        let mut inputs = Vec::new();
+        for (index, operand) in assembly.outputs.iter().chain(&assembly.inputs).enumerate() {
+            if let Some(name) = &operand.name {
+                if names.insert(name.clone(), index).is_some() {
+                    return Err(self.fail(line, "duplicate inline assembly operand name"));
+                }
+            }
+            let value = self.value(&operand.expression)?;
+            let register = registers[index];
+            if index < assembly.outputs.len() {
+                if !matches!(operand.constraint.as_str(), "=r" | "+r" | "=&r" | "+&r") {
+                    return Err(self.fail(line, "unsupported inline assembly output constraint"));
+                }
+                if !value.modifiable() || !value.ty.scalar() {
+                    return Err(self.fail(
+                        line,
+                        "inline assembly output requires a modifiable scalar object",
+                    ));
+                }
+                outputs.push((value, operand.constraint.starts_with('+'), register));
+                substitutions.push(register.to_owned());
+            } else {
+                match operand.constraint.as_str() {
+                    "r" if value.ty.scalar() => {
+                        inputs.push((value, register));
+                        substitutions.push(register.to_owned());
+                    }
+                    "i" if value.integer_constant_expression() => {
+                        let number = value.constant_integer().ok_or_else(|| {
+                            self.fail(
+                                line,
+                                "inline assembly immediate requires an integer constant expression",
+                            )
+                        })?;
+                        substitutions.push((number as i64).to_string());
+                    }
+                    _ => {
+                        return Err(self.fail(line, "unsupported inline assembly input constraint"));
+                    }
+                }
+            }
+        }
+        let mut template = String::new();
+        let mut chars = assembly.template.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                template.push(c);
+                continue;
+            }
+            if chars.peek() == Some(&'%') {
+                chars.next();
+                template.push('%');
+                continue;
+            }
+            let index = if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut name = String::new();
+                while chars.peek().is_some_and(|c| *c != ']') {
+                    name.push(chars.next().expect("peeked template character"));
+                }
+                if chars.next() != Some(']') {
+                    return Err(self.fail(line, "unterminated inline assembly operand name"));
+                }
+                *names
+                    .get(&name)
+                    .ok_or_else(|| self.fail(line, "unknown inline assembly operand name"))?
+            } else {
+                let mut digits = String::new();
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    digits.push(chars.next().expect("peeked template character"));
+                }
+                digits
+                    .parse::<usize>()
+                    .map_err(|_| self.fail(line, "unsupported inline assembly template modifier"))?
+            };
+            template.push_str(
+                substitutions
+                    .get(index)
+                    .ok_or_else(|| self.fail(line, "inline assembly operand index out of range"))?,
+            );
+        }
+        Ok(Action::Assembly {
+            template,
+            outputs,
+            inputs,
+        })
+    }
 }
 
 struct Emit {
@@ -1771,7 +2439,7 @@ impl Emit {
             Type::Short => "lh a0, 0(a0)",
             Type::UShort => "lhu a0, 0(a0)",
             Type::Long | Type::ULong => "ld a0, 0(a0)",
-            _ if ty.pointee().is_some() => "ld a0, 0(a0)",
+            _ if ty.pointer_value() => "ld a0, 0(a0)",
             _ => unreachable!("checked scalar load"),
         });
     }
@@ -1782,13 +2450,31 @@ impl Emit {
             Type::Int | Type::UInt => "sw a0, 0(t0)",
             Type::Short | Type::UShort => "sh a0, 0(t0)",
             Type::Long | Type::ULong => "sd a0, 0(t0)",
-            _ if ty.pointee().is_some() => "sd a0, 0(t0)",
+            _ if ty.pointer_value() => "sd a0, 0(t0)",
             _ => unreachable!("checked scalar store"),
         });
     }
 
+    fn object_address(&mut self, target: &Value) {
+        match &target.kind {
+            ValueKind::Local(slot) => self.line(format!("addi a0, s0, -{}", 24 + slot * 8)),
+            ValueKind::Global(_, address) => self.constant(*address),
+            ValueKind::Load(pointer) => self.value(pointer),
+            _ => unreachable!("checked modifiable object"),
+        }
+    }
+
     fn value(&mut self, value: &Value) {
         match &value.kind {
+            ValueKind::VariadicAddress(offset) => self.line(format!("addi a0, s0, {offset}")),
+            ValueKind::VariadicArgument(pointer) => {
+                self.value(pointer);
+                self.load(value.ty);
+            }
+            ValueKind::FunctionAddress(name) => {
+                self.line(format!("la a0, {}", self.function_symbol(name)))
+            }
+            ValueKind::FunctionDesignator(inner) => self.value(inner),
             ValueKind::Constant(number) => self.constant(*number),
             ValueKind::GlobalAddress(_, address) => self.constant(*address),
             ValueKind::Global(_, address) => {
@@ -1838,7 +2524,12 @@ impl Emit {
                 self.value(when_false);
                 self.line(format!("{done}:"));
             }
-            ValueKind::Call(name, arguments) => {
+            ValueKind::Call(target, arguments) => {
+                let indirect = !matches!(target.kind, ValueKind::FunctionAddress(_));
+                if indirect {
+                    self.value(target);
+                    self.push();
+                }
                 let stack_bytes = (arguments.len().saturating_sub(8) * 8).div_ceil(STACK_ALIGNMENT)
                     * STACK_ALIGNMENT;
                 if stack_bytes != 0 {
@@ -1868,9 +2559,16 @@ impl Emit {
                     }
                     self.line(format!("addi sp, sp, {temporary_bytes}"));
                 }
-                self.line(format!("call {}", self.function_symbol(name)));
+                if let ValueKind::FunctionAddress(name) = &target.kind {
+                    self.line(format!("call {}", self.function_symbol(name)));
+                } else {
+                    self.line(format!("ld t0, {stack_bytes}(sp)\njalr ra, 0(t0)"));
+                }
                 if stack_bytes != 0 {
                     self.line(format!("addi sp, sp, {stack_bytes}"));
+                }
+                if indirect {
+                    self.line(format!("addi sp, sp, {STACK_ALIGNMENT}"));
                 }
             }
             ValueKind::Load(pointer) => {
@@ -1958,12 +2656,7 @@ impl Emit {
                 operation_type,
                 postfix,
             } => {
-                match &target.kind {
-                    ValueKind::Local(slot) => self.line(format!("addi a0, s0, -{}", 24 + slot * 8)),
-                    ValueKind::Global(_, address) => self.constant(*address),
-                    ValueKind::Load(pointer) => self.value(pointer),
-                    _ => unreachable!("checked update"),
-                }
+                self.object_address(target);
                 self.push();
                 let local = matches!(target.kind, ValueKind::Local(_));
                 self.load(target.ty);
@@ -1991,6 +2684,57 @@ impl Emit {
 
     fn action(&mut self, action: &Action) {
         match action {
+            Action::Assembly {
+                template,
+                outputs,
+                inputs,
+            } => {
+                let bytes = (outputs.len() + inputs.len()) * 16;
+                if bytes != 0 {
+                    self.line(format!("addi sp, sp, -{bytes}"));
+                }
+                for (index, (target, read, _)) in outputs.iter().enumerate() {
+                    self.object_address(target);
+                    self.line(format!("sd a0, {}(sp)", index * 16));
+                    if *read {
+                        self.load(target.ty);
+                        self.normalize(target.ty);
+                        self.line(format!("sd a0, {}(sp)", index * 16 + 8));
+                    }
+                }
+                for (index, (value, _)) in inputs.iter().enumerate() {
+                    self.value(value);
+                    self.line(format!("sd a0, {}(sp)", (outputs.len() + index) * 16));
+                }
+                for (index, (_, read, register)) in outputs.iter().enumerate() {
+                    if *read {
+                        self.line(format!("ld {register}, {}(sp)", index * 16 + 8));
+                    }
+                }
+                for (index, (_, register)) in inputs.iter().enumerate() {
+                    self.line(format!(
+                        "ld {register}, {}(sp)",
+                        (outputs.len() + index) * 16
+                    ));
+                }
+                self.line(template);
+                for (index, (_, _, register)) in outputs.iter().enumerate() {
+                    self.line(format!("sd {register}, {}(sp)", index * 16 + 8));
+                }
+                for (index, (target, _, _)) in outputs.iter().enumerate() {
+                    self.line(format!("ld a0, {}(sp)", index * 16 + 8));
+                    self.normalize(target.ty);
+                    self.line(format!("ld t0, {}(sp)", index * 16));
+                    if matches!(target.kind, ValueKind::Local(_)) {
+                        self.line("sd a0, 0(t0)");
+                    } else {
+                        self.store(target.ty);
+                    }
+                }
+                if bytes != 0 {
+                    self.line(format!("addi sp, sp, {bytes}"));
+                }
+            }
             Action::Block(actions) => {
                 for action in actions {
                     self.action(action);
@@ -2101,41 +2845,73 @@ impl Emit {
     }
 }
 
-fn signature(declaration: &FunctionDeclaration) -> Option<Signature> {
-    if declaration.variadic || !declaration.has_prototype || declaration.parameters.len() > 32 {
+fn signature(
+    declaration: &FunctionDeclaration,
+    function_types: &FunctionTypes,
+) -> Option<Signature> {
+    if !declaration.has_prototype
+        || declaration.parameters.len() > 32
+        || (declaration.variadic && declaration.parameters.is_empty())
+    {
         return None;
     }
     Some(Signature {
-        result: Type::parse(&declaration.return_type)?,
+        variadic: declaration.variadic,
+        result: function_types.parse(&declaration.return_type)?.ty,
         parameters: declaration
             .parameters
             .iter()
-            .map(|p| Type::parse(&p.c_type).filter(|ty| *ty != Type::Void))
+            .map(|p| {
+                function_types
+                    .parse(&p.c_type)
+                    .map(|object| object.ty)
+                    .filter(|ty| *ty != Type::Void)
+            })
             .collect::<Option<_>>()?,
     })
 }
 
 fn array_length(expression: &Expression) -> Result<usize, CCompilerError> {
-    array_constant(expression, false)
+    array_constant(expression, false, false)
 }
 
 fn array_designator(expression: &Expression) -> Result<usize, CCompilerError> {
-    array_constant(expression, true)
+    array_constant(expression, true, true)
 }
 
-fn array_constant(expression: &Expression, allow_zero: bool) -> Result<usize, CCompilerError> {
+pub(super) fn object_alignment(expression: &Expression) -> Result<usize, CCompilerError> {
+    array_constant(expression, false, true)
+}
+
+pub(super) fn attribute_index(expression: &Expression) -> Result<usize, CCompilerError> {
+    array_constant(expression, true, true).map_err(|_| error(
+        expression.filename.as_deref().unwrap_or("<source>"), expression.line,
+        "format attribute index requires a nonnegative integer constant below 65536 without undefined arithmetic",
+    ))
+}
+
+fn array_constant(
+    expression: &Expression,
+    allow_zero: bool,
+    require_constant_expression: bool,
+) -> Result<usize, CCompilerError> {
     let filename = expression.filename.as_deref().unwrap_or("<source>");
     let signatures = BTreeMap::new();
     let globals = BTreeMap::new();
+    let function_types = FunctionTypes::default();
     let mut lower = Lower {
         filename,
         signatures: &signatures,
+        function_types: &function_types,
         globals: &globals,
         typedefs: None,
         enumerators: None,
         scopes: vec![BTreeMap::new()],
         slots: 0,
         result: Type::Void,
+        no_return: false,
+        variadic_parameters: None,
+        formats: None,
         loop_depth: 0,
         break_depth: 0,
         labels: BTreeSet::new(),
@@ -2144,7 +2920,7 @@ fn array_constant(expression: &Expression, allow_zero: bool) -> Result<usize, CC
     let value = lower.value(expression)?;
     value
         .constant_integer()
-        .filter(|_| !allow_zero || value.integer_constant_expression())
+        .filter(|_| !require_constant_expression || value.integer_constant_expression())
         .filter(|number| {
             (allow_zero || *number > 0) && (value.ty.unsigned() || (*number as i64) >= 0)
         })
@@ -2167,15 +2943,20 @@ fn enumerator(expression: &Expression) -> Result<i64, CCompilerError> {
     let filename = expression.filename.as_deref().unwrap_or("<source>");
     let signatures = BTreeMap::new();
     let globals = BTreeMap::new();
+    let function_types = FunctionTypes::default();
     let mut lower = Lower {
         filename,
         signatures: &signatures,
+        function_types: &function_types,
         globals: &globals,
         typedefs: None,
         enumerators: None,
         scopes: vec![BTreeMap::new()],
         slots: 0,
         result: Type::Void,
+        no_return: false,
+        variadic_parameters: None,
+        formats: None,
         loop_depth: 0,
         break_depth: 0,
         labels: BTreeSet::new(),
@@ -2209,14 +2990,17 @@ fn enumerator(expression: &Expression) -> Result<i64, CCompilerError> {
 fn global(
     declaration: &Declaration,
     globals: &BTreeMap<String, Global>,
+    signatures: &BTreeMap<String, Signature>,
+    function_types: &FunctionTypes,
     filename: &str,
 ) -> Result<Global, CCompilerError> {
     let line = declaration
         .initializer
         .as_ref()
         .map_or(1, |value| value.line);
-    let ty = Type::parse(&declaration.c_type)
-        .filter(|ty| ty.scalar())
+    let object_type = function_types
+        .parse(&declaration.c_type)
+        .filter(|object| object.ty.scalar())
         .ok_or_else(|| {
             error(
                 filename,
@@ -2224,6 +3008,7 @@ fn global(
                 "RV64 globals require supported scalar types",
             )
         })?;
+    let ty = object_type.ty;
     if declaration.array_dimensions.len() > 1 {
         return Err(error(
             filename,
@@ -2250,26 +3035,31 @@ fn global(
             )
         })?;
     let mut object = Global {
-        ty,
+        object: object_type,
         array_length: declaration.array_length,
         address: 0,
         bytes: bytes.div_ceil(8) * 8,
+        alignment: 8,
+        nonstring: false,
         initializer: None,
         pointer_initializer: None,
     };
     if let Some(initializer) = &declaration.initializer {
         let mut visible = globals.clone();
         visible.insert(declaration.name.clone(), object.clone());
-        let signatures = BTreeMap::new();
         let mut lower = Lower {
             filename,
-            signatures: &signatures,
+            signatures,
+            function_types,
             globals: &visible,
             typedefs: None,
             enumerators: None,
             scopes: vec![BTreeMap::new()],
             slots: 0,
             result: Type::Void,
+            no_return: false,
+            variadic_parameters: None,
+            formats: None,
             loop_depth: 0,
             break_depth: 0,
             labels: BTreeSet::new(),
@@ -2283,7 +3073,7 @@ fn global(
             let value = lower.value(initializer)?;
             vec![(0, lower.convert(value, ty, line)?)]
         };
-        if ty.pointee().is_some() {
+        if ty.pointer_value() {
             object.pointer_initializer = Some((line, values));
             return Ok(object);
         }
@@ -2300,17 +3090,143 @@ fn global(
     Ok(object)
 }
 
+pub(super) fn preprocessor_condition(expression: &Expression) -> Result<bool, CCompilerError> {
+    fn value(expression: &Expression, filename: &str) -> Result<Value, CCompilerError> {
+        let line = expression.line;
+        let invalid = || error(filename, line, "unsupported RV64 preprocessor expression");
+        Ok(match &expression.kind {
+            ExpressionKind::Atom(token) => {
+                let end = token.trim_end_matches(['u', 'U', 'l', 'L']).len();
+                let suffix = &token[end..];
+                integer_literal(token).ok_or_else(invalid)?;
+                let literal = format!(
+                    "{}{}",
+                    &token[..end],
+                    if suffix.contains(['u', 'U']) {
+                        "UL"
+                    } else {
+                        "L"
+                    }
+                );
+                let (number, ty) = integer_literal(&literal).ok_or_else(invalid)?;
+                Value {
+                    ty,
+                    kind: ValueKind::Constant(number),
+                }
+            }
+            ExpressionKind::Unary { operator, operand }
+                if matches!(operator.as_str(), "+" | "-" | "~" | "!") =>
+            {
+                let inner = value(operand, filename)?;
+                Value {
+                    ty: if operator == "!" {
+                        Type::Long
+                    } else {
+                        inner.ty
+                    },
+                    kind: ValueKind::Unary(operator.clone(), Box::new(inner)),
+                }
+            }
+            ExpressionKind::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                if !matches!(
+                    operator.as_str(),
+                    "+" | "-"
+                        | "*"
+                        | "/"
+                        | "%"
+                        | "&"
+                        | "|"
+                        | "^"
+                        | "<<"
+                        | ">>"
+                        | "=="
+                        | "!="
+                        | "<"
+                        | "<="
+                        | ">"
+                        | ">="
+                        | "&&"
+                        | "||"
+                ) {
+                    return Err(invalid());
+                }
+                let left = value(left, filename)?;
+                let right = value(right, filename)?;
+                if matches!(operator.as_str(), "&&" | "||") {
+                    Value {
+                        ty: Type::Long,
+                        kind: ValueKind::Logical(operator.clone(), Box::new(left), Box::new(right)),
+                    }
+                } else {
+                    let shift = matches!(operator.as_str(), "<<" | ">>");
+                    let ty = if shift {
+                        left.ty
+                    } else {
+                        Type::common(left.ty, right.ty)
+                    };
+                    let convert = |inner: Value, ty| Value {
+                        ty,
+                        kind: ValueKind::Convert(Box::new(inner)),
+                    };
+                    let right_ty = if shift { right.ty } else { ty };
+                    let comparison =
+                        matches!(operator.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=");
+                    Value::binary(
+                        if comparison { Type::Long } else { ty },
+                        operator,
+                        convert(left, ty),
+                        convert(right, right_ty),
+                    )
+                }
+            }
+            ExpressionKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let condition = value(condition, filename)?;
+                let when_true = value(when_true, filename)?;
+                let when_false = value(when_false, filename)?;
+                Value {
+                    ty: Type::common(when_true.ty, when_false.ty),
+                    kind: ValueKind::Conditional(
+                        Box::new(condition),
+                        Box::new(when_true),
+                        Box::new(when_false),
+                    ),
+                }
+            }
+            _ => return Err(invalid()),
+        })
+    }
+    let filename = expression.filename.as_deref().unwrap_or("<source>");
+    value(expression, filename)?
+        .constant_integer()
+        .map(|number| number != 0)
+        .ok_or_else(|| {
+            error(
+                filename,
+                expression.line,
+                "invalid RV64 preprocessor arithmetic",
+            )
+        })
+}
+
 pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CCompilerError> {
-    let tokens = lex_unexpanded(source, filename)?;
+    let tokens = lex_for_target(source, filename, PreprocessorTarget::Kiuas16)?;
     for token in &tokens {
         if matches!(
             token.value.as_str(),
             "struct" | "union" | "register" | "auto" | "restrict" | "#"
         ) {
             return Err(error(
-                filename,
+                token.filename.as_deref().unwrap_or(filename),
                 token.line,
-                "preprocessing, automatic storage classes and records are not supported by initial RV64 subset",
+                "automatic storage classes, records and stray preprocessing tokens are not supported by initial RV64 subset",
             ));
         }
     }
@@ -2330,8 +3246,14 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
             }
             bytes.resize(length.div_ceil(8) * 8, 0);
             globals.entry(token.value.clone()).or_insert(Global {
-                ty: Type::Char,
+                object: ObjectType {
+                    ty: Type::Char,
+                    read_only: false,
+                    volatile: false,
+                },
                 array_length: Some(length),
+                alignment: 8,
+                nonstring: false,
                 address: 0,
                 bytes: bytes.len(),
                 initializer: Some(bytes),
@@ -2346,24 +3268,24 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
     parser.statements.expressions.resolved_enumerators = Some(HashMap::new());
     parser.file_scope_storage = Some(Vec::new());
     let unit = parser.parse()?;
-    if unit
-        .enumerators
-        .keys()
-        .any(|name| atomic_operation(name).is_some())
+    let function_types = FunctionTypes::default();
+    if unit.enumerators.keys().any(|name| reserved_builtin(name))
         || parser
             .statements
             .expressions
             .typedefs
             .keys()
-            .any(|name| atomic_operation(name).is_some())
+            .any(|name| reserved_builtin(name))
     {
-        return Err(error(filename, 1, "atomic builtin name is reserved"));
+        return Err(error(filename, 1, "compiler builtin name is reserved"));
     }
     let storage = parser
         .file_scope_storage
         .as_ref()
         .expect("RV64 storage metadata");
     let mut internal_linkage = BTreeMap::new();
+    let mut no_return_functions = BTreeSet::new();
+    let mut formats = BTreeMap::new();
     let mut object_definitions = BTreeSet::new();
     for (declaration, storage) in unit.declarations.iter().zip(storage) {
         let (name, function) = match declaration {
@@ -2374,11 +3296,21 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
             }
         };
         let previous = internal_linkage.get(name).copied();
-        if atomic_operation(name).is_some() {
+        if storage.attributes.no_return {
+            if name == "main" {
+                return Err(error(
+                    filename,
+                    storage.line,
+                    "RV64 ROM main cannot be declared noreturn",
+                ));
+            }
+            no_return_functions.insert(name.to_owned());
+        }
+        if reserved_builtin(name) {
             return Err(error(
                 filename,
                 storage.line,
-                "atomic builtin name is reserved",
+                "compiler builtin name is reserved",
             ));
         }
         let internal = match storage.class.as_deref() {
@@ -2394,6 +3326,13 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
                 ));
             }
         };
+        if storage.attributes.inline && (!function || !internal) {
+            return Err(error(
+                storage.filename.as_deref().unwrap_or(filename),
+                storage.line,
+                "RV64 inline requires internal linkage; external inline semantics are not supported",
+            ));
+        }
         if previous.is_some_and(|previous| previous != internal) {
             return Err(error(
                 filename,
@@ -2421,7 +3360,7 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
                 "typedef name conflicts with an enumerator",
             ));
         }
-        if Type::parse(target).is_none() {
+        if function_types.parse(target).is_none() {
             return Err(error(
                 filename,
                 1,
@@ -2446,7 +3385,7 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
             ));
         }
     }
-    for declaration in &unit.declarations {
+    for (declaration, storage) in unit.declarations.iter().zip(storage) {
         let (function, line, definition) = match declaration {
             ExternalDeclaration::FunctionDefinition(f) => (&f.declaration, f.body.line, true),
             ExternalDeclaration::FunctionPrototype(f) => (f, 1, false),
@@ -2469,11 +3408,38 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
                 if declaration.name == "_start" || declaration.name.starts_with(".Lrv64_") {
                     return Err(error(filename, 1, "reserved RV64 startup symbol"));
                 }
-                let object = global(declaration, &globals, filename)?;
+                let mut object = global(
+                    declaration,
+                    &globals,
+                    &signatures,
+                    &function_types,
+                    filename,
+                )?;
+                object.alignment = object.alignment.max(storage.attributes.alignment);
+                object.nonstring = storage.attributes.nonstring;
+                if object.nonstring
+                    && !(object.array_length.is_some()
+                        && matches!(object.object.ty, Type::Char | Type::SignedChar | Type::Byte)
+                        || object.array_length.is_none()
+                            && matches!(
+                                object.object.ty.pointee(),
+                                Some(Type::Char | Type::SignedChar | Type::Byte)
+                            ))
+                {
+                    return Err(error(
+                        storage.filename.as_deref().unwrap_or(filename),
+                        storage.line,
+                        "nonstring requires a file-scope character array or pointer object",
+                    ));
+                }
                 if let Some(previous) = globals.get_mut(&declaration.name) {
-                    if previous.ty != object.ty || previous.array_length != object.array_length {
+                    if previous.object != object.object
+                        || previous.array_length != object.array_length
+                    {
                         return Err(error(filename, 1, "conflicting global declarations"));
                     }
+                    previous.alignment = previous.alignment.max(object.alignment);
+                    previous.nonstring |= object.nonstring;
                     if object.initialized() {
                         if previous.initialized() {
                             return Err(error(
@@ -2513,8 +3479,36 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
                 "function name conflicts with a typedef",
             ));
         }
-        let signature = signature(function)
-            .ok_or_else(|| error(filename, line, "unsupported RV64 function signature; use prototypes and at most 32 scalar parameters"))?;
+        let signature = signature(function, &function_types)
+            .ok_or_else(|| error(filename, line, "unsupported RV64 function signature; use prototypes, at least one named variadic parameter, and at most 32 scalar parameters"))?;
+        if let Some(attribute) = storage.attributes.format {
+            let index = attribute.format_index;
+            if index == 0
+                || !signature
+                    .parameters
+                    .get(index - 1)
+                    .is_some_and(|ty| ty.pointee() == Some(Type::Char))
+                || (attribute.first_argument != 0
+                    && (!signature.variadic
+                        || attribute.first_argument != signature.parameters.len() + 1))
+            {
+                return Err(error(
+                    storage.filename.as_deref().unwrap_or(filename),
+                    storage.line,
+                    "printf format requires a char-pointer parameter index and first variadic argument index (or zero)",
+                ));
+            }
+            if formats
+                .insert(function.name.clone(), attribute)
+                .is_some_and(|previous| previous != attribute)
+            {
+                return Err(error(
+                    storage.filename.as_deref().unwrap_or(filename),
+                    storage.line,
+                    "conflicting printf format attributes",
+                ));
+            }
+        }
         if let Some(previous) = signatures.insert(function.name.clone(), signature.clone()) {
             if previous != signature {
                 return Err(error(filename, line, "conflicting function declarations"));
@@ -2542,34 +3536,42 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         ));
     }
     let mut image = Vec::new();
+    let mut function_addresses = BTreeMap::new();
     let mut storage_bytes = 0;
     for initialized in [true, false] {
         for object in globals
             .values_mut()
             .filter(|object| object.initialized() == initialized)
         {
-            if object.bytes > GLOBAL_BYTES - storage_bytes {
+            let aligned = (GLOBAL_BASE as usize + storage_bytes).next_multiple_of(object.alignment)
+                - GLOBAL_BASE as usize;
+            if aligned > GLOBAL_BYTES || object.bytes > GLOBAL_BYTES - aligned {
                 return Err(error(
                     filename,
                     1,
                     "global storage exceeds the 65536-byte RAM budget",
                 ));
             }
-            object.address = GLOBAL_BASE + storage_bytes as u64;
-            storage_bytes += object.bytes;
+            object.address = GLOBAL_BASE + aligned as u64;
+            storage_bytes = aligned + object.bytes;
         }
     }
     for object in globals.values().filter(|object| object.initialized()) {
+        image.resize((object.address - GLOBAL_BASE) as usize, 0);
         if let Some(bytes) = &object.initializer {
             image.extend_from_slice(bytes);
         } else if let Some((line, values)) = &object.pointer_initializer {
             let start = image.len();
             image.resize(start + object.bytes, 0);
             for (index, value) in values {
+                let offset = start + index * 8;
+                if let Some(name) = value.static_function() {
+                    function_addresses.insert(offset, name.to_owned());
+                    continue;
+                }
                 let address = value.static_pointer(&globals).ok_or_else(|| {
                     error(filename, *line, "pointer initializer requires a static object address or an explicit integer constant cast")
                 })?;
-                let offset = start + index * 8;
                 image[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
             }
         }
@@ -2583,6 +3585,7 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
     }
     if signatures.get("main")
         != Some(&Signature {
+            variadic: false,
             result: Type::Int,
             parameters: Vec::new(),
         })
@@ -2639,18 +3642,22 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         let mut lower = Lower {
             filename,
             signatures: &visible,
+            function_types: &function_types,
             globals: &visible_globals,
             typedefs: Some(&parser.statements.expressions.typedefs),
             enumerators: Some(&unit.enumerators),
             scopes: vec![BTreeMap::new()],
             slots: 0,
             result: sig.result,
+            no_return: no_return_functions.contains(&function.declaration.name),
+            variadic_parameters: sig.variadic.then_some(sig.parameters.len()),
+            formats: Some(&formats),
             loop_depth: 0,
             break_depth: 0,
             labels: BTreeSet::new(),
             jumps: Vec::new(),
         };
-        for (parameter, ty) in function.declaration.parameters.iter().zip(&sig.parameters) {
+        for parameter in &function.declaration.parameters {
             let name = parameter.name.as_ref().ok_or_else(|| {
                 error(
                     filename,
@@ -2658,7 +3665,10 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
                     "function definition requires named parameters",
                 )
             })?;
-            lower.local(name, *ty, None, function.body.line)?;
+            let object = function_types
+                .parse(&parameter.c_type)
+                .expect("validated parameter type");
+            lower.local(name, object, None, function.body.line)?;
         }
         let StatementKind::Compound(statements) = &function.body.kind else {
             unreachable!("parser function body")
@@ -2677,8 +3687,17 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         }
         emit.return_label = emit.label();
         emit.line(format!(
-            "{}:\naddi sp, sp, -{frame}\nsd ra, {}(sp)\nsd s0, {}(sp)\naddi s0, sp, {frame}",
-            emit.function_symbol(&function.declaration.name),
+            "{}:",
+            emit.function_symbol(&function.declaration.name)
+        ));
+        if sig.variadic {
+            emit.line("addi sp, sp, -64");
+            for index in 0..8 {
+                emit.line(format!("sd a{index}, {}(sp)", index * 8));
+            }
+        }
+        emit.line(format!(
+            "addi sp, sp, -{frame}\nsd ra, {}(sp)\nsd s0, {}(sp)\naddi s0, sp, {frame}",
             frame - 8,
             frame - 16,
         ));
@@ -2686,12 +3705,20 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
             if index < 8 {
                 emit.line(format!("mv a0, a{index}"));
             } else {
-                emit.line(format!("ld a0, {}(s0)", (index - 8) * 8));
+                emit.line(format!(
+                    "ld a0, {}(s0)",
+                    (index - 8) * 8 + if sig.variadic { 64 } else { 0 }
+                ));
             }
             emit.normalize(*ty);
             emit.line(format!("sd a0, -{}(s0)", 24 + index * 8));
         }
         emit.action(&body);
+        if lower.no_return {
+            let violation = emit.label();
+            emit.line(format!("{violation}:\nebreak\nj {violation}"));
+            continue;
+        }
         if function.declaration.name == "main" {
             emit.line("li a0, 0");
         } else if sig.result != Type::Void {
@@ -2701,19 +3728,35 @@ pub fn compile_to_assembly(source: &str, filename: &str) -> Result<String, CComp
         if sig.result == Type::UInt {
             emit.line("addiw a0, a0, 0");
         }
-        emit.line("ld ra, -8(s0)\nld t0, -16(s0)\nmv sp, s0\nmv s0, t0\nret");
+        emit.line("ld ra, -8(s0)\nld t0, -16(s0)\nmv sp, s0");
+        if sig.variadic {
+            emit.line("addi sp, sp, 64");
+        }
+        emit.line("mv s0, t0\nret");
     }
     if !image.is_empty() {
         emit.line(".balign 8\n.Lrv64_data:");
-        for bytes in image.chunks(16) {
-            emit.line(format!(
-                ".byte {}",
-                bytes
-                    .iter()
-                    .map(u8::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+        let mut offset = 0;
+        while offset < image.len() {
+            if let Some(name) = function_addresses.get(&offset) {
+                emit.line(format!(".dword {}", emit.function_symbol(name)));
+                offset += 8;
+            } else {
+                let end = function_addresses
+                    .range(offset..)
+                    .next()
+                    .map_or(image.len(), |(next, _)| *next)
+                    .min(offset + 16);
+                emit.line(format!(
+                    ".byte {}",
+                    image[offset..end]
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                offset = end;
+            }
         }
     }
     Ok(emit.assembly)

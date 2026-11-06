@@ -34,6 +34,21 @@ fn independent_instruction_bytes() {
         ("mul a0, a1, a2", 0x02c58533),
         ("ret", 0x00008067),
         ("fence", 0x0ff0000f),
+        ("csrrw a0, mscratch, a1", 0x34059573),
+        ("csrrs a0, 0x340, a1", 0x3405a573),
+        ("csrrc a0, mscratch, a1", 0x3405b573),
+        ("csrrwi a0, mscratch, 31", 0x340fd573),
+        ("csrrsi a0, mscratch, 0", 0x34006573),
+        ("csrrci a0, mscratch, 1", 0x3400f573),
+        ("csrr a0, mhartid", 0xf1402573),
+        ("csrw mscratch, a1", 0x34059073),
+        ("csrs mscratch, a1", 0x3405a073),
+        ("csrc mscratch, a1", 0x3405b073),
+        ("csrwi mscratch, 31", 0x340fd073),
+        ("csrsi mscratch, 0", 0x34006073),
+        ("csrci mscratch, 1", 0x3400f073),
+        ("csrr a0, 0", 0x00002573),
+        ("csrr a0, 4095", 0xfff02573),
         ("lr.w a0, (t0)", 0x1002a52f),
         ("lr.d.aq a0, (t0)", 0x1402b52f),
         ("amoswap.w a0, a1, (t0)", 0x08b2a52f),
@@ -54,6 +69,134 @@ fn independent_instruction_bytes() {
         assert_eq!(&rom[..4], &expected.to_le_bytes(), "{source}");
         assert_eq!(rom.len(), BOOT_ROM_BYTES);
         assert!(rom[4..].iter().all(|byte| *byte == 0));
+    }
+}
+
+#[test]
+fn assembled_csr_register_and_immediate_operations_execute() {
+    let rom = assemble_boot_rom(
+        "li t0, -1
+         csrrw a0, mscratch, t0
+         csrrs a1, mscratch, zero
+         li t0, 0x15
+         csrrc a2, mscratch, t0
+         csrrs a3, mscratch, t0
+         csrrwi a4, mscratch, 16
+         csrrsi a5, mscratch, 3
+         csrrci a6, mscratch, 1
+         csrr a7, mscratch
+         csrwi sscratch, 31
+         csrci sscratch, 15
+         csrsi sscratch, 1
+         csrr s1, sscratch
+         csrw sscratch, t0
+         csrc sscratch, t0
+         csrs sscratch, t0
+         csrr s2, sscratch
+         csrr s3, mhartid
+         csrrsi s4, mhartid, 0
+         csrrc s5, mhartid, zero
+         wfi",
+    )
+    .unwrap();
+    let mut machine = Kiuas16Machine::new_with_ram_size(rom, 4096).unwrap();
+    let report = run_headless(&mut machine, 100, &[], &mut Vec::new()).unwrap();
+    assert_eq!(report.traps, 0, "{:?}", report.last_trap);
+    assert!(report.waiting > 0);
+    for (register, value) in [
+        (10, 0),
+        (11, u64::MAX),
+        (12, u64::MAX),
+        (13, !0x15u64),
+        (14, u64::MAX),
+        (15, 16),
+        (16, 19),
+        (17, 18),
+        (9, 17),
+        (18, 21),
+        (19, 0),
+        (20, 0),
+        (21, 0),
+    ] {
+        assert_eq!(
+            machine.core().register(register),
+            Some(value),
+            "x{register}"
+        );
+    }
+}
+
+#[test]
+fn assembler_csr_names_match_machine_register_addresses() {
+    for (name, address) in [
+        ("sstatus", 0x100u32),
+        ("sie", 0x104),
+        ("stvec", 0x105),
+        ("scounteren", 0x106),
+        ("sscratch", 0x140),
+        ("sepc", 0x141),
+        ("scause", 0x142),
+        ("stval", 0x143),
+        ("sip", 0x144),
+        ("stimecmp", 0x14d),
+        ("satp", 0x180),
+        ("mstatus", 0x300),
+        ("misa", 0x301),
+        ("medeleg", 0x302),
+        ("mideleg", 0x303),
+        ("mie", 0x304),
+        ("mtvec", 0x305),
+        ("mcounteren", 0x306),
+        ("menvcfg", 0x30a),
+        ("mscratch", 0x340),
+        ("mepc", 0x341),
+        ("mcause", 0x342),
+        ("mtval", 0x343),
+        ("mip", 0x344),
+        ("pmpcfg0", 0x3a0),
+        ("pmpaddr0", 0x3b0),
+        ("mcycle", 0xb00),
+        ("minstret", 0xb02),
+        ("cycle", 0xc00),
+        ("time", 0xc01),
+        ("instret", 0xc02),
+        ("mhartid", 0xf14),
+    ] {
+        let rom = assemble_boot_rom(&format!("csrr a0, {name}")).unwrap();
+        let expected = address << 20 | 0x2573;
+        assert_eq!(&rom[..4], &expected.to_le_bytes(), "{name}");
+    }
+}
+
+#[test]
+fn invalid_csr_operands_preserve_existing_rom() {
+    for source in [
+        "csrr a0, unknown",
+        "csrr a0, -1",
+        "csrr a0, 4096",
+        "csrrw a0, mscratch",
+        "csrr a0, mscratch, zero",
+        "csrrwi a0, mscratch, 32",
+        "csrwi mscratch, -1",
+        "csrsi mscratch, a0",
+        "csrrci a0, mscratch, 0x20",
+        "csrrw a0, mscratch, 1",
+        "csrw mscratch, x32",
+        "csrci mscratch",
+        "csrs mscratch, zero, a0",
+    ] {
+        let diagnostic = assemble_boot_rom(source).unwrap_err().to_string();
+        assert!(diagnostic.starts_with("line 1:"), "{diagnostic}");
+        let files = Files::new();
+        std::fs::write(files.0.join("guest.S"), source).unwrap();
+        std::fs::write(files.0.join("rom.bin"), b"previous ROM").unwrap();
+        let result = files.assemble();
+        assert!(!result.status.success(), "{source}");
+        assert!(!result.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(files.0.join("rom.bin")).unwrap(),
+            b"previous ROM"
+        );
     }
 }
 

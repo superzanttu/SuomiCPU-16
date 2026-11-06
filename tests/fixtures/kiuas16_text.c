@@ -1,8 +1,8 @@
-static char banner[] = "Kiuas16: ";
+static const char banner[] = "Kiuas16: ";
 static const char *cursor = "ROM ";
-static signed char high[] = "\200\377";
+static const signed char high[] = "\200\377";
 static const char *fragments[] = { [2] = "rea" "dy\n", [0] = banner, "ROM ", [3] = 0 };
-extern char banner[10];
+extern const char banner[10];
 extern const char *cursor;
 
 static int puts_uart(const char *text)

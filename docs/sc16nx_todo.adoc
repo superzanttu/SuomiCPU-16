@@ -488,7 +488,9 @@ execution fixtures. Initial typed RV64 C lowering now executes signed
 integer/byte calls against independently handwritten RV64 callers and callees,
 including eight register arguments, stack alignment, and saved registers
 (+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+).
-Aggregate layout, floating/LP64D, varargs, and ELF execution fixtures still
+Scalar variadic save-area/stack cursor and default integer promotions now
+execute against independent assembly call partners, as recorded below.
+Aggregate layout, floating/LP64D including floating/aggregate varargs, and ELF execution fixtures still
 need the corresponding compiler/linker capabilities. Keep this child unchecked.
 
 ** [ ] [[nx-device-contract]] *P0 / Establish one device contract source of truth.*
@@ -1256,13 +1258,329 @@ preprocessing/+stdbool.h+, records, function pointers, ELF/separate-unit
 linking, complete firmware/xv6 execution, and all incomplete P0 gates remain
 open. This is a tested C99 scalar extension, not full C99 conformance.
 +
-*Validation checkpoint:* Working tree based on +ea83f43+; one hart, M-mode
+*Qualified-object slice:* Declaring the text guest's banner/high-byte arrays
+const reproduced rejection of inferred character-array bounds. The shared
+array-bound inference now recognizes qualified character elements, and the
+Rust RV64 backend retains separate object qualifiers without qualifying
+ordinary scalar expression values. Const/volatile integer scalars and
+one-dimensional arrays, including boolean objects, support static/extern
+declarations, automatic initialization, typedefs, addresses and array decay.
+Const initialization uses existing guest-owned RAM data/BSS startup;
+subsequent mutations diagnose, including unreachable/unevaluated updates.
+Volatile reads/writes use declared widths, and qualified address expressions
+reuse existing conversion and atomic checks. Top-level parameter/result
+qualifiers do not change signature compatibility or ABI representation;
+parameter objects still retain qualifiers inside their definition.
+Regressions execute all ten integer types, sparse local/global arrays,
+inferred const strings, exact data/BSS/stack bytes and padding, untouched
+neighboring RAM, aliases, recursive/ninth-argument calls, scalar casts/sizeof,
+and atomic loads from const objects plus writes to volatile objects.
+An independent assembly caller checks signed-byte/halfword register values,
+the unsigned ninth argument/result, stack alignment/cleanup, unchanged
+incoming stack arguments, and saved registers.
+UART reads initialize qualified objects once; skipped expressions and
+sizeof consume no input, output is +41 43 45 45+, and the third input byte
+remains pending. Invalid const mutations, qualifier-dropping addresses,
+conflicting qualified redeclarations, and unsupported pointer-object qualifiers
+diagnose; CLI rejection preserves an existing ROM.
+The production text guest retains UART +Kiuas16: ROM ready\n+ then +80 ff 0a+,
+result 19, exact reported buffers/table, no traps, and restored registers
+within 10000 steps. Established bitmap and storage guests also still pass.
+This supersedes earlier qualified-scalar limitations, not the remaining
+pointer-object qualification, records, function pointers, preprocessing,
+ELF/separate-unit linking, complete firmware/xv6, or P0 completion gates.
++
+*Target preprocessing/header slice:* A header-based MMIO/table consumer
+reproduced the RV64 frontend's blanket preprocessing rejection. It now reuses
+the Rust preprocessor with isolated Kiuas16 header lookup, target identity/
+layout macros, and signed/unsigned 64-bit intmax conditional evaluation.
+The separate +toolchain/kiuas16/include+ directory supplies bounded
++stdint.h+, +limits.h+, +stddef.h+, and +stdbool.h+ interfaces; there is no
+implicit legacy/host header fallback or external preprocessing command.
+Shared fixes preserve independent macro state for repeated header/logical
+locations, prescan nested same-name function macro arguments before disabling
+the outer invocation, and concatenate strings after expansion/stringification.
+Macro expansion/include resource limits still diagnose exhaustion.
++tests/fixtures/kiuas16_headers.c+ uses fixed-width/size/pointer types,
+NULL/boolean macros, pasted names, sparse const arrays, typed MMIO macros,
+and pointer-taking helpers. Direct and production compiler/runner execution
+emit UART +48 11 2a 08 0a+, return 59, and leave the exact 24-byte report:
+words 17 and 42 at offsets zero/twelve, intervening zero words, and
+doubleword byte count eight at offset sixteen. Poisoned global RAM proves
+guest startup ownership; no traps occur and stack/frame registers restore
+within 10000 steps.
+Regressions execute every exact/least/fast/pointer/max integer typedef/limit,
+constant-macro promotions/wrapping, target layouts, unsigned plain char,
+boolean/NULL conversions, and intmax conditional edge cases.
+Macro rescanning, nested arguments with counted side effects, stringification,
+token pasting, multiline calls/splicing, active definition changes, nested/
+repeated includes, guards, inactive branches, and mapped FILE/LINE diagnostics
+are covered. Invalid macros/directives/arithmetic, missing/legacy-only
+headers, variadic macros, and active pragmas diagnose without replacing a ROM.
+Existing guest and legacy compiler acceptance remains required.
+This supersedes earlier preprocessing/header limitations, not full C99,
+complete standard headers, preprocessing of assembler input, records,
+function pointers, ELF/separate-unit linking, firmware/xv6, or P0 completion.
++
+*Callback dispatch slice:* A sparse function-pointer table guest reproduced
+unsupported RV64 callback typedefs. The backend now interns exact normalized
+fixed-prototype signatures and carries distinct function-pointer types rather
+than treating code addresses as object pointers. Function designators,
+address/dereference, typedef-based automatic objects/tables, globals,
+parameters/results, callback-object addresses, compatible equality/conditional
+selection, nulls, and boolean conditions execute through typed lowering.
+Symbolic initialized addresses reuse Rust assembler +.dword label+ emission
+and guest data-copy startup; sparse nulls/BSS use the existing storage paths.
+Indirect targets are evaluated once before arguments and saved separately
+from aligned argument temporaries/outgoing stack space. Register/stack argument
+normalization, result conversion, and cleanup share direct-call behavior.
+The shared parser permits general RV64 call targets while leaving legacy
+parsing restrictions unchanged.
++tests/fixtures/kiuas16_dispatch.c+ dispatches add/subtract/multiply through
+a private sparse callback table, tests a null sentinel, then replaces an entry.
+Direct and production compiler/runner execution emit UART +44 45 03 0a+,
+return 69, and report exact total/count/table bytes. Initialized code addresses
+lie in aligned protected ROM; replaced entries match, the sentinel is zero,
+poisoned data/BSS RAM is initialized by guest code, no traps occur, and stack/
+frame registers restore within 10000 steps.
+Regressions execute zero/one/eight/nine/ten/eleven/twelve/31/32-argument
+indirect calls, nested target/argument evaluation with exact side-effect counts,
+target mutation during argument evaluation, recursion, callback returns and
+object-pointer views, void/pointer results, and all ten integer result widths.
+Independent assembly calls a compiled callback-taking wrapper; its callback
+checks signed-byte/unsigned-halfword registers, the sign-extended ninth
+unsigned-int argument, aligned stack, XLEN return value, and saved registers.
+Incompatible signatures, old-style/variadic callbacks, function-pointer
+arithmetic/casts, const/qualifier restrictions, invalid initializers, undefined
+targets, and writes to function designators diagnose; CLI rejection preserves
+an existing ROM.
+This is bounded fixed-prototype dispatch, not nested callback signatures,
+direct local callback declarator syntax, qualified callback objects, varargs,
+records, ELF/separate-unit linking, full LP64D, firmware/xv6, or P0 completion.
++
+*GNU inline-assembly/CSR slice:* A scratch-register helper guest reproduced
+rejection at +asm volatile+. The shared parser now provides a dedicated
+RV64-only assembly statement, not an ordinary builtin call or a legacy
+backend escape. Basic strings remain verbatim; extended strings support
+numeric/named operand substitutions and escaped percent signs. Up to six
+explicit scalar operands accept output constraints +"=r"+, +"+r"+, +"=&r"+,
+and +"+&r"+, input +"r"+ or integer-constant +"i"+, and +"memory"+ clobbers.
+Operand registers are distinct caller-saved temporaries. Output addresses
+and input values are evaluated once and staged on aligned storage before
+loading registers; read/write outputs preserve their initial value.
+All output registers are staged before typed, width-correct writeback and
+temporary cleanup. Statements retain source order; a compiler memory
+clobber does not silently insert a hardware fence.
+The Rust assembler adds all six CSR register/immediate forms and seven
+read/write/set/clear pseudos, with implemented architectural CSR names or
+unsigned 12-bit numbers and checked five-bit immediate sources. Independent
+expected instruction words and guest execution verify encoding, full-XLEN
+scratch read/write/exchange/set/clear, and zero-source access to read-only CSRs.
+CPU privilege/implemented-register checks remain execution semantics.
++tests/fixtures/kiuas16_csr.c+ executes through both library and production
+compiler/runner paths: UART +43 19 0a+, result 25, exact doublewords
++fedcba9876543210+, +fedcba9876543210+, and 25 at report offsets zero/eight/
+sixteen, no traps, and restored stack/frame registers within 10000 steps.
+Behavioral regressions cover all ten integer output widths, boolean
+normalization, poisoned neighboring RAM, object/callback pointers, named and
+immediate operands, six simultaneous read/write outputs, nested/recursive
+operand calls, ninth stack arguments, and exact address/input side effects.
+Independent assembly verifies call alignment/arguments and all twelve saved
+registers. Volatile UART operations preserve exact read/write order.
+Invalid constraints/clobbers, const/nonobject outputs, nonconstant immediate
+values, malformed templates, excessive operands, and invalid CSR operands
+diagnose without replacing an existing ROM; legacy GNU-asm rejection remains.
+Matching/alternative/memory constraints, explicit register variables/clobbers,
+template modifiers, +asm goto+, unique/numeric local labels, file-scope
+assembly, preprocessed assembler input, remaining ISA/relocation work,
+records, varargs, ELF/separate-unit linking, full LP64D, firmware/xv6, and
+P0 completion remain open. This is a bounded GNU extension, not C90 support.
++
+*Aligned global-object slice:* A descriptor/page-table-sized buffer consumer
+reproduced rejection of GNU +__attribute__((aligned(n)))+. RV64 file-scope
+declaration metadata now retains checked alignment requests without changing
+legacy parsing, object types, element strides, or function signatures.
+The +__attribute+ and +__aligned__+ alternative spellings, specifier-side
+attributes across comma-separated declarations, declarator-side attributes,
+repeated attributes, macros, typedef-named scalar types, sizeof, and enum
+constants are covered. Arguments require evaluable LP64 integer constant
+expressions and power-of-two values from one to 65536.
+Compatible redeclarations merge the strongest request; lower requests do not
+reduce existing eight-byte minimum alignment. Initialized objects still
+precede BSS with name ordering within each group. Alignment gaps count
+against RAM capacity and are included in copied ROM data or cleared BSS.
+Static object pointers and symbolic callback payloads use the final layout.
++tests/fixtures/kiuas16_aligned.c+ executes through library and production
+compiler/runner paths: UART +41 07 0a+, result 42, descriptor address
++0x80010040+, page-table-sized buffer address +0x80011000+, exact static
+pointer bytes and 32-byte report, zero traps, and restored stack/frame
+registers within 100000 steps. Poisoned RAM verifies every data/BSS/gap byte
+and untouched following bytes, including writes at both ends of the table.
+Further guests cover all supported alignment powers, complete 65536-byte BSS
+allocation, initialized-data gaps through 32768-byte alignment, sparse arrays,
+pointer offsets, and symbolic callback tables that execute their functions.
+Invalid attributes/placements/arguments, linkage/type conflicts, undefined
+objects, RAM overflow including alignment gaps, and ROM payload overflow
+diagnose without replacing existing output; mapped header locations remain.
+Local/parameter/type/function/record alignment, remaining GNU attributes,
+ELF section alignment, aggregates, varargs, separate units, full LP64D,
+firmware/xv6, and the parent P0 milestones remain open. This is global RAM
+storage alignment, not Sv39 page-table acceptance or full GNU compatibility.
++
+*Noreturn panic-helper slice:* A recursive panic guest reproduced rejection
+of a function's trailing GNU attribute. File-scope declaration metadata now
+retains +noreturn+ alongside existing global alignment requests. Supported
+prefix/specifier/trailing function positions, +__attribute/__attribute__+
+and +noreturn/__noreturn__+ spellings, repeated attributes, and compatible
+static/extern redeclarations merge across the complete unit, including
+declarations after definitions. The function's scalar signature and callback
+compatibility are unchanged; no caller continuation is removed based on the
+promise. Ordinary returning helpers and recursive/ninth-argument calls still
+use the existing aligned scalar ABI.
+Attributed bodies reject explicit returns even in unreachable branches,
+loops, switch cases, or labels. Unexpected fallthrough emits an +ebreak+
+loop without an epilogue, so an independently assembled trap handler that
+resumes after the breakpoint still cannot reach caller continuation.
+This is deliberate fail-closed guest behavior, not an all-path termination
+proof, host panic/exit fallback, or synthesized stack unwinding.
++tests/fixtures/kiuas16_noreturn.c+ executes through library and production
+compiler/runner paths: UART +50 2a 0a+, exact doubleword report seven/42,
+no post-call state/output, zero traps, and waiting within 10000 steps.
+Live panic frames remain 16-byte aligned; they intentionally do not return
+or restore the startup stack. Other guests verify direct/indirect calls,
+signed-byte and unsigned-word arguments, full-XLEN ninth arguments,
+recursive calls, and an ordinary returning function called within the helper.
+Violation tests observe actual breakpoint instruction bytes/cause and repeated
+traps with a resuming handler; production +--deny-traps+ rejects violations.
+Object/type/parameter/local placements, malformed/argument-bearing attributes,
+conflicting signatures, missing definitions, attributed +main+, and explicit
+returns diagnose without replacing a ROM; mapped return locations are kept.
+Legacy attribute rejection remains. Local prototypes, attributed callback
+types, C11 +_Noreturn+, +format/nonstring+ attributes, all-path termination
+analysis, records, varargs, separate units, full LP64D, firmware/xv6, and
+parent P0 completion remain open.
++
+*Scalar variadic/stdarg slice:* A header-based variadic sum consumer reproduced
+missing +stdarg.h+ and unsupported variadic signatures. The Rust RV64 backend
+now retains the ellipsis in direct/callback signatures, requires at least one
+fixed parameter, and allows up to 32 total scalar arguments. Fixed arguments
+use declared conversions; unnamed narrow integers promote to +int+, while
+word/long/pointer values retain their types. Unsigned-word ABI sign extension
+is unchanged. Variadic callees save all eight argument registers into a
+64-byte area adjacent to incoming stack arguments, adjust named stack
+offsets, and reclaim the save area on ordinary return.
+The isolated Kiuas16 +stdarg.h+ supplies +va_list+ and checked Rust-native
++va_start/va_arg/va_copy/va_end+ builtins. A list is an eight-byte
++unsigned long *+ cursor traversing XLEN slots. Start checks the current
+variadic function's last fixed parameter; copy/forwarding preserve independent
+positions; arg validates promoted scalar type names and returns rvalues;
+end validates/evaluates the list without runtime resource cleanup. Lists and
+argument expressions evaluate once; skipped/sizeof expressions do not advance.
+No external compiler or host varargs helper participates.
++tests/fixtures/kiuas16_varargs.c+ copies/forwards eleven long arguments across
+the register/stack boundary. Library and production compiler/runner paths
+emit UART +56 84 0a+, return/report 132, restore stack/frame registers, and
+trap zero times within 10000 steps.
+Behavioral regressions cover fixed counts one/two/six/seven/eight/nine/ten/
+31/32 and zero through 31 unnamed arguments subject to the 32-total limit,
+all narrow promotions, signed/unsigned words/longs, object/callback pointers,
+pointer-to-pointer and callback-object views, list restart/copy/forwarding,
+recursive indirect dispatch, and counted target/input/list side effects.
+Independent assembly verifies caller promotions, incoming/outgoing stack
+slots/alignment, preserved registers, and cursor addresses relative to the
+original incoming stack for fixed counts one/seven/eight/nine/ten/30.
+Invalid list/type/last-parameter operands, narrow/void/floating extraction,
+assignments to extracted rvalues, reserved builtin names, mismatched callback
+ellipsis, prototype/count errors, and oversized calls diagnose without
+replacing a ROM. An ellipsis-only callback parser case now diagnoses instead
+of being normalized into a no-argument prototype. Existing legacy behavior
+and nonvariadic guests remain covered.
+Extraction type/count mismatches and invalid list lifetimes remain guest
+undefined behavior, not dynamically checked. This supersedes earlier scalar
+varargs/callback-ellipsis limitations; floating/aggregate varargs, full LP64D,
+hosted formatted I/O, variadic preprocessing macros, records, separate units,
+ELF, firmware/xv6, and the parent P0 milestones remain open.
++
+*Implemented slice / bounded printf-format attributes:* Rust-native RV64
+declaration metadata accepts GNU +format(printf,index,first)+ and underscored
+spellings on functions. One-based constant indices must name a fixed char
+pointer and the first variadic argument, or zero for syntax-only +va_list+
+wrappers. Identical attributes merge; incompatible repeated/redeclared
+attributes and invalid placements diagnose. Metadata stays outside callback
+signature compatibility and does not change emitted calling conventions.
+Known-target calls with literal formats check promoted arguments for
++d/i/u/o/x/X/c/s/p/%%+, supported +h/hh/l/j/z/t+ lengths, numeric/star
+widths/precisions, and compatible flags. Checks reject missing/excess
+arguments, strict type/signedness mismatches, malformed/unsupported directives,
+floating/wide conversions, +n+, positional forms, and +ll+. Nonliteral formats,
+stored strings, and dynamically selected callbacks remain unchecked.
++tests/fixtures/kiuas16_format.c+ executes a private scalar variadic logger
+through the compiler, assembler, machine, and production CLI. Within 10000
+steps it emits exact UART +46 3a 37 2f 39 21 25 0a+, returns eight, writes
+doubleword eight at +0x80000000+, restores +sp/s0+, and traps zero times.
+Focused execution covers all supported integer lengths/conversions after
+promotion, full-width values, string/void pointers, star operands evaluated
+once, zero-byte termination, redeclaration/specifier spellings, and forwarded
++va_list+ syntax-only wrappers. Negative regressions verify mapped source
+locations and preserve an existing ROM. This supersedes earlier rejection
+of all +format+ attributes; it adds neither a hosted printf library nor
+runtime format checks. +nonstring+, records, separate units, ELF, floating/
+aggregate ABI, full LP64D, firmware/xv6, and parent P0 milestones remain open.
++
+*Implemented slice / nonstring byte objects:* Rust-native RV64 metadata
+accepts GNU +nonstring/__nonstring__+ on file-scope plain/signed/unsigned
+character arrays and character-pointer objects, including supported
+const/volatile qualifiers. Specifier/trailing positions, repeated attributes,
+compatible redeclarations, and array alignment combinations preserve their
+existing object/call semantics. No terminator, new storage, ABI change, or
+string implementation is synthesized. Checked known-target format calls
+diagnose a known nonstring format buffer or literal +s+ operand (even with
+precision). Pointer casts/arithmetic, element addresses, pointer updates/
+assignments, and conditional branches retain known expression provenance.
+Unannotated aliases, interprocedural propagation, dynamic callbacks, and
+nonliteral format contents remain unchecked; local/parameter/member/type
+annotations and unsupported object shapes diagnose.
++tests/fixtures/kiuas16_nonstring.c+ executes through library and production
+tools within 10000 steps: exact UART +4e 4f 44 45 0a+, return/report 262,
+name size four, aligned scratch address, restored +sp/s0+, and zero traps.
+Poisoned-RAM regression checks full-width nonterminated names, signed and
+unsigned bytes, pointer relocation, initialized padding, BSS, and untouched
+trailing bytes. Invalid string uses, types/placements, and arguments preserve
+an existing ROM; mapped diagnostics and per-declarator/redeclaration behavior
+are covered. This supersedes blanket rejection of +nonstring+; records and
+their member attributes, separate units, ELF, floating/aggregate ABI, full
+LP64D, firmware/xv6, and the parent P0 milestones remain open.
++
+*Implemented slice / private inline helpers:* Rust-native RV64 accepts C99
++inline+ and GNU +__inline/__inline__+ specifiers for functions with internal
+linkage. Shared declaration parsing handles specifier ordering/repetition
+and target header macros; inline remains outside callback signatures.
+The backend emits ordinary private functions rather than substituting
+call sites, preserving recursive calls, stable function addresses, stack
+arguments, scalar varargs, inline assembly, and existing function attributes.
+Earlier static declarations may establish inherited internal linkage;
+initially external inline declarations diagnose rather than guessing C99/
+GNU external-inline semantics. Invalid object/type/parameter/local uses,
+missing/duplicate definitions, and unsupported linkage preserve a prior ROM.
++tests/fixtures/kiuas16_inline.c+ executes CSR exchange/read helpers and
+recursion through library and production CLI within 10000 steps, emits
+UART +49 2a 0a+, returns 42, and reports +0x1234567887654321+/42 at
++0x80000000/+0x80000008+ with restored +sp/s0+ and zero traps.
+Regressions execute header-defined macros/helpers, callback address identity,
+nine-argument recursion and single argument side effects, scalar variadic/
+format checks, noreturn waiting, and a handwritten ABI caller. Mapped
+external-inline diagnostics retain their source location.
+No actual inline optimization, external-inline/separate-unit semantics,
+records, ELF, floating/aggregate ABI, full LP64D, firmware/xv6, or parent P0
+completion is claimed.
++
+*Validation checkpoint:* Working tree based on +2882334+; one hart, M-mode
 raw-ROM startup, standard runner RAM/media profile.
-+cargo test --test kiuas16_compiler -j 1 -- --test-threads=1+ passes all 138
-compiler integration tests, including independently assembled call partners
-and compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
++cargo test --workspace -j 1 -- --test-threads=1+ passes all 975 tests,
+including all 213 compiler and 12 assembler integration tests.
+Compiler coverage includes independently assembled call partners and
+compiled storage with UART +43 00 52 01 00 01 03 00+ on read-only media
 (write status changes to zero on writable media and sector 1 starts with +W+).
-+cargo test --workspace -j 1 -- --test-threads=1+ passes all 895 tests in the serial workspace suite, including all 9 assembler integration tests.
 +cargo check --lib --bin kiuas16-cc --bin kiuas16-asm --bin kiuas16-run -j 1+,
 +cargo fmt --check+, and +git diff --check+ pass. Remaining P0 completion
 gates are unchanged.

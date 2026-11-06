@@ -294,6 +294,15 @@ Supported syntax is intentionally limited:
   +call+ is a checked local +jal+, not a long-call relocation.
 * +wfi+, +ecall+, +ebreak+, +mret+, +sret+, +fence+, and +fence.i+
   with no operands. Explicit fence predecessor/successor lists are unsupported.
+* +csrrw/csrrs/csrrc+ and +csrrwi/csrrsi/csrrci+, plus
+  +csrr/csrw/csrs/csrc/csrwi/csrsi/csrci+ pseudos. CSR addresses accept
+  unsigned 12-bit numbers or the architectural names implemented by the
+  machine (supervisor/machine status, interrupt, trap, scratch, delegation,
+  counter, PMP, SATP, environment, hart ID, and supervisor timer compare).
+  Immediate sources are unsigned five-bit numbers; register sources require
+  integer registers. The assembler encodes numeric CSR addresses even if the
+  machine does not implement them; privilege, read-only, and implemented-CSR
+  checks remain CPU execution semantics.
 * +lr.w/lr.d+, +amoswap.w/amoswap.d+, +amoadd.w/amoadd.d+,
   +amoand.w/amoand.d+, +amoor.w/amoor.d+, and +amoxor.w/amoxor.d+, optionally suffixed with
   +.aq+, +.rl+, or +.aqrl+. Atomic address operands require zero offset,
@@ -308,7 +317,7 @@ Supported syntax is intentionally limited:
   definition, but do not select an entry point or export an object symbol.
   Numeric operands reuse the shared assembler's integer-literal parser.
 * +#+ comments. Preprocessor directives, expressions, numeric local labels,
-  other sections/directives, CSR operands, F/D/A/C instructions, external
+  other sections/directives, F/D/C and remaining A instructions, external
   symbols, relocatable objects, and ELF output are not supported.
 
 Malformed input, unknown operations, unresolved/duplicate labels, immediate
@@ -354,6 +363,24 @@ cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_text.c C:\path\text-rom.b
 cargo run --bin kiuas16-run -- --rom C:\path\text-rom.bin --steps 10000 --deny-traps
 cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_bitmap.c C:\path\bitmap-rom.bin
 cargo run --bin kiuas16-run -- --rom C:\path\bitmap-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_headers.c C:\path\headers-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\headers-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_dispatch.c C:\path\dispatch-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\dispatch-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_csr.c C:\path\csr-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\csr-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_aligned.c C:\path\aligned-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\aligned-rom.bin --steps 100000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_noreturn.c C:\path\panic-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\panic-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_varargs.c C:\path\varargs-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\varargs-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_format.c C:\path\format-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\format-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_nonstring.c C:\path\nonstring-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\nonstring-rom.bin --steps 10000 --deny-traps
+cargo run --bin kiuas16-cc -- .\tests\fixtures\kiuas16_inline.c C:\path\inline-rom.bin
+cargo run --bin kiuas16-run -- --rom C:\path\inline-rom.bin --steps 10000 --deny-traps
 cargo test --test kiuas16_compiler -j 1 -- --test-threads=1
 ----
 
@@ -478,8 +505,7 @@ The initial language/backend subset is deliberately bounded:
   Short conversions retain the low 16 bits; signed halfwords sign-extend and
   unsigned halfwords zero-extend in values and integer register/stack calls.
   Matching halfword pointer arithmetic scales by two bytes. Qualified pointees
-  are supported, but standalone volatile-qualified scalar declarations remain
-  outside this subset.
+  and const/volatile integer objects are supported.
 * +_Bool+ occupies one byte, matching the shared target ABI layout.
   Integer and pointer conversions yield zero for zero/null and one for every
   nonzero value/address, testing the full source width before normalization.
@@ -494,8 +520,7 @@ The initial language/backend subset is deliberately bounded:
   generic void-pointer conversions, and null constants reuse the existing
   pointer rules. Dereferences use byte accesses; boolean updates perform
   promoted integer arithmetic followed by conversion back to zero/one.
-  Qualified-object declarations and byte-width atomic builtins remain
-  unsupported, as do preprocessing/+stdbool.h+ and global initializers
+  Byte-width atomic builtins remain unsupported, as do global initializers
   requiring conversion of a symbolic pointer address to an integer constant.
   This adds a C99 scalar type, not blanket C99 conformance.
 * Ordinary character constants and narrow string literals reuse shared lexer
@@ -508,7 +533,7 @@ The initial language/backend subset is deliberately bounded:
   Every distinct source literal, including array initializers and unevaluated
   uses, consumes eight-byte-aligned/padded space in the existing 65536-byte
   global budget and contributes to ROM capacity. Oversized storage or ROM output
-  diagnoses without overwriting an existing output. Wide literals, const-qualified objects,
+  diagnoses without overwriting an existing output. Wide literals
   and pointers to whole literal arrays remain
   unsupported.
 * Integer promotions, LP64 signed/unsigned mixed arithmetic, scalar conversions,
@@ -566,8 +591,8 @@ The initial language/backend subset is deliberately bounded:
   Void-pointer arithmetic, subtraction, updates, subscripting, dereference,
   and ordered comparisons diagnose because void has no complete object size.
   Different integer-pointer types still require an explicit intermediate
-  +void *+ cast; const-qualified objects and function-pointer types remain
-  unsupported, as do implicit nonzero/runtime integer-pointer conversions. Converting an
+  +void *+ cast; function pointers do not convert to/from object pointers.
+  Implicit nonzero/runtime integer-pointer conversions remain unsupported. Converting an
   address does not establish valid alignment, bounds, lifetime, or aliasing.
 * Const-pointee pointers (such as +const char *+ and +const volatile int *+)
   expose read-only views of the supported integer/void types without changing
@@ -585,23 +610,41 @@ The initial language/backend subset is deliberately bounded:
   the read-only integer objects they reference.
   Explicit casts can remove qualification; guest code remains responsible for
   not writing actual const objects or string literals. This is compile-time
-  view checking, not runtime RAM protection. Const scalar/array objects and
-  outer pointer-object qualification remain unsupported, including qualified
+  view checking, not runtime RAM protection.
+  Outer pointer-object qualification remains unsupported, including qualified
   pointer typedef uses and abstract pointer-qualified cast/sizeof types.
-  The text fixture uses a const-pointee cursor, fragment table, and UART helper,
+  The text fixture uses const banner/high-byte arrays and a const-pointee cursor,
+  fragment table, and UART helper,
   retaining its exact UART and reported memory results.
-* File-scope typedefs name supported unqualified integer types, +void+, or
+* Const/volatile qualifiers apply to supported integer scalar objects and
+  one-dimensional integer array elements, including +_Bool+. Global,
+  automatic, and parameter objects retain qualifiers through address-of;
+  arrays decay to correspondingly qualified element pointers. Reads produce
+  unqualified scalar values, and casts/sizeof accept qualified scalar types.
+  Initialization may write const storage; later direct/compound assignments
+  and prefix/postfix updates diagnose, even in unreachable/unevaluated code.
+  Volatile objects use declared-width loads/stores on every evaluated access;
+  aliases observe updates, and skipped expressions/sizeof do not read them.
+  Top-level parameter/result qualifiers do not change call compatibility or
+  the scalar ABI, but a const parameter cannot be changed in its definition.
+  Compatible global redeclarations must retain object qualifiers.
+  Integer object typedefs preserve these rules. Const data uses the existing
+  guest-owned RAM copy/BSS initialization and storage budgets, not a protected
+  read-only section. Pointer-object qualification, records, qualified void
+  objects, and runtime protection of explicitly cast-away const remain unsupported.
+* File-scope typedefs name supported qualified/unqualified integer types, +void+, or
   pointers to supported integer types/void, including const/volatile pointees.
   Alias chains, function
   signatures, global/automatic objects, array elements/bounds, casts, and
   +sizeof+ reuse the shared parser's resolved types; aliases do not create
   distinct types. Volatile-qualified pointee uses of integer aliases such as
   +(volatile u16 *)+ are supported. Unsupported alias targets diagnose even
-  when unused. Block-scope/array/function/qualified-object typedefs,
+  when unused. Block-scope/array/function typedefs,
   qualified uses of pointer aliases, duplicate typedef names, and typedef
   names reused by objects, functions, locals, or parameters diagnose.
   Typedef names are reserved across this source unit; inner-scope shadowing
-  is not implemented. Preprocessing and target header inclusion remain open.
+  is not implemented. Target headers and macros use the Rust preprocessor
+  described below; this does not add unsupported typedef targets.
 * Anonymous file-scope +enum { NAME = expression, NEXT };+ declarations provide
   signed 32-bit +int+ constants. Explicit values use the RV64 LP64 integer
   evaluator, including prior enumerators, casts, +sizeof+, unsigned wrapping,
@@ -629,7 +672,7 @@ The initial language/backend subset is deliberately bounded:
   byte size under +sizeof+; elsewhere it decays to an element pointer.
   Array parameters are adjusted to pointers, so their +sizeof+ is 8.
   Array type names, variable-length types, and aggregate sizes are not implemented.
-* One-dimensional automatic arrays of supported unqualified integer or one-level pointer elements
+* One-dimensional automatic arrays of supported qualified/unqualified integer or one-level pointer elements
   occupy contiguous byte/halfword/word/doubleword storage. Each object starts on an
   eight-byte boundary. Nonempty initializer lists convert each element,
   evaluate explicit initializers left-to-right, and zero-fill omitted elements;
@@ -658,7 +701,7 @@ The initial language/backend subset is deliberately bounded:
   Character arrays accept string initializers, optionally surrounded by scalar
   braces: omitted bounds include the terminator, larger arrays zero-fill, and
   an exact byte-length bound may omit the trailing zero. A smaller bound diagnoses.
-* File-scope unqualified integer scalars, scalar pointers to void or the supported
+* File-scope qualified/unqualified integer scalars, scalar pointers to void or the supported
   integer types (including volatile-qualified pointees), and one-dimensional integer arrays
   have persistent RAM storage. Supported integer constant initializers use
   LP64 typing, conversions, optional scalar braces, and the same array-list
@@ -669,8 +712,7 @@ The initial language/backend subset is deliberately bounded:
   accompany compatible tentative declarations. Conflicting types/lengths,
   multiple initialized definitions, and object/function name collisions
   diagnose. Objects must be declared before use and local scopes may shadow
-  them. Volatile-qualified integer objects and record globals,
-  dynamic initializers and separate-unit linkage remain
+  them. Record globals, dynamic initializers and separate-unit linkage remain
   unsupported.
 * File-scope +static+ objects/functions have internal linkage; +extern+
   declarations inherit prior linkage or introduce external linkage. Function
@@ -714,7 +756,7 @@ The initial language/backend subset is deliberately bounded:
   updates, globals, aliases, and scalar parameter/return conventions.
   Nested pointee qualification must match: +int **+ does not convert implicitly
   to +const int **+, +volatile int **+, or +void **+. Outer pointer-object qualification, three
-  or more pointer levels, arrays of two-level pointers, function pointers,
+  or more pointer levels, arrays of two-level pointers,
   and pointer-to-array types remain unsupported.
   Tables count eight bytes per element against existing RAM/frame budgets.
   The text fixture traverses an inferred-bound string/address table terminated
@@ -735,7 +777,8 @@ The initial language/backend subset is deliberately bounded:
   integer casts, +sizeof+, unary/binary integer operations, and logical/
   conditional expressions whose operands are all integer constants. Runtime
   operands in skipped branches are not accepted as null constants.
-  Floating constant casts and preprocessor +NULL+ macros remain unsupported;
+  The target +<stddef.h>+ defines +NULL+ as +((void *)0)+ using this path.
+  Floating constant casts remain unsupported;
   this is not blanket C constant-expression support.
 * Automatic scalar locals, nested scopes, compound/expression/return
   statements, +if/else+, +while+, +do-while+, and +for+ (including omitted
@@ -747,7 +790,7 @@ The initial language/backend subset is deliberately bounded:
   eight-byte parameter/local storage slots (960 bytes): scalars consume one,
   arrays consume their byte size rounded up to eight, and nested scopes share
   this budget without slot reuse. Records, unsupported enum/typedef forms, storage
-  class specifiers on block declarations, const-qualified objects, and other unsupported constructs
+  class specifiers on block declarations, qualified pointer objects, and other unsupported constructs
   diagnose. C99-style +for+ declarations are not a C90 conformance claim.
 * +goto name;+ and named statement labels are function-scoped, including
   forward/backward targets in nested compounds, loops, and switch case bodies.
@@ -859,20 +902,337 @@ The initial language/backend subset is deliberately bounded:
   bit 31 to XLEN at argument/return boundaries (including stack arguments),
   as required by the RISC-V integer calling convention; callees normalize
   incoming register and stack parameters.
-  Indirect calls, aggregates, floating-point arguments, and varargs remain
-  unsupported. This is a fixed-prototype scalar convention, not full LP64D.
-* Preprocessor directives, including includes and macros, are rejected
-  before parsing. No legacy header search or legacy target macros are
-  used for this RV64 path.
+  Direct and supported indirect calls share this argument/result convention.
+  Aggregates and floating-point arguments remain unsupported.
+  This is a prototyped scalar convention, not full LP64D.
+* Variadic prototypes require at least one fixed scalar parameter; definitions
+  require names for the fixed parameters. Direct and indirect calls accept
+  zero or more unnamed supported scalar arguments, with a limit of 32 total
+  fixed/unnamed arguments. Fixed parameters use ordinary typed conversions.
+  Unnamed boolean/char/short values promote to +int+; +int/unsigned int+,
+  +long/unsigned long+, object pointers, and callbacks retain their types.
+  Unsigned 32-bit arguments still sign-extend to XLEN at the ABI boundary.
+  Null integers in an ellipsis are not implicitly converted to pointers:
+  passing a null pointer requires a pointer-typed expression.
+  Variadic callees reserve a 64-byte register-save area immediately below
+  incoming +sp+ before allocating their ordinary frame; +a0..a7+ occupy its
+  consecutive eight-byte slots. The area is adjacent to incoming stack
+  arguments, so a cursor traverses both without separate overflow machinery.
+  Named stack parameters use the adjusted frame offsets. Ordinary return
+  reclaims both frame and save area and restores +ra/s0+; nested calls and
+  recursive argument evaluation retain 16-byte alignment.
+  The isolated target +<stdarg.h>+ defines eight-byte +va_list+ as an
+  +unsigned long *+ cursor and maps +va_start/va_arg/va_copy/va_end+ to checked
+  Rust-native compiler builtins. +va_start+ requires a modifiable list and
+  the last fixed parameter of the current variadic definition; it points
+  to the original saved arguments, not mutable named-parameter locals.
+  +va_arg+ requires a type name for a supported promoted integer or pointer,
+  advances the list by one XLEN slot, and returns a typed rvalue. Narrow
+  integer types, void, floats, aggregates, and unimplemented types diagnose.
+  Signed/unsigned 32-bit extraction loads only the declared low word and
+  normalizes it; pointer/long extraction uses all eight bytes.
+  +va_copy+ copies the cursor independently; passing a list by value allows
+  existing scalar pointer calls to forward it without advancing the caller's
+  cursor. +va_end+ evaluates and validates its list operand without a runtime
+  resource cleanup operation. Side-effecting list operands evaluate once;
+  skipped/sizeof operands do not advance a cursor.
+  Wrong extraction types, reading past supplied arguments, uninitialized or
+  ended lists, and retaining cursors after their defining call returns remain
+  invalid guest behavior, not runtime-checked operations. This is a scalar
+  subset, not floating/aggregate varargs, full LP64D, a hosted formatted-I/O
+  library, or C23 unnamed-only variadic functions.
+  +tests/fixtures/kiuas16_varargs.c+ copies/forwards a list of eleven long
+  values across the register/stack boundary. Library and production CLI
+  execution emit +56 84 0a+, return 132, report doubleword 132 at
+  +0x80000000+, restore +sp/s0+, and trap zero times within 10000 steps.
+  Independent handwritten callers/callees check default promotions, stack
+  slots, saved registers, and the cursor's actual address for one/seven/eight/
+  nine/ten/30 fixed parameters. Generated consumers cover up to 32 total
+  parameters, including 31/32 named parameters and zero unnamed arguments.
+* Function-pointer typedefs such as +typedef int (*operation)(int,int);+
+  name eight-byte scalar callback values. Supported callback signatures use
+  zero to 32 fixed scalar integer/object-pointer parameters and a scalar or
+  void result, optionally variadic after at least one fixed parameter.
+  Nested callback signatures and old-style prototypes remain unsupported.
+  The ellipsis is part of signature compatibility; fixed and variadic
+  callbacks cannot be interchanged. Top-level scalar parameter qualifiers do not change
+  callback compatibility. Function designators and +&function+ produce the
+  same typed address; dereferencing a callback produces a function designator,
+  not a modifiable object. Locals/globals, arguments/results, aliases,
+  assignment, compatible equality, scalar conditions, boolean conversion,
+  null constants, conditional selection, and +sizeof(callback)+ reuse typed
+  scalar lowering. +sizeof(function)+ diagnoses.
+  Automatic callback objects use typedef declarations; direct function-pointer
+  syntax is accepted for globals, function parameters, and abstract type
+  names. Direct local function-pointer declarators remain unsupported.
+  Addresses of callback objects and array decay produce eight-byte-stride
+  object pointers, allowing indexing, table traversal, and reassignment through
+  a pointer to a callback. Further levels and qualified callback objects
+  remain unsupported. Function pointers themselves cannot be advanced,
+  subscripted, ordered, subtracted, or used by the integer atomic builtins.
+  Casts accept compatible callback types and null constants, not incompatible
+  signatures, integer addresses, or object-pointer/function-pointer interchange.
+  Matching signatures require exact normalized parameter/result types, not
+  ordinary arithmetic conversions.
+  Global callback initializers accept prior declared function addresses,
+  constant selection, and nulls; arrays support existing sparse designators.
+  Symbolic function addresses use the assembler's checked +.dword label+
+  handling and existing ROM-to-RAM data copy. Function pointers in BSS and
+  omitted array entries are zeroed by guest startup.
+  Indirect targets evaluate once before arguments and remain in a separate
+  aligned temporary across nested argument calls; +jalr+ then uses the shared
+  integer register/stack ABI. Tests cover zero through 32 parameters, recursive
+  callbacks, target changes during argument evaluation, all integer result
+  widths, pointer/void results, and independent assembled caller/callee checks.
+  Calling null or an invalid address remains invalid guest behavior, not a
+  checked callback runtime.
+  +tests/fixtures/kiuas16_dispatch.c+ initializes and modifies a sparse private
+  callback table. Direct and production CLI execution emit +44 45 03 0a+,
+  return 69, report total 69/count three at +0x80000000/+0x80000004+ and
+  table address at +0x80000008+. Tests inspect exact table addresses/nulls,
+  poisoned startup RAM, restored +sp/s0+, and zero traps within 10000 steps.
+* GNU +__attribute__((format(printf, index, first)))+ supports +__attribute+,
+  +__format__+, and +__printf__+ spellings on function prototypes/definitions
+  at the same specifier/trailing positions as +noreturn+. Indices are integer
+  constants, one-based: +index+ must name a fixed char-pointer parameter,
+  and +first+ must name the first unnamed argument of a variadic function.
+  Zero +first+ requests syntax-only checks, for example on a +va_list+
+  wrapper. Identical repeated attributes merge across the complete source
+  unit; conflicting attributes diagnose, including later redeclarations.
+  Metadata does not change callback type compatibility or the scalar ABI.
+  Calls with a statically known target and a direct string literal are
+  checked after default argument promotions. Literal concatenation and
+  escaped bytes follow ordinary string parsing; checks stop at the first
+  zero byte. Nonliteral format contents, stored string contents, and runtime-selected
+  callbacks remain unchecked; known +nonstring+ format operands still diagnose.
+  The attribute is not carried through callback
+  types. This is static validation, not a runtime formatter or safety check.
+  Supported conversions are +d/i/u/o/x/X/c/s/p/%%+. Integer lengths +h/hh+
+  consume promoted +int+ values; unqualified signed/unsigned conversions
+  require +int/unsigned int+, and +l/j/z/t+ require the corresponding signed/
+  unsigned LP64 long type. Narrow arguments promote before checking.
+  +c+ requires +int+, +s+ a possibly qualified char pointer, and +p+ an
+  explicitly converted (possibly qualified) void pointer. Signedness is
+  checked strictly, not only register width. Numeric widths/precisions and
+  +*+ are supported; each star consumes an +int+ before the converted value.
+  Standard integer flags and string/character/pointer left justification
+  are supported; incompatible flags or precision on +c/p+ diagnose.
+  Missing/excess arguments, malformed directives, unsupported lengths
+  (including +ll+), floating/wide conversions, +n+, positional forms, and
+  other archetypes diagnose. Object/local/parameter/typedef attribute
+  placements remain unsupported. No hosted formatted-I/O implementation
+  or general constant-propagation format analysis is added.
+  +tests/fixtures/kiuas16_format.c+ calls a private variadic guest logger.
+  Library and production CLI execution emit +46 3a 37 2f 39 21 25 0a+,
+  return eight, report doubleword eight at +0x80000000+, restore +sp/s0+,
+  and trap zero times within 10000 steps.
+* GNU +__attribute__((nonstring))+ (including +__attribute+ and +__nonstring__+
+  spellings) marks file-scope character arrays and character-pointer objects.
+  Plain/signed/unsigned char elements/pointees and existing const/volatile
+  qualifiers are supported. Attributes before/within specifiers apply to
+  all declarators; trailing attributes apply to one object. Repeated
+  annotations and compatible redeclarations merge across the whole source
+  unit, including a declaration following an earlier function definition.
+  Alignment may be combined with +nonstring+ on arrays.
+  The annotation says the bytes need not be a terminated string. It changes
+  neither storage, initializer rules, alignment, pointer compatibility, nor
+  the call ABI; it does not append a terminator or remove explicit zeros.
+  Exact-bound strings, byte lists, BSS clearing, and ordinary indexed
+  accesses retain their existing semantics.
+  Calls to a statically known +format(printf,...)+ function reject a known
+  nonstring format operand and known nonstring +s+ operands in literal
+  formats. The latter is a strict diagnostic even with precision; no
+  terminator or safe bound is inferred. Direct array decay/pointer reads,
+  pointer casts/arithmetic, element addresses, pointer updates/assignments,
+  and conditional selection retain known provenance within the expression.
+  A constant condition checks its selected branch; an unknown condition
+  conservatively checks both. Ordinary byte operations, +c+, and explicit
+  void-pointer +p+ operands remain allowed.
+  This is not whole-program taint analysis: copying a pointer into an
+  unannotated local/global alias, passing/returning it through another
+  function, nonliteral format contents, and dynamic callback calls are not
+  tracked. No string library or runtime bounds/termination check is added.
+  Local/parameter/member/typedef annotations, functions, scalar characters,
+  pointer arrays, pointer-to-pointer objects, and non-character objects
+  remain unsupported and diagnose rather than silently ignoring attributes.
+  +tests/fixtures/kiuas16_nonstring.c+ copies four nonterminated name bytes
+  into aligned BSS and sums a byte packet. Library and production CLI
+  execution emit +4e 4f 44 45 0a+, return/report 262 at +0x80000000+,
+  report name size four and the aligned buffer address, restore +sp/s0+,
+  and trap zero times within 10000 steps. Poisoned-RAM regressions inspect
+  exact signed/unsigned initializer bytes, BSS, padding, pointer relocation,
+  and untouched trailing storage.
+* C99 +inline+ and GNU +__inline/__inline__+ function specifiers are supported
+  for functions with internal linkage. +static inline+ definitions and
+  prototypes, repeated inline specifiers, and supported storage/type/specifier
+  orderings compile without changing function signatures or callback types.
+  An earlier static declaration may establish internal linkage for a later
+  inline declaration without +static+, including an +extern inline+
+  redeclaration that inherits internal linkage. An initially external inline
+  declaration diagnoses; a later static definition cannot retroactively
+  supply internal linkage. External C99/GNU inline definition/linking semantics
+  are not implemented.
+  Inline is a hint, not a requirement to substitute the function body.
+  The backend emits one ordinary private function with its existing local
+  symbol, frame, and scalar register/stack ABI. Recursive calls, taking the
+  function address, callback tables, argument side effects, scalar varargs,
+  GNU inline assembly, and supported +format/noreturn+ attributes keep their
+  existing behavior. No optimization, forced inlining, duplicate code,
+  implicit definition, or external tool fallback is introduced.
+  Object/typedef/parameter/local specifiers and missing or duplicate
+  definitions diagnose. This is target-specific C99/GNU support, not a
+  change to the legacy compiler's C90 contract.
+  +tests/fixtures/kiuas16_inline.c+ uses private inline CSR read/exchange
+  helpers and recursion. Library and production CLI execution emit
+  +49 2a 0a+, return 42, report doublewords +0x1234567887654321+ and 42 at
+  +0x80000000/+0x80000008+, restore +sp/s0+, and trap zero times within
+  10000 steps. A separate handwritten caller checks the ordinary symbol
+  and ninth stack argument; header preprocessing, callback identity,
+  recursion, and side-effecting calls also execute.
+* GNU +__attribute__((noreturn))+ (including +__attribute+ and +__noreturn__+
+  spellings) applies to function declarations/definitions, before or within
+  declaration specifiers or after the parameter list. Repeated attributes and
+  compatible static/extern declarations merge across the complete source
+  unit, including a later declaration after the definition. It does not change
+  the function signature, scalar call ABI, callback compatibility, or callback
+  object type. Both void and supported scalar result types remain valid.
+  Attributed definitions reject every explicit return statement, including
+  unreachable returns in branches/loops/switch cases/labels. This is a strict
+  subset diagnostic, not an all-path termination proof.
+  Falling through an attributed function enters an +ebreak+ loop with no
+  return epilogue. Even a trap handler resuming after the breakpoint cannot
+  fall into adjacent code or return normally. Caller continuations are not
+  deleted on the strength of the attribute; indirect calls keep ordinary
+  callback types. A helper may call ordinary returning functions, recurse,
+  enter an infinite loop, or delegate to another terminating helper.
+  No host exit/panic service, stack unwinding, or stack restoration is
+  synthesized. A waiting panic helper retains its active aligned frames.
+  +main+ cannot be attributed in this ROM profile, which requires an ordinary
+  +int main(void)+ entry. Object, parameter, typedef, and local attributes,
+  arguments to +noreturn+, unsupported attribute combinations, and explicit
+  returns diagnose rather than silently ignoring the promise. Local
+  prototypes and attributed callback types are not added.
+  +tests/fixtures/kiuas16_noreturn.c+ descends through recursive calls into a
+  private panic helper whose earlier prototype carries the attribute. Direct
+  and production CLI execution emit +50 2a 0a+, report doublewords seven and
+  42 at +0x80000000/+0x80000008+, and wait without traps within 10000 steps.
+  Post-call state changes/UART output are not reached. Separate regressions
+  execute indirect calls, ninth-argument recursion, ordinary returning
+  helpers, and unexpected fallthrough with an independently assembled
+  trap handler. The runner's +--deny-traps+ rejects contract violations.
+  This bounded GNU extension is not C11 +_Noreturn+, a hosted +exit+, or
+  general control-flow termination analysis.
+* GNU inline assembly statements accept +asm/__asm/__asm__+ with optional
+  +volatile/__volatile/__volatile__+. Basic assembly copies the string
+  verbatim; extended assembly has output/input/clobber sections and accepts
+  up to six explicit operands in total. Output constraints are +"=r"+, +"+r"+,
+  +"=&r"+, and +"+&r"+; outputs must be modifiable scalar objects. Input +"r"+
+  accepts supported integer/object-pointer/callback scalar values, and +"i"+
+  requires an evaluable integer constant expression. Numeric +%0+ and named
+  +%[name]+ substitutions and escaped +%%+ are supported in extended templates.
+  Register operands use distinct caller-saved +t1..t6+ registers, including
+  early-clobber outputs. Output addresses and input expressions evaluate once
+  into aligned temporary storage before loading operand registers, so nested/
+  recursive calls and stack arguments cannot destroy earlier operands.
+  Read/write outputs load their original declared width; all results normalize
+  to the output type and store at its width (automatic scalar slots retain
+  the backend's eight-byte representation). Output registers are staged before
+  any writeback, and all temporary storage is reclaimed.
+  +"memory"+ is the only supported clobber. Statements stay in source order;
+  this compiler barrier does not implicitly emit a hardware fence. An explicit
+  +asm volatile("fence" : : : "memory");+ uses the existing fence instruction.
+  Templates must preserve stack/frame and callee-saved registers and describe
+  modified values through supported output operands; undeclared register
+  clobbers or invalid guest addresses are not checked at runtime.
+  Alternative/matching constraints, memory operands, explicit register
+  variables/clobbers, modifiers, +asm goto+, unique/numeric local labels,
+  file-scope assembly, and semicolon-separated instructions remain unsupported.
+  Templates use newline-separated instructions accepted by the Rust assembler.
+  These are GNU extensions, not C90/C99 language conformance.
+  +tests/fixtures/kiuas16_csr.c+ exercises full-XLEN scratch read/write/exchange,
+  a five-bit immediate set, read/write operands, and a compiler memory barrier.
+  Direct and production CLI execution emit +43 19 0a+, return 25, report
+  doublewords +fedcba9876543210+, +fedcba9876543210+, and 25 at
+  +0x80000000/+0x80000008/+0x80000010+, restore +sp/s0+, and trap zero
+  times within 10000 steps. Independent instruction-byte and execution tests
+  cover all six CSR instruction forms and all seven pseudos, including
+  zero-source reads of read-only CSRs without accidental writes.
+* The shared Rust preprocessor handles object/function macros, argument
+  prescan/rescanning, stringification, token pasting, line splicing,
+  +#undef+, +#if/elif/ifdef/ifndef/else/endif+, +defined+, +#include+,
+  +#line+, +__FILE__+, +__LINE__+, and active +#error+ diagnostics.
+  Adjacent strings concatenate after macro expansion, not before argument
+  stringification. Repeated includes/logical locations preserve each
+  occurrence's macro state. Nested expansion is bounded to 128 levels and
+  includes to 64 nested levels; exhaustion diagnoses.
+  Conditional expressions evaluate signed/unsigned integers as 64-bit
+  +intmax_t/uintmax_t+, not runtime 32-bit +int/unsigned int+.
+  Unknown identifiers become zero, comparisons/logical results retain
+  intmax width, and short-circuit branches skip undefined arithmetic.
+  Casts, sizeof, comma expressions, floating point, +long long+ literals,
+  variadic macros, active pragmas, and unknown directives remain unsupported.
+  Undefined evaluated arithmetic and malformed directives diagnose.
+  Quoted includes first search relative to the physical including source,
+  then the target directory +toolchain/kiuas16/include+; angle includes use
+  that target directory. Explicit absolute paths are accepted. No implicit
+  legacy SC-16/host system-header search or external preprocessor is used.
+  Predefined target macros are +__kiuas16__=1+, +__riscv=1+,
+  +__riscv_xlen=64+, +__SIZEOF_LONG__=8+, and +__SIZEOF_POINTER__=8+;
+  they do not claim a complete GCC macro environment.
+  Target +<stdint.h>+ supplies exact/least-width types, 64-bit fast types,
+  pointer/max types, limits, and integer constant macros. +<limits.h>+
+  describes the supported unsigned plain char, short/int/long types.
+  +<stddef.h>+ supplies +size_t+, +ptrdiff_t+, and +NULL+;
+  +<stdbool.h>+ supplies +bool+, +true+, +false+, and
+  +__bool_true_false_are_defined+. These are freestanding subset headers,
+  not a hosted library or complete standard headers: +wchar_t+, +offsetof+,
+  multibyte limits, and long-long limits remain absent.
+  +tests/fixtures/kiuas16_headers.c+ combines these headers with typed MMIO,
+  sparse const tables, pasted identifiers, boolean helpers, and size/pointer
+  conversions. Direct and production CLI execution emit UART +48 11 2a 08 0a+,
+  return 59, report words 17/42 at +0x80000000/+0x8000000c+ and byte count
+  eight at +0x80000010+, restore +sp/s0+, and trap zero times within 10000 steps.
 
 Startup begins at the ROM reset vector in M-mode, sets +sp+ to +0x80010000+,
 copies initialized global bytes from protected ROM to RAM, clears
 uninitialized global storage, and calls +int main(void)+.
 Global storage occupies at most 65536 bytes in
-+[0x80010000, 0x80020000)+, above the downward-growing stack. Objects are
-eight-byte aligned and padded to eight bytes; initialized objects precede
-uninitialized objects, with names sorted within each group. Padding is also
-initialized. Guest DMA buffers and other fixed-address accesses must avoid
++[0x80010000, 0x80020000)+, above the downward-growing stack. Objects have
+at least eight-byte alignment and their sizes are padded to eight bytes;
+initialized objects precede uninitialized objects, with names sorted within
+each group. GNU +__attribute__((aligned(n)))+ (also +__attribute+ and
++__aligned__+ spellings) raises a global object's required RAM alignment.
+The argument must be a positive LP64 integer constant expression and a power
+of two from one through 65536. Smaller requests do not reduce the backend's
+eight-byte minimum or change element sizes/array strides.
+Attributes before/within declaration specifiers apply to all comma-separated
+declarators; attributes after a declarator's array dimensions apply only to
+that object. Multiple attributes and compatible static/extern/tentative
+redeclarations retain the strongest alignment; weaker later declarations
+cannot undo it. These attributes do not change object types or call ABI.
+Array bounds inferred from initializers and existing object/callback pointer
+initializers use the same path.
+Alignment gaps count against the RAM budget. Gaps within initialized storage
+are zero bytes in the ROM payload and are copied by startup; gaps before or
+within BSS are cleared by startup. Static object pointers and symbolic callback
+addresses resolve after the aligned layout is final. Data padding counts
+against ROM capacity, too: a RAM-valid initialized layout can still exceed
+the raw-ROM limit and must diagnose without replacing an output.
+Attributes with missing/default arguments, nonconstant/invalid arithmetic,
+non-power-of-two or excessive alignment, unsupported attribute names, and
+local/parameter/function/typedef alignment remain rejected. This does not
+add aligned stack frames, aligned type aliases, record fields, code alignment,
+ELF section alignment, or general attribute/type-layout support.
++tests/fixtures/kiuas16_aligned.c+ uses a 64-byte-aligned initialized
+descriptor and a 4096-byte-aligned zero-initialized page-table-sized buffer.
+Production execution emits +41 07 0a+, returns 42, and reports descriptor
+address +0x80010040+, table address +0x80011000+, descriptor address again,
+and +0123456789abcdef+ at +0x80000000+ through +0x80000018+.
+Poisoned RAM tests verify exact initialized/BSS bytes and alignment gaps,
+untouched bytes after the allocation, static pointer values, restored +sp/s0+,
+and zero traps within 100000 steps. This verifies aligned buffer storage,
+not construction or execution of a valid Sv39 page table.
+Guest DMA buffers and other fixed-address accesses must avoid
 allocated global storage. Explicitly initialized zeros currently occupy ROM
 data rather than BSS. BSS uses only guest clearing code and no ROM payload;
 initialized bytes and code must still fit the 61440-byte ROM or assembly

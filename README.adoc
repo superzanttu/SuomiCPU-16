@@ -78,7 +78,56 @@ integer/object-pointer tables, inferred bounds, and source-order evaluation.
 Repeated indices and nested/member designators remain unsupported.
 Const-qualified integer/void pointee views preserve read widths and reject
 writes or implicit qualification loss. The text helper and table use read-only
-views; const objects and outer pointer qualification remain unsupported.
+views. Const/volatile integer scalar and array objects retain qualification
+through addresses and array decay; const mutation and implicit qualifier loss
+diagnose. The text guest now declares its banner/high-byte arrays const.
+Outer pointer-object qualification remains unsupported.
+The RV64 frontend now reuses the Rust preprocessor for macros, conditionals,
+and quoted/target-header includes. Its separate +toolchain/kiuas16/include+
+directory supplies LP64 integer limits/types, +size_t/ptrdiff_t/NULL+, and
++bool/true/false+ without falling back to legacy SC-16 headers.
+The header/MMIO guest executes through the production compiler and runner;
+unsupported pragmas, variadic macros, and missing headers diagnose.
+Fixed-prototype function pointers now support typed callback values,
+automatic/global dispatch tables, symbolic ROM addresses, and indirect
+register/stack calls. The dispatch guest runs through the production tools;
+incompatible signatures, function-pointer arithmetic, and unsupported casts
+diagnose. This does not add records or separate-unit linking.
+Scalar variadic prototypes/callbacks now use default integer promotions
+and a contiguous RV64 register-save/stack cursor. The isolated target
++stdarg.h+ supplies checked +va_start/va_arg/va_copy/va_end+ operations;
+the summation guest executes through production tools. Floating/aggregate
+varargs, unprototyped calls, and variadic preprocessor macros remain unsupported.
+Bounded GNU inline assembly supports scalar register operands, integer
+constant operands, and compiler +"memory"+ clobbers. CSR read/write/set/clear
+instructions and their pseudos accept checked names/numbers in the Rust
+assembler. The scratch-CSR guest executes through the production tools;
+unsupported constraints, clobbers, and templates diagnose.
+GNU +aligned(n)+ attributes now give supported global objects power-of-two
+RAM alignment up to 65536 bytes, including initialized/BSS buffers and static
+pointer/callback tables. The aligned descriptor/page-table guest verifies
+exact addresses and startup bytes. Local/type/function alignment remains
+unsupported.
+GNU +noreturn+ function attributes now merge across prototypes/definitions,
+reject explicit returns, and guard unexpected fallthrough with a breakpoint
+loop rather than a return. A recursive panic guest reports its state and
+waits without reaching caller continuation.
+GNU +format(printf, index, first)+ function attributes now validate declarations
+and check known-target literal calls against promoted scalar argument types.
+Integer, character, string, pointer, width/precision, and syntax-only
++va_list+ wrapper checks are bounded to the documented subset; nonliteral
+formats and dynamic callbacks remain unchecked. The guest logger executes
+through production tools; this does not add a hosted printf library.
+GNU +nonstring+ now marks file-scope character arrays/pointers without
+changing their bytes, size, or ABI. Checked format calls reject known
+nonstring format buffers and +%s+ operands. The fixed-width buffer guest
+executes through production tools; local/parameter/member annotations and
+general alias tracking remain unsupported.
+C99 +static inline+ helpers (including GNU +__inline/__inline__+ spellings)
+now compile as ordinary private functions, preserving recursion, address
+identity, scalar/variadic calls, and inline assembly. The CSR-helper guest
+executes through production tools. This adds no call-site inlining or
+external-inline/separate-unit semantics.
 This is initial bring-up,
 not the complete xv6 compiler or ELF build pipeline.
 
